@@ -1,0 +1,1 @@
+"""Image classification training templates."""

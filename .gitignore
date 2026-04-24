@@ -1,0 +1,47 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Go
+bin/
+coverage.out
+*.test
+
+# Node/frontend
+node_modules/
+.next/
+out/
+coverage/
+
+# Local ML/runtime data
+datasets/**
+artifacts/**
+exports/**
+mlruns/**
+mlartifacts/**
+*.db
+*.sqlite
+*.sqlite3
+
+!datasets/.gitkeep
+!artifacts/.gitkeep
+!exports/.gitkeep

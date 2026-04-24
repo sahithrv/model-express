@@ -1,0 +1,21 @@
+[project]
+name = "model-express-worker"
+version = "0.1.0"
+description = "Python GPU worker for Model Express training jobs"
+requires-python = ">=3.11"
+dependencies = [
+  "mlflow",
+  "numpy",
+  "pillow",
+  "pydantic",
+  "requests",
+  "scikit-learn",
+  "torch",
+  "torchvision",
+]
+
+[project.scripts]
+model-express-worker = "worker.main:main"
+
+[tool.ruff]
+line-length = 100
