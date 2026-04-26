@@ -14,6 +14,26 @@ worker:
   heartbeat_timeout_seconds: 30
   max_concurrent_jobs: 1
 
+constraints:
+  max_workers: 2
+  max_experiments: 6
+  max_runtime_minutes: 60
+  allowed_templates:
+    - "simple_cnn"
+    - "mobilenet_transfer"
+    - "resnet_transfer"
+
+allocation_modes:
+  cheap:
+    target_workers: 2
+    pruning_aggressiveness: "high"
+  balanced:
+    target_workers: 4
+    pruning_aggressiveness: "medium"
+  fast:
+    target_workers: 8
+    pruning_aggressiveness: "low"
+
 training:
   default_metric: "macro_f1"
   max_epochs: 15
