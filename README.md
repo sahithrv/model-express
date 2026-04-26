@@ -46,6 +46,40 @@ Build the vertical slice before broadening the platform:
 Go orchestrator -> local Python worker -> MLflow run -> exported model package
 ```
 
+## Local Development
+
+Start the local backing services:
+
+```powershell
+docker compose -f infra/compose.yaml up -d postgres minio
+```
+
+Then run the orchestrator:
+
+```powershell
+cd services/orchestrator
+go run ./cmd/orchestrator
+```
+
+By default the orchestrator uses:
+
+```text
+postgres://model_express:model_express@localhost:5432/model_express?sslmode=disable
+```
+
+Override it with `DATABASE_URL` when needed.
+
+MinIO runs at:
+
+```text
+API:     http://localhost:9000
+Console: http://localhost:9001
+Login:   model_express / model_express_password
+```
+
+Datasets should live in object storage, not Postgres. Postgres stores metadata
+such as `storage_uri`, checksum, size, status, and profile JSON.
+
 ## Control Boundary
 
 ```text
@@ -58,3 +92,16 @@ Memory stores reusable experiment insights.
 
 Workers can run locally or on manually launched GPU hosts such as RunPod-style
 instances. Each worker should run one training job at a time for the MVP.
+
+Worker registrations are scoped to one project. Start a worker with the project
+it should serve:
+
+```powershell
+cd services/worker
+$env:PROJECT_ID="project_1"
+$env:WORKER_NAME="local-worker-1"
+python -m worker.main
+```
+
+This prevents a worker launched for one experiment project from pulling queued
+jobs from another project.

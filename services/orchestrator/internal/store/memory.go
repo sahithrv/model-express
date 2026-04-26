@@ -1,19 +1,14 @@
 package store
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/workers"
-)
-
-var (
-	ErrNotFound = errors.New("not found")
-	ErrNoJob    = errors.New("no job available")
 )
 
 type MemoryStore struct {
@@ -21,6 +16,7 @@ type MemoryStore struct {
 
 	nextID   uint64
 	projects map[string]projects.Project
+	datasets map[string]datasets.Dataset
 	workers  map[string]workers.Worker
 	jobs     map[string]jobs.ExperimentJob
 	metrics  map[string][]jobs.EpochMetric
@@ -29,13 +25,14 @@ type MemoryStore struct {
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		projects: make(map[string]projects.Project),
+		datasets: make(map[string]datasets.Dataset),
 		workers:  make(map[string]workers.Worker),
 		jobs:     make(map[string]jobs.ExperimentJob),
 		metrics:  make(map[string][]jobs.EpochMetric),
 	}
 }
 
-func (s *MemoryStore) CreateProject(name string, goal string) projects.Project {
+func (s *MemoryStore) CreateProject(name string, goal string) (projects.Project, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -50,7 +47,7 @@ func (s *MemoryStore) CreateProject(name string, goal string) projects.Project {
 	}
 
 	s.projects[project.ID] = project
-	return project
+	return project, nil
 }
 
 func (s *MemoryStore) GetProject(id string) (projects.Project, error) {
@@ -65,7 +62,7 @@ func (s *MemoryStore) GetProject(id string) (projects.Project, error) {
 	return project, nil
 }
 
-func (s *MemoryStore) ListProjects() []projects.Project {
+func (s *MemoryStore) ListProjects() ([]projects.Project, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -74,15 +71,92 @@ func (s *MemoryStore) ListProjects() []projects.Project {
 		out = append(out, project)
 	}
 
-	return out
+	return out, nil
 }
 
-func (s *MemoryStore) RegisterWorker(name string, gpuType string) workers.Worker {
+func (s *MemoryStore) CreateDataset(projectID string, name string, storageURI string, checksumSHA256 string, sizeBytes int64) (datasets.Dataset, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, ok := s.projects[projectID]; !ok {
+		return datasets.Dataset{}, ErrNotFound
+	}
+
+	dataset := datasets.Dataset{
+		ID:             s.newID("dataset"),
+		ProjectID:      projectID,
+		Name:           name,
+		StorageURI:     storageURI,
+		ChecksumSHA256: checksumSHA256,
+		SizeBytes:      sizeBytes,
+		Profile:        map[string]any{},
+		Status:         datasets.StatusRegistered,
+		CreatedAt:      time.Now().UTC(),
+	}
+
+	s.datasets[dataset.ID] = dataset
+	return dataset, nil
+}
+
+func (s *MemoryStore) GetDataset(id string) (datasets.Dataset, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dataset, ok := s.datasets[id]
+	if !ok {
+		return datasets.Dataset{}, ErrNotFound
+	}
+
+	return dataset, nil
+}
+
+func (s *MemoryStore) ListProjectDatasets(projectID string) ([]datasets.Dataset, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := []datasets.Dataset{}
+	for _, dataset := range s.datasets {
+		if dataset.ProjectID == projectID {
+			out = append(out, dataset)
+		}
+	}
+
+	return out, nil
+}
+
+func (s *MemoryStore) UpdateDatasetProfile(id string, profile map[string]any) (datasets.Dataset, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dataset, ok := s.datasets[id]
+	if !ok {
+		return datasets.Dataset{}, ErrNotFound
+	}
+
+	now := time.Now().UTC()
+	dataset.Profile = profile
+	dataset.Status = datasets.StatusProfiled
+	dataset.ProfiledAt = &now
+	s.datasets[id] = dataset
+
+	return dataset, nil
+}
+
+func (s *MemoryStore) RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return workers.Worker{}, ErrNotFound
+	}
+
 	worker := workers.Worker{
 		ID:            s.newID("worker"),
+		ProjectID:     projectID,
 		Name:          name,
 		Status:        workers.StatusIdle,
 		GPUType:       gpuType,
@@ -90,7 +164,49 @@ func (s *MemoryStore) RegisterWorker(name string, gpuType string) workers.Worker
 	}
 
 	s.workers[worker.ID] = worker
-	return worker
+	return worker, nil
+}
+
+func (s *MemoryStore) ListWorkers() ([]workers.Worker, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]workers.Worker, 0, len(s.workers))
+	for _, worker := range s.workers {
+		out = append(out, worker)
+	}
+
+	return out, nil
+}
+
+func (s *MemoryStore) ListProjectWorkers(projectID string) ([]workers.Worker, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := []workers.Worker{}
+	for _, worker := range s.workers {
+		if worker.ProjectID == projectID {
+			out = append(out, worker)
+		}
+	}
+
+	return out, nil
+}
+
+func (s *MemoryStore) GetWorker(workerID string) (workers.Worker, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	worker, ok := s.workers[workerID]
+	if !ok {
+		return workers.Worker{}, ErrNotFound
+	}
+
+	return worker, nil
 }
 
 func (s *MemoryStore) HeartbeatWorker(id string) (workers.Worker, error) {
@@ -124,6 +240,9 @@ func (s *MemoryStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 
 	for id, job := range s.jobs {
 		if job.Status != jobs.StatusQueued {
+			continue
+		}
+		if job.ProjectID != worker.ProjectID {
 			continue
 		}
 
@@ -180,6 +299,24 @@ func (s *MemoryStore) GetJob(id string) (jobs.ExperimentJob, error) {
 	return job, nil
 }
 
+func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := []jobs.ExperimentJob{}
+	for _, job := range s.jobs {
+		if job.ProjectID == projectID {
+			out = append(out, job)
+		}
+	}
+
+	return out, nil
+}
+
 func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -203,6 +340,18 @@ func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]fl
 
 	s.metrics[jobID] = append(s.metrics[jobID], metric)
 	return metric, nil
+}
+
+func (s *MemoryStore) ListJobMetrics(jobID string) ([]jobs.EpochMetric, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.jobs[jobID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := append([]jobs.EpochMetric(nil), s.metrics[jobID]...)
+	return out, nil
 }
 
 func (s *MemoryStore) CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error) {

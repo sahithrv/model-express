@@ -9,10 +9,10 @@ import (
 )
 
 type Server struct {
-	store *store.MemoryStore
+	store store.Store
 }
 
-func NewRouter(store *store.MemoryStore) *gin.Engine {
+func NewRouter(store store.Store) *gin.Engine {
 	server := &Server{store: store}
 
 	router := gin.Default()
@@ -22,14 +22,24 @@ func NewRouter(store *store.MemoryStore) *gin.Engine {
 	router.POST("/projects", server.createProject)
 	router.GET("/projects", server.listProjects)
 	router.GET("/projects/:id", server.getProject)
+	router.POST("/projects/:id/datasets", server.createDataset)
+	router.GET("/projects/:id/datasets", server.listProjectDatasets)
 	router.POST("/projects/:id/jobs", server.createJob)
+	router.GET("/projects/:id/jobs", server.listProjectJobs)
+	router.GET("/projects/:id/workers", server.listProjectWorkers)
+
+	router.GET("/datasets/:id", server.getDataset)
+	router.POST("/datasets/:id/profile", server.updateDatasetProfile)
 
 	router.GET("/jobs/:id", server.getJob)
 	router.POST("/jobs/:id/metrics", server.reportMetric)
+	router.GET("/jobs/:id/metrics", server.listJobMetrics)
 	router.POST("/jobs/:id/complete", server.completeJob)
 	router.POST("/jobs/:id/fail", server.failJob)
 
+	router.GET("/workers", server.listWorkers)
 	router.POST("/workers/register", server.registerWorker)
+	router.GET("/workers/:id", server.getWorker)
 	router.POST("/workers/:id/heartbeat", server.heartbeatWorker)
 	router.POST("/workers/:id/poll", server.pollJob)
 

@@ -3,12 +3,20 @@ server:
   port: 8080
 
 database:
-  driver: "sqlite"
-  dsn: "artifacts/model-express.sqlite3"
+  driver: "postgres"
+  dsn: "postgres://model_express:model_express@localhost:5432/model_express?sslmode=disable"
 
 mlflow:
   tracking_uri: "http://127.0.0.1:5000"
   default_experiment_name: "model-express-local"
+
+object_storage:
+  provider: "minio"
+  endpoint: "http://127.0.0.1:9000"
+  bucket: "model-express"
+  access_key: "model_express"
+  secret_key: "model_express_password"
+  use_ssl: false
 
 worker:
   heartbeat_timeout_seconds: 30

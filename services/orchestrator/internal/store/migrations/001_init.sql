@@ -1,0 +1,66 @@
+CREATE SEQUENCE IF NOT EXISTS project_id_seq;
+CREATE SEQUENCE IF NOT EXISTS dataset_id_seq;
+CREATE SEQUENCE IF NOT EXISTS worker_id_seq;
+CREATE SEQUENCE IF NOT EXISTS job_id_seq;
+
+CREATE TABLE IF NOT EXISTS projects (
+  id text PRIMARY KEY DEFAULT 'project_' || nextval('project_id_seq'),
+  name text NOT NULL,
+  goal text NOT NULL,
+  status text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS workers (
+  id text PRIMARY KEY DEFAULT 'worker_' || nextval('worker_id_seq'),
+  project_id text NOT NULL DEFAULT '',
+  name text NOT NULL,
+  status text NOT NULL,
+  gpu_type text NOT NULL DEFAULT '',
+  last_heartbeat timestamptz NOT NULL DEFAULT now(),
+  current_job_id text NOT NULL DEFAULT ''
+);
+
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS project_id text NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS datasets (
+  id text PRIMARY KEY DEFAULT 'dataset_' || nextval('dataset_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  storage_uri text NOT NULL,
+  checksum_sha256 text NOT NULL DEFAULT '',
+  size_bytes bigint NOT NULL DEFAULT 0,
+  profile jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  profiled_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS experiment_jobs (
+  id text PRIMARY KEY DEFAULT 'job_' || nextval('job_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  worker_id text NOT NULL DEFAULT '',
+  template text NOT NULL,
+  status text NOT NULL,
+  config jsonb NOT NULL DEFAULT '{}'::jsonb,
+  mlflow_run_id text NOT NULL DEFAULT '',
+  error text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  completed_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS epoch_metrics (
+  job_id text NOT NULL REFERENCES experiment_jobs(id) ON DELETE CASCADE,
+  epoch integer NOT NULL,
+  metrics jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (job_id, epoch)
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_id ON experiment_jobs(project_id);
+CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_epoch_metrics_job_id ON epoch_metrics(job_id);
+CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
+CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id);

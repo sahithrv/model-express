@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,8 +14,22 @@ import (
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	memoryStore := store.NewMemoryStore()
-	router := api.NewRouter(memoryStore)
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://model_express:model_express@localhost:5432/model_express?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	postgresStore, err := store.NewPostgresStore(ctx, databaseURL)
+	if err != nil {
+		logger.Error("failed to connect to postgres", "error", err)
+		os.Exit(1)
+	}
+	defer postgresStore.Close()
+
+	router := api.NewRouter(postgresStore)
 
 	addr := ":8080"
 	server := &http.Server{
