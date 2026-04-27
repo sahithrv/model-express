@@ -319,9 +319,20 @@ button {
 }
 
 .badge.queued,
-.badge.registered {
+.badge.registered,
+.badge.proposed {
   color: #7db7ff;
   background: rgba(125, 183, 255, 0.13);
+}
+
+.badge.approved {
+  color: #00d47e;
+  background: rgba(0, 212, 126, 0.13);
+}
+
+.badge.rejected {
+  color: #ff6875;
+  background: rgba(255, 104, 117, 0.13);
 }
 
 .notice {
@@ -343,7 +354,7 @@ button {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -558,6 +569,109 @@ button {
 
 .job-list.paged .job > span:nth-child(2) {
   justify-items: end;
+}
+
+.plan-card {
+  display: grid;
+  gap: 14px;
+}
+
+.plan-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.plan-actions span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.plan-actions small {
+  color: #77837d;
+  font-size: 12px;
+}
+
+.plan-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.plan-overview > div {
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  min-height: 70px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  padding: 12px;
+  background: #070c0b;
+}
+
+.plan-overview small,
+.experiment-item small {
+  color: #77837d;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.plan-overview strong {
+  color: #fbfffc;
+  font-size: 18px;
+}
+
+.experiment-list {
+  display: grid;
+  gap: 8px;
+}
+
+.experiment-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) 140px 110px minmax(0, 1.6fr);
+  align-items: center;
+  gap: 14px;
+  min-height: 66px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  padding: 11px 12px;
+  background: #101715;
+}
+
+.experiment-item span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.experiment-item strong {
+  color: #eef3f0;
+}
+
+.experiment-item p {
+  margin: 0;
+  color: #a6b2ad;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.warning-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.warning-list span {
+  border: 1px solid rgba(255, 209, 102, 0.2);
+  border-radius: 7px;
+  padding: 7px 9px;
+  color: #ffd166;
+  background: rgba(255, 209, 102, 0.08);
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .mono {

@@ -5,4 +5,5 @@ contextBridge.exposeInMainWorld("missionControl", {
   selectAndUploadDataset: (options) => ipcRenderer.invoke("dataset:selectAndUpload", options),
   selectDatasetFolder: () => ipcRenderer.invoke("dataset:selectFolder"),
   uploadDatasetFolder: (options) => ipcRenderer.invoke("dataset:uploadFolder", options),
+  ensureProjectWorker: (options) => ipcRenderer.invoke("worker:ensureProjectWorker", options),
 });

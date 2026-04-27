@@ -4,12 +4,16 @@ from worker.datasets.cache import dataset_archive_path, extract_dataset_archive
 from worker.datasets.profiler import profile_image_folder
 from worker.datasets.storage import download_s3_uri
 from worker.orchestrator_client import OrchestratorClient
+from worker.training.providers import run_training_job
 
 def run_job(client: OrchestratorClient, job: dict) -> None:
     template = job["template"]
     if template == "profile_dataset":
         run_profile_dataset_job(client, job)
         return 
+    if template == "train_experiment":
+        run_training_job(client, job)
+        return
     client.run_fake_job(job)
 
 def run_profile_dataset_job(client: OrchestratorClient, job: dict) -> None:

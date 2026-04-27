@@ -7,6 +7,7 @@ import (
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/workers"
 )
@@ -20,6 +21,7 @@ type MemoryStore struct {
 	workers  map[string]workers.Worker
 	jobs     map[string]jobs.ExperimentJob
 	metrics  map[string][]jobs.EpochMetric
+	plans    map[string]plans.ExperimentPlan
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -29,6 +31,7 @@ func NewMemoryStore() *MemoryStore {
 		workers:  make(map[string]workers.Worker),
 		jobs:     make(map[string]jobs.ExperimentJob),
 		metrics:  make(map[string][]jobs.EpochMetric),
+		plans:    make(map[string]plans.ExperimentPlan),
 	}
 }
 
@@ -360,6 +363,79 @@ func (s *MemoryStore) ListJobMetrics(jobID string) ([]jobs.EpochMetric, error) {
 	return out, nil
 }
 
+func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return plans.ExperimentPlan{}, ErrNotFound
+	}
+	if err := s.requireDatasetBelongsToProject(projectID, datasetID); err != nil {
+		return plans.ExperimentPlan{}, err
+	}
+	if targetMetric == "" {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: target_metric is required", ErrInvalidRequest)
+	}
+	if recommendedWorkers < 1 {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: recommended_workers must be at least 1", ErrInvalidRequest)
+	}
+	if estimatedMinutes < 1 {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: estimated_minutes must be at least 1", ErrInvalidRequest)
+	}
+	if len(experiments) == 0 {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: at least one planned experiment is required", ErrInvalidRequest)
+	}
+	if warnings == nil {
+		warnings = []string{}
+	}
+
+	plan := plans.ExperimentPlan{
+		ID:                 s.newID("plan"),
+		ProjectID:          projectID,
+		DatasetID:          datasetID,
+		Status:             plans.StatusProposed,
+		TargetMetric:       targetMetric,
+		RecommendedWorkers: recommendedWorkers,
+		EstimatedMinutes:   estimatedMinutes,
+		Experiments:        append([]plans.PlannedExperiment(nil), experiments...),
+		Warnings:           append([]string(nil), warnings...),
+		CreatedAt:          time.Now().UTC(),
+	}
+
+	s.plans[plan.ID] = plan
+	return plan, nil
+}
+
+func (s *MemoryStore) GetExperimentPlan(id string) (plans.ExperimentPlan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	plan, ok := s.plans[id]
+	if !ok {
+		return plans.ExperimentPlan{}, ErrNotFound
+	}
+
+	return plan, nil
+}
+
+func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := []plans.ExperimentPlan{}
+	for _, plan := range s.plans {
+		if plan.ProjectID == projectID {
+			out = append(out, plan)
+		}
+	}
+
+	return out, nil
+}
+
 func (s *MemoryStore) CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error) {
 	return s.finishJob(jobID, jobs.StatusSucceeded, mlflowRunID, "")
 }
@@ -420,6 +496,14 @@ func (s *MemoryStore) requireDatasetConfig(projectID string, config map[string]a
 	datasetID, ok := value.(string)
 	if !ok || datasetID == "" {
 		return fmt.Errorf("%w: dataset_id must be a non-empty string", ErrInvalidRequest)
+	}
+
+	return s.requireDatasetBelongsToProject(projectID, datasetID)
+}
+
+func (s *MemoryStore) requireDatasetBelongsToProject(projectID string, datasetID string) error {
+	if datasetID == "" {
+		return fmt.Errorf("%w: dataset_id is required", ErrInvalidRequest)
 	}
 
 	dataset, ok := s.datasets[datasetID]

@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
   "boto3",
   "mlflow",
+  "modal",
   "numpy",
   "pillow",
   "pydantic",

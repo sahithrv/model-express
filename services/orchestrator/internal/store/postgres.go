@@ -13,6 +13,7 @@ import (
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/workers"
 )
@@ -551,6 +552,108 @@ func (s *PostgresStore) ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return plans.ExperimentPlan{}, err
+	}
+	if err := s.requireDatasetBelongsToProject(projectID, datasetID); err != nil {
+		return plans.ExperimentPlan{}, err
+	}
+	if targetMetric == "" {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: target_metric is required", ErrInvalidRequest)
+	}
+	if recommendedWorkers < 1 {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: recommended_workers must be at least 1", ErrInvalidRequest)
+	}
+	if estimatedMinutes < 1 {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: estimated_minutes must be at least 1", ErrInvalidRequest)
+	}
+	if len(experiments) == 0 {
+		return plans.ExperimentPlan{}, fmt.Errorf("%w: at least one planned experiment is required", ErrInvalidRequest)
+	}
+	if warnings == nil {
+		warnings = []string{}
+	}
+
+	experimentsJSON, err := json.Marshal(experiments)
+	if err != nil {
+		return plans.ExperimentPlan{}, fmt.Errorf("marshal planned experiments: %w", err)
+	}
+
+	warningsJSON, err := json.Marshal(warnings)
+	if err != nil {
+		return plans.ExperimentPlan{}, fmt.Errorf("marshal experiment plan warnings: %w", err)
+	}
+
+	const query = `
+		INSERT INTO experiment_plans (
+			project_id,
+			dataset_id,
+			status,
+			target_metric,
+			recommended_workers,
+			estimated_minutes,
+			experiments,
+			warnings
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id, project_id, dataset_id, status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+	`
+
+	return scanExperimentPlan(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		projectID,
+		datasetID,
+		plans.StatusProposed,
+		targetMetric,
+		recommendedWorkers,
+		estimatedMinutes,
+		experimentsJSON,
+		warningsJSON,
+	))
+}
+
+func (s *PostgresStore) GetExperimentPlan(id string) (plans.ExperimentPlan, error) {
+	const query = `
+		SELECT id, project_id, dataset_id, status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		FROM experiment_plans
+		WHERE id = $1
+	`
+
+	return scanExperimentPlan(s.db.QueryRowContext(context.Background(), query, id))
+}
+
+func (s *PostgresStore) ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+
+	const query = `
+		SELECT id, project_id, dataset_id, status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		FROM experiment_plans
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+	`
+
+	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []plans.ExperimentPlan{}
+	for rows.Next() {
+		plan, err := scanExperimentPlan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, plan)
+	}
+
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error) {
 	return s.finishJob(jobID, jobs.StatusSucceeded, mlflowRunID, "")
 }
@@ -624,15 +727,9 @@ func (s *PostgresStore) requireProjectDataset(projectID string) error {
 	return nil
 }
 
-func (s *PostgresStore) requireDatasetConfig(projectID string, config map[string]any) error {
-	value, ok := config["dataset_id"]
-	if !ok {
-		return fmt.Errorf("%w: job config must include dataset_id", ErrInvalidRequest)
-	}
-
-	datasetID, ok := value.(string)
-	if !ok || datasetID == "" {
-		return fmt.Errorf("%w: dataset_id must be a non-empty string", ErrInvalidRequest)
+func (s *PostgresStore) requireDatasetBelongsToProject(projectID string, datasetID string) error {
+	if datasetID == "" {
+		return fmt.Errorf("%w: dataset_id is required", ErrInvalidRequest)
 	}
 
 	var exists bool
@@ -647,6 +744,20 @@ func (s *PostgresStore) requireDatasetConfig(projectID string, config map[string
 	}
 
 	return nil
+}
+
+func (s *PostgresStore) requireDatasetConfig(projectID string, config map[string]any) error {
+	value, ok := config["dataset_id"]
+	if !ok {
+		return fmt.Errorf("%w: job config must include dataset_id", ErrInvalidRequest)
+	}
+
+	datasetID, ok := value.(string)
+	if !ok || datasetID == "" {
+		return fmt.Errorf("%w: dataset_id must be a non-empty string", ErrInvalidRequest)
+	}
+
+	return s.requireDatasetBelongsToProject(projectID, datasetID)
 }
 
 func scanProject(row rowScanner) (projects.Project, error) {
@@ -771,6 +882,49 @@ func scanMetric(row rowScanner) (jobs.EpochMetric, error) {
 	}
 
 	return metric, nil
+}
+
+func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
+	var plan plans.ExperimentPlan
+	var experimentsJSON []byte
+	var warningsJSON []byte
+
+	if err := row.Scan(
+		&plan.ID,
+		&plan.ProjectID,
+		&plan.DatasetID,
+		&plan.Status,
+		&plan.TargetMetric,
+		&plan.RecommendedWorkers,
+		&plan.EstimatedMinutes,
+		&experimentsJSON,
+		&warningsJSON,
+		&plan.CreatedAt,
+	); err != nil {
+		return plans.ExperimentPlan{}, normalizeSQLError(err)
+	}
+
+	plan.Experiments = []plans.PlannedExperiment{}
+	if len(experimentsJSON) > 0 {
+		if err := json.Unmarshal(experimentsJSON, &plan.Experiments); err != nil {
+			return plans.ExperimentPlan{}, fmt.Errorf("unmarshal planned experiments: %w", err)
+		}
+	}
+	if plan.Experiments == nil {
+		plan.Experiments = []plans.PlannedExperiment{}
+	}
+
+	plan.Warnings = []string{}
+	if len(warningsJSON) > 0 {
+		if err := json.Unmarshal(warningsJSON, &plan.Warnings); err != nil {
+			return plans.ExperimentPlan{}, fmt.Errorf("unmarshal experiment plan warnings: %w", err)
+		}
+	}
+	if plan.Warnings == nil {
+		plan.Warnings = []string{}
+	}
+
+	return plan, nil
 }
 
 func normalizeSQLError(err error) error {

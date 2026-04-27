@@ -41,5 +41,16 @@ interface Window {
       checksum_sha256: string;
       size_bytes: number;
     } | null>;
+    ensureProjectWorker(options: {
+      projectId: string;
+      baseUrl: string;
+      name?: string;
+      gpuType?: string;
+    }): Promise<{
+      project_id: string;
+      pid: number;
+      started: boolean;
+      status: string;
+    }>;
   };
 }

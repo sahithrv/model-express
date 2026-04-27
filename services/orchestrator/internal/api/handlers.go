@@ -2,18 +2,22 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/store"
 )
 
 type createProjectRequest struct {
 	Name string `json:"name" binding:"required"`
-	Goal string `json:"goal" binding:"required"`
+	Goal string `json:"goal"`
 }
 
 type registerWorkerRequest struct {
@@ -32,6 +36,28 @@ type createDatasetRequest struct {
 	StorageURI     string `json:"storage_uri" binding:"required"`
 	ChecksumSHA256 string `json:"checksum_sha256"`
 	SizeBytes      int64  `json:"size_bytes"`
+}
+
+type createExperimentPlanRequest struct {
+	DatasetID          string                    `json:"dataset_id" binding:"required"`
+	TargetMetric       string                    `json:"target_metric"`
+	Priority           string                    `json:"priority"`
+	MaxWorkers         int                       `json:"max_workers"`
+	TimeBudgetMinutes  int                       `json:"time_budget_minutes"`
+	RecommendedWorkers int                       `json:"recommended_workers"`
+	EstimatedMinutes   int                       `json:"estimated_minutes"`
+	Experiments        []plans.PlannedExperiment `json:"experiments"`
+	Warnings           []string                  `json:"warnings"`
+}
+
+type executeExperimentPlanRequest struct {
+	Provider string `json:"provider"`
+	GPUType  string `json:"gpu_type"`
+}
+
+type executeExperimentPlanResponse struct {
+	Plan plans.ExperimentPlan `json:"plan"`
+	Jobs []jobs.ExperimentJob `json:"jobs"`
 }
 
 type updateDatasetProfileRequest struct {
@@ -116,6 +142,13 @@ func (s *Server) createDataset(c *gin.Context) {
 		return
 	}
 
+	if _, err := s.store.CreateJob(dataset.ProjectID, jobs.TemplateProfileDataset, map[string]any{
+		"dataset_id": dataset.ID,
+	}); err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
 	c.JSON(http.StatusCreated, dataset)
 }
 
@@ -147,6 +180,11 @@ func (s *Server) updateDatasetProfile(c *gin.Context) {
 
 	dataset, err := s.store.UpdateDatasetProfile(c.Param("id"), req.Profile)
 	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	if err := s.createInitialPlanForDataset(dataset.ID); err != nil {
 		writeStoreError(c, err)
 		return
 	}
@@ -316,6 +354,255 @@ func (s *Server) pollJob(c *gin.Context) {
 	}
 
 	writeStoreError(c, err)
+}
+
+func (s *Server) createExperimentPlan(c *gin.Context) {
+	var req createExperimentPlanRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	targetMetric := req.TargetMetric
+	recommendedWorkers := req.RecommendedWorkers
+	estimatedMinutes := req.EstimatedMinutes
+	experiments := req.Experiments
+	warnings := req.Warnings
+
+	if len(experiments) == 0 {
+		project, err := s.store.GetProject(c.Param("id"))
+		if err != nil {
+			writeStoreError(c, err)
+			return
+		}
+
+		dataset, err := s.store.GetDataset(req.DatasetID)
+		if err != nil {
+			writeStoreError(c, err)
+			return
+		}
+
+		recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{
+			Priority:          req.Priority,
+			MaxWorkers:        req.MaxWorkers,
+			TimeBudgetMinutes: req.TimeBudgetMinutes,
+			TargetMetric:      req.TargetMetric,
+		})
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		targetMetric = recommendation.TargetMetric
+		recommendedWorkers = recommendation.RecommendedWorkers
+		estimatedMinutes = recommendation.EstimatedMinutes
+		experiments = recommendation.Experiments
+		warnings = append(warnings, recommendation.Warnings...)
+	}
+
+	plan, err := s.store.CreateExperimentPlan(
+		c.Param("id"),
+		req.DatasetID,
+		targetMetric,
+		recommendedWorkers,
+		estimatedMinutes,
+		experiments,
+		warnings,
+	)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, plan)
+}
+
+func (s *Server) listProjectPlans(c *gin.Context) {
+	plans, err := s.store.ListProjectExperimentPlans(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"plans": plans})
+}
+
+func (s *Server) listExperimentPlans(c *gin.Context) {
+	plans, err := s.store.GetExperimentPlan(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, plans)
+}
+
+func (s *Server) executeExperimentPlan(c *gin.Context) {
+	var req executeExperimentPlanRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	response, err := s.executeStoredExperimentPlan(c.Param("id"), req)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+func (s *Server) createInitialPlanForDataset(datasetID string) error {
+	dataset, err := s.store.GetDataset(datasetID)
+	if err != nil {
+		return err
+	}
+
+	existingPlans, err := s.store.ListProjectExperimentPlans(dataset.ProjectID)
+	if err != nil {
+		return err
+	}
+	for _, plan := range existingPlans {
+		if plan.DatasetID == dataset.ID {
+			return nil
+		}
+	}
+
+	project, err := s.store.GetProject(dataset.ProjectID)
+	if err != nil {
+		return err
+	}
+
+	recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{
+		Priority: agents.PriorityBalanced,
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %s", store.ErrInvalidRequest, err.Error())
+	}
+
+	plan, err := s.store.CreateExperimentPlan(
+		project.ID,
+		dataset.ID,
+		recommendation.TargetMetric,
+		recommendation.RecommendedWorkers,
+		recommendation.EstimatedMinutes,
+		recommendation.Experiments,
+		recommendation.Warnings,
+	)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.executeStoredExperimentPlan(plan.ID, defaultExecuteExperimentPlanRequest())
+
+	return err
+}
+
+func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimentPlanRequest) (executeExperimentPlanResponse, error) {
+	plan, err := s.store.GetExperimentPlan(planID)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+
+	if len(plan.Experiments) == 0 {
+		return executeExperimentPlanResponse{}, fmt.Errorf("%w: plan has no experiments to execute", store.ErrInvalidRequest)
+	}
+
+	provider := req.Provider
+	if provider == "" {
+		provider = "local"
+	}
+
+	existingJobs, err := s.store.ListProjectJobs(plan.ProjectID)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+
+	jobsByExperiment := map[int]jobs.ExperimentJob{}
+	for _, job := range existingJobs {
+		if job.Template != jobs.TemplateTrainExperiment {
+			continue
+		}
+		if configString(job.Config, "plan_id") != plan.ID {
+			continue
+		}
+		jobProvider := configString(job.Config, "provider")
+		if jobProvider == "" {
+			jobProvider = "local"
+		}
+		if jobProvider != provider {
+			continue
+		}
+
+		index, ok := configInt(job.Config, "experiment_index")
+		if !ok {
+			continue
+		}
+		jobsByExperiment[index] = job
+	}
+
+	out := make([]jobs.ExperimentJob, 0, len(plan.Experiments))
+	for index, experiment := range plan.Experiments {
+		if job, ok := jobsByExperiment[index]; ok {
+			out = append(out, job)
+			continue
+		}
+
+		config := map[string]any{
+			"plan_id":             plan.ID,
+			"dataset_id":          plan.DatasetID,
+			"experiment_index":    index,
+			"experiment_template": experiment.Template,
+			"model":               experiment.Model,
+			"epochs":              experiment.Epochs,
+			"batch_size":          experiment.BatchSize,
+			"learning_rate":       experiment.LearningRate,
+			"target_metric":       plan.TargetMetric,
+			"provider":            provider,
+			"gpu_type":            req.GPUType,
+		}
+
+		job, err := s.store.CreateJob(plan.ProjectID, jobs.TemplateTrainExperiment, config)
+		if err != nil {
+			return executeExperimentPlanResponse{}, err
+		}
+
+		out = append(out, job)
+	}
+
+	return executeExperimentPlanResponse{
+		Plan: plan,
+		Jobs: out,
+	}, nil
+}
+
+func configString(config map[string]any, key string) string {
+	value, _ := config[key].(string)
+	return value
+}
+
+func configInt(config map[string]any, key string) (int, bool) {
+	switch value := config[key].(type) {
+	case int:
+		return value, true
+	case int64:
+		return int(value), true
+	case float64:
+		return int(value), true
+	default:
+		return 0, false
+	}
+}
+
+func defaultExecuteExperimentPlanRequest() executeExperimentPlanRequest {
+	provider := os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER")
+	if provider == "" {
+		provider = "local"
+	}
+
+	return executeExperimentPlanRequest{
+		Provider: provider,
+		GPUType:  os.Getenv("MODEL_EXPRESS_DEFAULT_GPU_TYPE"),
+	}
 }
 
 func bindJSON(c *gin.Context, value any) bool {

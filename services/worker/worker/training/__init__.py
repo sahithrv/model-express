@@ -1,1 +1,1 @@
-"""Controlled training templates."""
+"""Training providers for experiment jobs."""

@@ -1,4 +1,5 @@
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
@@ -7,6 +8,7 @@ const AdmZip = require("adm-zip");
 const { CreateBucketCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 
 let mainWindow;
+const projectWorkers = new Map();
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -44,6 +46,15 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", () => {
+  for (const worker of projectWorkers.values()) {
+    if (worker.exitCode === null && !worker.killed) {
+      worker.kill();
+    }
+  }
+  projectWorkers.clear();
 });
 
 ipcMain.handle("orchestrator:request", async (_event, request) => {
@@ -110,6 +121,89 @@ ipcMain.handle("dataset:selectFolder", async () => {
 ipcMain.handle("dataset:uploadFolder", async (_event, options) => {
   return uploadDatasetFolder(options);
 });
+
+ipcMain.handle("worker:ensureProjectWorker", async (_event, options) => {
+  return ensureProjectWorker(options);
+});
+
+function ensureProjectWorker(options) {
+  const { projectId, baseUrl } = options;
+  if (!projectId) {
+    throw new Error("Project id is required before starting a worker.");
+  }
+  if (!baseUrl) {
+    throw new Error("Orchestrator URL is required before starting a worker.");
+  }
+
+  const existing = projectWorkers.get(projectId);
+  if (existing && existing.exitCode === null && !existing.killed) {
+    return {
+      project_id: projectId,
+      pid: existing.pid,
+      started: false,
+      status: "already_running",
+    };
+  }
+
+  const repoRoot = process.env.MODEL_EXPRESS_ROOT ?? path.resolve(__dirname, "..", "..", "..");
+  const workerDir = path.join(repoRoot, "services", "worker");
+  if (!fs.existsSync(workerDir)) {
+    throw new Error(`Worker directory does not exist: ${workerDir}`);
+  }
+
+  const python = process.env.MODEL_EXPRESS_PYTHON ?? (process.platform === "win32" ? "python" : "python3");
+  const workerName = options.name ?? `profile-worker-${projectId}`;
+  const child = spawn(python, ["-m", "worker.main"], {
+    cwd: workerDir,
+    env: {
+      ...process.env,
+      ORCHESTRATOR_URL: baseUrl,
+      PROJECT_ID: projectId,
+      WORKER_NAME: workerName,
+      GPU_TYPE: options.gpuType ?? "local",
+      PYTHONUNBUFFERED: "1",
+    },
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  projectWorkers.set(projectId, child);
+
+  child.stdout.on("data", (data) => {
+    console.log(`[worker:${projectId}] ${data.toString().trimEnd()}`);
+  });
+
+  child.stderr.on("data", (data) => {
+    console.error(`[worker:${projectId}] ${data.toString().trimEnd()}`);
+  });
+
+  child.on("exit", (code, signal) => {
+    const current = projectWorkers.get(projectId);
+    if (current === child) {
+      projectWorkers.delete(projectId);
+    }
+    console.log(`[worker:${projectId}] exited code=${code} signal=${signal}`);
+  });
+
+  child.on("error", (error) => {
+    const current = projectWorkers.get(projectId);
+    if (current === child) {
+      projectWorkers.delete(projectId);
+    }
+    console.error(`[worker:${projectId}] failed to start: ${error.message}`);
+  });
+
+  if (!child.pid) {
+    throw new Error("Worker process did not start.");
+  }
+
+  return {
+    project_id: projectId,
+    pid: child.pid,
+    started: true,
+    status: "started",
+  };
+}
 
 async function uploadDatasetFolder(options) {
   const { projectId, datasetPath } = options;

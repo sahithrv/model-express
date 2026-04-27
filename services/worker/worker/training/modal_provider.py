@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+import os
+from urllib.parse import urlparse
+
+from worker.orchestrator_client import OrchestratorClient
+
+
+def run_modal_training(client: OrchestratorClient, job: dict) -> None:
+    config = job["config"]
+    if config.get("gpu_type"):
+        os.environ["MODAL_GPU_TYPE"] = str(config["gpu_type"])
+
+    try:
+        from worker.training.modal_app import app, train_image_classifier
+    except ModuleNotFoundError as exc:
+        if exc.name == "modal":
+            raise RuntimeError(
+                "Modal is not installed. Install worker dependencies, then run `modal setup`."
+            ) from exc
+        raise
+
+    dataset = client.get_dataset(str(config["dataset_id"]))
+
+    orchestrator_url = os.getenv("MODAL_ORCHESTRATOR_URL", client.base_url)
+    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
+
+    _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
+    _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+
+    payload = {
+        "job": job,
+        "dataset": dataset,
+        "orchestrator_url": orchestrator_url,
+        "s3_endpoint_url": s3_endpoint_url,
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
+        "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    }
+
+    print(
+        "Submitting Modal training job "
+        f"{job['id']} model={config.get('model')} gpu={config.get('gpu_type') or os.getenv('MODAL_GPU_TYPE', 'T4')}"
+    )
+
+    with app.run():
+        result = train_image_classifier.remote(payload)
+
+    print(f"Modal training finished for {job['id']}: {result}")
+
+
+def _require_remote_reachable_url(name: str, value: str) -> None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{name} must be a full http(s) URL, got {value!r}")
+
+    host = parsed.hostname or ""
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError(
+            f"{name} points at {value!r}, but Modal cannot reach your local localhost. "
+            "Expose it with a tunnel and set the public URL before running Modal jobs."
+        )

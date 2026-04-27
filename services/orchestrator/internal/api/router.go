@@ -27,6 +27,10 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/projects/:id/jobs", server.createJob)
 	router.GET("/projects/:id/jobs", server.listProjectJobs)
 	router.GET("/projects/:id/workers", server.listProjectWorkers)
+	router.POST("/projects/:id/plans", server.createExperimentPlan)
+	router.GET("/projects/:id/plans", server.listProjectPlans)
+	router.GET("/plans/:id", server.listExperimentPlans)
+	router.POST("/plans/:id/execute", server.executeExperimentPlan)
 
 	router.GET("/datasets/:id", server.getDataset)
 	router.POST("/datasets/:id/profile", server.updateDatasetProfile)

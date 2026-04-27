@@ -44,6 +44,28 @@ export type Job = {
   completed_at?: string;
 };
 
+export type PlannedExperiment = {
+  template: string;
+  model: string;
+  epochs: number;
+  batch_size: number;
+  learning_rate: number;
+  reason: string;
+};
+
+export type ExperimentPlan = {
+  id: string;
+  project_id: string;
+  dataset_id: string;
+  status: string;
+  target_metric: string;
+  recommended_workers: number;
+  estimated_minutes: number;
+  experiments: PlannedExperiment[];
+  warnings: string[];
+  created_at: string;
+};
+
 export type EpochMetric = {
   job_id: string;
   epoch: number;

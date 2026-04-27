@@ -5,6 +5,7 @@ import {
   Box,
   BrainCircuit,
   CheckCircle2,
+  ClipboardList,
   Database,
   FolderOpen,
   HardDriveUpload,
@@ -17,7 +18,7 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
-import type { Dataset, EpochMetric, Health, Job, Project, Worker } from "./types";
+import type { Dataset, EpochMetric, ExperimentPlan, Health, Job, Project, Worker } from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
 const jobsPerPage = 10;
@@ -25,6 +26,7 @@ const jobsPerPage = 10;
 type ProjectDetail = {
   datasets: Dataset[];
   jobs: Job[];
+  plans: ExperimentPlan[];
   workers: Worker[];
 };
 
@@ -43,7 +45,7 @@ export function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>("");
-  const [detail, setDetail] = useState<ProjectDetail>({ datasets: [], jobs: [], workers: [] });
+  const [detail, setDetail] = useState<ProjectDetail>({ datasets: [], jobs: [], plans: [], workers: [] });
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -61,6 +63,8 @@ export function App() {
     () => detail.jobs.find((job) => job.id === selectedJobId) ?? null,
     [detail.jobs, selectedJobId],
   );
+
+  const latestPlan = detail.plans[0] ?? null;
 
   const firstDatasetId = detail.datasets[0]?.id ?? "";
   const jobPageCount = Math.max(1, Math.ceil(detail.jobs.length / jobsPerPage));
@@ -94,19 +98,21 @@ export function App() {
   const refreshProjectDetail = useCallback(
     async (projectId: string) => {
       if (!projectId) {
-        setDetail({ datasets: [], jobs: [], workers: [] });
+        setDetail({ datasets: [], jobs: [], plans: [], workers: [] });
         return;
       }
 
-      const [datasets, jobs, workers] = await Promise.all([
+      const [datasets, jobs, plans, workers] = await Promise.all([
         request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
         request<{ jobs: Job[] }>(`/projects/${projectId}/jobs`),
+        request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
       ]);
 
       setDetail({
         datasets: datasets.datasets,
         jobs: jobs.jobs,
+        plans: plans.plans,
         workers: workers.workers,
       });
 
@@ -201,8 +207,8 @@ export function App() {
     const name = String(formData.get("name") ?? "").trim();
     const goal = String(formData.get("goal") ?? "").trim();
 
-    if (!name || !goal || !newProjectFolder) {
-      setNotice({ kind: "error", text: "Project name, goal, and dataset folder are required." });
+    if (!name || !newProjectFolder) {
+      setNotice({ kind: "error", text: "Project name and dataset folder are required." });
       return;
     }
 
@@ -224,12 +230,25 @@ export function App() {
         body: metadata,
       });
 
+      let workerMessage = "Profiling worker started.";
+      try {
+        const workerProcess = await window.missionControl.ensureProjectWorker({
+          projectId: project.id,
+          baseUrl,
+          name: `profile-worker-${project.id}`,
+          gpuType: "local",
+        });
+        workerMessage = workerProcess.started ? "Profiling worker started." : "Profiling worker is already running.";
+      } catch (error) {
+        workerMessage = `Worker did not start: ${error instanceof Error ? error.message : String(error)}`;
+      }
+
       setSelectedProjectId(project.id);
       setNewProjectFolder(null);
       setNewProjectOpen(false);
       await refreshProjects();
       await refreshProjectDetail(project.id);
-      setNotice({ kind: "info", text: `Created ${project.name} with dataset ${metadata.name}` });
+      setNotice({ kind: "info", text: `Created ${project.name} with dataset ${metadata.name}. ${workerMessage}` });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -253,6 +272,26 @@ export function App() {
 
     setSelectedJobId(job.id);
     await refreshProjectDetail(selectedProjectId);
+  }
+
+  async function executePlan(planId: string) {
+    if (!selectedProjectId) return;
+
+    setLoading(true);
+    setNotice(null);
+    try {
+      const response = await request<{ jobs: Job[] }>(`/plans/${planId}/execute`, {
+        method: "POST",
+        body: { provider: "modal", gpu_type: "T4" },
+      });
+
+      await refreshProjectDetail(selectedProjectId);
+      setNotice({ kind: "info", text: `Plan execution ensured ${response.jobs.length} experiment jobs.` });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function handleSubmit(action: (formData: FormData) => Promise<void>, form: HTMLFormElement) {
@@ -334,6 +373,7 @@ export function App() {
         <section className="summary-grid">
           <MetricCard icon={<Box size={18} />} label="Datasets" value={detail.datasets.length} />
           <MetricCard icon={<Activity size={18} />} label="Jobs" value={detail.jobs.length} />
+          <MetricCard icon={<ClipboardList size={18} />} label="Plans" value={detail.plans.length} />
           <MetricCard icon={<MonitorDot size={18} />} label="Workers" value={detail.workers.length} />
           <MetricCard
             icon={<ListRestart size={18} />}
@@ -343,6 +383,73 @@ export function App() {
         </section>
 
         <section className="content-grid">
+          <Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide>
+            {latestPlan ? (
+              <div className="plan-card">
+                <div className="plan-actions">
+                  <span>
+                    <strong>{latestPlan.id}</strong>
+                    <small>{new Date(latestPlan.created_at).toLocaleString()}</small>
+                  </span>
+                  <button className="command" onClick={() => executePlan(latestPlan.id)} disabled={loading}>
+                    <Play size={16} />
+                    Execute Plan
+                  </button>
+                </div>
+                <div className="plan-overview">
+                  <div>
+                    <small>Status</small>
+                    <Badge value={latestPlan.status} />
+                  </div>
+                  <div>
+                    <small>Target Metric</small>
+                    <strong>{latestPlan.target_metric}</strong>
+                  </div>
+                  <div>
+                    <small>Workers</small>
+                    <strong>{latestPlan.recommended_workers}</strong>
+                  </div>
+                  <div>
+                    <small>Estimate</small>
+                    <strong>{latestPlan.estimated_minutes}m</strong>
+                  </div>
+                </div>
+                <div className="experiment-list">
+                  {latestPlan.experiments.map((experiment) => (
+                    <div className="experiment-item" key={`${latestPlan.id}-${experiment.template}-${experiment.model}`}>
+                      <span>
+                        <strong>{experiment.model}</strong>
+                        <small>{experiment.template}</small>
+                      </span>
+                      <span>
+                        <small>{experiment.epochs} epochs</small>
+                        <small>batch {experiment.batch_size}</small>
+                      </span>
+                      <span>
+                        <small>lr</small>
+                        <strong>{experiment.learning_rate}</strong>
+                      </span>
+                      <p>{experiment.reason}</p>
+                    </div>
+                  ))}
+                </div>
+                {latestPlan.warnings.length > 0 && (
+                  <div className="warning-list">
+                    {latestPlan.warnings.map((warning) => (
+                      <span key={warning}>{warning}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="empty">
+                {detail.datasets.some((dataset) => dataset.status === "PROFILED")
+                  ? "No experiment plan has been proposed yet."
+                  : "Waiting for the dataset profiling job to finish."}
+              </div>
+            )}
+          </Panel>
+
           <Panel title="Manual Job Queue" icon={<Play size={17} />} wide>
             <form
               className="job-create-grid"
@@ -499,7 +606,7 @@ export function App() {
               }}
             >
               <input name="name" placeholder="Project Name" required />
-              <input name="goal" placeholder="Goal" required />
+              <input name="goal" placeholder="Goal / extra context (optional)" />
               <button className="dataset-picker" type="button" onClick={chooseNewProjectFolder} disabled={loading}>
                 <FolderOpen size={18} />
                 <span>

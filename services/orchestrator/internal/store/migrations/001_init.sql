@@ -2,6 +2,7 @@ CREATE SEQUENCE IF NOT EXISTS project_id_seq;
 CREATE SEQUENCE IF NOT EXISTS dataset_id_seq;
 CREATE SEQUENCE IF NOT EXISTS worker_id_seq;
 CREATE SEQUENCE IF NOT EXISTS job_id_seq;
+CREATE SEQUENCE IF NOT EXISTS experiment_plan_id_seq;
 
 CREATE TABLE IF NOT EXISTS projects (
   id text PRIMARY KEY DEFAULT 'project_' || nextval('project_id_seq'),
@@ -37,6 +38,19 @@ CREATE TABLE IF NOT EXISTS datasets (
   profiled_at timestamptz
 );
 
+CREATE TABLE IF NOT EXISTS experiment_plans (
+  id text PRIMARY KEY DEFAULT 'plan_' || nextval('experiment_plan_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  dataset_id text NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+  status text NOT NULL,
+  target_metric text NOT NULL,
+  recommended_workers integer NOT NULL,
+  estimated_minutes integer NOT NULL,
+  experiments jsonb NOT NULL DEFAULT '[]'::jsonb,
+  warnings jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS experiment_jobs (
   id text PRIMARY KEY DEFAULT 'job_' || nextval('job_id_seq'),
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -64,3 +78,4 @@ CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_j
 CREATE INDEX IF NOT EXISTS idx_epoch_metrics_job_id ON epoch_metrics(job_id);
 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
 CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id);
+CREATE INDEX IF NOT EXISTS idx_experiment_plans_project_id ON experiment_plans(project_id);

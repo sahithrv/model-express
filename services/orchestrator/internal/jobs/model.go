@@ -12,6 +12,11 @@ const (
 	StatusFailed    = "FAILED"
 )
 
+const (
+	TemplateProfileDataset  = "profile_dataset"
+	TemplateTrainExperiment = "train_experiment"
+)
+
 type ExperimentJob struct {
 	ID          string         `json:"id"`
 	ProjectID   string         `json:"project_id"`
