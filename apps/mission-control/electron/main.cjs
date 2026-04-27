@@ -14,7 +14,7 @@ function createWindow() {
     height: 860,
     minWidth: 1120,
     minHeight: 720,
-    backgroundColor: "#f7f4ef",
+    backgroundColor: "#050807",
     title: "Model Express",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -84,7 +84,45 @@ ipcMain.handle("dataset:selectAndUpload", async (_event, options) => {
     return null;
   }
 
+  return uploadDatasetFolder({
+    ...options,
+    datasetPath: result.filePaths[0],
+  });
+});
+
+ipcMain.handle("dataset:selectFolder", async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Select image dataset folder",
+    properties: ["openDirectory"],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
   const datasetPath = result.filePaths[0];
+  return {
+    path: datasetPath,
+    name: path.basename(datasetPath),
+  };
+});
+
+ipcMain.handle("dataset:uploadFolder", async (_event, options) => {
+  return uploadDatasetFolder(options);
+});
+
+async function uploadDatasetFolder(options) {
+  const { projectId, datasetPath } = options;
+  if (!projectId) {
+    throw new Error("Project id is required before uploading a dataset.");
+  }
+  if (!datasetPath) {
+    throw new Error("Dataset folder path is required.");
+  }
+  if (!fs.existsSync(datasetPath) || !fs.statSync(datasetPath).isDirectory()) {
+    throw new Error(`Dataset folder does not exist: ${datasetPath}`);
+  }
+
   const datasetName = path.basename(datasetPath);
   const safeName = datasetName.replace(/[^a-zA-Z0-9._-]/g, "-");
   const tempDir = path.join(os.tmpdir(), "model-express");
@@ -139,7 +177,7 @@ ipcMain.handle("dataset:selectAndUpload", async (_event, options) => {
     checksum_sha256: checksum,
     size_bytes: sizeBytes,
   };
-});
+}
 
 function sha256File(filePath) {
   const hash = crypto.createHash("sha256");

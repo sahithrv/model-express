@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import {
   Activity,
   Box,
   BrainCircuit,
+  CheckCircle2,
   Database,
+  FolderOpen,
   HardDriveUpload,
   ListRestart,
   MonitorDot,
@@ -12,10 +15,12 @@ import {
   RefreshCcw,
   Server,
   SquareTerminal,
+  X,
 } from "lucide-react";
 import type { Dataset, EpochMetric, Health, Job, Project, Worker } from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
+const jobsPerPage = 10;
 
 type ProjectDetail = {
   datasets: Dataset[];
@@ -28,6 +33,11 @@ type Notice = {
   text: string;
 };
 
+type DatasetFolder = {
+  path: string;
+  name: string;
+};
+
 export function App() {
   const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
   const [health, setHealth] = useState<Health | null>(null);
@@ -38,6 +48,9 @@ export function App() {
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [loading, setLoading] = useState(false);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const [newProjectFolder, setNewProjectFolder] = useState<DatasetFolder | null>(null);
+  const [jobPage, setJobPage] = useState(0);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -48,7 +61,10 @@ export function App() {
     () => detail.jobs.find((job) => job.id === selectedJobId) ?? null,
     [detail.jobs, selectedJobId],
   );
+
   const firstDatasetId = detail.datasets[0]?.id ?? "";
+  const jobPageCount = Math.max(1, Math.ceil(detail.jobs.length / jobsPerPage));
+  const visibleJobs = detail.jobs.slice(jobPage * jobsPerPage, jobPage * jobsPerPage + jobsPerPage);
 
   const request = useCallback(
     async <T,>(path: string, options: { method?: string; body?: unknown } = {}) => {
@@ -94,12 +110,24 @@ export function App() {
         workers: workers.workers,
       });
 
-      if (!selectedJobId && jobs.jobs.length > 0) {
-        setSelectedJobId(jobs.jobs[0].id);
-      }
+      setSelectedJobId((currentJobId) => {
+        if (jobs.jobs.length === 0) return "";
+        if (jobs.jobs.some((job) => job.id === currentJobId)) return currentJobId;
+        return jobs.jobs[0].id;
+      });
     },
-    [request, selectedJobId],
+    [request],
   );
+
+  const refreshSelectedJobMetrics = useCallback(async () => {
+    if (!selectedJobId) {
+      setMetrics([]);
+      return;
+    }
+
+    const response = await request<{ metrics: EpochMetric[] }>(`/jobs/${selectedJobId}/metrics`);
+    setMetrics(response.metrics);
+  }, [request, selectedJobId]);
 
   const refreshAll = useCallback(async () => {
     setLoading(true);
@@ -110,12 +138,26 @@ export function App() {
       if (selectedProjectId) {
         await refreshProjectDetail(selectedProjectId);
       }
+      await refreshSelectedJobMetrics();
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
       setLoading(false);
     }
-  }, [refreshHealth, refreshProjectDetail, refreshProjects, selectedProjectId]);
+  }, [refreshHealth, refreshProjectDetail, refreshProjects, refreshSelectedJobMetrics, selectedProjectId]);
+
+  const refreshLive = useCallback(async () => {
+    try {
+      await refreshHealth();
+      await refreshProjects();
+      if (selectedProjectId) {
+        await refreshProjectDetail(selectedProjectId);
+      }
+      await refreshSelectedJobMetrics();
+    } catch {
+      setHealth(null);
+    }
+  }, [refreshHealth, refreshProjectDetail, refreshProjects, refreshSelectedJobMetrics, selectedProjectId]);
 
   useEffect(() => {
     localStorage.setItem("orchestratorUrl", baseUrl);
@@ -127,6 +169,7 @@ export function App() {
 
   useEffect(() => {
     if (selectedProjectId) {
+      setJobPage(0);
       refreshProjectDetail(selectedProjectId).catch((error) =>
         setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
       );
@@ -134,68 +177,59 @@ export function App() {
   }, [refreshProjectDetail, selectedProjectId]);
 
   useEffect(() => {
-    if (!selectedJobId) {
-      setMetrics([]);
-      return;
+    refreshSelectedJobMetrics().catch((error) =>
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
+    );
+  }, [refreshSelectedJobMetrics]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      refreshLive();
+    }, 2500);
+
+    return () => window.clearInterval(timer);
+  }, [refreshLive]);
+
+  async function chooseNewProjectFolder() {
+    const folder = await window.missionControl.selectDatasetFolder();
+    if (folder) {
+      setNewProjectFolder(folder);
     }
+  }
 
-    request<{ metrics: EpochMetric[] }>(`/jobs/${selectedJobId}/metrics`)
-      .then((response) => setMetrics(response.metrics))
-      .catch((error) =>
-        setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
-      );
-  }, [request, selectedJobId]);
-
-  async function createProject(formData: FormData) {
+  async function createProjectWithDataset(formData: FormData) {
     const name = String(formData.get("name") ?? "").trim();
     const goal = String(formData.get("goal") ?? "").trim();
-    if (!name || !goal) return;
 
-    const project = await request<Project>("/projects", {
-      method: "POST",
-      body: { name, goal },
-    });
-    setSelectedProjectId(project.id);
-    await refreshProjects();
-  }
-
-  async function createDataset(formData: FormData) {
-    if (!selectedProjectId) return;
-
-    await request<Dataset>(`/projects/${selectedProjectId}/datasets`, {
-      method: "POST",
-      body: {
-        name: String(formData.get("name") ?? "").trim(),
-        storage_uri: String(formData.get("storage_uri") ?? "").trim(),
-        checksum_sha256: String(formData.get("checksum_sha256") ?? "").trim(),
-        size_bytes: Number(formData.get("size_bytes") ?? 0),
-      },
-    });
-
-    await refreshProjectDetail(selectedProjectId);
-  }
-
-  async function uploadDatasetFolder() {
-    if (!selectedProjectId) return;
+    if (!name || !goal || !newProjectFolder) {
+      setNotice({ kind: "error", text: "Project name, goal, and dataset folder are required." });
+      return;
+    }
 
     setLoading(true);
     setNotice(null);
     try {
-      const metadata = await window.missionControl.selectAndUploadDataset({
-        projectId: selectedProjectId,
+      const project = await request<Project>("/projects", {
+        method: "POST",
+        body: { name, goal },
       });
-      if (!metadata) {
-        setNotice({ kind: "info", text: "Dataset upload cancelled" });
-        return;
-      }
 
-      await request<Dataset>(`/projects/${selectedProjectId}/datasets`, {
+      const metadata = await window.missionControl.uploadDatasetFolder({
+        projectId: project.id,
+        datasetPath: newProjectFolder.path,
+      });
+
+      await request<Dataset>(`/projects/${project.id}/datasets`, {
         method: "POST",
         body: metadata,
       });
 
-      await refreshProjectDetail(selectedProjectId);
-      setNotice({ kind: "info", text: `Uploaded ${metadata.name}` });
+      setSelectedProjectId(project.id);
+      setNewProjectFolder(null);
+      setNewProjectOpen(false);
+      await refreshProjects();
+      await refreshProjectDetail(project.id);
+      setNotice({ kind: "info", text: `Created ${project.name} with dataset ${metadata.name}` });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -212,7 +246,7 @@ export function App() {
     const job = await request<Job>(`/projects/${selectedProjectId}/jobs`, {
       method: "POST",
       body: {
-        template: String(formData.get("template") ?? "mobilenet_transfer"),
+        template: String(formData.get("template") ?? "profile_dataset"),
         config,
       },
     });
@@ -253,10 +287,15 @@ export function App() {
           <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
         </label>
 
-        <button className="command primary" onClick={refreshAll} disabled={loading}>
-          <RefreshCcw size={16} />
-          Refresh
-        </button>
+        <div className="sidebar-actions">
+          <button className="command primary" onClick={() => setNewProjectOpen(true)} disabled={loading}>
+            <Plus size={16} />
+            New Project
+          </button>
+          <button className="icon-command" onClick={refreshAll} disabled={loading} title="Refresh now">
+            <RefreshCcw size={16} />
+          </button>
+        </div>
 
         <section className="nav-section">
           <div className="section-title">
@@ -304,54 +343,9 @@ export function App() {
         </section>
 
         <section className="content-grid">
-          <Panel title="New Project" icon={<Plus size={17} />}>
+          <Panel title="Manual Job Queue" icon={<Play size={17} />} wide>
             <form
-              className="stack"
-              onSubmit={(event) => {
-                event.preventDefault();
-                handleSubmit(createProject, event.currentTarget);
-              }}
-            >
-              <input name="name" placeholder="Project name" />
-              <input name="goal" placeholder="Classifier goal" />
-              <button className="command" disabled={loading}>
-                <Plus size={16} />
-                Create
-              </button>
-            </form>
-          </Panel>
-
-          <Panel title="Register Dataset" icon={<HardDriveUpload size={17} />}>
-            <div className="stack">
-              <button className="command primary" onClick={uploadDatasetFolder} disabled={!selectedProjectId || loading}>
-                <HardDriveUpload size={16} />
-                Choose Folder & Upload
-              </button>
-              <div className="divider">Manual object registration</div>
-              <form
-                className="stack"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  handleSubmit(createDataset, event.currentTarget);
-                }}
-              >
-              <input name="name" placeholder="Dataset name" />
-              <input name="storage_uri" placeholder="s3://model-express/datasets/project_1/demo.zip" />
-              <div className="two-col">
-                <input name="checksum_sha256" placeholder="SHA256" />
-                <input name="size_bytes" placeholder="Size bytes" type="number" min="0" />
-              </div>
-              <button className="command" disabled={!selectedProjectId || loading}>
-                <HardDriveUpload size={16} />
-                Register
-              </button>
-              </form>
-            </div>
-          </Panel>
-
-          <Panel title="Create Job" icon={<Play size={17} />}>
-            <form
-              className="stack"
+              className="job-create-grid"
               onSubmit={(event) => {
                 event.preventDefault();
                 handleSubmit(createJob, event.currentTarget);
@@ -366,12 +360,8 @@ export function App() {
               <textarea
                 key={`${selectedProjectId}-${firstDatasetId}`}
                 name="config"
-                rows={5}
-                defaultValue={JSON.stringify(
-                  { dataset_id: firstDatasetId || "dataset_id_here" },
-                  null,
-                  2,
-                )}
+                rows={4}
+                defaultValue={JSON.stringify({ dataset_id: firstDatasetId || "dataset_id_here" }, null, 2)}
               />
               <button className="command" disabled={!selectedProjectId || detail.datasets.length === 0 || loading}>
                 <Play size={16} />
@@ -402,24 +392,6 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Jobs" icon={<SquareTerminal size={17} />} wide>
-            <div className="job-list">
-              {detail.jobs.map((job) => (
-                <button
-                  key={job.id}
-                  className={job.id === selectedJobId ? "job active" : "job"}
-                  onClick={() => setSelectedJobId(job.id)}
-                >
-                  <span>
-                    <strong>{job.template}</strong>
-                    <small>{job.id}</small>
-                  </span>
-                  <Badge value={job.status} />
-                </button>
-              ))}
-            </div>
-          </Panel>
-
           <Panel title="Datasets" icon={<Database size={17} />} wide>
             <div className="table">
               <div className="table-row table-head">
@@ -442,24 +414,63 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Metric Stream" icon={<Activity size={17} />} wide>
+          <Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide>
+            <div className="job-panel-head">
+              <span>
+                Showing {visibleJobs.length} of {detail.jobs.length}
+              </span>
+              <div className="pager">
+                <button
+                  className="icon-command"
+                  onClick={() => setJobPage((page) => Math.max(0, page - 1))}
+                  disabled={jobPage === 0}
+                >
+                  Prev
+                </button>
+                <small>
+                  {jobPage + 1} / {jobPageCount}
+                </small>
+                <button
+                  className="icon-command"
+                  onClick={() => setJobPage((page) => Math.min(jobPageCount - 1, page + 1))}
+                  disabled={jobPage >= jobPageCount - 1}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+            <div className="job-list paged">
+              {visibleJobs.map((job) => (
+                <button
+                  key={job.id}
+                  className={job.id === selectedJobId ? "job active" : "job"}
+                  onClick={() => setSelectedJobId(job.id)}
+                >
+                  <span>
+                    <strong>{job.template}</strong>
+                    <small>{job.id}</small>
+                  </span>
+                  <span>
+                    <small>{job.worker_id || "unassigned"}</small>
+                    <small>{new Date(job.created_at).toLocaleTimeString()}</small>
+                  </span>
+                  <Badge value={job.status} />
+                </button>
+              ))}
+            </div>
+          </Panel>
+
+          <Panel title="Run Metrics" icon={<Activity size={17} />} wide>
             {selectedJob ? (
               <div className="metric-area">
                 <div className="selected-job">
-                  <strong>{selectedJob.id}</strong>
+                  <span>
+                    <strong>{selectedJob.template}</strong>
+                    <small>{selectedJob.id}</small>
+                  </span>
                   <Badge value={selectedJob.status} />
                 </div>
-                <div className="metric-bars">
-                  {metrics.map((metric) => (
-                    <div className="metric-bar" key={`${metric.job_id}-${metric.epoch}`}>
-                      <span>Epoch {metric.epoch}</span>
-                      <div>
-                        <i style={{ width: `${Math.min((metric.metrics.macro_f1 ?? 0) * 100, 100)}%` }} />
-                      </div>
-                      <b>{metric.metrics.macro_f1?.toFixed(3) ?? "-"}</b>
-                    </div>
-                  ))}
-                </div>
+                <MetricChart metrics={metrics} />
               </div>
             ) : (
               <div className="empty">No job selected</div>
@@ -467,6 +478,44 @@ export function App() {
           </Panel>
         </section>
       </section>
+
+      {newProjectOpen && (
+        <div className="modal-backdrop">
+          <section className="modal">
+            <header>
+              <div>
+                <div className="eyebrow">New Project</div>
+                <h3>Project Dataset Setup</h3>
+              </div>
+              <button className="icon-command" onClick={() => setNewProjectOpen(false)} disabled={loading}>
+                <X size={16} />
+              </button>
+            </header>
+            <form
+              className="stack"
+              onSubmit={(event) => {
+                event.preventDefault();
+                createProjectWithDataset(new FormData(event.currentTarget));
+              }}
+            >
+              <input name="name" placeholder="Project Name" required />
+              <input name="goal" placeholder="Goal" required />
+              <button className="dataset-picker" type="button" onClick={chooseNewProjectFolder} disabled={loading}>
+                <FolderOpen size={18} />
+                <span>
+                  <strong>{newProjectFolder ? newProjectFolder.name : "Choose Folder & Upload"}</strong>
+                  <small>{newProjectFolder ? newProjectFolder.path : "Required image dataset folder"}</small>
+                </span>
+                {newProjectFolder && <CheckCircle2 size={18} />}
+              </button>
+              <button className="command primary" disabled={!newProjectFolder || loading}>
+                <HardDriveUpload size={16} />
+                Create Project
+              </button>
+            </form>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -478,9 +527,9 @@ function Panel({
   children,
 }: {
   title: string;
-  icon: React.ReactNode;
+  icon: ReactNode;
   wide?: boolean;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <section className={wide ? "panel wide" : "panel"}>
@@ -493,7 +542,7 @@ function Panel({
   );
 }
 
-function MetricCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
+function MetricCard({ icon, label, value }: { icon: ReactNode; label: string; value: number }) {
   return (
     <div className="metric-card">
       <span>{icon}</span>
@@ -507,6 +556,70 @@ function MetricCard({ icon, label, value }: { icon: React.ReactNode; label: stri
 
 function Badge({ value }: { value: string }) {
   return <span className={`badge ${value.toLowerCase()}`}>{value}</span>;
+}
+
+function MetricChart({ metrics }: { metrics: EpochMetric[] }) {
+  if (metrics.length === 0) {
+    return <div className="empty chart-empty">No metrics reported</div>;
+  }
+
+  const values = metrics.map((metric) => metric.metrics.macro_f1 ?? 0);
+  const maxValue = Math.max(...values, 1);
+  const minValue = Math.min(...values, 0);
+  const range = Math.max(maxValue - minValue, 0.001);
+
+  const width = 760;
+  const height = 240;
+  const padding = 28;
+  const points = values.map((value, index) => {
+    const x =
+      metrics.length === 1
+        ? width / 2
+        : padding + (index / (metrics.length - 1)) * (width - padding * 2);
+    const y = height - padding - ((value - minValue) / range) * (height - padding * 2);
+    return { x, y, value, epoch: metrics[index].epoch };
+  });
+
+  const linePath = points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    .join(" ");
+
+  const fillPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${height - padding} L ${points[0].x.toFixed(
+    2,
+  )} ${height - padding} Z`;
+
+  const latest = points[points.length - 1];
+
+  return (
+    <div className="chart-wrap">
+      <div className="chart-stat">
+        <span>macro_f1</span>
+        <strong>{latest.value.toFixed(3)}</strong>
+      </div>
+      <svg className="metric-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="macro F1 chart">
+        <defs>
+          <linearGradient id="metric-fill" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#00d47e" stopOpacity="0.28" />
+            <stop offset="100%" stopColor="#00d47e" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {[0, 1, 2, 3].map((line) => {
+          const y = padding + (line / 3) * (height - padding * 2);
+          return <line key={line} className="chart-grid" x1={padding} x2={width - padding} y1={y} y2={y} />;
+        })}
+        <path className="chart-fill" d={fillPath} />
+        <path className="chart-line" d={linePath} />
+        {points.map((point) => (
+          <g key={point.epoch}>
+            <circle className="chart-dot" cx={point.x} cy={point.y} r="4" />
+            <text className="chart-label" x={point.x} y={height - 7} textAnchor="middle">
+              {point.epoch}
+            </text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
 }
 
 function formatBytes(value: number) {
