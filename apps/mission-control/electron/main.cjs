@@ -1,5 +1,10 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const crypto = require("crypto");
+const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const AdmZip = require("adm-zip");
+const { CreateBucketCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 
 let mainWindow;
 
@@ -63,3 +68,82 @@ ipcMain.handle("orchestrator:request", async (_event, request) => {
 
   return payload;
 });
+
+ipcMain.handle("dataset:selectAndUpload", async (_event, options) => {
+  const { projectId } = options;
+  if (!projectId) {
+    throw new Error("Select a project before uploading a dataset.");
+  }
+
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Select image dataset folder",
+    properties: ["openDirectory"],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  const datasetPath = result.filePaths[0];
+  const datasetName = path.basename(datasetPath);
+  const safeName = datasetName.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const tempDir = path.join(os.tmpdir(), "model-express");
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  const archivePath = path.join(tempDir, `${safeName}-${Date.now()}.zip`);
+  const zip = new AdmZip();
+  zip.addLocalFolder(datasetPath);
+  zip.writeZip(archivePath);
+
+  const checksum = sha256File(archivePath);
+  const sizeBytes = fs.statSync(archivePath).size;
+
+  const bucket = options.bucket ?? "model-express";
+  const endpoint = options.endpoint ?? "http://localhost:9000";
+  const accessKeyId = options.accessKeyId ?? "model_express";
+  const secretAccessKey = options.secretAccessKey ?? "model_express_password";
+  const region = options.region ?? "us-east-1";
+  const key = `datasets/${projectId}/${safeName}.zip`;
+
+  const client = new S3Client({
+    endpoint,
+    region,
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+    },
+  });
+
+  try {
+    await client.send(new HeadBucketCommand({ Bucket: bucket }));
+  } catch (_error) {
+    await client.send(new CreateBucketCommand({ Bucket: bucket }));
+  }
+
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: fs.createReadStream(archivePath),
+      ContentType: "application/zip",
+      Metadata: {
+        "checksum-sha256": checksum,
+      },
+    }),
+  );
+
+  return {
+    name: datasetName,
+    storage_uri: `s3://${bucket}/${key}`,
+    checksum_sha256: checksum,
+    size_bytes: sizeBytes,
+  };
+});
+
+function sha256File(filePath) {
+  const hash = crypto.createHash("sha256");
+  const buffer = fs.readFileSync(filePath);
+  hash.update(buffer);
+  return hash.digest("hex");
+}

@@ -153,6 +153,9 @@ func (s *MemoryStore) RegisterWorker(projectID string, name string, gpuType stri
 	if _, ok := s.projects[projectID]; !ok {
 		return workers.Worker{}, ErrNotFound
 	}
+	if !s.projectHasDataset(projectID) {
+		return workers.Worker{}, fmt.Errorf("%w: project must have a dataset before workers or jobs can be created", ErrInvalidRequest)
+	}
 
 	worker := workers.Worker{
 		ID:            s.newID("worker"),
@@ -272,6 +275,9 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 
 	if _, ok := s.projects[projectID]; !ok {
 		return jobs.ExperimentJob{}, ErrNotFound
+	}
+	if err := s.requireDatasetConfig(projectID, config); err != nil {
+		return jobs.ExperimentJob{}, err
 	}
 
 	job := jobs.ExperimentJob{
@@ -393,4 +399,33 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 func (s *MemoryStore) newID(prefix string) string {
 	s.nextID++
 	return fmt.Sprintf("%s_%d", prefix, s.nextID)
+}
+
+func (s *MemoryStore) projectHasDataset(projectID string) bool {
+	for _, dataset := range s.datasets {
+		if dataset.ProjectID == projectID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *MemoryStore) requireDatasetConfig(projectID string, config map[string]any) error {
+	value, ok := config["dataset_id"]
+	if !ok {
+		return fmt.Errorf("%w: job config must include dataset_id", ErrInvalidRequest)
+	}
+
+	datasetID, ok := value.(string)
+	if !ok || datasetID == "" {
+		return fmt.Errorf("%w: dataset_id must be a non-empty string", ErrInvalidRequest)
+	}
+
+	dataset, ok := s.datasets[datasetID]
+	if !ok || dataset.ProjectID != projectID {
+		return fmt.Errorf("%w: dataset_id does not belong to this project", ErrInvalidRequest)
+	}
+
+	return nil
 }

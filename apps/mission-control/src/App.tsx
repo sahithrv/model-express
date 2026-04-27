@@ -48,6 +48,7 @@ export function App() {
     () => detail.jobs.find((job) => job.id === selectedJobId) ?? null,
     [detail.jobs, selectedJobId],
   );
+  const firstDatasetId = detail.datasets[0]?.id ?? "";
 
   const request = useCallback(
     async <T,>(path: string, options: { method?: string; body?: unknown } = {}) => {
@@ -174,6 +175,34 @@ export function App() {
     await refreshProjectDetail(selectedProjectId);
   }
 
+  async function uploadDatasetFolder() {
+    if (!selectedProjectId) return;
+
+    setLoading(true);
+    setNotice(null);
+    try {
+      const metadata = await window.missionControl.selectAndUploadDataset({
+        projectId: selectedProjectId,
+      });
+      if (!metadata) {
+        setNotice({ kind: "info", text: "Dataset upload cancelled" });
+        return;
+      }
+
+      await request<Dataset>(`/projects/${selectedProjectId}/datasets`, {
+        method: "POST",
+        body: metadata,
+      });
+
+      await refreshProjectDetail(selectedProjectId);
+      setNotice({ kind: "info", text: `Uploaded ${metadata.name}` });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function createJob(formData: FormData) {
     if (!selectedProjectId) return;
 
@@ -293,13 +322,19 @@ export function App() {
           </Panel>
 
           <Panel title="Register Dataset" icon={<HardDriveUpload size={17} />}>
-            <form
-              className="stack"
-              onSubmit={(event) => {
-                event.preventDefault();
-                handleSubmit(createDataset, event.currentTarget);
-              }}
-            >
+            <div className="stack">
+              <button className="command primary" onClick={uploadDatasetFolder} disabled={!selectedProjectId || loading}>
+                <HardDriveUpload size={16} />
+                Choose Folder & Upload
+              </button>
+              <div className="divider">Manual object registration</div>
+              <form
+                className="stack"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  handleSubmit(createDataset, event.currentTarget);
+                }}
+              >
               <input name="name" placeholder="Dataset name" />
               <input name="storage_uri" placeholder="s3://model-express/datasets/project_1/demo.zip" />
               <div className="two-col">
@@ -310,7 +345,8 @@ export function App() {
                 <HardDriveUpload size={16} />
                 Register
               </button>
-            </form>
+              </form>
+            </div>
           </Panel>
 
           <Panel title="Create Job" icon={<Play size={17} />}>
@@ -321,21 +357,23 @@ export function App() {
                 handleSubmit(createJob, event.currentTarget);
               }}
             >
-              <select name="template" defaultValue="mobilenet_transfer">
+              <select name="template" defaultValue="profile_dataset">
+                <option value="profile_dataset">profile_dataset</option>
                 <option value="mobilenet_transfer">mobilenet_transfer</option>
                 <option value="simple_cnn">simple_cnn</option>
                 <option value="resnet_transfer">resnet_transfer</option>
               </select>
               <textarea
+                key={`${selectedProjectId}-${firstDatasetId}`}
                 name="config"
                 rows={5}
                 defaultValue={JSON.stringify(
-                  { image_size: 224, epochs: 3, learning_rate: 0.0003 },
+                  { dataset_id: firstDatasetId || "dataset_id_here" },
                   null,
                   2,
                 )}
               />
-              <button className="command" disabled={!selectedProjectId || loading}>
+              <button className="command" disabled={!selectedProjectId || detail.datasets.length === 0 || loading}>
                 <Play size={16} />
                 Queue
               </button>

@@ -345,6 +345,24 @@ button {
   gap: 10px;
 }
 
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #7c817d;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: #e2dbcf;
+}
+
 .two-col {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 130px;

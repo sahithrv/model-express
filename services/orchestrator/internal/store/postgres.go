@@ -215,6 +215,9 @@ func (s *PostgresStore) RegisterWorker(projectID string, name string, gpuType st
 	if err := s.requireProject(projectID); err != nil {
 		return workers.Worker{}, err
 	}
+	if err := s.requireProjectDataset(projectID); err != nil {
+		return workers.Worker{}, err
+	}
 
 	const query = `
 		INSERT INTO workers (project_id, name, status, gpu_type)
@@ -410,6 +413,9 @@ func (s *PostgresStore) CreateJob(projectID string, template string, config map[
 	if err := s.requireProject(projectID); err != nil {
 		return jobs.ExperimentJob{}, err
 	}
+	if err := s.requireDatasetConfig(projectID, config); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
 
 	configJSON, err := json.Marshal(config)
 	if err != nil {
@@ -598,6 +604,46 @@ func (s *PostgresStore) requireProject(projectID string) error {
 
 	if !exists {
 		return ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *PostgresStore) requireProjectDataset(projectID string) error {
+	var exists bool
+	if err := s.db.QueryRowContext(context.Background(), `
+		SELECT EXISTS(SELECT 1 FROM datasets WHERE project_id = $1)
+	`, projectID).Scan(&exists); err != nil {
+		return err
+	}
+
+	if !exists {
+		return fmt.Errorf("%w: project must have a dataset before workers or jobs can be created", ErrInvalidRequest)
+	}
+
+	return nil
+}
+
+func (s *PostgresStore) requireDatasetConfig(projectID string, config map[string]any) error {
+	value, ok := config["dataset_id"]
+	if !ok {
+		return fmt.Errorf("%w: job config must include dataset_id", ErrInvalidRequest)
+	}
+
+	datasetID, ok := value.(string)
+	if !ok || datasetID == "" {
+		return fmt.Errorf("%w: dataset_id must be a non-empty string", ErrInvalidRequest)
+	}
+
+	var exists bool
+	if err := s.db.QueryRowContext(context.Background(), `
+		SELECT EXISTS(SELECT 1 FROM datasets WHERE id = $1 AND project_id = $2)
+	`, datasetID, projectID).Scan(&exists); err != nil {
+		return err
+	}
+
+	if !exists {
+		return fmt.Errorf("%w: dataset_id does not belong to this project", ErrInvalidRequest)
 	}
 
 	return nil
