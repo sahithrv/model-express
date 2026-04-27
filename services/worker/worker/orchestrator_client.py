@@ -62,6 +62,16 @@ class OrchestratorClient:
         return response.json()
 
 
+    def report_training_run_summary(self, job_id: str, summary: dict) -> dict:
+        response = requests.post(
+            f"{self.base_url}/jobs/{job_id}/training-run-summary",
+            json=summary,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
     def complete_job(self, job_id: str, mlflow_run_id: str = "") -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/complete",

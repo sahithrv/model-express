@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,6 +13,7 @@ import (
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
 
@@ -68,6 +70,8 @@ type reportMetricRequest struct {
 	Epoch   int                `json:"epoch" binding:"required"`
 	Metrics map[string]float64 `json:"metrics" binding:"required"`
 }
+
+type reportTrainingRunSummaryRequest = runs.TrainingRunSummaryUpdate
 
 type completeJobRequest struct {
 	MLflowRunID string `json:"mlflow_run_id"`
@@ -256,6 +260,41 @@ func (s *Server) listJobMetrics(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"metrics": metrics})
 }
 
+func (s *Server) upsertTrainingRunSummary(c *gin.Context) {
+	var req reportTrainingRunSummaryRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	summary, err := s.store.UpsertTrainingRunSummary(c.Param("id"), req)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, summary)
+}
+
+func (s *Server) getTrainingRunSummary(c *gin.Context) {
+	summary, err := s.store.GetTrainingRunSummary(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, summary)
+}
+
+func (s *Server) listProjectTrainingRunSummaries(c *gin.Context) {
+	summaries, err := s.store.ListProjectTrainingRunSummaries(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"summaries": summaries})
+}
+
 func (s *Server) completeJob(c *gin.Context) {
 	var req completeJobRequest
 	if !bindJSON(c, &req) {
@@ -266,6 +305,15 @@ func (s *Server) completeJob(c *gin.Context) {
 	if err != nil {
 		writeStoreError(c, err)
 		return
+	}
+
+	if job.Template == jobs.TemplateTrainExperiment {
+		if _, err := s.store.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
+			Status: jobs.StatusSucceeded,
+		}); err != nil {
+			writeStoreError(c, err)
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, job)
@@ -281,6 +329,15 @@ func (s *Server) failJob(c *gin.Context) {
 	if err != nil {
 		writeStoreError(c, err)
 		return
+	}
+
+	if job.Template == jobs.TemplateTrainExperiment {
+		if _, err := s.store.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
+			Status: jobs.StatusFailed,
+		}); err != nil {
+			writeStoreError(c, err)
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, job)
@@ -492,9 +549,12 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 		return err
 	}
 
-	_, err = s.executeStoredExperimentPlan(plan.ID, defaultExecuteExperimentPlanRequest())
+	if shouldAutoExecuteExperimentPlans() {
+		_, err = s.executeStoredExperimentPlan(plan.ID, defaultExecuteExperimentPlanRequest())
+		return err
+	}
 
-	return err
+	return nil
 }
 
 func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimentPlanRequest) (executeExperimentPlanResponse, error) {
@@ -520,6 +580,9 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	jobsByExperiment := map[int]jobs.ExperimentJob{}
 	for _, job := range existingJobs {
 		if job.Template != jobs.TemplateTrainExperiment {
+			continue
+		}
+		if job.Status == jobs.StatusFailed {
 			continue
 		}
 		if configString(job.Config, "plan_id") != plan.ID {
@@ -603,6 +666,18 @@ func defaultExecuteExperimentPlanRequest() executeExperimentPlanRequest {
 		Provider: provider,
 		GPUType:  os.Getenv("MODEL_EXPRESS_DEFAULT_GPU_TYPE"),
 	}
+}
+
+func shouldAutoExecuteExperimentPlans() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS")))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+
+	return os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER") != ""
 }
 
 func bindJSON(c *gin.Context, value any) bool {

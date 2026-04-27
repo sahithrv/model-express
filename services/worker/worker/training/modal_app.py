@@ -30,12 +30,14 @@ app = modal.App(APP_NAME)
 @app.function(image=image, gpu=DEFAULT_GPU, timeout=60 * 60)
 def train_image_classifier(payload: dict) -> dict:
     import requests
+    import time
     import torch
     from torch import nn
 
     from worker.datasets.cache import dataset_archive_path, extract_dataset_archive
     from worker.datasets.storage import download_s3_uri
 
+    started_at = time.time()
     job = payload["job"]
     config = job["config"]
     dataset = payload["dataset"]
@@ -49,6 +51,8 @@ def train_image_classifier(payload: dict) -> dict:
     batch_size = _positive_int(config.get("batch_size"), default=16)
     learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
     model_name = str(config.get("model", "mobilenet_v3_small"))
+    gpu_type = str(config.get("gpu_type") or os.getenv("MODAL_GPU_TYPE", "T4"))
+    modal_function_call_id, modal_input_id = _modal_identifiers()
 
     archive_path = dataset_archive_path(dataset_id)
     download_s3_uri(dataset["storage_uri"], archive_path)
@@ -72,6 +76,8 @@ def train_image_classifier(payload: dict) -> dict:
         val_loss, accuracy, macro_f1 = _evaluate(model, val_loader, criterion, device)
         best_macro_f1 = max(best_macro_f1, macro_f1)
         best_accuracy = max(best_accuracy, accuracy)
+        runtime_seconds = time.time() - started_at
+        estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
 
         _post_json(
             f"{orchestrator_url}/jobs/{job_id}/metrics",
@@ -88,6 +94,47 @@ def train_image_classifier(payload: dict) -> dict:
                 },
             },
         )
+        _post_training_run_summary(
+            orchestrator_url,
+            job_id,
+            {
+                "model": model_name,
+                "provider": "modal",
+                "gpu_type": gpu_type,
+                "status": "RUNNING",
+                "runtime_seconds": round(runtime_seconds, 3),
+                "estimated_cost_usd": round(estimated_cost_usd, 6),
+                "best_macro_f1": round(best_macro_f1, 6),
+                "best_accuracy": round(best_accuracy, 6),
+                "final_train_loss": round(train_loss, 6),
+                "final_val_loss": round(val_loss, 6),
+                "epochs_completed": epoch,
+                "modal_function_call_id": modal_function_call_id,
+                "modal_input_id": modal_input_id,
+            },
+        )
+
+    runtime_seconds = time.time() - started_at
+    estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
+    _post_training_run_summary(
+        orchestrator_url,
+        job_id,
+        {
+            "model": model_name,
+            "provider": "modal",
+            "gpu_type": gpu_type,
+            "status": "SUCCEEDED",
+            "runtime_seconds": round(runtime_seconds, 3),
+            "estimated_cost_usd": round(estimated_cost_usd, 6),
+            "best_macro_f1": round(best_macro_f1, 6),
+            "best_accuracy": round(best_accuracy, 6),
+            "final_train_loss": round(train_loss, 6),
+            "final_val_loss": round(val_loss, 6),
+            "epochs_completed": epochs,
+            "modal_function_call_id": modal_function_call_id,
+            "modal_input_id": modal_input_id,
+        },
+    )
 
     _post_json(
         f"{orchestrator_url}/jobs/{job_id}/complete",
@@ -100,6 +147,8 @@ def train_image_classifier(payload: dict) -> dict:
         "classes": class_names,
         "best_accuracy": best_accuracy,
         "best_macro_f1": best_macro_f1,
+        "estimated_cost_usd": estimated_cost_usd,
+        "runtime_seconds": runtime_seconds,
         "device": str(device),
     }
 
@@ -205,6 +254,7 @@ def _train_one_epoch(model, loader, criterion, optimizer, device) -> float:
 
 
 def _evaluate(model, loader, criterion, device) -> tuple[float, float, float]:
+    import torch
     from sklearn.metrics import f1_score
 
     model.eval()
@@ -239,6 +289,37 @@ def _post_json(url: str, payload: dict) -> None:
 
     response = requests.post(url, json=payload, timeout=30)
     response.raise_for_status()
+
+
+def _post_training_run_summary(orchestrator_url: str, job_id: str, payload: dict) -> None:
+    _post_json(f"{orchestrator_url}/jobs/{job_id}/training-run-summary", payload)
+
+
+def _modal_gpu_price_per_second(gpu_type: str) -> float:
+    base_type = gpu_type.split(":", 1)[0].upper()
+    prices = {
+        "T4": 0.000164,
+        "L4": 0.000222,
+        "A10": 0.000306,
+        "L40S": 0.000542,
+        "A100": 0.000583,
+        "A100-40GB": 0.000583,
+        "A100-80GB": 0.000694,
+        "RTX-PRO-6000": 0.000842,
+        "H100": 0.001097,
+        "H200": 0.001261,
+        "B200": 0.001736,
+    }
+    return prices.get(base_type, prices["T4"])
+
+
+def _modal_identifiers() -> tuple[str, str]:
+    try:
+        import modal
+
+        return modal.current_function_call_id() or "", modal.current_input_id() or ""
+    except Exception:
+        return "", ""
 
 
 def _positive_int(value: object, default: int) -> int:

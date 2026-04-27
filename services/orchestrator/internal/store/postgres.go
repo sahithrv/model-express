@@ -15,6 +15,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -552,6 +553,131 @@ func (s *PostgresStore) ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error) {
+	job, err := s.GetJob(jobID)
+	if err != nil {
+		return runs.TrainingRunSummary{}, err
+	}
+
+	now := time.Now().UTC()
+	summary, err := s.GetTrainingRunSummary(jobID)
+	if errors.Is(err, ErrNotFound) {
+		summary = newPostgresTrainingRunSummaryFromJob(job, now)
+	} else if err != nil {
+		return runs.TrainingRunSummary{}, err
+	}
+
+	applyPostgresTrainingRunSummaryUpdate(&summary, update, now)
+
+	const query = `
+		INSERT INTO training_run_summaries (
+			job_id,
+			project_id,
+			plan_id,
+			dataset_id,
+			model,
+			provider,
+			gpu_type,
+			status,
+			runtime_seconds,
+			estimated_cost_usd,
+			best_macro_f1,
+			best_accuracy,
+			final_train_loss,
+			final_val_loss,
+			epochs_completed,
+			modal_function_call_id,
+			modal_input_id,
+			created_at,
+			updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		ON CONFLICT (job_id) DO UPDATE SET
+			project_id = EXCLUDED.project_id,
+			plan_id = EXCLUDED.plan_id,
+			dataset_id = EXCLUDED.dataset_id,
+			model = EXCLUDED.model,
+			provider = EXCLUDED.provider,
+			gpu_type = EXCLUDED.gpu_type,
+			status = EXCLUDED.status,
+			runtime_seconds = EXCLUDED.runtime_seconds,
+			estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+			best_macro_f1 = EXCLUDED.best_macro_f1,
+			best_accuracy = EXCLUDED.best_accuracy,
+			final_train_loss = EXCLUDED.final_train_loss,
+			final_val_loss = EXCLUDED.final_val_loss,
+			epochs_completed = EXCLUDED.epochs_completed,
+			modal_function_call_id = EXCLUDED.modal_function_call_id,
+			modal_input_id = EXCLUDED.modal_input_id,
+			updated_at = EXCLUDED.updated_at
+		RETURNING job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, created_at, updated_at
+	`
+
+	return scanTrainingRunSummary(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		summary.JobID,
+		summary.ProjectID,
+		summary.PlanID,
+		summary.DatasetID,
+		summary.Model,
+		summary.Provider,
+		summary.GPUType,
+		summary.Status,
+		summary.RuntimeSeconds,
+		summary.EstimatedCostUSD,
+		summary.BestMacroF1,
+		summary.BestAccuracy,
+		summary.FinalTrainLoss,
+		summary.FinalValLoss,
+		summary.EpochsCompleted,
+		summary.ModalFunctionCallID,
+		summary.ModalInputID,
+		summary.CreatedAt,
+		summary.UpdatedAt,
+	))
+}
+
+func (s *PostgresStore) GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error) {
+	const query = `
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, created_at, updated_at
+		FROM training_run_summaries
+		WHERE job_id = $1
+	`
+
+	return scanTrainingRunSummary(s.db.QueryRowContext(context.Background(), query, jobID))
+}
+
+func (s *PostgresStore) ListProjectTrainingRunSummaries(projectID string) ([]runs.TrainingRunSummary, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+
+	const query = `
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, created_at, updated_at
+		FROM training_run_summaries
+		WHERE project_id = $1
+		ORDER BY updated_at DESC
+	`
+
+	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []runs.TrainingRunSummary{}
+	for rows.Next() {
+		summary, err := scanTrainingRunSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, summary)
+	}
+
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return plans.ExperimentPlan{}, err
@@ -884,6 +1010,35 @@ func scanMetric(row rowScanner) (jobs.EpochMetric, error) {
 	return metric, nil
 }
 
+func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
+	var summary runs.TrainingRunSummary
+	if err := row.Scan(
+		&summary.JobID,
+		&summary.ProjectID,
+		&summary.PlanID,
+		&summary.DatasetID,
+		&summary.Model,
+		&summary.Provider,
+		&summary.GPUType,
+		&summary.Status,
+		&summary.RuntimeSeconds,
+		&summary.EstimatedCostUSD,
+		&summary.BestMacroF1,
+		&summary.BestAccuracy,
+		&summary.FinalTrainLoss,
+		&summary.FinalValLoss,
+		&summary.EpochsCompleted,
+		&summary.ModalFunctionCallID,
+		&summary.ModalInputID,
+		&summary.CreatedAt,
+		&summary.UpdatedAt,
+	); err != nil {
+		return runs.TrainingRunSummary{}, normalizeSQLError(err)
+	}
+
+	return summary, nil
+}
+
 func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
 	var plan plans.ExperimentPlan
 	var experimentsJSON []byte
@@ -941,4 +1096,73 @@ func selectJobSQL(column string) string {
 		FROM experiment_jobs
 		WHERE %s = $1
 	`, column)
+}
+
+func newPostgresTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.TrainingRunSummary {
+	provider := postgresConfigString(job.Config, "provider")
+	if provider == "" {
+		provider = "local"
+	}
+
+	return runs.TrainingRunSummary{
+		JobID:     job.ID,
+		ProjectID: job.ProjectID,
+		PlanID:    postgresConfigString(job.Config, "plan_id"),
+		DatasetID: postgresConfigString(job.Config, "dataset_id"),
+		Model:     postgresConfigString(job.Config, "model"),
+		Provider:  provider,
+		GPUType:   postgresConfigString(job.Config, "gpu_type"),
+		Status:    job.Status,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func applyPostgresTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, update runs.TrainingRunSummaryUpdate, now time.Time) {
+	if update.Model != "" {
+		summary.Model = update.Model
+	}
+	if update.Provider != "" {
+		summary.Provider = update.Provider
+	}
+	if update.GPUType != "" {
+		summary.GPUType = update.GPUType
+	}
+	if update.Status != "" {
+		summary.Status = update.Status
+	}
+	if update.RuntimeSeconds != nil {
+		summary.RuntimeSeconds = *update.RuntimeSeconds
+	}
+	if update.EstimatedCostUSD != nil {
+		summary.EstimatedCostUSD = *update.EstimatedCostUSD
+	}
+	if update.BestMacroF1 != nil {
+		summary.BestMacroF1 = *update.BestMacroF1
+	}
+	if update.BestAccuracy != nil {
+		summary.BestAccuracy = *update.BestAccuracy
+	}
+	if update.FinalTrainLoss != nil {
+		summary.FinalTrainLoss = *update.FinalTrainLoss
+	}
+	if update.FinalValLoss != nil {
+		summary.FinalValLoss = *update.FinalValLoss
+	}
+	if update.EpochsCompleted != nil {
+		summary.EpochsCompleted = *update.EpochsCompleted
+	}
+	if update.ModalFunctionCallID != "" {
+		summary.ModalFunctionCallID = update.ModalFunctionCallID
+	}
+	if update.ModalInputID != "" {
+		summary.ModalInputID = update.ModalInputID
+	}
+
+	summary.UpdatedAt = now
+}
+
+func postgresConfigString(config map[string]any, key string) string {
+	value, _ := config[key].(string)
+	return value
 }

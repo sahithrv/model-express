@@ -26,6 +26,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/projects/:id/datasets", server.listProjectDatasets)
 	router.POST("/projects/:id/jobs", server.createJob)
 	router.GET("/projects/:id/jobs", server.listProjectJobs)
+	router.GET("/projects/:id/training-run-summaries", server.listProjectTrainingRunSummaries)
 	router.GET("/projects/:id/workers", server.listProjectWorkers)
 	router.POST("/projects/:id/plans", server.createExperimentPlan)
 	router.GET("/projects/:id/plans", server.listProjectPlans)
@@ -38,6 +39,8 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/jobs/:id", server.getJob)
 	router.POST("/jobs/:id/metrics", server.reportMetric)
 	router.GET("/jobs/:id/metrics", server.listJobMetrics)
+	router.POST("/jobs/:id/training-run-summary", server.upsertTrainingRunSummary)
+	router.GET("/jobs/:id/training-run-summary", server.getTrainingRunSummary)
 	router.POST("/jobs/:id/complete", server.completeJob)
 	router.POST("/jobs/:id/fail", server.failJob)
 

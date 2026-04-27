@@ -674,6 +674,92 @@ button {
   font-weight: 800;
 }
 
+.run-summary {
+  display: grid;
+  gap: 12px;
+}
+
+.run-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.run-overview > div {
+  display: grid;
+  align-content: center;
+  gap: 8px;
+  min-height: 78px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  padding: 12px;
+  background: #070c0b;
+}
+
+.run-overview span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #77837d;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.run-overview svg {
+  color: #00d47e;
+}
+
+.run-overview strong {
+  color: #fbfffc;
+  font-size: 24px;
+}
+
+.run-table {
+  display: grid;
+  gap: 7px;
+}
+
+.run-table-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) 112px 90px 90px 100px 70px;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 50px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 9px 10px;
+  color: #dce7e2;
+  background: #101715;
+  text-align: left;
+}
+
+.run-row:hover {
+  border-color: rgba(0, 212, 126, 0.38);
+  background: #121d19;
+}
+
+.run-table-head {
+  min-height: 34px;
+  color: #77837d;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.run-table-row span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.run-table-row small {
+  color: #77837d;
+  font-size: 12px;
+}
+
 .mono {
   overflow: hidden;
   color: #a6b2ad;

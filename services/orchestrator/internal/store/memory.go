@@ -9,29 +9,32 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/workers"
 )
 
 type MemoryStore struct {
 	mu sync.Mutex
 
-	nextID   uint64
-	projects map[string]projects.Project
-	datasets map[string]datasets.Dataset
-	workers  map[string]workers.Worker
-	jobs     map[string]jobs.ExperimentJob
-	metrics  map[string][]jobs.EpochMetric
-	plans    map[string]plans.ExperimentPlan
+	nextID    uint64
+	projects  map[string]projects.Project
+	datasets  map[string]datasets.Dataset
+	workers   map[string]workers.Worker
+	jobs      map[string]jobs.ExperimentJob
+	metrics   map[string][]jobs.EpochMetric
+	plans     map[string]plans.ExperimentPlan
+	summaries map[string]runs.TrainingRunSummary
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		projects: make(map[string]projects.Project),
-		datasets: make(map[string]datasets.Dataset),
-		workers:  make(map[string]workers.Worker),
-		jobs:     make(map[string]jobs.ExperimentJob),
-		metrics:  make(map[string][]jobs.EpochMetric),
-		plans:    make(map[string]plans.ExperimentPlan),
+		projects:  make(map[string]projects.Project),
+		datasets:  make(map[string]datasets.Dataset),
+		workers:   make(map[string]workers.Worker),
+		jobs:      make(map[string]jobs.ExperimentJob),
+		metrics:   make(map[string][]jobs.EpochMetric),
+		plans:     make(map[string]plans.ExperimentPlan),
+		summaries: make(map[string]runs.TrainingRunSummary),
 	}
 }
 
@@ -363,6 +366,56 @@ func (s *MemoryStore) ListJobMetrics(jobID string) ([]jobs.EpochMetric, error) {
 	return out, nil
 }
 
+func (s *MemoryStore) UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return runs.TrainingRunSummary{}, ErrNotFound
+	}
+
+	now := time.Now().UTC()
+	summary, ok := s.summaries[jobID]
+	if !ok {
+		summary = newTrainingRunSummaryFromJob(job, now)
+	}
+
+	applyTrainingRunSummaryUpdate(&summary, update, now)
+	s.summaries[jobID] = summary
+	return summary, nil
+}
+
+func (s *MemoryStore) GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	summary, ok := s.summaries[jobID]
+	if !ok {
+		return runs.TrainingRunSummary{}, ErrNotFound
+	}
+
+	return summary, nil
+}
+
+func (s *MemoryStore) ListProjectTrainingRunSummaries(projectID string) ([]runs.TrainingRunSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := []runs.TrainingRunSummary{}
+	for _, summary := range s.summaries {
+		if summary.ProjectID == projectID {
+			out = append(out, summary)
+		}
+	}
+
+	return out, nil
+}
+
 func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -512,4 +565,73 @@ func (s *MemoryStore) requireDatasetBelongsToProject(projectID string, datasetID
 	}
 
 	return nil
+}
+
+func newTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.TrainingRunSummary {
+	provider := memoryConfigString(job.Config, "provider")
+	if provider == "" {
+		provider = "local"
+	}
+
+	return runs.TrainingRunSummary{
+		JobID:     job.ID,
+		ProjectID: job.ProjectID,
+		PlanID:    memoryConfigString(job.Config, "plan_id"),
+		DatasetID: memoryConfigString(job.Config, "dataset_id"),
+		Model:     memoryConfigString(job.Config, "model"),
+		Provider:  provider,
+		GPUType:   memoryConfigString(job.Config, "gpu_type"),
+		Status:    job.Status,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func applyTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, update runs.TrainingRunSummaryUpdate, now time.Time) {
+	if update.Model != "" {
+		summary.Model = update.Model
+	}
+	if update.Provider != "" {
+		summary.Provider = update.Provider
+	}
+	if update.GPUType != "" {
+		summary.GPUType = update.GPUType
+	}
+	if update.Status != "" {
+		summary.Status = update.Status
+	}
+	if update.RuntimeSeconds != nil {
+		summary.RuntimeSeconds = *update.RuntimeSeconds
+	}
+	if update.EstimatedCostUSD != nil {
+		summary.EstimatedCostUSD = *update.EstimatedCostUSD
+	}
+	if update.BestMacroF1 != nil {
+		summary.BestMacroF1 = *update.BestMacroF1
+	}
+	if update.BestAccuracy != nil {
+		summary.BestAccuracy = *update.BestAccuracy
+	}
+	if update.FinalTrainLoss != nil {
+		summary.FinalTrainLoss = *update.FinalTrainLoss
+	}
+	if update.FinalValLoss != nil {
+		summary.FinalValLoss = *update.FinalValLoss
+	}
+	if update.EpochsCompleted != nil {
+		summary.EpochsCompleted = *update.EpochsCompleted
+	}
+	if update.ModalFunctionCallID != "" {
+		summary.ModalFunctionCallID = update.ModalFunctionCallID
+	}
+	if update.ModalInputID != "" {
+		summary.ModalInputID = update.ModalInputID
+	}
+
+	summary.UpdatedAt = now
+}
+
+func memoryConfigString(config map[string]any, key string) string {
+	value, _ := config[key].(string)
+	return value
 }

@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ClipboardList,
   Database,
+  DollarSign,
   FolderOpen,
   HardDriveUpload,
   ListRestart,
@@ -16,9 +17,11 @@ import {
   RefreshCcw,
   Server,
   SquareTerminal,
+  Timer,
+  Trophy,
   X,
 } from "lucide-react";
-import type { Dataset, EpochMetric, ExperimentPlan, Health, Job, Project, Worker } from "./types";
+import type { Dataset, EpochMetric, ExperimentPlan, Health, Job, Project, TrainingRunSummary, Worker } from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
 const jobsPerPage = 10;
@@ -27,6 +30,7 @@ type ProjectDetail = {
   datasets: Dataset[];
   jobs: Job[];
   plans: ExperimentPlan[];
+  runSummaries: TrainingRunSummary[];
   workers: Worker[];
 };
 
@@ -45,7 +49,7 @@ export function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>("");
-  const [detail, setDetail] = useState<ProjectDetail>({ datasets: [], jobs: [], plans: [], workers: [] });
+  const [detail, setDetail] = useState<ProjectDetail>({ datasets: [], jobs: [], plans: [], runSummaries: [], workers: [] });
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -65,6 +69,7 @@ export function App() {
   );
 
   const latestPlan = detail.plans[0] ?? null;
+  const runTotals = useMemo(() => summarizeTrainingRuns(detail.runSummaries), [detail.runSummaries]);
 
   const firstDatasetId = detail.datasets[0]?.id ?? "";
   const jobPageCount = Math.max(1, Math.ceil(detail.jobs.length / jobsPerPage));
@@ -98,14 +103,15 @@ export function App() {
   const refreshProjectDetail = useCallback(
     async (projectId: string) => {
       if (!projectId) {
-        setDetail({ datasets: [], jobs: [], plans: [], workers: [] });
+        setDetail({ datasets: [], jobs: [], plans: [], runSummaries: [], workers: [] });
         return;
       }
 
-      const [datasets, jobs, plans, workers] = await Promise.all([
+      const [datasets, jobs, plans, runSummaries, workers] = await Promise.all([
         request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
         request<{ jobs: Job[] }>(`/projects/${projectId}/jobs`),
         request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
+        request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries`),
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
       ]);
 
@@ -113,6 +119,7 @@ export function App() {
         datasets: datasets.datasets,
         jobs: jobs.jobs,
         plans: plans.plans,
+        runSummaries: runSummaries.summaries,
         workers: workers.workers,
       });
 
@@ -280,13 +287,29 @@ export function App() {
     setLoading(true);
     setNotice(null);
     try {
+      const plan = detail.plans.find((candidate) => candidate.id === planId);
+      const workerCount = Math.max(
+        1,
+        Math.min(plan?.recommended_workers ?? 1, plan?.experiments.length || 1),
+      );
+      const workerPool = await window.missionControl.ensureProjectWorker({
+        projectId: selectedProjectId,
+        baseUrl,
+        name: `modal-worker-${selectedProjectId}`,
+        gpuType: "modal",
+        count: workerCount,
+      });
+
       const response = await request<{ jobs: Job[] }>(`/plans/${planId}/execute`, {
         method: "POST",
         body: { provider: "modal", gpu_type: "T4" },
       });
 
       await refreshProjectDetail(selectedProjectId);
-      setNotice({ kind: "info", text: `Plan execution ensured ${response.jobs.length} experiment jobs.` });
+      setNotice({
+        kind: "info",
+        text: `Plan execution ensured ${response.jobs.length} experiment jobs across ${workerPool.running_count} workers.`,
+      });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -383,6 +406,61 @@ export function App() {
         </section>
 
         <section className="content-grid">
+          <Panel title="Training Run Summary" icon={<Trophy size={17} />} wide>
+            <div className="run-summary">
+              <div className="run-overview">
+                <div>
+                  <span><DollarSign size={15} /> Estimated Spend</span>
+                  <strong>{formatCurrency(runTotals.totalCost)}</strong>
+                </div>
+                <div>
+                  <span><Trophy size={15} /> Best macro_f1</span>
+                  <strong>{formatMaybeMetric(runTotals.bestMacroF1)}</strong>
+                </div>
+                <div>
+                  <span><Timer size={15} /> GPU Runtime</span>
+                  <strong>{formatSeconds(runTotals.totalRuntimeSeconds)}</strong>
+                </div>
+                <div>
+                  <span><Activity size={15} /> Active Runs</span>
+                  <strong>{runTotals.activeRuns}</strong>
+                </div>
+              </div>
+
+              {detail.runSummaries.length > 0 ? (
+                <div className="run-table">
+                  <div className="run-table-row run-table-head">
+                    <span>Model</span>
+                    <span>Status</span>
+                    <span>Best F1</span>
+                    <span>Cost</span>
+                    <span>Runtime</span>
+                    <span>Epochs</span>
+                  </div>
+                  {detail.runSummaries.map((summary) => (
+                    <button
+                      className="run-table-row run-row"
+                      key={summary.job_id}
+                      onClick={() => setSelectedJobId(summary.job_id)}
+                    >
+                      <span>
+                        <strong>{summary.model || "unknown"}</strong>
+                        <small>{summary.job_id}</small>
+                      </span>
+                      <Badge value={summary.status || "UNKNOWN"} />
+                      <strong>{formatMaybeMetric(summary.best_macro_f1)}</strong>
+                      <strong>{formatCurrency(summary.estimated_cost_usd)}</strong>
+                      <span>{formatSeconds(summary.runtime_seconds)}</span>
+                      <span>{summary.epochs_completed}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty">Training summaries will appear as soon as experiment jobs report their first epoch.</div>
+              )}
+            </div>
+          </Panel>
+
           <Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide>
             {latestPlan ? (
               <div className="plan-card">
@@ -739,4 +817,35 @@ function formatBytes(value: number) {
     index += 1;
   }
   return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function summarizeTrainingRuns(summaries: TrainingRunSummary[]) {
+  const best = summaries.reduce<TrainingRunSummary | null>((currentBest, summary) => {
+    if (!currentBest) return summary;
+    return summary.best_macro_f1 > currentBest.best_macro_f1 ? summary : currentBest;
+  }, null);
+
+  return {
+    totalCost: summaries.reduce((total, summary) => total + summary.estimated_cost_usd, 0),
+    totalRuntimeSeconds: summaries.reduce((total, summary) => total + summary.runtime_seconds, 0),
+    bestMacroF1: best?.best_macro_f1 ?? 0,
+    activeRuns: summaries.filter((summary) => ["RUNNING", "ASSIGNED", "QUEUED"].includes(summary.status)).length,
+  };
+}
+
+function formatCurrency(value: number) {
+  return `$${value.toFixed(value < 1 ? 4 : 2)}`;
+}
+
+function formatSeconds(value: number) {
+  if (!value) return "0s";
+  if (value < 60) return `${Math.round(value)}s`;
+  const minutes = Math.floor(value / 60);
+  const seconds = Math.round(value % 60);
+  return `${minutes}m ${seconds}s`;
+}
+
+function formatMaybeMetric(value: number) {
+  if (!value) return "-";
+  return value.toFixed(3);
 }

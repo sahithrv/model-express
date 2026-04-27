@@ -135,74 +135,184 @@ function ensureProjectWorker(options) {
     throw new Error("Orchestrator URL is required before starting a worker.");
   }
 
-  const existing = projectWorkers.get(projectId);
-  if (existing && existing.exitCode === null && !existing.killed) {
-    return {
-      project_id: projectId,
-      pid: existing.pid,
-      started: false,
-      status: "already_running",
-    };
-  }
-
   const repoRoot = process.env.MODEL_EXPRESS_ROOT ?? path.resolve(__dirname, "..", "..", "..");
   const workerDir = path.join(repoRoot, "services", "worker");
   if (!fs.existsSync(workerDir)) {
     throw new Error(`Worker directory does not exist: ${workerDir}`);
   }
 
-  const python = process.env.MODEL_EXPRESS_PYTHON ?? (process.platform === "win32" ? "python" : "python3");
-  const workerName = options.name ?? `profile-worker-${projectId}`;
-  const child = spawn(python, ["-m", "worker.main"], {
-    cwd: workerDir,
-    env: {
+  const targetCount = normalizeWorkerCount(options.count);
+  const repoEnv = loadRepoEnv(repoRoot);
+  const pids = [];
+  let startedCount = 0;
+
+  for (let slot = 1; slot <= targetCount; slot += 1) {
+    const key = projectWorkerKey(projectId, slot);
+    const existing = projectWorkers.get(key);
+    if (isWorkerRunning(existing)) {
+      pids.push(existing.pid);
+      continue;
+    }
+
+    const workerName = options.name
+      ? `${options.name}-${slot}`
+      : `project-${projectId}-worker-${slot}`;
+    const childEnv = {
       ...process.env,
+      ...repoEnv,
       ORCHESTRATOR_URL: baseUrl,
       PROJECT_ID: projectId,
       WORKER_NAME: workerName,
       GPU_TYPE: options.gpuType ?? "local",
       PYTHONUNBUFFERED: "1",
-    },
+    };
+
+    const child = startProjectWorker({
+      projectId,
+      slot,
+      key,
+      workerDir,
+      childEnv,
+    });
+
+    pids.push(child.pid);
+    startedCount += 1;
+  }
+
+  return {
+    project_id: projectId,
+    pid: pids[0] ?? 0,
+    pids,
+    started: startedCount > 0,
+    started_count: startedCount,
+    running_count: pids.length,
+    status: startedCount > 0 ? "started" : "already_running",
+  };
+}
+
+function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
+  const python = resolveWorkerPython(workerDir, childEnv);
+  console.log(`[worker:${projectId}:${slot}] starting with python=${python}`);
+  console.log(
+    `[worker:${projectId}:${slot}] modal env orchestrator=${childEnv.MODAL_ORCHESTRATOR_URL ?? "(unset)"} ` +
+    `s3=${childEnv.MODAL_S3_ENDPOINT_URL ?? "(unset)"}`,
+  );
+
+  const child = spawn(python, ["-m", "worker.main"], {
+    cwd: workerDir,
+    env: childEnv,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  projectWorkers.set(projectId, child);
+  projectWorkers.set(key, child);
 
   child.stdout.on("data", (data) => {
-    console.log(`[worker:${projectId}] ${data.toString().trimEnd()}`);
+    console.log(`[worker:${projectId}:${slot}] ${data.toString().trimEnd()}`);
   });
 
   child.stderr.on("data", (data) => {
-    console.error(`[worker:${projectId}] ${data.toString().trimEnd()}`);
+    console.error(`[worker:${projectId}:${slot}] ${data.toString().trimEnd()}`);
   });
 
   child.on("exit", (code, signal) => {
-    const current = projectWorkers.get(projectId);
+    const current = projectWorkers.get(key);
     if (current === child) {
-      projectWorkers.delete(projectId);
+      projectWorkers.delete(key);
     }
-    console.log(`[worker:${projectId}] exited code=${code} signal=${signal}`);
+    console.log(`[worker:${projectId}:${slot}] exited code=${code} signal=${signal}`);
   });
 
   child.on("error", (error) => {
-    const current = projectWorkers.get(projectId);
+    const current = projectWorkers.get(key);
     if (current === child) {
-      projectWorkers.delete(projectId);
+      projectWorkers.delete(key);
     }
-    console.error(`[worker:${projectId}] failed to start: ${error.message}`);
+    console.error(`[worker:${projectId}:${slot}] failed to start: ${error.message}`);
   });
 
   if (!child.pid) {
     throw new Error("Worker process did not start.");
   }
 
-  return {
-    project_id: projectId,
-    pid: child.pid,
-    started: true,
-    status: "started",
-  };
+  return child;
+}
+
+function projectWorkerKey(projectId, slot) {
+  return `${projectId}:${slot}`;
+}
+
+function isWorkerRunning(worker) {
+  return worker && worker.exitCode === null && !worker.killed;
+}
+
+function normalizeWorkerCount(count) {
+  const parsed = Number(count);
+  if (!Number.isFinite(parsed)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.min(8, Math.trunc(parsed)));
+}
+
+function resolveWorkerPython(workerDir, env) {
+  if (env.MODEL_EXPRESS_PYTHON) {
+    return env.MODEL_EXPRESS_PYTHON;
+  }
+
+  const venvPython = process.platform === "win32"
+    ? path.join(workerDir, ".venv", "Scripts", "python.exe")
+    : path.join(workerDir, ".venv", "bin", "python");
+
+  if (fs.existsSync(venvPython)) {
+    return venvPython;
+  }
+
+  return process.platform === "win32" ? "python" : "python3";
+}
+
+function loadRepoEnv(repoRoot) {
+  const env = {};
+  const envFile = process.env.MODEL_EXPRESS_ENV_FILE;
+  const files = envFile
+    ? [path.resolve(repoRoot, envFile)]
+    : [path.join(repoRoot, ".env"), path.join(repoRoot, ".env.local")];
+
+  for (const file of files) {
+    if (!fs.existsSync(file)) {
+      continue;
+    }
+
+    const contents = fs.readFileSync(file, "utf8");
+    for (const rawLine of contents.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+
+      const separator = line.indexOf("=");
+      if (separator === -1) {
+        continue;
+      }
+
+      const key = line.slice(0, separator).trim();
+      let value = line.slice(separator + 1).trim();
+      if (!key) {
+        continue;
+      }
+
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+
+      env[key] = value;
+    }
+  }
+
+  return env;
 }
 
 async function uploadDatasetFolder(options) {

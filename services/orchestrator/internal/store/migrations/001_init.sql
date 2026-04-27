@@ -73,9 +73,33 @@ CREATE TABLE IF NOT EXISTS epoch_metrics (
   PRIMARY KEY (job_id, epoch)
 );
 
+CREATE TABLE IF NOT EXISTS training_run_summaries (
+  job_id text PRIMARY KEY REFERENCES experiment_jobs(id) ON DELETE CASCADE,
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  plan_id text NOT NULL DEFAULT '',
+  dataset_id text NOT NULL DEFAULT '',
+  model text NOT NULL DEFAULT '',
+  provider text NOT NULL DEFAULT '',
+  gpu_type text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT '',
+  runtime_seconds double precision NOT NULL DEFAULT 0,
+  estimated_cost_usd double precision NOT NULL DEFAULT 0,
+  best_macro_f1 double precision NOT NULL DEFAULT 0,
+  best_accuracy double precision NOT NULL DEFAULT 0,
+  final_train_loss double precision NOT NULL DEFAULT 0,
+  final_val_loss double precision NOT NULL DEFAULT 0,
+  epochs_completed integer NOT NULL DEFAULT 0,
+  modal_function_call_id text NOT NULL DEFAULT '',
+  modal_input_id text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_id ON experiment_jobs(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_epoch_metrics_job_id ON epoch_metrics(job_id);
 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
 CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_plans_project_id ON experiment_plans(project_id);
+CREATE INDEX IF NOT EXISTS idx_training_run_summaries_project_id ON training_run_summaries(project_id);
+CREATE INDEX IF NOT EXISTS idx_training_run_summaries_plan_id ON training_run_summaries(plan_id);

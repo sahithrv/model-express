@@ -66,6 +66,28 @@ export type ExperimentPlan = {
   created_at: string;
 };
 
+export type TrainingRunSummary = {
+  job_id: string;
+  project_id: string;
+  plan_id?: string;
+  dataset_id?: string;
+  model: string;
+  provider: string;
+  gpu_type: string;
+  status: string;
+  runtime_seconds: number;
+  estimated_cost_usd: number;
+  best_macro_f1: number;
+  best_accuracy: number;
+  final_train_loss: number;
+  final_val_loss: number;
+  epochs_completed: number;
+  modal_function_call_id?: string;
+  modal_input_id?: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type EpochMetric = {
   job_id: string;
   epoch: number;

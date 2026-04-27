@@ -7,6 +7,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -40,6 +41,10 @@ type Store interface {
 	ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
 	CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error)
 	FailJob(jobID string, message string) (jobs.ExperimentJob, error)
+
+	UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error)
+	GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error)
+	ListProjectTrainingRunSummaries(projectID string) ([]runs.TrainingRunSummary, error)
 
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)

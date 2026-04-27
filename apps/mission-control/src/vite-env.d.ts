@@ -46,10 +46,14 @@ interface Window {
       baseUrl: string;
       name?: string;
       gpuType?: string;
+      count?: number;
     }): Promise<{
       project_id: string;
       pid: number;
+      pids: number[];
       started: boolean;
+      started_count: number;
+      running_count: number;
       status: string;
     }>;
   };

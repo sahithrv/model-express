@@ -16,11 +16,14 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
     batch_size = _positive_int(config.get("batch_size"), default=16)
     epoch_sleep = _positive_float(os.getenv("LOCAL_TRAINING_EPOCH_SECONDS"), default=0.5)
+    started_at = time.time()
 
     model_score = _model_score(model)
     batch_penalty = 0.02 if batch_size < 8 else 0.0
     lr_penalty = 0.03 if learning_rate > 0.001 else 0.0
     final_macro_f1 = max(0.35, min(0.94, model_score - batch_penalty - lr_penalty))
+    best_macro_f1 = 0.0
+    best_accuracy = 0.0
 
     for epoch in range(1, epochs + 1):
         progress = epoch / epochs
@@ -28,6 +31,8 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
         accuracy = round(min(0.97, macro_f1 + 0.035), 4)
         train_loss = round(max(0.04, 1.18 - 0.82 * progress - model_score * 0.08), 4)
         val_loss = round(max(0.05, 1.28 - 0.72 * progress - model_score * 0.05), 4)
+        best_macro_f1 = max(best_macro_f1, macro_f1)
+        best_accuracy = max(best_accuracy, accuracy)
 
         client.report_metric(
             job_id,
@@ -40,9 +45,41 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
                 "learning_rate": learning_rate,
             },
         )
+        client.report_training_run_summary(
+            job_id,
+            {
+                "model": model,
+                "provider": "local",
+                "gpu_type": str(config.get("gpu_type", "local")),
+                "status": "RUNNING",
+                "runtime_seconds": round(time.time() - started_at, 3),
+                "estimated_cost_usd": 0,
+                "best_macro_f1": best_macro_f1,
+                "best_accuracy": best_accuracy,
+                "final_train_loss": train_loss,
+                "final_val_loss": val_loss,
+                "epochs_completed": epoch,
+            },
+        )
         print(f"Reported training epoch {epoch}/{epochs} for {job_id} ({model})")
         time.sleep(epoch_sleep)
 
+    client.report_training_run_summary(
+        job_id,
+        {
+            "model": model,
+            "provider": "local",
+            "gpu_type": str(config.get("gpu_type", "local")),
+            "status": "SUCCEEDED",
+            "runtime_seconds": round(time.time() - started_at, 3),
+            "estimated_cost_usd": 0,
+            "best_macro_f1": best_macro_f1,
+            "best_accuracy": best_accuracy,
+            "final_train_loss": train_loss,
+            "final_val_loss": val_loss,
+            "epochs_completed": epochs,
+        },
+    )
     client.complete_job(job_id, mlflow_run_id=f"local-training-{job_id}")
 
 
