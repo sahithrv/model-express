@@ -26,6 +26,15 @@ import type { Dataset, EpochMetric, ExperimentPlan, Health, Job, Project, Traini
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
 const jobsPerPage = 10;
 
+type MetricKey = "macro_f1" | "accuracy" | "train_loss" | "val_loss";
+
+const metricOptions: Array<{ key: MetricKey; label: string }> = [
+  { key: "macro_f1", label: "macro_f1" },
+  { key: "accuracy", label: "Accuracy" },
+  { key: "train_loss", label: "Train loss" },
+  { key: "val_loss", label: "Val loss" },
+];
+
 type ProjectDetail = {
   datasets: Dataset[];
   jobs: Job[];
@@ -57,6 +66,7 @@ export function App() {
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectFolder, setNewProjectFolder] = useState<DatasetFolder | null>(null);
   const [jobPage, setJobPage] = useState(0);
+  const [selectedMetricKey, setSelectedMetricKey] = useState<MetricKey>("macro_f1");
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -66,6 +76,11 @@ export function App() {
   const selectedJob = useMemo(
     () => detail.jobs.find((job) => job.id === selectedJobId) ?? null,
     [detail.jobs, selectedJobId],
+  );
+
+  const selectedRunSummary = useMemo(
+    () => detail.runSummaries.find((summary) => summary.job_id === selectedJobId) ?? null,
+    [detail.runSummaries, selectedJobId],
   );
 
   const latestPlan = detail.plans[0] ?? null;
@@ -333,17 +348,22 @@ export function App() {
 
   return (
     <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">
-            <BrainCircuit size={22} />
-          </div>
-          <div>
-            <h1>Model Express</h1>
-            <p>Mission Control</p>
-          </div>
+      <header className="app-chrome">
+        <div className="chrome-left">
+          <span className="chrome-mark">
+            <BrainCircuit size={16} />
+          </span>
+          <span>
+            <strong>Model Express</strong>
+            <small>Agentic vision training control plane</small>
+          </span>
         </div>
+        <div className="chrome-right">
+          <span>{health?.status === "ok" ? "Orchestrator online" : "Orchestrator offline"}</span>
+        </div>
+      </header>
 
+      <aside className="sidebar">
         <label className="field compact">
           <span>Orchestrator</span>
           <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
@@ -439,7 +459,7 @@ export function App() {
                   </div>
                   {detail.runSummaries.map((summary) => (
                     <button
-                      className="run-table-row run-row"
+                      className={summary.job_id === selectedJobId ? "run-table-row run-row active" : "run-table-row run-row"}
                       key={summary.job_id}
                       onClick={() => setSelectedJobId(summary.job_id)}
                     >
@@ -655,7 +675,31 @@ export function App() {
                   </span>
                   <Badge value={selectedJob.status} />
                 </div>
-                <MetricChart metrics={metrics} />
+                <div className="metric-toolbar">
+                  <div className="metric-tabs">
+                    {metricOptions.map((metric) => (
+                      <button
+                        key={metric.key}
+                        className={selectedMetricKey === metric.key ? "metric-tab active" : "metric-tab"}
+                        onClick={() => setSelectedMetricKey(metric.key)}
+                      >
+                        {metric.label}
+                      </button>
+                    ))}
+                  </div>
+                  {selectedRunSummary && (
+                    <div className="metric-inline-stats">
+                      <span>{formatCurrency(selectedRunSummary.estimated_cost_usd)}</span>
+                      <span>{formatSeconds(selectedRunSummary.runtime_seconds)}</span>
+                      <span>{selectedRunSummary.epochs_completed} epochs</span>
+                    </div>
+                  )}
+                </div>
+                <MetricChart
+                  metrics={metrics}
+                  metricKey={selectedMetricKey}
+                  label={metricOptions.find((metric) => metric.key === selectedMetricKey)?.label ?? selectedMetricKey}
+                />
               </div>
             ) : (
               <div className="empty">No job selected</div>
@@ -743,12 +787,14 @@ function Badge({ value }: { value: string }) {
   return <span className={`badge ${value.toLowerCase()}`}>{value}</span>;
 }
 
-function MetricChart({ metrics }: { metrics: EpochMetric[] }) {
+function MetricChart({ metrics, metricKey, label }: { metrics: EpochMetric[]; metricKey: MetricKey; label: string }) {
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+
   if (metrics.length === 0) {
     return <div className="empty chart-empty">No metrics reported</div>;
   }
 
-  const values = metrics.map((metric) => metric.metrics.macro_f1 ?? 0);
+  const values = metrics.map((metric) => metric.metrics[metricKey] ?? 0);
   const maxValue = Math.max(...values, 1);
   const minValue = Math.min(...values, 0);
   const range = Math.max(maxValue - minValue, 0.001);
@@ -765,43 +811,96 @@ function MetricChart({ metrics }: { metrics: EpochMetric[] }) {
     return { x, y, value, epoch: metrics[index].epoch };
   });
 
-  const linePath = points
-    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
-    .join(" ");
-
-  const fillPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${height - padding} L ${points[0].x.toFixed(
-    2,
-  )} ${height - padding} Z`;
-
   const latest = points[points.length - 1];
+  const hovered = hoveredIndex === null ? null : points[hoveredIndex];
+  const tooltipWidth = 128;
+  const tooltipHeight = 58;
+  const tooltipX = hovered
+    ? Math.min(Math.max(hovered.x - tooltipWidth / 2, padding), width - padding - tooltipWidth)
+    : 0;
+  const tooltipY = hovered ? Math.max(8, hovered.y - tooltipHeight - 12) : 0;
 
   return (
     <div className="chart-wrap">
       <div className="chart-stat">
-        <span>macro_f1</span>
-        <strong>{latest.value.toFixed(3)}</strong>
+        <span>{label}</span>
+        <strong>{formatChartValue(latest.value)}</strong>
       </div>
-      <svg className="metric-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="macro F1 chart">
+      <svg className="metric-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label} chart`}>
         <defs>
-          <linearGradient id="metric-fill" x1="0" x2="0" y1="0" y2="1">
+          <linearGradient id="metric-fill-up" x1="0" x2="0" y1="0" y2="1">
             <stop offset="0%" stopColor="#00d47e" stopOpacity="0.28" />
             <stop offset="100%" stopColor="#00d47e" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id="metric-fill-down" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#ff5967" stopOpacity="0.28" />
+            <stop offset="100%" stopColor="#ff5967" stopOpacity="0" />
           </linearGradient>
         </defs>
         {[0, 1, 2, 3].map((line) => {
           const y = padding + (line / 3) * (height - padding * 2);
           return <line key={line} className="chart-grid" x1={padding} x2={width - padding} y1={y} y2={y} />;
         })}
-        <path className="chart-fill" d={fillPath} />
-        <path className="chart-line" d={linePath} />
-        {points.map((point) => (
+        {points.slice(1).map((point, index) => {
+          const previous = points[index];
+          const direction = point.value >= previous.value ? "up" : "down";
+          const baseline = height - padding;
+          const fillPath = [
+            `M ${previous.x.toFixed(2)} ${baseline.toFixed(2)}`,
+            `L ${previous.x.toFixed(2)} ${previous.y.toFixed(2)}`,
+            `L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`,
+            `L ${point.x.toFixed(2)} ${baseline.toFixed(2)}`,
+            "Z",
+          ].join(" ");
+
+          return <path key={`fill-${previous.epoch}-${point.epoch}`} className={`chart-fill ${direction}`} d={fillPath} />;
+        })}
+        {points.slice(1).map((point, index) => {
+          const previous = points[index];
+          const direction = point.value >= previous.value ? "up" : "down";
+          return (
+            <line
+              key={`${previous.epoch}-${point.epoch}`}
+              className={`chart-segment ${direction}`}
+              x1={previous.x}
+              y1={previous.y}
+              x2={point.x}
+              y2={point.y}
+            />
+          );
+        })}
+        {points.map((point, index) => (
           <g key={point.epoch}>
-            <circle className="chart-dot" cx={point.x} cy={point.y} r="4" />
+            <circle
+              className={hoveredIndex === index ? "chart-dot active" : "chart-dot"}
+              cx={point.x}
+              cy={point.y}
+              r="4"
+            />
+            <circle
+              className="chart-hit"
+              cx={point.x}
+              cy={point.y}
+              r="15"
+              onMouseEnter={() => setHoveredIndex(index)}
+              onMouseLeave={() => setHoveredIndex(null)}
+            />
             <text className="chart-label" x={point.x} y={height - 7} textAnchor="middle">
               {point.epoch}
             </text>
           </g>
         ))}
+        {hovered && (
+          <g className="chart-tooltip" transform={`translate(${tooltipX} ${tooltipY})`}>
+            <rect width={tooltipWidth} height={tooltipHeight} rx="7" />
+            <text x="10" y="18">
+              epoch {hovered.epoch}
+            </text>
+            <text x="10" y="38" className="chart-tooltip-value">
+              {formatChartValue(hovered.value)}
+            </text>
+          </g>
+        )}
       </svg>
     </div>
   );
@@ -848,4 +947,9 @@ function formatSeconds(value: number) {
 function formatMaybeMetric(value: number) {
   if (!value) return "-";
   return value.toFixed(3);
+}
+
+function formatChartValue(value: number) {
+  if (Math.abs(value) >= 10) return value.toFixed(2);
+  return value.toFixed(4);
 }
