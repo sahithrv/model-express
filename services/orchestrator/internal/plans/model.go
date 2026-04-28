@@ -13,6 +13,7 @@ type ExperimentPlan struct {
 	ProjectID          string              `json:"project_id"`
 	DatasetID          string              `json:"dataset_id"`
 	Status             string              `json:"status"`
+	SourceDecisionID   string              `json:"source_decision_id,omitempty"`
 	TargetMetric       string              `json:"target_metric"`
 	RecommendedWorkers int                 `json:"recommended_workers"`
 	EstimatedMinutes   int                 `json:"estimated_minutes"`

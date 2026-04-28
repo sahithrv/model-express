@@ -58,6 +58,7 @@ export type ExperimentPlan = {
   project_id: string;
   dataset_id: string;
   status: string;
+  source_decision_id?: string;
   target_metric: string;
   recommended_workers: number;
   estimated_minutes: number;
@@ -86,6 +87,16 @@ export type TrainingRunSummary = {
   modal_input_id?: string;
   created_at: string;
   updated_at: string;
+};
+
+export type AgentDecision = {
+  id: string;
+  project_id: string;
+  plan_id?: string;
+  decision_type: string;
+  rationale: string;
+  payload: Record<string, unknown>;
+  created_at: string;
 };
 
 export type EpochMetric = {

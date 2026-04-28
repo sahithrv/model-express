@@ -12,6 +12,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"model-express/services/orchestrator/internal/datasets"
+	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
@@ -678,7 +679,67 @@ func (s *PostgresStore) ListProjectTrainingRunSummaries(projectID string) ([]run
 	return out, rows.Err()
 }
 
-func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error) {
+func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return decisions.AgentDecision{}, err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return decisions.AgentDecision{}, fmt.Errorf("marshal agent decision payload: %w", err)
+	}
+
+	const query = `
+		INSERT INTO agent_decisions (project_id, plan_id, decision_type, rationale, payload)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, project_id, plan_id, decision_type, rationale, payload, created_at
+	`
+
+	return scanAgentDecision(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		projectID,
+		planID,
+		decisionType,
+		rationale,
+		payloadJSON,
+	))
+}
+
+func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+
+	const query = `
+		SELECT id, project_id, plan_id, decision_type, rationale, payload, created_at
+		FROM agent_decisions
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+	`
+
+	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []decisions.AgentDecision{}
+	for rows.Next() {
+		decision, err := scanAgentDecision(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, decision)
+	}
+
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return plans.ExperimentPlan{}, err
 	}
@@ -716,14 +777,15 @@ func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string,
 			project_id,
 			dataset_id,
 			status,
+			source_decision_id,
 			target_metric,
 			recommended_workers,
 			estimated_minutes,
 			experiments,
 			warnings
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING id, project_id, dataset_id, status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id, project_id, dataset_id, status, source_decision_id, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
 	`
 
 	return scanExperimentPlan(s.db.QueryRowContext(
@@ -732,6 +794,7 @@ func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string,
 		projectID,
 		datasetID,
 		plans.StatusProposed,
+		sourceDecisionID,
 		targetMetric,
 		recommendedWorkers,
 		estimatedMinutes,
@@ -742,7 +805,7 @@ func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string,
 
 func (s *PostgresStore) GetExperimentPlan(id string) (plans.ExperimentPlan, error) {
 	const query = `
-		SELECT id, project_id, dataset_id, status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		SELECT id, project_id, dataset_id, status, source_decision_id, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
 		FROM experiment_plans
 		WHERE id = $1
 	`
@@ -756,7 +819,7 @@ func (s *PostgresStore) ListProjectExperimentPlans(projectID string) ([]plans.Ex
 	}
 
 	const query = `
-		SELECT id, project_id, dataset_id, status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		SELECT id, project_id, dataset_id, status, source_decision_id, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
 		FROM experiment_plans
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -1039,6 +1102,32 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 	return summary, nil
 }
 
+func scanAgentDecision(row rowScanner) (decisions.AgentDecision, error) {
+	var decision decisions.AgentDecision
+	var payloadJSON []byte
+
+	if err := row.Scan(
+		&decision.ID,
+		&decision.ProjectID,
+		&decision.PlanID,
+		&decision.DecisionType,
+		&decision.Rationale,
+		&payloadJSON,
+		&decision.CreatedAt,
+	); err != nil {
+		return decisions.AgentDecision{}, normalizeSQLError(err)
+	}
+
+	decision.Payload = map[string]any{}
+	if len(payloadJSON) > 0 {
+		if err := json.Unmarshal(payloadJSON, &decision.Payload); err != nil {
+			return decisions.AgentDecision{}, fmt.Errorf("unmarshal agent decision payload: %w", err)
+		}
+	}
+
+	return decision, nil
+}
+
 func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
 	var plan plans.ExperimentPlan
 	var experimentsJSON []byte
@@ -1049,6 +1138,7 @@ func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
 		&plan.ProjectID,
 		&plan.DatasetID,
 		&plan.Status,
+		&plan.SourceDecisionID,
 		&plan.TargetMetric,
 		&plan.RecommendedWorkers,
 		&plan.EstimatedMinutes,

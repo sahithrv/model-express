@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"model-express/services/orchestrator/internal/datasets"
+	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
@@ -46,7 +47,10 @@ type Store interface {
 	GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error)
 	ListProjectTrainingRunSummaries(projectID string) ([]runs.TrainingRunSummary, error)
 
-	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error)
+	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)
+	ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error)
+
+	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)
 	ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error)
 }

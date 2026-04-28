@@ -876,6 +876,152 @@ button {
   font-size: 12px;
 }
 
+.decision-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.decision-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.decision-actions > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.decision-actions strong {
+  color: #fbfffc;
+}
+
+.decision-actions small {
+  color: #77837d;
+  font-size: 12px;
+}
+
+.decision-actions .decision-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.decision-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  padding: 12px;
+  background: #070c0b;
+}
+
+.decision-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.decision-card-head span {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.decision-card-head small {
+  overflow: hidden;
+  color: #77837d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-card p {
+  margin: 0;
+  color: #dce7e2;
+  line-height: 1.45;
+}
+
+.decision-payload {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.decision-payload span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid #17221e;
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: #101715;
+}
+
+.decision-payload small {
+  color: #77837d;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.decision-payload strong {
+  overflow: hidden;
+  color: #fbfffc;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-history {
+  display: grid;
+  gap: 7px;
+}
+
+.decision-history > div {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 8px 10px;
+  background: #101715;
+}
+
+.decision-history span:last-child {
+  overflow: hidden;
+  color: #a6b2ad;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge.wait {
+  color: #7db7ff;
+  background: rgba(125, 183, 255, 0.13);
+}
+
+.badge.select_champion {
+  color: #00d47e;
+  background: rgba(0, 212, 126, 0.13);
+}
+
+.badge.add_experiments {
+  color: #ffd166;
+  background: rgba(255, 209, 102, 0.13);
+}
+
+.badge.stop_project {
+  color: #ff6875;
+  background: rgba(255, 104, 117, 0.13);
+}
+
 .mono {
   overflow: hidden;
   color: #a6b2ad;

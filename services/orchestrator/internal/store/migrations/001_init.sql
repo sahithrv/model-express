@@ -3,6 +3,7 @@ CREATE SEQUENCE IF NOT EXISTS dataset_id_seq;
 CREATE SEQUENCE IF NOT EXISTS worker_id_seq;
 CREATE SEQUENCE IF NOT EXISTS job_id_seq;
 CREATE SEQUENCE IF NOT EXISTS experiment_plan_id_seq;
+CREATE SEQUENCE IF NOT EXISTS agent_decision_id_seq;
 
 CREATE TABLE IF NOT EXISTS projects (
   id text PRIMARY KEY DEFAULT 'project_' || nextval('project_id_seq'),
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS experiment_plans (
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   dataset_id text NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
   status text NOT NULL,
+  source_decision_id text NOT NULL DEFAULT '',
   target_metric text NOT NULL,
   recommended_workers integer NOT NULL,
   estimated_minutes integer NOT NULL,
@@ -50,6 +52,8 @@ CREATE TABLE IF NOT EXISTS experiment_plans (
   warnings jsonb NOT NULL DEFAULT '[]'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE experiment_plans ADD COLUMN IF NOT EXISTS source_decision_id text NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS experiment_jobs (
   id text PRIMARY KEY DEFAULT 'job_' || nextval('job_id_seq'),
@@ -95,6 +99,16 @@ CREATE TABLE IF NOT EXISTS training_run_summaries (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS agent_decisions (
+  id text PRIMARY KEY DEFAULT 'decision_' || nextval('agent_decision_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  plan_id text NOT NULL DEFAULT '',
+  decision_type text NOT NULL,
+  rationale text NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_id ON experiment_jobs(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_epoch_metrics_job_id ON epoch_metrics(job_id);
@@ -103,3 +117,5 @@ CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_plans_project_id ON experiment_plans(project_id);
 CREATE INDEX IF NOT EXISTS idx_training_run_summaries_project_id ON training_run_summaries(project_id);
 CREATE INDEX IF NOT EXISTS idx_training_run_summaries_plan_id ON training_run_summaries(plan_id);
+CREATE INDEX IF NOT EXISTS idx_agent_decisions_project_id ON agent_decisions(project_id);
+CREATE INDEX IF NOT EXISTS idx_agent_decisions_plan_id ON agent_decisions(plan_id);

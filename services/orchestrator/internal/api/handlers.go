@@ -1,16 +1,19 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"model-express/services/orchestrator/internal/agents"
+	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
@@ -60,6 +63,11 @@ type executeExperimentPlanRequest struct {
 type executeExperimentPlanResponse struct {
 	Plan plans.ExperimentPlan `json:"plan"`
 	Jobs []jobs.ExperimentJob `json:"jobs"`
+}
+
+type scheduleFollowUpExperimentsResponse struct {
+	Decision     decisions.AgentDecision `json:"decision"`
+	FollowUpPlan *plans.ExperimentPlan   `json:"follow_up_plan,omitempty"`
 }
 
 type updateDatasetProfileRequest struct {
@@ -295,6 +303,153 @@ func (s *Server) listProjectTrainingRunSummaries(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"summaries": summaries})
 }
 
+func (s *Server) reviewProjectExperiments(c *gin.Context) {
+	_, decision, err := s.createReviewerDecision(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, decision)
+}
+
+func (s *Server) scheduleFollowUpExperiments(c *gin.Context) {
+	projectID := c.Param("id")
+
+	sourcePlan, decision, err := s.followUpSourceDecision(projectID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	if decision.DecisionType != decisions.TypeAddExperiments {
+		c.JSON(http.StatusOK, scheduleFollowUpExperimentsResponse{
+			Decision: decision,
+		})
+		return
+	}
+
+	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		c.JSON(http.StatusOK, scheduleFollowUpExperimentsResponse{
+			Decision:     decision,
+			FollowUpPlan: &existingPlan,
+		})
+		return
+	}
+
+	experiments, err := plannedExperimentsFromPayload(decision.Payload)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	warnings := []string{
+		fmt.Sprintf("Follow-up plan generated from reviewer decision %s.", decision.ID),
+		fmt.Sprintf("Previous plan: %s.", sourcePlan.ID),
+	}
+
+	plan, err := s.store.CreateExperimentPlan(
+		projectID,
+		sourcePlan.DatasetID,
+		sourcePlan.TargetMetric,
+		recommendedWorkersForExperiments(experiments),
+		estimateFollowUpMinutes(experiments),
+		experiments,
+		warnings,
+		decision.ID,
+	)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, scheduleFollowUpExperimentsResponse{
+		Decision:     decision,
+		FollowUpPlan: &plan,
+	})
+}
+
+func (s *Server) createReviewerDecision(projectID string) (plans.ExperimentPlan, decisions.AgentDecision, error) {
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+	}
+
+	projectPlans, err := s.store.ListProjectExperimentPlans(project.ID)
+	if err != nil {
+		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+	}
+
+	summaries, err := s.store.ListProjectTrainingRunSummaries(project.ID)
+	if err != nil {
+		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+	}
+
+	latestPlan, ok := latestExperimentPlan(projectPlans)
+	if !ok {
+		recommendation := agents.NewExperimentReviewer().Review(project, plans.ExperimentPlan{}, summaries)
+		decision, err := s.store.CreateAgentDecision(
+			project.ID,
+			recommendation.PlanID,
+			recommendation.DecisionType,
+			recommendation.Rationale,
+			recommendation.Payload,
+		)
+		if err != nil {
+			return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+		}
+		return plans.ExperimentPlan{}, decision, nil
+	}
+
+	recommendation := agents.NewExperimentReviewer().Review(project, latestPlan, summaries)
+	decision, err := s.store.CreateAgentDecision(
+		project.ID,
+		recommendation.PlanID,
+		recommendation.DecisionType,
+		recommendation.Rationale,
+		recommendation.Payload,
+	)
+	if err != nil {
+		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+	}
+
+	return latestPlan, decision, nil
+}
+
+func (s *Server) followUpSourceDecision(projectID string) (plans.ExperimentPlan, decisions.AgentDecision, error) {
+	agentDecisions, err := s.store.ListProjectAgentDecisions(projectID)
+	if err != nil {
+		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+	}
+
+	if len(agentDecisions) > 0 && agentDecisions[0].DecisionType == decisions.TypeAddExperiments && agentDecisions[0].PlanID != "" {
+		plan, err := s.store.GetExperimentPlan(agentDecisions[0].PlanID)
+		if err == nil {
+			return plan, agentDecisions[0], nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+		}
+	}
+
+	return s.createReviewerDecision(projectID)
+}
+
+func (s *Server) listProjectAgentDecisions(c *gin.Context) {
+	agentDecisions, err := s.store.ListProjectAgentDecisions(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"decisions": agentDecisions})
+}
+
 func (s *Server) completeJob(c *gin.Context) {
 	var req completeJobRequest
 	if !bindJSON(c, &req) {
@@ -464,6 +619,7 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 		estimatedMinutes,
 		experiments,
 		warnings,
+		"",
 	)
 	if err != nil {
 		writeStoreError(c, err)
@@ -544,6 +700,7 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 		recommendation.EstimatedMinutes,
 		recommendation.Experiments,
 		recommendation.Warnings,
+		"",
 	)
 	if err != nil {
 		return err
@@ -654,6 +811,87 @@ func configInt(config map[string]any, key string) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func latestExperimentPlan(projectPlans []plans.ExperimentPlan) (plans.ExperimentPlan, bool) {
+	if len(projectPlans) == 0 {
+		return plans.ExperimentPlan{}, false
+	}
+
+	sort.Slice(projectPlans, func(i, j int) bool {
+		return projectPlans[i].CreatedAt.After(projectPlans[j].CreatedAt)
+	})
+
+	return projectPlans[0], true
+}
+
+func followUpPlanForDecision(projectPlans []plans.ExperimentPlan, decisionID string) (plans.ExperimentPlan, bool) {
+	for _, plan := range projectPlans {
+		if plan.SourceDecisionID == decisionID {
+			return plan, true
+		}
+	}
+
+	return plans.ExperimentPlan{}, false
+}
+
+func plannedExperimentsFromPayload(payload map[string]any) ([]plans.PlannedExperiment, error) {
+	value, ok := payload["proposed_experiments"]
+	if !ok {
+		return nil, fmt.Errorf("%w: reviewer decision does not include proposed_experiments", store.ErrInvalidRequest)
+	}
+
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("%w: proposed_experiments could not be encoded", store.ErrInvalidRequest)
+	}
+
+	var experiments []plans.PlannedExperiment
+	if err := json.Unmarshal(blob, &experiments); err != nil {
+		return nil, fmt.Errorf("%w: proposed_experiments has an invalid shape", store.ErrInvalidRequest)
+	}
+
+	if len(experiments) == 0 {
+		return nil, fmt.Errorf("%w: reviewer proposed no follow-up experiments", store.ErrInvalidRequest)
+	}
+
+	for index, experiment := range experiments {
+		if strings.TrimSpace(experiment.Template) == "" {
+			return nil, fmt.Errorf("%w: proposed experiment %d is missing template", store.ErrInvalidRequest, index)
+		}
+		if strings.TrimSpace(experiment.Model) == "" {
+			return nil, fmt.Errorf("%w: proposed experiment %d is missing model", store.ErrInvalidRequest, index)
+		}
+		if experiment.Epochs < 1 {
+			return nil, fmt.Errorf("%w: proposed experiment %d must have at least one epoch", store.ErrInvalidRequest, index)
+		}
+		if experiment.BatchSize < 1 {
+			return nil, fmt.Errorf("%w: proposed experiment %d must have a positive batch size", store.ErrInvalidRequest, index)
+		}
+		if experiment.LearningRate <= 0 {
+			return nil, fmt.Errorf("%w: proposed experiment %d must have a positive learning rate", store.ErrInvalidRequest, index)
+		}
+	}
+
+	return experiments, nil
+}
+
+func recommendedWorkersForExperiments(experiments []plans.PlannedExperiment) int {
+	if len(experiments) < 1 {
+		return 1
+	}
+	return len(experiments)
+}
+
+func estimateFollowUpMinutes(experiments []plans.PlannedExperiment) int {
+	maxEpochs := 1
+	for _, experiment := range experiments {
+		if experiment.Epochs > maxEpochs {
+			maxEpochs = experiment.Epochs
+		}
+	}
+
+	return max(5, maxEpochs*6)
 }
 
 func defaultExecuteExperimentPlanRequest() executeExperimentPlanRequest {

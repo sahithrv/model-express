@@ -21,7 +21,17 @@ import {
   Trophy,
   X,
 } from "lucide-react";
-import type { Dataset, EpochMetric, ExperimentPlan, Health, Job, Project, TrainingRunSummary, Worker } from "./types";
+import type {
+  AgentDecision,
+  Dataset,
+  EpochMetric,
+  ExperimentPlan,
+  Health,
+  Job,
+  Project,
+  TrainingRunSummary,
+  Worker,
+} from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
 const jobsPerPage = 10;
@@ -36,6 +46,7 @@ const metricOptions: Array<{ key: MetricKey; label: string }> = [
 ];
 
 type ProjectDetail = {
+  decisions: AgentDecision[];
   datasets: Dataset[];
   jobs: Job[];
   plans: ExperimentPlan[];
@@ -53,12 +64,24 @@ type DatasetFolder = {
   name: string;
 };
 
+type ScheduleFollowUpResponse = {
+  decision: AgentDecision;
+  follow_up_plan?: ExperimentPlan;
+};
+
 export function App() {
   const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
   const [health, setHealth] = useState<Health | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>("");
-  const [detail, setDetail] = useState<ProjectDetail>({ datasets: [], jobs: [], plans: [], runSummaries: [], workers: [] });
+  const [detail, setDetail] = useState<ProjectDetail>({
+    decisions: [],
+    datasets: [],
+    jobs: [],
+    plans: [],
+    runSummaries: [],
+    workers: [],
+  });
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -84,6 +107,10 @@ export function App() {
   );
 
   const latestPlan = detail.plans[0] ?? null;
+  const latestDecision = detail.decisions[0] ?? null;
+  const latestDecisionHasFollowUpPlan = latestDecision
+    ? detail.plans.some((plan) => plan.source_decision_id === latestDecision.id)
+    : false;
   const runTotals = useMemo(() => summarizeTrainingRuns(detail.runSummaries), [detail.runSummaries]);
 
   const firstDatasetId = detail.datasets[0]?.id ?? "";
@@ -118,19 +145,21 @@ export function App() {
   const refreshProjectDetail = useCallback(
     async (projectId: string) => {
       if (!projectId) {
-        setDetail({ datasets: [], jobs: [], plans: [], runSummaries: [], workers: [] });
+        setDetail({ decisions: [], datasets: [], jobs: [], plans: [], runSummaries: [], workers: [] });
         return;
       }
 
-      const [datasets, jobs, plans, runSummaries, workers] = await Promise.all([
+      const [datasets, jobs, plans, runSummaries, decisions, workers] = await Promise.all([
         request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
         request<{ jobs: Job[] }>(`/projects/${projectId}/jobs`),
         request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
         request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries`),
+        request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`),
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
       ]);
 
       setDetail({
+        decisions: decisions.decisions,
         datasets: datasets.datasets,
         jobs: jobs.jobs,
         plans: plans.plans,
@@ -332,6 +361,73 @@ export function App() {
     }
   }
 
+  async function reviewExperiments() {
+    if (!selectedProjectId) return;
+
+    setLoading(true);
+    setNotice(null);
+    try {
+      const decision = await request<AgentDecision>(`/projects/${selectedProjectId}/review-experiments`, {
+        method: "POST",
+        body: {},
+      });
+
+      await refreshProjectDetail(selectedProjectId);
+      setNotice({ kind: "info", text: `Reviewer decision: ${decision.decision_type}` });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function scheduleFollowUpExperiments() {
+    if (!selectedProjectId) return;
+
+    setLoading(true);
+    setNotice(null);
+    try {
+      const response = await request<ScheduleFollowUpResponse>(
+        `/projects/${selectedProjectId}/schedule-follow-up-experiments`,
+        {
+          method: "POST",
+          body: {},
+        },
+      );
+
+      if (!response.follow_up_plan) {
+        await refreshProjectDetail(selectedProjectId);
+        setNotice({ kind: "info", text: `No follow-up scheduled. Reviewer decision: ${response.decision.decision_type}` });
+        return;
+      }
+
+      const plan = response.follow_up_plan;
+      const workerCount = Math.max(1, Math.min(plan.recommended_workers, plan.experiments.length || 1));
+      const workerPool = await window.missionControl.ensureProjectWorker({
+        projectId: selectedProjectId,
+        baseUrl,
+        name: `modal-worker-${selectedProjectId}`,
+        gpuType: "modal",
+        count: workerCount,
+      });
+
+      const execution = await request<{ jobs: Job[] }>(`/plans/${plan.id}/execute`, {
+        method: "POST",
+        body: { provider: "modal", gpu_type: "T4" },
+      });
+
+      await refreshProjectDetail(selectedProjectId);
+      setNotice({
+        kind: "info",
+        text: `Scheduled ${execution.jobs.length} follow-up jobs from ${plan.id} across ${workerPool.running_count} workers.`,
+      });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleSubmit(action: (formData: FormData) => Promise<void>, form: HTMLFormElement) {
     setLoading(true);
     setNotice(null);
@@ -477,6 +573,63 @@ export function App() {
                 </div>
               ) : (
                 <div className="empty">Training summaries will appear as soon as experiment jobs report their first epoch.</div>
+              )}
+            </div>
+          </Panel>
+
+          <Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide>
+            <div className="decision-panel">
+              <div className="decision-actions">
+                <div>
+                  <strong>Experiment Reviewer</strong>
+                  <small>Compares finished runs and records the next project decision.</small>
+                </div>
+                <div className="decision-buttons">
+                  {latestDecision?.decision_type === "ADD_EXPERIMENTS" && !latestDecisionHasFollowUpPlan && (
+                    <button className="command primary" onClick={scheduleFollowUpExperiments} disabled={!selectedProjectId || loading}>
+                      <Play size={16} />
+                      Schedule Follow-up
+                    </button>
+                  )}
+                  <button className="command" onClick={reviewExperiments} disabled={!selectedProjectId || loading}>
+                    <BrainCircuit size={16} />
+                    Review Experiments
+                  </button>
+                </div>
+              </div>
+
+              {latestDecision ? (
+                <div className="decision-card">
+                  <div className="decision-card-head">
+                    <span>
+                      <Badge value={latestDecision.decision_type} />
+                      <small>{new Date(latestDecision.created_at).toLocaleString()}</small>
+                    </span>
+                    <small>{latestDecision.plan_id || "no plan"}</small>
+                  </div>
+                  <p>{latestDecision.rationale}</p>
+                  <div className="decision-payload">
+                    {decisionHighlights(latestDecision).map((item) => (
+                      <span key={item.label}>
+                        <small>{item.label}</small>
+                        <strong>{item.value}</strong>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="empty">No agent decisions yet. Run the reviewer after experiments finish.</div>
+              )}
+
+              {detail.decisions.length > 1 && (
+                <div className="decision-history">
+                  {detail.decisions.slice(1, 5).map((decision) => (
+                    <div key={decision.id}>
+                      <Badge value={decision.decision_type} />
+                      <span>{decision.rationale}</span>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
           </Panel>
@@ -930,6 +1083,53 @@ function summarizeTrainingRuns(summaries: TrainingRunSummary[]) {
     bestMacroF1: best?.best_macro_f1 ?? 0,
     activeRuns: summaries.filter((summary) => ["RUNNING", "ASSIGNED", "QUEUED"].includes(summary.status)).length,
   };
+}
+
+function decisionHighlights(decision: AgentDecision) {
+  const payload = decision.payload ?? {};
+  const items: Array<{ label: string; value: string }> = [];
+
+  if (typeof payload.champion_model === "string" && payload.champion_model) {
+    items.push({ label: "Champion", value: payload.champion_model });
+  }
+
+  const championScore = numberPayload(payload.champion_score);
+  if (championScore !== null) {
+    items.push({ label: "Score", value: championScore.toFixed(3) });
+  }
+
+  const runtimeSeconds = numberPayload(
+    payload.champion_runtime_seconds !== undefined
+      ? payload.champion_runtime_seconds
+      : payload.total_runtime_seconds,
+  );
+  if (runtimeSeconds !== null) {
+    items.push({ label: "Runtime", value: formatSeconds(runtimeSeconds) });
+  }
+
+  const reportedRuns = numberPayload(payload.reported_experiments);
+  if (reportedRuns !== null) {
+    items.push({ label: "Runs", value: String(reportedRuns) });
+  }
+
+  const estimatedCost = numberPayload(
+    payload.champion_estimated_cost_usd !== undefined
+      ? payload.champion_estimated_cost_usd
+      : payload.total_estimated_cost,
+  );
+  if (estimatedCost !== null) {
+    items.push({ label: "Budget Used", value: formatCurrency(estimatedCost) });
+  }
+
+  if (items.length === 0) {
+    items.push({ label: "Decision", value: decision.decision_type });
+  }
+
+  return items;
+}
+
+function numberPayload(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function formatCurrency(value: number) {

@@ -2,10 +2,12 @@ package store
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	"model-express/services/orchestrator/internal/datasets"
+	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
@@ -24,6 +26,7 @@ type MemoryStore struct {
 	metrics   map[string][]jobs.EpochMetric
 	plans     map[string]plans.ExperimentPlan
 	summaries map[string]runs.TrainingRunSummary
+	decisions map[string]decisions.AgentDecision
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -35,6 +38,7 @@ func NewMemoryStore() *MemoryStore {
 		metrics:   make(map[string][]jobs.EpochMetric),
 		plans:     make(map[string]plans.ExperimentPlan),
 		summaries: make(map[string]runs.TrainingRunSummary),
+		decisions: make(map[string]decisions.AgentDecision),
 	}
 }
 
@@ -416,7 +420,53 @@ func (s *MemoryStore) ListProjectTrainingRunSummaries(projectID string) ([]runs.
 	return out, nil
 }
 
-func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string) (plans.ExperimentPlan, error) {
+func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return decisions.AgentDecision{}, ErrNotFound
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+
+	decision := decisions.AgentDecision{
+		ID:           s.newID("decision"),
+		ProjectID:    projectID,
+		PlanID:       planID,
+		DecisionType: decisionType,
+		Rationale:    rationale,
+		Payload:      payload,
+		CreatedAt:    time.Now().UTC(),
+	}
+
+	s.decisions[decision.ID] = decision
+	return decision, nil
+}
+
+func (s *MemoryStore) ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := []decisions.AgentDecision{}
+	for _, decision := range s.decisions {
+		if decision.ProjectID == projectID {
+			out = append(out, decision)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+
+	return out, nil
+}
+
+func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -447,6 +497,7 @@ func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, t
 		ProjectID:          projectID,
 		DatasetID:          datasetID,
 		Status:             plans.StatusProposed,
+		SourceDecisionID:   sourceDecisionID,
 		TargetMetric:       targetMetric,
 		RecommendedWorkers: recommendedWorkers,
 		EstimatedMinutes:   estimatedMinutes,
@@ -485,6 +536,9 @@ func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.Expe
 			out = append(out, plan)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
 
 	return out, nil
 }
