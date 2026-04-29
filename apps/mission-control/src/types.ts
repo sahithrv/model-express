@@ -111,3 +111,13 @@ export type Health = {
   service: string;
   timestamp: string;
 };
+
+export type AutomationSettings = {
+  auto_review_experiments: boolean;
+  auto_schedule_followups: boolean;
+  auto_execute_plans: boolean;
+  max_followup_rounds: number;
+  default_training_provider: string;
+  default_gpu_type: string;
+  updated_at: string;
+};

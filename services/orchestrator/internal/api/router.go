@@ -1,23 +1,30 @@
 package api
 
 import (
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 )
 
 type Server struct {
-	store store.Store
+	store              store.Store
+	autoReviewMu       sync.Mutex
+	automationSettings settings.AutomationSettings
+	settingsMu         sync.RWMutex
 }
 
 func NewRouter(store store.Store) *gin.Engine {
-	server := &Server{store: store}
+	server := newServer(store)
 
 	router := gin.Default()
 
 	router.GET("/healthz", server.health)
+	router.GET("/settings/automation", server.getAutomationSettings)
+	router.PATCH("/settings/automation", server.updateAutomationSettings)
 
 	router.POST("/projects", server.createProject)
 	router.GET("/projects", server.listProjects)
@@ -54,6 +61,19 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/workers/:id/poll", server.pollJob)
 
 	return router
+}
+
+func newServer(store store.Store) *Server {
+	server := &Server{
+		store:              store,
+		automationSettings: automationSettingsFromEnv(),
+	}
+
+	if automationSettings, err := store.GetAutomationSettings(); err == nil {
+		server.automationSettings = automationSettings
+	}
+
+	return server
 }
 
 type healthResponse struct {

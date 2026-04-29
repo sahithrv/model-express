@@ -12,21 +12,23 @@ import (
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
+	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/workers"
 )
 
 type MemoryStore struct {
 	mu sync.Mutex
 
-	nextID    uint64
-	projects  map[string]projects.Project
-	datasets  map[string]datasets.Dataset
-	workers   map[string]workers.Worker
-	jobs      map[string]jobs.ExperimentJob
-	metrics   map[string][]jobs.EpochMetric
-	plans     map[string]plans.ExperimentPlan
-	summaries map[string]runs.TrainingRunSummary
-	decisions map[string]decisions.AgentDecision
+	nextID             uint64
+	projects           map[string]projects.Project
+	datasets           map[string]datasets.Dataset
+	workers            map[string]workers.Worker
+	jobs               map[string]jobs.ExperimentJob
+	metrics            map[string][]jobs.EpochMetric
+	plans              map[string]plans.ExperimentPlan
+	summaries          map[string]runs.TrainingRunSummary
+	decisions          map[string]decisions.AgentDecision
+	automationSettings *settings.AutomationSettings
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -464,6 +466,27 @@ func (s *MemoryStore) ListProjectAgentDecisions(projectID string) ([]decisions.A
 	})
 
 	return out, nil
+}
+
+func (s *MemoryStore) GetAutomationSettings() (settings.AutomationSettings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.automationSettings == nil {
+		return settings.AutomationSettings{}, ErrNotFound
+	}
+
+	return *s.automationSettings, nil
+}
+
+func (s *MemoryStore) SaveAutomationSettings(automationSettings settings.AutomationSettings) (settings.AutomationSettings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	automationSettings.UpdatedAt = time.Now().UTC()
+	s.automationSettings = &automationSettings
+
+	return automationSettings, nil
 }
 
 func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {

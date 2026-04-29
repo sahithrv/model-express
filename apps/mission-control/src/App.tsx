@@ -16,6 +16,7 @@ import {
   Plus,
   RefreshCcw,
   Server,
+  SlidersHorizontal,
   SquareTerminal,
   Timer,
   Trophy,
@@ -31,6 +32,7 @@ import type {
   Project,
   TrainingRunSummary,
   Worker,
+  AutomationSettings,
 } from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
@@ -69,6 +71,28 @@ type ScheduleFollowUpResponse = {
   follow_up_plan?: ExperimentPlan;
 };
 
+type AutomationSettingsUpdate = Partial<
+  Pick<
+    AutomationSettings,
+    | "auto_review_experiments"
+    | "auto_schedule_followups"
+    | "auto_execute_plans"
+    | "max_followup_rounds"
+    | "default_training_provider"
+    | "default_gpu_type"
+  >
+>;
+
+const defaultAutomationSettings: AutomationSettings = {
+  auto_review_experiments: false,
+  auto_schedule_followups: false,
+  auto_execute_plans: false,
+  max_followup_rounds: 2,
+  default_training_provider: "local",
+  default_gpu_type: "",
+  updated_at: "",
+};
+
 export function App() {
   const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
   const [health, setHealth] = useState<Health | null>(null);
@@ -84,6 +108,8 @@ export function App() {
   });
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
+  const [automationSettings, setAutomationSettings] = useState<AutomationSettings>(defaultAutomationSettings);
+  const [settingsDraft, setSettingsDraft] = useState<AutomationSettings>(defaultAutomationSettings);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [loading, setLoading] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
@@ -142,6 +168,12 @@ export function App() {
     setHealth(response);
   }, [request]);
 
+  const refreshAutomationSettings = useCallback(async () => {
+    const response = await request<AutomationSettings>("/settings/automation");
+    setAutomationSettings(response);
+    setSettingsDraft(response);
+  }, [request]);
+
   const refreshProjectDetail = useCallback(
     async (projectId: string) => {
       if (!projectId) {
@@ -191,6 +223,7 @@ export function App() {
     setNotice(null);
     try {
       await refreshHealth();
+      await refreshAutomationSettings();
       await refreshProjects();
       if (selectedProjectId) {
         await refreshProjectDetail(selectedProjectId);
@@ -201,7 +234,14 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }, [refreshHealth, refreshProjectDetail, refreshProjects, refreshSelectedJobMetrics, selectedProjectId]);
+  }, [
+    refreshAutomationSettings,
+    refreshHealth,
+    refreshProjectDetail,
+    refreshProjects,
+    refreshSelectedJobMetrics,
+    selectedProjectId,
+  ]);
 
   const refreshLive = useCallback(async () => {
     try {
@@ -428,6 +468,36 @@ export function App() {
     }
   }
 
+  function updateSettingsDraft(update: AutomationSettingsUpdate) {
+    setSettingsDraft((current) => ({ ...current, ...update }));
+  }
+
+  async function saveAutomationSettings() {
+    setLoading(true);
+    setNotice(null);
+    try {
+      const response = await request<AutomationSettings>("/settings/automation", {
+        method: "PATCH",
+        body: {
+          auto_review_experiments: settingsDraft.auto_review_experiments,
+          auto_schedule_followups: settingsDraft.auto_schedule_followups,
+          auto_execute_plans: settingsDraft.auto_execute_plans,
+          max_followup_rounds: Math.max(0, Math.trunc(settingsDraft.max_followup_rounds || 0)),
+          default_training_provider: settingsDraft.default_training_provider,
+          default_gpu_type: settingsDraft.default_gpu_type,
+        },
+      });
+
+      setAutomationSettings(response);
+      setSettingsDraft(response);
+      setNotice({ kind: "info", text: "Automation settings updated." });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleSubmit(action: (formData: FormData) => Promise<void>, form: HTMLFormElement) {
     setLoading(true);
     setNotice(null);
@@ -522,6 +592,85 @@ export function App() {
         </section>
 
         <section className="content-grid">
+          <Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide>
+            <div className="settings-panel">
+              <div className="settings-grid">
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.auto_review_experiments}
+                    onChange={(event) => updateSettingsDraft({ auto_review_experiments: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>Auto Review</strong>
+                    <small>{automationSettings.auto_review_experiments ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.auto_schedule_followups}
+                    onChange={(event) => updateSettingsDraft({ auto_schedule_followups: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>Auto Follow-ups</strong>
+                    <small>{automationSettings.auto_schedule_followups ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.auto_execute_plans}
+                    onChange={(event) => updateSettingsDraft({ auto_execute_plans: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>Auto Execute</strong>
+                    <small>{automationSettings.auto_execute_plans ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="setting-field">
+                  <span>Follow-up Rounds</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={settingsDraft.max_followup_rounds}
+                    onChange={(event) =>
+                      updateSettingsDraft({ max_followup_rounds: Number.parseInt(event.currentTarget.value, 10) || 0 })
+                    }
+                  />
+                </label>
+                <label className="setting-field">
+                  <span>Provider</span>
+                  <select
+                    value={settingsDraft.default_training_provider}
+                    onChange={(event) => updateSettingsDraft({ default_training_provider: event.currentTarget.value })}
+                  >
+                    <option value="local">local</option>
+                    <option value="modal">modal</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>GPU</span>
+                  <input
+                    value={settingsDraft.default_gpu_type}
+                    placeholder="T4"
+                    onChange={(event) => updateSettingsDraft({ default_gpu_type: event.currentTarget.value })}
+                  />
+                </label>
+              </div>
+              <div className="settings-actions">
+                <small>
+                  Updated {automationSettings.updated_at ? new Date(automationSettings.updated_at).toLocaleString() : "from defaults"}
+                </small>
+                <button className="command primary" type="button" onClick={saveAutomationSettings} disabled={loading}>
+                  <CheckCircle2 size={16} />
+                  Apply Settings
+                </button>
+              </div>
+            </div>
+          </Panel>
+
           <Panel title="Training Run Summary" icon={<Trophy size={17} />} wide>
             <div className="run-summary">
               <div className="run-overview">

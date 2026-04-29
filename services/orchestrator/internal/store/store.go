@@ -9,6 +9,7 @@ import (
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
+	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -49,6 +50,9 @@ type Store interface {
 
 	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)
 	ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error)
+
+	GetAutomationSettings() (settings.AutomationSettings, error)
+	SaveAutomationSettings(automationSettings settings.AutomationSettings) (settings.AutomationSettings, error)
 
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)

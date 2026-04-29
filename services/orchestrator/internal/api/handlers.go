@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
+	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 )
 
@@ -70,6 +73,12 @@ type scheduleFollowUpExperimentsResponse struct {
 	FollowUpPlan *plans.ExperimentPlan   `json:"follow_up_plan,omitempty"`
 }
 
+type automaticExperimentReviewResult struct {
+	Decision     *decisions.AgentDecision
+	FollowUpPlan *plans.ExperimentPlan
+	Jobs         []jobs.ExperimentJob
+}
+
 type updateDatasetProfileRequest struct {
 	Profile map[string]any `json:"profile" binding:"required"`
 }
@@ -99,6 +108,33 @@ func (s *Server) health(c *gin.Context) {
 		Service:   "orchestrator",
 		Timestamp: time.Now().UTC(),
 	})
+}
+
+func (s *Server) getAutomationSettings(c *gin.Context) {
+	c.JSON(http.StatusOK, s.currentAutomationSettings())
+}
+
+func (s *Server) updateAutomationSettings(c *gin.Context) {
+	var req settings.AutomationSettingsUpdate
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	current := s.currentAutomationSettings()
+	updated, err := applyAutomationSettingsUpdate(current, req)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	saved, err := s.store.SaveAutomationSettings(updated)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	s.setAutomationSettings(saved)
+	c.JSON(http.StatusOK, saved)
 }
 
 func (s *Server) createProject(c *gin.Context) {
@@ -329,46 +365,17 @@ func (s *Server) scheduleFollowUpExperiments(c *gin.Context) {
 		return
 	}
 
-	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
-	if err != nil {
-		writeStoreError(c, err)
-		return
-	}
-	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
-		c.JSON(http.StatusOK, scheduleFollowUpExperimentsResponse{
-			Decision:     decision,
-			FollowUpPlan: &existingPlan,
-		})
-		return
-	}
-
-	experiments, err := plannedExperimentsFromPayload(decision.Payload)
+	plan, created, err := s.ensureFollowUpPlan(projectID, sourcePlan, decision)
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 
-	warnings := []string{
-		fmt.Sprintf("Follow-up plan generated from reviewer decision %s.", decision.ID),
-		fmt.Sprintf("Previous plan: %s.", sourcePlan.ID),
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
 	}
-
-	plan, err := s.store.CreateExperimentPlan(
-		projectID,
-		sourcePlan.DatasetID,
-		sourcePlan.TargetMetric,
-		recommendedWorkersForExperiments(experiments),
-		estimateFollowUpMinutes(experiments),
-		experiments,
-		warnings,
-		decision.ID,
-	)
-	if err != nil {
-		writeStoreError(c, err)
-		return
-	}
-
-	c.JSON(http.StatusCreated, scheduleFollowUpExperimentsResponse{
+	c.JSON(status, scheduleFollowUpExperimentsResponse{
 		Decision:     decision,
 		FollowUpPlan: &plan,
 	})
@@ -440,6 +447,172 @@ func (s *Server) followUpSourceDecision(projectID string) (plans.ExperimentPlan,
 	return s.createReviewerDecision(projectID)
 }
 
+func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.ExperimentPlan, decision decisions.AgentDecision) (plans.ExperimentPlan, bool, error) {
+	if decision.DecisionType != decisions.TypeAddExperiments {
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: reviewer decision is not ADD_EXPERIMENTS", store.ErrInvalidRequest)
+	}
+	if sourcePlan.ID == "" {
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: follow-up experiments require a source plan", store.ErrInvalidRequest)
+	}
+
+	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		return existingPlan, false, nil
+	}
+
+	experiments, err := plannedExperimentsFromPayload(decision.Payload)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+
+	warnings := []string{
+		fmt.Sprintf("Follow-up plan generated from reviewer decision %s.", decision.ID),
+		fmt.Sprintf("Previous plan: %s.", sourcePlan.ID),
+	}
+
+	plan, err := s.store.CreateExperimentPlan(
+		projectID,
+		sourcePlan.DatasetID,
+		sourcePlan.TargetMetric,
+		recommendedWorkersForExperiments(experiments),
+		estimateFollowUpMinutes(experiments),
+		experiments,
+		warnings,
+		decision.ID,
+	)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+
+	return plan, true, nil
+}
+
+func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperimentReviewResult, error) {
+	if !s.shouldAutoReviewExperimentJobs() {
+		return automaticExperimentReviewResult{}, nil
+	}
+
+	s.autoReviewMu.Lock()
+	defer s.autoReviewMu.Unlock()
+
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	projectPlans, err := s.store.ListProjectExperimentPlans(project.ID)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	latestPlan, ok := latestExperimentPlan(projectPlans)
+	if !ok {
+		return automaticExperimentReviewResult{}, nil
+	}
+
+	summaries, err := s.store.ListProjectTrainingRunSummaries(project.ID)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	recommendation := agents.NewExperimentReviewer().Review(project, latestPlan, summaries)
+	if recommendation.DecisionType == decisions.TypeWait {
+		return automaticExperimentReviewResult{}, nil
+	}
+
+	agentDecisions, err := s.store.ListProjectAgentDecisions(project.ID)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	decision, ok := actionDecisionForPlan(agentDecisions, latestPlan.ID)
+	if !ok {
+		decision, err = s.store.CreateAgentDecision(
+			project.ID,
+			recommendation.PlanID,
+			recommendation.DecisionType,
+			recommendation.Rationale,
+			recommendation.Payload,
+		)
+		if err != nil {
+			return automaticExperimentReviewResult{}, err
+		}
+	}
+
+	result := automaticExperimentReviewResult{
+		Decision: &decision,
+	}
+
+	if decision.DecisionType != decisions.TypeAddExperiments {
+		return result, nil
+	}
+	if !s.shouldAutoScheduleFollowUps() {
+		return result, nil
+	}
+
+	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		result.FollowUpPlan = &existingPlan
+		return s.executeAutomaticFollowUpPlan(result)
+	}
+
+	maxRounds := s.maxAutoFollowUpRounds()
+	if followUpRoundCount(projectPlans) >= maxRounds {
+		log.Printf(
+			"automatic follow-up scheduling skipped for project %s plan %s: max follow-up rounds reached (%d)",
+			project.ID,
+			latestPlan.ID,
+			maxRounds,
+		)
+		return result, nil
+	}
+
+	followUpPlan, _, err := s.ensureFollowUpPlan(project.ID, latestPlan, decision)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	result.FollowUpPlan = &followUpPlan
+	return s.executeAutomaticFollowUpPlan(result)
+}
+
+func (s *Server) executeAutomaticFollowUpPlan(result automaticExperimentReviewResult) (automaticExperimentReviewResult, error) {
+	if result.FollowUpPlan == nil || !s.shouldAutoExecuteExperimentPlans() {
+		return result, nil
+	}
+
+	execution, err := s.executeStoredExperimentPlan(result.FollowUpPlan.ID, s.defaultExecuteExperimentPlanRequest())
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	result.Jobs = execution.Jobs
+	return result, nil
+}
+
+func actionDecisionForPlan(agentDecisions []decisions.AgentDecision, planID string) (decisions.AgentDecision, bool) {
+	for _, decision := range agentDecisions {
+		if decision.PlanID == planID && decision.DecisionType != decisions.TypeWait {
+			return decision, true
+		}
+	}
+
+	return decisions.AgentDecision{}, false
+}
+
+func followUpRoundCount(projectPlans []plans.ExperimentPlan) int {
+	count := 0
+	for _, plan := range projectPlans {
+		if plan.SourceDecisionID != "" {
+			count++
+		}
+	}
+
+	return count
+}
+
 func (s *Server) listProjectAgentDecisions(c *gin.Context) {
 	agentDecisions, err := s.store.ListProjectAgentDecisions(c.Param("id"))
 	if err != nil {
@@ -469,6 +642,7 @@ func (s *Server) completeJob(c *gin.Context) {
 			writeStoreError(c, err)
 			return
 		}
+		s.runAutomaticExperimentReviewAfterTrainingJob(job)
 	}
 
 	c.JSON(http.StatusOK, job)
@@ -493,9 +667,16 @@ func (s *Server) failJob(c *gin.Context) {
 			writeStoreError(c, err)
 			return
 		}
+		s.runAutomaticExperimentReviewAfterTrainingJob(job)
 	}
 
 	c.JSON(http.StatusOK, job)
+}
+
+func (s *Server) runAutomaticExperimentReviewAfterTrainingJob(job jobs.ExperimentJob) {
+	if _, err := s.runAutomaticExperimentReview(job.ProjectID); err != nil {
+		log.Printf("automatic experiment review failed after training job %s: %v", job.ID, err)
+	}
 }
 
 func (s *Server) listWorkers(c *gin.Context) {
@@ -706,8 +887,8 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 		return err
 	}
 
-	if shouldAutoExecuteExperimentPlans() {
-		_, err = s.executeStoredExperimentPlan(plan.ID, defaultExecuteExperimentPlanRequest())
+	if s.shouldAutoExecuteExperimentPlans() {
+		_, err = s.executeStoredExperimentPlan(plan.ID, s.defaultExecuteExperimentPlanRequest())
 		return err
 	}
 
@@ -894,28 +1075,127 @@ func estimateFollowUpMinutes(experiments []plans.PlannedExperiment) int {
 	return max(5, maxEpochs*6)
 }
 
-func defaultExecuteExperimentPlanRequest() executeExperimentPlanRequest {
-	provider := os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER")
+func automationSettingsFromEnv() settings.AutomationSettings {
+	defaultProvider := os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER")
+	if defaultProvider == "" {
+		defaultProvider = "local"
+	}
+
+	return settings.AutomationSettings{
+		AutoReviewExperiments:   envFlag("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", false),
+		AutoScheduleFollowUps:   envFlag("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", false),
+		AutoExecutePlans:        envFlag("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER") != ""),
+		MaxFollowUpRounds:       maxAutoFollowUpRoundsFromEnv(),
+		DefaultTrainingProvider: defaultProvider,
+		DefaultGPUType:          os.Getenv("MODEL_EXPRESS_DEFAULT_GPU_TYPE"),
+		UpdatedAt:               time.Now().UTC(),
+	}
+}
+
+func (s *Server) currentAutomationSettings() settings.AutomationSettings {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+
+	return s.automationSettings
+}
+
+func (s *Server) setAutomationSettings(automationSettings settings.AutomationSettings) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+
+	s.automationSettings = automationSettings
+}
+
+func applyAutomationSettingsUpdate(current settings.AutomationSettings, update settings.AutomationSettingsUpdate) (settings.AutomationSettings, error) {
+	if update.AutoReviewExperiments != nil {
+		current.AutoReviewExperiments = *update.AutoReviewExperiments
+	}
+	if update.AutoScheduleFollowUps != nil {
+		current.AutoScheduleFollowUps = *update.AutoScheduleFollowUps
+	}
+	if update.AutoExecutePlans != nil {
+		current.AutoExecutePlans = *update.AutoExecutePlans
+	}
+	if update.MaxFollowUpRounds != nil {
+		if *update.MaxFollowUpRounds < 0 {
+			return settings.AutomationSettings{}, fmt.Errorf("%w: max_followup_rounds must be at least 0", store.ErrInvalidRequest)
+		}
+		current.MaxFollowUpRounds = *update.MaxFollowUpRounds
+	}
+	if update.DefaultTrainingProvider != nil {
+		current.DefaultTrainingProvider = strings.ToLower(strings.TrimSpace(*update.DefaultTrainingProvider))
+		if current.DefaultTrainingProvider == "" {
+			current.DefaultTrainingProvider = "local"
+		}
+	}
+	if update.DefaultGPUType != nil {
+		current.DefaultGPUType = strings.TrimSpace(*update.DefaultGPUType)
+	}
+
+	return current, nil
+}
+
+func (s *Server) defaultExecuteExperimentPlanRequest() executeExperimentPlanRequest {
+	automationSettings := s.currentAutomationSettings()
+	provider := automationSettings.DefaultTrainingProvider
 	if provider == "" {
 		provider = "local"
 	}
 
 	return executeExperimentPlanRequest{
 		Provider: provider,
-		GPUType:  os.Getenv("MODEL_EXPRESS_DEFAULT_GPU_TYPE"),
+		GPUType:  automationSettings.DefaultGPUType,
 	}
 }
 
-func shouldAutoExecuteExperimentPlans() bool {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS")))
-	switch value {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
+func (s *Server) shouldAutoReviewExperimentJobs() bool {
+	return s.currentAutomationSettings().AutoReviewExperiments
+}
+
+func (s *Server) shouldAutoScheduleFollowUps() bool {
+	return s.currentAutomationSettings().AutoScheduleFollowUps
+}
+
+func maxAutoFollowUpRoundsFromEnv() int {
+	value := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS"))
+	if value == "" {
+		return 2
 	}
 
-	return os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER") != ""
+	rounds, err := strconv.Atoi(value)
+	if err != nil || rounds < 0 {
+		return 2
+	}
+
+	return rounds
+}
+
+func (s *Server) maxAutoFollowUpRounds() int {
+	return s.currentAutomationSettings().MaxFollowUpRounds
+}
+
+func (s *Server) shouldAutoExecuteExperimentPlans() bool {
+	return s.currentAutomationSettings().AutoExecutePlans
+}
+
+func envFlag(name string, defaultValue bool) bool {
+	if value, ok := envFlagValue(name); ok {
+		return value
+	}
+
+	return defaultValue
+}
+
+func envFlagValue(name string) (bool, bool) {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	}
+
+	return false, false
 }
 
 func bindJSON(c *gin.Context, value any) bool {

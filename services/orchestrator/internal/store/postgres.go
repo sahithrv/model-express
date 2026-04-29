@@ -17,6 +17,7 @@ import (
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
+	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -739,6 +740,51 @@ func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) GetAutomationSettings() (settings.AutomationSettings, error) {
+	const query = `
+		SELECT auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, updated_at
+		FROM automation_settings
+		WHERE singleton = true
+	`
+
+	return scanAutomationSettings(s.db.QueryRowContext(context.Background(), query))
+}
+
+func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.AutomationSettings) (settings.AutomationSettings, error) {
+	const query = `
+		INSERT INTO automation_settings (
+			singleton,
+			auto_review_experiments,
+			auto_schedule_followups,
+			auto_execute_plans,
+			max_followup_rounds,
+			default_training_provider,
+			default_gpu_type
+		)
+		VALUES (true, $1, $2, $3, $4, $5, $6)
+		ON CONFLICT (singleton) DO UPDATE SET
+			auto_review_experiments = EXCLUDED.auto_review_experiments,
+			auto_schedule_followups = EXCLUDED.auto_schedule_followups,
+			auto_execute_plans = EXCLUDED.auto_execute_plans,
+			max_followup_rounds = EXCLUDED.max_followup_rounds,
+			default_training_provider = EXCLUDED.default_training_provider,
+			default_gpu_type = EXCLUDED.default_gpu_type,
+			updated_at = now()
+		RETURNING auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, updated_at
+	`
+
+	return scanAutomationSettings(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		automationSettings.AutoReviewExperiments,
+		automationSettings.AutoScheduleFollowUps,
+		automationSettings.AutoExecutePlans,
+		automationSettings.MaxFollowUpRounds,
+		automationSettings.DefaultTrainingProvider,
+		automationSettings.DefaultGPUType,
+	))
+}
+
 func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return plans.ExperimentPlan{}, err
@@ -1126,6 +1172,23 @@ func scanAgentDecision(row rowScanner) (decisions.AgentDecision, error) {
 	}
 
 	return decision, nil
+}
+
+func scanAutomationSettings(row rowScanner) (settings.AutomationSettings, error) {
+	var automationSettings settings.AutomationSettings
+	if err := row.Scan(
+		&automationSettings.AutoReviewExperiments,
+		&automationSettings.AutoScheduleFollowUps,
+		&automationSettings.AutoExecutePlans,
+		&automationSettings.MaxFollowUpRounds,
+		&automationSettings.DefaultTrainingProvider,
+		&automationSettings.DefaultGPUType,
+		&automationSettings.UpdatedAt,
+	); err != nil {
+		return settings.AutomationSettings{}, normalizeSQLError(err)
+	}
+
+	return automationSettings, nil
 }
 
 func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {

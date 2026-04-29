@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS agent_decisions (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS automation_settings (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  auto_review_experiments boolean NOT NULL DEFAULT false,
+  auto_schedule_followups boolean NOT NULL DEFAULT false,
+  auto_execute_plans boolean NOT NULL DEFAULT false,
+  max_followup_rounds integer NOT NULL DEFAULT 2,
+  default_training_provider text NOT NULL DEFAULT 'local',
+  default_gpu_type text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_id ON experiment_jobs(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_epoch_metrics_job_id ON epoch_metrics(job_id);

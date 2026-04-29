@@ -651,6 +651,88 @@ button {
   min-height: 86px;
 }
 
+.settings-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.toggle-row,
+.setting-field {
+  min-height: 68px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  background: #101715;
+}
+
+.toggle-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+}
+
+.toggle-row input {
+  width: 20px;
+  height: 20px;
+  accent-color: #00d47e;
+}
+
+.toggle-row span,
+.setting-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.toggle-row strong {
+  color: #fbfffc;
+}
+
+.toggle-row small,
+.setting-field span,
+.settings-actions small {
+  color: #77837d;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.setting-field {
+  align-content: center;
+  padding: 10px;
+}
+
+.setting-field input,
+.setting-field select {
+  width: 100%;
+  border: 1px solid #22302b;
+  border-radius: 7px;
+  padding: 8px 9px;
+  color: #eef3f0;
+  background: #0d1412;
+  outline: none;
+}
+
+.setting-field input:focus,
+.setting-field select:focus {
+  border-color: rgba(0, 212, 126, 0.74);
+  box-shadow: 0 0 0 3px rgba(0, 212, 126, 0.1);
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .job-panel-head {
   display: flex;
   align-items: center;
