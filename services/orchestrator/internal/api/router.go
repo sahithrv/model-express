@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 )
@@ -37,6 +38,10 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/projects/:id/review-experiments", server.reviewProjectExperiments)
 	router.POST("/projects/:id/schedule-follow-up-experiments", server.scheduleFollowUpExperiments)
 	router.GET("/projects/:id/agent-decisions", server.listProjectAgentDecisions)
+	router.GET("/projects/:id/agent-memory", server.listProjectAgentMemoryRecords)
+	router.GET("/projects/:id/agent-invocations", server.listProjectAgentInvocations)
+	router.GET("/projects/:id/worker-requirements", server.listProjectWorkerRequirements)
+	router.GET("/projects/:id/execution-events", server.listProjectExecutionEvents)
 	router.GET("/projects/:id/workers", server.listProjectWorkers)
 	router.POST("/projects/:id/plans", server.createExperimentPlan)
 	router.GET("/projects/:id/plans", server.listProjectPlans)
@@ -53,6 +58,8 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/jobs/:id/training-run-summary", server.getTrainingRunSummary)
 	router.POST("/jobs/:id/complete", server.completeJob)
 	router.POST("/jobs/:id/fail", server.failJob)
+
+	router.PATCH("/worker-requirements/:id", server.updateWorkerRequirement)
 
 	router.GET("/workers", server.listWorkers)
 	router.POST("/workers/register", server.registerWorker)
@@ -71,6 +78,10 @@ func newServer(store store.Store) *Server {
 
 	if automationSettings, err := store.GetAutomationSettings(); err == nil {
 		server.automationSettings = automationSettings
+	}
+	server.automationSettings.AgentMode = llm.NormalizeAgentMode(server.automationSettings.AgentMode)
+	if server.automationSettings.LLMProvider == "" {
+		server.automationSettings.LLMProvider = llm.ProviderOpenAI
 	}
 
 	return server

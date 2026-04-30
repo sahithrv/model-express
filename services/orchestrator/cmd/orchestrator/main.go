@@ -5,14 +5,23 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"model-express/services/orchestrator/internal/api"
+	"model-express/services/orchestrator/internal/config"
 	"model-express/services/orchestrator/internal/store"
 )
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	repoRoot := os.Getenv("MODEL_EXPRESS_ROOT")
+	if repoRoot == "" {
+		repoRoot = filepath.Clean(filepath.Join("..", ".."))
+	}
+	if err := config.LoadRepoEnv(repoRoot); err != nil {
+		logger.Warn("failed to load repo env files", "error", err)
+	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {

@@ -1084,6 +1084,97 @@ button {
   white-space: nowrap;
 }
 
+.automation-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 14px;
+}
+
+.automation-block,
+.memory-list,
+.status-list,
+.event-list {
+  display: grid;
+  gap: 9px;
+}
+
+.automation-block > strong {
+  color: #fbfffc;
+  font-size: 13px;
+}
+
+.status-row,
+.event-row,
+.memory-row {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  padding: 10px;
+  background: #070c0b;
+}
+
+.status-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.status-row span,
+.event-row span,
+.memory-row span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.status-row small,
+.event-row small,
+.memory-row small {
+  overflow: hidden;
+  color: #77837d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event-row {
+  grid-template-columns: 170px minmax(0, 1fr);
+  align-items: center;
+}
+
+.event-row strong,
+.memory-row strong {
+  overflow: hidden;
+  color: #dce7e2;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memory-row p {
+  margin: 0;
+  color: #dce7e2;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-list small {
+  border: 1px solid #223029;
+  border-radius: 999px;
+  padding: 4px 7px;
+  background: #101715;
+}
+
+.empty.compact {
+  min-height: 54px;
+}
+
 .badge.wait {
   color: #7db7ff;
   background: rgba(125, 183, 255, 0.13);
@@ -1100,6 +1191,32 @@ button {
 }
 
 .badge.stop_project {
+  color: #ff6875;
+  background: rgba(255, 104, 117, 0.13);
+}
+
+.badge.pending,
+.badge.workers_required,
+.badge.jobs_queued {
+  color: #ffd166;
+  background: rgba(255, 209, 102, 0.13);
+}
+
+.badge.starting,
+.badge.workers_starting {
+  color: #7db7ff;
+  background: rgba(125, 183, 255, 0.13);
+}
+
+.badge.active,
+.badge.workers_active,
+.badge.agent_recommendation_recorded {
+  color: #00d47e;
+  background: rgba(0, 212, 126, 0.13);
+}
+
+.badge.execution_failed,
+.badge.cancelled {
   color: #ff6875;
   background: rgba(255, 104, 117, 0.13);
 }

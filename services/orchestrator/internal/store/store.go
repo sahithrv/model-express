@@ -5,7 +5,9 @@ import (
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -53,6 +55,17 @@ type Store interface {
 
 	GetAutomationSettings() (settings.AutomationSettings, error)
 	SaveAutomationSettings(automationSettings settings.AutomationSettings) (settings.AutomationSettings, error)
+
+	UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string) (execution.WorkerRequirement, bool, error)
+	ListProjectWorkerRequirements(projectID string) ([]execution.WorkerRequirement, error)
+	UpdateWorkerRequirement(id string, update execution.WorkerRequirementUpdate) (execution.WorkerRequirement, error)
+	CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error)
+	ListProjectExecutionEvents(projectID string, limit int) ([]execution.ExecutionEvent, error)
+
+	CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error)
+	ListProjectAgentMemoryRecords(projectID string, filter memory.AgentMemoryFilter) ([]memory.AgentMemoryRecord, error)
+	CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error)
+	ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error)
 
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)

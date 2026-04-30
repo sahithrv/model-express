@@ -25,3 +25,11 @@ type AgentDecisionRecommendation struct {
 	Rationale    string         `json:"rationale"`
 	Payload      map[string]any `json:"payload"`
 }
+
+type AgentActionProposal struct {
+	ActionType       string         `json:"action_type"`
+	Confidence       float64        `json:"confidence"`
+	Rationale        string         `json:"rationale"`
+	Payload          map[string]any `json:"payload"`
+	RequiresApproval bool           `json:"requires_approval"`
+}

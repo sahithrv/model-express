@@ -99,6 +99,68 @@ export type AgentDecision = {
   created_at: string;
 };
 
+export type WorkerRequirement = {
+  id: string;
+  project_id: string;
+  plan_id: string;
+  provider: string;
+  gpu_type: string;
+  target_count: number;
+  status: string;
+  source: string;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ExecutionEvent = {
+  id: string;
+  project_id: string;
+  plan_id?: string;
+  event_type: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type AgentMemoryRecord = {
+  id: string;
+  invocation_id?: string;
+  project_id: string;
+  dataset_id?: string;
+  plan_id?: string;
+  job_id?: string;
+  agent_name: string;
+  kind: string;
+  summary: string;
+  payload: Record<string, unknown>;
+  tags: string[];
+  created_at: string;
+};
+
+export type AgentInvocation = {
+  id: string;
+  project_id: string;
+  dataset_id?: string;
+  plan_id?: string;
+  job_id?: string;
+  agent_name: string;
+  agent_version?: string;
+  prompt_version?: string;
+  provider?: string;
+  model?: string;
+  input_messages: Array<Record<string, string>>;
+  input_context: Record<string, unknown>;
+  raw_output: string;
+  parsed_output: Record<string, unknown>;
+  validation_status: string;
+  validation_error?: string;
+  accepted_for_memory: boolean;
+  human_feedback: Record<string, unknown>;
+  downstream_outcome: Record<string, unknown>;
+  created_at: string;
+};
+
 export type EpochMetric = {
   job_id: string;
   epoch: number;
@@ -119,5 +181,9 @@ export type AutomationSettings = {
   max_followup_rounds: number;
   default_training_provider: string;
   default_gpu_type: string;
+  llm_enabled: boolean;
+  agent_mode: string;
+  llm_provider: string;
+  llm_model: string;
   updated_at: string;
 };

@@ -4,6 +4,10 @@ CREATE SEQUENCE IF NOT EXISTS worker_id_seq;
 CREATE SEQUENCE IF NOT EXISTS job_id_seq;
 CREATE SEQUENCE IF NOT EXISTS experiment_plan_id_seq;
 CREATE SEQUENCE IF NOT EXISTS agent_decision_id_seq;
+CREATE SEQUENCE IF NOT EXISTS worker_requirement_id_seq;
+CREATE SEQUENCE IF NOT EXISTS execution_event_id_seq;
+CREATE SEQUENCE IF NOT EXISTS agent_memory_id_seq;
+CREATE SEQUENCE IF NOT EXISTS agent_invocation_id_seq;
 
 CREATE TABLE IF NOT EXISTS projects (
   id text PRIMARY KEY DEFAULT 'project_' || nextval('project_id_seq'),
@@ -117,8 +121,82 @@ CREATE TABLE IF NOT EXISTS automation_settings (
   max_followup_rounds integer NOT NULL DEFAULT 2,
   default_training_provider text NOT NULL DEFAULT 'local',
   default_gpu_type text NOT NULL DEFAULT '',
+  llm_enabled boolean NOT NULL DEFAULT false,
+  agent_mode text NOT NULL DEFAULT 'propose',
+  llm_provider text NOT NULL DEFAULT 'openai',
+  llm_model text NOT NULL DEFAULT '',
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS llm_enabled boolean NOT NULL DEFAULT false;
+ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS agent_mode text NOT NULL DEFAULT 'propose';
+ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS llm_provider text NOT NULL DEFAULT 'openai';
+ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS llm_model text NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS worker_requirements (
+  id text PRIMARY KEY DEFAULT 'worker_requirement_' || nextval('worker_requirement_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  plan_id text NOT NULL DEFAULT '',
+  provider text NOT NULL DEFAULT 'local',
+  gpu_type text NOT NULL DEFAULT '',
+  target_count integer NOT NULL DEFAULT 1,
+  status text NOT NULL DEFAULT 'PENDING',
+  source text NOT NULL DEFAULT '',
+  last_error text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(project_id, plan_id)
+);
+
+CREATE TABLE IF NOT EXISTS execution_events (
+  id text PRIMARY KEY DEFAULT 'execution_event_' || nextval('execution_event_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  plan_id text NOT NULL DEFAULT '',
+  event_type text NOT NULL,
+  message text NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS agent_invocations (
+  id text PRIMARY KEY DEFAULT 'agent_invocation_' || nextval('agent_invocation_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  dataset_id text NOT NULL DEFAULT '',
+  plan_id text NOT NULL DEFAULT '',
+  job_id text NOT NULL DEFAULT '',
+  agent_name text NOT NULL,
+  agent_version text NOT NULL DEFAULT '',
+  prompt_version text NOT NULL DEFAULT '',
+  provider text NOT NULL DEFAULT '',
+  model text NOT NULL DEFAULT '',
+  input_messages jsonb NOT NULL DEFAULT '[]'::jsonb,
+  input_context jsonb NOT NULL DEFAULT '{}'::jsonb,
+  raw_output text NOT NULL DEFAULT '',
+  parsed_output jsonb NOT NULL DEFAULT '{}'::jsonb,
+  validation_status text NOT NULL DEFAULT '',
+  validation_error text NOT NULL DEFAULT '',
+  accepted_for_memory boolean NOT NULL DEFAULT false,
+  human_feedback jsonb NOT NULL DEFAULT '{}'::jsonb,
+  downstream_outcome jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS agent_memory_records (
+  id text PRIMARY KEY DEFAULT 'memory_' || nextval('agent_memory_id_seq'),
+  invocation_id text NOT NULL DEFAULT '',
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  dataset_id text NOT NULL DEFAULT '',
+  plan_id text NOT NULL DEFAULT '',
+  job_id text NOT NULL DEFAULT '',
+  agent_name text NOT NULL,
+  kind text NOT NULL,
+  summary text NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  tags jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE agent_memory_records ADD COLUMN IF NOT EXISTS invocation_id text NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_id ON experiment_jobs(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_jobs(status, created_at);
@@ -130,3 +208,14 @@ CREATE INDEX IF NOT EXISTS idx_training_run_summaries_project_id ON training_run
 CREATE INDEX IF NOT EXISTS idx_training_run_summaries_plan_id ON training_run_summaries(plan_id);
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_project_id ON agent_decisions(project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_plan_id ON agent_decisions(plan_id);
+CREATE INDEX IF NOT EXISTS idx_worker_requirements_project_id ON worker_requirements(project_id);
+CREATE INDEX IF NOT EXISTS idx_worker_requirements_status ON worker_requirements(status);
+CREATE INDEX IF NOT EXISTS idx_execution_events_project_id ON execution_events(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_invocations_project_id ON agent_invocations(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_invocations_dataset_id ON agent_invocations(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_agent_invocations_agent_name ON agent_invocations(agent_name);
+CREATE INDEX IF NOT EXISTS idx_agent_invocations_job_id ON agent_invocations(job_id);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_project_id ON agent_memory_records(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_dataset_id ON agent_memory_records(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_kind ON agent_memory_records(kind);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_invocation_id ON agent_memory_records(invocation_id);

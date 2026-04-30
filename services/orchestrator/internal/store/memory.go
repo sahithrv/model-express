@@ -8,7 +8,9 @@ import (
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -28,19 +30,27 @@ type MemoryStore struct {
 	plans              map[string]plans.ExperimentPlan
 	summaries          map[string]runs.TrainingRunSummary
 	decisions          map[string]decisions.AgentDecision
+	workerRequirements map[string]execution.WorkerRequirement
+	executionEvents    map[string]execution.ExecutionEvent
+	agentMemoryRecords map[string]memory.AgentMemoryRecord
+	agentInvocations   map[string]memory.AgentInvocation
 	automationSettings *settings.AutomationSettings
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		projects:  make(map[string]projects.Project),
-		datasets:  make(map[string]datasets.Dataset),
-		workers:   make(map[string]workers.Worker),
-		jobs:      make(map[string]jobs.ExperimentJob),
-		metrics:   make(map[string][]jobs.EpochMetric),
-		plans:     make(map[string]plans.ExperimentPlan),
-		summaries: make(map[string]runs.TrainingRunSummary),
-		decisions: make(map[string]decisions.AgentDecision),
+		projects:           make(map[string]projects.Project),
+		datasets:           make(map[string]datasets.Dataset),
+		workers:            make(map[string]workers.Worker),
+		jobs:               make(map[string]jobs.ExperimentJob),
+		metrics:            make(map[string][]jobs.EpochMetric),
+		plans:              make(map[string]plans.ExperimentPlan),
+		summaries:          make(map[string]runs.TrainingRunSummary),
+		decisions:          make(map[string]decisions.AgentDecision),
+		workerRequirements: make(map[string]execution.WorkerRequirement),
+		executionEvents:    make(map[string]execution.ExecutionEvent),
+		agentMemoryRecords: make(map[string]memory.AgentMemoryRecord),
+		agentInvocations:   make(map[string]memory.AgentInvocation),
 	}
 }
 
@@ -489,6 +499,234 @@ func (s *MemoryStore) SaveAutomationSettings(automationSettings settings.Automat
 	return automationSettings, nil
 }
 
+func (s *MemoryStore) UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string) (execution.WorkerRequirement, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return execution.WorkerRequirement{}, false, ErrNotFound
+	}
+	if targetCount < 1 {
+		return execution.WorkerRequirement{}, false, fmt.Errorf("%w: target_count must be at least 1", ErrInvalidRequest)
+	}
+
+	now := time.Now().UTC()
+	for id, requirement := range s.workerRequirements {
+		if requirement.ProjectID == projectID && requirement.PlanID == planID {
+			requirement.Provider = provider
+			requirement.GPUType = gpuType
+			requirement.TargetCount = targetCount
+			requirement.Source = source
+			requirement.UpdatedAt = now
+			s.workerRequirements[id] = requirement
+			return requirement, false, nil
+		}
+	}
+
+	requirement := execution.WorkerRequirement{
+		ID:          s.newID("worker_requirement"),
+		ProjectID:   projectID,
+		PlanID:      planID,
+		Provider:    provider,
+		GPUType:     gpuType,
+		TargetCount: targetCount,
+		Status:      execution.WorkerRequirementPending,
+		Source:      source,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	s.workerRequirements[requirement.ID] = requirement
+	return requirement, true, nil
+}
+
+func (s *MemoryStore) ListProjectWorkerRequirements(projectID string) ([]execution.WorkerRequirement, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+
+	out := []execution.WorkerRequirement{}
+	for _, requirement := range s.workerRequirements {
+		if requirement.ProjectID == projectID {
+			out = append(out, requirement)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out, nil
+}
+
+func (s *MemoryStore) UpdateWorkerRequirement(id string, update execution.WorkerRequirementUpdate) (execution.WorkerRequirement, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	requirement, ok := s.workerRequirements[id]
+	if !ok {
+		return execution.WorkerRequirement{}, ErrNotFound
+	}
+	if update.Status != nil {
+		requirement.Status = *update.Status
+	}
+	if update.LastError != nil {
+		requirement.LastError = *update.LastError
+	}
+	requirement.UpdatedAt = time.Now().UTC()
+	s.workerRequirements[id] = requirement
+	return requirement, nil
+}
+
+func (s *MemoryStore) CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return execution.ExecutionEvent{}, ErrNotFound
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+
+	event := execution.ExecutionEvent{
+		ID:        s.newID("execution_event"),
+		ProjectID: projectID,
+		PlanID:    planID,
+		EventType: eventType,
+		Message:   message,
+		Payload:   payload,
+		CreatedAt: time.Now().UTC(),
+	}
+	s.executionEvents[event.ID] = event
+	return event, nil
+}
+
+func (s *MemoryStore) ListProjectExecutionEvents(projectID string, limit int) ([]execution.ExecutionEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+
+	out := []execution.ExecutionEvent{}
+	for _, event := range s.executionEvents {
+		if event.ProjectID == projectID {
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[record.ProjectID]; !ok {
+		return memory.AgentMemoryRecord{}, ErrNotFound
+	}
+	if record.Payload == nil {
+		record.Payload = map[string]any{}
+	}
+	if record.Tags == nil {
+		record.Tags = []string{}
+	}
+	record.ID = s.newID("memory")
+	record.CreatedAt = time.Now().UTC()
+	s.agentMemoryRecords[record.ID] = record
+	return record, nil
+}
+
+func (s *MemoryStore) ListProjectAgentMemoryRecords(projectID string, filter memory.AgentMemoryFilter) ([]memory.AgentMemoryRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = 25
+	}
+
+	out := []memory.AgentMemoryRecord{}
+	for _, record := range s.agentMemoryRecords {
+		if record.ProjectID == projectID && memoryRecordMatchesFilter(record, filter) {
+			out = append(out, record)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[invocation.ProjectID]; !ok {
+		return memory.AgentInvocation{}, ErrNotFound
+	}
+	if invocation.InputMessages == nil {
+		invocation.InputMessages = []map[string]string{}
+	}
+	if invocation.InputContext == nil {
+		invocation.InputContext = map[string]any{}
+	}
+	if invocation.ParsedOutput == nil {
+		invocation.ParsedOutput = map[string]any{}
+	}
+	if invocation.HumanFeedback == nil {
+		invocation.HumanFeedback = map[string]any{}
+	}
+	if invocation.DownstreamOutcome == nil {
+		invocation.DownstreamOutcome = map[string]any{}
+	}
+	invocation.ID = s.newID("agent_invocation")
+	invocation.CreatedAt = time.Now().UTC()
+	s.agentInvocations[invocation.ID] = invocation
+	return invocation, nil
+}
+
+func (s *MemoryStore) ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = 25
+	}
+
+	out := []memory.AgentInvocation{}
+	for _, invocation := range s.agentInvocations {
+		if invocation.ProjectID == projectID && agentInvocationMatchesFilter(invocation, filter) {
+			out = append(out, invocation)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
 func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -711,4 +949,36 @@ func applyTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, update runs
 func memoryConfigString(config map[string]any, key string) string {
 	value, _ := config[key].(string)
 	return value
+}
+
+func memoryRecordMatchesFilter(record memory.AgentMemoryRecord, filter memory.AgentMemoryFilter) bool {
+	if filter.DatasetID != "" && record.DatasetID != filter.DatasetID {
+		return false
+	}
+	if filter.PlanID != "" && record.PlanID != filter.PlanID {
+		return false
+	}
+	if filter.JobID != "" && record.JobID != filter.JobID {
+		return false
+	}
+	if filter.Kind != "" && record.Kind != filter.Kind {
+		return false
+	}
+	return true
+}
+
+func agentInvocationMatchesFilter(invocation memory.AgentInvocation, filter memory.AgentInvocationFilter) bool {
+	if filter.DatasetID != "" && invocation.DatasetID != filter.DatasetID {
+		return false
+	}
+	if filter.PlanID != "" && invocation.PlanID != filter.PlanID {
+		return false
+	}
+	if filter.JobID != "" && invocation.JobID != filter.JobID {
+		return false
+	}
+	if filter.AgentName != "" && invocation.AgentName != filter.AgentName {
+		return false
+	}
+	return true
 }

@@ -13,7 +13,9 @@ import (
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -742,7 +744,7 @@ func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions
 
 func (s *PostgresStore) GetAutomationSettings() (settings.AutomationSettings, error) {
 	const query = `
-		SELECT auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, updated_at
+		SELECT auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, llm_enabled, agent_mode, llm_provider, llm_model, updated_at
 		FROM automation_settings
 		WHERE singleton = true
 	`
@@ -759,9 +761,13 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 			auto_execute_plans,
 			max_followup_rounds,
 			default_training_provider,
-			default_gpu_type
+			default_gpu_type,
+			llm_enabled,
+			agent_mode,
+			llm_provider,
+			llm_model
 		)
-		VALUES (true, $1, $2, $3, $4, $5, $6)
+		VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (singleton) DO UPDATE SET
 			auto_review_experiments = EXCLUDED.auto_review_experiments,
 			auto_schedule_followups = EXCLUDED.auto_schedule_followups,
@@ -769,8 +775,12 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 			max_followup_rounds = EXCLUDED.max_followup_rounds,
 			default_training_provider = EXCLUDED.default_training_provider,
 			default_gpu_type = EXCLUDED.default_gpu_type,
+			llm_enabled = EXCLUDED.llm_enabled,
+			agent_mode = EXCLUDED.agent_mode,
+			llm_provider = EXCLUDED.llm_provider,
+			llm_model = EXCLUDED.llm_model,
 			updated_at = now()
-		RETURNING auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, updated_at
+		RETURNING auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, llm_enabled, agent_mode, llm_provider, llm_model, updated_at
 	`
 
 	return scanAutomationSettings(s.db.QueryRowContext(
@@ -782,7 +792,382 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 		automationSettings.MaxFollowUpRounds,
 		automationSettings.DefaultTrainingProvider,
 		automationSettings.DefaultGPUType,
+		automationSettings.LLMEnabled,
+		automationSettings.AgentMode,
+		automationSettings.LLMProvider,
+		automationSettings.LLMModel,
 	))
+}
+
+func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string) (execution.WorkerRequirement, bool, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return execution.WorkerRequirement{}, false, err
+	}
+	if targetCount < 1 {
+		return execution.WorkerRequirement{}, false, fmt.Errorf("%w: target_count must be at least 1", ErrInvalidRequest)
+	}
+
+	existing, err := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), `
+		SELECT id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+		FROM worker_requirements
+		WHERE project_id = $1 AND plan_id = $2
+	`, projectID, planID))
+	if err == nil {
+		const updateQuery = `
+			UPDATE worker_requirements
+			SET provider = $1, gpu_type = $2, target_count = $3, source = $4, updated_at = now()
+			WHERE id = $5
+			RETURNING id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+		`
+		requirement, updateErr := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), updateQuery, provider, gpuType, targetCount, source, existing.ID))
+		return requirement, false, updateErr
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return execution.WorkerRequirement{}, false, err
+	}
+
+	const insertQuery = `
+		INSERT INTO worker_requirements (project_id, plan_id, provider, gpu_type, target_count, status, source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+	`
+	requirement, err := scanWorkerRequirement(s.db.QueryRowContext(
+		context.Background(),
+		insertQuery,
+		projectID,
+		planID,
+		provider,
+		gpuType,
+		targetCount,
+		execution.WorkerRequirementPending,
+		source,
+	))
+	return requirement, true, err
+}
+
+func (s *PostgresStore) ListProjectWorkerRequirements(projectID string) ([]execution.WorkerRequirement, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+
+	const query = `
+		SELECT id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+		FROM worker_requirements
+		WHERE project_id = $1
+		ORDER BY updated_at DESC
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []execution.WorkerRequirement{}
+	for rows.Next() {
+		requirement, err := scanWorkerRequirement(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, requirement)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) UpdateWorkerRequirement(id string, update execution.WorkerRequirementUpdate) (execution.WorkerRequirement, error) {
+	requirement, err := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), `
+		SELECT id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+		FROM worker_requirements
+		WHERE id = $1
+	`, id))
+	if err != nil {
+		return execution.WorkerRequirement{}, err
+	}
+	if update.Status != nil {
+		requirement.Status = *update.Status
+	}
+	if update.LastError != nil {
+		requirement.LastError = *update.LastError
+	}
+
+	const query = `
+		UPDATE worker_requirements
+		SET status = $1, last_error = $2, updated_at = now()
+		WHERE id = $3
+		RETURNING id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+	`
+	return scanWorkerRequirement(s.db.QueryRowContext(context.Background(), query, requirement.Status, requirement.LastError, id))
+}
+
+func (s *PostgresStore) CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return execution.ExecutionEvent{}, err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return execution.ExecutionEvent{}, fmt.Errorf("marshal execution event payload: %w", err)
+	}
+
+	const query = `
+		INSERT INTO execution_events (project_id, plan_id, event_type, message, payload)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, project_id, plan_id, event_type, message, payload, created_at
+	`
+	return scanExecutionEvent(s.db.QueryRowContext(context.Background(), query, projectID, planID, eventType, message, payloadJSON))
+}
+
+func (s *PostgresStore) ListProjectExecutionEvents(projectID string, limit int) ([]execution.ExecutionEvent, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+
+	const query = `
+		SELECT id, project_id, plan_id, event_type, message, payload, created_at
+		FROM execution_events
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []execution.ExecutionEvent{}
+	for rows.Next() {
+		event, err := scanExecutionEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error) {
+	if err := s.requireProject(invocation.ProjectID); err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	if invocation.InputMessages == nil {
+		invocation.InputMessages = []map[string]string{}
+	}
+	if invocation.InputContext == nil {
+		invocation.InputContext = map[string]any{}
+	}
+	if invocation.ParsedOutput == nil {
+		invocation.ParsedOutput = map[string]any{}
+	}
+	if invocation.HumanFeedback == nil {
+		invocation.HumanFeedback = map[string]any{}
+	}
+	if invocation.DownstreamOutcome == nil {
+		invocation.DownstreamOutcome = map[string]any{}
+	}
+
+	inputMessagesJSON, err := json.Marshal(invocation.InputMessages)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation input messages: %w", err)
+	}
+	inputContextJSON, err := json.Marshal(invocation.InputContext)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation input context: %w", err)
+	}
+	parsedOutputJSON, err := json.Marshal(invocation.ParsedOutput)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation parsed output: %w", err)
+	}
+	humanFeedbackJSON, err := json.Marshal(invocation.HumanFeedback)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation human feedback: %w", err)
+	}
+	downstreamOutcomeJSON, err := json.Marshal(invocation.DownstreamOutcome)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation downstream outcome: %w", err)
+	}
+
+	const query = `
+		INSERT INTO agent_invocations (
+			project_id,
+			dataset_id,
+			plan_id,
+			job_id,
+			agent_name,
+			agent_version,
+			prompt_version,
+			provider,
+			model,
+			input_messages,
+			input_context,
+			raw_output,
+			parsed_output,
+			validation_status,
+			validation_error,
+			accepted_for_memory,
+			human_feedback,
+			downstream_outcome
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		RETURNING id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+	`
+	return scanAgentInvocation(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		invocation.ProjectID,
+		invocation.DatasetID,
+		invocation.PlanID,
+		invocation.JobID,
+		invocation.AgentName,
+		invocation.AgentVersion,
+		invocation.PromptVersion,
+		invocation.Provider,
+		invocation.Model,
+		inputMessagesJSON,
+		inputContextJSON,
+		invocation.RawOutput,
+		parsedOutputJSON,
+		invocation.ValidationStatus,
+		invocation.ValidationError,
+		invocation.AcceptedForMemory,
+		humanFeedbackJSON,
+		downstreamOutcomeJSON,
+	))
+}
+
+func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = 25
+	}
+
+	const query = `
+		SELECT id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+		FROM agent_invocations
+		WHERE project_id = $1
+			AND ($2 = '' OR dataset_id = $2)
+			AND ($3 = '' OR plan_id = $3)
+			AND ($4 = '' OR job_id = $4)
+			AND ($5 = '' OR agent_name = $5)
+		ORDER BY created_at DESC
+		LIMIT $6
+	`
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		query,
+		projectID,
+		filter.DatasetID,
+		filter.PlanID,
+		filter.JobID,
+		filter.AgentName,
+		filter.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []memory.AgentInvocation{}
+	for rows.Next() {
+		invocation, err := scanAgentInvocation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, invocation)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error) {
+	if err := s.requireProject(record.ProjectID); err != nil {
+		return memory.AgentMemoryRecord{}, err
+	}
+	if record.Payload == nil {
+		record.Payload = map[string]any{}
+	}
+	if record.Tags == nil {
+		record.Tags = []string{}
+	}
+
+	payloadJSON, err := json.Marshal(record.Payload)
+	if err != nil {
+		return memory.AgentMemoryRecord{}, fmt.Errorf("marshal agent memory payload: %w", err)
+	}
+	tagsJSON, err := json.Marshal(record.Tags)
+	if err != nil {
+		return memory.AgentMemoryRecord{}, fmt.Errorf("marshal agent memory tags: %w", err)
+	}
+
+	const query = `
+		INSERT INTO agent_memory_records (invocation_id, project_id, dataset_id, plan_id, job_id, agent_name, kind, summary, payload, tags)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id, invocation_id, project_id, dataset_id, plan_id, job_id, agent_name, kind, summary, payload, tags, created_at
+	`
+	return scanAgentMemoryRecord(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		record.InvocationID,
+		record.ProjectID,
+		record.DatasetID,
+		record.PlanID,
+		record.JobID,
+		record.AgentName,
+		record.Kind,
+		record.Summary,
+		payloadJSON,
+		tagsJSON,
+	))
+}
+
+func (s *PostgresStore) ListProjectAgentMemoryRecords(projectID string, filter memory.AgentMemoryFilter) ([]memory.AgentMemoryRecord, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = 25
+	}
+
+	const query = `
+		SELECT id, invocation_id, project_id, dataset_id, plan_id, job_id, agent_name, kind, summary, payload, tags, created_at
+		FROM agent_memory_records
+		WHERE project_id = $1
+			AND ($2 = '' OR dataset_id = $2)
+			AND ($3 = '' OR plan_id = $3)
+			AND ($4 = '' OR job_id = $4)
+			AND ($5 = '' OR kind = $5)
+		ORDER BY created_at DESC
+		LIMIT $6
+	`
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		query,
+		projectID,
+		filter.DatasetID,
+		filter.PlanID,
+		filter.JobID,
+		filter.Kind,
+		filter.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []memory.AgentMemoryRecord{}
+	for rows.Next() {
+		record, err := scanAgentMemoryRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, record)
+	}
+	return out, rows.Err()
 }
 
 func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
@@ -1174,6 +1559,151 @@ func scanAgentDecision(row rowScanner) (decisions.AgentDecision, error) {
 	return decision, nil
 }
 
+func scanWorkerRequirement(row rowScanner) (execution.WorkerRequirement, error) {
+	var requirement execution.WorkerRequirement
+	if err := row.Scan(
+		&requirement.ID,
+		&requirement.ProjectID,
+		&requirement.PlanID,
+		&requirement.Provider,
+		&requirement.GPUType,
+		&requirement.TargetCount,
+		&requirement.Status,
+		&requirement.Source,
+		&requirement.LastError,
+		&requirement.CreatedAt,
+		&requirement.UpdatedAt,
+	); err != nil {
+		return execution.WorkerRequirement{}, normalizeSQLError(err)
+	}
+	return requirement, nil
+}
+
+func scanExecutionEvent(row rowScanner) (execution.ExecutionEvent, error) {
+	var event execution.ExecutionEvent
+	var payloadJSON []byte
+	if err := row.Scan(
+		&event.ID,
+		&event.ProjectID,
+		&event.PlanID,
+		&event.EventType,
+		&event.Message,
+		&payloadJSON,
+		&event.CreatedAt,
+	); err != nil {
+		return execution.ExecutionEvent{}, normalizeSQLError(err)
+	}
+	event.Payload = map[string]any{}
+	if len(payloadJSON) > 0 {
+		if err := json.Unmarshal(payloadJSON, &event.Payload); err != nil {
+			return execution.ExecutionEvent{}, fmt.Errorf("unmarshal execution event payload: %w", err)
+		}
+	}
+	return event, nil
+}
+
+func scanAgentMemoryRecord(row rowScanner) (memory.AgentMemoryRecord, error) {
+	var record memory.AgentMemoryRecord
+	var payloadJSON []byte
+	var tagsJSON []byte
+	if err := row.Scan(
+		&record.ID,
+		&record.InvocationID,
+		&record.ProjectID,
+		&record.DatasetID,
+		&record.PlanID,
+		&record.JobID,
+		&record.AgentName,
+		&record.Kind,
+		&record.Summary,
+		&payloadJSON,
+		&tagsJSON,
+		&record.CreatedAt,
+	); err != nil {
+		return memory.AgentMemoryRecord{}, normalizeSQLError(err)
+	}
+	record.Payload = map[string]any{}
+	if len(payloadJSON) > 0 {
+		if err := json.Unmarshal(payloadJSON, &record.Payload); err != nil {
+			return memory.AgentMemoryRecord{}, fmt.Errorf("unmarshal agent memory payload: %w", err)
+		}
+	}
+	record.Tags = []string{}
+	if len(tagsJSON) > 0 {
+		if err := json.Unmarshal(tagsJSON, &record.Tags); err != nil {
+			return memory.AgentMemoryRecord{}, fmt.Errorf("unmarshal agent memory tags: %w", err)
+		}
+	}
+	return record, nil
+}
+
+func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
+	var invocation memory.AgentInvocation
+	var inputMessagesJSON []byte
+	var inputContextJSON []byte
+	var parsedOutputJSON []byte
+	var humanFeedbackJSON []byte
+	var downstreamOutcomeJSON []byte
+
+	if err := row.Scan(
+		&invocation.ID,
+		&invocation.ProjectID,
+		&invocation.DatasetID,
+		&invocation.PlanID,
+		&invocation.JobID,
+		&invocation.AgentName,
+		&invocation.AgentVersion,
+		&invocation.PromptVersion,
+		&invocation.Provider,
+		&invocation.Model,
+		&inputMessagesJSON,
+		&inputContextJSON,
+		&invocation.RawOutput,
+		&parsedOutputJSON,
+		&invocation.ValidationStatus,
+		&invocation.ValidationError,
+		&invocation.AcceptedForMemory,
+		&humanFeedbackJSON,
+		&downstreamOutcomeJSON,
+		&invocation.CreatedAt,
+	); err != nil {
+		return memory.AgentInvocation{}, normalizeSQLError(err)
+	}
+
+	invocation.InputMessages = []map[string]string{}
+	if len(inputMessagesJSON) > 0 {
+		if err := json.Unmarshal(inputMessagesJSON, &invocation.InputMessages); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation input messages: %w", err)
+		}
+	}
+	invocation.InputContext = map[string]any{}
+	if len(inputContextJSON) > 0 {
+		if err := json.Unmarshal(inputContextJSON, &invocation.InputContext); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation input context: %w", err)
+		}
+	}
+	invocation.ParsedOutput = map[string]any{}
+	if len(parsedOutputJSON) > 0 {
+		if err := json.Unmarshal(parsedOutputJSON, &invocation.ParsedOutput); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation parsed output: %w", err)
+		}
+	}
+	invocation.HumanFeedback = map[string]any{}
+	if len(humanFeedbackJSON) > 0 {
+		if err := json.Unmarshal(humanFeedbackJSON, &invocation.HumanFeedback); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation human feedback: %w", err)
+		}
+	}
+	invocation.DownstreamOutcome = map[string]any{}
+	if len(downstreamOutcomeJSON) > 0 {
+		if err := json.Unmarshal(downstreamOutcomeJSON, &invocation.DownstreamOutcome); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation downstream outcome: %w", err)
+		}
+	}
+
+	return invocation, nil
+}
+
 func scanAutomationSettings(row rowScanner) (settings.AutomationSettings, error) {
 	var automationSettings settings.AutomationSettings
 	if err := row.Scan(
@@ -1183,6 +1713,10 @@ func scanAutomationSettings(row rowScanner) (settings.AutomationSettings, error)
 		&automationSettings.MaxFollowUpRounds,
 		&automationSettings.DefaultTrainingProvider,
 		&automationSettings.DefaultGPUType,
+		&automationSettings.LLMEnabled,
+		&automationSettings.AgentMode,
+		&automationSettings.LLMProvider,
+		&automationSettings.LLMModel,
 		&automationSettings.UpdatedAt,
 	); err != nil {
 		return settings.AutomationSettings{}, normalizeSQLError(err)

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Activity,
@@ -24,8 +24,10 @@ import {
 } from "lucide-react";
 import type {
   AgentDecision,
+  AgentMemoryRecord,
   Dataset,
   EpochMetric,
+  ExecutionEvent,
   ExperimentPlan,
   Health,
   Job,
@@ -33,6 +35,7 @@ import type {
   TrainingRunSummary,
   Worker,
   AutomationSettings,
+  WorkerRequirement,
 } from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
@@ -54,6 +57,9 @@ type ProjectDetail = {
   plans: ExperimentPlan[];
   runSummaries: TrainingRunSummary[];
   workers: Worker[];
+  workerRequirements: WorkerRequirement[];
+  executionEvents: ExecutionEvent[];
+  agentMemory: AgentMemoryRecord[];
 };
 
 type Notice = {
@@ -80,6 +86,10 @@ type AutomationSettingsUpdate = Partial<
     | "max_followup_rounds"
     | "default_training_provider"
     | "default_gpu_type"
+    | "llm_enabled"
+    | "agent_mode"
+    | "llm_provider"
+    | "llm_model"
   >
 >;
 
@@ -90,6 +100,10 @@ const defaultAutomationSettings: AutomationSettings = {
   max_followup_rounds: 2,
   default_training_provider: "local",
   default_gpu_type: "",
+  llm_enabled: false,
+  agent_mode: "propose",
+  llm_provider: "openai",
+  llm_model: "",
   updated_at: "",
 };
 
@@ -105,6 +119,9 @@ export function App() {
     plans: [],
     runSummaries: [],
     workers: [],
+    workerRequirements: [],
+    executionEvents: [],
+    agentMemory: [],
   });
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
@@ -116,6 +133,7 @@ export function App() {
   const [newProjectFolder, setNewProjectFolder] = useState<DatasetFolder | null>(null);
   const [jobPage, setJobPage] = useState(0);
   const [selectedMetricKey, setSelectedMetricKey] = useState<MetricKey>("macro_f1");
+  const supervisingRequirements = useRef<Set<string>>(new Set());
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -177,17 +195,31 @@ export function App() {
   const refreshProjectDetail = useCallback(
     async (projectId: string) => {
       if (!projectId) {
-        setDetail({ decisions: [], datasets: [], jobs: [], plans: [], runSummaries: [], workers: [] });
+        setDetail({
+          decisions: [],
+          datasets: [],
+          jobs: [],
+          plans: [],
+          runSummaries: [],
+          workers: [],
+          workerRequirements: [],
+          executionEvents: [],
+          agentMemory: [],
+        });
         return;
       }
 
-      const [datasets, jobs, plans, runSummaries, decisions, workers] = await Promise.all([
+      const [datasets, jobs, plans, runSummaries, decisions, workers, workerRequirements, executionEvents, agentMemory] =
+        await Promise.all([
         request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
         request<{ jobs: Job[] }>(`/projects/${projectId}/jobs`),
         request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
         request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries`),
         request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`),
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
+        request<{ requirements: WorkerRequirement[] }>(`/projects/${projectId}/worker-requirements`),
+        request<{ events: ExecutionEvent[] }>(`/projects/${projectId}/execution-events?limit=8`),
+        request<{ records: AgentMemoryRecord[] }>(`/projects/${projectId}/agent-memory?limit=6`),
       ]);
 
       setDetail({
@@ -197,6 +229,9 @@ export function App() {
         plans: plans.plans,
         runSummaries: runSummaries.summaries,
         workers: workers.workers,
+        workerRequirements: workerRequirements.requirements,
+        executionEvents: executionEvents.events,
+        agentMemory: agentMemory.records,
       });
 
       setSelectedJobId((currentJobId) => {
@@ -256,6 +291,52 @@ export function App() {
     }
   }, [refreshHealth, refreshProjectDetail, refreshProjects, refreshSelectedJobMetrics, selectedProjectId]);
 
+  const superviseWorkerRequirements = useCallback(async () => {
+    if (!selectedProjectId) return;
+
+    const response = await request<{ requirements: WorkerRequirement[] }>(
+      `/projects/${selectedProjectId}/worker-requirements`,
+    );
+    const pending = response.requirements.filter((requirement) => requirement.status === "PENDING");
+
+    for (const requirement of pending) {
+      if (supervisingRequirements.current.has(requirement.id)) {
+        continue;
+      }
+      supervisingRequirements.current.add(requirement.id);
+      try {
+        await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
+          method: "PATCH",
+          body: { status: "STARTING", last_error: "" },
+        });
+
+        await window.missionControl.ensureProjectWorker({
+          projectId: requirement.project_id,
+          baseUrl,
+          name: `auto-worker-${requirement.project_id}`,
+          gpuType: requirement.gpu_type || requirement.provider || "local",
+          count: requirement.target_count,
+        });
+
+        await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
+          method: "PATCH",
+          body: { status: "ACTIVE", last_error: "" },
+        });
+      } catch (error) {
+        await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
+          method: "PATCH",
+          body: {
+            status: "FAILED",
+            last_error: error instanceof Error ? error.message : String(error),
+          },
+        }).catch(() => undefined);
+      } finally {
+        supervisingRequirements.current.delete(requirement.id);
+        refreshProjectDetail(selectedProjectId).catch(() => undefined);
+      }
+    }
+  }, [baseUrl, refreshProjectDetail, request, selectedProjectId]);
+
   useEffect(() => {
     localStorage.setItem("orchestratorUrl", baseUrl);
   }, [baseUrl]);
@@ -286,6 +367,15 @@ export function App() {
 
     return () => window.clearInterval(timer);
   }, [refreshLive]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      superviseWorkerRequirements().catch(() => undefined);
+    }, 3000);
+
+    superviseWorkerRequirements().catch(() => undefined);
+    return () => window.clearInterval(timer);
+  }, [superviseWorkerRequirements]);
 
   async function chooseNewProjectFolder() {
     const folder = await window.missionControl.selectDatasetFolder();
@@ -485,6 +575,10 @@ export function App() {
           max_followup_rounds: Math.max(0, Math.trunc(settingsDraft.max_followup_rounds || 0)),
           default_training_provider: settingsDraft.default_training_provider,
           default_gpu_type: settingsDraft.default_gpu_type,
+          llm_enabled: settingsDraft.llm_enabled,
+          agent_mode: settingsDraft.agent_mode,
+          llm_provider: settingsDraft.llm_provider,
+          llm_model: settingsDraft.llm_model,
         },
       });
 
@@ -628,6 +722,27 @@ export function App() {
                     <small>{automationSettings.auto_execute_plans ? "on" : "off"}</small>
                   </span>
                 </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.llm_enabled}
+                    onChange={(event) => updateSettingsDraft({ llm_enabled: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>LLM Agents</strong>
+                    <small>{automationSettings.llm_enabled ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="setting-field">
+                  <span>Agent Mode</span>
+                  <select
+                    value={settingsDraft.agent_mode}
+                    onChange={(event) => updateSettingsDraft({ agent_mode: event.currentTarget.value })}
+                  >
+                    <option value="propose">propose</option>
+                    <option value="autonomous">autonomous</option>
+                  </select>
+                </label>
                 <label className="setting-field">
                   <span>Follow-up Rounds</span>
                   <input
@@ -649,6 +764,25 @@ export function App() {
                     <option value="local">local</option>
                     <option value="modal">modal</option>
                   </select>
+                </label>
+                <label className="setting-field">
+                  <span>LLM Provider</span>
+                  <select
+                    value={settingsDraft.llm_provider}
+                    onChange={(event) => updateSettingsDraft({ llm_provider: event.currentTarget.value })}
+                  >
+                    <option value="openai">openai</option>
+                    <option value="openai_compatible">openai_compatible</option>
+                    <option value="local">local</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>LLM Model</span>
+                  <input
+                    value={settingsDraft.llm_model}
+                    placeholder="model id from .env"
+                    onChange={(event) => updateSettingsDraft({ llm_model: event.currentTarget.value })}
+                  />
                 </label>
                 <label className="setting-field">
                   <span>GPU</span>
@@ -781,6 +915,76 @@ export function App() {
                 </div>
               )}
             </div>
+          </Panel>
+
+          <Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide>
+            <div className="automation-grid">
+              <div className="automation-block">
+                <strong>Worker Requirements</strong>
+                {detail.workerRequirements.length > 0 ? (
+                  <div className="status-list">
+                    {detail.workerRequirements.slice(0, 4).map((requirement) => (
+                      <div className="status-row" key={requirement.id}>
+                        <span>
+                          <strong>{requirement.plan_id || "no plan"}</strong>
+                          <small>
+                            {requirement.target_count} worker(s) · {requirement.provider}
+                            {requirement.gpu_type ? `/${requirement.gpu_type}` : ""}
+                          </small>
+                        </span>
+                        <Badge value={requirement.status} />
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty compact">No worker requirements yet.</div>
+                )}
+              </div>
+              <div className="automation-block">
+                <strong>Execution Events</strong>
+                {detail.executionEvents.length > 0 ? (
+                  <div className="event-list">
+                    {detail.executionEvents.map((event) => (
+                      <div className="event-row" key={event.id}>
+                        <Badge value={event.event_type} />
+                        <span>
+                          <strong>{event.message}</strong>
+                          <small>{new Date(event.created_at).toLocaleString()}</small>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty compact">No automation events yet.</div>
+                )}
+              </div>
+            </div>
+          </Panel>
+
+          <Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide>
+            {detail.agentMemory.length > 0 ? (
+              <div className="memory-list">
+                {detail.agentMemory.map((record) => (
+                  <div className="memory-row" key={record.id}>
+                    <span>
+                      <strong>{record.agent_name}</strong>
+                      <small>
+                        {record.kind}
+                        {record.invocation_id ? ` - ${record.invocation_id}` : ""}
+                      </small>
+                    </span>
+                    <p>{record.summary}</p>
+                    <div className="tag-list">
+                      {record.tags.slice(0, 5).map((tag) => (
+                        <small key={`${record.id}-${tag}`}>{tag}</small>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty">LLM agent recommendations will appear after completed runs.</div>
+            )}
           </Panel>
 
           <Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide>

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +17,10 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/llm"
+	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
@@ -78,6 +82,11 @@ type automaticExperimentReviewResult struct {
 	FollowUpPlan *plans.ExperimentPlan
 	Jobs         []jobs.ExperimentJob
 }
+
+const (
+	llmTrainingMonitorDecisionSource = "llm_training_monitor"
+	minLLMDecisionConfidence         = 0.50
+)
 
 type updateDatasetProfileRequest struct {
 	Profile map[string]any `json:"profile" binding:"required"`
@@ -583,23 +592,110 @@ func (s *Server) executeAutomaticFollowUpPlan(result automaticExperimentReviewRe
 		return result, nil
 	}
 
-	execution, err := s.executeStoredExperimentPlan(result.FollowUpPlan.ID, s.defaultExecuteExperimentPlanRequest())
+	req := s.defaultExecuteExperimentPlanRequest()
+	planExecution, err := s.executeStoredExperimentPlan(result.FollowUpPlan.ID, req)
 	if err != nil {
+		if _, eventErr := s.store.CreateExecutionEvent(
+			result.FollowUpPlan.ProjectID,
+			result.FollowUpPlan.ID,
+			execution.EventExecutionFailed,
+			fmt.Sprintf("Automatic execution failed for plan %s.", result.FollowUpPlan.ID),
+			map[string]any{"error": err.Error()},
+		); eventErr != nil {
+			log.Printf("record automatic execution failure event failed: %v", eventErr)
+		}
 		return automaticExperimentReviewResult{}, err
 	}
 
-	result.Jobs = execution.Jobs
+	result.Jobs = planExecution.Jobs
+	if err := s.recordAutomaticExecutionQueued(*result.FollowUpPlan, req, planExecution.Jobs); err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
 	return result, nil
+}
+
+func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req executeExperimentPlanRequest, queuedJobs []jobs.ExperimentJob) error {
+	targetCount := plan.RecommendedWorkers
+	if targetCount < 1 {
+		targetCount = 1
+	}
+	if len(plan.Experiments) > 0 && targetCount > len(plan.Experiments) {
+		targetCount = len(plan.Experiments)
+	}
+
+	provider := req.Provider
+	if provider == "" {
+		provider = "local"
+	}
+
+	requirement, created, err := s.store.UpsertWorkerRequirement(
+		plan.ProjectID,
+		plan.ID,
+		provider,
+		req.GPUType,
+		targetCount,
+		"auto_followup",
+	)
+	if err != nil {
+		return err
+	}
+
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventJobsQueued, fmt.Sprintf("Queued %d automatic experiment job(s) for plan %s.", len(queuedJobs), plan.ID), map[string]any{
+		"job_ids":               experimentJobIDs(queuedJobs),
+		"worker_requirement_id": requirement.ID,
+		"provider":              provider,
+		"gpu_type":              req.GPUType,
+	}); err != nil {
+		return err
+	}
+
+	if created {
+		_, err = s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventWorkersRequired, fmt.Sprintf("Automatic execution requires %d worker(s) for plan %s.", requirement.TargetCount, plan.ID), map[string]any{
+			"worker_requirement_id": requirement.ID,
+			"target_count":          requirement.TargetCount,
+			"provider":              requirement.Provider,
+			"gpu_type":              requirement.GPUType,
+		})
+	}
+	return err
+}
+
+func experimentJobIDs(experimentJobs []jobs.ExperimentJob) []string {
+	out := make([]string, 0, len(experimentJobs))
+	for _, job := range experimentJobs {
+		out = append(out, job.ID)
+	}
+	return out
+}
+
+func mapFromStruct(value any) (map[string]any, error) {
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(blob, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func actionDecisionForPlan(agentDecisions []decisions.AgentDecision, planID string) (decisions.AgentDecision, bool) {
 	for _, decision := range agentDecisions {
-		if decision.PlanID == planID && decision.DecisionType != decisions.TypeWait {
+		if decision.PlanID == planID && decision.DecisionType != decisions.TypeWait && decisionAutoExecutable(decision) {
 			return decision, true
 		}
 	}
 
 	return decisions.AgentDecision{}, false
+}
+
+func decisionAutoExecutable(decision decisions.AgentDecision) bool {
+	value, ok := decision.Payload["auto_executable"].(bool)
+	if ok && !value {
+		return false
+	}
+	return true
 }
 
 func followUpRoundCount(projectPlans []plans.ExperimentPlan) int {
@@ -613,6 +709,48 @@ func followUpRoundCount(projectPlans []plans.ExperimentPlan) int {
 	return count
 }
 
+func (s *Server) recordWorkerRequirementStatusEvent(requirement execution.WorkerRequirement) {
+	eventType := ""
+	message := ""
+	switch requirement.Status {
+	case execution.WorkerRequirementStarting:
+		eventType = execution.EventWorkersStarting
+		message = fmt.Sprintf("Starting %d worker(s) for plan %s.", requirement.TargetCount, requirement.PlanID)
+	case execution.WorkerRequirementActive:
+		eventType = execution.EventWorkersActive
+		message = fmt.Sprintf("%d worker(s) are active for plan %s.", requirement.TargetCount, requirement.PlanID)
+	case execution.WorkerRequirementFailed:
+		eventType = execution.EventExecutionFailed
+		message = fmt.Sprintf("Worker startup failed for plan %s.", requirement.PlanID)
+	default:
+		return
+	}
+
+	if _, err := s.store.CreateExecutionEvent(requirement.ProjectID, requirement.PlanID, eventType, message, map[string]any{
+		"worker_requirement_id": requirement.ID,
+		"status":                requirement.Status,
+		"target_count":          requirement.TargetCount,
+		"provider":              requirement.Provider,
+		"gpu_type":              requirement.GPUType,
+		"last_error":            requirement.LastError,
+	}); err != nil {
+		log.Printf("record worker requirement event failed: %v", err)
+	}
+}
+
+func validWorkerRequirementStatus(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case execution.WorkerRequirementPending,
+		execution.WorkerRequirementStarting,
+		execution.WorkerRequirementActive,
+		execution.WorkerRequirementFailed,
+		execution.WorkerRequirementCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) listProjectAgentDecisions(c *gin.Context) {
 	agentDecisions, err := s.store.ListProjectAgentDecisions(c.Param("id"))
 	if err != nil {
@@ -621,6 +759,88 @@ func (s *Server) listProjectAgentDecisions(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"decisions": agentDecisions})
+}
+
+func (s *Server) listProjectAgentMemoryRecords(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "25"))
+	records, err := s.store.ListProjectAgentMemoryRecords(c.Param("id"), memory.AgentMemoryFilter{
+		DatasetID: c.Query("dataset_id"),
+		PlanID:    c.Query("plan_id"),
+		JobID:     c.Query("job_id"),
+		Kind:      c.Query("kind"),
+		Limit:     limit,
+	})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"records": records})
+}
+
+func (s *Server) listProjectAgentInvocations(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "25"))
+	invocations, err := s.store.ListProjectAgentInvocations(c.Param("id"), memory.AgentInvocationFilter{
+		DatasetID: c.Query("dataset_id"),
+		PlanID:    c.Query("plan_id"),
+		JobID:     c.Query("job_id"),
+		AgentName: c.Query("agent_name"),
+		Limit:     limit,
+	})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"invocations": invocations})
+}
+
+func (s *Server) listProjectWorkerRequirements(c *gin.Context) {
+	requirements, err := s.store.ListProjectWorkerRequirements(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"requirements": requirements})
+}
+
+func (s *Server) updateWorkerRequirement(c *gin.Context) {
+	var req execution.WorkerRequirementUpdate
+	if !bindJSON(c, &req) {
+		return
+	}
+	if req.Status != nil {
+		normalizedStatus := strings.ToUpper(strings.TrimSpace(*req.Status))
+		if !validWorkerRequirementStatus(normalizedStatus) {
+			writeStoreError(c, fmt.Errorf("%w: invalid worker requirement status", store.ErrInvalidRequest))
+			return
+		}
+		req.Status = &normalizedStatus
+	}
+
+	requirement, err := s.store.UpdateWorkerRequirement(c.Param("id"), req)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	if req.Status != nil {
+		s.recordWorkerRequirementStatusEvent(requirement)
+	}
+
+	c.JSON(http.StatusOK, requirement)
+}
+
+func (s *Server) listProjectExecutionEvents(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	events, err := s.store.ListProjectExecutionEvents(c.Param("id"), limit)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"events": events})
 }
 
 func (s *Server) completeJob(c *gin.Context) {
@@ -642,6 +862,7 @@ func (s *Server) completeJob(c *gin.Context) {
 			writeStoreError(c, err)
 			return
 		}
+		s.runTrainingMonitorAfterTrainingJob(job)
 		s.runAutomaticExperimentReviewAfterTrainingJob(job)
 	}
 
@@ -667,6 +888,7 @@ func (s *Server) failJob(c *gin.Context) {
 			writeStoreError(c, err)
 			return
 		}
+		s.runTrainingMonitorAfterTrainingJob(job)
 		s.runAutomaticExperimentReviewAfterTrainingJob(job)
 	}
 
@@ -677,6 +899,367 @@ func (s *Server) runAutomaticExperimentReviewAfterTrainingJob(job jobs.Experimen
 	if _, err := s.runAutomaticExperimentReview(job.ProjectID); err != nil {
 		log.Printf("automatic experiment review failed after training job %s: %v", job.ID, err)
 	}
+}
+
+func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
+	if !s.shouldRunLLMAgents() {
+		return
+	}
+
+	summary, err := s.store.GetTrainingRunSummary(job.ID)
+	if err != nil {
+		log.Printf("training monitor skipped for job %s: summary unavailable: %v", job.ID, err)
+		return
+	}
+
+	metrics, err := s.store.ListJobMetrics(job.ID)
+	if err != nil {
+		log.Printf("training monitor skipped for job %s: metrics unavailable: %v", job.ID, err)
+		return
+	}
+
+	plan := plans.ExperimentPlan{}
+	if summary.PlanID != "" {
+		plan, err = s.store.GetExperimentPlan(summary.PlanID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.Printf("training monitor skipped for job %s: plan unavailable: %v", job.ID, err)
+			return
+		}
+	}
+
+	priorMemory, err := s.store.ListProjectAgentMemoryRecords(job.ProjectID, memory.AgentMemoryFilter{
+		DatasetID: summary.DatasetID,
+		Limit:     12,
+	})
+	if err != nil {
+		log.Printf("training monitor memory lookup failed for job %s: %v", job.ID, err)
+		priorMemory = []memory.AgentMemoryRecord{}
+	}
+
+	automationSettings := s.currentAutomationSettings()
+	config := llm.ConfigFromEnv(automationSettings.LLMEnabled, automationSettings.LLMProvider, automationSettings.LLMModel)
+	client := llm.NewOpenAICompatibleClient(config)
+	agent := agents.NewTrainingMonitorAgent(client, config.Model)
+
+	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
+	defer cancel()
+
+	trace, err := agent.EvaluateWithTrace(ctx, agents.TrainingMonitorInput{
+		Plan:          plan,
+		Job:           job,
+		Summary:       summary,
+		Metrics:       metrics,
+		MemoryRecords: priorMemory,
+	})
+	acceptedForMemory := err == nil
+	invocation, invocationErr := s.recordTrainingMonitorInvocation(job, summary, config, trace, acceptedForMemory)
+	if invocationErr != nil {
+		log.Printf("training monitor invocation write failed for job %s: %v", job.ID, invocationErr)
+	}
+	if err != nil {
+		log.Printf("training monitor failed for job %s: %v", job.ID, err)
+		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Training Monitor failed for job %s.", job.ID), map[string]any{
+			"job_id":        job.ID,
+			"invocation_id": invocation.ID,
+			"error":         err.Error(),
+		}); eventErr != nil {
+			log.Printf("record training monitor failure event failed: %v", eventErr)
+		}
+		return
+	}
+
+	recommendation := trace.Recommendation
+	payload, err := mapFromStruct(recommendation)
+	if err != nil {
+		log.Printf("training monitor payload conversion failed for job %s: %v", job.ID, err)
+		return
+	}
+
+	record, err := s.store.CreateAgentMemoryRecord(memory.AgentMemoryRecord{
+		InvocationID: invocation.ID,
+		ProjectID:    job.ProjectID,
+		DatasetID:    summary.DatasetID,
+		PlanID:       summary.PlanID,
+		JobID:        job.ID,
+		AgentName:    agents.TrainingMonitorAgentName,
+		Kind:         memory.KindTrainingEvaluation,
+		Summary:      recommendation.Summary,
+		Payload:      payload,
+		Tags:         recommendation.Tags,
+	})
+	if err != nil {
+		log.Printf("training monitor memory write failed for job %s: %v", job.ID, err)
+		return
+	}
+
+	if _, err := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventAgentRecommendationRecorded, fmt.Sprintf("Training Monitor recorded an evaluation for job %s.", job.ID), map[string]any{
+		"job_id":           job.ID,
+		"invocation_id":    invocation.ID,
+		"memory_record_id": record.ID,
+		"agent_name":       record.AgentName,
+		"kind":             record.Kind,
+	}); err != nil {
+		log.Printf("record training monitor event failed: %v", err)
+	}
+
+	if _, err := s.handleTrainingMonitorAgentDecision(job, summary, trace, invocation, record); err != nil {
+		log.Printf("training monitor decision handling failed for job %s: %v", job.ID, err)
+		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Training Monitor decision was not scheduled for job %s.", job.ID), map[string]any{
+			"job_id":           job.ID,
+			"invocation_id":    invocation.ID,
+			"memory_record_id": record.ID,
+			"error":            err.Error(),
+		}); eventErr != nil {
+			log.Printf("record training monitor decision failure event failed: %v", eventErr)
+		}
+	}
+}
+
+func (s *Server) recordTrainingMonitorInvocation(
+	job jobs.ExperimentJob,
+	summary runs.TrainingRunSummary,
+	config llm.Config,
+	trace agents.TrainingMonitorEvaluationTrace,
+	acceptedForMemory bool,
+) (memory.AgentInvocation, error) {
+	validationStatus := trace.ValidationStatus
+	if validationStatus == "" {
+		validationStatus = memory.InvocationValidationFailed
+	}
+
+	return s.store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:         job.ProjectID,
+		DatasetID:         summary.DatasetID,
+		PlanID:            summary.PlanID,
+		JobID:             job.ID,
+		AgentName:         agents.TrainingMonitorAgentName,
+		AgentVersion:      trace.AgentVersion,
+		PromptVersion:     trace.PromptVersion,
+		Provider:          config.Provider,
+		Model:             config.Model,
+		InputMessages:     llmMessagesForMemory(trace.Request.Messages),
+		InputContext:      trace.PromptContext,
+		RawOutput:         string(trace.RawOutput),
+		ParsedOutput:      trace.ParsedOutput,
+		ValidationStatus:  validationStatus,
+		ValidationError:   trace.ValidationError,
+		AcceptedForMemory: acceptedForMemory,
+		HumanFeedback:     map[string]any{},
+		DownstreamOutcome: map[string]any{},
+	})
+}
+
+func llmMessagesForMemory(messages []llm.Message) []map[string]string {
+	out := make([]map[string]string, 0, len(messages))
+	for _, message := range messages {
+		out = append(out, map[string]string{
+			"role":    message.Role,
+			"content": message.Content,
+		})
+	}
+	return out
+}
+
+func (s *Server) handleTrainingMonitorAgentDecision(
+	job jobs.ExperimentJob,
+	summary runs.TrainingRunSummary,
+	trace agents.TrainingMonitorEvaluationTrace,
+	invocation memory.AgentInvocation,
+	record memory.AgentMemoryRecord,
+) (automaticExperimentReviewResult, error) {
+	if !s.shouldAutoReviewExperimentJobs() {
+		return automaticExperimentReviewResult{}, nil
+	}
+	if trace.ValidationStatus != memory.InvocationValidationValid {
+		return automaticExperimentReviewResult{}, nil
+	}
+
+	recommendation := trace.Recommendation
+	action := recommendation.RecommendedAction
+	decisionType, ok := llmActionDecisionType(action.ActionType)
+	if !ok {
+		return automaticExperimentReviewResult{}, nil
+	}
+	if action.Confidence < minLLMDecisionConfidence {
+		log.Printf(
+			"training monitor decision skipped for job %s: confidence %.2f below %.2f",
+			job.ID,
+			action.Confidence,
+			minLLMDecisionConfidence,
+		)
+		return automaticExperimentReviewResult{}, nil
+	}
+
+	plan, ready, err := s.sourcePlanReadyForAgentDecision(job.ProjectID, summary.PlanID)
+	if err != nil || !ready {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	payload, err := trainingMonitorDecisionPayload(action, invocation, record, s.currentAutomationSettings().AgentMode)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	agentDecisions, err := s.store.ListProjectAgentDecisions(job.ProjectID)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+	decision, ok := trainingMonitorDecisionForPlan(agentDecisions, plan.ID)
+	if !ok {
+		decision, err = s.store.CreateAgentDecision(
+			job.ProjectID,
+			plan.ID,
+			decisionType,
+			action.Rationale,
+			payload,
+		)
+		if err != nil {
+			return automaticExperimentReviewResult{}, err
+		}
+	}
+
+	result := automaticExperimentReviewResult{Decision: &decision}
+	if decision.DecisionType != decisions.TypeAddExperiments {
+		return result, nil
+	}
+	if !s.shouldAutoScheduleFollowUps() || s.currentAutomationSettings().AgentMode != llm.AgentModeAutonomous {
+		return result, nil
+	}
+
+	projectPlans, err := s.store.ListProjectExperimentPlans(job.ProjectID)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		result.FollowUpPlan = &existingPlan
+		return s.executeAutomaticFollowUpPlan(result)
+	}
+
+	maxRounds := s.maxAutoFollowUpRounds()
+	if followUpRoundCount(projectPlans) >= maxRounds {
+		log.Printf(
+			"llm follow-up scheduling skipped for project %s plan %s: max follow-up rounds reached (%d)",
+			job.ProjectID,
+			plan.ID,
+			maxRounds,
+		)
+		return result, nil
+	}
+
+	followUpPlan, _, err := s.ensureFollowUpPlan(job.ProjectID, plan, decision)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
+
+	result.FollowUpPlan = &followUpPlan
+	return s.executeAutomaticFollowUpPlan(result)
+}
+
+func llmActionDecisionType(actionType string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(actionType)) {
+	case decisions.TypeAddExperiments:
+		return decisions.TypeAddExperiments, true
+	case decisions.TypeStopProject:
+		return decisions.TypeStopProject, true
+	default:
+		return "", false
+	}
+}
+
+func trainingMonitorDecisionPayload(
+	action decisions.AgentActionProposal,
+	invocation memory.AgentInvocation,
+	record memory.AgentMemoryRecord,
+	agentMode string,
+) (map[string]any, error) {
+	payload := map[string]any{}
+	for key, value := range action.Payload {
+		payload[key] = value
+	}
+
+	if strings.EqualFold(action.ActionType, decisions.TypeAddExperiments) {
+		experiments, err := plannedExperimentsFromPayload(payload)
+		if err != nil {
+			return nil, err
+		}
+		payload["proposed_experiments"] = experiments
+	}
+
+	payload["decision_source"] = llmTrainingMonitorDecisionSource
+	payload["agent_name"] = agents.TrainingMonitorAgentName
+	payload["invocation_id"] = invocation.ID
+	payload["memory_record_id"] = record.ID
+	payload["confidence"] = action.Confidence
+	payload["llm_action_type"] = action.ActionType
+	payload["llm_requires_approval"] = action.RequiresApproval
+	payload["auto_executable"] = agentMode == llm.AgentModeAutonomous
+	return payload, nil
+}
+
+func (s *Server) sourcePlanReadyForAgentDecision(projectID string, planID string) (plans.ExperimentPlan, bool, error) {
+	if planID == "" {
+		return plans.ExperimentPlan{}, false, nil
+	}
+
+	plan, err := s.store.GetExperimentPlan(planID)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	if plan.ProjectID != projectID {
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: plan does not belong to project", store.ErrInvalidRequest)
+	}
+
+	summaries, err := s.store.ListProjectTrainingRunSummaries(projectID)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+
+	return plan, planTrainingRunsComplete(plan, summaries), nil
+}
+
+func planTrainingRunsComplete(plan plans.ExperimentPlan, summaries []runs.TrainingRunSummary) bool {
+	if plan.ID == "" || len(plan.Experiments) == 0 {
+		return false
+	}
+
+	planSummaries := []runs.TrainingRunSummary{}
+	for _, summary := range summaries {
+		if summary.PlanID == plan.ID {
+			planSummaries = append(planSummaries, summary)
+		}
+	}
+	if len(planSummaries) < len(plan.Experiments) {
+		return false
+	}
+
+	for _, summary := range planSummaries {
+		if !isTerminalTrainingSummary(summary) {
+			return false
+		}
+	}
+	return true
+}
+
+func isTerminalTrainingSummary(summary runs.TrainingRunSummary) bool {
+	switch strings.ToUpper(strings.TrimSpace(summary.Status)) {
+	case jobs.StatusSucceeded, jobs.StatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func trainingMonitorDecisionForPlan(agentDecisions []decisions.AgentDecision, planID string) (decisions.AgentDecision, bool) {
+	for _, decision := range agentDecisions {
+		if decision.PlanID != planID {
+			continue
+		}
+		if decision.Payload["decision_source"] != llmTrainingMonitorDecisionSource {
+			continue
+		}
+		return decision, true
+	}
+	return decisions.AgentDecision{}, false
 }
 
 func (s *Server) listWorkers(c *gin.Context) {
@@ -1088,6 +1671,10 @@ func automationSettingsFromEnv() settings.AutomationSettings {
 		MaxFollowUpRounds:       maxAutoFollowUpRoundsFromEnv(),
 		DefaultTrainingProvider: defaultProvider,
 		DefaultGPUType:          os.Getenv("MODEL_EXPRESS_DEFAULT_GPU_TYPE"),
+		LLMEnabled:              envFlag("MODEL_EXPRESS_LLM_ENABLED", false),
+		AgentMode:               llm.NormalizeAgentMode(os.Getenv("MODEL_EXPRESS_AGENT_MODE")),
+		LLMProvider:             defaultLLMProviderFromEnv(),
+		LLMModel:                strings.TrimSpace(os.Getenv("MODEL_EXPRESS_LLM_MODEL")),
 		UpdatedAt:               time.Now().UTC(),
 	}
 }
@@ -1130,6 +1717,24 @@ func applyAutomationSettingsUpdate(current settings.AutomationSettings, update s
 	}
 	if update.DefaultGPUType != nil {
 		current.DefaultGPUType = strings.TrimSpace(*update.DefaultGPUType)
+	}
+	if update.LLMEnabled != nil {
+		current.LLMEnabled = *update.LLMEnabled
+	}
+	if update.AgentMode != nil {
+		current.AgentMode = llm.NormalizeAgentMode(*update.AgentMode)
+	}
+	if update.LLMProvider != nil {
+		current.LLMProvider = normalizeLLMProvider(*update.LLMProvider)
+	}
+	if update.LLMModel != nil {
+		current.LLMModel = strings.TrimSpace(*update.LLMModel)
+	}
+	if current.AgentMode == "" {
+		current.AgentMode = llm.AgentModePropose
+	}
+	if current.LLMProvider == "" {
+		current.LLMProvider = llm.ProviderOpenAI
 	}
 
 	return current, nil
@@ -1176,6 +1781,25 @@ func (s *Server) maxAutoFollowUpRounds() int {
 
 func (s *Server) shouldAutoExecuteExperimentPlans() bool {
 	return s.currentAutomationSettings().AutoExecutePlans
+}
+
+func (s *Server) shouldRunLLMAgents() bool {
+	return s.currentAutomationSettings().LLMEnabled
+}
+
+func defaultLLMProviderFromEnv() string {
+	return normalizeLLMProvider(os.Getenv("MODEL_EXPRESS_LLM_PROVIDER"))
+}
+
+func normalizeLLMProvider(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case llm.ProviderOpenAICompatible:
+		return llm.ProviderOpenAICompatible
+	case llm.ProviderLocal:
+		return llm.ProviderLocal
+	default:
+		return llm.ProviderOpenAI
+	}
 }
 
 func envFlag(name string, defaultValue bool) bool {

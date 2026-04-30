@@ -9,6 +9,10 @@ type AutomationSettings struct {
 	MaxFollowUpRounds       int       `json:"max_followup_rounds"`
 	DefaultTrainingProvider string    `json:"default_training_provider"`
 	DefaultGPUType          string    `json:"default_gpu_type"`
+	LLMEnabled              bool      `json:"llm_enabled"`
+	AgentMode               string    `json:"agent_mode"`
+	LLMProvider             string    `json:"llm_provider"`
+	LLMModel                string    `json:"llm_model"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 
@@ -19,4 +23,8 @@ type AutomationSettingsUpdate struct {
 	MaxFollowUpRounds       *int    `json:"max_followup_rounds"`
 	DefaultTrainingProvider *string `json:"default_training_provider"`
 	DefaultGPUType          *string `json:"default_gpu_type"`
+	LLMEnabled              *bool   `json:"llm_enabled"`
+	AgentMode               *string `json:"agent_mode"`
+	LLMProvider             *string `json:"llm_provider"`
+	LLMModel                *string `json:"llm_model"`
 }
