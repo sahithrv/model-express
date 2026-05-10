@@ -50,6 +50,13 @@ def train_image_classifier(payload: dict) -> dict:
     epochs = _positive_int(config.get("epochs"), default=5)
     batch_size = _positive_int(config.get("batch_size"), default=16)
     learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
+    image_size = _bounded_int(config.get("image_size"), default=224, minimum=96, maximum=384)
+    optimizer_name = str(config.get("optimizer", "adamw")).lower()
+    scheduler_name = str(config.get("scheduler", "none")).lower()
+    weight_decay = _non_negative_float(config.get("weight_decay"), default=0.0)
+    augmentation = config.get("augmentation") if isinstance(config.get("augmentation"), dict) else {}
+    class_balancing = str(config.get("class_balancing", "")).lower()
+    early_stopping_patience = _positive_int(config.get("early_stopping_patience"), default=0)
     model_name = str(config.get("model", "mobilenet_v3_small"))
     gpu_type = str(config.get("gpu_type") or os.getenv("MODAL_GPU_TYPE", "T4"))
     modal_function_call_id, modal_input_id = _modal_identifiers()
@@ -58,24 +65,38 @@ def train_image_classifier(payload: dict) -> dict:
     download_s3_uri(dataset["storage_uri"], archive_path)
     dataset_dir = extract_dataset_archive(archive_path, dataset_id)
 
-    train_loader, val_loader, class_names = _load_image_data(dataset_dir, batch_size)
+    train_loader, val_loader, class_names, class_weights = _load_image_data(
+        dataset_dir,
+        batch_size,
+        image_size,
+        augmentation,
+        class_balancing,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _build_model(model_name, len(class_names)).to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=learning_rate,
-    )
+    weight_tensor = class_weights.to(device) if class_weights is not None else None
+    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = _build_optimizer(optimizer_name, trainable_parameters, learning_rate, weight_decay)
+    scheduler = _build_scheduler(scheduler_name, optimizer, epochs)
 
     best_macro_f1 = 0.0
     best_accuracy = 0.0
+    best_epoch = 0
+    completed_epochs = 0
 
     for epoch in range(1, epochs + 1):
         train_loss = _train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, accuracy, macro_f1 = _evaluate(model, val_loader, criterion, device)
+        improved = macro_f1 > best_macro_f1
+        if improved:
+            best_epoch = epoch
         best_macro_f1 = max(best_macro_f1, macro_f1)
         best_accuracy = max(best_accuracy, accuracy)
+        completed_epochs = epoch
+        if scheduler is not None:
+            scheduler.step()
         runtime_seconds = time.time() - started_at
         estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
 
@@ -91,6 +112,8 @@ def train_image_classifier(payload: dict) -> dict:
                     "best_accuracy": round(best_accuracy, 6),
                     "best_macro_f1": round(best_macro_f1, 6),
                     "learning_rate": learning_rate,
+                    "image_size": image_size,
+                    "weight_decay": weight_decay,
                 },
             },
         )
@@ -113,6 +136,8 @@ def train_image_classifier(payload: dict) -> dict:
                 "modal_input_id": modal_input_id,
             },
         )
+        if early_stopping_patience > 0 and epoch - best_epoch >= early_stopping_patience:
+            break
 
     runtime_seconds = time.time() - started_at
     estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
@@ -130,7 +155,7 @@ def train_image_classifier(payload: dict) -> dict:
             "best_accuracy": round(best_accuracy, 6),
             "final_train_loss": round(train_loss, 6),
             "final_val_loss": round(val_loss, 6),
-            "epochs_completed": epochs,
+            "epochs_completed": completed_epochs,
             "modal_function_call_id": modal_function_call_id,
             "modal_input_id": modal_input_id,
         },
@@ -160,37 +185,80 @@ def _configure_storage_env(payload: dict) -> None:
     os.environ["AWS_DEFAULT_REGION"] = payload["aws_default_region"]
 
 
-def _load_image_data(dataset_dir: Path, batch_size: int):
+def _load_image_data(dataset_dir: Path, batch_size: int, image_size: int, augmentation: dict, class_balancing: str):
     import torch
-    from torch.utils.data import DataLoader, random_split
+    from torch.utils.data import DataLoader, Subset
     from torchvision import datasets, transforms
 
-    transform = transforms.Compose(
+    train_transform = _image_transform(image_size, augmentation, training=True)
+    val_transform = _image_transform(image_size, {}, training=False)
+
+    base_dataset = datasets.ImageFolder(dataset_dir)
+    if len(base_dataset.classes) < 2:
+        raise ValueError("Training requires at least two image classes.")
+    if len(base_dataset) < 2:
+        raise ValueError("Training requires at least two images.")
+
+    validation_size = max(1, int(len(base_dataset) * 0.2))
+    training_size = len(base_dataset) - validation_size
+    if training_size < 1:
+        training_size = len(base_dataset) - 1
+        validation_size = 1
+
+    generator = torch.Generator().manual_seed(42)
+    shuffled_indices = torch.randperm(len(base_dataset), generator=generator).tolist()
+    train_indices = shuffled_indices[:training_size]
+    val_indices = shuffled_indices[training_size : training_size + validation_size]
+
+    train_dataset = datasets.ImageFolder(dataset_dir, transform=train_transform)
+    val_dataset = datasets.ImageFolder(dataset_dir, transform=val_transform)
+    train_data = Subset(train_dataset, train_indices)
+    val_data = Subset(val_dataset, val_indices)
+
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=2)
+    class_weights = _class_weights(base_dataset.targets, train_indices, len(base_dataset.classes), class_balancing)
+    return train_loader, val_loader, base_dataset.classes, class_weights
+
+
+def _image_transform(image_size: int, augmentation: dict, training: bool):
+    from torchvision import transforms
+
+    steps = []
+    if training and augmentation.get("random_crop"):
+        steps.append(transforms.Resize((int(image_size * 1.15), int(image_size * 1.15))))
+        steps.append(transforms.RandomResizedCrop(image_size, scale=(0.72, 1.0)))
+    else:
+        steps.append(transforms.Resize((image_size, image_size)))
+
+    if training and augmentation.get("horizontal_flip"):
+        steps.append(transforms.RandomHorizontalFlip())
+    if training and augmentation.get("color_jitter"):
+        steps.append(transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.12, hue=0.03))
+    if training and augmentation.get("random_rotation"):
+        steps.append(transforms.RandomRotation(10))
+
+    steps.extend(
         [
-            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ]
     )
+    return transforms.Compose(steps)
 
-    dataset = datasets.ImageFolder(dataset_dir, transform=transform)
-    if len(dataset.classes) < 2:
-        raise ValueError("Training requires at least two image classes.")
-    if len(dataset) < 2:
-        raise ValueError("Training requires at least two images.")
 
-    validation_size = max(1, int(len(dataset) * 0.2))
-    training_size = len(dataset) - validation_size
-    if training_size < 1:
-        training_size = len(dataset) - 1
-        validation_size = 1
+def _class_weights(targets: list[int], train_indices: list[int], class_count: int, class_balancing: str):
+    if class_balancing not in {"weighted_loss", "class_weighted_loss"}:
+        return None
 
-    generator = torch.Generator().manual_seed(42)
-    train_data, val_data = random_split(dataset, [training_size, validation_size], generator=generator)
+    import torch
 
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=2)
-    return train_loader, val_loader, dataset.classes
+    counts = torch.zeros(class_count, dtype=torch.float32)
+    for index in train_indices:
+        counts[int(targets[index])] += 1.0
+    counts = torch.clamp(counts, min=1.0)
+    weights = counts.sum() / (counts * class_count)
+    return weights
 
 
 def _build_model(model_name: str, class_count: int):
@@ -198,6 +266,17 @@ def _build_model(model_name: str, class_count: int):
     from torchvision import models
 
     normalized = model_name.lower()
+
+    if "efficientnet_b1" in normalized:
+        try:
+            model = models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.DEFAULT)
+        except Exception:
+            model = models.efficientnet_b1(weights=None)
+        for parameter in model.features.parameters():
+            parameter.requires_grad = False
+        in_features = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Linear(in_features, class_count)
+        return model
 
     if "efficientnet" in normalized:
         try:
@@ -208,6 +287,16 @@ def _build_model(model_name: str, class_count: int):
             parameter.requires_grad = False
         in_features = model.classifier[-1].in_features
         model.classifier[-1] = nn.Linear(in_features, class_count)
+        return model
+
+    if "resnet34" in normalized:
+        try:
+            model = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
+        except Exception:
+            model = models.resnet34(weights=None)
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+        model.fc = nn.Linear(model.fc.in_features, class_count)
         return model
 
     if "resnet" in normalized:
@@ -229,6 +318,26 @@ def _build_model(model_name: str, class_count: int):
     in_features = model.classifier[-1].in_features
     model.classifier[-1] = nn.Linear(in_features, class_count)
     return model
+
+
+def _build_optimizer(optimizer_name: str, parameters, learning_rate: float, weight_decay: float):
+    import torch
+
+    if optimizer_name == "sgd":
+        return torch.optim.SGD(parameters, lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
+    if optimizer_name == "adam":
+        return torch.optim.Adam(parameters, lr=learning_rate, weight_decay=weight_decay)
+    return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
+
+
+def _build_scheduler(scheduler_name: str, optimizer, epochs: int):
+    import torch
+
+    if scheduler_name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    if scheduler_name == "step":
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, epochs // 3), gamma=0.5)
+    return None
 
 
 def _train_one_epoch(model, loader, criterion, optimizer, device) -> float:
@@ -336,3 +445,16 @@ def _positive_float(value: object, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _non_negative_float(value: object, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    parsed = _positive_int(value, default=default)
+    return max(minimum, min(maximum, parsed))

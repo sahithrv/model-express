@@ -7,6 +7,7 @@ const (
 	KindPreprocessingRecommendation = "preprocessing_recommendation"
 	KindTrainingEvaluation          = "training_evaluation"
 	KindPlanningFeedback            = "planning_feedback"
+	KindPlanningOutcome             = "planning_outcome"
 	KindModelRanking                = "model_ranking"
 )
 

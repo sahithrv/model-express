@@ -1033,6 +1033,14 @@ export function App() {
                         <small>lr</small>
                         <strong>{experiment.learning_rate}</strong>
                       </span>
+                      {(experiment.image_size || experiment.optimizer || experiment.scheduler || experiment.class_balancing) && (
+                        <span>
+                          {experiment.image_size ? <small>{experiment.image_size}px</small> : null}
+                          {experiment.optimizer ? <small>{experiment.optimizer}</small> : null}
+                          {experiment.scheduler ? <small>{experiment.scheduler}</small> : null}
+                          {experiment.class_balancing ? <small>{experiment.class_balancing}</small> : null}
+                        </span>
+                      )}
                       <p>{experiment.reason}</p>
                     </div>
                   ))}

@@ -701,6 +701,33 @@ func (s *MemoryStore) CreateAgentInvocation(invocation memory.AgentInvocation) (
 	return invocation, nil
 }
 
+func (s *MemoryStore) GetAgentInvocation(invocationID string) (memory.AgentInvocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	invocation, ok := s.agentInvocations[invocationID]
+	if !ok {
+		return memory.AgentInvocation{}, ErrNotFound
+	}
+	return invocation, nil
+}
+
+func (s *MemoryStore) UpdateAgentInvocationDownstreamOutcome(invocationID string, outcome map[string]any) (memory.AgentInvocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	invocation, ok := s.agentInvocations[invocationID]
+	if !ok {
+		return memory.AgentInvocation{}, ErrNotFound
+	}
+	if outcome == nil {
+		outcome = map[string]any{}
+	}
+	invocation.DownstreamOutcome = outcome
+	s.agentInvocations[invocationID] = invocation
+	return invocation, nil
+}
+
 func (s *MemoryStore) ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

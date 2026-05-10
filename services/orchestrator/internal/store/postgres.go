@@ -1039,6 +1039,33 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 	))
 }
 
+func (s *PostgresStore) GetAgentInvocation(invocationID string) (memory.AgentInvocation, error) {
+	const query = `
+		SELECT id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+		FROM agent_invocations
+		WHERE id = $1
+	`
+	return scanAgentInvocation(s.db.QueryRowContext(context.Background(), query, invocationID))
+}
+
+func (s *PostgresStore) UpdateAgentInvocationDownstreamOutcome(invocationID string, outcome map[string]any) (memory.AgentInvocation, error) {
+	if outcome == nil {
+		outcome = map[string]any{}
+	}
+	outcomeJSON, err := json.Marshal(outcome)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation downstream outcome: %w", err)
+	}
+
+	const query = `
+		UPDATE agent_invocations
+		SET downstream_outcome = $2
+		WHERE id = $1
+		RETURNING id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+	`
+	return scanAgentInvocation(s.db.QueryRowContext(context.Background(), query, invocationID, outcomeJSON))
+}
+
 func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return nil, err

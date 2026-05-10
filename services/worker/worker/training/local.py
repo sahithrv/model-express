@@ -15,13 +15,45 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     epochs = _positive_int(config.get("epochs"), default=3)
     learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
     batch_size = _positive_int(config.get("batch_size"), default=16)
+    image_size = _positive_int(config.get("image_size"), default=224)
+    optimizer = str(config.get("optimizer", "adamw")).lower()
+    scheduler = str(config.get("scheduler", "none")).lower()
+    weight_decay = _positive_float(config.get("weight_decay"), default=0.0)
+    augmentation = config.get("augmentation") if isinstance(config.get("augmentation"), dict) else {}
+    class_balancing = str(config.get("class_balancing", "")).lower()
     epoch_sleep = _positive_float(os.getenv("LOCAL_TRAINING_EPOCH_SECONDS"), default=0.5)
     started_at = time.time()
 
     model_score = _model_score(model)
+    image_bonus = 0.015 if image_size >= 256 else 0.0
+    optimizer_bonus = 0.012 if optimizer in {"adamw", "sgd"} else 0.0
+    scheduler_bonus = 0.01 if scheduler in {"cosine", "step"} else 0.0
+    regularization_bonus = 0.01 if 0 < weight_decay <= 0.05 else 0.0
+    augmentation_bonus = 0.0
+    if augmentation.get("horizontal_flip"):
+        augmentation_bonus += 0.006
+    if augmentation.get("color_jitter"):
+        augmentation_bonus += 0.008
+    if augmentation.get("random_crop"):
+        augmentation_bonus += 0.006
+    balance_bonus = 0.012 if class_balancing in {"weighted_loss", "class_weighted_loss"} else 0.0
     batch_penalty = 0.02 if batch_size < 8 else 0.0
     lr_penalty = 0.03 if learning_rate > 0.001 else 0.0
-    final_macro_f1 = max(0.35, min(0.94, model_score - batch_penalty - lr_penalty))
+    final_macro_f1 = max(
+        0.35,
+        min(
+            0.96,
+            model_score
+            + image_bonus
+            + optimizer_bonus
+            + scheduler_bonus
+            + regularization_bonus
+            + augmentation_bonus
+            + balance_bonus
+            - batch_penalty
+            - lr_penalty,
+        ),
+    )
     best_macro_f1 = 0.0
     best_accuracy = 0.0
 

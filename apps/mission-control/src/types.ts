@@ -51,6 +51,14 @@ export type PlannedExperiment = {
   batch_size: number;
   learning_rate: number;
   reason: string;
+  image_size?: number;
+  optimizer?: string;
+  scheduler?: string;
+  weight_decay?: number;
+  augmentation?: Record<string, unknown>;
+  class_balancing?: string;
+  early_stopping_patience?: number;
+  strategy?: string;
 };
 
 export type ExperimentPlan = {

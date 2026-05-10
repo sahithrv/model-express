@@ -134,7 +134,8 @@ func trainingMonitorJSONRequest(model string, contextBlob []byte) llm.JSONReques
 Return only valid JSON. Evaluate image-classification training runs holistically.
 Consider validation quality, macro-F1, accuracy, train/validation gap, metric stability,
 plateauing, cost, runtime, and whether the run should inform future experiments.
-Do not request direct execution. Produce a recommendation that deterministic policy can review.`),
+This agent evaluates one run only. Do not propose new experiments or plan a follow-up batch.
+Produce signals that the plan-level Experiment Planning Agent can use later.`),
 			},
 			{
 				Role: "user",
@@ -142,22 +143,11 @@ Do not request direct execution. Produce a recommendation that deterministic pol
 {
   "summary": "short human-readable summary",
   "recommended_action": {
-    "action_type": "RANK_MODELS|ADD_EXPERIMENTS|PRUNE_RUN|STOP_PROJECT|CHANGE_PREPROCESSING",
+    "action_type": "RANK_MODELS|PRUNE_RUN|STOP_PROJECT|CHANGE_PREPROCESSING",
     "confidence": 0.0,
     "rationale": "why this action is useful",
-    "payload": {
-      "proposed_experiments": [
-        {
-          "template": "efficientnet_transfer",
-          "model": "efficientnet_b0",
-          "epochs": 8,
-          "batch_size": 16,
-          "learning_rate": 0.0002,
-          "reason": "why this experiment should be run next"
-        }
-      ]
-    },
-    "requires_approval": false
+    "payload": {},
+    "requires_approval": true
   },
   "quality_summary": "quality assessment",
   "training_dynamics": "overfitting/underfitting/plateau/stability assessment",
@@ -168,10 +158,8 @@ Do not request direct execution. Produce a recommendation that deterministic pol
   "tags": ["short_tag"]
 }
 
-If action_type is ADD_EXPERIMENTS, payload.proposed_experiments must contain 1-3 complete experiments.
-Use only the fields template, model, epochs, batch_size, learning_rate, and reason.
-Keep proposals conservative enough for deterministic validation and scheduling.
-For non-ADD_EXPERIMENTS actions, payload may be empty or contain supporting evidence.
+Do not include proposed_experiments. This is not the plan-level planner.
+Payload may include supporting evidence such as overfitting indicators, plateau signals, or promising settings.
 
 Context:
 %s`, string(contextBlob)),
@@ -216,7 +204,7 @@ func validateTrainingEvaluation(recommendation TrainingEvaluationRecommendation)
 
 func allowedAgentAction(actionType string) bool {
 	switch strings.ToUpper(strings.TrimSpace(actionType)) {
-	case "ADD_EXPERIMENTS", "CHANGE_PREPROCESSING", "PRUNE_RUN", "RANK_MODELS", "STOP_PROJECT":
+	case "CHANGE_PREPROCESSING", "PRUNE_RUN", "RANK_MODELS", "STOP_PROJECT":
 		return true
 	default:
 		return false

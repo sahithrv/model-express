@@ -23,10 +23,18 @@ type ExperimentPlan struct {
 }
 
 type PlannedExperiment struct {
-	Template     string  `json:"template"`
-	Model        string  `json:"model"`
-	Epochs       int     `json:"epochs"`
-	BatchSize    int     `json:"batch_size"`
-	LearningRate float64 `json:"learning_rate"`
-	Reason       string  `json:"reason"`
+	Template              string         `json:"template"`
+	Model                 string         `json:"model"`
+	Epochs                int            `json:"epochs"`
+	BatchSize             int            `json:"batch_size"`
+	LearningRate          float64        `json:"learning_rate"`
+	Reason                string         `json:"reason"`
+	ImageSize             int            `json:"image_size,omitempty"`
+	Optimizer             string         `json:"optimizer,omitempty"`
+	Scheduler             string         `json:"scheduler,omitempty"`
+	WeightDecay           float64        `json:"weight_decay,omitempty"`
+	Augmentation          map[string]any `json:"augmentation,omitempty"`
+	ClassBalancing        string         `json:"class_balancing,omitempty"`
+	EarlyStoppingPatience int            `json:"early_stopping_patience,omitempty"`
+	Strategy              string         `json:"strategy,omitempty"`
 }

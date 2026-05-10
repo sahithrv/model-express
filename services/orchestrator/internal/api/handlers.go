@@ -84,8 +84,11 @@ type automaticExperimentReviewResult struct {
 }
 
 const (
-	llmTrainingMonitorDecisionSource = "llm_training_monitor"
-	minLLMDecisionConfidence         = 0.50
+	llmExperimentPlannerDecisionSource  = "llm_experiment_planner"
+	minLLMDecisionConfidence            = 0.50
+	maxLLMPlannerExperiments            = 5
+	plannerMinimumMeaningfulImprovement = 0.005
+	plannerNoImprovementRoundsToSelect  = 2
 )
 
 type updateDatasetProfileRequest struct {
@@ -863,7 +866,7 @@ func (s *Server) completeJob(c *gin.Context) {
 			return
 		}
 		s.runTrainingMonitorAfterTrainingJob(job)
-		s.runAutomaticExperimentReviewAfterTrainingJob(job)
+		s.runPlanningLoopAfterTrainingJob(job)
 	}
 
 	c.JSON(http.StatusOK, job)
@@ -889,7 +892,7 @@ func (s *Server) failJob(c *gin.Context) {
 			return
 		}
 		s.runTrainingMonitorAfterTrainingJob(job)
-		s.runAutomaticExperimentReviewAfterTrainingJob(job)
+		s.runPlanningLoopAfterTrainingJob(job)
 	}
 
 	c.JSON(http.StatusOK, job)
@@ -899,6 +902,116 @@ func (s *Server) runAutomaticExperimentReviewAfterTrainingJob(job jobs.Experimen
 	if _, err := s.runAutomaticExperimentReview(job.ProjectID); err != nil {
 		log.Printf("automatic experiment review failed after training job %s: %v", job.ID, err)
 	}
+}
+
+func (s *Server) runPlanningLoopAfterTrainingJob(job jobs.ExperimentJob) {
+	if err := s.recordExperimentPlannerOutcomeAfterTrainingJob(job); err != nil {
+		log.Printf("record experiment planner outcome failed after training job %s: %v", job.ID, err)
+	}
+
+	handled, err := s.runExperimentPlannerAfterTrainingJob(job)
+	if err != nil {
+		log.Printf("llm experiment planner failed after training job %s: %v", job.ID, err)
+	}
+	if handled {
+		return
+	}
+	s.runAutomaticExperimentReviewAfterTrainingJob(job)
+}
+
+func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.ExperimentJob) error {
+	summary, err := s.store.GetTrainingRunSummary(job.ID)
+	if err != nil || summary.PlanID == "" {
+		return nil
+	}
+
+	s.autoReviewMu.Lock()
+	defer s.autoReviewMu.Unlock()
+
+	plan, err := s.store.GetExperimentPlan(summary.PlanID)
+	if err != nil {
+		return err
+	}
+	if plan.SourceDecisionID == "" {
+		return nil
+	}
+
+	summaries, err := s.store.ListProjectTrainingRunSummaries(job.ProjectID)
+	if err != nil {
+		return err
+	}
+	planSummaries := summariesForPlanID(summaries, plan.ID)
+	if !planTrainingRunsComplete(plan, planSummaries) {
+		return nil
+	}
+
+	agentDecisions, err := s.store.ListProjectAgentDecisions(job.ProjectID)
+	if err != nil {
+		return err
+	}
+	sourceDecision, ok := agentDecisionByID(agentDecisions, plan.SourceDecisionID)
+	if !ok || sourceDecision.Payload["decision_source"] != llmExperimentPlannerDecisionSource {
+		return nil
+	}
+
+	invocationID := payloadString(sourceDecision.Payload, "invocation_id")
+	if invocationID == "" {
+		return nil
+	}
+	invocation, err := s.store.GetAgentInvocation(invocationID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if payloadString(invocation.DownstreamOutcome, "follow_up_plan_id") == plan.ID {
+		return nil
+	}
+
+	projectPlans, err := s.store.ListProjectExperimentPlans(job.ProjectID)
+	if err != nil {
+		return err
+	}
+	outcome, err := experimentPlanningOutcomeForPlan(sourceDecision, plan, projectPlans, summaries)
+	if err != nil {
+		return err
+	}
+	outcomePayload, err := mapFromStruct(outcome)
+	if err != nil {
+		return err
+	}
+
+	updatedInvocation, err := s.store.UpdateAgentInvocationDownstreamOutcome(invocationID, outcomePayload)
+	if err != nil {
+		return err
+	}
+
+	tags := plannerOutcomeTags(outcome)
+	record, err := s.store.CreateAgentMemoryRecord(memory.AgentMemoryRecord{
+		InvocationID: updatedInvocation.ID,
+		ProjectID:    job.ProjectID,
+		DatasetID:    plan.DatasetID,
+		PlanID:       plan.ID,
+		AgentName:    agents.ExperimentPlannerAgentName,
+		Kind:         memory.KindPlanningOutcome,
+		Summary:      outcome.Lesson,
+		Payload:      outcomePayload,
+		Tags:         tags,
+	})
+	if err != nil {
+		return err
+	}
+
+	if _, err := s.store.CreateExecutionEvent(job.ProjectID, plan.ID, execution.EventAgentOutcomeRecorded, fmt.Sprintf("Experiment Planner outcome recorded for follow-up plan %s.", plan.ID), map[string]any{
+		"invocation_id":      updatedInvocation.ID,
+		"memory_record_id":   record.ID,
+		"source_decision_id": sourceDecision.ID,
+		"outcome_status":     outcome.OutcomeStatus,
+	}); err != nil {
+		log.Printf("record experiment planner outcome event failed: %v", err)
+	}
+	return nil
 }
 
 func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
@@ -1001,18 +1114,6 @@ func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
 	}); err != nil {
 		log.Printf("record training monitor event failed: %v", err)
 	}
-
-	if _, err := s.handleTrainingMonitorAgentDecision(job, summary, trace, invocation, record); err != nil {
-		log.Printf("training monitor decision handling failed for job %s: %v", job.ID, err)
-		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Training Monitor decision was not scheduled for job %s.", job.ID), map[string]any{
-			"job_id":           job.ID,
-			"invocation_id":    invocation.ID,
-			"memory_record_id": record.ID,
-			"error":            err.Error(),
-		}); eventErr != nil {
-			log.Printf("record training monitor decision failure event failed: %v", eventErr)
-		}
-	}
 }
 
 func (s *Server) recordTrainingMonitorInvocation(
@@ -1060,161 +1161,349 @@ func llmMessagesForMemory(messages []llm.Message) []map[string]string {
 	return out
 }
 
-func (s *Server) handleTrainingMonitorAgentDecision(
-	job jobs.ExperimentJob,
-	summary runs.TrainingRunSummary,
-	trace agents.TrainingMonitorEvaluationTrace,
-	invocation memory.AgentInvocation,
-	record memory.AgentMemoryRecord,
-) (automaticExperimentReviewResult, error) {
-	if !s.shouldAutoReviewExperimentJobs() {
-		return automaticExperimentReviewResult{}, nil
-	}
-	if trace.ValidationStatus != memory.InvocationValidationValid {
-		return automaticExperimentReviewResult{}, nil
+func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (bool, error) {
+	if !s.shouldRunLLMAgents() || !s.shouldAutoReviewExperimentJobs() {
+		return false, nil
 	}
 
-	recommendation := trace.Recommendation
-	action := recommendation.RecommendedAction
-	decisionType, ok := llmActionDecisionType(action.ActionType)
-	if !ok {
-		return automaticExperimentReviewResult{}, nil
-	}
-	if action.Confidence < minLLMDecisionConfidence {
-		log.Printf(
-			"training monitor decision skipped for job %s: confidence %.2f below %.2f",
-			job.ID,
-			action.Confidence,
-			minLLMDecisionConfidence,
-		)
-		return automaticExperimentReviewResult{}, nil
-	}
-
-	plan, ready, err := s.sourcePlanReadyForAgentDecision(job.ProjectID, summary.PlanID)
-	if err != nil || !ready {
-		return automaticExperimentReviewResult{}, err
-	}
-
-	payload, err := trainingMonitorDecisionPayload(action, invocation, record, s.currentAutomationSettings().AgentMode)
+	summary, err := s.store.GetTrainingRunSummary(job.ID)
 	if err != nil {
-		return automaticExperimentReviewResult{}, err
+		return false, nil
+	}
+	if summary.PlanID == "" {
+		return false, nil
+	}
+
+	s.autoReviewMu.Lock()
+	defer s.autoReviewMu.Unlock()
+
+	input, ready, err := s.buildExperimentPlannerInput(job.ProjectID, summary.PlanID)
+	if err != nil || !ready {
+		return false, err
 	}
 
 	agentDecisions, err := s.store.ListProjectAgentDecisions(job.ProjectID)
 	if err != nil {
-		return automaticExperimentReviewResult{}, err
+		return false, err
 	}
-	decision, ok := trainingMonitorDecisionForPlan(agentDecisions, plan.ID)
-	if !ok {
-		decision, err = s.store.CreateAgentDecision(
-			job.ProjectID,
-			plan.ID,
-			decisionType,
-			action.Rationale,
-			payload,
-		)
-		if err != nil {
-			return automaticExperimentReviewResult{}, err
+	if decision, ok := experimentPlannerDecisionForPlan(agentDecisions, input.SourcePlan.ID); ok {
+		result := automaticExperimentReviewResult{Decision: &decision}
+		if decision.DecisionType == decisions.TypeAddExperiments &&
+			s.shouldAutoScheduleFollowUps() &&
+			s.currentAutomationSettings().AgentMode == llm.AgentModeAutonomous {
+			return true, s.schedulePlannerDecision(job.ProjectID, input.SourcePlan, decision, result)
 		}
+		return true, nil
+	}
+
+	automationSettings := s.currentAutomationSettings()
+	config := llm.ConfigFromEnv(automationSettings.LLMEnabled, automationSettings.LLMProvider, automationSettings.LLMModel)
+	client := llm.NewOpenAICompatibleClient(config)
+	agent := agents.NewExperimentPlannerAgent(client, config.Model)
+
+	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
+	defer cancel()
+
+	trace, err := agent.PlanWithTrace(ctx, input)
+	acceptedForMemory := err == nil
+	invocation, invocationErr := s.recordExperimentPlannerInvocation(input, config, trace, acceptedForMemory)
+	if invocationErr != nil {
+		log.Printf("experiment planner invocation write failed for plan %s: %v", summary.PlanID, invocationErr)
+	}
+	if err != nil {
+		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Experiment Planner failed for plan %s.", summary.PlanID), map[string]any{
+			"invocation_id": invocation.ID,
+			"error":         err.Error(),
+		}); eventErr != nil {
+			log.Printf("record experiment planner failure event failed: %v", eventErr)
+		}
+		return false, err
+	}
+
+	recommendation := applyExperimentPlannerStopCriteria(trace.Recommendation, input)
+	payload, err := experimentPlannerDecisionPayload(recommendation, invocation, automationSettings.AgentMode, input)
+	if err != nil {
+		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Experiment Planner proposal failed validation for plan %s.", summary.PlanID), map[string]any{
+			"invocation_id": invocation.ID,
+			"error":         err.Error(),
+		}); eventErr != nil {
+			log.Printf("record experiment planner validation event failed: %v", eventErr)
+		}
+		return false, err
+	}
+
+	memoryPayload, err := mapFromStruct(recommendation)
+	if err != nil {
+		return false, err
+	}
+	memoryPayload["current_champion"] = input.CurrentChampion
+	memoryPayload["source_plan_baseline_champion"] = input.SourcePlanBaselineChampion
+	memoryPayload["source_plan_run_deltas"] = input.SourcePlanDeltas
+	memoryPayload["no_improvement_rounds"] = input.NoImprovementRounds
+	memoryPayload["stop_signals"] = input.StopSignals
+	record, err := s.store.CreateAgentMemoryRecord(memory.AgentMemoryRecord{
+		InvocationID: invocation.ID,
+		ProjectID:    job.ProjectID,
+		DatasetID:    input.SourcePlan.DatasetID,
+		PlanID:       input.SourcePlan.ID,
+		AgentName:    agents.ExperimentPlannerAgentName,
+		Kind:         memory.KindPlanningFeedback,
+		Summary:      recommendation.Summary,
+		Payload:      memoryPayload,
+		Tags:         recommendation.Tags,
+	})
+	if err != nil {
+		return false, err
+	}
+	payload["memory_record_id"] = record.ID
+
+	decisionType := strings.ToUpper(strings.TrimSpace(recommendation.DecisionType))
+	if decisionType == decisions.TypeWait {
+		return true, nil
+	}
+
+	decision, err := s.store.CreateAgentDecision(
+		job.ProjectID,
+		input.SourcePlan.ID,
+		decisionType,
+		recommendation.Rationale,
+		payload,
+	)
+	if err != nil {
+		return false, err
+	}
+
+	if _, err := s.store.CreateExecutionEvent(job.ProjectID, input.SourcePlan.ID, execution.EventAgentRecommendationRecorded, fmt.Sprintf("Experiment Planner recorded a plan-level decision for plan %s.", input.SourcePlan.ID), map[string]any{
+		"invocation_id":    invocation.ID,
+		"memory_record_id": record.ID,
+		"decision_id":      decision.ID,
+		"decision_type":    decision.DecisionType,
+		"agent_name":       agents.ExperimentPlannerAgentName,
+	}); err != nil {
+		log.Printf("record experiment planner event failed: %v", err)
 	}
 
 	result := automaticExperimentReviewResult{Decision: &decision}
-	if decision.DecisionType != decisions.TypeAddExperiments {
-		return result, nil
-	}
-	if !s.shouldAutoScheduleFollowUps() || s.currentAutomationSettings().AgentMode != llm.AgentModeAutonomous {
-		return result, nil
+	if decision.DecisionType != decisions.TypeAddExperiments ||
+		!s.shouldAutoScheduleFollowUps() ||
+		automationSettings.AgentMode != llm.AgentModeAutonomous {
+		return true, nil
 	}
 
-	projectPlans, err := s.store.ListProjectExperimentPlans(job.ProjectID)
+	return true, s.schedulePlannerDecision(job.ProjectID, input.SourcePlan, decision, result)
+}
+
+func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (agents.ExperimentPlannerInput, bool, error) {
+	project, err := s.store.GetProject(projectID)
 	if err != nil {
-		return automaticExperimentReviewResult{}, err
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	plan, err := s.store.GetExperimentPlan(planID)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	if plan.ProjectID != projectID {
+		return agents.ExperimentPlannerInput{}, false, fmt.Errorf("%w: plan does not belong to project", store.ErrInvalidRequest)
+	}
+
+	dataset, err := s.store.GetDataset(plan.DatasetID)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	summaries, err := s.store.ListProjectTrainingRunSummaries(projectID)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+
+	planJobs := jobsForPlan(projectJobs, plan.ID)
+	planSummaries := summariesForPlanID(summaries, plan.ID)
+	if !planTrainingRunsComplete(plan, planSummaries) {
+		return agents.ExperimentPlannerInput{}, false, nil
+	}
+	currentChampion, baselineChampion, sourcePlanDeltas, noImprovementRounds, stopSignals := experimentPlannerPerformanceContext(
+		plan.TargetMetric,
+		projectPlans,
+		summaries,
+		plan.ID,
+	)
+
+	planMetrics := map[string][]jobs.EpochMetric{}
+	for _, planJob := range planJobs {
+		metrics, err := s.store.ListJobMetrics(planJob.ID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return agents.ExperimentPlannerInput{}, false, err
+		}
+		planMetrics[planJob.ID] = metrics
+	}
+
+	priorMemory, err := s.store.ListProjectAgentMemoryRecords(projectID, memory.AgentMemoryFilter{
+		DatasetID: plan.DatasetID,
+		Limit:     25,
+	})
+	if err != nil {
+		priorMemory = []memory.AgentMemoryRecord{}
+	}
+
+	return agents.ExperimentPlannerInput{
+		Project:                      project,
+		Dataset:                      dataset,
+		SourcePlan:                   plan,
+		PlanJobs:                     planJobs,
+		PlanSummaries:                planSummaries,
+		PlanMetrics:                  planMetrics,
+		CurrentChampion:              currentChampion,
+		SourcePlanBaselineChampion:   baselineChampion,
+		SourcePlanDeltas:             sourcePlanDeltas,
+		NoImprovementRounds:          noImprovementRounds,
+		StopSignals:                  stopSignals,
+		MinimumMeaningfulImprovement: plannerMinimumMeaningfulImprovement,
+		PriorPlans:                   projectPlans,
+		PriorJobs:                    projectJobs,
+		PriorMemory:                  priorMemory,
+		ExistingExperimentSignatures: experimentSignaturesForPlans(projectPlans),
+		MaxExperiments:               maxLLMPlannerExperiments,
+		MaxFollowUpRounds:            s.maxAutoFollowUpRounds(),
+		FollowUpRound:                followUpRoundCount(projectPlans),
+	}, true, nil
+}
+
+func (s *Server) recordExperimentPlannerInvocation(
+	input agents.ExperimentPlannerInput,
+	config llm.Config,
+	trace agents.ExperimentPlanningTrace,
+	acceptedForMemory bool,
+) (memory.AgentInvocation, error) {
+	validationStatus := trace.ValidationStatus
+	if validationStatus == "" {
+		validationStatus = memory.InvocationValidationFailed
+	}
+
+	return s.store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:         input.Project.ID,
+		DatasetID:         input.SourcePlan.DatasetID,
+		PlanID:            input.SourcePlan.ID,
+		AgentName:         agents.ExperimentPlannerAgentName,
+		AgentVersion:      trace.AgentVersion,
+		PromptVersion:     trace.PromptVersion,
+		Provider:          config.Provider,
+		Model:             config.Model,
+		InputMessages:     llmMessagesForMemory(trace.Request.Messages),
+		InputContext:      trace.PromptContext,
+		RawOutput:         string(trace.RawOutput),
+		ParsedOutput:      trace.ParsedOutput,
+		ValidationStatus:  validationStatus,
+		ValidationError:   trace.ValidationError,
+		AcceptedForMemory: acceptedForMemory,
+		HumanFeedback:     map[string]any{},
+		DownstreamOutcome: map[string]any{},
+	})
+}
+
+func applyExperimentPlannerStopCriteria(
+	recommendation agents.ExperimentPlanningRecommendation,
+	input agents.ExperimentPlannerInput,
+) agents.ExperimentPlanningRecommendation {
+	decisionType := strings.ToUpper(strings.TrimSpace(recommendation.DecisionType))
+	recommendation.DecisionType = decisionType
+	if decisionType != decisions.TypeAddExperiments {
+		return recommendation
+	}
+	if input.CurrentChampion == nil || input.NoImprovementRounds < plannerNoImprovementRoundsToSelect {
+		return recommendation
+	}
+
+	stopReason := fmt.Sprintf(
+		"Current champion %s remains unbeaten after %d consecutive follow-up plan(s) with less than %.3f target-metric improvement.",
+		input.CurrentChampion.JobID,
+		input.NoImprovementRounds,
+		input.MinimumMeaningfulImprovement,
+	)
+	recommendation.DecisionType = decisions.TypeSelectChampion
+	recommendation.ChampionJobID = input.CurrentChampion.JobID
+	recommendation.ProposedExperiments = nil
+	recommendation.StopReason = stopReason
+	recommendation.Summary = fmt.Sprintf("Select champion %s; recent follow-ups did not meaningfully improve on it.", input.CurrentChampion.JobID)
+	recommendation.Rationale = strings.TrimSpace(recommendation.Rationale + " Backend stop criteria applied: " + stopReason)
+	recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend guard converted ADD_EXPERIMENTS to SELECT_CHAMPION after repeated no-improvement rounds.")
+	recommendation.Tags = append(recommendation.Tags, "select_champion", "no_improvement_guard")
+	return recommendation
+}
+
+func experimentPlannerDecisionPayload(
+	recommendation agents.ExperimentPlanningRecommendation,
+	invocation memory.AgentInvocation,
+	agentMode string,
+	input agents.ExperimentPlannerInput,
+) (map[string]any, error) {
+	payload := map[string]any{
+		"decision_source":                llmExperimentPlannerDecisionSource,
+		"agent_name":                     agents.ExperimentPlannerAgentName,
+		"invocation_id":                  invocation.ID,
+		"confidence":                     recommendation.Confidence,
+		"auto_executable":                agentMode == llm.AgentModeAutonomous,
+		"risks":                          recommendation.Risks,
+		"expected_tradeoffs":             recommendation.ExpectedTradeoffs,
+		"novelty_notes":                  recommendation.NoveltyNotes,
+		"champion_job_id":                recommendation.ChampionJobID,
+		"why_can_beat_champion":          recommendation.WhyCanBeatChampion,
+		"expected_delta_vs_champion":     recommendation.ExpectedDeltaVsChampion,
+		"stop_reason":                    recommendation.StopReason,
+		"current_champion":               input.CurrentChampion,
+		"source_plan_baseline_champion":  input.SourcePlanBaselineChampion,
+		"source_plan_run_deltas":         input.SourcePlanDeltas,
+		"no_improvement_rounds":          input.NoImprovementRounds,
+		"minimum_meaningful_improvement": input.MinimumMeaningfulImprovement,
+		"stop_signals":                   input.StopSignals,
+	}
+
+	if strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
+		if err := validateNovelProposedExperiments(recommendation.ProposedExperiments, input.PriorPlans); err != nil {
+			return nil, err
+		}
+		payload["proposed_experiments"] = recommendation.ProposedExperiments
+	}
+
+	return payload, nil
+}
+
+func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.ExperimentPlan, decision decisions.AgentDecision, result automaticExperimentReviewResult) error {
+	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
+	if err != nil {
+		return err
 	}
 	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
 		result.FollowUpPlan = &existingPlan
-		return s.executeAutomaticFollowUpPlan(result)
+		_, err := s.executeAutomaticFollowUpPlan(result)
+		return err
 	}
 
 	maxRounds := s.maxAutoFollowUpRounds()
 	if followUpRoundCount(projectPlans) >= maxRounds {
 		log.Printf(
-			"llm follow-up scheduling skipped for project %s plan %s: max follow-up rounds reached (%d)",
-			job.ProjectID,
-			plan.ID,
+			"llm planner follow-up scheduling skipped for project %s plan %s: max follow-up rounds reached (%d)",
+			projectID,
+			sourcePlan.ID,
 			maxRounds,
 		)
-		return result, nil
+		return nil
 	}
 
-	followUpPlan, _, err := s.ensureFollowUpPlan(job.ProjectID, plan, decision)
+	followUpPlan, _, err := s.ensureFollowUpPlan(projectID, sourcePlan, decision)
 	if err != nil {
-		return automaticExperimentReviewResult{}, err
+		return err
 	}
 
 	result.FollowUpPlan = &followUpPlan
-	return s.executeAutomaticFollowUpPlan(result)
-}
-
-func llmActionDecisionType(actionType string) (string, bool) {
-	switch strings.ToUpper(strings.TrimSpace(actionType)) {
-	case decisions.TypeAddExperiments:
-		return decisions.TypeAddExperiments, true
-	case decisions.TypeStopProject:
-		return decisions.TypeStopProject, true
-	default:
-		return "", false
-	}
-}
-
-func trainingMonitorDecisionPayload(
-	action decisions.AgentActionProposal,
-	invocation memory.AgentInvocation,
-	record memory.AgentMemoryRecord,
-	agentMode string,
-) (map[string]any, error) {
-	payload := map[string]any{}
-	for key, value := range action.Payload {
-		payload[key] = value
-	}
-
-	if strings.EqualFold(action.ActionType, decisions.TypeAddExperiments) {
-		experiments, err := plannedExperimentsFromPayload(payload)
-		if err != nil {
-			return nil, err
-		}
-		payload["proposed_experiments"] = experiments
-	}
-
-	payload["decision_source"] = llmTrainingMonitorDecisionSource
-	payload["agent_name"] = agents.TrainingMonitorAgentName
-	payload["invocation_id"] = invocation.ID
-	payload["memory_record_id"] = record.ID
-	payload["confidence"] = action.Confidence
-	payload["llm_action_type"] = action.ActionType
-	payload["llm_requires_approval"] = action.RequiresApproval
-	payload["auto_executable"] = agentMode == llm.AgentModeAutonomous
-	return payload, nil
-}
-
-func (s *Server) sourcePlanReadyForAgentDecision(projectID string, planID string) (plans.ExperimentPlan, bool, error) {
-	if planID == "" {
-		return plans.ExperimentPlan{}, false, nil
-	}
-
-	plan, err := s.store.GetExperimentPlan(planID)
-	if err != nil {
-		return plans.ExperimentPlan{}, false, err
-	}
-	if plan.ProjectID != projectID {
-		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: plan does not belong to project", store.ErrInvalidRequest)
-	}
-
-	summaries, err := s.store.ListProjectTrainingRunSummaries(projectID)
-	if err != nil {
-		return plans.ExperimentPlan{}, false, err
-	}
-
-	return plan, planTrainingRunsComplete(plan, summaries), nil
+	_, err = s.executeAutomaticFollowUpPlan(result)
+	return err
 }
 
 func planTrainingRunsComplete(plan plans.ExperimentPlan, summaries []runs.TrainingRunSummary) bool {
@@ -1222,17 +1511,11 @@ func planTrainingRunsComplete(plan plans.ExperimentPlan, summaries []runs.Traini
 		return false
 	}
 
-	planSummaries := []runs.TrainingRunSummary{}
-	for _, summary := range summaries {
-		if summary.PlanID == plan.ID {
-			planSummaries = append(planSummaries, summary)
-		}
-	}
-	if len(planSummaries) < len(plan.Experiments) {
+	if len(summaries) < len(plan.Experiments) {
 		return false
 	}
 
-	for _, summary := range planSummaries {
+	for _, summary := range summaries {
 		if !isTerminalTrainingSummary(summary) {
 			return false
 		}
@@ -1249,17 +1532,500 @@ func isTerminalTrainingSummary(summary runs.TrainingRunSummary) bool {
 	}
 }
 
-func trainingMonitorDecisionForPlan(agentDecisions []decisions.AgentDecision, planID string) (decisions.AgentDecision, bool) {
+func experimentPlannerDecisionForPlan(agentDecisions []decisions.AgentDecision, planID string) (decisions.AgentDecision, bool) {
 	for _, decision := range agentDecisions {
 		if decision.PlanID != planID {
 			continue
 		}
-		if decision.Payload["decision_source"] != llmTrainingMonitorDecisionSource {
+		if decision.Payload["decision_source"] != llmExperimentPlannerDecisionSource {
 			continue
 		}
 		return decision, true
 	}
 	return decisions.AgentDecision{}, false
+}
+
+func agentDecisionByID(agentDecisions []decisions.AgentDecision, decisionID string) (decisions.AgentDecision, bool) {
+	for _, decision := range agentDecisions {
+		if decision.ID == decisionID {
+			return decision, true
+		}
+	}
+	return decisions.AgentDecision{}, false
+}
+
+func experimentPlanningOutcomeForPlan(
+	sourceDecision decisions.AgentDecision,
+	followUpPlan plans.ExperimentPlan,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+) (agents.ExperimentPlanningOutcome, error) {
+	planSummaries := summariesForPlanID(summaries, followUpPlan.ID)
+	proposedExperiments, err := plannedExperimentsFromPayload(sourceDecision.Payload)
+	if err != nil {
+		proposedExperiments = []plans.PlannedExperiment{}
+	}
+
+	baselineChampion := baselineChampionForPlannerOutcome(sourceDecision, followUpPlan, projectPlans, summaries)
+	bestSummary, hasBest := bestSuccessfulTrainingSummary(followUpPlan.TargetMetric, planSummaries)
+
+	var actualBest *agents.ExperimentChampion
+	actualDelta := 0.0
+	if hasBest {
+		best := experimentChampionFromSummary(followUpPlan.TargetMetric, bestSummary)
+		actualBest = &best
+		if baselineChampion != nil {
+			actualDelta = best.Score - baselineChampion.Score
+		} else {
+			actualDelta = best.Score
+		}
+	}
+
+	expectedDelta := payloadFloat(sourceDecision.Payload, "expected_delta_vs_champion")
+	metExpectedDelta := hasBest && actualDelta > plannerMinimumMeaningfulImprovement
+	if expectedDelta > 0 {
+		metExpectedDelta = hasBest && actualDelta >= expectedDelta
+	}
+	outcomeStatus := plannerOutcomeStatus(actualDelta, hasBest)
+	outcome := agents.ExperimentPlanningOutcome{
+		OutcomeType:             "planner_followup_result",
+		OutcomeStatus:           outcomeStatus,
+		SourceDecisionID:        sourceDecision.ID,
+		SourcePlanID:            sourceDecision.PlanID,
+		FollowUpPlanID:          followUpPlan.ID,
+		BaselineChampion:        baselineChampion,
+		ActualBestRun:           actualBest,
+		ExpectedDeltaVsChampion: expectedDelta,
+		ActualDeltaVsChampion:   actualDelta,
+		MetExpectedDelta:        metExpectedDelta,
+		TotalCostUSD:            totalSummaryCost(planSummaries),
+		TotalRuntimeSeconds:     totalSummaryRuntime(planSummaries),
+		TerminalRunCount:        len(planSummaries),
+		SuccessfulRunCount:      successfulSummaryCount(planSummaries),
+		FailedRunCount:          failedSummaryCount(planSummaries),
+		ProposedExperiments:     proposedExperiments,
+		CompletedAt:             time.Now().UTC(),
+	}
+	outcome.Lesson = plannerOutcomeLesson(followUpPlan.TargetMetric, outcome)
+	return outcome, nil
+}
+
+func baselineChampionForPlannerOutcome(
+	sourceDecision decisions.AgentDecision,
+	followUpPlan plans.ExperimentPlan,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+) *agents.ExperimentChampion {
+	if champion, ok := experimentChampionFromPayload(sourceDecision.Payload["current_champion"]); ok {
+		return champion
+	}
+	if champion, ok := experimentChampionFromPayload(sourceDecision.Payload["source_plan_baseline_champion"]); ok {
+		return champion
+	}
+	if summary, ok := bestSuccessfulTrainingSummaryBeforePlan(followUpPlan.TargetMetric, projectPlans, summaries, followUpPlan.ID); ok {
+		champion := experimentChampionFromSummary(followUpPlan.TargetMetric, summary)
+		return &champion
+	}
+	return nil
+}
+
+func experimentChampionFromPayload(value any) (*agents.ExperimentChampion, bool) {
+	if value == nil {
+		return nil, false
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	var champion agents.ExperimentChampion
+	if err := json.Unmarshal(blob, &champion); err != nil {
+		return nil, false
+	}
+	if champion.JobID == "" {
+		return nil, false
+	}
+	return &champion, true
+}
+
+func plannerOutcomeStatus(actualDelta float64, hasBest bool) string {
+	if !hasBest {
+		return agents.ExperimentPlanningOutcomeFailed
+	}
+	if actualDelta > plannerMinimumMeaningfulImprovement {
+		return agents.ExperimentPlanningOutcomeImprovedChampion
+	}
+	if actualDelta > 0 {
+		return agents.ExperimentPlanningOutcomeMinorImprovement
+	}
+	return agents.ExperimentPlanningOutcomeNoImprovement
+}
+
+func plannerOutcomeLesson(targetMetric string, outcome agents.ExperimentPlanningOutcome) string {
+	metric := normalizedPlannerTargetMetric(targetMetric)
+	if outcome.OutcomeStatus == agents.ExperimentPlanningOutcomeFailed {
+		return fmt.Sprintf("Planner follow-up plan %s produced no successful runs after %.3f total cost; avoid repeating this failed strategy without changing the setup.", outcome.FollowUpPlanID, outcome.TotalCostUSD)
+	}
+	bestModel := ""
+	if outcome.ActualBestRun != nil {
+		bestModel = outcome.ActualBestRun.Model
+	}
+	switch outcome.OutcomeStatus {
+	case agents.ExperimentPlanningOutcomeImprovedChampion:
+		return fmt.Sprintf("Planner follow-up plan %s improved the champion with %s by %.3f %s; similar strategy changes are worth reusing.", outcome.FollowUpPlanID, bestModel, outcome.ActualDeltaVsChampion, metric)
+	case agents.ExperimentPlanningOutcomeMinorImprovement:
+		return fmt.Sprintf("Planner follow-up plan %s only slightly improved the champion with %s by %.3f %s, below the meaningful threshold %.3f; treat this as weak evidence.", outcome.FollowUpPlanID, bestModel, outcome.ActualDeltaVsChampion, metric, plannerMinimumMeaningfulImprovement)
+	default:
+		return fmt.Sprintf("Planner follow-up plan %s failed to beat the prior champion; best run %s trailed by %.3f %s after %.3f total cost.", outcome.FollowUpPlanID, bestModel, outcome.ActualDeltaVsChampion, metric, outcome.TotalCostUSD)
+	}
+}
+
+func plannerOutcomeTags(outcome agents.ExperimentPlanningOutcome) []string {
+	tags := []string{"planner_outcome", outcome.OutcomeStatus}
+	if outcome.MetExpectedDelta {
+		tags = append(tags, "met_expected_delta")
+	} else {
+		tags = append(tags, "missed_expected_delta")
+	}
+	if outcome.ActualBestRun != nil && outcome.ActualBestRun.Model != "" {
+		tags = append(tags, strings.ToLower(strings.TrimSpace(outcome.ActualBestRun.Model)))
+	}
+	return tags
+}
+
+func totalSummaryCost(summaries []runs.TrainingRunSummary) float64 {
+	total := 0.0
+	for _, summary := range summaries {
+		total += summary.EstimatedCostUSD
+	}
+	return total
+}
+
+func totalSummaryRuntime(summaries []runs.TrainingRunSummary) float64 {
+	total := 0.0
+	for _, summary := range summaries {
+		total += summary.RuntimeSeconds
+	}
+	return total
+}
+
+func successfulSummaryCount(summaries []runs.TrainingRunSummary) int {
+	count := 0
+	for _, summary := range summaries {
+		if strings.ToUpper(strings.TrimSpace(summary.Status)) == jobs.StatusSucceeded {
+			count++
+		}
+	}
+	return count
+}
+
+func failedSummaryCount(summaries []runs.TrainingRunSummary) int {
+	count := 0
+	for _, summary := range summaries {
+		if strings.ToUpper(strings.TrimSpace(summary.Status)) == jobs.StatusFailed {
+			count++
+		}
+	}
+	return count
+}
+
+func payloadString(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return value
+}
+
+func payloadFloat(payload map[string]any, key string) float64 {
+	switch value := payload[key].(type) {
+	case float64:
+		return value
+	case float32:
+		return float64(value)
+	case int:
+		return float64(value)
+	case int64:
+		return float64(value)
+	case json.Number:
+		out, _ := value.Float64()
+		return out
+	default:
+		return 0
+	}
+}
+
+func jobsForPlan(projectJobs []jobs.ExperimentJob, planID string) []jobs.ExperimentJob {
+	out := []jobs.ExperimentJob{}
+	for _, job := range projectJobs {
+		if configString(job.Config, "plan_id") == planID {
+			out = append(out, job)
+		}
+	}
+	return out
+}
+
+func summariesForPlanID(summaries []runs.TrainingRunSummary, planID string) []runs.TrainingRunSummary {
+	out := []runs.TrainingRunSummary{}
+	for _, summary := range summaries {
+		if summary.PlanID == planID {
+			out = append(out, summary)
+		}
+	}
+	return out
+}
+
+func experimentPlannerPerformanceContext(
+	targetMetric string,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+	sourcePlanID string,
+) (*agents.ExperimentChampion, *agents.ExperimentChampion, []agents.ExperimentRunDelta, int, []string) {
+	championSummary, hasChampion := bestSuccessfulTrainingSummary(targetMetric, summaries)
+	if !hasChampion {
+		return nil, nil, []agents.ExperimentRunDelta{}, 0, []string{"No successful champion run is available yet."}
+	}
+
+	champion := experimentChampionFromSummary(targetMetric, championSummary)
+	baselineChampion := champion
+	if baselineSummary, ok := bestSuccessfulTrainingSummaryBeforePlan(targetMetric, projectPlans, summaries, sourcePlanID); ok {
+		baselineChampion = experimentChampionFromSummary(targetMetric, baselineSummary)
+	}
+	sourcePlanDeltas := experimentRunDeltasForPlan(targetMetric, summariesForPlanID(summaries, sourcePlanID), baselineChampion)
+	noImprovementRounds := consecutiveNoImprovementFollowUpRounds(targetMetric, projectPlans, summaries)
+	stopSignals := experimentPlannerStopSignals(champion, noImprovementRounds)
+	return &champion, &baselineChampion, sourcePlanDeltas, noImprovementRounds, stopSignals
+}
+
+func experimentChampionFromSummary(targetMetric string, summary runs.TrainingRunSummary) agents.ExperimentChampion {
+	return agents.ExperimentChampion{
+		JobID:            summary.JobID,
+		PlanID:           summary.PlanID,
+		Model:            summary.Model,
+		TargetMetric:     normalizedPlannerTargetMetric(targetMetric),
+		Score:            plannerTargetMetricValue(targetMetric, summary),
+		BestMacroF1:      summary.BestMacroF1,
+		BestAccuracy:     summary.BestAccuracy,
+		EstimatedCostUSD: summary.EstimatedCostUSD,
+		RuntimeSeconds:   summary.RuntimeSeconds,
+		EpochsCompleted:  summary.EpochsCompleted,
+	}
+}
+
+func experimentRunDeltasForPlan(
+	targetMetric string,
+	summaries []runs.TrainingRunSummary,
+	champion agents.ExperimentChampion,
+) []agents.ExperimentRunDelta {
+	out := make([]agents.ExperimentRunDelta, 0, len(summaries))
+	for _, summary := range summaries {
+		score := plannerTargetMetricValue(targetMetric, summary)
+		out = append(out, agents.ExperimentRunDelta{
+			JobID:                    summary.JobID,
+			PlanID:                   summary.PlanID,
+			Model:                    summary.Model,
+			Status:                   summary.Status,
+			TargetMetric:             normalizedPlannerTargetMetric(targetMetric),
+			Score:                    score,
+			BestMacroF1:              summary.BestMacroF1,
+			BestAccuracy:             summary.BestAccuracy,
+			EstimatedCostUSD:         summary.EstimatedCostUSD,
+			RuntimeSeconds:           summary.RuntimeSeconds,
+			EpochsCompleted:          summary.EpochsCompleted,
+			ChampionJobID:            champion.JobID,
+			DeltaScoreVsChampion:     score - champion.Score,
+			DeltaCostVsChampion:      summary.EstimatedCostUSD - champion.EstimatedCostUSD,
+			DeltaRuntimeVsChampion:   summary.RuntimeSeconds - champion.RuntimeSeconds,
+			MeaningfullyImprovedOver: score > champion.Score+plannerMinimumMeaningfulImprovement,
+		})
+	}
+	return out
+}
+
+func consecutiveNoImprovementFollowUpRounds(
+	targetMetric string,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+) int {
+	orderedPlans := append([]plans.ExperimentPlan(nil), projectPlans...)
+	sort.Slice(orderedPlans, func(i, j int) bool {
+		if orderedPlans[i].CreatedAt.Equal(orderedPlans[j].CreatedAt) {
+			return orderedPlans[i].ID < orderedPlans[j].ID
+		}
+		return orderedPlans[i].CreatedAt.Before(orderedPlans[j].CreatedAt)
+	})
+
+	hasChampion := false
+	championScore := 0.0
+	noImprovementRounds := 0
+	for _, plan := range orderedPlans {
+		planSummaries := summariesForPlanID(summaries, plan.ID)
+		if !planTrainingRunsComplete(plan, planSummaries) {
+			continue
+		}
+
+		best, ok := bestSuccessfulTrainingSummary(targetMetric, planSummaries)
+		if !ok {
+			if plan.SourceDecisionID != "" && hasChampion {
+				noImprovementRounds++
+			}
+			continue
+		}
+
+		score := plannerTargetMetricValue(targetMetric, best)
+		if !hasChampion {
+			hasChampion = true
+			championScore = score
+			continue
+		}
+
+		if plan.SourceDecisionID != "" {
+			if score > championScore+plannerMinimumMeaningfulImprovement {
+				noImprovementRounds = 0
+			} else {
+				noImprovementRounds++
+			}
+		}
+		if score > championScore {
+			championScore = score
+		}
+	}
+	return noImprovementRounds
+}
+
+func experimentPlannerStopSignals(champion agents.ExperimentChampion, noImprovementRounds int) []string {
+	signals := []string{
+		fmt.Sprintf("Current champion is %s (%s) with %s %.3f.", champion.JobID, champion.Model, champion.TargetMetric, champion.Score),
+	}
+	if noImprovementRounds > 0 {
+		signals = append(signals, fmt.Sprintf("%d consecutive completed follow-up plan(s) did not improve the champion by at least %.3f.", noImprovementRounds, plannerMinimumMeaningfulImprovement))
+	}
+	if noImprovementRounds >= plannerNoImprovementRoundsToSelect {
+		signals = append(signals, "Backend policy will select the current champion instead of scheduling another follow-up unless a future run meaningfully improves it.")
+	}
+	return signals
+}
+
+func bestSuccessfulTrainingSummary(targetMetric string, summaries []runs.TrainingRunSummary) (runs.TrainingRunSummary, bool) {
+	var best runs.TrainingRunSummary
+	hasBest := false
+	bestScore := 0.0
+	for _, summary := range summaries {
+		if strings.ToUpper(strings.TrimSpace(summary.Status)) != jobs.StatusSucceeded {
+			continue
+		}
+		score := plannerTargetMetricValue(targetMetric, summary)
+		if !hasBest || score > bestScore || (score == bestScore && summary.EstimatedCostUSD < best.EstimatedCostUSD) {
+			best = summary
+			bestScore = score
+			hasBest = true
+		}
+	}
+	return best, hasBest
+}
+
+func bestSuccessfulTrainingSummaryBeforePlan(
+	targetMetric string,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+	sourcePlanID string,
+) (runs.TrainingRunSummary, bool) {
+	orderedPlans := append([]plans.ExperimentPlan(nil), projectPlans...)
+	sort.Slice(orderedPlans, func(i, j int) bool {
+		if orderedPlans[i].CreatedAt.Equal(orderedPlans[j].CreatedAt) {
+			return orderedPlans[i].ID < orderedPlans[j].ID
+		}
+		return orderedPlans[i].CreatedAt.Before(orderedPlans[j].CreatedAt)
+	})
+
+	priorPlanIDs := map[string]bool{}
+	for _, plan := range orderedPlans {
+		if plan.ID == sourcePlanID {
+			break
+		}
+		priorPlanIDs[plan.ID] = true
+	}
+
+	priorSummaries := []runs.TrainingRunSummary{}
+	for _, summary := range summaries {
+		if priorPlanIDs[summary.PlanID] {
+			priorSummaries = append(priorSummaries, summary)
+		}
+	}
+	return bestSuccessfulTrainingSummary(targetMetric, priorSummaries)
+}
+
+func plannerTargetMetricValue(targetMetric string, summary runs.TrainingRunSummary) float64 {
+	switch normalizedPlannerTargetMetric(targetMetric) {
+	case "accuracy":
+		return summary.BestAccuracy
+	default:
+		return summary.BestMacroF1
+	}
+}
+
+func normalizedPlannerTargetMetric(targetMetric string) string {
+	normalized := strings.ToLower(strings.TrimSpace(targetMetric))
+	if normalized == "" {
+		return "macro_f1"
+	}
+	return normalized
+}
+
+func experimentSignaturesForPlans(projectPlans []plans.ExperimentPlan) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, plan := range projectPlans {
+		for _, experiment := range plan.Experiments {
+			signature := experimentSignature(experiment)
+			if seen[signature] {
+				continue
+			}
+			seen[signature] = true
+			out = append(out, signature)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func validateNovelProposedExperiments(experiments []plans.PlannedExperiment, projectPlans []plans.ExperimentPlan) error {
+	existing := map[string]bool{}
+	for _, plan := range projectPlans {
+		for _, experiment := range plan.Experiments {
+			existing[experimentSignature(experiment)] = true
+		}
+	}
+
+	proposed := map[string]bool{}
+	for index, experiment := range experiments {
+		if err := validatePlannedExperiment(experiment, index); err != nil {
+			return err
+		}
+		signature := experimentSignature(experiment)
+		if existing[signature] {
+			return fmt.Errorf("%w: proposed experiment %d duplicates an existing experiment signature %s", store.ErrInvalidRequest, index, signature)
+		}
+		if proposed[signature] {
+			return fmt.Errorf("%w: proposed experiment %d duplicates another proposed experiment signature %s", store.ErrInvalidRequest, index, signature)
+		}
+		proposed[signature] = true
+	}
+	return nil
+}
+
+func experimentSignature(experiment plans.PlannedExperiment) string {
+	augmentationBlob, _ := json.Marshal(experiment.Augmentation)
+	return strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(experiment.Template)),
+		strings.ToLower(strings.TrimSpace(experiment.Model)),
+		strconv.Itoa(experiment.Epochs),
+		strconv.Itoa(experiment.BatchSize),
+		strconv.FormatFloat(experiment.LearningRate, 'g', -1, 64),
+		strconv.Itoa(experiment.ImageSize),
+		strings.ToLower(strings.TrimSpace(experiment.Optimizer)),
+		strings.ToLower(strings.TrimSpace(experiment.Scheduler)),
+		strconv.FormatFloat(experiment.WeightDecay, 'g', -1, 64),
+		string(augmentationBlob),
+		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
+		strconv.Itoa(experiment.EarlyStoppingPatience),
+	}, ":")
 }
 
 func (s *Server) listWorkers(c *gin.Context) {
@@ -1544,6 +2310,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			"provider":            provider,
 			"gpu_type":            req.GPUType,
 		}
+		addOptionalExperimentConfig(config, experiment)
 
 		job, err := s.store.CreateJob(plan.ProjectID, jobs.TemplateTrainExperiment, config)
 		if err != nil {
@@ -1557,6 +2324,33 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		Plan: plan,
 		Jobs: out,
 	}, nil
+}
+
+func addOptionalExperimentConfig(config map[string]any, experiment plans.PlannedExperiment) {
+	if experiment.ImageSize > 0 {
+		config["image_size"] = experiment.ImageSize
+	}
+	if experiment.Optimizer != "" {
+		config["optimizer"] = experiment.Optimizer
+	}
+	if experiment.Scheduler != "" {
+		config["scheduler"] = experiment.Scheduler
+	}
+	if experiment.WeightDecay > 0 {
+		config["weight_decay"] = experiment.WeightDecay
+	}
+	if len(experiment.Augmentation) > 0 {
+		config["augmentation"] = experiment.Augmentation
+	}
+	if experiment.ClassBalancing != "" {
+		config["class_balancing"] = experiment.ClassBalancing
+	}
+	if experiment.EarlyStoppingPatience > 0 {
+		config["early_stopping_patience"] = experiment.EarlyStoppingPatience
+	}
+	if experiment.Strategy != "" {
+		config["strategy"] = experiment.Strategy
+	}
 }
 
 func configString(config map[string]any, key string) string {
@@ -1618,26 +2412,45 @@ func plannedExperimentsFromPayload(payload map[string]any) ([]plans.PlannedExper
 	if len(experiments) == 0 {
 		return nil, fmt.Errorf("%w: reviewer proposed no follow-up experiments", store.ErrInvalidRequest)
 	}
+	if len(experiments) > maxLLMPlannerExperiments {
+		return nil, fmt.Errorf("%w: proposed_experiments has %d experiments, max is %d", store.ErrInvalidRequest, len(experiments), maxLLMPlannerExperiments)
+	}
 
 	for index, experiment := range experiments {
-		if strings.TrimSpace(experiment.Template) == "" {
-			return nil, fmt.Errorf("%w: proposed experiment %d is missing template", store.ErrInvalidRequest, index)
-		}
-		if strings.TrimSpace(experiment.Model) == "" {
-			return nil, fmt.Errorf("%w: proposed experiment %d is missing model", store.ErrInvalidRequest, index)
-		}
-		if experiment.Epochs < 1 {
-			return nil, fmt.Errorf("%w: proposed experiment %d must have at least one epoch", store.ErrInvalidRequest, index)
-		}
-		if experiment.BatchSize < 1 {
-			return nil, fmt.Errorf("%w: proposed experiment %d must have a positive batch size", store.ErrInvalidRequest, index)
-		}
-		if experiment.LearningRate <= 0 {
-			return nil, fmt.Errorf("%w: proposed experiment %d must have a positive learning rate", store.ErrInvalidRequest, index)
+		if err := validatePlannedExperiment(experiment, index); err != nil {
+			return nil, err
 		}
 	}
 
 	return experiments, nil
+}
+
+func validatePlannedExperiment(experiment plans.PlannedExperiment, index int) error {
+	if strings.TrimSpace(experiment.Template) == "" {
+		return fmt.Errorf("%w: proposed experiment %d is missing template", store.ErrInvalidRequest, index)
+	}
+	if strings.TrimSpace(experiment.Model) == "" {
+		return fmt.Errorf("%w: proposed experiment %d is missing model", store.ErrInvalidRequest, index)
+	}
+	if experiment.Epochs < 1 || experiment.Epochs > 100 {
+		return fmt.Errorf("%w: proposed experiment %d must have 1-100 epochs", store.ErrInvalidRequest, index)
+	}
+	if experiment.BatchSize < 1 || experiment.BatchSize > 512 {
+		return fmt.Errorf("%w: proposed experiment %d must have batch_size 1-512", store.ErrInvalidRequest, index)
+	}
+	if experiment.LearningRate <= 0 || experiment.LearningRate > 1 {
+		return fmt.Errorf("%w: proposed experiment %d must have learning_rate in (0, 1]", store.ErrInvalidRequest, index)
+	}
+	if experiment.ImageSize < 0 || experiment.ImageSize > 1024 {
+		return fmt.Errorf("%w: proposed experiment %d image_size must be at most 1024", store.ErrInvalidRequest, index)
+	}
+	if experiment.WeightDecay < 0 || experiment.WeightDecay > 1 {
+		return fmt.Errorf("%w: proposed experiment %d weight_decay must be between 0 and 1", store.ErrInvalidRequest, index)
+	}
+	if experiment.EarlyStoppingPatience < 0 || experiment.EarlyStoppingPatience > 50 {
+		return fmt.Errorf("%w: proposed experiment %d early_stopping_patience must be between 0 and 50", store.ErrInvalidRequest, index)
+	}
+	return nil
 }
 
 func recommendedWorkersForExperiments(experiments []plans.PlannedExperiment) int {
