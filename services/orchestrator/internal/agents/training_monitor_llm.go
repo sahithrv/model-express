@@ -26,11 +26,13 @@ type TrainingMonitorAgent struct {
 }
 
 type TrainingMonitorInput struct {
-	Plan          plans.ExperimentPlan
-	Job           jobs.ExperimentJob
-	Summary       runs.TrainingRunSummary
-	Metrics       []jobs.EpochMetric
-	MemoryRecords []memory.AgentMemoryRecord
+	Plan             plans.ExperimentPlan
+	Job              jobs.ExperimentJob
+	Summary          runs.TrainingRunSummary
+	Evaluation       *runs.TrainingRunEvaluation
+	Metrics          []jobs.EpochMetric
+	ObjectiveContext ProjectObjectiveContext
+	MemoryRecords    []memory.AgentMemoryRecord
 }
 
 type TrainingEvaluationRecommendation struct {
@@ -132,8 +134,9 @@ func trainingMonitorJSONRequest(model string, contextBlob []byte) llm.JSONReques
 				Role: "system",
 				Content: strings.TrimSpace(`You are the Model Express Training Monitor Agent.
 Return only valid JSON. Evaluate image-classification training runs holistically.
-Consider validation quality, macro-F1, accuracy, train/validation gap, metric stability,
-plateauing, cost, runtime, and whether the run should inform future experiments.
+Consider validation quality, macro-F1, accuracy, per-class metrics, confusion matrix,
+train/validation gap, metric stability, plateauing, cost, runtime, inference latency,
+model size, and whether the run should inform future experiments.
 This agent evaluates one run only. Do not propose new experiments or plan a follow-up batch.
 Produce signals that the plan-level Experiment Planning Agent can use later.`),
 			},
@@ -160,6 +163,8 @@ Produce signals that the plan-level Experiment Planning Agent can use later.`),
 
 Do not include proposed_experiments. This is not the plan-level planner.
 Payload may include supporting evidence such as overfitting indicators, plateau signals, or promising settings.
+Use objective_context to judge whether the run fits the user's goal. For live/real-time goals,
+penalize slow or oversized models when quality is close.
 
 Context:
 %s`, string(contextBlob)),
@@ -224,9 +229,11 @@ func trainingMonitorPromptContext(input TrainingMonitorInput) map[string]any {
 			"config":   input.Job.Config,
 			"status":   input.Job.Status,
 		},
-		"summary":       input.Summary,
-		"epoch_metrics": compactEpochMetrics(input.Metrics),
-		"prior_memory":  compactMemoryRecords(input.MemoryRecords),
+		"summary":           input.Summary,
+		"run_evaluation":    input.Evaluation,
+		"objective_context": input.ObjectiveContext,
+		"epoch_metrics":     compactEpochMetrics(input.Metrics),
+		"prior_memory":      compactMemoryRecords(input.MemoryRecords),
 	}
 }
 

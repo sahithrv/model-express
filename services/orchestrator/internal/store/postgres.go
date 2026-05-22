@@ -20,6 +20,7 @@ import (
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
+	"model-express/services/orchestrator/internal/strategies"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -472,6 +473,9 @@ func (s *PostgresStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob,
 }
 
 func (s *PostgresStore) ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error) {
+	if epoch < 1 {
+		return jobs.EpochMetric{}, fmt.Errorf("%w: epoch must be positive", ErrInvalidRequest)
+	}
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -682,6 +686,305 @@ func (s *PostgresStore) ListProjectTrainingRunSummaries(projectID string) ([]run
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) UpsertTrainingRunEvaluation(jobID string, update runs.TrainingRunEvaluationUpdate) (runs.TrainingRunEvaluation, error) {
+	job, err := s.GetJob(jobID)
+	if err != nil {
+		return runs.TrainingRunEvaluation{}, err
+	}
+	objectiveProfileJSON, err := json.Marshal(emptyMapIfNil(update.ObjectiveProfile))
+	if err != nil {
+		return runs.TrainingRunEvaluation{}, fmt.Errorf("marshal objective profile: %w", err)
+	}
+	perClassMetricsJSON, err := json.Marshal(emptyMapIfNil(update.PerClassMetrics))
+	if err != nil {
+		return runs.TrainingRunEvaluation{}, fmt.Errorf("marshal per-class metrics: %w", err)
+	}
+	confusionMatrixJSON, err := json.Marshal(update.ConfusionMatrix)
+	if err != nil {
+		return runs.TrainingRunEvaluation{}, fmt.Errorf("marshal confusion matrix: %w", err)
+	}
+	modelProfileJSON, err := json.Marshal(emptyMapIfNil(update.ModelProfile))
+	if err != nil {
+		return runs.TrainingRunEvaluation{}, fmt.Errorf("marshal model profile: %w", err)
+	}
+	holisticScoresJSON, err := json.Marshal(emptyMapIfNil(update.HolisticScores))
+	if err != nil {
+		return runs.TrainingRunEvaluation{}, fmt.Errorf("marshal holistic scores: %w", err)
+	}
+
+	const query = `
+		INSERT INTO training_run_evaluations (
+			job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (job_id) DO UPDATE SET
+			objective_profile = EXCLUDED.objective_profile,
+			per_class_metrics = EXCLUDED.per_class_metrics,
+			confusion_matrix = EXCLUDED.confusion_matrix,
+			model_profile = EXCLUDED.model_profile,
+			holistic_scores = EXCLUDED.holistic_scores,
+			recommendation_summary = EXCLUDED.recommendation_summary,
+			updated_at = now()
+		RETURNING job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+	`
+	return scanTrainingRunEvaluation(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		job.ID,
+		job.ProjectID,
+		postgresConfigString(job.Config, "plan_id"),
+		postgresConfigString(job.Config, "dataset_id"),
+		objectiveProfileJSON,
+		perClassMetricsJSON,
+		confusionMatrixJSON,
+		modelProfileJSON,
+		holisticScoresJSON,
+		update.RecommendationSummary,
+	))
+}
+
+func (s *PostgresStore) GetTrainingRunEvaluation(jobID string) (runs.TrainingRunEvaluation, error) {
+	const query = `
+		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+		FROM training_run_evaluations
+		WHERE job_id = $1
+	`
+	return scanTrainingRunEvaluation(s.db.QueryRowContext(context.Background(), query, jobID))
+}
+
+func (s *PostgresStore) ListProjectTrainingRunEvaluations(projectID string) ([]runs.TrainingRunEvaluation, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	const query = `
+		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+		FROM training_run_evaluations
+		WHERE project_id = $1
+		ORDER BY updated_at DESC
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []runs.TrainingRunEvaluation{}
+	for rows.Next() {
+		evaluation, err := scanTrainingRunEvaluation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, evaluation)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) UpsertProjectChampion(champion runs.ProjectChampionUpsert) (runs.ProjectChampion, error) {
+	if err := s.requireProject(champion.ProjectID); err != nil {
+		return runs.ProjectChampion{}, err
+	}
+	metricsJSON, err := json.Marshal(emptyMapIfNil(champion.Metrics))
+	if err != nil {
+		return runs.ProjectChampion{}, fmt.Errorf("marshal champion metrics: %w", err)
+	}
+	evaluationJSON, err := json.Marshal(emptyMapIfNil(champion.Evaluation))
+	if err != nil {
+		return runs.ProjectChampion{}, fmt.Errorf("marshal champion evaluation: %w", err)
+	}
+	deploymentJSON, err := json.Marshal(emptyMapIfNil(champion.DeploymentProfile))
+	if err != nil {
+		return runs.ProjectChampion{}, fmt.Errorf("marshal champion deployment profile: %w", err)
+	}
+	const query = `
+		INSERT INTO project_champions (project_id, dataset_id, plan_id, job_id, source_decision_id, selection_reason, metrics, evaluation, deployment_profile)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (project_id) DO UPDATE SET
+			dataset_id = EXCLUDED.dataset_id,
+			plan_id = EXCLUDED.plan_id,
+			job_id = EXCLUDED.job_id,
+			source_decision_id = EXCLUDED.source_decision_id,
+			selection_reason = EXCLUDED.selection_reason,
+			metrics = EXCLUDED.metrics,
+			evaluation = EXCLUDED.evaluation,
+			deployment_profile = EXCLUDED.deployment_profile,
+			updated_at = now()
+		RETURNING id, project_id, dataset_id, plan_id, job_id, source_decision_id, selection_reason, metrics, evaluation, deployment_profile, created_at, updated_at
+	`
+	return scanProjectChampion(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		champion.ProjectID,
+		champion.DatasetID,
+		champion.PlanID,
+		champion.JobID,
+		champion.SourceDecisionID,
+		champion.SelectionReason,
+		metricsJSON,
+		evaluationJSON,
+		deploymentJSON,
+	))
+}
+
+func (s *PostgresStore) GetProjectChampion(projectID string) (runs.ProjectChampion, error) {
+	const query = `
+		SELECT id, project_id, dataset_id, plan_id, job_id, source_decision_id, selection_reason, metrics, evaluation, deployment_profile, created_at, updated_at
+		FROM project_champions
+		WHERE project_id = $1
+	`
+	return scanProjectChampion(s.db.QueryRowContext(context.Background(), query, projectID))
+}
+
+func (s *PostgresStore) CreateChampionExport(export runs.ChampionExportCreate) (runs.ChampionExport, error) {
+	if err := s.requireProject(export.ProjectID); err != nil {
+		return runs.ChampionExport{}, err
+	}
+	metadataJSON, err := json.Marshal(emptyMapIfNil(export.Metadata))
+	if err != nil {
+		return runs.ChampionExport{}, fmt.Errorf("marshal champion export metadata: %w", err)
+	}
+	validationErrorsJSON, err := json.Marshal(export.ValidationErrors)
+	if err != nil {
+		return runs.ChampionExport{}, fmt.Errorf("marshal champion export validation errors: %w", err)
+	}
+	const query = `
+		WITH existing AS (
+			SELECT id
+			FROM champion_exports
+			WHERE project_id = $1 AND champion_id = $2 AND format = $5
+			ORDER BY created_at ASC
+			LIMIT 1
+		), updated AS (
+			UPDATE champion_exports
+			SET job_id = $3,
+				status = $4,
+				artifact_uri = $6,
+				metadata = $7,
+				validation_errors = $8,
+				updated_at = now()
+			WHERE id = (SELECT id FROM existing)
+			RETURNING id, project_id, champion_id, job_id, status, format, artifact_uri, metadata, validation_errors, created_at, updated_at
+		), inserted AS (
+			INSERT INTO champion_exports (project_id, champion_id, job_id, status, format, artifact_uri, metadata, validation_errors)
+			SELECT $1, $2, $3, $4, $5, $6, $7, $8
+			WHERE NOT EXISTS (SELECT 1 FROM updated)
+			RETURNING id, project_id, champion_id, job_id, status, format, artifact_uri, metadata, validation_errors, created_at, updated_at
+		)
+		SELECT id, project_id, champion_id, job_id, status, format, artifact_uri, metadata, validation_errors, created_at, updated_at FROM updated
+		UNION ALL
+		SELECT id, project_id, champion_id, job_id, status, format, artifact_uri, metadata, validation_errors, created_at, updated_at FROM inserted
+		LIMIT 1
+	`
+	return scanChampionExport(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		export.ProjectID,
+		export.ChampionID,
+		export.JobID,
+		export.Status,
+		export.Format,
+		export.ArtifactURI,
+		metadataJSON,
+		validationErrorsJSON,
+	))
+}
+
+func (s *PostgresStore) ListProjectChampionExports(projectID string) ([]runs.ChampionExport, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	const query = `
+		SELECT id, project_id, champion_id, job_id, status, format, artifact_uri, metadata, validation_errors, created_at, updated_at
+		FROM champion_exports
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []runs.ChampionExport{}
+	for rows.Next() {
+		export, err := scanChampionExport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, export)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) CreateChampionDemoPrediction(prediction runs.ChampionDemoPredictionCreate) (runs.ChampionDemoPrediction, error) {
+	if err := s.requireProject(prediction.ProjectID); err != nil {
+		return runs.ChampionDemoPrediction{}, err
+	}
+	imageMetadataJSON, err := json.Marshal(emptyMapIfNil(prediction.ImageMetadata))
+	if err != nil {
+		return runs.ChampionDemoPrediction{}, fmt.Errorf("marshal champion demo prediction image metadata: %w", err)
+	}
+	topKJSON, err := json.Marshal(prediction.TopK)
+	if err != nil {
+		return runs.ChampionDemoPrediction{}, fmt.Errorf("marshal champion demo prediction top-k: %w", err)
+	}
+	const query = `
+		INSERT INTO champion_demo_predictions (
+			project_id, champion_id, job_id, dataset_id, image_uri, image_id, image_metadata,
+			status, predicted_label, true_label, confidence, top_k, latency_ms, correct, error
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		RETURNING id, project_id, champion_id, job_id, dataset_id, image_uri, image_id, image_metadata,
+			status, predicted_label, true_label, confidence, top_k, latency_ms, correct, error, created_at
+	`
+	return scanChampionDemoPrediction(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		prediction.ProjectID,
+		prediction.ChampionID,
+		prediction.JobID,
+		prediction.DatasetID,
+		prediction.ImageURI,
+		prediction.ImageID,
+		imageMetadataJSON,
+		prediction.Status,
+		prediction.PredictedLabel,
+		prediction.TrueLabel,
+		prediction.Confidence,
+		topKJSON,
+		prediction.LatencyMS,
+		prediction.Correct,
+		prediction.Error,
+	))
+}
+
+func (s *PostgresStore) ListProjectChampionDemoPredictions(projectID string) ([]runs.ChampionDemoPrediction, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	const query = `
+		SELECT id, project_id, champion_id, job_id, dataset_id, image_uri, image_id, image_metadata,
+			status, predicted_label, true_label, confidence, top_k, latency_ms, correct, error, created_at
+		FROM champion_demo_predictions
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []runs.ChampionDemoPrediction{}
+	for rows.Next() {
+		prediction, err := scanChampionDemoPrediction(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, prediction)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return decisions.AgentDecision{}, err
@@ -813,13 +1116,19 @@ func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string,
 		WHERE project_id = $1 AND plan_id = $2
 	`, projectID, planID))
 	if err == nil {
+		status := existing.Status
+		lastError := existing.LastError
+		if existing.TargetCount != targetCount || status == execution.WorkerRequirementFailed || status == execution.WorkerRequirementCancelled {
+			status = execution.WorkerRequirementPending
+			lastError = ""
+		}
 		const updateQuery = `
 			UPDATE worker_requirements
-			SET provider = $1, gpu_type = $2, target_count = $3, source = $4, updated_at = now()
-			WHERE id = $5
+			SET provider = $1, gpu_type = $2, target_count = $3, source = $4, status = $5, last_error = $6, updated_at = now()
+			WHERE id = $7
 			RETURNING id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
 		`
-		requirement, updateErr := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), updateQuery, provider, gpuType, targetCount, source, existing.ID))
+		requirement, updateErr := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), updateQuery, provider, gpuType, targetCount, source, status, lastError, existing.ID))
 		return requirement, false, updateErr
 	}
 	if !errors.Is(err, ErrNotFound) {
@@ -1107,6 +1416,131 @@ func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter mem
 			return nil, err
 		}
 		out = append(out, invocation)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) CreateStrategyScorecard(scorecard strategies.StrategyScorecardCreate) (strategies.StrategyScorecard, error) {
+	if err := s.requireProject(scorecard.ProjectID); err != nil {
+		return strategies.StrategyScorecard{}, err
+	}
+	if scorecard.Outcome == "" {
+		scorecard.Outcome = strategies.OutcomePending
+	}
+	datasetTraitsJSON, err := json.Marshal(emptyMapIfNil(scorecard.DatasetTraits))
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard dataset_traits: %w", err)
+	}
+	objectiveProfileJSON, err := json.Marshal(emptyMapIfNil(scorecard.ObjectiveProfile))
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard objective_profile: %w", err)
+	}
+	proposedChangesJSON, err := json.Marshal(emptyMapIfNil(scorecard.ProposedChanges))
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard proposed_changes: %w", err)
+	}
+	tagsJSON, err := json.Marshal(scorecard.Tags)
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard tags: %w", err)
+	}
+
+	const query = `
+		INSERT INTO strategy_scorecards (
+			project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
+			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
+			expected_delta, confidence_before, outcome, lesson, tags
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		RETURNING id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
+			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
+			expected_delta, actual_delta, confidence_before, confidence_after, cost_usd,
+			runtime_seconds, outcome, lesson, tags, created_at
+	`
+	return scanStrategyScorecard(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		scorecard.ProjectID,
+		scorecard.DatasetID,
+		scorecard.SourceDecisionID,
+		scorecard.SourcePlanID,
+		scorecard.FollowUpPlanID,
+		scorecard.StrategyType,
+		scorecard.PlanningMode,
+		datasetTraitsJSON,
+		objectiveProfileJSON,
+		proposedChangesJSON,
+		scorecard.ExpectedDelta,
+		scorecard.ConfidenceBefore,
+		scorecard.Outcome,
+		scorecard.Lesson,
+		tagsJSON,
+	))
+}
+
+func (s *PostgresStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPlanID string, update strategies.StrategyScorecardOutcomeUpdate) (strategies.StrategyScorecard, error) {
+	tagsJSON, err := json.Marshal(update.Tags)
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard tags: %w", err)
+	}
+	const query = `
+		UPDATE strategy_scorecards
+		SET actual_delta = $1,
+			confidence_after = $2,
+			cost_usd = $3,
+			runtime_seconds = $4,
+			outcome = $5,
+			lesson = $6,
+			tags = $7
+		WHERE followup_plan_id = $8
+		RETURNING id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
+			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
+			expected_delta, actual_delta, confidence_before, confidence_after, cost_usd,
+			runtime_seconds, outcome, lesson, tags, created_at
+	`
+	return scanStrategyScorecard(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		update.ActualDelta,
+		update.ConfidenceAfter,
+		update.CostUSD,
+		update.RuntimeSeconds,
+		update.Outcome,
+		update.Lesson,
+		tagsJSON,
+		followUpPlanID,
+	))
+}
+
+func (s *PostgresStore) ListProjectStrategyScorecards(projectID string, limit int) ([]strategies.StrategyScorecard, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	const query = `
+		SELECT id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
+			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
+			expected_delta, actual_delta, confidence_before, confidence_after, cost_usd,
+			runtime_seconds, outcome, lesson, tags, created_at
+		FROM strategy_scorecards
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []strategies.StrategyScorecard{}
+	for rows.Next() {
+		scorecard, err := scanStrategyScorecard(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, scorecard)
 	}
 	return out, rows.Err()
 }
@@ -1560,6 +1994,194 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 	return summary, nil
 }
 
+func scanTrainingRunEvaluation(row rowScanner) (runs.TrainingRunEvaluation, error) {
+	var evaluation runs.TrainingRunEvaluation
+	var objectiveProfileJSON []byte
+	var perClassMetricsJSON []byte
+	var confusionMatrixJSON []byte
+	var modelProfileJSON []byte
+	var holisticScoresJSON []byte
+	if err := row.Scan(
+		&evaluation.JobID,
+		&evaluation.ProjectID,
+		&evaluation.PlanID,
+		&evaluation.DatasetID,
+		&objectiveProfileJSON,
+		&perClassMetricsJSON,
+		&confusionMatrixJSON,
+		&modelProfileJSON,
+		&holisticScoresJSON,
+		&evaluation.RecommendationSummary,
+		&evaluation.CreatedAt,
+		&evaluation.UpdatedAt,
+	); err != nil {
+		return runs.TrainingRunEvaluation{}, normalizeSQLError(err)
+	}
+
+	evaluation.ObjectiveProfile = map[string]any{}
+	if len(objectiveProfileJSON) > 0 {
+		if err := json.Unmarshal(objectiveProfileJSON, &evaluation.ObjectiveProfile); err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal objective profile: %w", err)
+		}
+	}
+	evaluation.PerClassMetrics = map[string]any{}
+	if len(perClassMetricsJSON) > 0 {
+		if err := json.Unmarshal(perClassMetricsJSON, &evaluation.PerClassMetrics); err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal per-class metrics: %w", err)
+		}
+	}
+	evaluation.ConfusionMatrix = [][]int{}
+	if len(confusionMatrixJSON) > 0 {
+		if err := json.Unmarshal(confusionMatrixJSON, &evaluation.ConfusionMatrix); err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal confusion matrix: %w", err)
+		}
+	}
+	evaluation.ModelProfile = map[string]any{}
+	if len(modelProfileJSON) > 0 {
+		if err := json.Unmarshal(modelProfileJSON, &evaluation.ModelProfile); err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal model profile: %w", err)
+		}
+	}
+	evaluation.HolisticScores = map[string]any{}
+	if len(holisticScoresJSON) > 0 {
+		if err := json.Unmarshal(holisticScoresJSON, &evaluation.HolisticScores); err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal holistic scores: %w", err)
+		}
+	}
+	return evaluation, nil
+}
+
+func scanProjectChampion(row rowScanner) (runs.ProjectChampion, error) {
+	var champion runs.ProjectChampion
+	var metricsJSON []byte
+	var evaluationJSON []byte
+	var deploymentProfileJSON []byte
+	if err := row.Scan(
+		&champion.ID,
+		&champion.ProjectID,
+		&champion.DatasetID,
+		&champion.PlanID,
+		&champion.JobID,
+		&champion.SourceDecisionID,
+		&champion.SelectionReason,
+		&metricsJSON,
+		&evaluationJSON,
+		&deploymentProfileJSON,
+		&champion.CreatedAt,
+		&champion.UpdatedAt,
+	); err != nil {
+		return runs.ProjectChampion{}, normalizeSQLError(err)
+	}
+
+	champion.Metrics = map[string]any{}
+	if len(metricsJSON) > 0 {
+		if err := json.Unmarshal(metricsJSON, &champion.Metrics); err != nil {
+			return runs.ProjectChampion{}, fmt.Errorf("unmarshal champion metrics: %w", err)
+		}
+	}
+	champion.Evaluation = map[string]any{}
+	if len(evaluationJSON) > 0 {
+		if err := json.Unmarshal(evaluationJSON, &champion.Evaluation); err != nil {
+			return runs.ProjectChampion{}, fmt.Errorf("unmarshal champion evaluation: %w", err)
+		}
+	}
+	champion.DeploymentProfile = map[string]any{}
+	if len(deploymentProfileJSON) > 0 {
+		if err := json.Unmarshal(deploymentProfileJSON, &champion.DeploymentProfile); err != nil {
+			return runs.ProjectChampion{}, fmt.Errorf("unmarshal champion deployment profile: %w", err)
+		}
+	}
+	return champion, nil
+}
+
+func scanChampionExport(row rowScanner) (runs.ChampionExport, error) {
+	var export runs.ChampionExport
+	var metadataJSON []byte
+	var validationErrorsJSON []byte
+	if err := row.Scan(
+		&export.ID,
+		&export.ProjectID,
+		&export.ChampionID,
+		&export.JobID,
+		&export.Status,
+		&export.Format,
+		&export.ArtifactURI,
+		&metadataJSON,
+		&validationErrorsJSON,
+		&export.CreatedAt,
+		&export.UpdatedAt,
+	); err != nil {
+		return runs.ChampionExport{}, normalizeSQLError(err)
+	}
+
+	export.Metadata = map[string]any{}
+	if len(metadataJSON) > 0 {
+		if err := json.Unmarshal(metadataJSON, &export.Metadata); err != nil {
+			return runs.ChampionExport{}, fmt.Errorf("unmarshal champion export metadata: %w", err)
+		}
+	}
+	export.ValidationErrors = []string{}
+	if len(validationErrorsJSON) > 0 {
+		if err := json.Unmarshal(validationErrorsJSON, &export.ValidationErrors); err != nil {
+			return runs.ChampionExport{}, fmt.Errorf("unmarshal champion export validation errors: %w", err)
+		}
+	}
+	return export, nil
+}
+
+func scanChampionDemoPrediction(row rowScanner) (runs.ChampionDemoPrediction, error) {
+	var prediction runs.ChampionDemoPrediction
+	var imageMetadataJSON []byte
+	var topKJSON []byte
+	var confidence sql.NullFloat64
+	var latencyMS sql.NullFloat64
+	var correct sql.NullBool
+	if err := row.Scan(
+		&prediction.ID,
+		&prediction.ProjectID,
+		&prediction.ChampionID,
+		&prediction.JobID,
+		&prediction.DatasetID,
+		&prediction.ImageURI,
+		&prediction.ImageID,
+		&imageMetadataJSON,
+		&prediction.Status,
+		&prediction.PredictedLabel,
+		&prediction.TrueLabel,
+		&confidence,
+		&topKJSON,
+		&latencyMS,
+		&correct,
+		&prediction.Error,
+		&prediction.CreatedAt,
+	); err != nil {
+		return runs.ChampionDemoPrediction{}, normalizeSQLError(err)
+	}
+
+	prediction.ImageMetadata = map[string]any{}
+	if len(imageMetadataJSON) > 0 {
+		if err := json.Unmarshal(imageMetadataJSON, &prediction.ImageMetadata); err != nil {
+			return runs.ChampionDemoPrediction{}, fmt.Errorf("unmarshal champion demo prediction image metadata: %w", err)
+		}
+	}
+	prediction.TopK = []runs.DemoPredictionTopK{}
+	if len(topKJSON) > 0 {
+		if err := json.Unmarshal(topKJSON, &prediction.TopK); err != nil {
+			return runs.ChampionDemoPrediction{}, fmt.Errorf("unmarshal champion demo prediction top-k: %w", err)
+		}
+	}
+	if confidence.Valid {
+		prediction.Confidence = &confidence.Float64
+	}
+	if latencyMS.Valid {
+		prediction.LatencyMS = &latencyMS.Float64
+	}
+	if correct.Valid {
+		prediction.Correct = &correct.Bool
+	}
+	return prediction, nil
+}
+
 func scanAgentDecision(row rowScanner) (decisions.AgentDecision, error) {
 	var decision decisions.AgentDecision
 	var payloadJSON []byte
@@ -1729,6 +2351,52 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 	}
 
 	return invocation, nil
+}
+
+func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error) {
+	var scorecard strategies.StrategyScorecard
+	var datasetTraitsJSON []byte
+	var objectiveProfileJSON []byte
+	var proposedChangesJSON []byte
+	var tagsJSON []byte
+	if err := row.Scan(
+		&scorecard.ID,
+		&scorecard.ProjectID,
+		&scorecard.DatasetID,
+		&scorecard.SourceDecisionID,
+		&scorecard.SourcePlanID,
+		&scorecard.FollowUpPlanID,
+		&scorecard.StrategyType,
+		&scorecard.PlanningMode,
+		&datasetTraitsJSON,
+		&objectiveProfileJSON,
+		&proposedChangesJSON,
+		&scorecard.ExpectedDelta,
+		&scorecard.ActualDelta,
+		&scorecard.ConfidenceBefore,
+		&scorecard.ConfidenceAfter,
+		&scorecard.CostUSD,
+		&scorecard.RuntimeSeconds,
+		&scorecard.Outcome,
+		&scorecard.Lesson,
+		&tagsJSON,
+		&scorecard.CreatedAt,
+	); err != nil {
+		return strategies.StrategyScorecard{}, normalizeSQLError(err)
+	}
+	if err := json.Unmarshal(datasetTraitsJSON, &scorecard.DatasetTraits); err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard dataset_traits: %w", err)
+	}
+	if err := json.Unmarshal(objectiveProfileJSON, &scorecard.ObjectiveProfile); err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard objective_profile: %w", err)
+	}
+	if err := json.Unmarshal(proposedChangesJSON, &scorecard.ProposedChanges); err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard proposed_changes: %w", err)
+	}
+	if err := json.Unmarshal(tagsJSON, &scorecard.Tags); err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard tags: %w", err)
+	}
+	return scorecard, nil
 }
 
 func scanAutomationSettings(row rowScanner) (settings.AutomationSettings, error) {

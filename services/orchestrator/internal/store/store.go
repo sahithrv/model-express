@@ -12,6 +12,7 @@ import (
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
+	"model-express/services/orchestrator/internal/strategies"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -49,6 +50,15 @@ type Store interface {
 	UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error)
 	GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error)
 	ListProjectTrainingRunSummaries(projectID string) ([]runs.TrainingRunSummary, error)
+	UpsertTrainingRunEvaluation(jobID string, update runs.TrainingRunEvaluationUpdate) (runs.TrainingRunEvaluation, error)
+	GetTrainingRunEvaluation(jobID string) (runs.TrainingRunEvaluation, error)
+	ListProjectTrainingRunEvaluations(projectID string) ([]runs.TrainingRunEvaluation, error)
+	UpsertProjectChampion(champion runs.ProjectChampionUpsert) (runs.ProjectChampion, error)
+	GetProjectChampion(projectID string) (runs.ProjectChampion, error)
+	CreateChampionExport(export runs.ChampionExportCreate) (runs.ChampionExport, error)
+	ListProjectChampionExports(projectID string) ([]runs.ChampionExport, error)
+	CreateChampionDemoPrediction(prediction runs.ChampionDemoPredictionCreate) (runs.ChampionDemoPrediction, error)
+	ListProjectChampionDemoPredictions(projectID string) ([]runs.ChampionDemoPrediction, error)
 
 	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)
 	ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error)
@@ -68,6 +78,9 @@ type Store interface {
 	GetAgentInvocation(invocationID string) (memory.AgentInvocation, error)
 	UpdateAgentInvocationDownstreamOutcome(invocationID string, outcome map[string]any) (memory.AgentInvocation, error)
 	ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error)
+	CreateStrategyScorecard(scorecard strategies.StrategyScorecardCreate) (strategies.StrategyScorecard, error)
+	UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPlanID string, update strategies.StrategyScorecardOutcomeUpdate) (strategies.StrategyScorecard, error)
+	ListProjectStrategyScorecards(projectID string, limit int) ([]strategies.StrategyScorecard, error)
 
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)

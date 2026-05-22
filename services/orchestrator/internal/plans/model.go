@@ -30,11 +30,26 @@ type PlannedExperiment struct {
 	LearningRate          float64        `json:"learning_rate"`
 	Reason                string         `json:"reason"`
 	ImageSize             int            `json:"image_size,omitempty"`
+	ResolutionStrategy    string         `json:"resolution_strategy,omitempty"`
+	Preprocessing         *Preprocessing `json:"preprocessing,omitempty"`
 	Optimizer             string         `json:"optimizer,omitempty"`
 	Scheduler             string         `json:"scheduler,omitempty"`
 	WeightDecay           float64        `json:"weight_decay,omitempty"`
 	Augmentation          map[string]any `json:"augmentation,omitempty"`
+	AugmentationPolicy    string         `json:"augmentation_policy,omitempty"`
 	ClassBalancing        string         `json:"class_balancing,omitempty"`
+	SamplingStrategy      string         `json:"sampling_strategy,omitempty"`
 	EarlyStoppingPatience int            `json:"early_stopping_patience,omitempty"`
 	Strategy              string         `json:"strategy,omitempty"`
+	Pretrained            bool           `json:"pretrained,omitempty"`
+	FreezeBackbone        bool           `json:"freeze_backbone,omitempty"`
+	FineTuneStrategy      string         `json:"fine_tune_strategy,omitempty"`
+}
+
+type Preprocessing struct {
+	ResizeStrategy          string `json:"resize_strategy,omitempty"`
+	Normalization           string `json:"normalization,omitempty"`
+	CropStrategy            string `json:"crop_strategy,omitempty"`
+	BBoxMode                string `json:"bbox_mode,omitempty"`
+	UseDatasetNormalization bool   `json:"use_dataset_normalization,omitempty"`
 }

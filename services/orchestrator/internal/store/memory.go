@@ -15,6 +15,7 @@ import (
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
+	"model-express/services/orchestrator/internal/strategies"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -29,11 +30,16 @@ type MemoryStore struct {
 	metrics            map[string][]jobs.EpochMetric
 	plans              map[string]plans.ExperimentPlan
 	summaries          map[string]runs.TrainingRunSummary
+	evaluations        map[string]runs.TrainingRunEvaluation
+	champions          map[string]runs.ProjectChampion
+	championExports    map[string]runs.ChampionExport
+	demoPredictions    map[string]runs.ChampionDemoPrediction
 	decisions          map[string]decisions.AgentDecision
 	workerRequirements map[string]execution.WorkerRequirement
 	executionEvents    map[string]execution.ExecutionEvent
 	agentMemoryRecords map[string]memory.AgentMemoryRecord
 	agentInvocations   map[string]memory.AgentInvocation
+	strategyScorecards map[string]strategies.StrategyScorecard
 	automationSettings *settings.AutomationSettings
 }
 
@@ -46,11 +52,16 @@ func NewMemoryStore() *MemoryStore {
 		metrics:            make(map[string][]jobs.EpochMetric),
 		plans:              make(map[string]plans.ExperimentPlan),
 		summaries:          make(map[string]runs.TrainingRunSummary),
+		evaluations:        make(map[string]runs.TrainingRunEvaluation),
+		champions:          make(map[string]runs.ProjectChampion),
+		championExports:    make(map[string]runs.ChampionExport),
+		demoPredictions:    make(map[string]runs.ChampionDemoPrediction),
 		decisions:          make(map[string]decisions.AgentDecision),
 		workerRequirements: make(map[string]execution.WorkerRequirement),
 		executionEvents:    make(map[string]execution.ExecutionEvent),
 		agentMemoryRecords: make(map[string]memory.AgentMemoryRecord),
 		agentInvocations:   make(map[string]memory.AgentInvocation),
+		strategyScorecards: make(map[string]strategies.StrategyScorecard),
 	}
 }
 
@@ -349,6 +360,9 @@ func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]fl
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if epoch < 1 {
+		return jobs.EpochMetric{}, fmt.Errorf("%w: epoch must be positive", ErrInvalidRequest)
+	}
 	job, ok := s.jobs[jobID]
 	if !ok {
 		return jobs.EpochMetric{}, ErrNotFound
@@ -429,6 +443,220 @@ func (s *MemoryStore) ListProjectTrainingRunSummaries(projectID string) ([]runs.
 		}
 	}
 
+	return out, nil
+}
+
+func (s *MemoryStore) UpsertTrainingRunEvaluation(jobID string, update runs.TrainingRunEvaluationUpdate) (runs.TrainingRunEvaluation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return runs.TrainingRunEvaluation{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	evaluation, ok := s.evaluations[jobID]
+	if !ok {
+		evaluation = runs.TrainingRunEvaluation{
+			JobID:     job.ID,
+			ProjectID: job.ProjectID,
+			PlanID:    memoryConfigString(job.Config, "plan_id"),
+			DatasetID: memoryConfigString(job.Config, "dataset_id"),
+			CreatedAt: now,
+		}
+	}
+	evaluation.ObjectiveProfile = emptyMapIfNil(update.ObjectiveProfile)
+	evaluation.PerClassMetrics = emptyMapIfNil(update.PerClassMetrics)
+	evaluation.ConfusionMatrix = update.ConfusionMatrix
+	evaluation.ModelProfile = emptyMapIfNil(update.ModelProfile)
+	evaluation.HolisticScores = emptyMapIfNil(update.HolisticScores)
+	evaluation.RecommendationSummary = update.RecommendationSummary
+	evaluation.UpdatedAt = now
+	s.evaluations[jobID] = evaluation
+	return evaluation, nil
+}
+
+func (s *MemoryStore) GetTrainingRunEvaluation(jobID string) (runs.TrainingRunEvaluation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	evaluation, ok := s.evaluations[jobID]
+	if !ok {
+		return runs.TrainingRunEvaluation{}, ErrNotFound
+	}
+	return evaluation, nil
+}
+
+func (s *MemoryStore) ListProjectTrainingRunEvaluations(projectID string) ([]runs.TrainingRunEvaluation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []runs.TrainingRunEvaluation{}
+	for _, evaluation := range s.evaluations {
+		if evaluation.ProjectID == projectID {
+			out = append(out, evaluation)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out, nil
+}
+
+func (s *MemoryStore) UpsertProjectChampion(champion runs.ProjectChampionUpsert) (runs.ProjectChampion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[champion.ProjectID]; !ok {
+		return runs.ProjectChampion{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	existing, ok := s.champions[champion.ProjectID]
+	if !ok {
+		existing = runs.ProjectChampion{
+			ID:        s.newID("champion"),
+			ProjectID: champion.ProjectID,
+			CreatedAt: now,
+		}
+	}
+	existing.DatasetID = champion.DatasetID
+	existing.PlanID = champion.PlanID
+	existing.JobID = champion.JobID
+	existing.SourceDecisionID = champion.SourceDecisionID
+	existing.SelectionReason = champion.SelectionReason
+	existing.Metrics = emptyMapIfNil(champion.Metrics)
+	existing.Evaluation = emptyMapIfNil(champion.Evaluation)
+	existing.DeploymentProfile = emptyMapIfNil(champion.DeploymentProfile)
+	existing.UpdatedAt = now
+	s.champions[champion.ProjectID] = existing
+	return existing, nil
+}
+
+func (s *MemoryStore) GetProjectChampion(projectID string) (runs.ProjectChampion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	champion, ok := s.champions[projectID]
+	if !ok {
+		return runs.ProjectChampion{}, ErrNotFound
+	}
+	return champion, nil
+}
+
+func (s *MemoryStore) CreateChampionExport(export runs.ChampionExportCreate) (runs.ChampionExport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[export.ProjectID]; !ok {
+		return runs.ChampionExport{}, ErrNotFound
+	}
+	champion, ok := s.champions[export.ProjectID]
+	if !ok || champion.ID != export.ChampionID {
+		return runs.ChampionExport{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	for _, existing := range s.championExports {
+		if existing.ProjectID == export.ProjectID && existing.ChampionID == export.ChampionID && existing.Format == export.Format {
+			existing.JobID = export.JobID
+			existing.Status = export.Status
+			existing.ArtifactURI = export.ArtifactURI
+			existing.Metadata = emptyMapIfNil(export.Metadata)
+			existing.ValidationErrors = append([]string(nil), export.ValidationErrors...)
+			existing.UpdatedAt = now
+			s.championExports[existing.ID] = existing
+			return existing, nil
+		}
+	}
+	created := runs.ChampionExport{
+		ID:               s.newID("champion_export"),
+		ProjectID:        export.ProjectID,
+		ChampionID:       export.ChampionID,
+		JobID:            export.JobID,
+		Status:           export.Status,
+		Format:           export.Format,
+		ArtifactURI:      export.ArtifactURI,
+		Metadata:         emptyMapIfNil(export.Metadata),
+		ValidationErrors: append([]string(nil), export.ValidationErrors...),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	s.championExports[created.ID] = created
+	return created, nil
+}
+
+func (s *MemoryStore) ListProjectChampionExports(projectID string) ([]runs.ChampionExport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []runs.ChampionExport{}
+	for _, export := range s.championExports {
+		if export.ProjectID == projectID {
+			out = append(out, export)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *MemoryStore) CreateChampionDemoPrediction(prediction runs.ChampionDemoPredictionCreate) (runs.ChampionDemoPrediction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[prediction.ProjectID]; !ok {
+		return runs.ChampionDemoPrediction{}, ErrNotFound
+	}
+	champion, ok := s.champions[prediction.ProjectID]
+	if !ok || champion.ID != prediction.ChampionID {
+		return runs.ChampionDemoPrediction{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	created := runs.ChampionDemoPrediction{
+		ID:             s.newID("champion_demo_prediction"),
+		ProjectID:      prediction.ProjectID,
+		ChampionID:     prediction.ChampionID,
+		JobID:          prediction.JobID,
+		DatasetID:      prediction.DatasetID,
+		ImageURI:       prediction.ImageURI,
+		ImageID:        prediction.ImageID,
+		ImageMetadata:  emptyMapIfNil(prediction.ImageMetadata),
+		Status:         prediction.Status,
+		PredictedLabel: prediction.PredictedLabel,
+		TrueLabel:      prediction.TrueLabel,
+		Confidence:     prediction.Confidence,
+		TopK:           append([]runs.DemoPredictionTopK(nil), prediction.TopK...),
+		LatencyMS:      prediction.LatencyMS,
+		Correct:        prediction.Correct,
+		Error:          prediction.Error,
+		CreatedAt:      now,
+	}
+	s.demoPredictions[created.ID] = created
+	return created, nil
+}
+
+func (s *MemoryStore) ListProjectChampionDemoPredictions(projectID string) ([]runs.ChampionDemoPrediction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []runs.ChampionDemoPrediction{}
+	for _, prediction := range s.demoPredictions {
+		if prediction.ProjectID == projectID {
+			out = append(out, prediction)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
 	return out, nil
 }
 
@@ -513,10 +741,15 @@ func (s *MemoryStore) UpsertWorkerRequirement(projectID string, planID string, p
 	now := time.Now().UTC()
 	for id, requirement := range s.workerRequirements {
 		if requirement.ProjectID == projectID && requirement.PlanID == planID {
+			targetChanged := requirement.TargetCount != targetCount
 			requirement.Provider = provider
 			requirement.GPUType = gpuType
 			requirement.TargetCount = targetCount
 			requirement.Source = source
+			if targetChanged || requirement.Status == execution.WorkerRequirementFailed || requirement.Status == execution.WorkerRequirementCancelled {
+				requirement.Status = execution.WorkerRequirementPending
+				requirement.LastError = ""
+			}
 			requirement.UpdatedAt = now
 			s.workerRequirements[id] = requirement
 			return requirement, false, nil
@@ -754,6 +987,86 @@ func (s *MemoryStore) ListProjectAgentInvocations(projectID string, filter memor
 	return out, nil
 }
 
+func (s *MemoryStore) CreateStrategyScorecard(scorecard strategies.StrategyScorecardCreate) (strategies.StrategyScorecard, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[scorecard.ProjectID]; !ok {
+		return strategies.StrategyScorecard{}, ErrNotFound
+	}
+	if scorecard.Outcome == "" {
+		scorecard.Outcome = strategies.OutcomePending
+	}
+	now := time.Now().UTC()
+	created := strategies.StrategyScorecard{
+		ID:               s.newID("strategy_scorecard"),
+		ProjectID:        scorecard.ProjectID,
+		DatasetID:        scorecard.DatasetID,
+		SourceDecisionID: scorecard.SourceDecisionID,
+		SourcePlanID:     scorecard.SourcePlanID,
+		FollowUpPlanID:   scorecard.FollowUpPlanID,
+		StrategyType:     scorecard.StrategyType,
+		PlanningMode:     scorecard.PlanningMode,
+		DatasetTraits:    emptyMapIfNil(scorecard.DatasetTraits),
+		ObjectiveProfile: emptyMapIfNil(scorecard.ObjectiveProfile),
+		ProposedChanges:  emptyMapIfNil(scorecard.ProposedChanges),
+		ExpectedDelta:    scorecard.ExpectedDelta,
+		ConfidenceBefore: scorecard.ConfidenceBefore,
+		Outcome:          scorecard.Outcome,
+		Lesson:           scorecard.Lesson,
+		Tags:             append([]string(nil), scorecard.Tags...),
+		CreatedAt:        now,
+	}
+	s.strategyScorecards[created.ID] = created
+	return created, nil
+}
+
+func (s *MemoryStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPlanID string, update strategies.StrategyScorecardOutcomeUpdate) (strategies.StrategyScorecard, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, scorecard := range s.strategyScorecards {
+		if scorecard.FollowUpPlanID != followUpPlanID {
+			continue
+		}
+		scorecard.ActualDelta = update.ActualDelta
+		scorecard.ConfidenceAfter = update.ConfidenceAfter
+		scorecard.CostUSD = update.CostUSD
+		scorecard.RuntimeSeconds = update.RuntimeSeconds
+		scorecard.Outcome = update.Outcome
+		scorecard.Lesson = update.Lesson
+		scorecard.Tags = append([]string(nil), update.Tags...)
+		s.strategyScorecards[id] = scorecard
+		return scorecard, nil
+	}
+	return strategies.StrategyScorecard{}, ErrNotFound
+}
+
+func (s *MemoryStore) ListProjectStrategyScorecards(projectID string, limit int) ([]strategies.StrategyScorecard, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	out := []strategies.StrategyScorecard{}
+	for _, scorecard := range s.strategyScorecards {
+		if scorecard.ProjectID == projectID {
+			out = append(out, scorecard)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -975,6 +1288,13 @@ func applyTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, update runs
 
 func memoryConfigString(config map[string]any, key string) string {
 	value, _ := config[key].(string)
+	return value
+}
+
+func emptyMapIfNil(value map[string]any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
 	return value
 }
 

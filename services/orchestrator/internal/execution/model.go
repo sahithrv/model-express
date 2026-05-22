@@ -13,8 +13,12 @@ const (
 const (
 	EventJobsQueued                  = "JOBS_QUEUED"
 	EventWorkersRequired             = "WORKERS_REQUIRED"
+	EventWorkerScalingUpdated        = "WORKER_SCALING_UPDATED"
 	EventWorkersStarting             = "WORKERS_STARTING"
 	EventWorkersActive               = "WORKERS_ACTIVE"
+	EventChampionSelected            = "CHAMPION_SELECTED"
+	EventChampionExportRequested     = "CHAMPION_EXPORT_REQUESTED"
+	EventChampionDemoPrediction      = "CHAMPION_DEMO_PREDICTION"
 	EventExecutionFailed             = "EXECUTION_FAILED"
 	EventAgentRecommendationRecorded = "AGENT_RECOMMENDATION_RECORDED"
 	EventAgentOutcomeRecorded        = "AGENT_OUTCOME_RECORDED"
