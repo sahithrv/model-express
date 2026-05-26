@@ -10,6 +10,7 @@ import {
   ClipboardList,
   Database,
   DollarSign,
+  Eye,
   FolderOpen,
   HardDriveUpload,
   ListRestart,
@@ -33,6 +34,7 @@ import type {
   ChampionDemoPrediction,
   ChampionExport,
   Dataset,
+  DatasetVisualAnalysis,
   EpochMetric,
   ExecutionEvent,
   ExperimentPlan,
@@ -64,6 +66,7 @@ const metricOptions: Array<{ key: MetricKey; label: string }> = [
 type ProjectDetail = {
   decisions: AgentDecision[];
   datasets: Dataset[];
+  visualAnalysis: VisualAnalysisDetail;
   jobs: Job[];
   plans: ExperimentPlan[];
   runSummaries: TrainingRunSummary[];
@@ -77,6 +80,23 @@ type ProjectDetail = {
   executionEvents: ExecutionEvent[];
   agentMemory: AgentMemoryRecord[];
   strategyScorecards: StrategyScorecard[];
+};
+
+type VisualAnalysisDetail = {
+  analysis: DatasetVisualAnalysis | null;
+  status: "available" | "empty" | "unsupported" | "error";
+  message: string;
+  manualRunSupported: boolean;
+};
+
+type VisualAnalysisListResponse = {
+  visual_analyses?: DatasetVisualAnalysis[];
+  dataset_visual_analyses?: DatasetVisualAnalysis[];
+  analyses?: DatasetVisualAnalysis[];
+  items?: DatasetVisualAnalysis[];
+  analysis?: DatasetVisualAnalysis;
+  latest?: DatasetVisualAnalysis;
+  dataset_visual_analysis?: DatasetVisualAnalysis;
 };
 
 type TimelineItem = {
@@ -190,14 +210,16 @@ const defaultAutomationSettings: AutomationSettings = {
   updated_at: "",
 };
 
-export function App() {
-  const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
-  const [health, setHealth] = useState<Health | null>(null);
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
-  const [detail, setDetail] = useState<ProjectDetail>({
+function emptyProjectDetail(message = "Select a dataset to load visual analysis evidence."): ProjectDetail {
+  return {
     decisions: [],
     datasets: [],
+    visualAnalysis: {
+      analysis: null,
+      status: "empty",
+      message,
+      manualRunSupported: false,
+    },
     jobs: [],
     plans: [],
     runSummaries: [],
@@ -211,7 +233,15 @@ export function App() {
     executionEvents: [],
     agentMemory: [],
     strategyScorecards: [],
-  });
+  };
+}
+
+export function App() {
+  const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
+  const [detail, setDetail] = useState<ProjectDetail>(() => emptyProjectDetail());
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
   const [automationSettings, setAutomationSettings] = useState<AutomationSettings>(defaultAutomationSettings);
@@ -320,26 +350,73 @@ export function App() {
     setSettingsDraft(response);
   }, [request]);
 
+  const fetchLatestDatasetVisualAnalysis = useCallback(
+    async (dataset: Dataset | null): Promise<VisualAnalysisDetail> => {
+      if (!dataset) {
+        return {
+          analysis: null,
+          status: "empty",
+          message: "Upload a dataset before visual analysis can run.",
+          manualRunSupported: false,
+        };
+      }
+
+      const profileFallback = visualAnalysisFromProfile(dataset.profile);
+
+      try {
+        const response = await request<VisualAnalysisListResponse>(`/datasets/${dataset.id}/visual-analyses`);
+        const latest = latestVisualAnalysis(visualAnalysesFromResponse(response)) ?? profileFallback;
+        return {
+          analysis: latest,
+          status: latest ? "available" : "empty",
+          message: latest
+            ? "Latest visual analysis loaded from the backend."
+            : "Visual analysis API is available; no analysis has been recorded for this dataset yet.",
+          manualRunSupported: true,
+        };
+      } catch (listError) {
+        try {
+          const response = await request<VisualAnalysisListResponse | DatasetVisualAnalysis>(
+            `/datasets/${dataset.id}/visual-analyses/latest`,
+          );
+          const latest = latestVisualAnalysis(visualAnalysesFromResponse(response)) ?? profileFallback;
+          return {
+            analysis: latest,
+            status: latest ? "available" : "empty",
+            message: latest
+              ? "Latest visual analysis loaded from the backend."
+              : "Visual analysis API is available; no analysis has been recorded for this dataset yet.",
+            manualRunSupported: true,
+          };
+        } catch (latestError) {
+          if (profileFallback) {
+            return {
+              analysis: profileFallback,
+              status: "available",
+              message: "Showing visual analysis stored on the dataset profile; dedicated API endpoints are not available.",
+              manualRunSupported: false,
+            };
+          }
+
+          const error = latestError instanceof Error ? latestError : listError;
+          return {
+            analysis: null,
+            status: isUnsupportedEndpointError(error) ? "unsupported" : "error",
+            message: isUnsupportedEndpointError(error)
+              ? "This backend does not expose dataset visual-analysis endpoints yet."
+              : `Visual analysis lookup failed: ${errorMessage(error)}`,
+            manualRunSupported: false,
+          };
+        }
+      }
+    },
+    [request],
+  );
+
   const refreshProjectDetail = useCallback(
     async (projectId: string) => {
       if (!projectId) {
-        setDetail({
-          decisions: [],
-          datasets: [],
-          jobs: [],
-          plans: [],
-          runSummaries: [],
-          runEvaluations: [],
-          champion: null,
-          championExports: [],
-          championDemoImages: [],
-          championDemoPredictions: [],
-          workers: [],
-          workerRequirements: [],
-          executionEvents: [],
-          agentMemory: [],
-          strategyScorecards: [],
-        });
+        setDetail(emptyProjectDetail());
         return;
       }
 
@@ -372,6 +449,8 @@ export function App() {
         request<{ scorecards: StrategyScorecard[] }>(`/projects/${projectId}/strategy-scorecards?limit=6`),
       ]);
 
+      const visualAnalysis = await fetchLatestDatasetVisualAnalysis(datasets.datasets[0] ?? null);
+
       const championValue = champion.champion;
       const [championExports, championDemoImages, championDemoPredictions] = championValue
         ? await Promise.all([
@@ -390,6 +469,7 @@ export function App() {
       setDetail({
         decisions: decisions.decisions,
         datasets: datasets.datasets,
+        visualAnalysis,
         jobs: jobs.jobs,
         plans: plans.plans,
         runSummaries: runSummaries.summaries,
@@ -415,7 +495,7 @@ export function App() {
         return jobs.jobs[0].id;
       });
     },
-    [request],
+    [fetchLatestDatasetVisualAnalysis, request],
   );
 
   const refreshSelectedJobMetrics = useCallback(async () => {
@@ -675,6 +755,39 @@ export function App() {
 
     setSelectedJobId(job.id);
     await refreshProjectDetail(selectedProjectId);
+  }
+
+  async function requestVisualAnalysisRerun() {
+    const dataset = detail.datasets[0] ?? null;
+    if (!selectedProjectId || !dataset) return;
+
+    setLoading(true);
+    setNotice(null);
+    try {
+      const response = await request<Record<string, unknown>>(`/datasets/${dataset.id}/visual-analyses/run`, {
+        method: "POST",
+        body: { trigger_reason: "manual" },
+      });
+      await refreshProjectDetail(selectedProjectId);
+      const responseStatus =
+        recordString(response, "status") ||
+        recordString(recordObject(response.job), "status") ||
+        recordString(recordObject(response.analysis), "validation_status") ||
+        "requested";
+      setNotice({
+        kind: "info",
+        text: `Manual visual analysis rerun ${responseStatus.toLowerCase()} for ${dataset.name}.`,
+      });
+    } catch (error) {
+      setNotice({
+        kind: "error",
+        text: isUnsupportedEndpointError(error)
+          ? "Manual visual analysis rerun is not supported by this backend yet."
+          : errorMessage(error),
+      });
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function executePlan(planId: string) {
@@ -1041,6 +1154,16 @@ export function App() {
             ) : (
               <div className="empty">Upload a dataset to see class balance, image sizes, artifacts, and metric recommendations.</div>
             )}
+          </Panel>
+
+          <Panel title="Visual Dataset Analysis" icon={<Eye size={17} />} wide>
+            <VisualAnalysisPanel
+              dataset={detail.datasets[0] ?? null}
+              jobs={detail.jobs}
+              loading={loading}
+              visualAnalysis={detail.visualAnalysis}
+              onRequestRerun={requestVisualAnalysisRerun}
+            />
           </Panel>
         </section>
 
@@ -1921,6 +2044,265 @@ function Panel({
   );
 }
 
+function VisualAnalysisPanel({
+  dataset,
+  jobs,
+  loading,
+  visualAnalysis,
+  onRequestRerun,
+}: {
+  dataset: Dataset | null;
+  jobs: Job[];
+  loading: boolean;
+  visualAnalysis: VisualAnalysisDetail;
+  onRequestRerun: () => void;
+}) {
+  const analysis = visualAnalysis.analysis;
+  const activeJob = visualAnalysisActiveJob(jobs, dataset?.id ?? "");
+  const coverage = recordObject(analysis?.coverage_report);
+  const facts = visualAnalysisFacts(visualAnalysis, activeJob);
+  const traits = Array.isArray(analysis?.visual_traits) ? analysis.visual_traits.slice(0, 6) : [];
+  const hypotheses = Array.isArray(analysis?.preprocessing_hypotheses)
+    ? analysis.preprocessing_hypotheses.slice(0, 6)
+    : [];
+  const cautions = Array.isArray(analysis?.cautions) ? analysis.cautions.slice(0, 6) : [];
+  const classesToWatch = Array.isArray(analysis?.classes_to_watch) ? analysis.classes_to_watch.slice(0, 4) : [];
+  const limitations = visualAnalysisLimitations(analysis);
+  const validationErrors = stringArrayPayload(analysis?.validation_errors);
+  const rerunDisabledReason = visualAnalysisRerunDisabledReason(visualAnalysis, dataset, activeJob, loading);
+  const canRerun = !rerunDisabledReason;
+  const datasetLabel = analysis?.dataset_name || dataset?.name || "No dataset selected";
+
+  return (
+    <div className="visual-analysis-panel">
+      <div className="visual-analysis-head">
+        <span>
+          <strong>{datasetLabel}</strong>
+          <small>{visualAnalysis.message}</small>
+        </span>
+        <div className="visual-analysis-actions">
+          <Badge value={visualAnalysisStatusBadge(visualAnalysis, activeJob)} />
+          <button
+            className="command compact"
+            type="button"
+            onClick={onRequestRerun}
+            disabled={!canRerun}
+            title={rerunDisabledReason || "Request a manual visual-analysis rerun"}
+          >
+            <RefreshCcw size={15} />
+            Manual Rerun
+          </button>
+        </div>
+      </div>
+
+      <div className="review-state wait visual-advisory">
+        <Badge value="EVIDENCE_ONLY" />
+        <span>
+          <strong>Advisory visual evidence</strong>
+          <small>Hypotheses below are observations for backend validation; they are not approved experiments or runnable config.</small>
+        </span>
+      </div>
+
+      <div className="insight-grid visual-facts">
+        {facts.map((item) => (
+          <div className={`insight-card ${item.tone ?? ""}`} key={item.label}>
+            <small>{item.label}</small>
+            <strong>{item.value}</strong>
+          </div>
+        ))}
+      </div>
+
+      {!analysis ? (
+        <div className="empty compact">
+          {activeJob
+            ? `Visual analysis job ${activeJob.status.toLowerCase()} for this dataset.`
+            : visualAnalysis.message}
+        </div>
+      ) : (
+        <>
+          <div className="visual-analysis-grid">
+            <div className="visual-analysis-block">
+              <strong>Coverage</strong>
+              <p>{visualCoverageSummary(analysis)}</p>
+              {stringArrayPayload(coverage.selection_basis).length > 0 && (
+                <div className="tag-list">
+                  {stringArrayPayload(coverage.selection_basis).slice(0, 8).map((item) => (
+                    <small key={item}>{item}</small>
+                  ))}
+                </div>
+              )}
+              {visualPerClassCoverageRows(coverage).length > 0 && (
+                <div className="visual-mini-table">
+                  {visualPerClassCoverageRows(coverage).map((row) => (
+                    <span key={row.label}>
+                      <small>{row.label}</small>
+                      <strong>{row.value}</strong>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="visual-analysis-block">
+              <strong>Classes To Watch</strong>
+              {classesToWatch.length > 0 ? (
+                <div className="visual-list">
+                  {classesToWatch.map((item, index) => (
+                    <span key={`${item.class_name || "class"}-${index}`}>
+                      <strong>{item.class_name || "class"}</strong>
+                      <small>{[item.confidence, item.reason].filter(Boolean).join(" - ") || "watch item"}</small>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty compact">No class watch items reported.</div>
+              )}
+            </div>
+          </div>
+
+          <div className="visual-section">
+            <strong>Visual Traits</strong>
+            {traits.length > 0 ? (
+              <div className="visual-card-grid">
+                {traits.map((trait, index) => (
+                  <div className="visual-card" key={`${trait.trait || "trait"}-${index}`}>
+                    <div className="visual-card-head">
+                      <span>
+                        <strong>{trait.trait || "visual trait"}</strong>
+                        <small>{[trait.level, trait.confidence].filter(Boolean).join(" confidence ")}</small>
+                      </span>
+                      {trait.confidence && <Badge value={trait.confidence} />}
+                    </div>
+                    {stringArrayPayload(trait.evidence).slice(0, 2).map((item) => (
+                      <p key={item}>{item}</p>
+                    ))}
+                    {trait.notes && <small>{trait.notes}</small>}
+                    {stringArrayPayload(trait.affected_classes).length > 0 && (
+                      <div className="tag-list">
+                        {stringArrayPayload(trait.affected_classes).slice(0, 5).map((item) => (
+                          <small key={item}>{item}</small>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty compact">No visual traits reported by the visual agent yet.</div>
+            )}
+          </div>
+
+          <div className="visual-section">
+            <strong>Preprocessing Hypotheses</strong>
+            {hypotheses.length > 0 ? (
+              <div className="visual-hypothesis-list">
+                {hypotheses.map((hypothesis, index) => (
+                  <div className="visual-hypothesis" key={hypothesis.id || `${hypothesis.mechanism}-${index}`}>
+                    <div className="visual-card-head">
+                      <span>
+                        <strong>{hypothesis.summary || hypothesis.mechanism || "hypothesis"}</strong>
+                        <small>{[hypothesis.mechanism, hypothesis.confidence].filter(Boolean).join(" - ")}</small>
+                      </span>
+                      <Badge value={hypothesis.support_status || "needs_backend_validation"} />
+                    </div>
+                    {hypothesis.expected_effect && <p>{hypothesis.expected_effect}</p>}
+                    <div className="visual-mini-table">
+                      {hypothesis.suggested_image_sizes && hypothesis.suggested_image_sizes.length > 0 && (
+                        <span>
+                          <small>Image Sizes</small>
+                          <strong>{hypothesis.suggested_image_sizes.join(", ")}</strong>
+                        </span>
+                      )}
+                      {hypothesis.suggested_augmentation_policy && (
+                        <span>
+                          <small>Augmentation</small>
+                          <strong>{hypothesis.suggested_augmentation_policy}</strong>
+                        </span>
+                      )}
+                      {hypothesis.suggested_preprocessing && (
+                        <span>
+                          <small>Preprocessing</small>
+                          <strong>{objectSummary(hypothesis.suggested_preprocessing)}</strong>
+                        </span>
+                      )}
+                      {hypothesis.risk && (
+                        <span>
+                          <small>Risk</small>
+                          <strong>{hypothesis.risk}</strong>
+                        </span>
+                      )}
+                    </div>
+                    {stringArrayPayload(hypothesis.evidence).length > 0 && (
+                      <div className="visual-evidence-list">
+                        {stringArrayPayload(hypothesis.evidence).slice(0, 3).map((item) => (
+                          <small key={item}>{item}</small>
+                        ))}
+                      </div>
+                    )}
+                    {(hypothesis.unsupported_reason || hypothesis.support_status !== "supported") && (
+                      <p className="visual-warning">
+                        {hypothesis.unsupported_reason || "Requires backend validation before any experiment can be scheduled."}
+                      </p>
+                    )}
+                    <small className="visual-advisory-note">Not an approved experiment.</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty compact">No preprocessing hypotheses reported.</div>
+            )}
+          </div>
+
+          <div className="visual-analysis-grid">
+            <div className="visual-analysis-block">
+              <strong>Cautions</strong>
+              {cautions.length > 0 ? (
+                <div className="visual-list caution">
+                  {cautions.map((caution, index) => (
+                    <span key={`${caution.operation || "operation"}-${index}`}>
+                      <strong>{caution.operation || "operation caution"}</strong>
+                      <small>{[caution.severity, caution.confidence, caution.reason].filter(Boolean).join(" - ")}</small>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty compact">No visual cautions reported.</div>
+              )}
+            </div>
+
+            <div className="visual-analysis-block">
+              <strong>Limitations</strong>
+              {limitations.length > 0 ? (
+                <div className="warning-list">
+                  {limitations.map((item) => (
+                    <span key={item}>{item}</span>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty compact">No limitations reported beyond the bounded sample.</div>
+              )}
+            </div>
+          </div>
+
+          {validationErrors.length > 0 && (
+            <div className="rejection-panel">
+              <strong>Validation Errors</strong>
+              <div className="rejection-list">
+                {validationErrors.map((item) => (
+                  <span key={item}>
+                    <small>Visual analysis validation</small>
+                    {item}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function ChampionExportDemoPanel({
   data,
   prediction,
@@ -2559,6 +2941,181 @@ function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: Agent
       { label: "Profile", value: dataset?.profiled_at ? "ready" : "pending", tone: dataset?.profiled_at ? "good" : "warn" },
     ] satisfies InsightItem[],
   };
+}
+
+function visualAnalysesFromResponse(value: unknown): DatasetVisualAnalysis[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => recordObject(item) as DatasetVisualAnalysis).filter(hasVisualAnalysisShape);
+  }
+
+  const record = recordObject(value);
+  const analyses = [
+    ...arrayVisualAnalyses(record.visual_analyses),
+    ...arrayVisualAnalyses(record.dataset_visual_analyses),
+    ...arrayVisualAnalyses(record.analyses),
+    ...arrayVisualAnalyses(record.items),
+  ];
+
+  for (const key of ["analysis", "latest", "dataset_visual_analysis"]) {
+    const analysis = recordObject(record[key]);
+    if (hasVisualAnalysisShape(analysis)) analyses.push(analysis as DatasetVisualAnalysis);
+  }
+
+  if (hasVisualAnalysisShape(record)) analyses.push(record as DatasetVisualAnalysis);
+  return analyses;
+}
+
+function arrayVisualAnalyses(value: unknown): DatasetVisualAnalysis[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => recordObject(item) as DatasetVisualAnalysis).filter(hasVisualAnalysisShape);
+}
+
+function hasVisualAnalysisShape(value: unknown): value is DatasetVisualAnalysis {
+  const record = recordObject(value);
+  return [
+    "coverage_report",
+    "visual_traits",
+    "preprocessing_hypotheses",
+    "cautions",
+    "validation_status",
+    "trigger_reason",
+    "analysis_version",
+  ].some((key) => key in record);
+}
+
+function latestVisualAnalysis(analyses: DatasetVisualAnalysis[]) {
+  return [...analyses]
+    .filter(hasVisualAnalysisShape)
+    .sort((left, right) => visualAnalysisSortScore(right) - visualAnalysisSortScore(left))[0] ?? null;
+}
+
+function visualAnalysisSortScore(analysis: DatasetVisualAnalysis) {
+  const timestamp = Date.parse(analysis.updated_at || analysis.created_at || "");
+  if (Number.isFinite(timestamp)) return timestamp;
+  return typeof analysis.analysis_version === "number" ? analysis.analysis_version : 0;
+}
+
+function visualAnalysisFromProfile(profile: Record<string, unknown>) {
+  const analyses: DatasetVisualAnalysis[] = [];
+  for (const key of ["dataset_visual_analysis", "visual_analysis", "latest_visual_analysis", "visual_dataset_analysis"]) {
+    const analysis = recordObject(profile[key]);
+    if (hasVisualAnalysisShape(analysis)) analyses.push(analysis as DatasetVisualAnalysis);
+  }
+  analyses.push(...arrayVisualAnalyses(profile.visual_analyses));
+  analyses.push(...arrayVisualAnalyses(profile.dataset_visual_analyses));
+  return latestVisualAnalysis(analyses);
+}
+
+function visualAnalysisFacts(visualAnalysis: VisualAnalysisDetail, activeJob: Job | null): InsightItem[] {
+  const analysis = visualAnalysis.analysis;
+  const coverage = recordObject(analysis?.coverage_report);
+  const status = visualAnalysisStatusBadge(visualAnalysis, activeJob);
+  const imagesAnalyzed = recordNumber(coverage, "images_analyzed") || analysis?.images_analyzed || 0;
+  const imagesAvailable = recordNumber(coverage, "images_available") || analysis?.total_images || 0;
+  const classesCovered = recordNumber(coverage, "classes_covered");
+  const classesTotal = recordNumber(coverage, "classes_total");
+  const classCoverageRatio = numberPayload(coverage.class_coverage_ratio);
+  const classCoverage = classesTotal
+    ? `${classesCovered}/${classesTotal}`
+    : classCoverageRatio !== null
+      ? formatPercent(classCoverageRatio)
+      : "-";
+
+  return [
+    { label: "Status", value: status, tone: visualStatusTone(status) },
+    { label: "Trigger", value: analysis?.trigger_reason || (activeJob ? "manual" : "-") },
+    {
+      label: "Images",
+      value: imagesAvailable ? `${imagesAnalyzed}/${imagesAvailable}` : imagesAnalyzed ? String(imagesAnalyzed) : "-",
+      tone: imagesAnalyzed > 0 ? "good" : "warn",
+    },
+    {
+      label: "Class Coverage",
+      value: classCoverage,
+      tone: classesTotal && classesCovered < classesTotal ? "warn" : classesCovered > 0 ? "good" : "warn",
+    },
+    { label: "Traits", value: String(analysis?.visual_traits?.length ?? 0) },
+    { label: "Hypotheses", value: String(analysis?.preprocessing_hypotheses?.length ?? 0), tone: "warn" },
+  ];
+}
+
+function visualStatusTone(status: string): InsightItem["tone"] {
+  const normalized = normalizedStatus(status).toLowerCase();
+  if (["accepted", "available", "succeeded", "completed", "ready"].includes(normalized)) return "good";
+  if (["failed", "error", "rejected", "unsupported"].includes(normalized)) return "bad";
+  return "warn";
+}
+
+function visualAnalysisStatusBadge(visualAnalysis: VisualAnalysisDetail, activeJob: Job | null) {
+  if (activeJob) return normalizedStatus(activeJob.status);
+  if (visualAnalysis.analysis?.validation_status) return normalizedStatus(visualAnalysis.analysis.validation_status);
+  if (visualAnalysis.status === "available") return "AVAILABLE";
+  if (visualAnalysis.status === "unsupported") return "UNSUPPORTED";
+  if (visualAnalysis.status === "error") return "ERROR";
+  return "NOT_RECORDED";
+}
+
+function visualAnalysisActiveJob(jobs: Job[], datasetId: string) {
+  return jobs.find((job) => {
+    const status = normalizedStatus(job.status);
+    if (!["QUEUED", "ASSIGNED", "RUNNING", "REQUESTED", "PENDING"].includes(status)) return false;
+    const template = job.template.toLowerCase();
+    if (!template.includes("visual")) return false;
+    const jobDatasetId = typeof job.config.dataset_id === "string" ? job.config.dataset_id : "";
+    return !datasetId || !jobDatasetId || jobDatasetId === datasetId;
+  }) ?? null;
+}
+
+function visualAnalysisRerunDisabledReason(
+  visualAnalysis: VisualAnalysisDetail,
+  dataset: Dataset | null,
+  activeJob: Job | null,
+  loading: boolean,
+) {
+  if (!dataset) return "Upload a dataset first.";
+  if (activeJob) return `Visual analysis job is already ${activeJob.status.toLowerCase()}.`;
+  if (!visualAnalysis.manualRunSupported) return "Backend manual visual-analysis endpoint is not available.";
+  if (loading) return "Another Mission Control request is in progress.";
+  return "";
+}
+
+function visualAnalysisLimitations(analysis: DatasetVisualAnalysis | null) {
+  if (!analysis) return [];
+  const coverage = recordObject(analysis.coverage_report);
+  return uniqueStrings([
+    ...stringArrayPayload(analysis.limitations),
+    ...stringArrayPayload(coverage.limitations),
+  ]).slice(0, 8);
+}
+
+function visualCoverageSummary(analysis: DatasetVisualAnalysis) {
+  const coverage = recordObject(analysis.coverage_report);
+  const strategy = recordString(coverage, "selection_strategy") || "bounded visual sample";
+  const imagesAnalyzed = recordNumber(coverage, "images_analyzed") || analysis.images_analyzed || 0;
+  const imagesAvailable = recordNumber(coverage, "images_available") || analysis.total_images || 0;
+  const classesCovered = recordNumber(coverage, "classes_covered");
+  const classesTotal = recordNumber(coverage, "classes_total");
+  const edgeCases = recordNumber(coverage, "edge_case_count");
+  const hardExamples = recordNumber(coverage, "hard_example_count");
+  const highDetail = recordNumber(coverage, "high_detail_image_count");
+  return [
+    strategy,
+    imagesAvailable ? `${imagesAnalyzed}/${imagesAvailable} images analyzed` : imagesAnalyzed ? `${imagesAnalyzed} images analyzed` : "",
+    classesTotal ? `${classesCovered}/${classesTotal} classes covered` : "",
+    edgeCases ? `${edgeCases} edge case(s)` : "",
+    hardExamples ? `${hardExamples} hard example(s)` : "",
+    highDetail ? `${highDetail} high-detail image(s)` : "",
+  ]
+    .filter(Boolean)
+    .join(" - ");
+}
+
+function visualPerClassCoverageRows(coverage: Record<string, unknown>) {
+  const counts = recordObject(coverage.per_class_counts);
+  return Object.entries(counts)
+    .map(([label, value]) => ({ label, value: String(numericValue(value)) }))
+    .filter((row) => row.value !== "0")
+    .slice(0, 10);
 }
 
 function decisionReasoningSections(decision: AgentDecision): ReasoningSection[] {
@@ -3292,6 +3849,34 @@ function predictionStatusMessage(value?: string) {
   return "prediction pending";
 }
 
+function objectSummary(record: Record<string, unknown>) {
+  const entries = Object.entries(record)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .slice(0, 4)
+    .map(([key, value]) => `${key}: ${shortValue(value)}`);
+  return entries.join("; ") || "-";
+}
+
+function shortValue(value: unknown): string {
+  if (Array.isArray(value)) return value.map((item) => shortValue(item)).join(", ");
+  if (value && typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isUnsupportedEndpointError(error: unknown) {
+  const message = errorMessage(error).toLowerCase();
+  return (
+    message.includes("404") ||
+    message.includes("not found") ||
+    message.includes("cannot get") ||
+    message.includes("unexpected non-whitespace")
+  );
+}
+
 function exemplarStatusFromProfile(profile: Record<string, unknown>) {
   const directStatus =
     recordString(profile, "visual_exemplar_status") ||
@@ -3491,6 +4076,11 @@ function formatSeconds(value: number) {
 function formatMaybeMetric(value: number) {
   if (!value) return "-";
   return value.toFixed(3);
+}
+
+function formatPercent(value: number) {
+  if (!Number.isFinite(value)) return "-";
+  return `${Math.round(value * 100)}%`;
 }
 
 function formatLossGap(value: number | null) {

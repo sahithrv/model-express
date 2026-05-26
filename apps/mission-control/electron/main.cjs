@@ -80,11 +80,21 @@ ipcMain.handle("orchestrator:request", async (_event, request) => {
   });
 
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : null;
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = text;
+    }
+  }
 
   if (!response.ok) {
-    const message = payload && payload.error ? payload.error : response.statusText;
-    throw new Error(message);
+    const message =
+      payload && typeof payload === "object" && payload.error
+        ? payload.error
+        : text || response.statusText;
+    throw new Error(`${response.status} ${message}`);
   }
 
   return payload;

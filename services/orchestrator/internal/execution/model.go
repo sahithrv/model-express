@@ -19,6 +19,8 @@ const (
 	EventChampionSelected            = "CHAMPION_SELECTED"
 	EventChampionExportRequested     = "CHAMPION_EXPORT_REQUESTED"
 	EventChampionDemoPrediction      = "CHAMPION_DEMO_PREDICTION"
+	EventDatasetVisualAnalysisQueued = "DATASET_VISUAL_ANALYSIS_QUEUED"
+	EventDatasetVisualAnalysisResult = "DATASET_VISUAL_ANALYSIS_RESULT"
 	EventExperimentationReopened     = "EXPERIMENTATION_REOPENED"
 	EventExecutionFailed             = "EXECUTION_FAILED"
 	EventAgentRecommendationRecorded = "AGENT_RECOMMENDATION_RECORDED"

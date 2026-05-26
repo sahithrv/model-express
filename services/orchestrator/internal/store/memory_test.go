@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/strategies"
 )
 
@@ -61,5 +62,77 @@ func TestMemoryStoreStrategyScorecardHydratesMechanismFields(t *testing.T) {
 	}
 	if updated.Mechanism != scorecard.Mechanism || updated.Intervention != scorecard.Intervention || updated.ExpectedEffect != scorecard.ExpectedEffect {
 		t.Fatalf("update should preserve mechanism fields, got %#v", updated)
+	}
+}
+
+func TestMemoryStoreDatasetVisualAnalysisCRUD(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("visual project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	dataset, err := store.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 1024)
+	if err != nil {
+		t.Fatalf("CreateDataset() error = %v", err)
+	}
+
+	first, err := store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      project.ID,
+		DatasetID:      dataset.ID,
+		SchemaVersion:  datasets.VisualAnalysisSchemaVersion,
+		TriggerReason:  datasets.VisualTriggerInitialProfile,
+		TotalImages:    100,
+		ImagesAnalyzed: 32,
+		CoverageReport: datasets.VisualCoverageReport{ImagesAnalyzed: 32, ClassesTotal: 4, ClassesCovered: 3},
+		Confidence:     "medium",
+		VisualTraits:   []datasets.VisualTrait{{Trait: "blur", Confidence: "low", Evidence: []string{"soft edges in samples"}}},
+	})
+	if err != nil {
+		t.Fatalf("CreateDatasetVisualAnalysis() error = %v", err)
+	}
+	if first.AnalysisVersion != 1 || first.ValidationStatus != datasets.VisualValidationStatusAccepted {
+		t.Fatalf("first analysis version/status = %d/%s", first.AnalysisVersion, first.ValidationStatus)
+	}
+
+	rejected, err := store.RejectDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:        project.ID,
+		DatasetID:        dataset.ID,
+		SchemaVersion:    datasets.VisualAnalysisSchemaVersion,
+		TriggerReason:    datasets.VisualTriggerManual,
+		ValidationErrors: []string{"bad image reference"},
+	})
+	if err != nil {
+		t.Fatalf("RejectDatasetVisualAnalysis() error = %v", err)
+	}
+	if rejected.AnalysisVersion != 2 || rejected.ValidationStatus != datasets.VisualValidationStatusRejected {
+		t.Fatalf("rejected analysis version/status = %d/%s", rejected.AnalysisVersion, rejected.ValidationStatus)
+	}
+
+	latest, err := store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      project.ID,
+		DatasetID:      dataset.ID,
+		SchemaVersion:  datasets.VisualAnalysisSchemaVersion,
+		TriggerReason:  datasets.VisualTriggerDeficiencyReanalysis,
+		TotalImages:    100,
+		ImagesAnalyzed: 48,
+		CoverageReport: datasets.VisualCoverageReport{ImagesAnalyzed: 48, ClassesTotal: 4, ClassesCovered: 4},
+		Confidence:     "high",
+	})
+	if err != nil {
+		t.Fatalf("CreateDatasetVisualAnalysis() latest error = %v", err)
+	}
+	found, err := store.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
+		t.Fatalf("GetLatestAcceptedDatasetVisualAnalysis() error = %v", err)
+	}
+	if found.ID != latest.ID {
+		t.Fatalf("latest accepted ID = %s, want %s", found.ID, latest.ID)
+	}
+	analyses, err := store.ListDatasetVisualAnalyses(dataset.ID)
+	if err != nil {
+		t.Fatalf("ListDatasetVisualAnalyses() error = %v", err)
+	}
+	if len(analyses) != 3 || analyses[0].ID != latest.ID || analyses[2].ID != first.ID {
+		t.Fatalf("unexpected visual analysis ordering: %#v", analyses)
 	}
 }

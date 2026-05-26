@@ -33,6 +33,13 @@ const (
 	plannerSnapshotMaxStrategyLessons   = 10
 	plannerSnapshotMaxBlockedRepeats    = 8
 	plannerSnapshotMaxRunDeltas         = 8
+	plannerVisualMaxObservedTraits      = 8
+	plannerVisualMaxClassesToWatch      = 6
+	plannerVisualMaxHypotheses          = 6
+	plannerVisualMaxCautions            = 6
+	plannerVisualMaxLimitations         = 8
+	plannerVisualMaxPerClassCounts      = 12
+	plannerVisualPromptBudget           = 4000
 )
 
 type ExperimentPlannerAgent struct {
@@ -370,17 +377,29 @@ type DatasetPlanningInsights struct {
 }
 
 type PlannerVisualExemplarContext struct {
-	Enabled        bool                   `json:"enabled"`
-	EvidenceOnly   bool                   `json:"evidence_only"`
-	ExemplarCount  int                    `json:"exemplar_count"`
-	ClassCount     int                    `json:"class_count"`
-	ByteBudget     int                    `json:"byte_budget"`
-	PromptBudget   int                    `json:"prompt_budget"`
-	Summary        string                 `json:"summary"`
-	ObservedTraits []string               `json:"observed_traits"`
-	ClassEvidence  []PlannerClassExemplar `json:"class_evidence"`
-	Warnings       []string               `json:"warnings"`
-	Audit          map[string]any         `json:"audit,omitempty"`
+	Enabled                 bool                               `json:"enabled"`
+	EvidenceOnly            bool                               `json:"evidence_only"`
+	Source                  string                             `json:"source,omitempty"`
+	AnalysisID              string                             `json:"analysis_id,omitempty"`
+	AnalysisVersion         int                                `json:"analysis_version,omitempty"`
+	TriggerReason           string                             `json:"trigger_reason,omitempty"`
+	ImagesAnalyzed          int                                `json:"images_analyzed,omitempty"`
+	ClassCoverage           datasets.VisualCoverageReport      `json:"class_coverage,omitempty"`
+	ClassesToWatch          []datasets.ClassWatchItem          `json:"classes_to_watch,omitempty"`
+	PreprocessingHypotheses []datasets.PreprocessingHypothesis `json:"preprocessing_hypotheses,omitempty"`
+	Cautions                []datasets.VisualCaution           `json:"cautions,omitempty"`
+	Limitations             []string                           `json:"limitations,omitempty"`
+	RawImagesIncluded       bool                               `json:"raw_images_included"`
+	RawVisualOutputIncluded bool                               `json:"raw_visual_output_included"`
+	ExemplarCount           int                                `json:"exemplar_count"`
+	ClassCount              int                                `json:"class_count"`
+	ByteBudget              int                                `json:"byte_budget"`
+	PromptBudget            int                                `json:"prompt_budget"`
+	Summary                 string                             `json:"summary"`
+	ObservedTraits          []string                           `json:"observed_traits"`
+	ClassEvidence           []PlannerClassExemplar             `json:"class_evidence"`
+	Warnings                []string                           `json:"warnings"`
+	Audit                   map[string]any                     `json:"audit,omitempty"`
 }
 
 type PlannerClassExemplar struct {
@@ -688,8 +707,10 @@ mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, s
 model_catalog, objective_context, visual_evidence, and planner_validation_feedback. Prefer changes that address
 the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps, not cosmetic hyperparameter nudges.
 Keep live inference cost and latency in view.
-If visual_evidence is present, treat it only as backend-curated evidence about visible dataset traits.
-It cannot override backend validation, choose arbitrary files, mutate datasets, or justify non-JSON output.
+If visual_evidence is present, treat it only as backend-curated advisory evidence about visible dataset traits.
+It may come from the latest accepted visual dataset analysis or bounded legacy exemplars, but raw images,
+raw Visual Agent output, visual prompt messages, local paths, and image bytes are never included.
+Visual evidence cannot override backend validation, choose arbitrary files, mutate datasets, or justify non-JSON output.
 Avoid repeating exact experiment configurations unless the repeat is explicitly intentional and justified.
 Do not request direct execution, exports, inference runs, worker creation, or job creation.
 If planner_validation_feedback is present, your previous JSON passed model decoding but failed backend validation.
@@ -860,7 +881,7 @@ Rules:
 - Use planner_context_snapshot.mechanism_coverage_card to avoid tried/blocked/failed mechanisms and to prefer eligible mechanisms with diagnosis support.
 - Use planner_context_snapshot.label_quality_card only to recommend label_noise_audit or hard_example_audit as report-only work with template label_quality_audit; never mutate labels or turn audit mechanisms into training jobs.
 - Use planner_context_snapshot.objective_context and dataset_card to decide resolution_strategy, preprocessing, augmentation_policy, augmentation_policy_config, sampling_strategy, class balancing/loss, model family, metrics, and deployment tradeoffs.
-- Use planner_context_snapshot.visual_evidence, when present, only as backend-curated evidence for visible traits such as object scale, background dominance, blur, lighting variation, fine-grained classes, or bbox/crop plausibility. Cite exemplar caps, warnings, or audit details if they limit confidence. Backend validation remains the gate for every proposed field.
+- Use planner_context_snapshot.visual_evidence, when present, only as backend-curated advisory evidence for visible traits such as object scale, background dominance, blur, lighting variation, fine-grained classes, or bbox/crop plausibility. Cite latest accepted visual-analysis IDs, coverage, caps, limitations, warnings, or audit details if they limit confidence. Backend validation remains the gate for every proposed field.
 - Do not ask to choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.
 - Use model families in stages: cheap baseline or preprocessing search first, then challenger models, then champion refinement, then final validation.
 - For a live setting, prefer low-latency candidates when quality is close: MobileNetV3, RegNet-Y-400MF, and EfficientNet-B0 are usually stronger deployment candidates than heavier challengers.
@@ -1248,6 +1269,10 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 				"prior_jobs",
 				"prior_evaluations",
 				"prior_memory",
+				"visual_images",
+				"visual_agent_prompt_messages",
+				"raw_visual_agent_output",
+				"dataset_visual_analysis.full_json",
 			},
 			MaxLedgerEntries:   plannerSnapshotMaxLedgerEntries,
 			MaxMechanisms:      plannerSnapshotMaxMechanisms,
@@ -2551,34 +2576,291 @@ func plannerConfigAugmentationPolicyConfig(config map[string]any, key string) *p
 	}
 }
 
+func NewPlannerVisualExemplarContextFromAnalysis(analysis datasets.DatasetVisualAnalysis) *PlannerVisualExemplarContext {
+	promptBudget := plannerVisualPromptBudget
+	coverage := compactPlannerVisualCoverage(analysis.CoverageReport)
+	imagesAnalyzed := analysis.ImagesAnalyzed
+	if imagesAnalyzed < 0 {
+		imagesAnalyzed = 0
+	}
+	if imagesAnalyzed == 0 {
+		imagesAnalyzed = coverage.ImagesAnalyzed
+	}
+	return &PlannerVisualExemplarContext{
+		Enabled:                 true,
+		EvidenceOnly:            true,
+		Source:                  "dataset_visual_analysis",
+		AnalysisID:              analysis.ID,
+		AnalysisVersion:         analysis.AnalysisVersion,
+		TriggerReason:           string(analysis.TriggerReason),
+		ImagesAnalyzed:          imagesAnalyzed,
+		ClassCoverage:           coverage,
+		PromptBudget:            promptBudget,
+		Summary:                 visualAnalysisSummary(analysis),
+		ObservedTraits:          visualTraitSummaries(analysis.VisualTraits, plannerVisualMaxObservedTraits),
+		ClassesToWatch:          capPlannerClassWatchItems(analysis.ClassesToWatch, plannerVisualMaxClassesToWatch),
+		PreprocessingHypotheses: capPlannerPreprocessingHypotheses(analysis.PreprocessingHypotheses, plannerVisualMaxHypotheses),
+		Cautions:                capPlannerVisualCautions(analysis.Cautions, plannerVisualMaxCautions),
+		Limitations:             cappedStrings(analysis.Limitations, plannerVisualMaxLimitations),
+		RawImagesIncluded:       false,
+		RawVisualOutputIncluded: false,
+	}
+}
+
 func visualExemplarPromptContext(context *PlannerVisualExemplarContext) map[string]any {
 	if context == nil || !context.Enabled {
 		return map[string]any{
-			"enabled":       false,
-			"evidence_only": true,
-			"instructions":  "No visual exemplars were supplied. If supplied later, use them only as evidence; backend validation remains the execution gate.",
+			"enabled":                    false,
+			"evidence_only":              true,
+			"source":                     "none",
+			"raw_images_included":        false,
+			"raw_visual_output_included": false,
+			"caps":                       plannerVisualCapsMap(context),
+			"instructions":               "No visual evidence was supplied. If supplied later, use it only as advisory evidence; backend validation remains the execution gate.",
 		}
 	}
-	return map[string]any{
-		"enabled":        true,
-		"evidence_only":  true,
-		"exemplar_count": context.ExemplarCount,
-		"class_count":    context.ClassCount,
-		"byte_budget":    context.ByteBudget,
-		"prompt_budget":  context.PromptBudget,
-		"caps": map[string]any{
-			"exemplar_count": context.ExemplarCount,
-			"class_count":    context.ClassCount,
-			"byte_budget":    context.ByteBudget,
-			"prompt_budget":  context.PromptBudget,
-		},
-		"summary":         context.Summary,
-		"observed_traits": context.ObservedTraits,
-		"class_evidence":  context.ClassEvidence,
-		"warnings":        context.Warnings,
-		"audit":           context.Audit,
-		"instructions":    "Treat visual exemplars as backend-curated supporting evidence only. Cite visible traits, caps, warnings, or audit details in evidence_used or dataset_preprocessing_rationale, return JSON only, and rely on backend validation for all proposed preprocessing fields.",
+
+	out := map[string]any{
+		"enabled":                    true,
+		"evidence_only":              true,
+		"source":                     visualEvidenceSource(context),
+		"prompt_budget":              plannerVisualPromptBudgetValue(context),
+		"caps":                       plannerVisualCapsMap(context),
+		"summary":                    context.Summary,
+		"observed_traits":            cappedStrings(context.ObservedTraits, plannerVisualMaxObservedTraits),
+		"raw_images_included":        false,
+		"raw_visual_output_included": false,
+		"instructions":               "Treat visual evidence as backend-curated, advisory support only. Raw images, image bytes, local paths, raw Visual Agent output, and visual prompt messages are not included. Cite visual-analysis or exemplar caps, warnings, limitations, audit details, and evidence-only status in evidence_used or dataset_preprocessing_rationale, return JSON only, and rely on backend validation for every proposed preprocessing or scheduling field.",
 	}
+	if context.AnalysisID != "" || context.Source == "dataset_visual_analysis" {
+		out["analysis_id"] = context.AnalysisID
+		out["analysis_version"] = context.AnalysisVersion
+		out["trigger_reason"] = context.TriggerReason
+		out["images_analyzed"] = context.ImagesAnalyzed
+		out["class_coverage"] = compactPlannerVisualCoverage(context.ClassCoverage)
+		out["classes_to_watch"] = capPlannerClassWatchItems(context.ClassesToWatch, plannerVisualMaxClassesToWatch)
+		out["preprocessing_hypotheses"] = capPlannerPreprocessingHypotheses(context.PreprocessingHypotheses, plannerVisualMaxHypotheses)
+		out["cautions"] = capPlannerVisualCautions(context.Cautions, plannerVisualMaxCautions)
+		out["limitations"] = cappedStrings(context.Limitations, plannerVisualMaxLimitations)
+	}
+	if context.ExemplarCount > 0 || len(context.ClassEvidence) > 0 {
+		out["exemplar_count"] = context.ExemplarCount
+		out["class_count"] = context.ClassCount
+		out["byte_budget"] = context.ByteBudget
+		out["class_evidence"] = capPlannerClassExemplars(context.ClassEvidence, plannerVisualMaxClassesToWatch)
+		out["warnings"] = cappedStrings(context.Warnings, plannerVisualMaxCautions)
+		out["audit"] = compactAnyMap(context.Audit, 8)
+	}
+	return out
+}
+
+func visualEvidenceSource(context *PlannerVisualExemplarContext) string {
+	if context == nil {
+		return "none"
+	}
+	if strings.TrimSpace(context.Source) != "" {
+		return strings.TrimSpace(context.Source)
+	}
+	if context.AnalysisID != "" {
+		return "dataset_visual_analysis"
+	}
+	if context.ExemplarCount > 0 || len(context.ClassEvidence) > 0 {
+		return "datasets.profile.visual_exemplars"
+	}
+	return "unknown"
+}
+
+func plannerVisualPromptBudgetValue(context *PlannerVisualExemplarContext) int {
+	if context != nil && context.PromptBudget > 0 {
+		return context.PromptBudget
+	}
+	return plannerVisualPromptBudget
+}
+
+func plannerVisualCapsMap(context *PlannerVisualExemplarContext) map[string]any {
+	caps := map[string]any{
+		"max_observed_traits":          plannerVisualMaxObservedTraits,
+		"max_classes_to_watch":         plannerVisualMaxClassesToWatch,
+		"max_preprocessing_hypotheses": plannerVisualMaxHypotheses,
+		"max_cautions":                 plannerVisualMaxCautions,
+		"max_limitations":              plannerVisualMaxLimitations,
+		"max_per_class_counts":         plannerVisualMaxPerClassCounts,
+		"prompt_budget":                plannerVisualPromptBudgetValue(context),
+	}
+	if context != nil {
+		if context.ExemplarCount > 0 {
+			caps["exemplar_count"] = context.ExemplarCount
+		}
+		if context.ClassCount > 0 {
+			caps["class_count"] = context.ClassCount
+		}
+		if context.ByteBudget > 0 {
+			caps["byte_budget"] = context.ByteBudget
+		}
+	}
+	return caps
+}
+
+func visualAnalysisSummary(analysis datasets.DatasetVisualAnalysis) string {
+	pieces := []string{}
+	label := "Accepted visual dataset analysis"
+	if strings.TrimSpace(analysis.ID) != "" {
+		label = fmt.Sprintf("%s %s", label, analysis.ID)
+	}
+	if analysis.ImagesAnalyzed > 0 {
+		pieces = append(pieces, fmt.Sprintf("%s analyzed %d bounded sample image(s)", label, analysis.ImagesAnalyzed))
+	} else {
+		pieces = append(pieces, label)
+	}
+	if analysis.CoverageReport.ClassesCovered > 0 || analysis.CoverageReport.ClassesTotal > 0 {
+		pieces = append(pieces, fmt.Sprintf("class coverage %d/%d", analysis.CoverageReport.ClassesCovered, analysis.CoverageReport.ClassesTotal))
+	}
+	if strings.TrimSpace(analysis.Confidence) != "" {
+		pieces = append(pieces, fmt.Sprintf("confidence %s", strings.TrimSpace(analysis.Confidence)))
+	}
+	if len(analysis.Limitations) > 0 {
+		pieces = append(pieces, "limitations: "+strings.Join(cappedStrings(analysis.Limitations, 2), "; "))
+	}
+	return strings.Join(pieces, "; ") + "."
+}
+
+func visualTraitSummaries(traits []datasets.VisualTrait, limit int) []string {
+	out := []string{}
+	for _, trait := range traits {
+		name := strings.TrimSpace(trait.Trait)
+		if name == "" {
+			continue
+		}
+		parts := []string{}
+		if strings.TrimSpace(trait.Level) != "" {
+			parts = append(parts, "level="+strings.TrimSpace(trait.Level))
+		}
+		if strings.TrimSpace(trait.Confidence) != "" {
+			parts = append(parts, "confidence="+strings.TrimSpace(trait.Confidence))
+		}
+		if evidence := cappedStrings(trait.Evidence, 1); len(evidence) > 0 {
+			parts = append(parts, "evidence: "+evidence[0])
+		}
+		if classes := cappedStrings(trait.AffectedClasses, 3); len(classes) > 0 {
+			parts = append(parts, "classes: "+strings.Join(classes, ", "))
+		}
+		if len(parts) > 0 {
+			name += " (" + strings.Join(parts, "; ") + ")"
+		}
+		out = append(out, name)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func compactPlannerVisualCoverage(coverage datasets.VisualCoverageReport) datasets.VisualCoverageReport {
+	coverage.SelectionBasis = cappedStrings(coverage.SelectionBasis, 6)
+	coverage.Limitations = cappedStrings(coverage.Limitations, 4)
+	coverage.PerClassCounts = capStringIntMap(coverage.PerClassCounts, plannerVisualMaxPerClassCounts)
+	return coverage
+}
+
+func capPlannerClassWatchItems(values []datasets.ClassWatchItem, limit int) []datasets.ClassWatchItem {
+	out := []datasets.ClassWatchItem{}
+	for _, value := range values {
+		if strings.TrimSpace(value.ClassName) == "" {
+			continue
+		}
+		copy := value
+		copy.RelatedClasses = cappedStrings(value.RelatedClasses, 4)
+		copy.Evidence = cappedStrings(value.Evidence, 3)
+		copy.ExampleImageIDs = cappedStrings(value.ExampleImageIDs, 4)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func capPlannerPreprocessingHypotheses(values []datasets.PreprocessingHypothesis, limit int) []datasets.PreprocessingHypothesis {
+	out := []datasets.PreprocessingHypothesis{}
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value.SupportStatus), "unsupported") {
+			continue
+		}
+		copy := value
+		copy.Evidence = cappedStrings(value.Evidence, 3)
+		copy.SuggestedImageSizes = capInts(value.SuggestedImageSizes, 3)
+		copy.UnsupportedReason = ""
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func capPlannerVisualCautions(values []datasets.VisualCaution, limit int) []datasets.VisualCaution {
+	out := []datasets.VisualCaution{}
+	for _, value := range values {
+		if strings.TrimSpace(value.Operation) == "" && strings.TrimSpace(value.Reason) == "" {
+			continue
+		}
+		copy := value
+		copy.AffectedClasses = cappedStrings(value.AffectedClasses, 4)
+		copy.ExampleImageIDs = cappedStrings(value.ExampleImageIDs, 4)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func capPlannerClassExemplars(values []PlannerClassExemplar, limit int) []PlannerClassExemplar {
+	out := []PlannerClassExemplar{}
+	for _, value := range values {
+		if strings.TrimSpace(value.ClassName) == "" {
+			continue
+		}
+		copy := value
+		copy.ObservedTraits = cappedStrings(value.ObservedTraits, 4)
+		copy.Metadata = compactAnyMap(value.Metadata, 6)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func capStringIntMap(values map[string]int, limit int) map[string]int {
+	if len(values) == 0 || limit <= 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	out := map[string]int{}
+	for _, key := range keys {
+		if len(out) >= limit {
+			break
+		}
+		out[key] = values[key]
+	}
+	return out
+}
+
+func capInts(values []int, limit int) []int {
+	if limit <= 0 || len(values) == 0 {
+		return []int{}
+	}
+	if len(values) > limit {
+		return append([]int(nil), values[:limit]...)
+	}
+	return append([]int(nil), values...)
 }
 
 func compactPlannerPlans(projectPlans []plans.ExperimentPlan) []map[string]any {

@@ -20,6 +20,98 @@ export type Dataset = {
   profiled_at?: string;
 };
 
+export type VisualCoverageReport = {
+  selection_strategy?: string;
+  selection_basis?: string[];
+  images_available?: number;
+  images_analyzed?: number;
+  classes_total?: number;
+  classes_covered?: number;
+  class_coverage_ratio?: number;
+  per_class_counts?: Record<string, number>;
+  hard_example_count?: number;
+  edge_case_count?: number;
+  high_detail_image_count?: number;
+  limitations?: string[];
+};
+
+export type VisualTrait = {
+  trait?: string;
+  level?: string;
+  confidence?: string;
+  evidence?: string[];
+  example_image_ids?: string[];
+  affected_classes?: string[];
+  notes?: string;
+};
+
+export type ClassWatchItem = {
+  class_name?: string;
+  reason?: string;
+  related_classes?: string[];
+  evidence?: string[];
+  example_image_ids?: string[];
+  confidence?: string;
+};
+
+export type PreprocessingHypothesis = {
+  id?: string;
+  mechanism?: string;
+  summary?: string;
+  evidence?: string[];
+  suggested_preprocessing?: Record<string, unknown>;
+  suggested_image_sizes?: number[];
+  suggested_augmentation_policy?: string;
+  suggested_augmentation_policy_config?: Record<string, unknown>;
+  expected_effect?: string;
+  risk?: string;
+  confidence?: string;
+  support_status?: string;
+  unsupported_reason?: string;
+};
+
+export type VisualCaution = {
+  operation?: string;
+  reason?: string;
+  severity?: string;
+  confidence?: string;
+  affected_classes?: string[];
+  example_image_ids?: string[];
+};
+
+export type DatasetVisualAnalysis = {
+  id?: string;
+  project_id?: string;
+  dataset_id?: string;
+  dataset_name?: string;
+  schema_version?: string;
+  analysis_version?: number;
+  prompt_version?: string;
+  agent_name?: string;
+  agent_version?: string;
+  provider?: string;
+  model?: string;
+  trigger_reason?: string;
+  trigger_details?: Record<string, unknown>;
+  source_job_id?: string;
+  source_invocation_id?: string;
+  profile_schema_version?: string;
+  profile_fingerprint?: string;
+  total_images?: number;
+  images_analyzed?: number;
+  coverage_report?: VisualCoverageReport;
+  classes_to_watch?: ClassWatchItem[];
+  confidence?: string;
+  visual_traits?: VisualTrait[];
+  preprocessing_hypotheses?: PreprocessingHypothesis[];
+  cautions?: VisualCaution[];
+  limitations?: string[];
+  validation_status?: string;
+  validation_errors?: string[];
+  created_at?: string;
+  updated_at?: string;
+};
+
 export type Worker = {
   id: string;
   project_id: string;

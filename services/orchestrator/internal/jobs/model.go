@@ -19,6 +19,7 @@ const (
 	TemplateExportChampion          = "export_champion"
 	TemplateChampionDemoPrediction  = "champion_demo_prediction"
 	TemplateGenerateVisualExemplars = "generate_visual_exemplars"
+	TemplateAnalyzeDatasetVisuals   = "analyze_dataset_visuals"
 )
 
 type ExperimentJob struct {

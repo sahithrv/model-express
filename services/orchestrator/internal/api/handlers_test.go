@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/agents"
+	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
@@ -2166,6 +2167,105 @@ func TestExperimentPlannerInputIncludesDatasetAndStrategyContext(t *testing.T) {
 	}
 	if !input.VisualExemplarContext.EvidenceOnly {
 		t.Fatal("expected visual exemplars to be evidence-only")
+	}
+}
+
+func TestExperimentPlannerInputPrefersLatestAcceptedVisualAnalysis(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	if _, err := server.store.UpdateDatasetProfile(plan.DatasetID, map[string]any{
+		"task_type":    "image_classification",
+		"class_count":  3,
+		"total_images": 180,
+		"visual_exemplars": []map[string]any{
+			{"class_name": "cat", "uri": "file:///raw-legacy-exemplar.jpg", "size_bytes": 1024},
+		},
+	}); err != nil {
+		t.Fatalf("update dataset profile: %v", err)
+	}
+	if _, err := server.store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      projectID,
+		DatasetID:      plan.DatasetID,
+		ImagesAnalyzed: 24,
+		CoverageReport: datasets.VisualCoverageReport{ImagesAnalyzed: 24, ClassesTotal: 3, ClassesCovered: 2},
+		VisualTraits:   []datasets.VisualTrait{{Trait: "blur", Level: "medium", Confidence: "low", Evidence: []string{"some sampled images are soft"}}},
+		TriggerDetails: map[string]any{"raw_visual_agent_output": "SHOULD_NOT_LEAK"},
+	}); err != nil {
+		t.Fatalf("create accepted visual analysis: %v", err)
+	}
+	if _, err := server.store.RejectDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      projectID,
+		DatasetID:      plan.DatasetID,
+		ImagesAnalyzed: 32,
+		VisualTraits:   []datasets.VisualTrait{{Trait: "rejected_trait", Evidence: []string{"should not appear"}}},
+	}); err != nil {
+		t.Fatalf("create rejected visual analysis: %v", err)
+	}
+	latest, err := server.store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      projectID,
+		DatasetID:      plan.DatasetID,
+		ImagesAnalyzed: 48,
+		TriggerReason:  datasets.VisualTriggerDeficiencyReanalysis,
+		CoverageReport: datasets.VisualCoverageReport{
+			ImagesAnalyzed:     48,
+			ClassesTotal:       3,
+			ClassesCovered:     3,
+			ClassCoverageRatio: 1,
+			PerClassCounts:     map[string]int{"cat": 16, "dog": 16, "rabbit": 16},
+		},
+		VisualTraits: []datasets.VisualTrait{
+			{Trait: "small_objects", Level: "high", Confidence: "medium", Evidence: []string{"subjects occupy small image regions"}},
+		},
+		ClassesToWatch: []datasets.ClassWatchItem{
+			{ClassName: "cat", Reason: "similar silhouettes", Evidence: []string{"cat/dog profiles overlap"}, Confidence: "medium"},
+		},
+		PreprocessingHypotheses: []datasets.PreprocessingHypothesis{
+			{ID: "vh_001", Mechanism: "resolution_crop", Summary: "Try preserve-aspect resize.", Evidence: []string{"small objects"}, ExpectedEffect: "Preserve detail.", Confidence: "medium", SupportStatus: "supported"},
+		},
+		Limitations: []string{"bounded visual sample"},
+		TriggerDetails: map[string]any{
+			"raw_visual_agent_output": "SHOULD_NOT_LEAK",
+			"image_payload":           "file:///secret-image.jpg",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create latest accepted visual analysis: %v", err)
+	}
+	createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.70)
+
+	input, ready, err := server.buildExperimentPlannerInput(projectID, plan.ID)
+	if err != nil {
+		t.Fatalf("build planner input: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected planner input to be ready")
+	}
+	if input.VisualExemplarContext == nil || input.VisualExemplarContext.AnalysisID != latest.ID {
+		t.Fatalf("expected latest accepted visual analysis in planner context, got %#v", input.VisualExemplarContext)
+	}
+	if input.VisualExemplarContext.Source != "dataset_visual_analysis" || input.VisualExemplarContext.ExemplarCount != 0 {
+		t.Fatalf("expected durable visual analysis to replace legacy exemplar fallback, got %#v", input.VisualExemplarContext)
+	}
+	snapshot := agents.BuildPlannerContextSnapshot(input)
+	evidence := snapshot.VisualEvidence
+	if evidence["analysis_id"] != latest.ID || evidence["trigger_reason"] != string(datasets.VisualTriggerDeficiencyReanalysis) {
+		t.Fatalf("expected latest accepted visual analysis metadata, got %#v", evidence)
+	}
+	if evidence["raw_images_included"] != false || evidence["raw_visual_output_included"] != false {
+		t.Fatalf("expected raw visual payload exclusion flags, got %#v", evidence)
+	}
+	if _, ok := evidence["class_evidence"]; ok {
+		t.Fatalf("expected legacy class_evidence to be omitted when durable analysis is available, got %#v", evidence)
+	}
+	blob, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatalf("marshal visual evidence: %v", err)
+	}
+	for _, forbidden := range []string{"SHOULD_NOT_LEAK", "file:///secret-image.jpg", "file:///raw-legacy-exemplar.jpg", "rejected_trait"} {
+		if strings.Contains(string(blob), forbidden) {
+			t.Fatalf("expected planner visual evidence to exclude %q: %s", forbidden, string(blob))
+		}
 	}
 }
 

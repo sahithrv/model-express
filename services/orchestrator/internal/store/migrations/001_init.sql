@@ -13,6 +13,7 @@ CREATE SEQUENCE IF NOT EXISTS project_champion_id_seq;
 CREATE SEQUENCE IF NOT EXISTS champion_export_id_seq;
 CREATE SEQUENCE IF NOT EXISTS champion_demo_prediction_id_seq;
 CREATE SEQUENCE IF NOT EXISTS strategy_scorecard_id_seq;
+CREATE SEQUENCE IF NOT EXISTS dataset_visual_analysis_id_seq;
 
 CREATE TABLE IF NOT EXISTS projects (
   id text PRIMARY KEY DEFAULT 'project_' || nextval('project_id_seq'),
@@ -64,6 +65,40 @@ CREATE TABLE IF NOT EXISTS dataset_profiles (
   recommended_metrics jsonb NOT NULL DEFAULT '[]'::jsonb,
   dataset_traits jsonb NOT NULL DEFAULT '[]'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS dataset_visual_analyses (
+  id text PRIMARY KEY DEFAULT 'dataset_visual_analysis_' || nextval('dataset_visual_analysis_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  dataset_id text NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+  dataset_name text NOT NULL DEFAULT '',
+  schema_version text NOT NULL DEFAULT 'dataset_visual_analysis_v1',
+  analysis_version integer NOT NULL DEFAULT 1,
+  prompt_version text NOT NULL DEFAULT '',
+  agent_name text NOT NULL DEFAULT 'visual_dataset_analysis',
+  agent_version text NOT NULL DEFAULT '',
+  provider text NOT NULL DEFAULT '',
+  model text NOT NULL DEFAULT '',
+  trigger_reason text NOT NULL DEFAULT 'manual',
+  trigger_details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  source_job_id text NOT NULL DEFAULT '',
+  source_invocation_id text NOT NULL DEFAULT '',
+  profile_schema_version text NOT NULL DEFAULT '',
+  profile_fingerprint text NOT NULL DEFAULT '',
+  total_images integer NOT NULL DEFAULT 0,
+  images_analyzed integer NOT NULL DEFAULT 0,
+  coverage_report jsonb NOT NULL DEFAULT '{}'::jsonb,
+  classes_to_watch jsonb NOT NULL DEFAULT '[]'::jsonb,
+  confidence text NOT NULL DEFAULT '',
+  visual_traits jsonb NOT NULL DEFAULT '[]'::jsonb,
+  preprocessing_hypotheses jsonb NOT NULL DEFAULT '[]'::jsonb,
+  cautions jsonb NOT NULL DEFAULT '[]'::jsonb,
+  limitations jsonb NOT NULL DEFAULT '[]'::jsonb,
+  validation_status text NOT NULL DEFAULT '',
+  validation_errors jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(dataset_id, analysis_version)
 );
 
 CREATE TABLE IF NOT EXISTS experiment_plans (
@@ -390,6 +425,10 @@ CREATE INDEX IF NOT EXISTS idx_epoch_metrics_job_id ON epoch_metrics(job_id);
 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
 CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id);
 CREATE INDEX IF NOT EXISTS idx_dataset_profiles_dataset_id ON dataset_profiles(dataset_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dataset_visual_analyses_project_created_at ON dataset_visual_analyses(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dataset_visual_analyses_dataset_created_at ON dataset_visual_analyses(dataset_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dataset_visual_analyses_dataset_status_version ON dataset_visual_analyses(dataset_id, validation_status, analysis_version DESC);
+CREATE INDEX IF NOT EXISTS idx_dataset_visual_analyses_source_job_id ON dataset_visual_analyses(source_job_id) WHERE source_job_id <> '';
 CREATE INDEX IF NOT EXISTS idx_experiment_plans_project_id ON experiment_plans(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_plans_source_decision_id ON experiment_plans(source_decision_id) WHERE source_decision_id <> '';
 CREATE INDEX IF NOT EXISTS idx_training_run_summaries_project_id ON training_run_summaries(project_id);

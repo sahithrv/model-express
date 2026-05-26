@@ -32,6 +32,10 @@ type Store interface {
 	GetDataset(id string) (datasets.Dataset, error)
 	ListProjectDatasets(projectID string) ([]datasets.Dataset, error)
 	UpdateDatasetProfile(id string, profile map[string]any) (datasets.Dataset, error)
+	CreateDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis) (datasets.DatasetVisualAnalysis, error)
+	RejectDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis) (datasets.DatasetVisualAnalysis, error)
+	GetLatestAcceptedDatasetVisualAnalysis(datasetID string) (datasets.DatasetVisualAnalysis, error)
+	ListDatasetVisualAnalyses(datasetID string) ([]datasets.DatasetVisualAnalysis, error)
 
 	RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error)
 	ListWorkers() ([]workers.Worker, error)

@@ -215,6 +215,53 @@ func (s *PostgresStore) UpdateDatasetProfile(id string, profile map[string]any) 
 	return scanDataset(s.db.QueryRowContext(context.Background(), query, profileJSON, datasets.StatusProfiled, id))
 }
 
+func (s *PostgresStore) CreateDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis) (datasets.DatasetVisualAnalysis, error) {
+	return s.insertDatasetVisualAnalysis(analysis, datasets.VisualValidationStatusAccepted)
+}
+
+func (s *PostgresStore) RejectDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis) (datasets.DatasetVisualAnalysis, error) {
+	return s.insertDatasetVisualAnalysis(analysis, datasets.VisualValidationStatusRejected)
+}
+
+func (s *PostgresStore) GetLatestAcceptedDatasetVisualAnalysis(datasetID string) (datasets.DatasetVisualAnalysis, error) {
+	query := `
+		SELECT ` + datasetVisualAnalysisSelectColumns() + `
+		FROM dataset_visual_analyses
+		WHERE dataset_id = $1 AND validation_status = $2
+		ORDER BY analysis_version DESC, created_at DESC
+		LIMIT 1
+	`
+	return scanDatasetVisualAnalysis(s.db.QueryRowContext(context.Background(), query, datasetID, datasets.VisualValidationStatusAccepted))
+}
+
+func (s *PostgresStore) ListDatasetVisualAnalyses(datasetID string) ([]datasets.DatasetVisualAnalysis, error) {
+	if _, err := s.GetDataset(datasetID); err != nil {
+		return nil, err
+	}
+
+	query := `
+		SELECT ` + datasetVisualAnalysisSelectColumns() + `
+		FROM dataset_visual_analyses
+		WHERE dataset_id = $1
+		ORDER BY analysis_version DESC, created_at DESC
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, datasetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []datasets.DatasetVisualAnalysis{}
+	for rows.Next() {
+		analysis, err := scanDatasetVisualAnalysis(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, analysis)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error) {
 	if projectID == "" {
 		return workers.Worker{}, fmt.Errorf("%w: project_id is required", ErrInvalidRequest)
@@ -2002,6 +2049,180 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 	return job, nil
 }
 
+func (s *PostgresStore) insertDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis, validationStatus string) (datasets.DatasetVisualAnalysis, error) {
+	dataset, err := s.GetDataset(analysis.DatasetID)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, err
+	}
+	if analysis.ProjectID == "" {
+		analysis.ProjectID = dataset.ProjectID
+	}
+	if analysis.ProjectID != dataset.ProjectID {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("%w: dataset_id does not belong to this project", ErrInvalidRequest)
+	}
+	if analysis.DatasetName == "" {
+		analysis.DatasetName = dataset.Name
+	}
+	if analysis.SchemaVersion == "" {
+		analysis.SchemaVersion = datasets.VisualAnalysisSchemaVersion
+	}
+	if analysis.AgentName == "" {
+		analysis.AgentName = datasets.VisualAnalysisAgentName
+	}
+	if analysis.TriggerReason == "" {
+		analysis.TriggerReason = datasets.VisualTriggerManual
+	}
+	if analysis.TriggerDetails == nil {
+		analysis.TriggerDetails = map[string]any{}
+	}
+	if analysis.CoverageReport.PerClassCounts == nil {
+		analysis.CoverageReport.PerClassCounts = map[string]int{}
+	}
+	if analysis.ClassesToWatch == nil {
+		analysis.ClassesToWatch = []datasets.ClassWatchItem{}
+	}
+	if analysis.VisualTraits == nil {
+		analysis.VisualTraits = []datasets.VisualTrait{}
+	}
+	if analysis.PreprocessingHypotheses == nil {
+		analysis.PreprocessingHypotheses = []datasets.PreprocessingHypothesis{}
+	}
+	if analysis.Cautions == nil {
+		analysis.Cautions = []datasets.VisualCaution{}
+	}
+	if analysis.Limitations == nil {
+		analysis.Limitations = []string{}
+	}
+	if analysis.ValidationErrors == nil {
+		analysis.ValidationErrors = []string{}
+	}
+
+	triggerDetailsJSON, err := json.Marshal(analysis.TriggerDetails)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis trigger details: %w", err)
+	}
+	coverageReportJSON, err := json.Marshal(analysis.CoverageReport)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis coverage report: %w", err)
+	}
+	classesToWatchJSON, err := json.Marshal(analysis.ClassesToWatch)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis classes to watch: %w", err)
+	}
+	visualTraitsJSON, err := json.Marshal(analysis.VisualTraits)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis traits: %w", err)
+	}
+	preprocessingHypothesesJSON, err := json.Marshal(analysis.PreprocessingHypotheses)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis preprocessing hypotheses: %w", err)
+	}
+	cautionsJSON, err := json.Marshal(analysis.Cautions)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis cautions: %w", err)
+	}
+	limitationsJSON, err := json.Marshal(analysis.Limitations)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis limitations: %w", err)
+	}
+	validationErrorsJSON, err := json.Marshal(analysis.ValidationErrors)
+	if err != nil {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("marshal visual analysis validation errors: %w", err)
+	}
+
+	query := `
+		INSERT INTO dataset_visual_analyses (
+			project_id,
+			dataset_id,
+			dataset_name,
+			schema_version,
+			analysis_version,
+			prompt_version,
+			agent_name,
+			agent_version,
+			provider,
+			model,
+			trigger_reason,
+			trigger_details,
+			source_job_id,
+			source_invocation_id,
+			profile_schema_version,
+			profile_fingerprint,
+			total_images,
+			images_analyzed,
+			coverage_report,
+			classes_to_watch,
+			confidence,
+			visual_traits,
+			preprocessing_hypotheses,
+			cautions,
+			limitations,
+			validation_status,
+			validation_errors
+		)
+		VALUES (
+			$1,
+			$2,
+			$3,
+			$4,
+			COALESCE((SELECT MAX(analysis_version) + 1 FROM dataset_visual_analyses WHERE dataset_id = $2), 1),
+			$5,
+			$6,
+			$7,
+			$8,
+			$9,
+			$10,
+			$11,
+			$12,
+			$13,
+			$14,
+			$15,
+			$16,
+			$17,
+			$18,
+			$19,
+			$20,
+			$21,
+			$22,
+			$23,
+			$24,
+			$25,
+			$26
+		)
+		RETURNING ` + datasetVisualAnalysisSelectColumns() + `
+	`
+	return scanDatasetVisualAnalysis(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		analysis.ProjectID,
+		analysis.DatasetID,
+		analysis.DatasetName,
+		analysis.SchemaVersion,
+		analysis.PromptVersion,
+		analysis.AgentName,
+		analysis.AgentVersion,
+		analysis.Provider,
+		analysis.Model,
+		string(analysis.TriggerReason),
+		triggerDetailsJSON,
+		analysis.SourceJobID,
+		analysis.SourceInvocationID,
+		analysis.ProfileSchemaVersion,
+		analysis.ProfileFingerprint,
+		analysis.TotalImages,
+		analysis.ImagesAnalyzed,
+		coverageReportJSON,
+		classesToWatchJSON,
+		analysis.Confidence,
+		visualTraitsJSON,
+		preprocessingHypothesesJSON,
+		cautionsJSON,
+		limitationsJSON,
+		validationStatus,
+		validationErrorsJSON,
+	))
+}
+
 func (s *PostgresStore) requireProject(projectID string) error {
 	var exists bool
 	if err := s.db.QueryRowContext(context.Background(), `
@@ -2113,6 +2334,105 @@ func scanDataset(row rowScanner) (datasets.Dataset, error) {
 	}
 
 	return dataset, nil
+}
+
+func scanDatasetVisualAnalysis(row rowScanner) (datasets.DatasetVisualAnalysis, error) {
+	var analysis datasets.DatasetVisualAnalysis
+	var triggerDetailsJSON []byte
+	var coverageReportJSON []byte
+	var classesToWatchJSON []byte
+	var visualTraitsJSON []byte
+	var preprocessingHypothesesJSON []byte
+	var cautionsJSON []byte
+	var limitationsJSON []byte
+	var validationErrorsJSON []byte
+	var triggerReason string
+
+	if err := row.Scan(
+		&analysis.ID,
+		&analysis.ProjectID,
+		&analysis.DatasetID,
+		&analysis.DatasetName,
+		&analysis.SchemaVersion,
+		&analysis.AnalysisVersion,
+		&analysis.PromptVersion,
+		&analysis.AgentName,
+		&analysis.AgentVersion,
+		&analysis.Provider,
+		&analysis.Model,
+		&triggerReason,
+		&triggerDetailsJSON,
+		&analysis.SourceJobID,
+		&analysis.SourceInvocationID,
+		&analysis.ProfileSchemaVersion,
+		&analysis.ProfileFingerprint,
+		&analysis.TotalImages,
+		&analysis.ImagesAnalyzed,
+		&coverageReportJSON,
+		&classesToWatchJSON,
+		&analysis.Confidence,
+		&visualTraitsJSON,
+		&preprocessingHypothesesJSON,
+		&cautionsJSON,
+		&limitationsJSON,
+		&analysis.ValidationStatus,
+		&validationErrorsJSON,
+		&analysis.CreatedAt,
+		&analysis.UpdatedAt,
+	); err != nil {
+		return datasets.DatasetVisualAnalysis{}, normalizeSQLError(err)
+	}
+
+	analysis.TriggerReason = datasets.VisualReanalysisTrigger(triggerReason)
+	analysis.TriggerDetails = map[string]any{}
+	if len(triggerDetailsJSON) > 0 {
+		if err := json.Unmarshal(triggerDetailsJSON, &analysis.TriggerDetails); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis trigger details: %w", err)
+		}
+	}
+	if len(coverageReportJSON) > 0 {
+		if err := json.Unmarshal(coverageReportJSON, &analysis.CoverageReport); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis coverage report: %w", err)
+		}
+	}
+	analysis.ClassesToWatch = []datasets.ClassWatchItem{}
+	if len(classesToWatchJSON) > 0 {
+		if err := json.Unmarshal(classesToWatchJSON, &analysis.ClassesToWatch); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis classes to watch: %w", err)
+		}
+	}
+	analysis.VisualTraits = []datasets.VisualTrait{}
+	if len(visualTraitsJSON) > 0 {
+		if err := json.Unmarshal(visualTraitsJSON, &analysis.VisualTraits); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis traits: %w", err)
+		}
+	}
+	analysis.PreprocessingHypotheses = []datasets.PreprocessingHypothesis{}
+	if len(preprocessingHypothesesJSON) > 0 {
+		if err := json.Unmarshal(preprocessingHypothesesJSON, &analysis.PreprocessingHypotheses); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis preprocessing hypotheses: %w", err)
+		}
+	}
+	analysis.Cautions = []datasets.VisualCaution{}
+	if len(cautionsJSON) > 0 {
+		if err := json.Unmarshal(cautionsJSON, &analysis.Cautions); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis cautions: %w", err)
+		}
+	}
+	analysis.Limitations = []string{}
+	if len(limitationsJSON) > 0 {
+		if err := json.Unmarshal(limitationsJSON, &analysis.Limitations); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis limitations: %w", err)
+		}
+	}
+	analysis.ValidationErrors = []string{}
+	if len(validationErrorsJSON) > 0 {
+		if err := json.Unmarshal(validationErrorsJSON, &analysis.ValidationErrors); err != nil {
+			return datasets.DatasetVisualAnalysis{}, fmt.Errorf("unmarshal visual analysis validation errors: %w", err)
+		}
+	}
+
+	return analysis, nil
 }
 
 func scanWorker(row rowScanner) (workers.Worker, error) {
@@ -2741,6 +3061,10 @@ func selectJobSQL(column string) string {
 
 func jobSelectColumns() string {
 	return "id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at"
+}
+
+func datasetVisualAnalysisSelectColumns() string {
+	return "id, project_id, dataset_id, dataset_name, schema_version, analysis_version, prompt_version, agent_name, agent_version, provider, model, trigger_reason, trigger_details, source_job_id, source_invocation_id, profile_schema_version, profile_fingerprint, total_images, images_analyzed, coverage_report, classes_to_watch, confidence, visual_traits, preprocessing_hypotheses, cautions, limitations, validation_status, validation_errors, created_at, updated_at"
 }
 
 func strategyScorecardSelectColumns() string {

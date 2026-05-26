@@ -39,6 +39,7 @@ type MemoryStore struct {
 	champions          map[string]runs.ProjectChampion
 	championExports    map[string]runs.ChampionExport
 	demoPredictions    map[string]runs.ChampionDemoPrediction
+	visualAnalyses     map[string]datasets.DatasetVisualAnalysis
 	decisions          map[string]decisions.AgentDecision
 	workerRequirements map[string]execution.WorkerRequirement
 	executionEvents    map[string]execution.ExecutionEvent
@@ -61,6 +62,7 @@ func NewMemoryStore() *MemoryStore {
 		champions:          make(map[string]runs.ProjectChampion),
 		championExports:    make(map[string]runs.ChampionExport),
 		demoPredictions:    make(map[string]runs.ChampionDemoPrediction),
+		visualAnalyses:     make(map[string]datasets.DatasetVisualAnalysis),
 		decisions:          make(map[string]decisions.AgentDecision),
 		workerRequirements: make(map[string]execution.WorkerRequirement),
 		executionEvents:    make(map[string]execution.ExecutionEvent),
@@ -182,6 +184,66 @@ func (s *MemoryStore) UpdateDatasetProfile(id string, profile map[string]any) (d
 	s.datasets[id] = dataset
 
 	return dataset, nil
+}
+
+func (s *MemoryStore) CreateDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis) (datasets.DatasetVisualAnalysis, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.createDatasetVisualAnalysisLocked(analysis, datasets.VisualValidationStatusAccepted)
+}
+
+func (s *MemoryStore) RejectDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis) (datasets.DatasetVisualAnalysis, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.createDatasetVisualAnalysisLocked(analysis, datasets.VisualValidationStatusRejected)
+}
+
+func (s *MemoryStore) GetLatestAcceptedDatasetVisualAnalysis(datasetID string) (datasets.DatasetVisualAnalysis, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.datasets[datasetID]; !ok {
+		return datasets.DatasetVisualAnalysis{}, ErrNotFound
+	}
+	var latest datasets.DatasetVisualAnalysis
+	for _, analysis := range s.visualAnalyses {
+		if analysis.DatasetID != datasetID || analysis.ValidationStatus != datasets.VisualValidationStatusAccepted {
+			continue
+		}
+		if latest.ID == "" ||
+			analysis.AnalysisVersion > latest.AnalysisVersion ||
+			(analysis.AnalysisVersion == latest.AnalysisVersion && analysis.CreatedAt.After(latest.CreatedAt)) {
+			latest = analysis
+		}
+	}
+	if latest.ID == "" {
+		return datasets.DatasetVisualAnalysis{}, ErrNotFound
+	}
+	return latest, nil
+}
+
+func (s *MemoryStore) ListDatasetVisualAnalyses(datasetID string) ([]datasets.DatasetVisualAnalysis, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.datasets[datasetID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []datasets.DatasetVisualAnalysis{}
+	for _, analysis := range s.visualAnalyses {
+		if analysis.DatasetID == datasetID {
+			out = append(out, analysis)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AnalysisVersion == out[j].AnalysisVersion {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].AnalysisVersion > out[j].AnalysisVersion
+	})
+	return out, nil
 }
 
 func (s *MemoryStore) RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error) {
@@ -1392,6 +1454,74 @@ func (s *MemoryStore) requireDatasetBelongsToProject(projectID string, datasetID
 	}
 
 	return nil
+}
+
+func (s *MemoryStore) createDatasetVisualAnalysisLocked(analysis datasets.DatasetVisualAnalysis, validationStatus string) (datasets.DatasetVisualAnalysis, error) {
+	dataset, ok := s.datasets[analysis.DatasetID]
+	if !ok {
+		return datasets.DatasetVisualAnalysis{}, ErrNotFound
+	}
+	if analysis.ProjectID == "" {
+		analysis.ProjectID = dataset.ProjectID
+	}
+	if analysis.ProjectID != dataset.ProjectID {
+		return datasets.DatasetVisualAnalysis{}, fmt.Errorf("%w: dataset_id does not belong to this project", ErrInvalidRequest)
+	}
+	if analysis.DatasetName == "" {
+		analysis.DatasetName = dataset.Name
+	}
+	if analysis.SchemaVersion == "" {
+		analysis.SchemaVersion = datasets.VisualAnalysisSchemaVersion
+	}
+	if analysis.AgentName == "" {
+		analysis.AgentName = datasets.VisualAnalysisAgentName
+	}
+	if analysis.TriggerReason == "" {
+		analysis.TriggerReason = datasets.VisualTriggerManual
+	}
+	if analysis.TriggerDetails == nil {
+		analysis.TriggerDetails = map[string]any{}
+	}
+	if analysis.CoverageReport.PerClassCounts == nil {
+		analysis.CoverageReport.PerClassCounts = map[string]int{}
+	}
+	if analysis.ClassesToWatch == nil {
+		analysis.ClassesToWatch = []datasets.ClassWatchItem{}
+	}
+	if analysis.VisualTraits == nil {
+		analysis.VisualTraits = []datasets.VisualTrait{}
+	}
+	if analysis.PreprocessingHypotheses == nil {
+		analysis.PreprocessingHypotheses = []datasets.PreprocessingHypothesis{}
+	}
+	if analysis.Cautions == nil {
+		analysis.Cautions = []datasets.VisualCaution{}
+	}
+	if analysis.Limitations == nil {
+		analysis.Limitations = []string{}
+	}
+	if analysis.ValidationErrors == nil {
+		analysis.ValidationErrors = []string{}
+	}
+
+	now := time.Now().UTC()
+	analysis.ID = s.newID("dataset_visual_analysis")
+	analysis.AnalysisVersion = s.nextDatasetVisualAnalysisVersionLocked(analysis.DatasetID)
+	analysis.ValidationStatus = validationStatus
+	analysis.CreatedAt = now
+	analysis.UpdatedAt = now
+	s.visualAnalyses[analysis.ID] = analysis
+	return analysis, nil
+}
+
+func (s *MemoryStore) nextDatasetVisualAnalysisVersionLocked(datasetID string) int {
+	maxVersion := 0
+	for _, analysis := range s.visualAnalyses {
+		if analysis.DatasetID == datasetID && analysis.AnalysisVersion > maxVersion {
+			maxVersion = analysis.AnalysisVersion
+		}
+	}
+	return maxVersion + 1
 }
 
 func newTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.TrainingRunSummary {

@@ -9,6 +9,14 @@ from worker.training.augmentation import (
     normalize_augmentation_config,
     structured_policy_type,
 )
+from worker.training.preprocessing_registry import (
+    bbox_compare_requested,
+    bbox_crop_required,
+    bbox_crop_requested,
+    build_image_transform,
+    normalization_values,
+    resize_with_padding,
+)
 
 try:
     import modal
@@ -26,9 +34,6 @@ EFFECTIVE_NUMBER_CLASS_BALANCING = {
     "class_balanced_loss",
     "class_balanced_effective_number",
 }
-BBOX_CROP_STRATEGIES = {"bbox_crop_if_available", "bbox_crop_ablation"}
-BBOX_CROP_MODES = {"crop_if_available", "crop_and_compare_full_image"}
-
 if modal is not None:
     image = (
         modal.Image.debian_slim(python_version="3.11")
@@ -355,20 +360,20 @@ def _load_image_data(
     val_transform = _image_transform(image_size, {}, preprocessing, training=False)
     crop_strategy = str(preprocessing.get("crop_strategy", "")).lower()
     bbox_mode = str(preprocessing.get("bbox_mode", "")).lower()
-    bbox_crop_requested = crop_strategy in BBOX_CROP_STRATEGIES or bbox_mode in BBOX_CROP_MODES
-    bbox_required = crop_strategy == "bbox_crop_ablation" or bbox_mode == "crop_and_compare_full_image"
-    bbox_compare_requested = crop_strategy == "bbox_crop_ablation" or bbox_mode == "crop_and_compare_full_image"
+    requested_bbox_crop = bbox_crop_requested(preprocessing)
+    bbox_required = bbox_crop_required(preprocessing)
+    compare_bbox_crop = bbox_compare_requested(preprocessing)
     bbox_lookup: dict[str, tuple[int, int, int, int]] = {}
     execution_metadata: dict = {
         "bbox_crop": {
-            "requested": bbox_crop_requested,
+            "requested": requested_bbox_crop,
             "applied": False,
             "annotation_count": 0,
             "mode": bbox_mode or crop_strategy or "none",
-            "compare_full_image": bbox_compare_requested,
+            "compare_full_image": compare_bbox_crop,
         }
     }
-    if bbox_crop_requested:
+    if requested_bbox_crop:
         bbox_lookup = _load_bbox_lookup(dataset_dir)
         execution_metadata["bbox_crop"]["annotation_count"] = len(bbox_lookup)
         if not bbox_lookup:
@@ -433,7 +438,7 @@ def _load_image_data(
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=sampler is None, sampler=sampler, num_workers=loader_workers)
     val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=loader_workers)
     test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=loader_workers)
-    if bbox_lookup and bbox_compare_requested:
+    if bbox_lookup and compare_bbox_crop:
         execution_metadata["_full_image_val_loader"] = DataLoader(
             full_image_val_data,
             batch_size=batch_size,
@@ -486,44 +491,7 @@ def _has_root_metadata_dirs(dataset_dir: Path) -> bool:
 
 
 def _image_transform(image_size: int, augmentation: dict, preprocessing: dict, training: bool):
-    from torchvision import transforms
-
-    steps = []
-    resize_strategy = str(preprocessing.get("resize_strategy", "")).lower()
-    crop_strategy = str(preprocessing.get("crop_strategy", "")).lower()
-    normalization = str(preprocessing.get("normalization", "imagenet")).lower()
-    random_crop = training and (augmentation.get("random_crop") or crop_strategy == "random_resized_crop")
-
-    if random_crop or (training and resize_strategy == "random_resized_crop"):
-        steps.append(transforms.Resize((int(image_size * 1.15), int(image_size * 1.15))))
-        steps.append(transforms.RandomResizedCrop(image_size, scale=(0.72, 1.0)))
-    elif resize_strategy == "preserve_aspect_pad":
-        steps.append(transforms.Lambda(lambda image: _resize_with_padding(image, image_size)))
-    elif crop_strategy == "center_crop" or resize_strategy == "center_crop":
-        steps.append(transforms.Resize((int(image_size * 1.15), int(image_size * 1.15))))
-        steps.append(transforms.CenterCrop(image_size))
-    else:
-        steps.append(transforms.Resize((image_size, image_size)))
-
-    if training and augmentation.get("horizontal_flip"):
-        steps.append(transforms.RandomHorizontalFlip())
-    if training and augmentation.get("vertical_flip"):
-        steps.append(transforms.RandomVerticalFlip())
-    if training and augmentation.get("color_jitter"):
-        steps.append(transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.12, hue=0.03))
-    if training and augmentation.get("random_rotation"):
-        steps.append(transforms.RandomRotation(10))
-    if training:
-        steps.extend(_advanced_augmentation_steps(transforms, augmentation))
-
-    steps.append(transforms.ToTensor())
-    if training and augmentation.get("random_erasing"):
-        steps.append(transforms.RandomErasing(p=0.15, scale=(0.02, 0.12)))
-    normalization_values = _normalization_values(normalization, preprocessing)
-    if normalization_values is not None:
-        mean, std = normalization_values
-        steps.append(transforms.Normalize(mean=mean, std=std))
-    return transforms.Compose(steps)
+    return build_image_transform(image_size, augmentation, preprocessing, training)
 
 
 def _advanced_augmentation_steps(transforms, augmentation: dict) -> list:
@@ -583,15 +551,7 @@ def _autoaugment_transform(transforms, augmentation: dict):
 
 
 def _resize_with_padding(image, image_size: int):
-    from PIL import Image
-
-    image = image.convert("RGB")
-    image.thumbnail((image_size, image_size), Image.Resampling.BILINEAR)
-    canvas = Image.new("RGB", (image_size, image_size), (0, 0, 0))
-    left = (image_size - image.width) // 2
-    top = (image_size - image.height) // 2
-    canvas.paste(image, (left, top))
-    return canvas
+    return resize_with_padding(image, image_size)
 
 
 def _load_bbox_lookup(dataset_dir: Path) -> dict[str, tuple[int, int, int, int]]:
@@ -742,16 +702,7 @@ def _dataset_normalization_metadata(dataset_dir: Path, preprocessing: dict) -> d
 
 
 def _normalization_values(normalization: str, preprocessing: dict) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
-    if normalization == "none":
-        return None
-    if normalization == "dataset":
-        metadata = preprocessing.get("normalization_metadata")
-        if isinstance(metadata, dict):
-            mean = _three_float_tuple(metadata.get("mean"))
-            std = _three_positive_float_tuple(metadata.get("std"))
-            if mean is not None and std is not None:
-                return mean, std
-    return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+    return normalization_values(normalization, preprocessing)
 
 
 def _three_float_tuple(value: object) -> tuple[float, float, float] | None:

@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -139,8 +140,10 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"focal_loss",
 		"Return only valid JSON",
 		"planner_context_snapshot",
-		"visual_evidence, when present, only as backend-curated evidence",
-		"Cite exemplar caps, warnings, or audit details",
+		"visual_evidence, when present, only as backend-curated advisory evidence",
+		"latest accepted visual-analysis IDs",
+		"raw Visual Agent output",
+		"raw images",
 		"Backend validation remains the gate",
 		"planner_validation_feedback",
 		"choose arbitrary files",
@@ -507,6 +510,120 @@ func TestExperimentPlannerPromptContextMarksVisualExemplarsAsEvidenceOnly(t *tes
 	instructions, _ := exemplarContext["instructions"].(string)
 	if !strings.Contains(instructions, "return JSON only") || !strings.Contains(instructions, "backend validation") || !strings.Contains(instructions, "caps") || !strings.Contains(instructions, "audit") {
 		t.Fatalf("expected evidence-only JSON/backend instructions, got %q", instructions)
+	}
+}
+
+func TestPlannerVisualAnalysisContextCapsAndExcludesRawPayloads(t *testing.T) {
+	analysis := datasets.DatasetVisualAnalysis{
+		ID:              "analysis_1",
+		DatasetID:       "dataset_1",
+		SchemaVersion:   datasets.VisualAnalysisSchemaVersion,
+		AnalysisVersion: 3,
+		TriggerReason:   datasets.VisualTriggerInitialProfile,
+		TriggerDetails: map[string]any{
+			"raw_visual_agent_output": "SHOULD_NOT_LEAK",
+			"images":                  []string{"file:///secret-image.jpg"},
+		},
+		ImagesAnalyzed: 64,
+		Confidence:     "medium",
+		CoverageReport: datasets.VisualCoverageReport{
+			SelectionStrategy: "deterministic_risk_and_representative_sampling",
+			SelectionBasis:    []string{"representative", "rare", "aspect_ratio", "blur", "brightness", "confusion", "extra"},
+			ImagesAvailable:   1000,
+			ImagesAnalyzed:    64,
+			ClassesTotal:      20,
+			ClassesCovered:    12,
+			Limitations:       []string{"bounded sample", "not class complete", "one more", "two more", "three more"},
+			PerClassCounts:    map[string]int{},
+		},
+		Limitations: []string{},
+	}
+	for i := 0; i < 18; i++ {
+		className := fmt.Sprintf("class_%02d", i)
+		analysis.CoverageReport.PerClassCounts[className] = i + 1
+		analysis.VisualTraits = append(analysis.VisualTraits, datasets.VisualTrait{
+			Trait:           fmt.Sprintf("trait_%02d", i),
+			Level:           "high",
+			Confidence:      "medium",
+			Evidence:        []string{"visible bounded evidence", "extra evidence"},
+			AffectedClasses: []string{className, "related_a", "related_b", "related_c"},
+			ExampleImageIDs: []string{"img_1", "img_2"},
+		})
+		analysis.ClassesToWatch = append(analysis.ClassesToWatch, datasets.ClassWatchItem{
+			ClassName:       className,
+			Reason:          "visually similar sampled class",
+			RelatedClasses:  []string{"related_a", "related_b", "related_c", "related_d", "related_e"},
+			Evidence:        []string{"visual ambiguity", "shape overlap", "texture overlap", "extra evidence"},
+			ExampleImageIDs: []string{"img_1", "img_2", "img_3", "img_4", "img_5"},
+			Confidence:      "medium",
+		})
+		analysis.PreprocessingHypotheses = append(analysis.PreprocessingHypotheses, datasets.PreprocessingHypothesis{
+			ID:                     fmt.Sprintf("vh_%02d", i),
+			Mechanism:              "resolution_crop",
+			Summary:                "Preserve aspect ratio for small objects.",
+			Evidence:               []string{"small objects", "varied aspect ratios", "background dominance", "extra evidence"},
+			SuggestedPreprocessing: &plans.Preprocessing{ResizeStrategy: "preserve_aspect_pad", Normalization: "imagenet", CropStrategy: "none", BBoxMode: "ignore"},
+			SuggestedImageSizes:    []int{224, 256, 320, 384},
+			ExpectedEffect:         "Reduce distortion.",
+			Confidence:             "medium",
+			SupportStatus:          "supported",
+		})
+		analysis.Cautions = append(analysis.Cautions, datasets.VisualCaution{
+			Operation:       fmt.Sprintf("operation_%02d", i),
+			Reason:          "orientation-sensitive evidence",
+			Severity:        "medium",
+			Confidence:      "medium",
+			AffectedClasses: []string{className, "related_a", "related_b", "related_c", "related_d"},
+			ExampleImageIDs: []string{"img_1", "img_2", "img_3", "img_4", "img_5"},
+		})
+		analysis.Limitations = append(analysis.Limitations, fmt.Sprintf("limitation_%02d", i))
+	}
+	analysis.PreprocessingHypotheses = append([]datasets.PreprocessingHypothesis{{
+		ID:                "vh_unsupported_secret",
+		Mechanism:         "delete_dataset",
+		Summary:           "unsupported_secret_hypothesis",
+		Evidence:          []string{"SHOULD_NOT_LEAK"},
+		SupportStatus:     "unsupported",
+		UnsupportedReason: "outside backend validation",
+	}}, analysis.PreprocessingHypotheses...)
+
+	input := testExperimentPlannerInput()
+	input.VisualExemplarContext = NewPlannerVisualExemplarContextFromAnalysis(analysis)
+	snapshot := BuildPlannerContextSnapshot(input)
+	evidence := snapshot.VisualEvidence
+	if evidence["source"] != "dataset_visual_analysis" || evidence["analysis_id"] != "analysis_1" {
+		t.Fatalf("expected latest visual analysis metadata, got %#v", evidence)
+	}
+	if evidence["evidence_only"] != true || evidence["raw_images_included"] != false || evidence["raw_visual_output_included"] != false {
+		t.Fatalf("expected evidence-only raw-exclusion flags, got %#v", evidence)
+	}
+	if got := len(evidence["observed_traits"].([]string)); got != plannerVisualMaxObservedTraits {
+		t.Fatalf("expected capped observed traits, got %d", got)
+	}
+	if got := len(evidence["classes_to_watch"].([]datasets.ClassWatchItem)); got != plannerVisualMaxClassesToWatch {
+		t.Fatalf("expected capped classes to watch, got %d", got)
+	}
+	if got := len(evidence["preprocessing_hypotheses"].([]datasets.PreprocessingHypothesis)); got != plannerVisualMaxHypotheses {
+		t.Fatalf("expected capped preprocessing hypotheses, got %d", got)
+	}
+	if got := len(evidence["cautions"].([]datasets.VisualCaution)); got != plannerVisualMaxCautions {
+		t.Fatalf("expected capped cautions, got %d", got)
+	}
+	if got := len(evidence["limitations"].([]string)); got != plannerVisualMaxLimitations {
+		t.Fatalf("expected capped limitations, got %d", got)
+	}
+	coverage := evidence["class_coverage"].(datasets.VisualCoverageReport)
+	if got := len(coverage.PerClassCounts); got != plannerVisualMaxPerClassCounts {
+		t.Fatalf("expected capped per-class coverage counts, got %d", got)
+	}
+	blob, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatalf("marshal visual evidence: %v", err)
+	}
+	for _, forbidden := range []string{"SHOULD_NOT_LEAK", "file:///secret-image.jpg", "vh_unsupported_secret", "unsupported_secret_hypothesis"} {
+		if strings.Contains(string(blob), forbidden) {
+			t.Fatalf("expected compressed visual evidence to exclude %q: %s", forbidden, string(blob))
+		}
 	}
 }
 
