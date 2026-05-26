@@ -1049,6 +1049,75 @@ func TestValidatePlannedExperimentRejectsUnsupportedAugmentationKey(t *testing.T
 	}
 }
 
+func TestValidatePlannedExperimentAcceptsStructuredAutoAugmentationPolicy(t *testing.T) {
+	experiment := testExperiment("efficientnet_b0", 8)
+	experiment.AugmentationPolicy = "randaugment"
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{
+		PolicyType:  "randaugment",
+		Magnitude:   15,
+		NumOps:      3,
+		Probability: 0.5,
+	}
+
+	if err := validatePlannedExperiment(experiment, 0); err != nil {
+		t.Fatalf("expected structured augmentation policy to validate: %v", err)
+	}
+}
+
+func TestValidatePlannedExperimentRejectsUnsupportedStructuredAugmentationPolicy(t *testing.T) {
+	experiment := testExperiment("efficientnet_b0", 8)
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{PolicyType: "mystery"}
+
+	err := validatePlannedExperiment(experiment, 0)
+	if err == nil || !strings.Contains(err.Error(), "augmentation_policy_config.policy_type") {
+		t.Fatalf("expected structured policy validation error, got %v", err)
+	}
+}
+
+func TestValidatePlannedExperimentAcceptsMixedSampleStructuredAugmentationPolicy(t *testing.T) {
+	experiment := testExperiment("efficientnet_b0", 8)
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{
+		PolicyType:  "mixup",
+		Alpha:       0.2,
+		Probability: 0.5,
+	}
+
+	if err := validatePlannedExperiment(experiment, 0); err != nil {
+		t.Fatalf("expected mixed-sample policy to validate after worker support: %v", err)
+	}
+}
+
+func TestExecuteExperimentPlanIncludesStructuredAugmentationPolicyConfig(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		func() plans.PlannedExperiment {
+			experiment := testExperiment("efficientnet_b0", 8)
+			experiment.AugmentationPolicy = "randaugment"
+			experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{
+				PolicyType:       "randaugment",
+				Magnitude:        9,
+				NumOps:           2,
+				NumMagnitudeBins: 31,
+				Probability:      0.75,
+			}
+			return experiment
+		}(),
+	})
+
+	response, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "local"})
+	if err != nil {
+		t.Fatalf("execute experiment plan: %v", err)
+	}
+	if len(response.Jobs) != 1 {
+		t.Fatalf("expected one job, got %d", len(response.Jobs))
+	}
+	if _, ok := response.Jobs[0].Config["augmentation_policy_config"]; !ok {
+		t.Fatalf("expected structured augmentation policy in job config, got %#v", response.Jobs[0].Config)
+	}
+	if response.Jobs[0].ProjectID != projectID {
+		t.Fatalf("expected job in project %s, got %s", projectID, response.Jobs[0].ProjectID)
+	}
+}
+
 func TestHolisticRunScoreCanPreferFastModelForLiveGoal(t *testing.T) {
 	slowSummary := runs.TrainingRunSummary{
 		JobID:            "job_slow",
@@ -1308,6 +1377,13 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 				"learning_rate": 0.0003,
 				"reason": "Repeat MobileNet with more epochs."
 			}],
+			"proposal_mechanisms": [{
+				"experiment_index": 0,
+				"mechanism": "capacity_finetune",
+				"intervention": "Extend the prior MobileNet training budget without changing preprocessing.",
+				"evidence_used": ["previous MobileNet was best"],
+				"expected_effect": "Determine whether the prior best model was simply undertrained."
+			}],
 			"why_can_beat_champion": "The previous family was best, so longer training might help.",
 			"expected_delta_vs_champion": 0.01,
 			"risks": ["low novelty"],
@@ -1343,6 +1419,13 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 				"augmentation_policy": "moderate",
 				"class_balancing": "weighted_loss",
 				"sampling_strategy": "weighted_random_sampler"
+			}],
+			"proposal_mechanisms": [{
+				"experiment_index": 0,
+				"mechanism": "class_imbalance",
+				"intervention": "Use weighted loss and weighted sampling with a stronger EfficientNet challenger.",
+				"evidence_used": ["backend rejected the minor-only repeat", "prior run plateaued"],
+				"expected_effect": "Improve macro-F1 by addressing class imbalance instead of repeating training budget."
 			}],
 			"why_can_beat_champion": "It changes the mechanism rather than repeating MobileNet with more epochs.",
 			"expected_delta_vs_champion": 0.02,
@@ -1472,10 +1555,37 @@ func TestExperimentPlannerRejectsDuplicateProposedExperiment(t *testing.T) {
 		Confidence:          0.9,
 		ProposedExperiments: []plans.PlannedExperiment{plan.Experiments[0]},
 	}
+	duplicate.ProposedExperiments[0].Mechanism = "baseline_control"
+	duplicate.ProposedExperiments[0].Intervention = "Repeat the existing baseline configuration."
+	duplicate.ProposedExperiments[0].EvidenceUsed = []string{"existing baseline result"}
+	duplicate.ProposedExperiments[0].ExpectedEffect = "Confirm whether the existing baseline is reproducible."
+	duplicate.ProposalMechanisms = []agents.PlannerProposalMechanism{{
+		ExperimentIndex: 0,
+		Mechanism:       duplicate.ProposedExperiments[0].Mechanism,
+		Intervention:    duplicate.ProposedExperiments[0].Intervention,
+		EvidenceUsed:    duplicate.ProposedExperiments[0].EvidenceUsed,
+		ExpectedEffect:  duplicate.ProposedExperiments[0].ExpectedEffect,
+	}}
 
 	_, err := experimentPlannerDecisionPayload(duplicate, invocation, "autonomous", plannerInputForPayload(t, server, projectID))
 	if err == nil {
 		t.Fatal("expected duplicate proposed experiment to fail validation")
+	}
+}
+
+func TestExperimentPlannerRejectsProposedExperimentWithoutMechanism(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.62)
+	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
+	recommendation := experimentPlannerAddExperimentsRecommendation()
+	recommendation.ProposedExperiments[0].Mechanism = ""
+	recommendation.ProposalMechanisms = nil
+
+	_, err := experimentPlannerDecisionPayload(recommendation, invocation, "autonomous", plannerInputForPayload(t, server, projectID))
+	if err == nil || !strings.Contains(err.Error(), "missing mechanism") {
+		t.Fatalf("expected missing mechanism validation error, got %v", err)
 	}
 }
 
@@ -1492,6 +1602,10 @@ func TestExperimentPlannerRejectsMinorOnlyRepeat(t *testing.T) {
 	repeat.Template = "efficientnet_transfer"
 	repeat.BatchSize = plan.Experiments[0].BatchSize
 	repeat.LearningRate = plan.Experiments[0].LearningRate
+	repeat.Mechanism = "capacity_finetune"
+	repeat.Intervention = "Run the same EfficientNet-B1 setup for additional epochs."
+	repeat.EvidenceUsed = []string{"prior EfficientNet-B1 run was inconclusive"}
+	repeat.ExpectedEffect = "Check whether longer training alone improves macro-F1."
 	repeat.Reason = "Try the same mechanism for more epochs."
 
 	recommendation := agents.ExperimentPlanningRecommendation{
@@ -1501,6 +1615,13 @@ func TestExperimentPlannerRejectsMinorOnlyRepeat(t *testing.T) {
 		Rationale:           "This intentionally repeats the existing mechanism with only more epochs.",
 		Confidence:          0.7,
 		ProposedExperiments: []plans.PlannedExperiment{repeat},
+		ProposalMechanisms: []agents.PlannerProposalMechanism{{
+			ExperimentIndex: 0,
+			Mechanism:       repeat.Mechanism,
+			Intervention:    repeat.Intervention,
+			EvidenceUsed:    repeat.EvidenceUsed,
+			ExpectedEffect:  repeat.ExpectedEffect,
+		}},
 	}
 
 	_, err := experimentPlannerDecisionPayload(recommendation, invocation, "autonomous", plannerInputForPayload(t, server, projectID))
@@ -1626,6 +1747,276 @@ func TestExistingStaleFollowUpPlanIsRevalidatedBeforeExecution(t *testing.T) {
 	_, err = server.executeStoredExperimentPlan(stalePlan.ID, executeExperimentPlanRequest{Provider: "local"})
 	if err == nil || !errors.Is(err, errNoNovelFollowUpExperiments) {
 		t.Fatalf("expected stale follow-up execution to be blocked, got %v", err)
+	}
+	projectJobs, err := server.store.ListProjectJobs(projectID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	if len(projectJobs) != 0 {
+		t.Fatalf("expected stale plan execution to create no jobs, got %d", len(projectJobs))
+	}
+}
+
+func TestEnsureFollowUpPlanBlocksBBoxCropWithoutAnnotations(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "bbox_crop_ablation"
+	experiment.Intervention = "Compare bbox crop against full-image training."
+	experiment.EvidenceUsed = []string{"small objects may be background-dominated"}
+	experiment.ExpectedEffect = "Improve object focus if annotated boxes are available."
+	experiment.Preprocessing = &plans.Preprocessing{
+		CropStrategy: "bbox_crop_ablation",
+		BBoxMode:     "crop_and_compare_full_image",
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"crop diagnosis"})
+
+	_, _, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err == nil || !errors.Is(err, errNoNovelFollowUpExperiments) {
+		t.Fatalf("expected bbox evidence validation block, got %v", err)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected no follow-up plan to be created, got %d total plans", got)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasBlockedFollowUpEvent(events) {
+		t.Fatalf("expected blocked follow-up event, got %#v", events)
+	}
+}
+
+func TestEnsureFollowUpPlanAllowsBBoxCropWithBackendAnnotations(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	if _, err := server.store.UpdateDatasetProfile(plan.DatasetID, map[string]any{
+		"metadata_summary": map[string]any{"bbox_available": true, "bbox_annotations_count": 12},
+		"dataset_traits":   []string{"bbox_available", "small_objects"},
+	}); err != nil {
+		t.Fatalf("update dataset profile: %v", err)
+	}
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "bbox_crop_ablation"
+	experiment.Intervention = "Compare bbox crop against full-image training."
+	experiment.EvidenceUsed = []string{"backend profile reports bbox annotations", "visual traits show small objects"}
+	experiment.ExpectedEffect = "Improve foreground focus without changing labels."
+	experiment.Preprocessing = &plans.Preprocessing{
+		CropStrategy: "bbox_crop_ablation",
+		BBoxMode:     "crop_and_compare_full_image",
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"bbox annotations available"})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected bbox-backed follow-up to pass, got %v", err)
+	}
+	if !created || len(followUp.Experiments) != 1 {
+		t.Fatalf("expected one follow-up experiment, got created=%v plan=%#v", created, followUp)
+	}
+}
+
+func TestEnsureFollowUpPlanBlocksAuditOnlyMechanismTrainingJob(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "label_noise_audit"
+	experiment.Intervention = "Audit high-loss examples for likely label noise."
+	experiment.EvidenceUsed = []string{"training dynamics show unstable per-class errors"}
+	experiment.ExpectedEffect = "Produce an audit report before training changes."
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"label quality concerns"})
+
+	_, _, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err == nil || !strings.Contains(err.Error(), "report-only") {
+		t.Fatalf("expected report-only mechanism to be blocked, got %v", err)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected no follow-up plan to be created, got %d total plans", got)
+	}
+}
+
+func TestLabelQualityAuditPlanCreatesAuditJobNotTrainingJob(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	audit := plans.PlannedExperiment{
+		Template:       jobs.TemplateLabelQualityAudit,
+		Mechanism:      "label_noise_audit",
+		Intervention:   "Produce a report-only audit of high-confidence mistakes and high-loss examples.",
+		EvidenceUsed:   []string{"label_quality_card reports asymmetric high-confidence errors"},
+		ExpectedEffect: "Create a label-quality artifact before any training changes.",
+		Reason:         "Label noise should be audited before training work is scheduled.",
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{audit}, []string{"label quality concerns"})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected label-quality audit follow-up to pass, got %v", err)
+	}
+	if !created || len(followUp.Experiments) != 1 {
+		t.Fatalf("expected one audit follow-up experiment, got created=%v plan=%#v", created, followUp)
+	}
+
+	result, err := server.executeStoredExperimentPlan(followUp.ID, executeExperimentPlanRequest{Provider: "local"})
+	if err != nil {
+		t.Fatalf("execute audit plan: %v", err)
+	}
+	if len(result.Jobs) != 1 {
+		t.Fatalf("expected one audit job, got %d", len(result.Jobs))
+	}
+	job := result.Jobs[0]
+	if job.Template != jobs.TemplateLabelQualityAudit {
+		t.Fatalf("expected %s job, got %s", jobs.TemplateLabelQualityAudit, job.Template)
+	}
+	if configString(job.Config, "audit_type") != "label_noise_audit" {
+		t.Fatalf("expected label_noise_audit config, got %#v", job.Config)
+	}
+	if _, ok := job.Config["model"]; ok {
+		t.Fatalf("audit job should not carry a model training config, got %#v", job.Config)
+	}
+}
+
+func TestMixedSampleAugmentationMechanismPassesWithStructuredPolicy(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "augmentation_mixed_sample"
+	experiment.Intervention = "Use MixUp to smooth labels and reduce overconfident errors."
+	experiment.EvidenceUsed = []string{"validation errors show overconfident confusion between visually similar classes"}
+	experiment.ExpectedEffect = "Improve calibration and macro-F1 without switching model families."
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{
+		PolicyType:  "mixup",
+		Probability: 0.5,
+		Alpha:       0.4,
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"overconfident errors"})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected MixUp-backed mechanism to pass, got %v", err)
+	}
+	if !created || followUp.Experiments[0].AugmentationPolicyConfig.PolicyType != "mixup" {
+		t.Fatalf("expected MixUp follow-up experiment, got %#v", followUp)
+	}
+}
+
+func TestEffectiveNumberClassBalancingPassesWithBackendEvidence(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	if _, err := server.store.UpdateDatasetProfile(plan.DatasetID, map[string]any{
+		"class_distribution": map[string]any{"common": 90, "rare": 12},
+	}); err != nil {
+		t.Fatalf("update dataset profile: %v", err)
+	}
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "class_imbalance"
+	experiment.Intervention = "Use effective-number class-balanced loss for rare classes."
+	experiment.EvidenceUsed = []string{"dataset profile shows common/rare class imbalance"}
+	experiment.ExpectedEffect = "Improve minority recall while preserving macro-F1."
+	experiment.ClassBalancing = "effective_number_loss"
+	experiment.ClassBalancingConfig = map[string]any{"effective_number_beta": 0.99}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"class imbalance evidence"})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected effective-number class-balanced follow-up to pass, got %v", err)
+	}
+	if !created || followUp.Experiments[0].ClassBalancing != "effective_number_loss" {
+		t.Fatalf("expected effective-number follow-up experiment, got %#v", followUp)
+	}
+}
+
+func TestEnsureFollowUpPlanBlocksHighResolutionWithoutObjectScaleEvidence(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "resolution_crop"
+	experiment.Intervention = "Try a larger input size."
+	experiment.EvidenceUsed = []string{"the current score is below target"}
+	experiment.ExpectedEffect = "Check whether a larger input improves validation quality."
+	experiment.ImageSize = 384
+	experiment.ResolutionStrategy = "high_resolution_ablation"
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"quality is below target"})
+
+	_, _, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err == nil || !strings.Contains(err.Error(), "object-scale") {
+		t.Fatalf("expected high-resolution evidence validation block, got %v", err)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected no follow-up plan to be created, got %d total plans", got)
+	}
+}
+
+func TestEnsureFollowUpPlanAllowsDiagnosisMatchedClassImbalanceMechanism(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	if _, err := server.store.UpdateDatasetProfile(plan.DatasetID, map[string]any{
+		"class_distribution": map[string]any{"cat": 180, "dog": 24},
+		"imbalance_ratio":    7.5,
+	}); err != nil {
+		t.Fatalf("update dataset profile: %v", err)
+	}
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "class_imbalance"
+	experiment.Intervention = "Train with weighted loss to target rare-class recall."
+	experiment.EvidenceUsed = []string{"backend profile imbalance_ratio=7.5", "minority recall is weak"}
+	experiment.ExpectedEffect = "Improve macro-F1 by improving rare-class recall."
+	experiment.ClassBalancing = "weighted_loss"
+	experiment.SamplingStrategy = "none"
+	experiment.AugmentationPolicy = "randaugment"
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{
+		PolicyType: "randaugment",
+		Magnitude:  9,
+		NumOps:     2,
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"class imbalance diagnosis"})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected diagnosis-matched class imbalance follow-up to pass, got %v", err)
+	}
+	if !created || len(followUp.Experiments) != 1 {
+		t.Fatalf("expected one follow-up experiment, got created=%v plan=%#v", created, followUp)
+	}
+}
+
+func TestExistingStaleFollowUpPlanRevalidatesMechanismDatasetEvidenceBeforeExecution(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "bbox_crop_ablation"
+	experiment.Intervention = "Stale bbox crop proposal without annotations."
+	experiment.EvidenceUsed = []string{"old planner claimed boxes existed"}
+	experiment.ExpectedEffect = "Should now be blocked by backend evidence validation."
+	experiment.Preprocessing = &plans.Preprocessing{
+		CropStrategy: "bbox_crop_ablation",
+		BBoxMode:     "crop_and_compare_full_image",
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"stale bbox evidence"})
+	stalePlan, err := server.store.CreateExperimentPlan(projectID, plan.DatasetID, "macro_f1", 1, 5, []plans.PlannedExperiment{experiment}, nil, decision.ID)
+	if err != nil {
+		t.Fatalf("create stale follow-up plan: %v", err)
+	}
+
+	_, err = server.executeStoredExperimentPlan(stalePlan.ID, executeExperimentPlanRequest{Provider: "local"})
+	if err == nil || !errors.Is(err, errNoNovelFollowUpExperiments) {
+		t.Fatalf("expected stale bbox follow-up execution to be blocked, got %v", err)
 	}
 	projectJobs, err := server.store.ListProjectJobs(projectID)
 	if err != nil {
@@ -2034,6 +2425,15 @@ func TestNearCeilingChampionBlocksPlannerFollowUpScheduling(t *testing.T) {
 				"fine_tune_strategy": "full"
 			}
 		],
+		"proposal_mechanisms": [
+			{
+				"experiment_index": 0,
+				"mechanism": "resolution_crop",
+				"intervention": "Challenge the near-ceiling champion with higher resolution and full fine-tuning.",
+				"evidence_used": ["champion is near-perfect", "dataset has variable dimensions"],
+				"expected_effect": "Capture any remaining fine-grained or scale-dependent errors."
+			}
+		],
 		"champion_job_id": "",
 		"why_can_beat_champion": "It changes model family and fine tuning.",
 		"expected_delta_vs_champion": 0.005,
@@ -2145,6 +2545,281 @@ func TestNearCeilingStaleAddDecisionCannotScheduleFollowUp(t *testing.T) {
 	}
 	if !foundBlocked {
 		t.Fatalf("expected near-ceiling blocked scheduling event, got %#v", events)
+	}
+}
+
+func TestPersistedChampionBlocksStaleAddDecisionBeforePlanCreation(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.82)
+	selectDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select the completed champion.", map[string]any{
+		"champion_job_id": job.ID,
+	})
+	if err != nil {
+		t.Fatalf("create select champion decision: %v", err)
+	}
+	if err := server.persistProjectChampionFromDecision(projectID, selectDecision); err != nil {
+		t.Fatalf("persist champion: %v", err)
+	}
+	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
+	payload, err := experimentPlannerDecisionPayload(experimentPlannerAddExperimentsRecommendation(), invocation, "autonomous", plannerInputForPayload(t, server, projectID))
+	if err != nil {
+		t.Fatalf("build stale planner payload: %v", err)
+	}
+	addDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeAddExperiments, "stale ADD_EXPERIMENTS decision", payload)
+	if err != nil {
+		t.Fatalf("create add decision: %v", err)
+	}
+
+	_, _, err = server.ensureFollowUpPlan(projectID, plan, addDecision)
+	if err == nil || !errors.Is(err, errChampionSelectedFollowUpBlocked) {
+		t.Fatalf("expected champion-selected follow-up block, got %v", err)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected no follow-up plan after champion selection, got %d total plans", got)
+	}
+	projectJobs, err := server.store.ListProjectJobs(projectID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	if len(projectJobs) != 1 {
+		t.Fatalf("expected only the completed champion job, got %d jobs", len(projectJobs))
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasBackendStopGuardEvent(events, "champion_selected_guard") {
+		t.Fatalf("expected champion-selected blocked event, got %#v", events)
+	}
+}
+
+func TestSelectChampionDecisionWithoutChampionRecordBlocksAutonomousScheduling(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.73)
+	if _, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select champion but do not persist champion row yet.", map[string]any{
+		"champion_job_id": job.ID,
+	}); err != nil {
+		t.Fatalf("create select champion decision: %v", err)
+	}
+	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
+	payload, err := experimentPlannerDecisionPayload(experimentPlannerAddExperimentsRecommendation(), invocation, "autonomous", plannerInputForPayload(t, server, projectID))
+	if err != nil {
+		t.Fatalf("build stale planner payload: %v", err)
+	}
+	addDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeAddExperiments, "stale ADD_EXPERIMENTS decision", payload)
+	if err != nil {
+		t.Fatalf("create add decision: %v", err)
+	}
+
+	if err := server.schedulePlannerDecision(projectID, plan, addDecision, automaticExperimentReviewResult{Decision: &addDecision}); err != nil {
+		t.Fatalf("schedule stale add decision: %v", err)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected SELECT_CHAMPION decision to block follow-up plan creation, got %d total plans", got)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasBackendStopGuardEvent(events, "champion_selected_guard") {
+		t.Fatalf("expected champion-selected guard event, got %#v", events)
+	}
+}
+
+func TestReopenExperimentationAllowsFollowUpsAfterChampionSelection(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.79)
+	selectDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select final champion.", map[string]any{
+		"champion_job_id": job.ID,
+	})
+	if err != nil {
+		t.Fatalf("create select champion decision: %v", err)
+	}
+	if err := server.persistProjectChampionFromDecision(projectID, selectDecision); err != nil {
+		t.Fatalf("persist champion: %v", err)
+	}
+
+	router := NewRouter(server.store)
+	body := []byte(`{"reason":"Open a new diagnosis round after reviewing the champion."}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+projectID+"/experimentation/reopen", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected reopen status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	var reopenResp reopenExperimentationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reopenResp); err != nil {
+		t.Fatalf("decode reopen response: %v", err)
+	}
+	if reopenResp.Decision.DecisionType != decisions.TypeReopenExperimentation {
+		t.Fatalf("expected reopen decision, got %s", reopenResp.Decision.DecisionType)
+	}
+	if reopenResp.Event.EventType != execution.EventExperimentationReopened {
+		t.Fatalf("expected reopen event, got %s", reopenResp.Event.EventType)
+	}
+
+	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
+	payload, err := experimentPlannerDecisionPayload(experimentPlannerAddExperimentsRecommendation(), invocation, "manual", plannerInputForPayload(t, server, projectID))
+	if err != nil {
+		t.Fatalf("build planner payload: %v", err)
+	}
+	addDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeAddExperiments, "new post-reopen ADD_EXPERIMENTS decision", payload)
+	if err != nil {
+		t.Fatalf("create add decision: %v", err)
+	}
+
+	followUpPlan, created, err := server.ensureFollowUpPlan(projectID, plan, addDecision)
+	if err != nil {
+		t.Fatalf("expected post-reopen follow-up plan creation, got %v", err)
+	}
+	if !created || followUpPlan.SourceDecisionID != addDecision.ID {
+		t.Fatalf("expected created follow-up plan sourced from %s, got %#v created=%v", addDecision.ID, followUpPlan, created)
+	}
+}
+
+func TestReopenExperimentationRequiresTerminalChampionState(t *testing.T) {
+	server, projectID, _ := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+
+	router := NewRouter(server.store)
+	body := []byte(`{"reason":"try another round"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+projectID+"/experimentation/reopen", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusBadRequest, resp.Code, resp.Body.String())
+	}
+	if got := len(listAgentDecisions(t, server, projectID)); got != 0 {
+		t.Fatalf("expected no reopen decision before champion selection, got %d", got)
+	}
+}
+
+func TestPostChampionExistingFollowUpPlanCannotCreateJobs(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.76)
+	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
+	payload, err := experimentPlannerDecisionPayload(experimentPlannerAddExperimentsRecommendation(), invocation, "autonomous", plannerInputForPayload(t, server, projectID))
+	if err != nil {
+		t.Fatalf("build planner payload: %v", err)
+	}
+	addDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeAddExperiments, "accepted ADD_EXPERIMENTS decision", payload)
+	if err != nil {
+		t.Fatalf("create add decision: %v", err)
+	}
+	followUpPlan, _, err := server.ensureFollowUpPlan(projectID, plan, addDecision)
+	if err != nil {
+		t.Fatalf("create follow-up before champion selection: %v", err)
+	}
+	selectDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select champion before stale follow-up execution.", map[string]any{
+		"champion_job_id": job.ID,
+	})
+	if err != nil {
+		t.Fatalf("create select decision: %v", err)
+	}
+	if err := server.persistProjectChampionFromDecision(projectID, selectDecision); err != nil {
+		t.Fatalf("persist champion: %v", err)
+	}
+
+	_, err = server.executeStoredExperimentPlan(followUpPlan.ID, executeExperimentPlanRequest{Provider: "local"})
+	if err == nil || !errors.Is(err, errChampionSelectedFollowUpBlocked) {
+		t.Fatalf("expected champion-selected execution block, got %v", err)
+	}
+	projectJobs, err := server.store.ListProjectJobs(projectID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	if len(projectJobs) != 1 {
+		t.Fatalf("expected no follow-up jobs after champion selection, got %d total jobs", len(projectJobs))
+	}
+}
+
+func TestExperimentPlannerSkipsNewPlanningAfterChampionSelected(t *testing.T) {
+	llmCalls := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": `{"summary":"should not be called","decision_type":"WAIT","rationale":"skip","confidence":0.5}`,
+				},
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "test-model")
+	t.Setenv("MODEL_EXPRESS_AGENT_MODE", "autonomous")
+	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	championJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.80)
+	selectDecision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select final champion.", map[string]any{
+		"champion_job_id": championJob.ID,
+	})
+	if err != nil {
+		t.Fatalf("create select decision: %v", err)
+	}
+	if err := server.persistProjectChampionFromDecision(projectID, selectDecision); err != nil {
+		t.Fatalf("persist champion: %v", err)
+	}
+	followUpExperiment := testExperiment("efficientnet_b0", 10)
+	followUpExperiment.Mechanism = "architecture_challenge"
+	followUpExperiment.Intervention = "Stale post-champion architecture challenger."
+	followUpExperiment.EvidenceUsed = []string{"stale decision predates champion selection"}
+	followUpExperiment.ExpectedEffect = "Should be blocked before planning."
+	followUpPlan, err := server.store.CreateExperimentPlan(projectID, plan.DatasetID, "macro_f1", 1, 5, []plans.PlannedExperiment{followUpExperiment}, nil, "stale_decision")
+	if err != nil {
+		t.Fatalf("create stale follow-up plan: %v", err)
+	}
+	followUpJob, _ := createTerminalTrainingJob(t, server, followUpPlan, followUpExperiment, jobs.StatusSucceeded, 0.79)
+
+	handled, err := server.runExperimentPlannerAfterTrainingJob(followUpJob)
+	if err != nil {
+		t.Fatalf("run experiment planner: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected planner path to be handled by champion guard")
+	}
+	if llmCalls != 0 {
+		t.Fatalf("expected champion guard to skip LLM call, got %d calls", llmCalls)
+	}
+	if _, ok := experimentPlannerDecisionForPlan(listAgentDecisions(t, server, projectID), followUpPlan.ID); ok {
+		t.Fatal("expected no new planner decision after champion selection")
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasBackendStopGuardEvent(events, "champion_selected_guard") {
+		t.Fatalf("expected champion-selected guard event, got %#v", events)
 	}
 }
 
@@ -2416,6 +3091,15 @@ func hasBlockedFollowUpEvent(events []execution.ExecutionEvent) bool {
 	return false
 }
 
+func hasBackendStopGuardEvent(events []execution.ExecutionEvent, guard string) bool {
+	for _, event := range events {
+		if event.Payload["backend_stop_guard"] == guard {
+			return true
+		}
+	}
+	return false
+}
+
 func createTerminalTrainingJob(
 	t *testing.T,
 	server *Server,
@@ -2483,6 +3167,38 @@ func createExperimentPlannerInvocation(t *testing.T, server *Server, projectID s
 	return invocation
 }
 
+func createLLMAddExperimentsDecision(
+	t *testing.T,
+	server *Server,
+	projectID string,
+	planID string,
+	experiments []plans.PlannedExperiment,
+	evidence []string,
+) decisions.AgentDecision {
+	t.Helper()
+
+	mechanisms := make([]agents.PlannerProposalMechanism, 0, len(experiments))
+	for index, experiment := range experiments {
+		mechanisms = append(mechanisms, agents.PlannerProposalMechanism{
+			ExperimentIndex: index,
+			Mechanism:       experiment.Mechanism,
+			Intervention:    experiment.Intervention,
+			EvidenceUsed:    experiment.EvidenceUsed,
+			ExpectedEffect:  experiment.ExpectedEffect,
+		})
+	}
+	decision, err := server.store.CreateAgentDecision(projectID, planID, decisions.TypeAddExperiments, "LLM ADD_EXPERIMENTS test decision", map[string]any{
+		"decision_source":      llmExperimentPlannerDecisionSource,
+		"evidence_used":        evidence,
+		"proposed_experiments": experiments,
+		"proposal_mechanisms":  mechanisms,
+	})
+	if err != nil {
+		t.Fatalf("create LLM add experiments decision: %v", err)
+	}
+	return decision
+}
+
 type capturingPlannerGenerator struct {
 	response string
 }
@@ -2495,6 +3211,10 @@ func experimentPlannerAddExperimentsRecommendation() agents.ExperimentPlanningRe
 	followUp := plans.PlannedExperiment{
 		Template:              "efficientnet_transfer",
 		Model:                 "efficientnet_b1",
+		Mechanism:             "class_imbalance",
+		Intervention:          "Train EfficientNet-B1 with weighted loss, moderate augmentation, and cosine scheduling.",
+		EvidenceUsed:          []string{"class_imbalance_score=0.55", "baseline macro-F1 remains below target"},
+		ExpectedEffect:        "Improve macro-F1 by addressing minority-class errors while keeping a deployment-capable architecture.",
 		Epochs:                12,
 		BatchSize:             16,
 		LearningRate:          0.0002,
@@ -2526,12 +3246,19 @@ func experimentPlannerAddExperimentsRecommendation() agents.ExperimentPlanningRe
 		StopCondition:                 "Select the current champion if the follow-up does not improve macro-F1 enough to justify runtime.",
 		DeploymentTradeoff:            "EfficientNet-B1 is slower than MobileNet, so it must show a meaningful quality gain to justify live deployment.",
 		ProposedExperiments:           []plans.PlannedExperiment{followUp},
-		WhyCanBeatChampion:            "The proposed run changes architecture, image size, augmentation, scheduler, and regularization instead of only extending epochs.",
-		ExpectedDeltaVsChampion:       0.01,
-		Risks:                         []string{"higher runtime"},
-		ExpectedTradeoffs:             []string{"more quality for more cost"},
-		NoveltyNotes:                  []string{"larger model, image size, augmentation, scheduler, weight decay"},
-		RejectedOptions:               []agents.RejectedPlannerOption{{Option: "more epochs only", Reason: "does not address diagnosis", Evidence: "plateau/class imbalance", AppliesWhen: []string{"plateau", "class_imbalance"}}},
-		Tags:                          []string{"follow_up"},
+		ProposalMechanisms: []agents.PlannerProposalMechanism{{
+			ExperimentIndex: 0,
+			Mechanism:       followUp.Mechanism,
+			Intervention:    followUp.Intervention,
+			EvidenceUsed:    followUp.EvidenceUsed,
+			ExpectedEffect:  followUp.ExpectedEffect,
+		}},
+		WhyCanBeatChampion:      "The proposed run changes architecture, image size, augmentation, scheduler, and regularization instead of only extending epochs.",
+		ExpectedDeltaVsChampion: 0.01,
+		Risks:                   []string{"higher runtime"},
+		ExpectedTradeoffs:       []string{"more quality for more cost"},
+		NoveltyNotes:            []string{"larger model, image size, augmentation, scheduler, weight decay"},
+		RejectedOptions:         []agents.RejectedPlannerOption{{Option: "more epochs only", Reason: "does not address diagnosis", Evidence: "plateau/class imbalance", AppliesWhen: []string{"plateau", "class_imbalance"}}},
+		Tags:                    []string{"follow_up"},
 	}
 }

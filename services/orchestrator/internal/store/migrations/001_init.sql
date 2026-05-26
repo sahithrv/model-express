@@ -305,6 +305,11 @@ CREATE TABLE IF NOT EXISTS strategy_scorecards (
   followup_plan_id text NOT NULL DEFAULT '',
   strategy_type text NOT NULL DEFAULT '',
   planning_mode text NOT NULL DEFAULT '',
+  mechanism text NOT NULL DEFAULT '',
+  intervention text NOT NULL DEFAULT '',
+  diagnosis_triggers jsonb NOT NULL DEFAULT '[]'::jsonb,
+  evidence_used jsonb NOT NULL DEFAULT '[]'::jsonb,
+  expected_effect text NOT NULL DEFAULT '',
   dataset_traits jsonb NOT NULL DEFAULT '{}'::jsonb,
   objective_profile jsonb NOT NULL DEFAULT '{}'::jsonb,
   proposed_changes jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -319,6 +324,63 @@ CREATE TABLE IF NOT EXISTS strategy_scorecards (
   tags jsonb NOT NULL DEFAULT '[]'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE strategy_scorecards ADD COLUMN IF NOT EXISTS mechanism text NOT NULL DEFAULT '';
+ALTER TABLE strategy_scorecards ADD COLUMN IF NOT EXISTS intervention text NOT NULL DEFAULT '';
+ALTER TABLE strategy_scorecards ADD COLUMN IF NOT EXISTS diagnosis_triggers jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE strategy_scorecards ADD COLUMN IF NOT EXISTS evidence_used jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE strategy_scorecards ADD COLUMN IF NOT EXISTS expected_effect text NOT NULL DEFAULT '';
+
+UPDATE strategy_scorecards
+SET mechanism = COALESCE(
+  NULLIF(proposed_changes->>'mechanism', ''),
+  NULLIF(proposed_changes->>'mechanism_group', ''),
+  NULLIF(proposed_changes->'proposal_mechanisms'->0->>'mechanism', ''),
+  NULLIF(proposed_changes->'candidate_hypotheses'->0->>'mechanism', ''),
+  NULLIF(proposed_changes->'proposed_experiments'->0->>'mechanism', ''),
+  ''
+)
+WHERE mechanism = '';
+
+UPDATE strategy_scorecards
+SET intervention = COALESCE(
+  NULLIF(proposed_changes->>'intervention', ''),
+  NULLIF(proposed_changes->'proposal_mechanisms'->0->>'intervention', ''),
+  NULLIF(proposed_changes->'candidate_hypotheses'->0->>'intervention', ''),
+  NULLIF(proposed_changes->'proposed_experiments'->0->>'intervention', ''),
+  ''
+)
+WHERE intervention = '';
+
+UPDATE strategy_scorecards
+SET diagnosis_triggers = CASE
+  WHEN jsonb_typeof(proposed_changes->'diagnosis_triggers') = 'array' THEN proposed_changes->'diagnosis_triggers'
+  WHEN jsonb_typeof(proposed_changes->'proposal_mechanisms'->0->'diagnosis_triggers') = 'array' THEN proposed_changes->'proposal_mechanisms'->0->'diagnosis_triggers'
+  WHEN jsonb_typeof(proposed_changes->'candidate_hypotheses'->0->'diagnosis_triggers') = 'array' THEN proposed_changes->'candidate_hypotheses'->0->'diagnosis_triggers'
+  WHEN jsonb_typeof(proposed_changes->'proposed_experiments'->0->'diagnosis_triggers') = 'array' THEN proposed_changes->'proposed_experiments'->0->'diagnosis_triggers'
+  ELSE diagnosis_triggers
+END
+WHERE diagnosis_triggers = '[]'::jsonb;
+
+UPDATE strategy_scorecards
+SET evidence_used = CASE
+  WHEN jsonb_typeof(proposed_changes->'evidence_used') = 'array' THEN proposed_changes->'evidence_used'
+  WHEN jsonb_typeof(proposed_changes->'proposal_mechanisms'->0->'evidence_used') = 'array' THEN proposed_changes->'proposal_mechanisms'->0->'evidence_used'
+  WHEN jsonb_typeof(proposed_changes->'candidate_hypotheses'->0->'evidence_used') = 'array' THEN proposed_changes->'candidate_hypotheses'->0->'evidence_used'
+  WHEN jsonb_typeof(proposed_changes->'proposed_experiments'->0->'evidence_used') = 'array' THEN proposed_changes->'proposed_experiments'->0->'evidence_used'
+  ELSE evidence_used
+END
+WHERE evidence_used = '[]'::jsonb;
+
+UPDATE strategy_scorecards
+SET expected_effect = COALESCE(
+  NULLIF(proposed_changes->>'expected_effect', ''),
+  NULLIF(proposed_changes->'proposal_mechanisms'->0->>'expected_effect', ''),
+  NULLIF(proposed_changes->'candidate_hypotheses'->0->>'expected_effect', ''),
+  NULLIF(proposed_changes->'proposed_experiments'->0->>'expected_effect', ''),
+  ''
+)
+WHERE expected_effect = '';
 
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_id ON experiment_jobs(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_jobs(status, created_at);
@@ -360,3 +422,4 @@ CREATE INDEX IF NOT EXISTS idx_strategy_scorecards_project_id ON strategy_scorec
 CREATE INDEX IF NOT EXISTS idx_strategy_scorecards_dataset_id ON strategy_scorecards(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_strategy_scorecards_followup_plan_id ON strategy_scorecards(followup_plan_id);
 CREATE INDEX IF NOT EXISTS idx_strategy_scorecards_outcome ON strategy_scorecards(outcome);
+CREATE INDEX IF NOT EXISTS idx_strategy_scorecards_mechanism ON strategy_scorecards(mechanism) WHERE mechanism <> '';

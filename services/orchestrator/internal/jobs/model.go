@@ -15,6 +15,7 @@ const (
 const (
 	TemplateProfileDataset          = "profile_dataset"
 	TemplateTrainExperiment         = "train_experiment"
+	TemplateLabelQualityAudit       = "label_quality_audit"
 	TemplateExportChampion          = "export_champion"
 	TemplateChampionDemoPrediction  = "champion_demo_prediction"
 	TemplateGenerateVisualExemplars = "generate_visual_exemplars"

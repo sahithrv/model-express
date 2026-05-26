@@ -47,6 +47,14 @@ export type Job = {
 export type PlannedExperiment = {
   template: string;
   model: string;
+  mechanism?: string;
+  intervention?: string;
+  expected_effect?: string;
+  evidence_used?: string[];
+  validation_status?: string;
+  validation_error?: string;
+  backend_validation_status?: string;
+  backend_validation_error?: string;
   epochs: number;
   batch_size: number;
   learning_rate: number;
@@ -65,7 +73,16 @@ export type PlannedExperiment = {
   weight_decay?: number;
   augmentation?: Record<string, unknown>;
   augmentation_policy?: string;
+  augmentation_policy_config?: {
+    policy_type?: string;
+    magnitude?: number;
+    num_ops?: number;
+    num_magnitude_bins?: number;
+    probability?: number;
+    alpha?: number;
+  };
   class_balancing?: string;
+  class_balancing_config?: Record<string, unknown>;
   sampling_strategy?: string;
   early_stopping_patience?: number;
   strategy?: string;
@@ -223,6 +240,13 @@ export type StrategyScorecard = {
   source_decision_id: string;
   source_plan_id: string;
   followup_plan_id: string;
+  mechanism?: string;
+  intervention?: string;
+  expected_effect?: string;
+  evidence_used?: string[];
+  diagnosis_triggers?: string[];
+  validation_status?: string;
+  validation_error?: string;
   strategy_type: string;
   planning_mode: string;
   dataset_traits: Record<string, unknown>;

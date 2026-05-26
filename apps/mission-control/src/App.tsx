@@ -117,9 +117,19 @@ type ChampionComparisonRow = {
 type CandidateScoreRow = {
   label: string;
   status: string;
+  mechanism: string;
+  intervention: string;
+  expectedEffect: string;
+  validationStatus: string;
   totalScore: number | null;
   reasons: string[];
   components: Array<{ label: string; value: number | string }>;
+};
+
+type MechanismCoverageRow = {
+  mechanism: string;
+  status: string;
+  detail: string;
 };
 
 type ChampionExportDemo = {
@@ -260,6 +270,10 @@ export function App() {
     () => (latestDecision ? decisionRejections(latestDecision) : []),
     [latestDecision],
   );
+  const mechanismCoverage = useMemo(
+    () => (latestDecision ? mechanismCoverageRows(latestDecision.payload) : []),
+    [latestDecision],
+  );
   const championComparison = useMemo(
     () => buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.jobs, detail.champion),
     [detail.champion, detail.jobs, detail.runEvaluations, detail.runSummaries],
@@ -269,6 +283,7 @@ export function App() {
     [latestDecision],
   );
   const championExportDemo = useMemo(() => buildChampionExportDemo(detail), [detail]);
+  const reviewState = automationReviewState(automationSettings);
 
   const firstDatasetId = detail.datasets[0]?.id ?? "";
   const jobPageCount = Math.max(1, Math.ceil(detail.jobs.length / jobsPerPage));
@@ -1137,6 +1152,13 @@ export function App() {
                   />
                 </label>
               </div>
+              <div className={`review-state ${reviewState.tone}`}>
+                <Badge value={reviewState.badge} />
+                <span>
+                  <strong>{reviewState.title}</strong>
+                  <small>{reviewState.detail}</small>
+                </span>
+              </div>
               <div className="settings-actions">
                 <small>
                   Updated {automationSettings.updated_at ? new Date(automationSettings.updated_at).toLocaleString() : "from defaults"}
@@ -1368,6 +1390,22 @@ export function App() {
                       ))}
                     </div>
                   )}
+                  {mechanismCoverage.length > 0 && (
+                    <div className="mechanism-coverage-panel">
+                      <strong>Mechanism Coverage</strong>
+                      <div className="mechanism-coverage-list">
+                        {mechanismCoverage.map((item) => (
+                          <div className="mechanism-coverage-row" key={`${item.status}-${item.mechanism}-${item.detail}`}>
+                            <span>
+                              <strong>{item.mechanism}</strong>
+                              <small>{item.detail}</small>
+                            </span>
+                            <Badge value={item.status} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   {rejectionItems.length > 0 && (
                     <div className="rejection-panel">
                       <strong>Backend Gate And Rejections</strong>
@@ -1390,11 +1428,37 @@ export function App() {
                             <div className="candidate-score-head">
                               <span>
                                 <strong>{candidate.label}</strong>
-                                <small>{candidate.reasons.slice(0, 2).join("; ") || "No rejection reason reported."}</small>
+                                <small>
+                                  {[
+                                    candidate.mechanism ? `mechanism ${candidate.mechanism}` : "",
+                                    candidate.intervention,
+                                    ...candidate.reasons.slice(0, 2),
+                                  ]
+                                    .filter(Boolean)
+                                    .join("; ") || "No rejection reason reported."}
+                                </small>
                               </span>
                               <Badge value={candidate.status} />
                             </div>
                             <div className="score-component-list">
+                              {candidate.mechanism && (
+                                <span>
+                                  <small>Mechanism</small>
+                                  <strong>{candidate.mechanism}</strong>
+                                </span>
+                              )}
+                              {candidate.expectedEffect && (
+                                <span>
+                                  <small>Expected Effect</small>
+                                  <strong>{candidate.expectedEffect}</strong>
+                                </span>
+                              )}
+                              {candidate.validationStatus && (
+                                <span>
+                                  <small>Validation</small>
+                                  <strong>{candidate.validationStatus}</strong>
+                                </span>
+                              )}
                               {candidate.totalScore !== null && (
                                 <span>
                                   <small>Total</small>
@@ -1423,7 +1487,7 @@ export function App() {
                   {detail.decisions.slice(1, 5).map((decision) => (
                     <div key={decision.id}>
                       <Badge value={decision.decision_type} />
-                      <span>{decision.rationale}</span>
+                      <span>{decisionHistorySummary(decision)}</span>
                     </div>
                   ))}
                 </div>
@@ -1435,8 +1499,13 @@ export function App() {
                     <div key={scorecard.id}>
                       <Badge value={scorecard.outcome} />
                       <span>
-                        {scorecard.planning_mode || scorecard.strategy_type || "strategy"} - expected{" "}
-                        {scorecard.expected_delta.toFixed(3)}, actual {scorecard.actual_delta.toFixed(3)}
+                        {[
+                          scorecard.mechanism || scorecard.planning_mode || scorecard.strategy_type || "strategy",
+                          scorecard.intervention,
+                          `expected ${scorecard.expected_delta.toFixed(3)}, actual ${scorecard.actual_delta.toFixed(3)}`,
+                        ]
+                          .filter(Boolean)
+                          .join(" - ")}
                       </span>
                     </div>
                   ))}
@@ -1546,21 +1615,34 @@ export function App() {
                     <strong>{latestPlan.estimated_minutes}m</strong>
                   </div>
                 </div>
+                {!automationSettings.auto_execute_plans && (
+                  <div className="review-state plan-review-state review">
+                    <Badge value="REVIEW" />
+                    <span>
+                      <strong>Auto execution disabled</strong>
+                      <small>Proposed experiments stay visible here for review until a manual execute action or backend setting runs them.</small>
+                    </span>
+                  </div>
+                )}
                 <div className="experiment-list">
-                  {latestPlan.experiments.map((experiment) => (
-                    <div className="experiment-item" key={`${latestPlan.id}-${experiment.template}-${experiment.model}`}>
+                  {latestPlan.experiments.map((experiment, index) => (
+                    <div className="experiment-item" key={`${latestPlan.id}-${index}-${experiment.template}-${experiment.model}`}>
                       <span>
-                        <strong>{experiment.model}</strong>
-                        <small>{experiment.template}</small>
+                        <strong>{experiment.model || experiment.mechanism || experiment.template}</strong>
+                        <small>{[experiment.template, experiment.mechanism].filter(Boolean).join(" - ")}</small>
                       </span>
-                      <span>
-                        <small>{experiment.epochs} epochs</small>
-                        <small>batch {experiment.batch_size}</small>
-                      </span>
-                      <span>
-                        <small>lr</small>
-                        <strong>{experiment.learning_rate}</strong>
-                      </span>
+                      {experiment.template !== "label_quality_audit" && (
+                        <>
+                          <span>
+                            <small>{experiment.epochs} epochs</small>
+                            <small>batch {experiment.batch_size}</small>
+                          </span>
+                          <span>
+                            <small>lr</small>
+                            <strong>{experiment.learning_rate}</strong>
+                          </span>
+                        </>
+                      )}
                       {(experiment.image_size || experiment.optimizer || experiment.scheduler || experiment.class_balancing) && (
                         <span>
                           {experiment.image_size ? <small>{experiment.image_size}px</small> : null}
@@ -1570,6 +1652,16 @@ export function App() {
                         </span>
                       )}
                       <p>{experiment.reason}</p>
+                      {experimentMechanismItems(experiment).length > 0 && (
+                        <div className="experiment-mechanism">
+                          {experimentMechanismItems(experiment).map((item) => (
+                            <span key={`${latestPlan.id}-${index}-${item.label}`}>
+                              <small>{item.label}</small>
+                              <strong>{item.value}</strong>
+                            </span>
+                          ))}
+                        </div>
+                      )}
                       {experimentPreprocessingItems(experiment).length > 0 && (
                         <div className="experiment-preprocessing">
                           {experimentPreprocessingItems(experiment).map((item) => (
@@ -1705,7 +1797,7 @@ export function App() {
                 >
                   <span>
                     <strong>{job.template}</strong>
-                    <small>{job.id}</small>
+                    <small>{[job.id, jobMechanismSummary(job)].filter(Boolean).join(" - ")}</small>
                   </span>
                   <span>
                     <small>{job.worker_id || "unassigned"}</small>
@@ -1723,7 +1815,7 @@ export function App() {
                 <div className="selected-job">
                   <span>
                     <strong>{selectedJob.template}</strong>
-                    <small>{selectedJob.id}</small>
+                    <small>{[selectedJob.id, jobMechanismSummary(selectedJob)].filter(Boolean).join(" - ")}</small>
                   </span>
                   <Badge value={selectedJob.status} />
                 </div>
@@ -2153,7 +2245,7 @@ function MetricCard({ icon, label, value }: { icon: ReactNode; label: string; va
 }
 
 function Badge({ value }: { value: string }) {
-  return <span className={`badge ${value.toLowerCase()}`}>{value}</span>;
+  return <span className={`badge ${value.toLowerCase().replace(/[^a-z0-9_-]+/g, "_")}`}>{value}</span>;
 }
 
 function MetricChart({ metrics, metricKey, label }: { metrics: EpochMetric[]; metricKey: MetricKey; label: string }) {
@@ -2363,7 +2455,7 @@ function buildExperimentTimeline(project: Project | null, detail: ProjectDetail)
     },
     {
       label: "Planner proposed",
-      detail: latestDecision ? latestDecision.rationale : "Experiment planner has not recorded a project-level decision.",
+      detail: latestDecision ? decisionHistorySummary(latestDecision) : "Experiment planner has not recorded a project-level decision.",
       status: latestDecision ? "done" : completedJobs > 0 ? "active" : "waiting",
       timestamp: latestDecision?.created_at,
     },
@@ -2492,8 +2584,14 @@ function decisionReasoningSections(decision: AgentDecision): ReasoningSection[] 
     recordString(payload, "why_can_beat_champion"),
     recordString(payload, "success_criteria"),
   ]);
+  addSection("Mechanism", mechanismDecisionSummaries(payload));
   addSection("Proposed Experiments", proposedExperimentSummaries(payload.proposed_experiments));
   addSection("Rejected Options", rejectedOptionSummaries(payload.rejected_options));
+  addSection("Validation", [
+    recordFirstString(payload, ["backend_validation_status", "validation_status", "planner_validation_status"]),
+    recordFirstString(payload, ["backend_validation_error", "validation_error", "planner_validation_error"]),
+    recordString(payload, "backend_stop_guard"),
+  ]);
   addSection("Tradeoffs", [
     recordString(payload, "deployment_tradeoff"),
     ...stringArrayPayload(payload.expected_tradeoffs),
@@ -2532,6 +2630,28 @@ function decisionRejections(decision: AgentDecision) {
   const validationError = recordString(payload, "validation_error");
   if (validationError) {
     items.push({ kind: classifyRejectionReason(validationError), text: validationError });
+  }
+
+  const backendValidationStatus = recordFirstString(payload, [
+    "backend_validation_status",
+    "validation_status",
+    "planner_validation_status",
+  ]);
+  if (backendValidationStatus && !["accepted", "approved", "valid"].includes(backendValidationStatus.toLowerCase())) {
+    const backendValidationError = recordFirstString(payload, [
+      "backend_validation_error",
+      "validation_error",
+      "planner_validation_error",
+    ]);
+    items.push({
+      kind: classifyRejectionReason(backendValidationError || backendValidationStatus),
+      text: backendValidationError ? `${backendValidationStatus}: ${backendValidationError}` : backendValidationStatus,
+    });
+  }
+
+  const backendStopGuard = recordString(payload, "backend_stop_guard");
+  if (backendStopGuard) {
+    items.push({ kind: "Stop guard", text: backendStopGuard });
   }
 
   return items.slice(0, 8);
@@ -2693,6 +2813,10 @@ function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[] {
           recordString(record, "model") ||
           `Candidate ${index + 1}`,
         status: record.selected === true ? "SELECTED" : record.rejected === true ? "REJECTED" : "CANDIDATE",
+        mechanism: recordFirstString(record, ["mechanism", "selected_mechanism", "proposal_mechanism"]),
+        intervention: recordString(record, "intervention"),
+        expectedEffect: recordFirstString(record, ["expected_effect", "expected_metric_effect"]),
+        validationStatus: recordFirstString(record, ["backend_validation_status", "validation_status"]),
         totalScore: numberPayload(record.score) ?? numberPayload(record.total_score),
         reasons: stringArrayPayload(record.reasons),
         components: Object.entries(components)
@@ -2701,7 +2825,13 @@ function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[] {
           .slice(0, 6),
       };
     })
-    .filter((row) => row.totalScore !== null || row.components.length > 0 || row.reasons.length > 0)
+    .filter(
+      (row) =>
+        row.totalScore !== null ||
+        row.components.length > 0 ||
+        row.reasons.length > 0 ||
+        Boolean(row.mechanism || row.intervention || row.expectedEffect || row.validationStatus),
+    )
     .slice(0, 6);
 }
 
@@ -2808,12 +2938,65 @@ function experimentPreprocessingItems(experiment: PlannedExperiment) {
     { label: "bbox", value: preprocessing.bbox_mode },
     { label: "dataset norm", value: preprocessing.use_dataset_normalization ? "enabled" : "" },
     { label: "augmentation", value: experiment.augmentation_policy },
+    { label: "aug policy", value: augmentationPolicyConfigSummary(experiment.augmentation_policy_config) },
     { label: "sampling", value: experiment.sampling_strategy },
     { label: "balancing", value: experiment.class_balancing },
+    { label: "balance config", value: classBalancingConfigSummary(experiment.class_balancing_config) },
   ].filter((item): item is { label: string; value: string } => typeof item.value === "string" && item.value.length > 0);
 }
 
+function classBalancingConfigSummary(config: PlannedExperiment["class_balancing_config"]) {
+  const record = recordObject(config);
+  const beta = recordNumber(record, "effective_number_beta");
+  return typeof beta === "number" ? `beta ${formatMetricNumber(beta)}` : "";
+}
+
+function augmentationPolicyConfigSummary(config: PlannedExperiment["augmentation_policy_config"]) {
+  if (!config?.policy_type) return "";
+  const details = [
+    config.magnitude ? `mag ${config.magnitude}` : "",
+    config.num_ops ? `${config.num_ops} ops` : "",
+    config.num_magnitude_bins ? `${config.num_magnitude_bins} bins` : "",
+    typeof config.probability === "number" ? `p ${formatMetricNumber(config.probability)}` : "",
+    config.alpha ? `alpha ${formatMetricNumber(config.alpha)}` : "",
+  ].filter(Boolean);
+  return [config.policy_type, ...details].join(" / ");
+}
+
+function experimentMechanismItems(experiment: PlannedExperiment) {
+  const evidence = stringArrayPayload(experiment.evidence_used).slice(0, 2).join("; ");
+  return [
+    { label: "mechanism", value: experiment.mechanism },
+    { label: "intervention", value: experiment.intervention },
+    { label: "expected effect", value: experiment.expected_effect },
+    { label: "evidence", value: evidence },
+    { label: "validation", value: experiment.backend_validation_status || experiment.validation_status },
+    { label: "validation error", value: experiment.backend_validation_error || experiment.validation_error },
+  ].filter((item): item is { label: string; value: string } => typeof item.value === "string" && item.value.length > 0);
+}
+
+function jobMechanismSummary(job: Job) {
+  const mechanism = recordString(job.config, "mechanism");
+  const intervention = recordString(job.config, "intervention");
+  const validation = recordFirstString(job.config, ["backend_validation_status", "validation_status"]);
+  return [mechanism ? `mechanism ${mechanism}` : "", intervention, validation ? `validation ${validation}` : ""]
+    .filter(Boolean)
+    .join(" / ");
+}
+
 function backendGateSummary(decision: AgentDecision) {
+  const validationStatus = recordFirstString(decision.payload ?? {}, [
+    "backend_validation_status",
+    "validation_status",
+    "planner_validation_status",
+  ]);
+  const stopGuard = recordString(decision.payload ?? {}, "backend_stop_guard");
+  if (stopGuard) {
+    return `Backend stop guard: ${stopGuard}.`;
+  }
+  if (validationStatus) {
+    return `Backend validation status: ${validationStatus}.`;
+  }
   const rejections = decisionRejections(decision);
   if (rejections.length > 0) {
     return `${rejections.length} rejected candidate/options visible; stored decision is ${decision.decision_type}.`;
@@ -2822,6 +3005,16 @@ function backendGateSummary(decision: AgentDecision) {
     return "Accepted for follow-up scheduling when automation settings allow it.";
   }
   return `Accepted project decision: ${decision.decision_type}.`;
+}
+
+function decisionHistorySummary(decision: AgentDecision) {
+  const payload = decision.payload ?? {};
+  const mechanism = recordFirstString(payload, ["mechanism", "selected_mechanism", "proposal_mechanism"]);
+  const intervention = recordString(payload, "intervention");
+  const validation = recordFirstString(payload, ["backend_validation_status", "validation_status"]);
+  return [mechanism ? `mechanism ${mechanism}` : "", intervention, validation ? `validation ${validation}` : "", decision.rationale]
+    .filter(Boolean)
+    .join(" - ");
 }
 
 function decisionHighlights(decision: AgentDecision) {
@@ -2834,6 +3027,30 @@ function decisionHighlights(decision: AgentDecision) {
 
   if (typeof payload.planning_mode === "string" && payload.planning_mode) {
     items.push({ label: "Mode", value: payload.planning_mode });
+  }
+
+  const mechanism = recordFirstString(payload, ["mechanism", "selected_mechanism", "proposal_mechanism"]);
+  if (mechanism) {
+    items.push({ label: "Mechanism", value: mechanism });
+  }
+
+  const intervention = recordString(payload, "intervention");
+  if (intervention) {
+    items.push({ label: "Intervention", value: intervention });
+  }
+
+  const expectedEffect = recordFirstString(payload, ["expected_effect", "expected_metric_effect"]);
+  if (expectedEffect) {
+    items.push({ label: "Expected Effect", value: expectedEffect });
+  }
+
+  const validationStatus = recordFirstString(payload, [
+    "backend_validation_status",
+    "validation_status",
+    "planner_validation_status",
+  ]);
+  if (validationStatus) {
+    items.push({ label: "Validation", value: validationStatus });
   }
 
   const championScore = numberPayload(payload.champion_score);
@@ -2894,6 +3111,124 @@ function decisionHighlights(decision: AgentDecision) {
   return items;
 }
 
+function mechanismDecisionSummaries(payload: Record<string, unknown>) {
+  const direct = mechanismSummaryFromRecord(payload);
+  const selectedCandidate = (Array.isArray(payload.candidate_rankings) ? payload.candidate_rankings : [])
+    .map(recordObject)
+    .find((record) => record.selected === true);
+  const proposed = Array.isArray(payload.proposed_experiments) ? payload.proposed_experiments.map(recordObject) : [];
+  const proposalMechanisms = Array.isArray(payload.proposal_mechanisms) ? payload.proposal_mechanisms.map(recordObject) : [];
+  return uniqueStrings([
+    direct,
+    selectedCandidate ? mechanismSummaryFromRecord(selectedCandidate) : "",
+    ...proposalMechanisms.map(mechanismSummaryFromRecord),
+    ...proposed.map(mechanismSummaryFromRecord),
+  ]);
+}
+
+function mechanismSummaryFromRecord(record: Record<string, unknown>) {
+  const mechanism = recordFirstString(record, ["mechanism", "selected_mechanism", "proposal_mechanism"]);
+  const intervention = recordString(record, "intervention");
+  const expectedEffect = recordFirstString(record, ["expected_effect", "expected_metric_effect"]);
+  const evidence = stringArrayPayload(record.evidence_used).slice(0, 2).join("; ");
+  const validation = recordFirstString(record, ["backend_validation_status", "validation_status"]);
+  return [
+    mechanism ? `mechanism ${mechanism}` : "",
+    intervention ? `intervention ${intervention}` : "",
+    expectedEffect ? `expected ${expectedEffect}` : "",
+    evidence ? `evidence ${evidence}` : "",
+    validation ? `validation ${validation}` : "",
+  ]
+    .filter(Boolean)
+    .join(" - ");
+}
+
+function mechanismCoverageRows(payload: Record<string, unknown>): MechanismCoverageRow[] {
+  const coverage = recordObject(payload.mechanism_coverage ?? payload.mechanism_coverage_card);
+  const rows: MechanismCoverageRow[] = [];
+  addCoverageRows(rows, "TRIED", coverage.tried ?? coverage.tried_mechanisms ?? coverage.attempted ?? coverage.attempted_mechanisms);
+  addCoverageRows(rows, "ELIGIBLE", coverage.eligible ?? coverage.eligible_mechanisms);
+  addCoverageRows(rows, "BLOCKED", coverage.blocked ?? coverage.blocked_mechanisms);
+  addCoverageRows(rows, "NO_IMPROVEMENT", coverage.no_improvement ?? coverage.no_improvement_mechanisms);
+  addCoverageRows(rows, "BEST_RESULT", coverage.best_result ?? coverage.best_results ?? coverage.best_result_by_mechanism);
+  return uniqueBy(rows, (row) => `${row.status}-${row.mechanism}-${row.detail}`).slice(0, 10);
+}
+
+function addCoverageRows(rows: MechanismCoverageRow[], status: string, value: unknown) {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === "string") {
+        rows.push({ mechanism: item, status, detail: status.toLowerCase() });
+        continue;
+      }
+      const record = recordObject(item);
+      const mechanism = recordFirstString(record, ["mechanism", "name", "key", "id"]);
+      if (!mechanism) continue;
+      rows.push({ mechanism, status: recordString(record, "status") || status, detail: coverageDetail(record, status) });
+    }
+    return;
+  }
+
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const [mechanism, detailValue] of Object.entries(value as Record<string, unknown>)) {
+      const detailRecord = recordObject(detailValue);
+      const detail =
+        Object.keys(detailRecord).length > 0
+          ? coverageDetail(detailRecord, status)
+          : typeof detailValue === "string"
+            ? detailValue
+            : typeof detailValue === "number"
+              ? String(detailValue)
+              : status.toLowerCase();
+      rows.push({ mechanism, status, detail });
+    }
+  }
+}
+
+function coverageDetail(record: Record<string, unknown>, fallback: string) {
+  const detail = recordFirstString(record, ["detail", "reason", "outcome", "lesson", "summary"]);
+  const score = numberPayload(record.best_score ?? record.score ?? record.metric);
+  const validation = recordFirstString(record, ["backend_validation_status", "validation_status"]);
+  return [
+    detail,
+    score !== null ? `score ${score.toFixed(3)}` : "",
+    validation ? `validation ${validation}` : "",
+  ]
+    .filter(Boolean)
+    .join("; ") || fallback.toLowerCase();
+}
+
+function automationReviewState(settings: AutomationSettings) {
+  if (!settings.auto_execute_plans) {
+    return {
+      badge: "REVIEW",
+      title: "Dry-run review mode",
+      detail: [
+        settings.auto_review_experiments ? "auto review on" : "manual review",
+        settings.auto_schedule_followups ? "follow-up plans may be created" : "manual follow-up scheduling",
+        "auto execution off",
+      ].join(" - "),
+      tone: "review",
+    };
+  }
+
+  if (settings.agent_mode !== "autonomous") {
+    return {
+      badge: "PROPOSE",
+      title: "Proposal mode",
+      detail: "Agents can propose decisions, but autonomous scheduling remains governed by the visible toggles.",
+      tone: "wait",
+    };
+  }
+
+  return {
+    badge: "AUTO",
+    title: "Autonomous execution visible",
+    detail: "Auto execution is enabled; review backend gates and worker events before spending on new plans.",
+    tone: "auto",
+  };
+}
+
 function numberPayload(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -2901,6 +3236,14 @@ function numberPayload(value: unknown) {
 function recordString(record: Record<string, unknown>, key: string) {
   const value = record[key];
   return typeof value === "string" ? value : "";
+}
+
+function recordFirstString(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = recordString(record, key);
+    if (value) return value;
+  }
+  return "";
 }
 
 function recordNumber(record: Record<string, unknown>, key: string) {
@@ -3028,9 +3371,25 @@ function proposedExperimentSummaries(value: unknown) {
     const record = recordObject(item);
     const model = recordString(record, "model") || "experiment";
     const strategy = recordString(record, "strategy");
+    const mechanism = recordFirstString(record, ["mechanism", "selected_mechanism", "proposal_mechanism"]);
+    const intervention = recordString(record, "intervention");
+    const expectedEffect = recordFirstString(record, ["expected_effect", "expected_metric_effect"]);
+    const validationStatus = recordFirstString(record, ["backend_validation_status", "validation_status"]);
     const reason = recordString(record, "reason");
     const imageSize = recordNumber(record, "image_size");
-    const details = [strategy, imageSize ? `${imageSize}px` : "", reason].filter(Boolean).join(" - ");
+    const evidence = stringArrayPayload(record.evidence_used).slice(0, 2).join("; ");
+    const details = [
+      mechanism,
+      intervention,
+      expectedEffect,
+      strategy,
+      imageSize ? `${imageSize}px` : "",
+      validationStatus ? `validation ${validationStatus}` : "",
+      evidence ? `evidence ${evidence}` : "",
+      reason,
+    ]
+      .filter(Boolean)
+      .join(" - ");
     return details ? `${model}: ${details}` : model;
   });
 }
@@ -3040,13 +3399,17 @@ function rejectedOptionSummaries(value: unknown) {
   return value.map((item) => {
     const record = recordObject(item);
     const option = recordString(record, "option") || "Rejected option";
+    const mechanism = recordString(record, "mechanism");
     const reason = recordString(record, "reason") || recordString(record, "evidence");
-    return reason ? `${option}: ${reason}` : option;
+    const prefix = mechanism ? `${option} (${mechanism})` : option;
+    return reason ? `${prefix}: ${reason}` : prefix;
   });
 }
 
 function classifyRejectionReason(text: string) {
   const normalized = text.toLowerCase();
+  if (normalized.includes("stop_guard") || normalized.includes("champion_selected_guard")) return "Stop guard";
+  if (normalized.includes("validation")) return "Validation";
   if (normalized.includes("duplicate")) return "Duplicate signature";
   if (normalized.includes("unsupported") || normalized.includes("must be")) return "Unsupported option";
   if (normalized.includes("tiny") || normalized.includes("only epochs") || normalized.includes("learning rate")) {

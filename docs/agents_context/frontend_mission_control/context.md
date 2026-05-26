@@ -59,7 +59,7 @@ Job metrics are fetched separately for the selected job.
 Important payload conventions:
 
 - Dataset intelligence is defensive over `datasets.profile`; profile JSON is still the current source of truth even though richer Go structs exist.
-- Agent reasoning is mostly read from `AgentDecision.payload`, including `summary`, `evidence_used`, `deterministic_diagnosis_used`, `hypothesis`, `proposed_experiments`, `rejected_options`, `candidate_rankings`, `expected_tradeoffs`, `risks`, and validation signals.
+- Agent reasoning is mostly read from `AgentDecision.payload`, including `summary`, `evidence_used`, `deterministic_diagnosis_used`, `hypothesis`, `proposed_experiments`, `proposal_mechanisms`, `rejected_options`, `candidate_rankings`, `expected_tradeoffs`, `risks`, and validation signals.
 - Champion/deployment fields may appear in `ProjectChampion.metrics`, `ProjectChampion.evaluation`, `ProjectChampion.deployment_profile`, `TrainingRunEvaluation.model_profile`, and `TrainingRunEvaluation.holistic_scores`.
 
 ## Key Files To Inspect
@@ -93,6 +93,7 @@ Important payload conventions:
 - `GET /projects/:id/champion`
 - `POST /projects/:id/review-experiments`
 - `POST /projects/:id/schedule-follow-up-experiments`
+- `POST /projects/:id/experimentation/reopen`
 - `GET /projects/:id/agent-decisions`
 - `GET /projects/:id/agent-memory?limit=...`
 - `GET /projects/:id/agent-invocations?limit=...`
@@ -120,6 +121,8 @@ From `docs/frontend_mission_control_report.md` and `docs/model_express_agentic_u
 - Added selected-run evaluation details for backend diagnostics, per-class precision/recall/F1, and confusion matrix preview.
 - Added sticky section navigation/tabs for Overview, Data, Agents, Runs, Operations, and Export/Demo.
 - Added typed display for preprocessing fields on planned experiments and candidate score-component visibility from planner rankings.
+- Backend now stores accepted mechanism metadata on planned experiments and emits `backend_stop_guard: champion_selected_guard` when stale/post-champion follow-ups are blocked; Mission Control displays these defensively when present.
+- Mission Control now surfaces mechanism/intervention/expected-effect/evidence metadata, mechanism coverage rows, backend validation/rejection cues, dry-run/review/autonomous state, structured `augmentation_policy_config`, `class_balancing_config`, and audit-only `label_quality_audit` plan display when backend payloads expose them.
 - Added Champion Export / Demo panel wired defensively to champion export records, backend demo images, and backend demo prediction requests.
 - Added selected demo image next/random controls plus prediction-history rendering for durable `champion_demo_predictions`.
 - Runtime-unavailable prediction rows are shown as audit/status records, not as successful live inference.

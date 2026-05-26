@@ -63,6 +63,7 @@ Always check these contracts before accepting changes from multiple agents:
   - worker support before planner relies on fields
 - LLM planner output:
   - JSON shape
+  - first-class mechanism fields and `proposal_mechanisms` sidecar
   - validation rules
   - planning modes
   - candidate hypotheses/rankings
@@ -107,9 +108,14 @@ For future multi-agent work:
 
 ## Known Current Mismatches
 
-- `augmentation_policy` is currently a safe string subset: `none|light|moderate|strong|custom`. The larger object-shaped RandAugment/AutoAugment/MixUp/CutMix design is future work.
+- Experiment follow-ups have a first-class mechanism contract for LLM-originated proposals. Backend validation accepts only the curated taxonomy and copies accepted sidecar metadata to stored experiments for UI/API display.
+- Persisted champion selection is terminal for autonomous follow-up creation/execution. Continuing after a champion requires explicit `POST /projects/:id/experimentation/reopen`, which records `REOPEN_EXPERIMENTATION` and `EXPERIMENTATION_REOPENED`.
+- Current roadmap status is tracked directly in `docs/model_express_agentic_upgrade_roadmap.md`. Non-PR9 agentic-upgrade slices are implemented; model routing, prompt caching, and vector/cross-project retrieval remain intentionally deferred.
+- Structured augmentation uses a shared additive contract: backend `augmentation_policy_config` validation, worker parser/transform support for `basic`, `randaugment`, `trivialaugment`/`TrivialAugmentWide`, `autoaugment`, `mixup`, and `cutmix`, and UI display.
+- Label-quality audit mechanisms are report-only. They must use the `label_quality_audit` job template and profile audit metadata; they must not mutate labels or create training jobs.
+- Effective-number class balancing is supported through `class_balancing: "effective_number_loss"` and bounded `class_balancing_config.effective_number_beta`.
 - `dataset_profiles` exists in SQL, but `datasets.profile` JSON remains the active profile source of truth.
-- Bbox/crop support has helper-level annotation parsing but no training ablation wiring yet.
+- Bbox/crop support includes helper-level annotation parsing and worker bbox crop/full-image ablation wiring for supported annotation formats.
 - `normalization: "dataset"` is validated and worker-computed in bounded form when requested.
 - Mission Control can display many reasoning fields but still lacks a normalized validation-failure/rejection feed.
 - Champion export/demo and visual class exemplars now have backend contracts, frontend display/actions, worker export/inference/exemplar jobs, backend result callbacks, profile exemplar persistence, and planner evidence-only context. Production artifact upload, durable exemplar history, and durable invocation audit remain future hardening.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 
 	"model-express/services/orchestrator/internal/decisions"
@@ -18,6 +20,12 @@ const (
 	TrainingMonitorAgentName     = "training_monitor"
 	TrainingMonitorAgentVersion  = "v1"
 	TrainingMonitorPromptVersion = "training_monitor_v1"
+
+	trainingMonitorContextVersion    = "training_monitor_run_evaluation_cards_v1"
+	trainingMonitorMaxRecentEpochs   = 5
+	trainingMonitorMaxWorstClasses   = 5
+	trainingMonitorMaxConfusionPairs = 5
+	trainingMonitorMaxMemoryRecords  = 8
 )
 
 type TrainingMonitorAgent struct {
@@ -217,24 +225,686 @@ func allowedAgentAction(actionType string) bool {
 }
 
 func trainingMonitorPromptContext(input TrainingMonitorInput) map[string]any {
-	return map[string]any{
-		"plan": map[string]any{
-			"id":            input.Plan.ID,
-			"target_metric": input.Plan.TargetMetric,
-			"experiments":   input.Plan.Experiments,
-		},
-		"job": map[string]any{
-			"id":       input.Job.ID,
-			"template": input.Job.Template,
-			"config":   input.Job.Config,
-			"status":   input.Job.Status,
-		},
-		"summary":           input.Summary,
-		"run_evaluation":    input.Evaluation,
-		"objective_context": input.ObjectiveContext,
-		"epoch_metrics":     compactEpochMetrics(input.Metrics),
-		"prior_memory":      compactMemoryRecords(input.MemoryRecords),
+	context := map[string]any{
+		"context_version":                       trainingMonitorContextVersion,
+		"run_summary_card":                      trainingMonitorRunSummaryCard(input),
+		"training_dynamics_card":                trainingMonitorDynamicsCard(input),
+		"per_class_confusion_card":              trainingMonitorPerClassConfusionCard(input),
+		"deployment_model_profile_card":         trainingMonitorDeploymentCard(input),
+		"objective_fit_card":                    trainingMonitorObjectiveFitCard(input),
+		"memory_summary":                        compactMemoryRecords(input.MemoryRecords),
+		"backend_full_data_preservation_notice": "Full run summary, evaluation, epoch metrics, plan, and job config remain in backend storage; this prompt contains compact decision cards only.",
 	}
+	attachTrainingMonitorPromptBudget(context)
+	return context
+}
+
+func trainingMonitorRunSummaryCard(input TrainingMonitorInput) map[string]any {
+	targetMetric := trainingMonitorTargetMetric(input)
+	card := map[string]any{
+		"job_id":                input.Summary.JobID,
+		"project_id":            input.Summary.ProjectID,
+		"plan_id":               input.Summary.PlanID,
+		"dataset_id":            input.Summary.DatasetID,
+		"status":                input.Summary.Status,
+		"model":                 input.Summary.Model,
+		"provider":              input.Summary.Provider,
+		"gpu_type":              input.Summary.GPUType,
+		"target_metric":         targetMetric,
+		"target_score":          trainingMonitorSummaryScore(input.Summary, targetMetric),
+		"best_macro_f1":         input.Summary.BestMacroF1,
+		"best_accuracy":         input.Summary.BestAccuracy,
+		"final_train_loss":      input.Summary.FinalTrainLoss,
+		"final_val_loss":        input.Summary.FinalValLoss,
+		"final_loss_gap":        roundMonitorFloat(input.Summary.FinalValLoss - input.Summary.FinalTrainLoss),
+		"epochs_completed":      input.Summary.EpochsCompleted,
+		"runtime_seconds":       input.Summary.RuntimeSeconds,
+		"estimated_cost_usd":    input.Summary.EstimatedCostUSD,
+		"plan_target_metric":    input.Plan.TargetMetric,
+		"plan_experiment_count": len(input.Plan.Experiments),
+		"job_template":          input.Job.Template,
+		"job_status":            input.Job.Status,
+	}
+	if profile := trainingMonitorExperimentProfile(input); len(profile) > 0 {
+		card["experiment_profile"] = profile
+	}
+	return card
+}
+
+func trainingMonitorDynamicsCard(input TrainingMonitorInput) map[string]any {
+	targetMetric := trainingMonitorTargetMetric(input)
+	metrics := sortedTrainingMonitorMetrics(input.Metrics)
+	recent := recentTrainingMonitorMetrics(metrics, targetMetric, trainingMonitorMaxRecentEpochs)
+	card := map[string]any{
+		"target_metric":         targetMetric,
+		"best_target_score":     trainingMonitorSummaryScore(input.Summary, targetMetric),
+		"final_train_loss":      input.Summary.FinalTrainLoss,
+		"final_val_loss":        input.Summary.FinalValLoss,
+		"final_loss_gap":        roundMonitorFloat(input.Summary.FinalValLoss - input.Summary.FinalTrainLoss),
+		"epochs_completed":      input.Summary.EpochsCompleted,
+		"epoch_count_total":     len(metrics),
+		"recent_epoch_count":    len(recent),
+		"recent_epochs":         recent,
+		"more_epochs_justified": false,
+		"plateau_signal":        "unknown",
+		"instability_score":     0.0,
+		"target_metric_delta":   0.0,
+		"recent_metric_delta":   0.0,
+		"train_loss_delta":      0.0,
+		"validation_loss_delta": 0.0,
+		"diagnostic_summary":    "No epoch metrics were available.",
+	}
+	if len(metrics) == 0 {
+		return card
+	}
+
+	firstMetric, firstOK := firstMetricValue(metrics, targetMetric, "macro_f1", "accuracy")
+	lastMetric, lastOK := lastMetricValue(metrics, targetMetric, "macro_f1", "accuracy")
+	if firstOK && lastOK {
+		metricDelta := roundMonitorFloat(lastMetric - firstMetric)
+		card["target_metric_delta"] = metricDelta
+		card["more_epochs_justified"] = metricDelta > 0.01
+	}
+	if len(recent) >= 2 {
+		firstRecent, firstOK := mapFloatValue(recent[0], "target_metric_value")
+		lastRecent, lastOK := mapFloatValue(recent[len(recent)-1], "target_metric_value")
+		if firstOK && lastOK {
+			recentDelta := roundMonitorFloat(lastRecent - firstRecent)
+			card["recent_metric_delta"] = recentDelta
+			card["plateau_signal"] = "active"
+			if math.Abs(recentDelta) > 0.005 {
+				card["plateau_signal"] = "not_active"
+			}
+			if recentDelta > 0.01 {
+				card["more_epochs_justified"] = true
+			}
+		}
+		card["instability_score"] = trainingMonitorInstabilityScore(recent)
+	}
+	if firstTrain, lastTrain, ok := firstLastMetricValues(metrics, "train_loss", "training_loss", "loss"); ok {
+		card["train_loss_delta"] = roundMonitorFloat(lastTrain - firstTrain)
+	}
+	if firstVal, lastVal, ok := firstLastMetricValues(metrics, "val_loss", "validation_loss"); ok {
+		card["validation_loss_delta"] = roundMonitorFloat(lastVal - firstVal)
+	}
+	card["diagnostic_summary"] = trainingMonitorDynamicsSummary(card)
+	return card
+}
+
+func trainingMonitorPerClassConfusionCard(input TrainingMonitorInput) map[string]any {
+	card := map[string]any{
+		"has_per_class_metrics":            false,
+		"has_confusion_matrix":             false,
+		"class_count":                      0,
+		"worst_classes":                    []map[string]any{},
+		"top_confusion_pairs":              []map[string]any{},
+		"accuracy_minus_macro_f1":          roundMonitorFloat(input.Summary.BestAccuracy - input.Summary.BestMacroF1),
+		"minority_or_imbalance_signal":     false,
+		"confusion_off_diagonal_total":     0,
+		"per_class_summary_capped_at":      trainingMonitorMaxWorstClasses,
+		"confusion_pair_summary_capped_at": trainingMonitorMaxConfusionPairs,
+	}
+	if input.Evaluation == nil {
+		return card
+	}
+	classRows := trainingMonitorClassRows(input.Evaluation.PerClassMetrics)
+	card["has_per_class_metrics"] = len(classRows) > 0
+	card["class_count"] = len(classRows)
+	card["worst_classes"] = cappedTrainingMonitorClassRows(classRows, trainingMonitorMaxWorstClasses)
+	card["minority_or_imbalance_signal"] = trainingMonitorMinoritySignal(input.Summary, classRows)
+	confusions, offDiagonal := trainingMonitorConfusionPairs(input.Evaluation.ConfusionMatrix, classRows)
+	card["has_confusion_matrix"] = len(input.Evaluation.ConfusionMatrix) > 0
+	card["top_confusion_pairs"] = confusions
+	card["confusion_off_diagonal_total"] = offDiagonal
+	return card
+}
+
+func trainingMonitorDeploymentCard(input TrainingMonitorInput) map[string]any {
+	card := map[string]any{
+		"model":              input.Summary.Model,
+		"provider":           input.Summary.Provider,
+		"gpu_type":           input.Summary.GPUType,
+		"runtime_seconds":    input.Summary.RuntimeSeconds,
+		"estimated_cost_usd": input.Summary.EstimatedCostUSD,
+	}
+	if input.Evaluation == nil {
+		return card
+	}
+	card["model_profile_summary"] = compactSelectedAnyMap(input.Evaluation.ModelProfile, []string{
+		"parameter_count",
+		"trainable_parameter_count",
+		"model_size_mb",
+		"estimated_latency_ms",
+		"estimated_throughput_images_per_second",
+		"image_size",
+		"pretrained",
+		"freeze_backbone",
+		"fine_tune_strategy",
+	})
+	card["holistic_score_summary"] = compactSelectedAnyMap(input.Evaluation.HolisticScores, []string{
+		"quality_score",
+		"latency_score",
+		"cost_score",
+		"runtime_score",
+		"overall_score",
+		"runtime_seconds",
+	})
+	card["recommendation_summary"] = input.Evaluation.RecommendationSummary
+	return card
+}
+
+func trainingMonitorObjectiveFitCard(input TrainingMonitorInput) map[string]any {
+	targetMetric := trainingMonitorTargetMetric(input)
+	card := map[string]any{
+		"target_metric":             targetMetric,
+		"target_score":              trainingMonitorSummaryScore(input.Summary, targetMetric),
+		"objective_context":         input.ObjectiveContext,
+		"live_or_latency_sensitive": trainingMonitorLatencySensitive(input.ObjectiveContext),
+	}
+	if input.Evaluation != nil {
+		card["evaluation_objective_profile"] = compactAnyMap(input.Evaluation.ObjectiveProfile, 10)
+		if len(input.Evaluation.HolisticScores) > 0 {
+			card["objective_score_components"] = compactSelectedAnyMap(input.Evaluation.HolisticScores, []string{
+				"quality_score",
+				"latency_score",
+				"cost_score",
+				"runtime_score",
+				"overall_score",
+			})
+		}
+	}
+	return card
+}
+
+func trainingMonitorTargetMetric(input TrainingMonitorInput) string {
+	if trimmed := strings.TrimSpace(input.Plan.TargetMetric); trimmed != "" {
+		return trimmed
+	}
+	if input.Evaluation != nil {
+		if target := stringFromAny(input.Evaluation.ObjectiveProfile["target_metric"]); target != "" {
+			return target
+		}
+	}
+	if len(input.ObjectiveContext.MetricPreferences) > 0 {
+		if trimmed := strings.TrimSpace(input.ObjectiveContext.MetricPreferences[0]); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "macro_f1"
+}
+
+func trainingMonitorSummaryScore(summary runs.TrainingRunSummary, targetMetric string) float64 {
+	switch strings.ToLower(strings.TrimSpace(targetMetric)) {
+	case "accuracy":
+		return summary.BestAccuracy
+	default:
+		return summary.BestMacroF1
+	}
+}
+
+func trainingMonitorExperimentProfile(input TrainingMonitorInput) map[string]any {
+	for _, experiment := range input.Plan.Experiments {
+		if input.Summary.Model != "" && experiment.Model != input.Summary.Model {
+			continue
+		}
+		return compactPlannedExperimentProfile(experiment)
+	}
+	return compactJobConfigProfile(input.Job.Config)
+}
+
+func compactPlannedExperimentProfile(experiment plans.PlannedExperiment) map[string]any {
+	out := map[string]any{
+		"template":                experiment.Template,
+		"model":                   experiment.Model,
+		"mechanism":               experiment.Mechanism,
+		"intervention":            experiment.Intervention,
+		"evidence_used":           cappedStrings(experiment.EvidenceUsed, 6),
+		"expected_effect":         experiment.ExpectedEffect,
+		"epochs":                  experiment.Epochs,
+		"batch_size":              experiment.BatchSize,
+		"learning_rate":           experiment.LearningRate,
+		"image_size":              experiment.ImageSize,
+		"resolution_strategy":     experiment.ResolutionStrategy,
+		"optimizer":               experiment.Optimizer,
+		"scheduler":               experiment.Scheduler,
+		"weight_decay":            experiment.WeightDecay,
+		"augmentation_policy":     experiment.AugmentationPolicy,
+		"class_balancing":         experiment.ClassBalancing,
+		"sampling_strategy":       experiment.SamplingStrategy,
+		"early_stopping_patience": experiment.EarlyStoppingPatience,
+		"pretrained":              experiment.Pretrained,
+		"freeze_backbone":         experiment.FreezeBackbone,
+		"fine_tune_strategy":      experiment.FineTuneStrategy,
+	}
+	if experiment.Preprocessing != nil {
+		out["preprocessing"] = map[string]any{
+			"resize_strategy":           experiment.Preprocessing.ResizeStrategy,
+			"normalization":             experiment.Preprocessing.Normalization,
+			"crop_strategy":             experiment.Preprocessing.CropStrategy,
+			"bbox_mode":                 experiment.Preprocessing.BBoxMode,
+			"use_dataset_normalization": experiment.Preprocessing.UseDatasetNormalization,
+		}
+	}
+	if experiment.AugmentationPolicyConfig != nil {
+		out["augmentation_policy_config"] = experiment.AugmentationPolicyConfig
+	}
+	return compactNonZeroMap(out)
+}
+
+func compactJobConfigProfile(config map[string]any) map[string]any {
+	if len(config) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	for _, key := range []string{
+		"template",
+		"model",
+		"mechanism",
+		"intervention",
+		"expected_effect",
+		"epochs",
+		"batch_size",
+		"learning_rate",
+		"image_size",
+		"resolution_strategy",
+		"optimizer",
+		"scheduler",
+		"weight_decay",
+		"augmentation_policy",
+		"class_balancing",
+		"sampling_strategy",
+		"early_stopping_patience",
+		"pretrained",
+		"freeze_backbone",
+		"fine_tune_strategy",
+	} {
+		if value, ok := config[key]; ok {
+			out[key] = compactAnyValue(value)
+		}
+	}
+	for _, key := range []string{"preprocessing", "augmentation_policy_config"} {
+		if value, ok := config[key]; ok {
+			if nested, ok := value.(map[string]any); ok {
+				out[key] = compactAnyMap(nested, 8)
+			}
+		}
+	}
+	if value, ok := config["evidence_used"]; ok {
+		out["evidence_used"] = cappedStrings(stringsFromAny(value), 6)
+	}
+	return compactNonZeroMap(out)
+}
+
+func sortedTrainingMonitorMetrics(metrics []jobs.EpochMetric) []jobs.EpochMetric {
+	out := append([]jobs.EpochMetric(nil), metrics...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Epoch < out[j].Epoch
+	})
+	return out
+}
+
+func recentTrainingMonitorMetrics(metrics []jobs.EpochMetric, targetMetric string, limit int) []map[string]any {
+	if len(metrics) == 0 || limit <= 0 {
+		return []map[string]any{}
+	}
+	start := len(metrics) - minInt(len(metrics), limit)
+	out := make([]map[string]any, 0, len(metrics)-start)
+	for _, metric := range metrics[start:] {
+		row := map[string]any{"epoch": metric.Epoch}
+		if value, ok := metricValue(metric.Metrics, targetMetric, "macro_f1", "accuracy"); ok {
+			row["target_metric_value"] = value
+		}
+		for _, key := range []string{"macro_f1", "accuracy", "train_loss", "val_loss"} {
+			if value, ok := metricValue(metric.Metrics, key); ok {
+				row[key] = value
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func firstMetricValue(metrics []jobs.EpochMetric, keys ...string) (float64, bool) {
+	for _, metric := range metrics {
+		if value, ok := metricValue(metric.Metrics, keys...); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func lastMetricValue(metrics []jobs.EpochMetric, keys ...string) (float64, bool) {
+	for index := len(metrics) - 1; index >= 0; index-- {
+		if value, ok := metricValue(metrics[index].Metrics, keys...); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func firstLastMetricValues(metrics []jobs.EpochMetric, keys ...string) (float64, float64, bool) {
+	first, firstOK := firstMetricValue(metrics, keys...)
+	last, lastOK := lastMetricValue(metrics, keys...)
+	return first, last, firstOK && lastOK
+}
+
+func metricValue(metrics map[string]float64, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		if value, ok := metrics[key]; ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func mapFloatValue(values map[string]any, key string) (float64, bool) {
+	switch typed := values[key].(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	default:
+		return 0, false
+	}
+}
+
+func trainingMonitorInstabilityScore(recent []map[string]any) float64 {
+	if len(recent) < 3 {
+		return 0
+	}
+	values := []float64{}
+	for _, row := range recent {
+		if value, ok := mapFloatValue(row, "target_metric_value"); ok {
+			values = append(values, value)
+		}
+	}
+	if len(values) < 3 {
+		return 0
+	}
+	directionChanges := 0
+	previousDirection := 0
+	for index := 1; index < len(values); index++ {
+		delta := values[index] - values[index-1]
+		direction := 0
+		if delta > 0.001 {
+			direction = 1
+		} else if delta < -0.001 {
+			direction = -1
+		}
+		if direction != 0 && previousDirection != 0 && direction != previousDirection {
+			directionChanges++
+		}
+		if direction != 0 {
+			previousDirection = direction
+		}
+	}
+	return roundMonitorFloat(float64(directionChanges) / float64(len(values)-2))
+}
+
+func trainingMonitorDynamicsSummary(card map[string]any) string {
+	recentDelta, _ := mapFloatValue(card, "recent_metric_delta")
+	lossGap, _ := mapFloatValue(card, "final_loss_gap")
+	plateau, _ := card["plateau_signal"].(string)
+	switch {
+	case lossGap > 0.15:
+		return "Validation loss remains meaningfully above training loss; watch for overfitting."
+	case plateau == "active" && math.Abs(recentDelta) <= 0.005:
+		return "Recent target metric movement is flat; additional epochs may have limited value."
+	case recentDelta > 0.01:
+		return "Recent target metric is still improving; additional epochs may be justified if cost fits."
+	default:
+		return "Training dynamics do not show a strong continuation signal."
+	}
+}
+
+type trainingMonitorClassRow struct {
+	Label     string
+	Precision float64
+	Recall    float64
+	F1        float64
+	Support   float64
+}
+
+func trainingMonitorClassRows(perClass map[string]any) []trainingMonitorClassRow {
+	rows := []trainingMonitorClassRow{}
+	for label, value := range perClass {
+		normalized := strings.ToLower(strings.TrimSpace(label))
+		if normalized == "" || normalized == "accuracy" || strings.Contains(normalized, "avg") {
+			continue
+		}
+		metrics := anyMap(value)
+		if len(metrics) == 0 {
+			continue
+		}
+		row := trainingMonitorClassRow{Label: label}
+		row.Precision, _ = anyFloat(metrics["precision"])
+		row.Recall, _ = anyFloat(metrics["recall"])
+		row.F1, _ = anyFloat(firstPresent(metrics, "f1-score", "f1", "f1_score"))
+		row.Support, _ = anyFloat(metrics["support"])
+		rows = append(rows, row)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].F1 == rows[j].F1 {
+			return rows[i].Recall < rows[j].Recall
+		}
+		return rows[i].F1 < rows[j].F1
+	})
+	return rows
+}
+
+func cappedTrainingMonitorClassRows(rows []trainingMonitorClassRow, limit int) []map[string]any {
+	if limit <= 0 {
+		return []map[string]any{}
+	}
+	out := []map[string]any{}
+	for _, row := range rows {
+		out = append(out, map[string]any{
+			"class":     row.Label,
+			"precision": roundMonitorFloat(row.Precision),
+			"recall":    roundMonitorFloat(row.Recall),
+			"f1":        roundMonitorFloat(row.F1),
+			"support":   row.Support,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func trainingMonitorMinoritySignal(summary runs.TrainingRunSummary, rows []trainingMonitorClassRow) bool {
+	if summary.BestAccuracy-summary.BestMacroF1 > 0.05 {
+		return true
+	}
+	for _, row := range rows {
+		if row.Recall > 0 && row.Recall < 0.60 {
+			return true
+		}
+	}
+	return false
+}
+
+func trainingMonitorConfusionPairs(matrix [][]int, rows []trainingMonitorClassRow) ([]map[string]any, int) {
+	type pair struct {
+		From  string
+		To    string
+		Count int
+	}
+	labels := make([]string, 0, len(rows))
+	for _, row := range rows {
+		labels = append(labels, row.Label)
+	}
+	sort.Strings(labels)
+	pairs := []pair{}
+	offDiagonal := 0
+	for fromIndex, row := range matrix {
+		for toIndex, count := range row {
+			if fromIndex == toIndex || count <= 0 {
+				continue
+			}
+			offDiagonal += count
+			pairs = append(pairs, pair{
+				From:  classLabelForIndex(labels, fromIndex),
+				To:    classLabelForIndex(labels, toIndex),
+				Count: count,
+			})
+		}
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		return pairs[i].Count > pairs[j].Count
+	})
+	out := []map[string]any{}
+	for _, pair := range pairs {
+		out = append(out, map[string]any{
+			"true_class":      pair.From,
+			"predicted_class": pair.To,
+			"count":           pair.Count,
+		})
+		if len(out) >= trainingMonitorMaxConfusionPairs {
+			break
+		}
+	}
+	return out, offDiagonal
+}
+
+func classLabelForIndex(labels []string, index int) string {
+	if index >= 0 && index < len(labels) && strings.TrimSpace(labels[index]) != "" {
+		return labels[index]
+	}
+	return fmt.Sprintf("class_%d", index)
+}
+
+func compactSelectedAnyMap(values map[string]any, keys []string) map[string]any {
+	if len(values) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			out[key] = compactAnyValue(value)
+		}
+	}
+	return compactNonZeroMap(out)
+}
+
+func compactNonZeroMap(values map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range values {
+		if isEmptyPromptValue(value) {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func isEmptyPromptValue(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(typed) == ""
+	case []string:
+		return len(typed) == 0
+	case []map[string]any:
+		return len(typed) == 0
+	case map[string]any:
+		return len(typed) == 0
+	case int:
+		return typed == 0
+	case float64:
+		return typed == 0
+	default:
+		return false
+	}
+}
+
+func anyMap(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	case map[string]float64:
+		out := map[string]any{}
+		for key, value := range typed {
+			out[key] = value
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func firstPresent(values map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func anyFloat(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func trainingMonitorLatencySensitive(context ProjectObjectiveContext) bool {
+	if strings.Contains(strings.ToLower(context.PrimaryObjective), "latency") || strings.Contains(strings.ToLower(context.PrimaryObjective), "live") {
+		return true
+	}
+	for _, value := range append(context.DeploymentPriorities, context.Constraints...) {
+		normalized := strings.ToLower(value)
+		if strings.Contains(normalized, "latency") || strings.Contains(normalized, "real-time") || strings.Contains(normalized, "live") || strings.Contains(normalized, "fast") {
+			return true
+		}
+	}
+	return false
+}
+
+func attachTrainingMonitorPromptBudget(context map[string]any) {
+	budget := map[string]any{
+		"raw_sections_excluded": []string{
+			"plan.experiments_full",
+			"job.config_full",
+			"training_run_evaluation_full",
+			"epoch_metrics_full",
+			"prior_memory_payloads",
+		},
+		"max_recent_epochs":   trainingMonitorMaxRecentEpochs,
+		"max_worst_classes":   trainingMonitorMaxWorstClasses,
+		"max_confusion_pairs": trainingMonitorMaxConfusionPairs,
+		"max_memory_records":  trainingMonitorMaxMemoryRecords,
+	}
+	context["prompt_budget"] = budget
+	encoded, err := json.Marshal(context)
+	if err == nil {
+		approxBytes := len(encoded)
+		budget["approx_context_bytes"] = approxBytes
+		budget["approx_input_bytes"] = approxBytes
+		budget["approx_token_estimate"] = (approxBytes / 4) + 1
+	}
+}
+
+func roundMonitorFloat(value float64) float64 {
+	return math.Round(value*1000000) / 1000000
 }
 
 func compactEpochMetrics(metrics []jobs.EpochMetric) []map[string]any {
@@ -249,7 +919,8 @@ func compactEpochMetrics(metrics []jobs.EpochMetric) []map[string]any {
 }
 
 func compactMemoryRecords(records []memory.AgentMemoryRecord) []map[string]any {
-	out := make([]map[string]any, 0, len(records))
+	limit := minInt(len(records), trainingMonitorMaxMemoryRecords)
+	out := make([]map[string]any, 0, limit)
 	for _, record := range records {
 		out = append(out, map[string]any{
 			"agent_name": record.AgentName,
@@ -257,6 +928,9 @@ func compactMemoryRecords(records []memory.AgentMemoryRecord) []map[string]any {
 			"summary":    record.Summary,
 			"tags":       record.Tags,
 		})
+		if len(out) >= trainingMonitorMaxMemoryRecords {
+			break
+		}
 	}
 	return out
 }

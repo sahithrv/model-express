@@ -19,6 +19,7 @@ const (
 	EventChampionSelected            = "CHAMPION_SELECTED"
 	EventChampionExportRequested     = "CHAMPION_EXPORT_REQUESTED"
 	EventChampionDemoPrediction      = "CHAMPION_DEMO_PREDICTION"
+	EventExperimentationReopened     = "EXPERIMENTATION_REOPENED"
 	EventExecutionFailed             = "EXECUTION_FAILED"
 	EventAgentRecommendationRecorded = "AGENT_RECOMMENDATION_RECORDED"
 	EventAgentOutcomeRecorded        = "AGENT_OUTCOME_RECORDED"

@@ -479,16 +479,155 @@ Tests/checks:
 - `go test ./internal/agents -count=1` passed.
 - `go test ./...` from `services/orchestrator` passed.
 
+## PR 13: Mechanism Contract And Champion Terminal Guard
+
+Owning agents: Orchestrator / Backend, LLM Decision Intelligence.
+
+What changed:
+
+- Added first-class mechanism metadata to planned experiments: `mechanism`, `intervention`, `evidence_used`, and `expected_effect`.
+- Added planner `proposal_mechanisms` sidecar requirements for direct `proposed_experiments`; accepted sidecar metadata is copied onto stored experiments before backend validation/storage.
+- Added mechanism taxonomy validation for LLM-originated `ADD_EXPERIMENTS`.
+- Updated planner prompt/schema and candidate ranking so model family is treated as a parameter inside a mechanism, while diagnosis-matched non-model mechanisms receive better ranking support.
+- Penalized architecture-only/model-shopping and same-mechanism minor variants in candidate ranking.
+- Added a terminal champion guard: any persisted project champion or persisted `SELECT_CHAMPION` decision blocks stale or new autonomous follow-up plan creation and follow-up execution.
+- Skipped new Experiment Planner LLM calls once champion selection is already terminal, avoiding new autonomous experiment proposals after the project has selected a champion.
+- Blocked post-champion attempts record `backend_stop_guard: champion_selected_guard`.
+
+Files changed:
+
+- `services/orchestrator/internal/plans/model.go`
+- `services/orchestrator/internal/agents/experiment_planner_llm.go`
+- `services/orchestrator/internal/agents/candidate_ranking.go`
+- `services/orchestrator/internal/agents/experiment_planner_llm_test.go`
+- `services/orchestrator/internal/api/handlers.go`
+- `services/orchestrator/internal/api/handlers_test.go`
+- `docs/agents_context/orchestrator_backend/context.md`
+- `docs/agents_context/llm_decision_intelligence/context.md`
+- `docs/agents_context/integration_coordinator/context.md`
+- `docs/model_express_pr_completion_report.md`
+
+Tests/checks:
+
+- `go test ./internal/agents -count=1` passed.
+- Focused backend regressions for mechanism rejection, retry feedback, stale decisions, no-novel filtering, near-ceiling blocking, persisted champion blocking, SELECT_CHAMPION-only blocking, post-champion execution blocking, and post-champion LLM skip behavior passed.
+- `go test ./...` from `services/orchestrator` passed.
+
+Deferred:
+
+- Explicit user-facing reopen/new-exploration action after champion selection.
+- Worker support for later mechanisms such as MixUp/CutMix, label-quality audit jobs, distillation, and richer crop/bbox ablations.
+
+## PR 14: Diagnosis-Driven Mechanism Slices
+
+Owning agents: Orchestrator / Backend, LLM Decision Intelligence, Python Worker / Training, Frontend / Mission Control.
+
+What changed:
+
+- Marked implementation status directly in `docs/model_express_agentic_upgrade_roadmap.md` so completed, partial, and deferred roadmap PRs are visible from the roadmap itself.
+- Added planner context cards V2: `training_dynamics_card`, `per_class_error_card`, `deployment_card`, `mechanism_coverage_card`, and `label_quality_card`.
+- Added backend mechanism-evidence validation before follow-up plan creation and stale follow-up execution. Class imbalance/minority targeting now require class-balancing config plus backend/profile/planner evidence; bbox crop requires backend-profiled annotation evidence; high-resolution/crop mechanisms require object-scale/crop/dimension/fine-grained evidence.
+- Kept label-noise/hard-example mechanisms report-only until an audit job/artifact path exists; blocked MixUp/CutMix and distillation until worker support contracts are complete.
+- Added structured `augmentation_policy_config` to planned experiments and job configs with bounded policy types and caps.
+- Added worker support for structured `basic`, `randaugment`, `trivialaugment`/`TrivialAugmentWide`, and `autoaugment` training transforms while preserving legacy augmentation behavior.
+- Added Mission Control visibility for mechanisms, mechanism coverage, backend validation/rejection cues, dry-run/review state, and structured augmentation policy metadata.
+
+Files changed:
+
+- `services/orchestrator/internal/plans/model.go`
+- `services/orchestrator/internal/agents/experiment_planner_llm.go`
+- `services/orchestrator/internal/agents/candidate_ranking.go`
+- `services/orchestrator/internal/agents/experiment_planner_llm_test.go`
+- `services/orchestrator/internal/api/handlers.go`
+- `services/orchestrator/internal/api/handlers_test.go`
+- `services/worker/worker/training/augmentation.py`
+- `services/worker/worker/training/modal_app.py`
+- `services/worker/worker/training/local.py`
+- `services/worker/tests/test_training_modal_helpers.py`
+- `apps/mission-control/src/App.tsx`
+- `apps/mission-control/src/types.ts`
+- `apps/mission-control/src/styles.css`
+- `docs/model_express_agentic_upgrade_roadmap.md`
+- `docs/agents_context/*/context.md`
+
+Tests/checks:
+
+- `go test ./internal/agents` from `services/orchestrator`: passed.
+- `go test ./internal/api` from `services/orchestrator`: passed.
+- `go test ./...` from `services/orchestrator`: passed.
+- `python -m py_compile worker/training/augmentation.py worker/training/modal_app.py worker/training/local.py tests/test_training_modal_helpers.py` from `services/worker`: passed.
+- `python -m unittest discover tests` from `services/worker`: passed, 26 tests run with 7 existing skips.
+- `npm run build` from `apps/mission-control`: passed; existing Vite/Node experimental CommonJS/ESM warning remains.
+
+Deferred:
+
+- Completed in PR 15 except for the explicitly deferred PR9 retrieval/routing/caching bucket.
+- Model routing, prompt caching, vector retrieval, and cross-project mechanism retrieval remain deferred.
+
+## PR 15: Remaining Non-PR9 Agentic Upgrade Slices
+
+Owning agents: Orchestrator / Backend, LLM Decision Intelligence, Python Worker / Training, Data / Dataset Intelligence, Frontend / Mission Control, Integration Coordinator.
+
+What changed:
+
+- Added explicit post-champion reopen flow: `POST /projects/:id/experimentation/reopen` records `REOPEN_EXPERIMENTATION` and `EXPERIMENTATION_REOPENED`, and the champion guard only permits further follow-up work when that user action is newer than the terminal champion state.
+- Compacted Training Monitor prompt input into run-evaluation cards and added approximate prompt/input-size telemetry.
+- Added first-class strategy scorecard mechanism columns and store hydration/backfill for `mechanism`, `intervention`, `diagnosis_triggers`, `evidence_used`, and `expected_effect`.
+- Added `label_quality_audit` as a report-only job template. Label-noise/hard-example mechanisms can create audit jobs but cannot create training jobs or mutate labels.
+- Enabled MixUp/CutMix through bounded `augmentation_policy_config` and worker training-batch label mixing.
+- Added effective-number class-balanced loss through bounded `class_balancing_config.effective_number_beta`.
+- Added worker bbox crop/full-image ablations and richer profile visual-trait summaries.
+- Updated Mission Control to display audit-only plans and class-balancing config metadata.
+- Updated roadmap and agent-context docs so only PR9 remains intentionally deferred.
+
+Files changed:
+
+- `services/orchestrator/internal/api/router.go`
+- `services/orchestrator/internal/api/handlers.go`
+- `services/orchestrator/internal/api/handlers_test.go`
+- `services/orchestrator/internal/decisions/model.go`
+- `services/orchestrator/internal/execution/model.go`
+- `services/orchestrator/internal/jobs/model.go`
+- `services/orchestrator/internal/plans/model.go`
+- `services/orchestrator/internal/agents/*`
+- `services/orchestrator/internal/store/*`
+- `services/orchestrator/internal/strategies/model.go`
+- `services/worker/worker/jobs.py`
+- `services/worker/worker/datasets/profiler.py`
+- `services/worker/worker/datasets/label_quality.py`
+- `services/worker/worker/training/*`
+- `services/worker/tests/*`
+- `apps/mission-control/src/App.tsx`
+- `apps/mission-control/src/types.ts`
+- `docs/model_express_agentic_upgrade_roadmap.md`
+- `docs/agents_context/*/context.md`
+
+Tests/checks:
+
+- `go test ./...` from `services/orchestrator`: passed.
+- `python -m py_compile worker/jobs.py worker/datasets/label_quality.py worker/training/augmentation.py worker/training/modal_app.py worker/training/local.py worker/datasets/profiler.py tests/test_training_modal_helpers.py tests/test_profiler.py tests/test_label_quality_audit_job.py` from `services/worker`: passed.
+- `python -m unittest discover -s tests` from `services/worker`: passed, 33 tests run with 11 optional-dependency skips.
+- `npm run build` from `apps/mission-control`: passed; existing Vite/Node experimental CommonJS/ESM warning remains.
+- No Modal jobs were run.
+
+Deferred:
+
+- Model routing.
+- Prompt caching.
+- Vector retrieval and cross-project mechanism retrieval.
+
 ## Final Verification
 
 - `go test ./...` from `services/orchestrator`: passed.
-- `python -m py_compile worker/jobs.py worker/orchestrator_client.py worker/champion_jobs.py worker/exporting/artifacts.py` from `services/worker`: passed.
-- `python -m unittest discover -s tests -v` from `services/worker`: passed; 21 tests run, 5 skipped due missing local `torch`/`torchvision`.
+- `python -m py_compile worker/jobs.py worker/datasets/label_quality.py worker/training/augmentation.py worker/training/modal_app.py worker/training/local.py worker/datasets/profiler.py tests/test_training_modal_helpers.py tests/test_profiler.py tests/test_label_quality_audit_job.py` from `services/worker`: passed.
+- `python -m unittest discover -s tests` from `services/worker`: passed; 33 tests run, 11 skipped due optional/local training dependencies.
 - `npm run build` from `apps/mission-control`: passed; existing Node experimental CommonJS/ESM warning from Vite config.
+- No Modal jobs were run.
 
 ## Known Risks
 
 - Lease recovery is implemented through poll/manual store recovery, but there is no standalone recovery ticker yet.
 - Export/demo can run through worker jobs when artifacts/manifests are worker-visible; production storage and real reconstruction from arbitrary completed training runs remain future hardening.
-- Visual exemplars persist into canonical profile JSON, but durable exemplar history tables and production object-storage upload remain future hardening.
+- Visual exemplars and label-quality audits persist into canonical profile JSON, but durable history tables and production object-storage upload remain future hardening.
 - `dataset_profiles` remains dormant; do not read from it as canonical until fully wired.
+- PR9 is still intentionally deferred: model routing, prompt caching, vector retrieval, and cross-project retrieval.

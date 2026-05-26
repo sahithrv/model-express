@@ -1651,22 +1651,29 @@ func (s *PostgresStore) CreateStrategyScorecard(scorecard strategies.StrategySco
 	if err != nil {
 		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard proposed_changes: %w", err)
 	}
+	mechanism, intervention, diagnosisTriggers, evidenceUsed, expectedEffect := hydrateStrategyScorecardMechanismFields(scorecard)
+	diagnosisTriggersJSON, err := json.Marshal(diagnosisTriggers)
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard diagnosis_triggers: %w", err)
+	}
+	evidenceUsedJSON, err := json.Marshal(evidenceUsed)
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard evidence_used: %w", err)
+	}
 	tagsJSON, err := json.Marshal(scorecard.Tags)
 	if err != nil {
 		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard tags: %w", err)
 	}
 
-	const query = `
+	query := `
 		INSERT INTO strategy_scorecards (
 			project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
-			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
-			expected_delta, confidence_before, outcome, lesson, tags
+			strategy_type, planning_mode, mechanism, intervention, diagnosis_triggers, evidence_used,
+			expected_effect, dataset_traits, objective_profile, proposed_changes, expected_delta,
+			confidence_before, outcome, lesson, tags
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-		RETURNING id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
-			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
-			expected_delta, actual_delta, confidence_before, confidence_after, cost_usd,
-			runtime_seconds, outcome, lesson, tags, created_at
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+		RETURNING ` + strategyScorecardSelectColumns() + `
 	`
 	return scanStrategyScorecard(s.db.QueryRowContext(
 		context.Background(),
@@ -1678,6 +1685,11 @@ func (s *PostgresStore) CreateStrategyScorecard(scorecard strategies.StrategySco
 		scorecard.FollowUpPlanID,
 		scorecard.StrategyType,
 		scorecard.PlanningMode,
+		mechanism,
+		intervention,
+		diagnosisTriggersJSON,
+		evidenceUsedJSON,
+		expectedEffect,
 		datasetTraitsJSON,
 		objectiveProfileJSON,
 		proposedChangesJSON,
@@ -1694,7 +1706,7 @@ func (s *PostgresStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPla
 	if err != nil {
 		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard tags: %w", err)
 	}
-	const query = `
+	query := `
 		UPDATE strategy_scorecards
 		SET actual_delta = $1,
 			confidence_after = $2,
@@ -1704,10 +1716,7 @@ func (s *PostgresStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPla
 			lesson = $6,
 			tags = $7
 		WHERE followup_plan_id = $8
-		RETURNING id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
-			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
-			expected_delta, actual_delta, confidence_before, confidence_after, cost_usd,
-			runtime_seconds, outcome, lesson, tags, created_at
+		RETURNING ` + strategyScorecardSelectColumns() + `
 	`
 	return scanStrategyScorecard(s.db.QueryRowContext(
 		context.Background(),
@@ -1730,11 +1739,8 @@ func (s *PostgresStore) ListProjectStrategyScorecards(projectID string, limit in
 	if limit <= 0 {
 		limit = 25
 	}
-	const query = `
-		SELECT id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id,
-			strategy_type, planning_mode, dataset_traits, objective_profile, proposed_changes,
-			expected_delta, actual_delta, confidence_before, confidence_after, cost_usd,
-			runtime_seconds, outcome, lesson, tags, created_at
+	query := `
+		SELECT ` + strategyScorecardSelectColumns() + `
 		FROM strategy_scorecards
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -2589,6 +2595,8 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 
 func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error) {
 	var scorecard strategies.StrategyScorecard
+	var diagnosisTriggersJSON []byte
+	var evidenceUsedJSON []byte
 	var datasetTraitsJSON []byte
 	var objectiveProfileJSON []byte
 	var proposedChangesJSON []byte
@@ -2602,6 +2610,11 @@ func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error)
 		&scorecard.FollowUpPlanID,
 		&scorecard.StrategyType,
 		&scorecard.PlanningMode,
+		&scorecard.Mechanism,
+		&scorecard.Intervention,
+		&diagnosisTriggersJSON,
+		&evidenceUsedJSON,
+		&scorecard.ExpectedEffect,
 		&datasetTraitsJSON,
 		&objectiveProfileJSON,
 		&proposedChangesJSON,
@@ -2617,6 +2630,18 @@ func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error)
 		&scorecard.CreatedAt,
 	); err != nil {
 		return strategies.StrategyScorecard{}, normalizeSQLError(err)
+	}
+	scorecard.DiagnosisTriggers = []string{}
+	if len(diagnosisTriggersJSON) > 0 {
+		if err := json.Unmarshal(diagnosisTriggersJSON, &scorecard.DiagnosisTriggers); err != nil {
+			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard diagnosis_triggers: %w", err)
+		}
+	}
+	scorecard.EvidenceUsed = []string{}
+	if len(evidenceUsedJSON) > 0 {
+		if err := json.Unmarshal(evidenceUsedJSON, &scorecard.EvidenceUsed); err != nil {
+			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard evidence_used: %w", err)
+		}
 	}
 	if err := json.Unmarshal(datasetTraitsJSON, &scorecard.DatasetTraits); err != nil {
 		return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard dataset_traits: %w", err)
@@ -2716,6 +2741,10 @@ func selectJobSQL(column string) string {
 
 func jobSelectColumns() string {
 	return "id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at"
+}
+
+func strategyScorecardSelectColumns() string {
+	return "id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id, strategy_type, planning_mode, mechanism, intervention, diagnosis_triggers, evidence_used, expected_effect, dataset_traits, objective_profile, proposed_changes, expected_delta, actual_delta, confidence_before, confidence_after, cost_usd, runtime_seconds, outcome, lesson, tags, created_at"
 }
 
 func newPostgresTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.TrainingRunSummary {

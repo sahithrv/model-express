@@ -11,7 +11,7 @@ import (
 	"model-express/services/orchestrator/internal/plans"
 )
 
-func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []CandidateHypothesis, maxExperiments int) ([]CandidateRanking, []plans.PlannedExperiment) {
+func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []CandidateHypothesis, maxExperiments int) ([]CandidateRanking, []plans.PlannedExperiment, []PlannerProposalMechanism) {
 	if maxExperiments < 1 {
 		maxExperiments = 5
 	}
@@ -46,6 +46,7 @@ func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []C
 
 	selectedIndexes := map[int]bool{}
 	selected := []plans.PlannedExperiment{}
+	selectedMechanisms := []PlannerProposalMechanism{}
 	selectedFamilyCounts := map[string]int{}
 	for _, ranking := range ordered {
 		if ranking.Rejected || len(selected) >= maxExperiments {
@@ -57,6 +58,7 @@ func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []C
 			ranking.Score = roundCandidateScore(ranking.Score - 0.12)
 		}
 		selectedIndexes[ranking.CandidateIndex] = true
+		selectedMechanisms = append(selectedMechanisms, plannerProposalMechanismFromCandidate(candidates[ranking.CandidateIndex], len(selected)))
 		selected = append(selected, experiment)
 		selectedFamilyCounts[family]++
 	}
@@ -67,7 +69,7 @@ func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []C
 			rankings[index].Reasons = append(rankings[index].Reasons, "selected by deterministic backend ranking")
 		}
 	}
-	return rankings, selected
+	return rankings, selected, selectedMechanisms
 }
 
 func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypothesis, index int, existing map[string]bool, seenProposed map[string]bool) CandidateRanking {
@@ -77,6 +79,9 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 		CandidateIndex:      index,
 		Hypothesis:          candidate.Hypothesis,
 		PlanningMode:        candidate.PlanningMode,
+		Mechanism:           normalizeMechanism(candidate.Mechanism),
+		Intervention:        strings.TrimSpace(candidate.Intervention),
+		ExpectedEffect:      strings.TrimSpace(candidate.ExpectedEffect),
 		Score:               0.45,
 		ScoreComponents:     map[string]float64{"base": 0.45},
 		Reasons:             []string{},
@@ -84,6 +89,12 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	}
 
 	if err := validatePlannedExperimentShape(experiment, index); err != nil {
+		ranking.Rejected = true
+		ranking.Score = 0
+		ranking.Reasons = append(ranking.Reasons, err.Error())
+		return ranking
+	}
+	if err := validateCandidateMechanismExpectation(candidate, index); err != nil {
 		ranking.Rejected = true
 		ranking.Score = 0
 		ranking.Reasons = append(ranking.Reasons, err.Error())
@@ -140,6 +151,11 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	}
 	ranking.ScoreComponents["redundancy"] = roundCandidateScore(-redundancyPenalty)
 
+	mechanismScore, mechanismReasons := candidateMechanismScore(input, candidate, experiment)
+	ranking.Score += mechanismScore
+	ranking.Reasons = append(ranking.Reasons, mechanismReasons...)
+	ranking.ScoreComponents["mechanism"] = roundCandidateScore(mechanismScore)
+
 	if tinyOnlyCandidate(candidate) {
 		ranking.Score -= 0.45
 		ranking.Reasons = append(ranking.Reasons, "tiny-only candidate: only epochs, learning rate, or batch size changed")
@@ -174,12 +190,16 @@ func candidateDiagnosisAlignment(diagnosis PlannerDiagnosis, candidate Candidate
 	reasons := []string{}
 	text := strings.ToLower(strings.Join([]string{
 		candidate.Hypothesis,
+		candidate.Mechanism,
+		candidate.Intervention,
+		candidate.ExpectedEffect,
 		experiment.Reason,
 		experiment.Strategy,
 		experiment.ClassBalancing,
 		experiment.SamplingStrategy,
 		experiment.ResolutionStrategy,
 		experiment.AugmentationPolicy,
+		compactJSON(experiment.ClassBalancingConfig),
 		plannerPreprocessingText(experiment),
 		strings.Join(candidate.EvidenceUsed, " "),
 	}, " "))
@@ -205,6 +225,129 @@ func candidateDiagnosisAlignment(diagnosis PlannerDiagnosis, candidate Candidate
 		reasons = append(reasons, "uses latency-friendly model under latency penalty")
 	}
 	return bonus, reasons
+}
+
+func candidateMechanismScore(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (float64, []string) {
+	score := 0.0
+	reasons := []string{}
+	mechanism := normalizeMechanism(candidate.Mechanism)
+	if mechanism == "" {
+		return score, reasons
+	}
+
+	if diagnosisMatchesMechanism(input.DeterministicDiagnosis, mechanism, candidate, experiment) {
+		if isModelShoppingMechanism(mechanism) {
+			score += 0.04
+			reasons = append(reasons, "mechanism has some diagnosis support")
+		} else {
+			score += 0.12
+			reasons = append(reasons, "diagnosis-matched non-model mechanism")
+		}
+	} else if mechanismUsuallyNeedsDiagnosis(mechanism) {
+		score -= 0.10
+		reasons = append(reasons, "mechanism is weakly supported by deterministic diagnosis")
+	}
+
+	if !mechanismReflectedInExperimentConfig(mechanism, experiment) {
+		score -= 0.18
+		reasons = append(reasons, "mechanism is not reflected in executable experiment config")
+	}
+	if architectureOnlyCandidate(candidate) && !architectureMechanismSupported(input.DeterministicDiagnosis) {
+		score -= 0.22
+		reasons = append(reasons, "architecture-only candidate lacks underfitting, plateau, or champion-challenge evidence")
+	}
+	if sameMechanismMinorVariant(input, candidate, experiment) {
+		score -= 0.24
+		reasons = append(reasons, "same mechanism only changes minor tuning knobs")
+	}
+	return score, reasons
+}
+
+func diagnosisMatchesMechanism(diagnosis PlannerDiagnosis, mechanism string, candidate CandidateHypothesis, experiment plans.PlannedExperiment) bool {
+	text := candidateMechanismEvidenceText(candidate, experiment)
+	switch mechanism {
+	case "class_imbalance", "minority_targeting":
+		return diagnosis.ClassImbalanceScore >= 0.45 || diagnosis.MinorityClassFailureScore >= 0.45 || containsAnyText(text, "minority", "rare class", "macro", "imbalance", "per-class", "per class")
+	case "regularization", "augmentation_basic", "augmentation_auto", "augmentation_mixed_sample":
+		return diagnosis.OverfittingScore >= 0.55 || diagnosis.InstabilityScore >= 0.45 || containsAnyText(text, "overfit", "small dataset", "blur", "lighting", "viewpoint", "background")
+	case "optimizer_scheduler":
+		return diagnosis.PlateauScore >= 0.55 || diagnosis.InstabilityScore >= 0.45 || containsAnyText(text, "plateau", "unstable", "scheduler", "optimization")
+	case "capacity_finetune":
+		return diagnosis.UnderfittingScore >= 0.55 || containsAnyText(text, "underfit", "capacity", "fine-tune", "fine tune", "full")
+	case "resolution_crop", "bbox_crop_ablation":
+		return containsAnyText(text, "small object", "object scale", "crop", "bbox", "aspect", "background", "resolution", "fine-grained")
+	case "deployment_latency":
+		return diagnosis.LatencyPenalty >= 0.45 || containsAnyText(text, "latency", "runtime", "cost", "live")
+	case "architecture_challenge":
+		return architectureMechanismSupported(diagnosis)
+	case "baseline_control", "stop_select_champion":
+		return true
+	default:
+		return false
+	}
+}
+
+func candidateMechanismEvidenceText(candidate CandidateHypothesis, experiment plans.PlannedExperiment) string {
+	return strings.ToLower(strings.Join([]string{
+		candidate.Hypothesis,
+		candidate.Mechanism,
+		candidate.Intervention,
+		candidate.ExpectedEffect,
+		strings.Join(candidate.EvidenceUsed, " "),
+		experiment.Reason,
+		experiment.Strategy,
+		experiment.ResolutionStrategy,
+		experiment.AugmentationPolicy,
+		compactJSON(experiment.AugmentationPolicyConfig),
+		experiment.ClassBalancing,
+		compactJSON(experiment.ClassBalancingConfig),
+		experiment.SamplingStrategy,
+		plannerPreprocessingText(experiment),
+	}, " "))
+}
+
+func architectureMechanismSupported(diagnosis PlannerDiagnosis) bool {
+	return diagnosis.UnderfittingScore >= 0.55 || diagnosis.PlateauScore >= 0.60 || diagnosis.ImprovementStagnationScore >= 0.60
+}
+
+func mechanismUsuallyNeedsDiagnosis(mechanism string) bool {
+	switch mechanism {
+	case "baseline_control", "stop_select_champion":
+		return false
+	default:
+		return true
+	}
+}
+
+func isModelShoppingMechanism(mechanism string) bool {
+	return mechanism == "architecture_challenge"
+}
+
+func mechanismReflectedInExperimentConfig(mechanism string, experiment plans.PlannedExperiment) bool {
+	switch mechanismGroup(mechanism) {
+	case "class_imbalance":
+		return nonDefaultText(experiment.ClassBalancing, "none") || nonDefaultText(experiment.SamplingStrategy, "none")
+	case "augmentation":
+		return nonDefaultText(experiment.AugmentationPolicy, "none") || len(experiment.Augmentation) > 0 || experiment.AugmentationPolicyConfig != nil
+	case "resolution_crop":
+		return (experiment.ImageSize > 0 && experiment.ImageSize != 224) || nonDefaultText(experiment.ResolutionStrategy, "fixed") || experiment.Preprocessing != nil
+	case "regularization":
+		return experiment.WeightDecay > 0 || nonDefaultText(experiment.AugmentationPolicy, "none") || len(experiment.Augmentation) > 0 || experiment.AugmentationPolicyConfig != nil
+	case "optimizer_scheduler":
+		return nonDefaultText(experiment.Optimizer, "adamw") || nonDefaultText(experiment.Scheduler, "none") || experiment.WeightDecay > 0
+	case "capacity_finetune":
+		return nonDefaultText(experiment.FineTuneStrategy, "head_only") || (experiment.Pretrained && !experiment.FreezeBackbone) || isHigherCapacityFamily(experiment.Model)
+	case "deployment_latency":
+		return strings.TrimSpace(experiment.Model) != ""
+	case "architecture_challenge":
+		return strings.TrimSpace(experiment.Model) != "" || strings.TrimSpace(experiment.Template) != ""
+	case "label_noise_audit", "hard_example_audit":
+		return strings.EqualFold(strings.TrimSpace(experiment.Template), "label_quality_audit")
+	case "baseline_control", "stop_select_champion":
+		return true
+	default:
+		return false
+	}
 }
 
 func candidateMemoryScore(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (float64, []string) {
@@ -250,7 +393,8 @@ func scorecardSimilarToCandidate(scorecard PlannerStrategyScorecard, candidate C
 	changes := strings.ToLower(string(changesBlob))
 	model := strings.ToLower(strings.TrimSpace(experiment.Model))
 	family := inferExperimentFamily(experiment.Model)
-	return strings.Contains(changes, model) || (family != "" && strings.Contains(changes, family))
+	mechanism := normalizeMechanism(candidate.Mechanism)
+	return strings.Contains(changes, model) || (family != "" && strings.Contains(changes, family)) || (mechanism != "" && strings.Contains(changes, mechanism))
 }
 
 func tinyOnlyCandidate(candidate CandidateHypothesis) bool {
@@ -332,12 +476,15 @@ func candidateRedundancyPenalty(input ExperimentPlannerInput, candidate Candidat
 func meaningfullyChangesExperiment(candidate CandidateHypothesis) bool {
 	for key := range candidate.ProposedChanges {
 		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "model", "model_family", "architecture", "image_size", "resolution_strategy", "augmentation", "augmentation_policy", "preprocessing", "resize_strategy", "normalization", "crop", "crop_strategy", "bbox_mode", "class_balancing", "sampling_strategy", "fine_tune_strategy", "scheduler", "optimizer", "weight_decay", "loss":
+		case "mechanism", "intervention", "expected_effect", "model", "model_family", "architecture", "image_size", "resolution_strategy", "augmentation", "augmentation_policy", "preprocessing", "resize_strategy", "normalization", "crop", "crop_strategy", "bbox_mode", "class_balancing", "sampling_strategy", "fine_tune_strategy", "scheduler", "optimizer", "weight_decay", "loss":
 			return true
 		}
 	}
 	text := strings.ToLower(strings.Join([]string{
 		candidate.Hypothesis,
+		candidate.Mechanism,
+		candidate.Intervention,
+		candidate.ExpectedEffect,
 		candidate.ExperimentConfig.Reason,
 		candidate.ExperimentConfig.Strategy,
 		candidate.ExperimentConfig.ResolutionStrategy,
@@ -347,6 +494,154 @@ func meaningfullyChangesExperiment(candidate CandidateHypothesis) bool {
 		plannerPreprocessingText(candidate.ExperimentConfig),
 	}, " "))
 	return containsAnyText(text, "model family", "augmentation", "augment", "preprocess", "resize", "normalization", "crop", "bbox", "image size", "resolution", "weighted", "balanced", "sampler", "fine-tune", "regularization", "scheduler")
+}
+
+func plannerProposalMechanismFromCandidate(candidate CandidateHypothesis, experimentIndex int) PlannerProposalMechanism {
+	return PlannerProposalMechanism{
+		ExperimentIndex: experimentIndex,
+		Mechanism:       normalizeMechanism(candidate.Mechanism),
+		Intervention:    strings.TrimSpace(candidate.Intervention),
+		EvidenceUsed:    nonEmptyStrings(candidate.EvidenceUsed),
+		ExpectedEffect:  strings.TrimSpace(candidate.ExpectedEffect),
+	}
+}
+
+func architectureOnlyCandidate(candidate CandidateHypothesis) bool {
+	mechanism := normalizeMechanism(candidate.Mechanism)
+	if mechanism != "architecture_challenge" && !proposedChangesOnlyModel(candidate.ProposedChanges) {
+		return false
+	}
+	if !proposedChangesOnlyModel(candidate.ProposedChanges) {
+		return false
+	}
+	text := candidateMechanismEvidenceText(candidate, candidate.ExperimentConfig)
+	return !containsAnyText(text, "weighted", "balance", "sampler", "augment", "regular", "scheduler", "crop", "resolution", "preprocess", "fine-tune", "fine tune")
+}
+
+func proposedChangesOnlyModel(changes map[string]any) bool {
+	if len(changes) == 0 {
+		return false
+	}
+	for key := range changes {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "mechanism", "model", "model_family", "architecture", "template", "epochs", "epoch", "learning_rate", "lr", "batch_size":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func sameMechanismMinorVariant(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) bool {
+	mechanism := normalizeMechanism(candidate.Mechanism)
+	if mechanism == "" {
+		return false
+	}
+	priors := append([]plans.PlannedExperiment(nil), input.SourcePlan.Experiments...)
+	for _, plan := range input.PriorPlans {
+		priors = append(priors, plan.Experiments...)
+	}
+	for _, prior := range priors {
+		if mechanismGroup(inferExperimentMechanismTaxonomy(prior)) != mechanismGroup(mechanism) {
+			continue
+		}
+		if experimentsDifferOnlyMinor(prior, experiment) {
+			return true
+		}
+	}
+	return false
+}
+
+func experimentsDifferOnlyMinor(left plans.PlannedExperiment, right plans.PlannedExperiment) bool {
+	return strings.EqualFold(strings.TrimSpace(left.Template), strings.TrimSpace(right.Template)) &&
+		strings.EqualFold(strings.TrimSpace(left.Model), strings.TrimSpace(right.Model)) &&
+		left.ImageSize == right.ImageSize &&
+		strings.EqualFold(strings.TrimSpace(left.ResolutionStrategy), strings.TrimSpace(right.ResolutionStrategy)) &&
+		strings.EqualFold(strings.TrimSpace(left.Optimizer), strings.TrimSpace(right.Optimizer)) &&
+		strings.EqualFold(strings.TrimSpace(left.Scheduler), strings.TrimSpace(right.Scheduler)) &&
+		left.WeightDecay == right.WeightDecay &&
+		strings.EqualFold(strings.TrimSpace(left.AugmentationPolicy), strings.TrimSpace(right.AugmentationPolicy)) &&
+		strings.EqualFold(strings.TrimSpace(left.ClassBalancing), strings.TrimSpace(right.ClassBalancing)) &&
+		strings.EqualFold(strings.TrimSpace(left.SamplingStrategy), strings.TrimSpace(right.SamplingStrategy)) &&
+		left.Pretrained == right.Pretrained &&
+		left.FreezeBackbone == right.FreezeBackbone &&
+		strings.EqualFold(strings.TrimSpace(left.FineTuneStrategy), strings.TrimSpace(right.FineTuneStrategy)) &&
+		compactJSON(left.Preprocessing) == compactJSON(right.Preprocessing) &&
+		compactJSON(left.Augmentation) == compactJSON(right.Augmentation) &&
+		compactJSON(left.AugmentationPolicyConfig) == compactJSON(right.AugmentationPolicyConfig) &&
+		compactJSON(left.ClassBalancingConfig) == compactJSON(right.ClassBalancingConfig)
+}
+
+func inferExperimentMechanismTaxonomy(experiment plans.PlannedExperiment) string {
+	if mechanism := normalizeMechanism(experiment.Mechanism); mechanism != "" {
+		return mechanism
+	}
+	if nonDefaultText(experiment.ClassBalancing, "none") || nonDefaultText(experiment.SamplingStrategy, "none") {
+		return "class_imbalance"
+	}
+	if experiment.Preprocessing != nil && (nonDefaultText(experiment.Preprocessing.BBoxMode, "ignore") || strings.Contains(strings.ToLower(experiment.Preprocessing.CropStrategy), "bbox")) {
+		return "bbox_crop_ablation"
+	}
+	if (experiment.ImageSize > 0 && experiment.ImageSize != 224) || nonDefaultText(experiment.ResolutionStrategy, "fixed") ||
+		(experiment.Preprocessing != nil && (nonDefaultText(experiment.Preprocessing.ResizeStrategy, "squash") || nonDefaultText(experiment.Preprocessing.CropStrategy, "none") || nonDefaultText(experiment.Preprocessing.Normalization, "imagenet"))) {
+		return "resolution_crop"
+	}
+	if nonDefaultText(experiment.AugmentationPolicy, "none") || len(experiment.Augmentation) > 0 || experiment.AugmentationPolicyConfig != nil {
+		if experiment.AugmentationPolicyConfig != nil {
+			switch normalizeMechanism(experiment.AugmentationPolicyConfig.PolicyType) {
+			case "randaugment", "trivialaugment", "trivialaugmentwide", "autoaugment":
+				return "augmentation_auto"
+			case "mixup", "cutmix":
+				return "augmentation_mixed_sample"
+			}
+		}
+		return "augmentation_basic"
+	}
+	if nonDefaultText(experiment.FineTuneStrategy, "head_only") || (experiment.Pretrained && !experiment.FreezeBackbone) {
+		return "capacity_finetune"
+	}
+	if nonDefaultText(experiment.Optimizer, "adamw") || nonDefaultText(experiment.Scheduler, "none") || experiment.WeightDecay > 0 {
+		return "optimizer_scheduler"
+	}
+	if strings.TrimSpace(experiment.Model) != "" || strings.TrimSpace(experiment.Template) != "" {
+		return "architecture_challenge"
+	}
+	return "baseline_control"
+}
+
+func normalizeMechanism(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func mechanismGroup(mechanism string) string {
+	switch normalizeMechanism(mechanism) {
+	case "class_imbalance", "minority_targeting":
+		return "class_imbalance"
+	case "augmentation_basic", "augmentation_auto", "augmentation_mixed_sample":
+		return "augmentation"
+	case "resolution_crop", "bbox_crop_ablation":
+		return "resolution_crop"
+	default:
+		return normalizeMechanism(mechanism)
+	}
+}
+
+func nonDefaultText(value string, defaults ...string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return false
+	}
+	for _, fallback := range defaults {
+		if normalized == strings.ToLower(strings.TrimSpace(fallback)) {
+			return false
+		}
+	}
+	return true
+}
+
+func compactJSON(value any) string {
+	blob, _ := json.Marshal(value)
+	return string(blob)
 }
 
 func plannerPreprocessingText(experiment plans.PlannedExperiment) string {
@@ -398,6 +693,8 @@ func isHigherCapacityFamily(model string) bool {
 
 func candidateExperimentSignature(experiment plans.PlannedExperiment) string {
 	augmentationBlob, _ := json.Marshal(experiment.Augmentation)
+	augmentationPolicyConfigBlob, _ := json.Marshal(experiment.AugmentationPolicyConfig)
+	classBalancingConfigBlob, _ := json.Marshal(experiment.ClassBalancingConfig)
 	preprocessingBlob, _ := json.Marshal(experiment.Preprocessing)
 	return strings.Join([]string{
 		strings.ToLower(strings.TrimSpace(experiment.Template)),
@@ -413,7 +710,9 @@ func candidateExperimentSignature(experiment plans.PlannedExperiment) string {
 		strconv.FormatFloat(experiment.WeightDecay, 'g', -1, 64),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
+		string(augmentationPolicyConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
+		string(classBalancingConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.SamplingStrategy)),
 		strconv.Itoa(experiment.EarlyStoppingPatience),
 		strconv.FormatBool(experiment.Pretrained),

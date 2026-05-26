@@ -37,8 +37,8 @@ Major tables and store concepts:
 - `champion_demo_predictions`: demo prediction audit/history rows for selected champions, including image metadata, status, top-k payloads when available, latency/correctness, and runtime errors.
 - `agent_invocations`: LLM input/output, validation status, parsed output, downstream outcome.
 - `agent_memory_records`: distilled training/planning memory.
-- `agent_decisions`: accepted project decisions such as `ADD_EXPERIMENTS` or `SELECT_CHAMPION`.
-- `strategy_scorecards`: structured follow-up outcome memory.
+- `agent_decisions`: accepted project decisions such as `ADD_EXPERIMENTS`, `SELECT_CHAMPION`, or `REOPEN_EXPERIMENTATION`.
+- `strategy_scorecards`: structured follow-up outcome memory, including first-class mechanism/intervention/evidence metadata.
 - `worker_requirements`: durable requests for Mission Control to satisfy worker capacity.
 - `execution_events`: audit events for queued jobs, worker requirements, agent outcomes, champion selection, champion export requests, and demo prediction requests. The project SSE endpoint streams these durable rows as refresh hints.
 
@@ -67,14 +67,19 @@ Supported execution-facing planning fields include:
 - `preprocessing.bbox_mode`
 - `preprocessing.use_dataset_normalization`
 - `augmentation_policy`
+- `augmentation_policy_config`
 - `augmentation`
 - `class_balancing`
+- `class_balancing_config`
 - `sampling_strategy`
 - optimizer, scheduler, weight decay, fine-tune strategy, pretrained/freeze flags
+- first-class mechanism metadata: `mechanism`, `intervention`, `evidence_used`, `expected_effect`
 
 The backend validates allowed model names, epochs, batch size, learning rate, image size, optimizer, scheduler, preprocessing values, augmentation keys, augmentation policy, class balancing, sampling strategy, early stopping, and fine-tune strategy.
 
-Duplicate experiment signatures include preprocessing, augmentation policy, sampling strategy, and resolution strategy. Backend follow-up validation also rejects or filters repeated mechanisms where the only changes are minor tuning knobs such as epochs, batch size, or learning rate.
+Duplicate experiment signatures include preprocessing, augmentation policy/config, class-balancing config, sampling strategy, and resolution strategy. Backend follow-up validation also rejects or filters repeated mechanisms where the only changes are minor tuning knobs such as epochs, batch size, or learning rate.
+
+LLM-originated follow-up proposals must name a mechanism and evidence-backed intervention. Label-quality mechanisms can only schedule report-only `label_quality_audit` jobs; they cannot create training jobs or mutate labels. MixUp/CutMix require bounded mixed-sample augmentation config. Effective-number class balancing requires bounded `class_balancing_config.effective_number_beta`.
 
 When an LLM planner proposal passes JSON/schema parsing but fails backend validation, the backend records the rejected invocation outcome and performs one bounded correction retry with `planner_validation_feedback` in the prompt context. The retry can only succeed if the corrected JSON passes the same backend validation and scheduling gates.
 
@@ -88,7 +93,7 @@ When an LLM planner proposal passes JSON/schema parsing but fails backend valida
 6. Workers report epoch metrics, summary updates, and final evaluation.
 7. Workers complete or fail the job through backend APIs.
 
-Worker-side preprocessing currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, augmentation policies, weighted/focal loss, and weighted sampling.
+Worker-side preprocessing currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, structured image augmentation, training-only MixUp/CutMix, weighted/focal/effective-number loss, weighted sampling, and bbox crop/full-image ablations when backend-validated annotations are available.
 
 Training evaluations for image classification include confusion matrices and per-class precision/recall/F1 when real validation/test labels are available. The backend enriches final evaluation payloads with deterministic `training_diagnostics` inside `holistic_scores`, including train/validation loss gap, divergence status, severity, and trend deltas derived from persisted epoch metrics and run summaries.
 
@@ -96,11 +101,12 @@ Worker utility modules also include:
 
 - split-file, Pascal VOC XML, and annotation JSON parsers
 - class-balanced visual exemplar generation with PIL downscale/compression and byte/image caps
+- report-only label-quality audit jobs that persist capped profile audit metadata without label mutation
 - champion export manifest/checkpoint helpers with guarded TorchScript/ONNX paths
 - TorchScript demo inference helper that returns a ranked payload when a valid worker-owned artifact exists, or a deterministic pending/error payload when dependencies/artifacts are missing
 - champion job handlers for `export_champion`, `champion_demo_prediction`, and `generate_visual_exemplars`
 
-Explicit split-file training, real bbox crop/full-image ablations, and advanced augmentation object policies remain deferred because they require a larger dataset/dataloader contract than the current safe helper slice.
+Explicit split-file training remains deferred. Model routing, prompt caching, vector retrieval, and cross-project mechanism retrieval are also intentionally deferred.
 
 ## Agent Flow
 
@@ -113,7 +119,9 @@ Experiment Planner reviews completed plans and can recommend:
 - `STOP_PROJECT`
 - `WAIT`
 
-Planner input includes project goal, dataset profile, dataset planning insights, optional visual exemplar evidence, objective context, deterministic diagnosis, supported model catalog, current champion, run deltas, no-improvement rounds, prior plans/jobs/evaluations, memory, rejected strategy memory, scorecards, and existing experiment signatures.
+Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional visual evidence, objective context, deterministic diagnosis, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, validation feedback, and existing experiment signatures.
+
+Training Monitor input is also compacted into run-evaluation cards. The backend still stores full run summaries, evaluations, epoch metrics, plans, and job configs, but the LLM receives capped cards and prompt-budget telemetry.
 
 Visual exemplars are evidence only. Backend-curated/capped metadata may help the planner cite object scale, background dominance, blur, lighting, fine-grained classes, or bbox/crop plausibility. Planner context includes exemplar caps and audit details when available. Planner output is still JSON only, and backend validation remains the gate.
 
@@ -130,6 +138,8 @@ Champion selection can come from deterministic review or validated planner decis
 If a validated `STOP_PROJECT` decision does not name a champion but successful runs exist, the backend selects the best successful run so far using the same objective-aware ranking helper used for planner context. This produces a usable champion without letting the LLM execute work or bypass validation.
 
 Mission Control displays the selected champion, champion comparison table, objective fit, model profile, confusion preview, train/validation gap, seed variance when repeated seeded runs exist, and deployment notes.
+
+Champion selection is terminal for autonomous follow-up scheduling. A project champion or persisted `SELECT_CHAMPION` decision blocks new planner calls, stale/new follow-up plan creation, and follow-up execution. Continuing after champion selection requires explicit `POST /projects/:id/experimentation/reopen`, which records `REOPEN_EXPERIMENTATION` and `EXPERIMENTATION_REOPENED`.
 
 ## Export And Demo Flow
 

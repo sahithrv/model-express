@@ -4,6 +4,7 @@ import os
 import time
 
 from worker.orchestrator_client import OrchestratorClient
+from worker.training.augmentation import normalize_augmentation_config, structured_policy_type
 
 
 def run_local_training(client: OrchestratorClient, job: dict) -> None:
@@ -19,8 +20,14 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     optimizer = str(config.get("optimizer", "adamw")).lower()
     scheduler = str(config.get("scheduler", "none")).lower()
     weight_decay = _positive_float(config.get("weight_decay"), default=0.0)
-    augmentation = config.get("augmentation") if isinstance(config.get("augmentation"), dict) else {}
-    augmentation_policy = str(config.get("augmentation_policy", "")).lower()
+    augmentation = normalize_augmentation_config(
+        config.get("augmentation"),
+        config.get("augmentation_policy", ""),
+        config.get("augmentation_policy_config"),
+    )
+    augmentation_policy = structured_policy_type(augmentation) or str(
+        config.get("augmentation_policy", "")
+    ).lower()
     class_balancing = str(config.get("class_balancing", "")).lower()
     sampling_strategy = str(config.get("sampling_strategy", "")).lower()
     preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
@@ -35,6 +42,8 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     augmentation_bonus = 0.0
     if augmentation.get("horizontal_flip"):
         augmentation_bonus += 0.006
+    if augmentation.get("vertical_flip"):
+        augmentation_bonus += 0.004
     if augmentation.get("color_jitter"):
         augmentation_bonus += 0.008
     if augmentation.get("random_crop"):
@@ -45,6 +54,10 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
         augmentation_bonus += 0.01
     elif augmentation_policy == "strong":
         augmentation_bonus += 0.012
+    elif augmentation_policy in {"basic", "randaugment", "trivialaugment", "autoaugment"}:
+        augmentation_bonus += 0.011
+    elif augmentation_policy in {"mixup", "cutmix"}:
+        augmentation_bonus += 0.009
     preprocessing_bonus = 0.0
     if str(preprocessing.get("resize_strategy", "")).lower() in {"preserve_aspect_pad", "center_crop"}:
         preprocessing_bonus += 0.004
@@ -53,7 +66,16 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     if str(preprocessing.get("normalization", "")).lower() == "none":
         preprocessing_bonus -= 0.006
     balance_bonus = 0.0
-    if class_balancing in {"weighted_loss", "class_weighted_loss", "focal_loss"}:
+    if class_balancing in {
+        "weighted_loss",
+        "class_weighted_loss",
+        "focal_loss",
+        "effective_number",
+        "effective_number_loss",
+        "effective_number_class_balanced_loss",
+        "class_balanced_loss",
+        "class_balanced_effective_number",
+    }:
         balance_bonus += 0.012
     if class_balancing in {"class_balanced_sampler", "weighted_random_sampler"} or sampling_strategy in {
         "class_balanced_sampler",
@@ -216,10 +238,14 @@ def _local_evaluation_payload(config: dict, model: str, best_macro_f1: float, be
         ),
         "preprocessing_summary": {
             "augmentation_policy": str(config.get("augmentation_policy", "")),
+            "augmentation_policy_config": config.get("augmentation_policy_config")
+            if isinstance(config.get("augmentation_policy_config"), dict)
+            else {},
             "class_balancing": str(config.get("class_balancing", "")),
             "sampling_strategy": str(config.get("sampling_strategy", "")),
             "preprocessing": config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {},
         },
+        "label_quality_audit": _local_label_quality_audit(config, per_class_metrics),
     }
 
 
@@ -264,6 +290,34 @@ def _synthetic_confusion_matrix(class_count: int, accuracy: float) -> list[list[
             values[(row + 1) % class_count] = off_diagonal
         matrix.append(values)
     return matrix
+
+
+def _local_label_quality_audit(config: dict, per_class_metrics: dict) -> dict:
+    mechanism = str(config.get("mechanism", "")).lower()
+    requested = mechanism in {"label_noise_audit", "hard_example_audit"} or bool(
+        config.get("label_quality_audit")
+    )
+    if not requested:
+        return {"status": "not_requested", "report_only": True}
+    hard_examples = [
+        {
+            "path": "",
+            "true_class": class_name,
+            "predicted_class": class_name,
+            "confidence": round(max(0.0, min(1.0, float(metrics.get("f1-score", 0.0)))), 4),
+            "correct": True,
+        }
+        for class_name, metrics in per_class_metrics.items()
+    ]
+    return {
+        "status": "simulated",
+        "report_only": True,
+        "sample_count": len(hard_examples),
+        "high_confidence_wrong": [],
+        "low_confidence_correct": hard_examples[:25],
+        "hard_examples": hard_examples[:50],
+        "notes": "Local simulator emits report-only audit metadata and never mutates labels.",
+    }
 
 
 def _positive_int(value: object, default: int) -> int:

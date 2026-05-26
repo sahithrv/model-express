@@ -81,6 +81,16 @@ type scheduleFollowUpExperimentsResponse struct {
 	FollowUpPlan *plans.ExperimentPlan   `json:"follow_up_plan,omitempty"`
 }
 
+type reopenExperimentationRequest struct {
+	Reason       string `json:"reason"`
+	SourcePlanID string `json:"source_plan_id"`
+}
+
+type reopenExperimentationResponse struct {
+	Decision decisions.AgentDecision  `json:"decision"`
+	Event    execution.ExecutionEvent `json:"event"`
+}
+
 type automaticExperimentReviewResult struct {
 	Decision     *decisions.AgentDecision
 	FollowUpPlan *plans.ExperimentPlan
@@ -96,7 +106,10 @@ const (
 	plannerBackendValidationRetryLimit  = 1
 )
 
-var errNoNovelFollowUpExperiments = fmt.Errorf("%w: no novel follow-up experiments", store.ErrInvalidRequest)
+var (
+	errNoNovelFollowUpExperiments      = fmt.Errorf("%w: no novel follow-up experiments", store.ErrInvalidRequest)
+	errChampionSelectedFollowUpBlocked = fmt.Errorf("%w: champion selected guard", errNoNovelFollowUpExperiments)
+)
 
 type updateDatasetProfileRequest struct {
 	Profile map[string]any `json:"profile" binding:"required"`
@@ -1007,6 +1020,96 @@ func (s *Server) scheduleFollowUpExperiments(c *gin.Context) {
 	})
 }
 
+func (s *Server) reopenProjectExperimentation(c *gin.Context) {
+	projectID := c.Param("id")
+	var req reopenExperimentationRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	state, err := s.projectChampionSelectionState(project.ID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if !state.Terminal {
+		writeStoreError(c, fmt.Errorf("%w: experimentation can only be reopened after a selected champion or SELECT_CHAMPION decision exists", store.ErrInvalidRequest))
+		return
+	}
+
+	planID := strings.TrimSpace(req.SourcePlanID)
+	if planID != "" {
+		plan, err := s.store.GetExperimentPlan(planID)
+		if err != nil {
+			writeStoreError(c, err)
+			return
+		}
+		if plan.ProjectID != project.ID {
+			writeStoreError(c, fmt.Errorf("%w: source plan does not belong to project", store.ErrInvalidRequest))
+			return
+		}
+	} else if state.PlanID != "" {
+		planID = state.PlanID
+	} else if projectPlans, err := s.store.ListProjectExperimentPlans(project.ID); err == nil {
+		if latestPlan, ok := latestExperimentPlan(projectPlans); ok {
+			planID = latestPlan.ID
+		}
+	} else {
+		writeStoreError(c, err)
+		return
+	}
+
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "User explicitly reopened experimentation after champion selection."
+	}
+
+	payload := map[string]any{
+		"explicit_user_action":     true,
+		"new_exploration_round":    true,
+		"reason":                   reason,
+		"reopened_at":              time.Now().UTC().Format(time.RFC3339),
+		"terminal_reason":          state.Reason,
+		"terminal_at":              state.TerminalAt.Format(time.RFC3339),
+		"previous_source_plan_id":  state.PlanID,
+		"previous_champion_job_id": state.ChampionJobID,
+	}
+	if state.DecisionID != "" {
+		payload["previous_decision_id"] = state.DecisionID
+	}
+	if state.ChampionID != "" {
+		payload["previous_champion_id"] = state.ChampionID
+	}
+
+	decision, err := s.store.CreateAgentDecision(project.ID, planID, decisions.TypeReopenExperimentation, reason, payload)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	event, err := s.store.CreateExecutionEvent(project.ID, planID, execution.EventExperimentationReopened, "Experimentation reopened by explicit user action after champion selection.", map[string]any{
+		"decision_id":              decision.ID,
+		"explicit_user_action":     true,
+		"new_exploration_round":    true,
+		"reason":                   reason,
+		"previous_source_plan_id":  state.PlanID,
+		"previous_champion_job_id": state.ChampionJobID,
+	})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, reopenExperimentationResponse{
+		Decision: decision,
+		Event:    event,
+	})
+}
+
 func (s *Server) createReviewerDecision(projectID string) (plans.ExperimentPlan, decisions.AgentDecision, error) {
 	project, err := s.store.GetProject(projectID)
 	if err != nil {
@@ -1091,6 +1194,13 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
+	if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(projectID); err != nil {
+		return plans.ExperimentPlan{}, false, err
+	} else if ok {
+		message := "Follow-up scheduling blocked because the project already has a selected champion."
+		s.recordChampionSelectedFollowUpBlocked(projectID, sourcePlan.ID, decision.ID, "", message, stopReason, stopDetails)
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
+	}
 	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
 		if err := s.validateExistingFollowUpPlanStillNovel(projectID, decision.ID, existingPlan, projectPlans); err != nil {
 			return plans.ExperimentPlan{}, false, err
@@ -1100,6 +1210,18 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 
 	experiments, err := plannedExperimentsFromPayload(decision.Payload)
 	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	experiments, err = plannedExperimentsWithStoredProposalMechanisms(decision.Payload, experiments)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	if err := validateLLMPlannerStoredMechanismContract(decision, experiments); err != nil {
+		message := "Follow-up scheduling blocked because the stored planner decision lacks a valid mechanism contract."
+		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{err.Error()})
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+	}
+	if err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, sourcePlan.DatasetID, sourcePlan.ID, decision.ID, "", experiments, payloadStringSlice(decision.Payload, "evidence_used")); err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
 	experiments, skippedExperiments := filterNovelPlannedExperiments(experiments, projectPlans)
@@ -1150,6 +1272,9 @@ func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisi
 			return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 		}
 	}
+	if err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, followUpPlan.DatasetID, followUpPlan.ID, decisionID, followUpPlan.ID, followUpPlan.Experiments, nil); err != nil {
+		return err
+	}
 	filtered, skippedExperiments := filterNovelPlannedExperiments(followUpPlan.Experiments, priorPlans)
 	if len(skippedExperiments) == 0 && len(filtered) == len(followUpPlan.Experiments) {
 		return nil
@@ -1157,6 +1282,33 @@ func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisi
 	message := fmt.Sprintf("Existing follow-up plan %s is blocked because it no longer passes backend novelty validation.", followUpPlan.ID)
 	s.recordFollowUpValidationBlocked(projectID, followUpPlan.ID, decisionID, followUpPlan.ID, message, skippedExperiments)
 	return fmt.Errorf("%w: existing follow-up plan %s is no longer schedulable", errNoNovelFollowUpExperiments, followUpPlan.ID)
+}
+
+func (s *Server) validateFollowUpExperimentMechanismsAgainstDataset(
+	projectID string,
+	datasetID string,
+	planID string,
+	decisionID string,
+	followUpPlanID string,
+	experiments []plans.PlannedExperiment,
+	planEvidence []string,
+) error {
+	if len(experiments) == 0 {
+		return nil
+	}
+	dataset, err := s.store.GetDataset(datasetID)
+	if err != nil {
+		return err
+	}
+	if err := validateMechanismDatasetEvidence(dataset.Profile, experiments, planEvidence); err != nil {
+		message := "Follow-up scheduling blocked because one or more proposed mechanisms lack backend-verifiable diagnosis or dataset support."
+		if followUpPlanID != "" {
+			message = fmt.Sprintf("Existing follow-up plan %s is blocked because one or more mechanisms lack backend-verifiable diagnosis or dataset support.", followUpPlanID)
+		}
+		s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, []string{err.Error()})
+		return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+	}
+	return nil
 }
 
 func (s *Server) recordFollowUpValidationBlocked(projectID string, planID string, decisionID string, followUpPlanID string, message string, skippedExperiments []string) {
@@ -1172,6 +1324,117 @@ func (s *Server) recordFollowUpValidationBlocked(projectID string, planID string
 	if _, err := s.store.CreateExecutionEvent(projectID, planID, execution.EventAgentOutcomeRecorded, message, payload); err != nil {
 		log.Printf("record follow-up validation block failed for project %s decision %s: %v", projectID, decisionID, err)
 	}
+}
+
+func (s *Server) recordChampionSelectedFollowUpBlocked(projectID string, planID string, decisionID string, followUpPlanID string, message string, reason string, details map[string]any) {
+	payload := map[string]any{
+		"decision_id":               decisionID,
+		"backend_validation_status": "blocked",
+		"backend_validation_error":  "champion selected guard",
+		"backend_stop_guard":        "champion_selected_guard",
+		"reason":                    reason,
+	}
+	for key, value := range details {
+		payload[key] = value
+	}
+	if followUpPlanID != "" {
+		payload["follow_up_plan_id"] = followUpPlanID
+	}
+	if _, err := s.store.CreateExecutionEvent(projectID, planID, execution.EventAgentOutcomeRecorded, message, payload); err != nil {
+		log.Printf("record champion-selected follow-up block failed for project %s decision %s: %v", projectID, decisionID, err)
+	}
+}
+
+type projectChampionSelectionState struct {
+	Terminal      bool
+	TerminalAt    time.Time
+	Reason        string
+	PlanID        string
+	DecisionID    string
+	ChampionID    string
+	ChampionJobID string
+	Reopened      bool
+	ReopenID      string
+	ReopenAt      time.Time
+}
+
+func (s *Server) projectChampionSelectedFollowUpStopReason(projectID string) (string, map[string]any, bool, error) {
+	state, err := s.projectChampionSelectionState(projectID)
+	if err != nil {
+		return "", nil, false, err
+	}
+	if !state.Terminal || state.Reopened {
+		return "", nil, false, nil
+	}
+	details := map[string]any{
+		"source_decision_id": state.DecisionID,
+		"champion_id":        state.ChampionID,
+		"champion_job_id":    state.ChampionJobID,
+		"source_plan_id":     state.PlanID,
+		"terminal_at":        state.TerminalAt.Format(time.RFC3339),
+		"reopen_required":    true,
+	}
+	if state.ReopenID != "" {
+		details["latest_reopen_decision_id"] = state.ReopenID
+		details["latest_reopen_at"] = state.ReopenAt.Format(time.RFC3339)
+	}
+	return state.Reason, details, true, nil
+}
+
+func (s *Server) projectChampionSelectionState(projectID string) (projectChampionSelectionState, error) {
+	state := projectChampionSelectionState{}
+
+	champion, err := s.store.GetProjectChampion(projectID)
+	if err == nil {
+		state.Terminal = true
+		state.TerminalAt = champion.UpdatedAt
+		if state.TerminalAt.IsZero() {
+			state.TerminalAt = champion.CreatedAt
+		}
+		state.Reason = fmt.Sprintf(
+			"Project already has selected champion %s; autonomous follow-up scheduling requires an explicit reopen or new exploration round.",
+			champion.JobID,
+		)
+		state.PlanID = champion.PlanID
+		state.DecisionID = champion.SourceDecisionID
+		state.ChampionID = champion.ID
+		state.ChampionJobID = champion.JobID
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return state, err
+	}
+
+	agentDecisions, err := s.store.ListProjectAgentDecisions(projectID)
+	if err != nil {
+		return state, err
+	}
+	for _, decision := range agentDecisions {
+		decisionType := strings.ToUpper(strings.TrimSpace(decision.DecisionType))
+		switch decisionType {
+		case decisions.TypeSelectChampion:
+			if !state.Terminal || decision.CreatedAt.After(state.TerminalAt) {
+				state.Terminal = true
+				state.TerminalAt = decision.CreatedAt
+				state.Reason = fmt.Sprintf(
+					"Project already has SELECT_CHAMPION decision %s; autonomous follow-up scheduling requires an explicit reopen or new exploration round.",
+					decision.ID,
+				)
+				state.PlanID = decision.PlanID
+				state.DecisionID = decision.ID
+				state.ChampionID = ""
+				state.ChampionJobID = payloadString(decision.Payload, "champion_job_id")
+			}
+		case decisions.TypeReopenExperimentation:
+			if state.ReopenID == "" || decision.CreatedAt.After(state.ReopenAt) {
+				state.ReopenID = decision.ID
+				state.ReopenAt = decision.CreatedAt
+			}
+		}
+	}
+	if state.Terminal && state.ReopenID != "" && !state.ReopenAt.Before(state.TerminalAt) {
+		state.Reopened = true
+	}
+
+	return state, nil
 }
 
 func (s *Server) createPendingStrategyScorecard(projectID string, sourcePlan plans.ExperimentPlan, decision decisions.AgentDecision, followUpPlan plans.ExperimentPlan) (strategies.StrategyScorecard, error) {
@@ -1193,6 +1456,7 @@ func (s *Server) createPendingStrategyScorecard(projectID string, sourcePlan pla
 		"hypothesis":            decision.Payload["hypothesis"],
 		"changed_variables":     decision.Payload["changed_variables"],
 		"proposed_experiments":  decision.Payload["proposed_experiments"],
+		"proposal_mechanisms":   decision.Payload["proposal_mechanisms"],
 		"candidate_hypotheses":  decision.Payload["candidate_hypotheses"],
 		"candidate_rankings":    decision.Payload["candidate_rankings"],
 		"rejected_options":      decision.Payload["rejected_options"],
@@ -1205,23 +1469,82 @@ func (s *Server) createPendingStrategyScorecard(projectID string, sourcePlan pla
 	if strategyType == "" {
 		strategyType = "planner_followup"
 	}
+	mechanism, intervention, diagnosisTriggers, evidenceUsed, expectedEffect := strategyScorecardMechanismFields(decision.Payload)
 	return s.store.CreateStrategyScorecard(strategies.StrategyScorecardCreate{
-		ProjectID:        projectID,
-		DatasetID:        sourcePlan.DatasetID,
-		SourceDecisionID: decision.ID,
-		SourcePlanID:     sourcePlan.ID,
-		FollowUpPlanID:   followUpPlan.ID,
-		StrategyType:     strategyType,
-		PlanningMode:     planningMode,
-		DatasetTraits:    datasetTraits,
-		ObjectiveProfile: objectiveProfile,
-		ProposedChanges:  proposedChanges,
-		ExpectedDelta:    payloadFloat(decision.Payload, "expected_delta_vs_champion"),
-		ConfidenceBefore: payloadFloat(decision.Payload, "confidence"),
-		Outcome:          strategies.OutcomePending,
-		Lesson:           "Pending follow-up outcome.",
-		Tags:             uniqueStrings([]string{"strategy_scorecard", planningMode, strategies.OutcomePending}),
+		ProjectID:         projectID,
+		DatasetID:         sourcePlan.DatasetID,
+		SourceDecisionID:  decision.ID,
+		SourcePlanID:      sourcePlan.ID,
+		FollowUpPlanID:    followUpPlan.ID,
+		StrategyType:      strategyType,
+		PlanningMode:      planningMode,
+		Mechanism:         mechanism,
+		Intervention:      intervention,
+		DiagnosisTriggers: diagnosisTriggers,
+		EvidenceUsed:      evidenceUsed,
+		ExpectedEffect:    expectedEffect,
+		DatasetTraits:     datasetTraits,
+		ObjectiveProfile:  objectiveProfile,
+		ProposedChanges:   proposedChanges,
+		ExpectedDelta:     payloadFloat(decision.Payload, "expected_delta_vs_champion"),
+		ConfidenceBefore:  payloadFloat(decision.Payload, "confidence"),
+		Outcome:           strategies.OutcomePending,
+		Lesson:            "Pending follow-up outcome.",
+		Tags:              uniqueStrings([]string{"strategy_scorecard", planningMode, mechanism, strategies.OutcomePending}),
 	})
+}
+
+func strategyScorecardMechanismFields(payload map[string]any) (string, string, []string, []string, string) {
+	diagnosisTriggers := payloadStringSlice(payload, "deterministic_diagnosis_used")
+	if len(diagnosisTriggers) == 0 {
+		diagnosisTriggers = payloadStringSlice(payload, "diagnosis_triggers")
+	}
+	evidenceUsed := payloadStringSlice(payload, "evidence_used")
+	mechanism := payloadString(payload, "mechanism")
+	intervention := payloadString(payload, "intervention")
+	expectedEffect := payloadString(payload, "expected_effect")
+
+	if proposals, ok, err := plannerProposalMechanismsFromPayload(payload); err == nil && ok {
+		for _, proposal := range proposals {
+			if mechanism == "" {
+				mechanism = proposal.Mechanism
+			}
+			if intervention == "" {
+				intervention = proposal.Intervention
+			}
+			if len(evidenceUsed) == 0 {
+				evidenceUsed = proposal.EvidenceUsed
+			}
+			if expectedEffect == "" {
+				expectedEffect = proposal.ExpectedEffect
+			}
+			if mechanism != "" && intervention != "" && len(evidenceUsed) > 0 && expectedEffect != "" {
+				break
+			}
+		}
+	}
+	if mechanism == "" || intervention == "" || len(evidenceUsed) == 0 || expectedEffect == "" {
+		if experiments, err := plannedExperimentsFromPayloadLenient(payload); err == nil {
+			for _, experiment := range experiments {
+				if mechanism == "" {
+					mechanism = experiment.Mechanism
+				}
+				if intervention == "" {
+					intervention = experiment.Intervention
+				}
+				if len(evidenceUsed) == 0 {
+					evidenceUsed = experiment.EvidenceUsed
+				}
+				if expectedEffect == "" {
+					expectedEffect = experiment.ExpectedEffect
+				}
+				if mechanism != "" && intervention != "" && len(evidenceUsed) > 0 && expectedEffect != "" {
+					break
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(mechanism), strings.TrimSpace(intervention), uniqueStrings(diagnosisTriggers), uniqueStrings(evidenceUsed), strings.TrimSpace(expectedEffect)
 }
 
 func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperimentReviewResult, error) {
@@ -1264,6 +1587,13 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 
 	decision, ok := actionDecisionForPlan(agentDecisions, latestPlan.ID)
 	if !ok {
+		if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(project.ID); err != nil {
+			return automaticExperimentReviewResult{}, err
+		} else if selected {
+			message := fmt.Sprintf("Automatic experiment review skipped for plan %s because the project already has a selected champion.", latestPlan.ID)
+			s.recordChampionSelectedFollowUpBlocked(project.ID, latestPlan.ID, "", "", message, stopReason, stopDetails)
+			return automaticExperimentReviewResult{}, nil
+		}
 		decision, err = s.store.CreateAgentDecision(
 			project.ID,
 			recommendation.PlanID,
@@ -2246,6 +2576,13 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		}
 		return true, nil
 	}
+	if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(job.ProjectID); err != nil {
+		return false, err
+	} else if selected {
+		message := fmt.Sprintf("Experiment Planner skipped for plan %s because the project already has a selected champion.", input.SourcePlan.ID)
+		s.recordChampionSelectedFollowUpBlocked(job.ProjectID, input.SourcePlan.ID, "", "", message, stopReason, stopDetails)
+		return true, nil
+	}
 
 	automationSettings := s.currentAutomationSettings()
 	config := llm.ConfigFromEnv(automationSettings.LLMEnabled, automationSettings.LLMProvider, automationSettings.LLMModel)
@@ -2729,6 +3066,7 @@ func experimentPlannerDecisionPayload(
 		"deployment_tradeoff":             recommendation.DeploymentTradeoff,
 		"candidate_hypotheses":            recommendation.CandidateHypotheses,
 		"candidate_rankings":              recommendation.CandidateRankings,
+		"proposal_mechanisms":             recommendation.ProposalMechanisms,
 		"risks":                           recommendation.Risks,
 		"expected_tradeoffs":              recommendation.ExpectedTradeoffs,
 		"novelty_notes":                   recommendation.NoveltyNotes,
@@ -2759,10 +3097,17 @@ func experimentPlannerDecisionPayload(
 	}
 
 	if strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
-		if err := validateNovelProposedExperiments(recommendation.ProposedExperiments, input.PriorPlans); err != nil {
+		experiments, err := plannerExperimentsWithProposalMechanisms(recommendation)
+		if err != nil {
 			return nil, err
 		}
-		payload["proposed_experiments"] = recommendation.ProposedExperiments
+		if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
+			return nil, err
+		}
+		if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
+			return nil, err
+		}
+		payload["proposed_experiments"] = experiments
 	}
 
 	return payload, nil
@@ -2988,6 +3333,11 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 }
 
 func (s *Server) plannerFollowUpStopReason(projectID string, sourcePlan plans.ExperimentPlan, projectPlans []plans.ExperimentPlan) (string, string, bool, error) {
+	if stopReason, _, ok, err := s.projectChampionSelectedFollowUpStopReason(projectID); err != nil {
+		return "", "", false, err
+	} else if ok {
+		return stopReason, "champion_selected_guard", true, nil
+	}
 	project, err := s.store.GetProject(projectID)
 	if err != nil {
 		return "", "", false, err
@@ -3477,25 +3827,30 @@ func plannerStrategyScorecards(scorecards []strategies.StrategyScorecard, datase
 			continue
 		}
 		out = append(out, agents.PlannerStrategyScorecard{
-			ID:               scorecard.ID,
-			DatasetID:        scorecard.DatasetID,
-			SourceDecisionID: scorecard.SourceDecisionID,
-			SourcePlanID:     scorecard.SourcePlanID,
-			FollowUpPlanID:   scorecard.FollowUpPlanID,
-			StrategyType:     scorecard.StrategyType,
-			PlanningMode:     scorecard.PlanningMode,
-			DatasetTraits:    scorecard.DatasetTraits,
-			ObjectiveProfile: scorecard.ObjectiveProfile,
-			ProposedChanges:  scorecard.ProposedChanges,
-			ExpectedDelta:    scorecard.ExpectedDelta,
-			ActualDelta:      scorecard.ActualDelta,
-			ConfidenceBefore: scorecard.ConfidenceBefore,
-			ConfidenceAfter:  scorecard.ConfidenceAfter,
-			CostUSD:          scorecard.CostUSD,
-			RuntimeSeconds:   scorecard.RuntimeSeconds,
-			Outcome:          scorecard.Outcome,
-			Lesson:           scorecard.Lesson,
-			Tags:             scorecard.Tags,
+			ID:                scorecard.ID,
+			DatasetID:         scorecard.DatasetID,
+			SourceDecisionID:  scorecard.SourceDecisionID,
+			SourcePlanID:      scorecard.SourcePlanID,
+			FollowUpPlanID:    scorecard.FollowUpPlanID,
+			StrategyType:      scorecard.StrategyType,
+			PlanningMode:      scorecard.PlanningMode,
+			Mechanism:         scorecard.Mechanism,
+			Intervention:      scorecard.Intervention,
+			DiagnosisTriggers: scorecard.DiagnosisTriggers,
+			EvidenceUsed:      scorecard.EvidenceUsed,
+			ExpectedEffect:    scorecard.ExpectedEffect,
+			DatasetTraits:     scorecard.DatasetTraits,
+			ObjectiveProfile:  scorecard.ObjectiveProfile,
+			ProposedChanges:   scorecard.ProposedChanges,
+			ExpectedDelta:     scorecard.ExpectedDelta,
+			ActualDelta:       scorecard.ActualDelta,
+			ConfidenceBefore:  scorecard.ConfidenceBefore,
+			ConfidenceAfter:   scorecard.ConfidenceAfter,
+			CostUSD:           scorecard.CostUSD,
+			RuntimeSeconds:    scorecard.RuntimeSeconds,
+			Outcome:           scorecard.Outcome,
+			Lesson:            scorecard.Lesson,
+			Tags:              scorecard.Tags,
 		})
 		if len(out) >= 10 {
 			break
@@ -3744,6 +4099,44 @@ func failedSummaryCount(summaries []runs.TrainingRunSummary) int {
 func payloadString(payload map[string]any, key string) string {
 	value, _ := payload[key].(string)
 	return value
+}
+
+func payloadStringSlice(payload map[string]any, key string) []string {
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return nil
+	}
+	if typed, ok := value.([]string); ok {
+		return append([]string(nil), typed...)
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	out := []string{}
+	if err := json.Unmarshal(blob, &out); err == nil {
+		return out
+	}
+	values, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	for _, item := range values {
+		if text, ok := item.(string); ok {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func nonEmptyStringValues(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func payloadMap(payload map[string]any, key string) map[string]any {
@@ -4315,6 +4708,8 @@ func filterNovelPlannedExperiments(experiments []plans.PlannedExperiment, projec
 
 func experimentSignature(experiment plans.PlannedExperiment) string {
 	augmentationBlob, _ := json.Marshal(experiment.Augmentation)
+	augmentationPolicyConfigBlob, _ := json.Marshal(experiment.AugmentationPolicyConfig)
+	classBalancingConfigBlob, _ := json.Marshal(experiment.ClassBalancingConfig)
 	preprocessingBlob, _ := json.Marshal(experiment.Preprocessing)
 	return strings.Join([]string{
 		strings.ToLower(strings.TrimSpace(experiment.Template)),
@@ -4330,7 +4725,9 @@ func experimentSignature(experiment plans.PlannedExperiment) string {
 		strconv.FormatFloat(experiment.WeightDecay, 'g', -1, 64),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
+		string(augmentationPolicyConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
+		string(classBalancingConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.SamplingStrategy)),
 		strconv.Itoa(experiment.EarlyStoppingPatience),
 		strconv.FormatBool(experiment.Pretrained),
@@ -4341,6 +4738,8 @@ func experimentSignature(experiment plans.PlannedExperiment) string {
 
 func experimentMechanismSignature(experiment plans.PlannedExperiment) string {
 	augmentationBlob, _ := json.Marshal(experiment.Augmentation)
+	augmentationPolicyConfigBlob, _ := json.Marshal(experiment.AugmentationPolicyConfig)
+	classBalancingConfigBlob, _ := json.Marshal(experiment.ClassBalancingConfig)
 	preprocessingBlob, _ := json.Marshal(experiment.Preprocessing)
 	return strings.Join([]string{
 		strings.ToLower(strings.TrimSpace(experiment.Template)),
@@ -4353,7 +4752,9 @@ func experimentMechanismSignature(experiment plans.PlannedExperiment) string {
 		strconv.FormatFloat(experiment.WeightDecay, 'g', -1, 64),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
+		string(augmentationPolicyConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
+		string(classBalancingConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.SamplingStrategy)),
 		strconv.FormatBool(experiment.Pretrained),
 		strconv.FormatBool(experiment.FreezeBackbone),
@@ -4612,7 +5013,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 
 	jobsByExperiment := map[int]jobs.ExperimentJob{}
 	for _, job := range existingJobs {
-		if job.Template != jobs.TemplateTrainExperiment {
+		if job.Template != jobs.TemplateTrainExperiment && job.Template != jobs.TemplateLabelQualityAudit {
 			continue
 		}
 		if job.Status == jobs.StatusFailed {
@@ -4643,22 +5044,28 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			continue
 		}
 
+		jobTemplate := experimentExecutionTemplate(experiment)
 		config := map[string]any{
 			"plan_id":             plan.ID,
 			"dataset_id":          plan.DatasetID,
 			"experiment_index":    index,
 			"experiment_template": experiment.Template,
-			"model":               experiment.Model,
-			"epochs":              experiment.Epochs,
-			"batch_size":          experiment.BatchSize,
-			"learning_rate":       experiment.LearningRate,
 			"target_metric":       plan.TargetMetric,
 			"provider":            provider,
 			"gpu_type":            req.GPUType,
 		}
+		if jobTemplate == jobs.TemplateTrainExperiment {
+			config["model"] = experiment.Model
+			config["epochs"] = experiment.Epochs
+			config["batch_size"] = experiment.BatchSize
+			config["learning_rate"] = experiment.LearningRate
+		} else if jobTemplate == jobs.TemplateLabelQualityAudit {
+			config["audit_type"] = strings.ToLower(strings.TrimSpace(experiment.Mechanism))
+			config["report_only"] = true
+		}
 		addOptionalExperimentConfig(config, experiment)
 
-		job, err := s.store.CreateJob(plan.ProjectID, jobs.TemplateTrainExperiment, config)
+		job, err := s.store.CreateJob(plan.ProjectID, jobTemplate, config)
 		if err != nil {
 			return executeExperimentPlanResponse{}, err
 		}
@@ -4676,6 +5083,13 @@ func (s *Server) validateFollowUpPlanCanExecute(plan plans.ExperimentPlan) error
 	if plan.SourceDecisionID == "" {
 		return nil
 	}
+	if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(plan.ProjectID); err != nil {
+		return err
+	} else if ok {
+		message := fmt.Sprintf("Follow-up execution blocked for plan %s because the project already has a selected champion.", plan.ID)
+		s.recordChampionSelectedFollowUpBlocked(plan.ProjectID, plan.ID, plan.SourceDecisionID, plan.ID, message, stopReason, stopDetails)
+		return fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
+	}
 	projectPlans, err := s.store.ListProjectExperimentPlans(plan.ProjectID)
 	if err != nil {
 		return err
@@ -4683,7 +5097,26 @@ func (s *Server) validateFollowUpPlanCanExecute(plan plans.ExperimentPlan) error
 	return s.validateExistingFollowUpPlanStillNovel(plan.ProjectID, plan.SourceDecisionID, plan, projectPlans)
 }
 
+func experimentExecutionTemplate(experiment plans.PlannedExperiment) string {
+	if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+		return jobs.TemplateLabelQualityAudit
+	}
+	return jobs.TemplateTrainExperiment
+}
+
 func addOptionalExperimentConfig(config map[string]any, experiment plans.PlannedExperiment) {
+	if experiment.Mechanism != "" {
+		config["mechanism"] = experiment.Mechanism
+	}
+	if experiment.Intervention != "" {
+		config["intervention"] = experiment.Intervention
+	}
+	if len(experiment.EvidenceUsed) > 0 {
+		config["evidence_used"] = experiment.EvidenceUsed
+	}
+	if experiment.ExpectedEffect != "" {
+		config["expected_effect"] = experiment.ExpectedEffect
+	}
 	if experiment.ImageSize > 0 {
 		config["image_size"] = experiment.ImageSize
 	}
@@ -4708,8 +5141,14 @@ func addOptionalExperimentConfig(config map[string]any, experiment plans.Planned
 	if experiment.AugmentationPolicy != "" {
 		config["augmentation_policy"] = experiment.AugmentationPolicy
 	}
+	if experiment.AugmentationPolicyConfig != nil {
+		config["augmentation_policy_config"] = experiment.AugmentationPolicyConfig
+	}
 	if experiment.ClassBalancing != "" {
 		config["class_balancing"] = experiment.ClassBalancing
+	}
+	if len(experiment.ClassBalancingConfig) > 0 {
+		config["class_balancing_config"] = experiment.ClassBalancingConfig
 	}
 	if experiment.SamplingStrategy != "" {
 		config["sampling_strategy"] = experiment.SamplingStrategy
@@ -4803,9 +5242,400 @@ func plannedExperimentsFromPayload(payload map[string]any) ([]plans.PlannedExper
 	return experiments, nil
 }
 
+func plannedExperimentsFromPayloadLenient(payload map[string]any) ([]plans.PlannedExperiment, error) {
+	value, ok := payload["proposed_experiments"]
+	if !ok || value == nil {
+		return nil, fmt.Errorf("%w: reviewer decision does not include proposed_experiments", store.ErrInvalidRequest)
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var experiments []plans.PlannedExperiment
+	if err := json.Unmarshal(blob, &experiments); err != nil {
+		return nil, err
+	}
+	return experiments, nil
+}
+
+func validateLLMPlannerStoredMechanismContract(decision decisions.AgentDecision, experiments []plans.PlannedExperiment) error {
+	if decision.Payload["decision_source"] != llmExperimentPlannerDecisionSource {
+		return nil
+	}
+	return validatePlannedExperimentMechanismContract(experiments, payloadStringSlice(decision.Payload, "evidence_used"))
+}
+
+func plannerExperimentsWithProposalMechanisms(recommendation agents.ExperimentPlanningRecommendation) ([]plans.PlannedExperiment, error) {
+	experiments := append([]plans.PlannedExperiment(nil), recommendation.ProposedExperiments...)
+	if len(experiments) == 0 {
+		return experiments, nil
+	}
+	return attachProposalMechanismsToExperiments(experiments, recommendation.ProposalMechanisms)
+}
+
+func plannedExperimentsWithStoredProposalMechanisms(payload map[string]any, experiments []plans.PlannedExperiment) ([]plans.PlannedExperiment, error) {
+	mechanisms, ok, err := plannerProposalMechanismsFromPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return experiments, nil
+	}
+	return attachProposalMechanismsToExperiments(experiments, mechanisms)
+}
+
+func plannerProposalMechanismsFromPayload(payload map[string]any) ([]agents.PlannerProposalMechanism, bool, error) {
+	value, ok := payload["proposal_mechanisms"]
+	if !ok || value == nil {
+		return nil, false, nil
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: proposal_mechanisms could not be encoded", store.ErrInvalidRequest)
+	}
+	var mechanisms []agents.PlannerProposalMechanism
+	if err := json.Unmarshal(blob, &mechanisms); err != nil {
+		return nil, false, fmt.Errorf("%w: proposal_mechanisms has an invalid shape", store.ErrInvalidRequest)
+	}
+	return mechanisms, true, nil
+}
+
+func attachProposalMechanismsToExperiments(experiments []plans.PlannedExperiment, mechanisms []agents.PlannerProposalMechanism) ([]plans.PlannedExperiment, error) {
+	out := append([]plans.PlannedExperiment(nil), experiments...)
+	mechanismsByIndex := map[int]agents.PlannerProposalMechanism{}
+	for index, mechanism := range mechanisms {
+		if mechanism.ExperimentIndex < 0 || mechanism.ExperimentIndex >= len(out) {
+			return nil, fmt.Errorf("%w: proposal_mechanisms[%d] has invalid experiment_index %d", store.ErrInvalidRequest, index, mechanism.ExperimentIndex)
+		}
+		if _, exists := mechanismsByIndex[mechanism.ExperimentIndex]; exists {
+			return nil, fmt.Errorf("%w: proposal_mechanisms duplicate experiment_index %d", store.ErrInvalidRequest, mechanism.ExperimentIndex)
+		}
+		mechanismsByIndex[mechanism.ExperimentIndex] = mechanism
+	}
+	for index := range out {
+		mechanism, ok := mechanismsByIndex[index]
+		if !ok {
+			continue
+		}
+		out[index].Mechanism = mechanism.Mechanism
+		out[index].Intervention = mechanism.Intervention
+		out[index].EvidenceUsed = append([]string(nil), mechanism.EvidenceUsed...)
+		out[index].ExpectedEffect = mechanism.ExpectedEffect
+	}
+	return out, nil
+}
+
+func validateLLMPlannerMechanismContract(experiments []plans.PlannedExperiment, evidenceUsed []string) error {
+	return validatePlannedExperimentMechanismContract(experiments, evidenceUsed)
+}
+
+func validatePlannedExperimentMechanismContract(experiments []plans.PlannedExperiment, planEvidence []string) error {
+	if len(experiments) == 0 {
+		return nil
+	}
+	for index, experiment := range experiments {
+		mechanism := strings.ToLower(strings.TrimSpace(experiment.Mechanism))
+		if mechanism == "" {
+			return fmt.Errorf("%w: proposed experiment %d is missing mechanism", store.ErrInvalidRequest, index)
+		}
+		if !allowedExperimentValue(mechanism, allowedPlannerMechanisms()) {
+			return fmt.Errorf("%w: proposed experiment %d has unsupported mechanism %q", store.ErrInvalidRequest, index, experiment.Mechanism)
+		}
+		if strings.TrimSpace(experiment.Intervention) == "" {
+			return fmt.Errorf("%w: proposed experiment %d is missing intervention", store.ErrInvalidRequest, index)
+		}
+		if strings.TrimSpace(experiment.ExpectedEffect) == "" {
+			return fmt.Errorf("%w: proposed experiment %d is missing expected_effect", store.ErrInvalidRequest, index)
+		}
+		if len(nonEmptyStringValues(experiment.EvidenceUsed)) == 0 && len(nonEmptyStringValues(planEvidence)) == 0 {
+			return fmt.Errorf("%w: proposed experiment %d is missing evidence_used", store.ErrInvalidRequest, index)
+		}
+	}
+	return nil
+}
+
+func validateMechanismDatasetEvidence(profile map[string]any, experiments []plans.PlannedExperiment, planEvidence []string) error {
+	violations := []string{}
+	for index, experiment := range experiments {
+		mechanism := strings.ToLower(strings.TrimSpace(experiment.Mechanism))
+		if mechanism == "" {
+			continue
+		}
+		evidenceText := experimentMechanismEvidenceText(experiment, planEvidence)
+		switch mechanism {
+		case "class_imbalance", "minority_targeting":
+			if !classBalancingConfigured(experiment) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism %s requires class_balancing or sampling_strategy", index, mechanism))
+			}
+			if !profileOrDiagnosisHasClassImbalanceEvidence(profile, evidenceText) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism %s requires dataset imbalance, per-class error, or minority-failure evidence", index, mechanism))
+			}
+		case "bbox_crop_ablation":
+			if !bboxCropConfigured(experiment) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism bbox_crop_ablation requires bbox crop preprocessing", index))
+			}
+			if !profileHasBBoxEvidence(profile) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism bbox_crop_ablation requires backend-profiled bbox/annotation evidence", index))
+			}
+		case "resolution_crop":
+			if !resolutionCropConfigured(experiment) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism resolution_crop requires image size, resolution strategy, or crop preprocessing changes", index))
+			}
+			if resolutionCropNeedsEvidence(experiment) && !profileOrDiagnosisHasResolutionCropEvidence(profile, evidenceText) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism resolution_crop requires object-scale, fine-grained, dimension, crop, or visual-trait evidence", index))
+			}
+		case "augmentation_auto":
+			if !autoAugmentationConfigured(experiment) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism augmentation_auto requires structured randaugment, trivialaugment, or autoaugment policy config", index))
+			}
+		case "augmentation_mixed_sample":
+			if !mixedSampleAugmentationConfigured(experiment) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism augmentation_mixed_sample requires structured MixUp or CutMix augmentation policy config", index))
+			}
+		case "label_noise_audit", "hard_example_audit":
+			if !labelQualityAuditExperiment(experiment) {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism %s is report-only and must use template %s instead of creating a training job", index, mechanism, jobs.TemplateLabelQualityAudit))
+			}
+		case "distillation":
+			violations = append(violations, fmt.Sprintf("experiment %d mechanism distillation is not schedulable until teacher-artifact validation and worker support are enabled", index))
+		case "deployment_latency":
+			if !containsAnyText(evidenceText, "latency", "runtime", "cost", "edge", "live", "small", "compact", "mobile") {
+				violations = append(violations, fmt.Sprintf("experiment %d mechanism deployment_latency requires deployment, latency, runtime, cost, or compact-model evidence", index))
+			}
+		}
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("%w: %s", store.ErrInvalidRequest, strings.Join(violations, "; "))
+	}
+	return nil
+}
+
+func experimentMechanismEvidenceText(experiment plans.PlannedExperiment, planEvidence []string) string {
+	parts := append([]string{}, planEvidence...)
+	parts = append(parts, experiment.EvidenceUsed...)
+	parts = append(parts,
+		experiment.Intervention,
+		experiment.ExpectedEffect,
+		experiment.Reason,
+		experiment.Strategy,
+	)
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+func classBalancingConfigured(experiment plans.PlannedExperiment) bool {
+	return nonDefaultText(experiment.ClassBalancing, "none") || nonDefaultText(experiment.SamplingStrategy, "none")
+}
+
+func bboxCropConfigured(experiment plans.PlannedExperiment) bool {
+	if experiment.Preprocessing == nil {
+		return false
+	}
+	return containsAnyText(strings.ToLower(experiment.Preprocessing.CropStrategy+" "+experiment.Preprocessing.BBoxMode+" "+experiment.Preprocessing.ResizeStrategy), "bbox", "box")
+}
+
+func resolutionCropConfigured(experiment plans.PlannedExperiment) bool {
+	if experiment.ImageSize > 0 || nonDefaultText(experiment.ResolutionStrategy, "fixed") {
+		return true
+	}
+	if experiment.Preprocessing == nil {
+		return false
+	}
+	return nonDefaultText(experiment.Preprocessing.ResizeStrategy, "squash") ||
+		nonDefaultText(experiment.Preprocessing.CropStrategy, "none") ||
+		nonDefaultText(experiment.Preprocessing.Normalization, "imagenet")
+}
+
+func resolutionCropNeedsEvidence(experiment plans.PlannedExperiment) bool {
+	if experiment.ImageSize > 256 {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(experiment.ResolutionStrategy), "high_resolution_ablation") {
+		return true
+	}
+	if experiment.Preprocessing == nil {
+		return false
+	}
+	return containsAnyText(strings.ToLower(experiment.Preprocessing.CropStrategy+" "+experiment.Preprocessing.ResizeStrategy), "crop", "bbox", "aspect")
+}
+
+func autoAugmentationConfigured(experiment plans.PlannedExperiment) bool {
+	policy := strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy))
+	if containsAnyText(policy, "randaugment", "trivialaugment", "autoaugment") {
+		return true
+	}
+	if experiment.AugmentationPolicyConfig == nil {
+		return false
+	}
+	policyType := strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicyConfig.PolicyType))
+	return policyType == "randaugment" || policyType == "trivialaugment" || policyType == "trivialaugmentwide" || policyType == "autoaugment"
+}
+
+func mixedSampleAugmentationConfigured(experiment plans.PlannedExperiment) bool {
+	policy := strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy))
+	if policy == "mixup" || policy == "cutmix" {
+		return true
+	}
+	if experiment.AugmentationPolicyConfig == nil {
+		return false
+	}
+	policyType := strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicyConfig.PolicyType))
+	return policyType == "mixup" || policyType == "cutmix"
+}
+
+func labelQualityAuditExperiment(experiment plans.PlannedExperiment) bool {
+	if !strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+		return false
+	}
+	mechanism := strings.ToLower(strings.TrimSpace(experiment.Mechanism))
+	return mechanism == "label_noise_audit" || mechanism == "hard_example_audit"
+}
+
+func profileOrDiagnosisHasClassImbalanceEvidence(profile map[string]any, evidenceText string) bool {
+	if profileFloat(profile, "imbalance_ratio") >= 1.5 {
+		return true
+	}
+	distribution := profileMap(profile, "class_distribution")
+	if len(distribution) == 0 {
+		distribution = profileMap(profile, "images_per_class")
+	}
+	if classDistributionImbalanceRatio(distribution) >= 1.5 {
+		return true
+	}
+	return containsAnyText(evidenceText, "class_imbalance", "class imbalance", "minority", "rare class", "per-class", "per class", "macro-f1 trails accuracy", "macro f1 trails accuracy")
+}
+
+func classDistributionImbalanceRatio(distribution map[string]any) float64 {
+	if len(distribution) == 0 {
+		return 0
+	}
+	minCount := math.MaxFloat64
+	maxCount := 0.0
+	for _, value := range distribution {
+		count := payloadNumber(value)
+		if count <= 0 {
+			continue
+		}
+		if count < minCount {
+			minCount = count
+		}
+		if count > maxCount {
+			maxCount = count
+		}
+	}
+	if minCount == math.MaxFloat64 || minCount <= 0 {
+		return 0
+	}
+	return maxCount / minCount
+}
+
+func profileHasBBoxEvidence(profile map[string]any) bool {
+	if profileBool(profile, "bbox_available") || profileBool(profile, "annotations_available") || profileInt(profile, "bbox_annotations_count") > 0 {
+		return true
+	}
+	metadata := profileMap(profile, "metadata_summary")
+	if metadataBool(metadata, "bbox_available") || metadataBool(metadata, "annotations_available") || payloadNumber(metadata["bbox_annotations_count"]) > 0 {
+		return true
+	}
+	traits := profileStringSlice(profile, "dataset_traits")
+	for _, trait := range traits {
+		if containsAnyText(strings.ToLower(trait), "bbox", "bounding box", "annotation") {
+			return true
+		}
+	}
+	for _, artifact := range profileMapSlice(profile, "artifacts") {
+		blob, _ := json.Marshal(artifact)
+		if containsAnyText(strings.ToLower(string(blob)), "bbox", "bounding_box", "annotation", "coco", "voc") {
+			return true
+		}
+	}
+	return false
+}
+
+func profileOrDiagnosisHasResolutionCropEvidence(profile map[string]any, evidenceText string) bool {
+	if containsAnyText(evidenceText, "small object", "object scale", "fine-grained", "fine grained", "crop mismatch", "background dominance", "aspect ratio", "variable dimensions", "image dimension") {
+		return true
+	}
+	traits := profileStringSlice(profile, "dataset_traits")
+	for _, trait := range traits {
+		if containsAnyText(strings.ToLower(trait), "small object", "object scale", "fine-grained", "fine grained", "background", "crop", "aspect", "variable dimension", "high resolution") {
+			return true
+		}
+	}
+	widthMin := profileInt(profile, "width_min")
+	widthMax := profileInt(profile, "width_max")
+	heightMin := profileInt(profile, "height_min")
+	heightMax := profileInt(profile, "height_max")
+	if widthMax >= 512 || heightMax >= 512 {
+		return true
+	}
+	if widthMin > 0 && widthMax > widthMin*2 {
+		return true
+	}
+	if heightMin > 0 && heightMax > heightMin*2 {
+		return true
+	}
+	return false
+}
+
+func payloadNumber(value any) float64 {
+	switch typed := value.(type) {
+	case int:
+		return float64(typed)
+	case int64:
+		return float64(typed)
+	case float64:
+		return typed
+	case float32:
+		return float64(typed)
+	case json.Number:
+		out, _ := typed.Float64()
+		return out
+	default:
+		return 0
+	}
+}
+
+func nonDefaultText(value string, defaults ...string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return false
+	}
+	for _, fallback := range defaults {
+		if normalized == strings.ToLower(strings.TrimSpace(fallback)) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsAnyText(value string, needles ...string) bool {
+	value = strings.ToLower(value)
+	for _, needle := range needles {
+		if strings.Contains(value, strings.ToLower(strings.TrimSpace(needle))) {
+			return true
+		}
+	}
+	return false
+}
+
 func validatePlannedExperiment(experiment plans.PlannedExperiment, index int) error {
 	if strings.TrimSpace(experiment.Template) == "" {
 		return fmt.Errorf("%w: proposed experiment %d is missing template", store.ErrInvalidRequest, index)
+	}
+	if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+		if !labelQualityAuditExperiment(experiment) {
+			return fmt.Errorf("%w: proposed experiment %d template %s requires mechanism label_noise_audit or hard_example_audit", store.ErrInvalidRequest, index, jobs.TemplateLabelQualityAudit)
+		}
+		if strings.TrimSpace(experiment.Intervention) == "" {
+			return fmt.Errorf("%w: proposed experiment %d audit job is missing intervention", store.ErrInvalidRequest, index)
+		}
+		if strings.TrimSpace(experiment.ExpectedEffect) == "" {
+			return fmt.Errorf("%w: proposed experiment %d audit job is missing expected_effect", store.ErrInvalidRequest, index)
+		}
+		if len(nonEmptyStringValues(experiment.EvidenceUsed)) == 0 {
+			return fmt.Errorf("%w: proposed experiment %d audit job is missing evidence_used", store.ErrInvalidRequest, index)
+		}
+		return nil
 	}
 	if strings.TrimSpace(experiment.Model) == "" {
 		return fmt.Errorf("%w: proposed experiment %d is missing model", store.ErrInvalidRequest, index)
@@ -4848,8 +5678,16 @@ func validatePlannedExperiment(experiment plans.PlannedExperiment, index int) er
 	if experiment.AugmentationPolicy != "" && !allowedExperimentValue(experiment.AugmentationPolicy, allowedAugmentationPolicies()) {
 		return fmt.Errorf("%w: proposed experiment %d has unsupported augmentation_policy %q", store.ErrInvalidRequest, index, experiment.AugmentationPolicy)
 	}
+	if experiment.AugmentationPolicyConfig != nil {
+		if err := validateAugmentationPolicyConfig(*experiment.AugmentationPolicyConfig, index); err != nil {
+			return err
+		}
+	}
 	if experiment.ClassBalancing != "" && !allowedExperimentValue(experiment.ClassBalancing, allowedClassBalancingStrategies()) {
 		return fmt.Errorf("%w: proposed experiment %d has unsupported class_balancing %q", store.ErrInvalidRequest, index, experiment.ClassBalancing)
+	}
+	if err := validateClassBalancingConfig(experiment.ClassBalancing, experiment.ClassBalancingConfig, index); err != nil {
+		return err
 	}
 	if experiment.SamplingStrategy != "" && !allowedExperimentValue(experiment.SamplingStrategy, allowedSamplingStrategies()) {
 		return fmt.Errorf("%w: proposed experiment %d has unsupported sampling_strategy %q", store.ErrInvalidRequest, index, experiment.SamplingStrategy)
@@ -4865,6 +5703,37 @@ func validatePlannedExperiment(experiment plans.PlannedExperiment, index int) er
 		}
 	}
 	return nil
+}
+
+func validateClassBalancingConfig(strategy string, config map[string]any, index int) error {
+	if len(config) == 0 {
+		return nil
+	}
+	if !effectiveNumberClassBalancing(strategy) {
+		return fmt.Errorf("%w: proposed experiment %d class_balancing_config is only supported with effective_number_loss class balancing", store.ErrInvalidRequest, index)
+	}
+	for key, value := range config {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		switch normalized {
+		case "effective_number_beta":
+			beta := payloadNumber(value)
+			if beta < 0.9 || beta > 0.99999 {
+				return fmt.Errorf("%w: proposed experiment %d class_balancing_config.effective_number_beta must be between 0.9 and 0.99999", store.ErrInvalidRequest, index)
+			}
+		default:
+			return fmt.Errorf("%w: proposed experiment %d has unsupported class_balancing_config key %q", store.ErrInvalidRequest, index, key)
+		}
+	}
+	return nil
+}
+
+func effectiveNumberClassBalancing(strategy string) bool {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "effective_number", "effective_number_loss", "effective_number_class_balanced_loss", "class_balanced_effective_number":
+		return true
+	default:
+		return false
+	}
 }
 
 func validatePreprocessingConfig(preprocessing plans.Preprocessing, index int) error {
@@ -4898,8 +5767,56 @@ func validateAugmentationConfig(augmentation map[string]any, index int) error {
 	return nil
 }
 
+func validateAugmentationPolicyConfig(config plans.AugmentationPolicyConfig, index int) error {
+	policyType := strings.ToLower(strings.TrimSpace(config.PolicyType))
+	if policyType == "" {
+		return fmt.Errorf("%w: proposed experiment %d augmentation_policy_config.policy_type is required", store.ErrInvalidRequest, index)
+	}
+	if !allowedExperimentValue(policyType, allowedStructuredAugmentationPolicyTypes()) {
+		return fmt.Errorf("%w: proposed experiment %d has unsupported augmentation_policy_config.policy_type %q", store.ErrInvalidRequest, index, config.PolicyType)
+	}
+	if config.Magnitude < 0 || config.Magnitude > 15 {
+		return fmt.Errorf("%w: proposed experiment %d augmentation_policy_config.magnitude must be between 0 and 15", store.ErrInvalidRequest, index)
+	}
+	if config.NumOps < 0 || config.NumOps > 3 {
+		return fmt.Errorf("%w: proposed experiment %d augmentation_policy_config.num_ops must be between 0 and 3", store.ErrInvalidRequest, index)
+	}
+	if config.NumMagnitudeBins < 0 || config.NumMagnitudeBins > 31 || (config.NumMagnitudeBins > 0 && config.NumMagnitudeBins < 2) {
+		return fmt.Errorf("%w: proposed experiment %d augmentation_policy_config.num_magnitude_bins must be between 2 and 31 when set", store.ErrInvalidRequest, index)
+	}
+	if config.Probability < 0 || config.Probability > 1 {
+		return fmt.Errorf("%w: proposed experiment %d augmentation_policy_config.probability must be between 0 and 1", store.ErrInvalidRequest, index)
+	}
+	if config.Alpha < 0 || config.Alpha > 1 {
+		return fmt.Errorf("%w: proposed experiment %d augmentation_policy_config.alpha must be between 0 and 1", store.ErrInvalidRequest, index)
+	}
+	return nil
+}
+
 func allowedExperimentValue(value string, allowed map[string]bool) bool {
 	return allowed[strings.ToLower(strings.TrimSpace(value))]
+}
+
+func allowedPlannerMechanisms() map[string]bool {
+	return map[string]bool{
+		"stop_select_champion":      true,
+		"baseline_control":          true,
+		"architecture_challenge":    true,
+		"capacity_finetune":         true,
+		"optimizer_scheduler":       true,
+		"regularization":            true,
+		"augmentation_basic":        true,
+		"augmentation_auto":         true,
+		"augmentation_mixed_sample": true,
+		"class_imbalance":           true,
+		"minority_targeting":        true,
+		"resolution_crop":           true,
+		"bbox_crop_ablation":        true,
+		"label_noise_audit":         true,
+		"hard_example_audit":        true,
+		"deployment_latency":        true,
+		"distillation":              true,
+	}
 }
 
 func allowedOptimizers() map[string]bool {
@@ -4953,7 +5870,33 @@ func allowedBBoxModes() map[string]bool {
 }
 
 func allowedAugmentationPolicies() map[string]bool {
-	return map[string]bool{"none": true, "light": true, "moderate": true, "strong": true, "custom": true}
+	return map[string]bool{
+		"none":               true,
+		"light":              true,
+		"moderate":           true,
+		"strong":             true,
+		"custom":             true,
+		"basic":              true,
+		"randaugment":        true,
+		"trivialaugment":     true,
+		"trivialaugmentwide": true,
+		"autoaugment":        true,
+		"mixup":              true,
+		"cutmix":             true,
+	}
+}
+
+func allowedStructuredAugmentationPolicyTypes() map[string]bool {
+	return map[string]bool{
+		"none":               true,
+		"basic":              true,
+		"randaugment":        true,
+		"trivialaugment":     true,
+		"trivialaugmentwide": true,
+		"autoaugment":        true,
+		"mixup":              true,
+		"cutmix":             true,
+	}
 }
 
 func allowedAugmentationKeys() map[string]bool {
@@ -4969,12 +5912,16 @@ func allowedAugmentationKeys() map[string]bool {
 
 func allowedClassBalancingStrategies() map[string]bool {
 	return map[string]bool{
-		"none":                    true,
-		"weighted_loss":           true,
-		"class_weighted_loss":     true,
-		"class_balanced_sampler":  true,
-		"weighted_random_sampler": true,
-		"focal_loss":              true,
+		"none":                                 true,
+		"weighted_loss":                        true,
+		"class_weighted_loss":                  true,
+		"effective_number":                     true,
+		"effective_number_loss":                true,
+		"effective_number_class_balanced_loss": true,
+		"class_balanced_effective_number":      true,
+		"class_balanced_sampler":               true,
+		"weighted_random_sampler":              true,
+		"focal_loss":                           true,
 	}
 }
 

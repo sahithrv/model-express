@@ -76,22 +76,27 @@ type ExperimentPlannerInput struct {
 }
 
 type PlannerContextSnapshot struct {
-	ContextVersion         string                      `json:"context_version"`
-	Project                PlannerProjectCard          `json:"project"`
-	DatasetCard            PlannerDatasetCard          `json:"dataset_card"`
-	SourcePlanCard         PlannerSourcePlanCard       `json:"source_plan_card"`
-	ObjectiveContext       ProjectObjectiveContext     `json:"objective_context"`
-	ChampionCard           PlannerChampionCard         `json:"champion_card"`
-	CompletedExperimentLog []PlannerExperimentLog      `json:"completed_experiment_ledger"`
-	FailureDiagnosis       PlannerFailureDiagnosis     `json:"failure_diagnosis"`
-	SearchCoverage         PlannerSearchCoverage       `json:"search_coverage"`
-	StrategyLessons        []PlannerStrategyLesson     `json:"strategy_lessons"`
-	BlockedRepeats         []RejectedPlannerOption     `json:"blocked_repeats"`
-	VisualEvidence         map[string]any              `json:"visual_evidence"`
-	ModelCatalog           []SupportedModelSpec        `json:"model_catalog"`
-	ValidationFeedback     []PlannerValidationFeedback `json:"planner_validation_feedback,omitempty"`
-	StopOrContinuePressure PlannerStopContinueCard     `json:"stop_or_continue_pressure"`
-	PromptBudget           PlannerPromptBudget         `json:"prompt_budget"`
+	ContextVersion         string                       `json:"context_version"`
+	Project                PlannerProjectCard           `json:"project"`
+	DatasetCard            PlannerDatasetCard           `json:"dataset_card"`
+	SourcePlanCard         PlannerSourcePlanCard        `json:"source_plan_card"`
+	ObjectiveContext       ProjectObjectiveContext      `json:"objective_context"`
+	ChampionCard           PlannerChampionCard          `json:"champion_card"`
+	CompletedExperimentLog []PlannerExperimentLog       `json:"completed_experiment_ledger"`
+	FailureDiagnosis       PlannerFailureDiagnosis      `json:"failure_diagnosis"`
+	TrainingDynamicsCard   PlannerTrainingDynamicsCard  `json:"training_dynamics_card"`
+	PerClassErrorCard      PlannerPerClassErrorCard     `json:"per_class_error_card"`
+	DeploymentCard         PlannerDeploymentCard        `json:"deployment_card"`
+	MechanismCoverageCard  PlannerMechanismCoverageCard `json:"mechanism_coverage_card"`
+	LabelQualityCard       PlannerLabelQualityCard      `json:"label_quality_card"`
+	SearchCoverage         PlannerSearchCoverage        `json:"search_coverage"`
+	StrategyLessons        []PlannerStrategyLesson      `json:"strategy_lessons"`
+	BlockedRepeats         []RejectedPlannerOption      `json:"blocked_repeats"`
+	VisualEvidence         map[string]any               `json:"visual_evidence"`
+	ModelCatalog           []SupportedModelSpec         `json:"model_catalog"`
+	ValidationFeedback     []PlannerValidationFeedback  `json:"planner_validation_feedback,omitempty"`
+	StopOrContinuePressure PlannerStopContinueCard      `json:"stop_or_continue_pressure"`
+	PromptBudget           PlannerPromptBudget          `json:"prompt_budget"`
 }
 
 type PlannerProjectCard struct {
@@ -131,23 +136,25 @@ type PlannerSourcePlanCard struct {
 }
 
 type PlannerExperiment struct {
-	Template           string   `json:"template"`
-	Model              string   `json:"model"`
-	ModelFamily        string   `json:"model_family"`
-	Epochs             int      `json:"epochs"`
-	BatchSize          int      `json:"batch_size"`
-	LearningRate       float64  `json:"learning_rate"`
-	ImageSize          int      `json:"image_size,omitempty"`
-	ResolutionStrategy string   `json:"resolution_strategy,omitempty"`
-	Optimizer          string   `json:"optimizer,omitempty"`
-	Scheduler          string   `json:"scheduler,omitempty"`
-	WeightDecay        float64  `json:"weight_decay,omitempty"`
-	AugmentationPolicy string   `json:"augmentation_policy,omitempty"`
-	ClassBalancing     string   `json:"class_balancing,omitempty"`
-	SamplingStrategy   string   `json:"sampling_strategy,omitempty"`
-	FineTuneStrategy   string   `json:"fine_tune_strategy,omitempty"`
-	Mechanism          string   `json:"mechanism"`
-	MeaningfulAxes     []string `json:"meaningful_axes,omitempty"`
+	Template                 string                          `json:"template"`
+	Model                    string                          `json:"model"`
+	ModelFamily              string                          `json:"model_family"`
+	Epochs                   int                             `json:"epochs"`
+	BatchSize                int                             `json:"batch_size"`
+	LearningRate             float64                         `json:"learning_rate"`
+	ImageSize                int                             `json:"image_size,omitempty"`
+	ResolutionStrategy       string                          `json:"resolution_strategy,omitempty"`
+	Optimizer                string                          `json:"optimizer,omitempty"`
+	Scheduler                string                          `json:"scheduler,omitempty"`
+	WeightDecay              float64                         `json:"weight_decay,omitempty"`
+	AugmentationPolicy       string                          `json:"augmentation_policy,omitempty"`
+	AugmentationPolicyConfig *plans.AugmentationPolicyConfig `json:"augmentation_policy_config,omitempty"`
+	ClassBalancing           string                          `json:"class_balancing,omitempty"`
+	ClassBalancingConfig     map[string]any                  `json:"class_balancing_config,omitempty"`
+	SamplingStrategy         string                          `json:"sampling_strategy,omitempty"`
+	FineTuneStrategy         string                          `json:"fine_tune_strategy,omitempty"`
+	Mechanism                string                          `json:"mechanism"`
+	MeaningfulAxes           []string                        `json:"meaningful_axes,omitempty"`
 }
 
 type PlannerResultSummary struct {
@@ -199,6 +206,99 @@ type PlannerFailureDiagnosis struct {
 	DeterministicRaw PlannerDiagnosis   `json:"deterministic_raw"`
 }
 
+type PlannerTrainingDynamicsCard struct {
+	TargetMetric                string   `json:"target_metric"`
+	BestJobID                   string   `json:"best_job_id,omitempty"`
+	BestModel                   string   `json:"best_model,omitempty"`
+	BestMetric                  float64  `json:"best_metric"`
+	FinalMetric                 float64  `json:"final_metric"`
+	FinalTrainLoss              float64  `json:"final_train_loss"`
+	FinalValidationLoss         float64  `json:"final_validation_loss"`
+	TrainValidationLossGap      float64  `json:"train_validation_loss_gap"`
+	MetricSlopeLastNEpochs      float64  `json:"metric_slope_last_n_epochs"`
+	PlateauScore                float64  `json:"plateau_score"`
+	InstabilityScore            float64  `json:"instability_score"`
+	MoreEpochsJustified         bool     `json:"more_epochs_justified"`
+	EarlyStoppingRecommendation string   `json:"early_stopping_recommendation"`
+	Evidence                    []string `json:"evidence"`
+}
+
+type PlannerClassError struct {
+	ClassName string  `json:"class_name"`
+	Recall    float64 `json:"recall,omitempty"`
+	F1        float64 `json:"f1,omitempty"`
+	Support   float64 `json:"support,omitempty"`
+}
+
+type PlannerConfusionPair struct {
+	ActualClass    string `json:"actual_class"`
+	PredictedClass string `json:"predicted_class"`
+	Count          int    `json:"count"`
+	ReverseCount   int    `json:"reverse_count,omitempty"`
+}
+
+type PlannerPerClassErrorCard struct {
+	WorstClasses          []PlannerClassError    `json:"worst_classes"`
+	TopConfusionPairs     []PlannerConfusionPair `json:"top_confusion_pairs"`
+	AccuracyMacroF1Gap    float64                `json:"accuracy_macro_f1_gap"`
+	ImbalanceActive       bool                   `json:"imbalance_active"`
+	MinorityFailureActive bool                   `json:"minority_failure_active"`
+	ClassBalancingUseful  bool                   `json:"class_balancing_useful"`
+	Evidence              []string               `json:"evidence"`
+}
+
+type PlannerDeploymentCard struct {
+	ObjectiveWeights                   map[string]float64 `json:"objective_weights,omitempty"`
+	DeploymentPriorities               []string           `json:"deployment_priorities,omitempty"`
+	BestModel                          string             `json:"best_model,omitempty"`
+	BestLatencyMS                      float64            `json:"best_latency_ms,omitempty"`
+	BestThroughput                     float64            `json:"best_throughput,omitempty"`
+	BestParameterCount                 float64            `json:"best_parameter_count,omitempty"`
+	BestModelSizeMB                    float64            `json:"best_model_size_mb,omitempty"`
+	ChampionLatencyMS                  float64            `json:"champion_latency_ms,omitempty"`
+	CompactChampion                    string             `json:"compact_champion,omitempty"`
+	QualityChallenger                  string             `json:"quality_challenger,omitempty"`
+	CanBeatChampionAfterLatencyPenalty bool               `json:"can_beat_champion_after_latency_penalty"`
+	TradeoffSummary                    string             `json:"tradeoff_summary"`
+	Evidence                           []string           `json:"evidence"`
+}
+
+type PlannerMechanismResult struct {
+	Mechanism      string  `json:"mechanism"`
+	BestScore      float64 `json:"best_score"`
+	BestModel      string  `json:"best_model,omitempty"`
+	BestJobID      string  `json:"best_job_id,omitempty"`
+	Outcome        string  `json:"outcome,omitempty"`
+	CostUSD        float64 `json:"cost_usd,omitempty"`
+	RuntimeSeconds float64 `json:"runtime_seconds,omitempty"`
+}
+
+type PlannerMechanismLesson struct {
+	Mechanism    string   `json:"mechanism"`
+	Outcome      string   `json:"outcome"`
+	Lesson       string   `json:"lesson"`
+	Intervention string   `json:"intervention,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+}
+
+type PlannerMechanismCoverageCard struct {
+	TriedMechanisms        []string                 `json:"tried_mechanisms"`
+	BlockedMechanisms      []string                 `json:"blocked_mechanisms"`
+	EligibleMechanisms     []string                 `json:"eligible_mechanisms"`
+	BestResultByMechanism  []PlannerMechanismResult `json:"best_result_by_mechanism"`
+	FailedMechanismLessons []PlannerMechanismLesson `json:"failed_mechanism_lessons"`
+	ShallowRepeatWarnings  []string                 `json:"shallow_repeat_warnings"`
+}
+
+type PlannerLabelQualityCard struct {
+	Signals                  []string               `json:"signals"`
+	SuspectClasses           []string               `json:"suspect_classes"`
+	AsymmetricConfusions     []PlannerConfusionPair `json:"asymmetric_confusions"`
+	HighConfidenceErrorCount int                    `json:"high_confidence_error_count,omitempty"`
+	AuditRecommended         bool                   `json:"audit_recommended"`
+	Evidence                 []string               `json:"evidence"`
+}
+
 type PlannerSearchCoverage struct {
 	PlanCount                         int      `json:"plan_count"`
 	FollowUpRound                     int      `json:"followup_round"`
@@ -212,15 +312,20 @@ type PlannerSearchCoverage struct {
 }
 
 type PlannerStrategyLesson struct {
-	Source      string   `json:"source"`
-	MemoryID    string   `json:"memory_id,omitempty"`
-	ScorecardID string   `json:"scorecard_id,omitempty"`
-	Outcome     string   `json:"outcome"`
-	Lesson      string   `json:"lesson"`
-	Models      []string `json:"models,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	CostUSD     float64  `json:"cost_usd,omitempty"`
-	RuntimeSecs float64  `json:"runtime_seconds,omitempty"`
+	Source            string   `json:"source"`
+	MemoryID          string   `json:"memory_id,omitempty"`
+	ScorecardID       string   `json:"scorecard_id,omitempty"`
+	Outcome           string   `json:"outcome"`
+	Mechanism         string   `json:"mechanism,omitempty"`
+	Intervention      string   `json:"intervention,omitempty"`
+	DiagnosisTriggers []string `json:"diagnosis_triggers,omitempty"`
+	ExpectedDelta     float64  `json:"expected_delta,omitempty"`
+	ActualDelta       float64  `json:"actual_delta,omitempty"`
+	Lesson            string   `json:"lesson"`
+	Models            []string `json:"models,omitempty"`
+	Tags              []string `json:"tags,omitempty"`
+	CostUSD           float64  `json:"cost_usd,omitempty"`
+	RuntimeSecs       float64  `json:"runtime_seconds,omitempty"`
 }
 
 type PlannerStopContinueCard struct {
@@ -299,25 +404,30 @@ type PlannerStrategyMemory struct {
 }
 
 type PlannerStrategyScorecard struct {
-	ID               string         `json:"id"`
-	DatasetID        string         `json:"dataset_id"`
-	SourceDecisionID string         `json:"source_decision_id"`
-	SourcePlanID     string         `json:"source_plan_id"`
-	FollowUpPlanID   string         `json:"followup_plan_id"`
-	StrategyType     string         `json:"strategy_type"`
-	PlanningMode     string         `json:"planning_mode"`
-	DatasetTraits    map[string]any `json:"dataset_traits"`
-	ObjectiveProfile map[string]any `json:"objective_profile"`
-	ProposedChanges  map[string]any `json:"proposed_changes"`
-	ExpectedDelta    float64        `json:"expected_delta"`
-	ActualDelta      float64        `json:"actual_delta"`
-	ConfidenceBefore float64        `json:"confidence_before"`
-	ConfidenceAfter  float64        `json:"confidence_after"`
-	CostUSD          float64        `json:"cost_usd"`
-	RuntimeSeconds   float64        `json:"runtime_seconds"`
-	Outcome          string         `json:"outcome"`
-	Lesson           string         `json:"lesson"`
-	Tags             []string       `json:"tags"`
+	ID                string         `json:"id"`
+	DatasetID         string         `json:"dataset_id"`
+	SourceDecisionID  string         `json:"source_decision_id"`
+	SourcePlanID      string         `json:"source_plan_id"`
+	FollowUpPlanID    string         `json:"followup_plan_id"`
+	StrategyType      string         `json:"strategy_type"`
+	PlanningMode      string         `json:"planning_mode"`
+	Mechanism         string         `json:"mechanism,omitempty"`
+	Intervention      string         `json:"intervention,omitempty"`
+	DiagnosisTriggers []string       `json:"diagnosis_triggers,omitempty"`
+	EvidenceUsed      []string       `json:"evidence_used,omitempty"`
+	ExpectedEffect    string         `json:"expected_effect,omitempty"`
+	DatasetTraits     map[string]any `json:"dataset_traits"`
+	ObjectiveProfile  map[string]any `json:"objective_profile"`
+	ProposedChanges   map[string]any `json:"proposed_changes"`
+	ExpectedDelta     float64        `json:"expected_delta"`
+	ActualDelta       float64        `json:"actual_delta"`
+	ConfidenceBefore  float64        `json:"confidence_before"`
+	ConfidenceAfter   float64        `json:"confidence_after"`
+	CostUSD           float64        `json:"cost_usd"`
+	RuntimeSeconds    float64        `json:"runtime_seconds"`
+	Outcome           string         `json:"outcome"`
+	Lesson            string         `json:"lesson"`
+	Tags              []string       `json:"tags"`
 }
 
 type PlannerValidationFeedback struct {
@@ -390,33 +500,34 @@ type ExperimentPlanningOutcome struct {
 }
 
 type ExperimentPlanningRecommendation struct {
-	AgentName                     string                    `json:"agent_name"`
-	Summary                       string                    `json:"summary"`
-	DecisionType                  string                    `json:"decision_type"`
-	Rationale                     string                    `json:"rationale"`
-	Confidence                    float64                   `json:"confidence"`
-	PlanningMode                  string                    `json:"planning_mode"`
-	DeterministicDiagnosisUsed    []string                  `json:"deterministic_diagnosis_used"`
-	EvidenceUsed                  []string                  `json:"evidence_used"`
-	Hypothesis                    string                    `json:"hypothesis"`
-	ExpectedFailureModes          []string                  `json:"expected_failure_modes"`
-	DatasetPreprocessingRationale string                    `json:"dataset_preprocessing_rationale"`
-	ChangedVariables              []string                  `json:"changed_variables"`
-	SuccessCriteria               string                    `json:"success_criteria"`
-	StopCondition                 string                    `json:"stop_condition"`
-	DeploymentTradeoff            string                    `json:"deployment_tradeoff"`
-	CandidateHypotheses           []CandidateHypothesis     `json:"candidate_hypotheses"`
-	CandidateRankings             []CandidateRanking        `json:"candidate_rankings"`
-	ProposedExperiments           []plans.PlannedExperiment `json:"proposed_experiments"`
-	ChampionJobID                 string                    `json:"champion_job_id"`
-	WhyCanBeatChampion            string                    `json:"why_can_beat_champion"`
-	ExpectedDeltaVsChampion       float64                   `json:"expected_delta_vs_champion"`
-	StopReason                    string                    `json:"stop_reason"`
-	Risks                         []string                  `json:"risks"`
-	ExpectedTradeoffs             []string                  `json:"expected_tradeoffs"`
-	NoveltyNotes                  []string                  `json:"novelty_notes"`
-	RejectedOptions               []RejectedPlannerOption   `json:"rejected_options"`
-	Tags                          []string                  `json:"tags"`
+	AgentName                     string                     `json:"agent_name"`
+	Summary                       string                     `json:"summary"`
+	DecisionType                  string                     `json:"decision_type"`
+	Rationale                     string                     `json:"rationale"`
+	Confidence                    float64                    `json:"confidence"`
+	PlanningMode                  string                     `json:"planning_mode"`
+	DeterministicDiagnosisUsed    []string                   `json:"deterministic_diagnosis_used"`
+	EvidenceUsed                  []string                   `json:"evidence_used"`
+	Hypothesis                    string                     `json:"hypothesis"`
+	ExpectedFailureModes          []string                   `json:"expected_failure_modes"`
+	DatasetPreprocessingRationale string                     `json:"dataset_preprocessing_rationale"`
+	ChangedVariables              []string                   `json:"changed_variables"`
+	SuccessCriteria               string                     `json:"success_criteria"`
+	StopCondition                 string                     `json:"stop_condition"`
+	DeploymentTradeoff            string                     `json:"deployment_tradeoff"`
+	CandidateHypotheses           []CandidateHypothesis      `json:"candidate_hypotheses"`
+	CandidateRankings             []CandidateRanking         `json:"candidate_rankings"`
+	ProposedExperiments           []plans.PlannedExperiment  `json:"proposed_experiments"`
+	ProposalMechanisms            []PlannerProposalMechanism `json:"proposal_mechanisms"`
+	ChampionJobID                 string                     `json:"champion_job_id"`
+	WhyCanBeatChampion            string                     `json:"why_can_beat_champion"`
+	ExpectedDeltaVsChampion       float64                    `json:"expected_delta_vs_champion"`
+	StopReason                    string                     `json:"stop_reason"`
+	Risks                         []string                   `json:"risks"`
+	ExpectedTradeoffs             []string                   `json:"expected_tradeoffs"`
+	NoveltyNotes                  []string                   `json:"novelty_notes"`
+	RejectedOptions               []RejectedPlannerOption    `json:"rejected_options"`
+	Tags                          []string                   `json:"tags"`
 }
 
 type RejectedPlannerOption struct {
@@ -426,10 +537,21 @@ type RejectedPlannerOption struct {
 	AppliesWhen []string `json:"applies_when"`
 }
 
+type PlannerProposalMechanism struct {
+	ExperimentIndex int      `json:"experiment_index"`
+	Mechanism       string   `json:"mechanism"`
+	Intervention    string   `json:"intervention"`
+	EvidenceUsed    []string `json:"evidence_used"`
+	ExpectedEffect  string   `json:"expected_effect"`
+}
+
 type CandidateHypothesis struct {
 	Hypothesis              string                  `json:"hypothesis"`
 	PlanningMode            string                  `json:"planning_mode"`
+	Mechanism               string                  `json:"mechanism"`
+	Intervention            string                  `json:"intervention"`
 	ProposedChanges         map[string]any          `json:"proposed_changes"`
+	ExpectedEffect          string                  `json:"expected_effect"`
 	ExpectedMetricImpact    float64                 `json:"expected_metric_impact"`
 	ExpectedTradeoffs       []string                `json:"expected_tradeoffs"`
 	Risk                    string                  `json:"risk"`
@@ -445,6 +567,9 @@ type CandidateRanking struct {
 	CandidateIndex      int                `json:"candidate_index"`
 	Hypothesis          string             `json:"hypothesis"`
 	PlanningMode        string             `json:"planning_mode"`
+	Mechanism           string             `json:"mechanism,omitempty"`
+	Intervention        string             `json:"intervention,omitempty"`
+	ExpectedEffect      string             `json:"expected_effect,omitempty"`
 	Score               float64            `json:"score"`
 	ScoreComponents     map[string]float64 `json:"score_components"`
 	Selected            bool               `json:"selected"`
@@ -518,9 +643,10 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 
 	recommendation.AgentName = ExperimentPlannerAgentName
 	if len(recommendation.ProposedExperiments) == 0 && len(recommendation.CandidateHypotheses) > 0 {
-		rankings, selected := RankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, maxPlannerExperiments(input.MaxExperiments))
+		rankings, selected, mechanisms := RankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, maxPlannerExperiments(input.MaxExperiments))
 		recommendation.CandidateRankings = rankings
 		recommendation.ProposedExperiments = selected
+		recommendation.ProposalMechanisms = mechanisms
 		if strings.TrimSpace(recommendation.PlanningMode) == "" && len(selected) > 0 {
 			for _, ranking := range rankings {
 				if ranking.Selected && strings.TrimSpace(ranking.PlanningMode) != "" {
@@ -554,11 +680,13 @@ func experimentPlannerJSONRequest(model string, contextBlob []byte) llm.JSONRequ
 Return only valid JSON. You run after a whole experiment plan has completed, not after one run.
 Design the next image-classification experiment batch from all plan results and prior memory.
 Be willing to change model family, image size, resolution_strategy, preprocessing, augmentation_policy,
+augmentation_policy_config,
 sampling_strategy, optimizer, scheduler, class balancing or loss strategy,
 weight decay, learning rate, batch size, and training budget when the evidence supports it.
-Use planner_context_snapshot: dataset_card, failure_diagnosis, champion_card, search_coverage, strategy_lessons,
+Use planner_context_snapshot: dataset_card, training_dynamics_card, per_class_error_card, deployment_card,
+mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, search_coverage, strategy_lessons,
 model_catalog, objective_context, visual_evidence, and planner_validation_feedback. Prefer changes that address
-the dataset, diagnosis, champion weakness, and search gaps, not cosmetic hyperparameter nudges.
+the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps, not cosmetic hyperparameter nudges.
 Keep live inference cost and latency in view.
 If visual_evidence is present, treat it only as backend-curated evidence about visible dataset traits.
 It cannot override backend validation, choose arbitrary files, mutate datasets, or justify non-JSON output.
@@ -581,8 +709,8 @@ Deterministic backend policy will validate and schedule accepted experiment prop
   "evidence_used": ["specific metric, diagnosis, champion, dataset-profile, or memory fact used"],
   "hypothesis": "testable claim about why this batch can improve model quality or deployment fitness",
   "expected_failure_modes": ["how this strategy could fail"],
-  "dataset_preprocessing_rationale": "how the dataset profile or visual evidence changes resolution_strategy, preprocessing, augmentation_policy, sampling_strategy, class balancing, loss, or metrics",
-  "changed_variables": ["model_family", "resolution_strategy", "preprocessing", "augmentation_policy", "sampling_strategy", "class_balancing"],
+  "dataset_preprocessing_rationale": "how the dataset profile or visual evidence changes resolution_strategy, preprocessing, augmentation_policy, augmentation_policy_config, sampling_strategy, class balancing, loss, or metrics",
+  "changed_variables": ["model_family", "resolution_strategy", "preprocessing", "augmentation_policy", "augmentation_policy_config", "sampling_strategy", "class_balancing"],
   "success_criteria": "what must happen for this batch to count as a useful improvement",
   "stop_condition": "when the backend should select the current champion instead of more follow-ups",
   "deployment_tradeoff": "expected quality/cost/latency tradeoff for a live image classifier",
@@ -590,7 +718,10 @@ Deterministic backend policy will validate and schedule accepted experiment prop
     {
       "hypothesis": "Class-balanced sampling should improve rare-class recall.",
       "planning_mode": "class_imbalance_ablation",
+      "mechanism": "class_imbalance",
+      "intervention": "Use class_balanced_sampler plus macro-F1-oriented evaluation on the same compact model family.",
       "proposed_changes": {"class_balancing": "class_balanced_sampler", "sampling_strategy": "class_balanced_sampler", "target_metric": "macro_f1"},
+      "expected_effect": "Improve minority recall and macro-F1 by making rare classes visible to the loss/sampler.",
       "expected_metric_impact": 0.025,
       "expected_tradeoffs": ["may reduce majority-class precision"],
       "risk": "medium",
@@ -620,6 +751,7 @@ Deterministic backend policy will validate and schedule accepted experiment prop
         "weight_decay": 0.01,
         "augmentation": {"horizontal_flip": true, "color_jitter": true},
         "augmentation_policy": "moderate",
+        "augmentation_policy_config": {"policy_type": "basic", "probability": 1.0},
         "class_balancing": "class_balanced_sampler",
         "sampling_strategy": "class_balanced_sampler",
         "early_stopping_patience": 4,
@@ -652,6 +784,7 @@ Deterministic backend policy will validate and schedule accepted experiment prop
       "weight_decay": 0.01,
       "augmentation": {"horizontal_flip": true, "color_jitter": true, "random_crop": true},
       "augmentation_policy": "moderate",
+      "augmentation_policy_config": {"policy_type": "basic", "probability": 1.0},
       "class_balancing": "weighted_loss",
       "sampling_strategy": "none",
       "early_stopping_patience": 3,
@@ -659,6 +792,15 @@ Deterministic backend policy will validate and schedule accepted experiment prop
       "pretrained": true,
       "freeze_backbone": true,
       "fine_tune_strategy": "head_only"
+    }
+  ],
+  "proposal_mechanisms": [
+    {
+      "experiment_index": 0,
+      "mechanism": "class_imbalance",
+      "intervention": "weighted_loss with moderate augmentation on EfficientNet-B0",
+      "evidence_used": ["minority_class_failure_score is high", "macro-F1 trails accuracy"],
+      "expected_effect": "Improve minority recall and macro-F1 without materially changing inference latency."
     }
   ],
   "champion_job_id": "",
@@ -681,8 +823,13 @@ Deterministic backend policy will validate and schedule accepted experiment prop
 
 Rules:
 - If decision_type is ADD_EXPERIMENTS, propose 1-5 complete, novel experiments.
-- Prefer returning 6-12 candidate_hypotheses. The backend will score/rank candidates and select 1-5 final proposed_experiments if proposed_experiments is empty.
-- If you include both candidate_hypotheses and proposed_experiments, proposed_experiments must be the strongest 1-5 after your own ranking.
+- Every candidate_hypothesis must include mechanism, intervention, evidence_used, and expected_effect.
+- Every proposed_experiment must have a matching proposal_mechanisms item with experiment_index, mechanism, intervention, evidence_used, and expected_effect.
+- Prefer returning 6-12 candidate_hypotheses. The backend will score/rank candidates and select 1-5 final proposed_experiments plus proposal_mechanisms if proposed_experiments is empty.
+- If you include both candidate_hypotheses and proposed_experiments, proposed_experiments must be the strongest 1-5 after your own ranking and proposal_mechanisms must explain each one.
+- Mechanism values should come from this taxonomy: baseline_control, architecture_challenge, capacity_finetune, optimizer_scheduler, regularization, augmentation_basic, augmentation_auto, augmentation_mixed_sample, class_imbalance, minority_targeting, resolution_crop, bbox_crop_ablation, label_noise_audit, hard_example_audit, deployment_latency, distillation.
+- Model family is a parameter inside a mechanism, not a mechanism by itself. Do not use architecture_challenge unless deterministic diagnosis supports capacity, underfitting, plateau, or a clear champion challenge.
+- Treat distillation as a rejected/future option unless the context shows backend support. Label-quality audit mechanisms are supported only as report-only jobs with template label_quality_audit.
 - Use only model names from planner_context_snapshot.model_catalog.
 - Use only supported optimizers: adamw, adam, sgd.
 - Use only supported schedulers: none, cosine, step.
@@ -691,38 +838,48 @@ Rules:
 - Use preprocessing.normalization values: imagenet, dataset, none.
 - Use preprocessing.crop_strategy values: none, center_crop, random_resized_crop, bbox_crop_if_available, bbox_crop_ablation.
 - Use preprocessing.bbox_mode values: ignore, crop_if_available, crop_and_compare_full_image, use_boxes_as_metadata.
-- Use augmentation_policy values: none, light, moderate, strong, custom. Keep augmentation as a small object of supported boolean knobs only when needed.
-- Use class_balancing values: none, weighted_loss, class_weighted_loss, class_balanced_sampler, weighted_random_sampler, focal_loss.
+- Use augmentation_policy values: none, light, moderate, strong, custom, basic, randaugment, trivialaugment, trivialaugmentwide, autoaugment, mixup, cutmix.
+- Use augmentation_policy_config for structured augmentation: policy_type basic, randaugment, trivialaugment, trivialaugmentwide, autoaugment, mixup, or cutmix; magnitude 0-15, num_ops 0-3, num_magnitude_bins 2-31 when set, probability 0-1, alpha 0-1.
+- Keep augmentation as a small object of supported boolean knobs only when needed.
+- Use class_balancing values: none, weighted_loss, class_weighted_loss, class_balanced_sampler, weighted_random_sampler, focal_loss, effective_number_loss.
+- Use class_balancing_config only with effective_number_loss, currently effective_number_beta between 0.9 and 0.99999.
 - Use sampling_strategy values: none, class_balanced_sampler, weighted_random_sampler.
 - Keep epochs between 3 and 40, batch_size between 4 and 128, image_size between 96 and 384.
 - Use fine_tune_strategy values head_only, last_block, or full.
 - Choose exactly one first-class planning_mode and justify it using planner_context_snapshot.failure_diagnosis.
-- Do not merely suggest more epochs, tiny learning-rate changes, or repeated model variants. Every proposed experiment must test a clear hypothesis tied to the diagnosis, dataset profile, champion weakness, or prior strategy outcome.
+- Do not merely suggest more epochs, tiny learning-rate changes, or repeated model variants. Every proposed experiment must test a named mechanism tied to the diagnosis, dataset profile, champion weakness, or prior strategy outcome.
 - If prior runs are weak or unstable, try model/preprocessing/regularization changes.
 - If one family is promising, exploit it with controlled learning-rate, augmentation, or image-size changes.
 - Do not make a batch that is only many variants of the current champion family. If exploiting the champion, include a clear control or challenger.
 - Use planner_context_snapshot.strategy_lessons to reuse patterns that improved the champion and avoid weak or failed plans.
 - Use planner_context_snapshot.blocked_repeats as explicit "do not repeat" guidance when its applies_when conditions match the current diagnosis.
 - Treat scorecard-derived strategy_lessons as structured outcome evidence. Prefer improved_champion lessons and avoid failed/no_improvement lessons with similar dataset traits or objective profile.
-- Use planner_context_snapshot.objective_context and dataset_card to decide resolution_strategy, preprocessing, augmentation_policy, sampling_strategy, class balancing/loss, model family, metrics, and deployment tradeoffs.
+- Use planner_context_snapshot.training_dynamics_card to decide whether more epochs are justified; if more_epochs_justified is false, do not propose more epochs without a substantive mechanism change.
+- Use planner_context_snapshot.per_class_error_card for class_imbalance, minority_targeting, focal/weighted loss, sampler, and metric-target decisions.
+- Use planner_context_snapshot.deployment_card to compare quality challengers against latency, cost, parameter count, throughput, and objective weights before proposing heavy models.
+- Use planner_context_snapshot.mechanism_coverage_card to avoid tried/blocked/failed mechanisms and to prefer eligible mechanisms with diagnosis support.
+- Use planner_context_snapshot.label_quality_card only to recommend label_noise_audit or hard_example_audit as report-only work with template label_quality_audit; never mutate labels or turn audit mechanisms into training jobs.
+- Use planner_context_snapshot.objective_context and dataset_card to decide resolution_strategy, preprocessing, augmentation_policy, augmentation_policy_config, sampling_strategy, class balancing/loss, model family, metrics, and deployment tradeoffs.
 - Use planner_context_snapshot.visual_evidence, when present, only as backend-curated evidence for visible traits such as object scale, background dominance, blur, lighting variation, fine-grained classes, or bbox/crop plausibility. Cite exemplar caps, warnings, or audit details if they limit confidence. Backend validation remains the gate for every proposed field.
 - Do not ask to choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.
 - Use model families in stages: cheap baseline or preprocessing search first, then challenger models, then champion refinement, then final validation.
 - For a live setting, prefer low-latency candidates when quality is close: MobileNetV3, RegNet-Y-400MF, and EfficientNet-B0 are usually stronger deployment candidates than heavier challengers.
 - Compare every proposal against planner_context_snapshot.champion_card.current, source_plan_baseline, and source_plan_run_deltas.
 - Only use ADD_EXPERIMENTS when you can explain a concrete path to beat the current champion.
-- A valid ADD_EXPERIMENTS response needs a planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, expected_failure_modes, dataset_preprocessing_rationale, success_criteria, stop_condition, deployment_tradeoff, rejected_options, and at least two changed_variables.
+- A valid ADD_EXPERIMENTS response needs a planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, expected_failure_modes, dataset_preprocessing_rationale, success_criteria, stop_condition, deployment_tradeoff, rejected_options, proposal_mechanisms, and at least two changed_variables.
 - Good: if minority recall is weak, test weighted_loss, focal_loss, class_balanced_sampler, or weighted_random_sampler and target macro-F1/minority recall.
 - Good: if overfitting is high, test stronger augmentation_policy, regularization, smaller model, or less aggressive fine-tuning.
 - Good: if underfitting is high, test a larger pretrained model or fuller fine-tuning.
 - Good: if the champion is low latency but weak on fine-grained classes, challenge with EfficientNet/ConvNeXt at a higher image size and compare deployment tradeoff.
 - Good: if validation improvement has stalled, select the champion instead of running low-value experiments.
 - Bad: same model, 2 more epochs, tiny learning-rate change.
+- Bad: ResNet/EfficientNet/model-family shopping with no mechanism-specific evidence.
+- Bad: repeating the same mechanism with only epochs, learning rate, or batch size changed.
 - If stop_signals say the project has repeated no-improvement follow-up rounds, prefer SELECT_CHAMPION or STOP_PROJECT.
 - Set champion_job_id when selecting a champion or when a champion anchors your recommendation.
 - Set why_can_beat_champion for ADD_EXPERIMENTS; set stop_reason for SELECT_CHAMPION or STOP_PROJECT.
-- Do not repeat mechanisms or signatures summarized in planner_context_snapshot.search_coverage; backend validation checks the full project history even when only a capped signature sample is shown.
-- Candidate ranking will reject or heavily penalize duplicate signatures, tiny-only changes, high-cost weak-justification experiments, failed strategies with similar traits, objective misalignment, and ideas not tied to planner_context_snapshot.failure_diagnosis.
+- Do not repeat mechanisms or signatures summarized in planner_context_snapshot.search_coverage or mechanism_coverage_card; backend validation checks the full project history even when only a capped signature sample is shown.
+- Candidate ranking will reject or heavily penalize missing mechanism fields, duplicate signatures, tiny-only changes, same-mechanism minor-only variants, architecture-only shopping, high-cost weak-justification experiments, failed strategies with similar traits, objective misalignment, and ideas not tied to planner_context_snapshot.failure_diagnosis.
 
 Context:
 %s`, string(contextBlob)),
@@ -786,6 +943,11 @@ func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningR
 		if len(recommendation.RejectedOptions) == 0 {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing rejected_options")
 		}
+		for index, candidate := range recommendation.CandidateHypotheses {
+			if err := validateCandidateMechanismExpectation(candidate, index); err != nil {
+				return err
+			}
+		}
 		if strings.TrimSpace(recommendation.WhyCanBeatChampion) == "" {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing why_can_beat_champion")
 		}
@@ -796,6 +958,9 @@ func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningR
 			if err := validatePlannedExperimentShape(experiment, index); err != nil {
 				return err
 			}
+		}
+		if err := validatePlannerProposalMechanisms(recommendation.ProposedExperiments, recommendation.ProposalMechanisms); err != nil {
+			return err
 		}
 		if err := validatePlannerExperimentDiversity(recommendation.ProposedExperiments); err != nil {
 			return err
@@ -826,6 +991,59 @@ func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningR
 	}
 	if recommendation.Tags == nil {
 		recommendation.Tags = []string{}
+	}
+	return nil
+}
+
+func validateCandidateMechanismExpectation(candidate CandidateHypothesis, index int) error {
+	if strings.TrimSpace(candidate.Mechanism) == "" {
+		return fmt.Errorf("candidate_hypotheses[%d] missing mechanism", index)
+	}
+	if strings.TrimSpace(candidate.Intervention) == "" {
+		return fmt.Errorf("candidate_hypotheses[%d] missing intervention", index)
+	}
+	if len(nonEmptyStrings(candidate.EvidenceUsed)) == 0 {
+		return fmt.Errorf("candidate_hypotheses[%d] missing evidence_used", index)
+	}
+	if strings.TrimSpace(candidate.ExpectedEffect) == "" {
+		return fmt.Errorf("candidate_hypotheses[%d] missing expected_effect", index)
+	}
+	return nil
+}
+
+func validatePlannerProposalMechanisms(experiments []plans.PlannedExperiment, mechanisms []PlannerProposalMechanism) error {
+	if len(experiments) == 0 {
+		return nil
+	}
+	if len(mechanisms) == 0 {
+		return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing proposal_mechanisms")
+	}
+	seen := map[int]bool{}
+	for index, mechanism := range mechanisms {
+		if mechanism.ExperimentIndex < 0 || mechanism.ExperimentIndex >= len(experiments) {
+			return fmt.Errorf("proposal_mechanisms[%d] has invalid experiment_index %d", index, mechanism.ExperimentIndex)
+		}
+		if seen[mechanism.ExperimentIndex] {
+			return fmt.Errorf("proposal_mechanisms duplicate experiment_index %d", mechanism.ExperimentIndex)
+		}
+		seen[mechanism.ExperimentIndex] = true
+		if strings.TrimSpace(mechanism.Mechanism) == "" {
+			return fmt.Errorf("proposal_mechanisms[%d] missing mechanism", index)
+		}
+		if strings.TrimSpace(mechanism.Intervention) == "" {
+			return fmt.Errorf("proposal_mechanisms[%d] missing intervention", index)
+		}
+		if len(nonEmptyStrings(mechanism.EvidenceUsed)) == 0 {
+			return fmt.Errorf("proposal_mechanisms[%d] missing evidence_used", index)
+		}
+		if strings.TrimSpace(mechanism.ExpectedEffect) == "" {
+			return fmt.Errorf("proposal_mechanisms[%d] missing expected_effect", index)
+		}
+	}
+	for index := range experiments {
+		if !seen[index] {
+			return fmt.Errorf("proposal_mechanisms missing experiment_index %d", index)
+		}
 	}
 	return nil
 }
@@ -1007,6 +1225,11 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		ChampionCard:           plannerChampionCard(input),
 		CompletedExperimentLog: plannerCompletedExperimentLedger(input),
 		FailureDiagnosis:       plannerFailureDiagnosis(input.DeterministicDiagnosis),
+		TrainingDynamicsCard:   plannerTrainingDynamicsCard(input),
+		PerClassErrorCard:      plannerPerClassErrorCard(input),
+		DeploymentCard:         plannerDeploymentCard(input),
+		MechanismCoverageCard:  plannerMechanismCoverageCard(input),
+		LabelQualityCard:       plannerLabelQualityCard(input),
 		SearchCoverage:         plannerSearchCoverage(input),
 		StrategyLessons:        plannerStrategyLessons(input),
 		BlockedRepeats:         capRejectedPlannerOptions(input.RejectedStrategyMemory, plannerSnapshotMaxBlockedRepeats),
@@ -1254,6 +1477,169 @@ func plannerFailureDiagnosis(diagnosis PlannerDiagnosis) PlannerFailureDiagnosis
 	}
 }
 
+func plannerTrainingDynamicsCard(input ExperimentPlannerInput) PlannerTrainingDynamicsCard {
+	targetMetric := normalizedDiagnosisMetric(input.SourcePlan.TargetMetric)
+	card := PlannerTrainingDynamicsCard{
+		TargetMetric:                targetMetric,
+		PlateauScore:                input.DeterministicDiagnosis.PlateauScore,
+		InstabilityScore:            input.DeterministicDiagnosis.InstabilityScore,
+		EarlyStoppingRecommendation: "Use existing early-stopping defaults; do not extend epochs unless the recent metric slope is still positive.",
+	}
+	best, ok := bestRunSummary(input.PlanSummaries, targetMetric)
+	if !ok {
+		card.Evidence = []string{"no completed run summary available for training dynamics"}
+		return card
+	}
+	card.BestJobID = best.JobID
+	card.BestModel = best.Model
+	card.BestMetric = roundDiagnosis(diagnosisSummaryMetric(best, targetMetric))
+	card.FinalTrainLoss = roundDiagnosis(best.FinalTrainLoss)
+	card.FinalValidationLoss = roundDiagnosis(best.FinalValLoss)
+	if best.FinalTrainLoss > 0 || best.FinalValLoss > 0 {
+		card.TrainValidationLossGap = roundDiagnosis(best.FinalValLoss - best.FinalTrainLoss)
+	}
+	metrics := input.PlanMetrics[best.JobID]
+	values := orderedMetricValues(metrics, targetMetric)
+	if len(values) > 0 {
+		card.FinalMetric = roundDiagnosis(values[len(values)-1])
+		card.MetricSlopeLastNEpochs = roundDiagnosis(metricSlopeLastN(values, 3))
+	} else {
+		card.FinalMetric = card.BestMetric
+	}
+	card.MoreEpochsJustified = card.MetricSlopeLastNEpochs >= 0.015 && card.PlateauScore < 0.45 && card.InstabilityScore < 0.45
+	if card.MoreEpochsJustified {
+		card.EarlyStoppingRecommendation = "More epochs are defensible only as part of the same mechanism because the recent metric slope is still improving."
+	} else if card.PlateauScore >= 0.55 || card.InstabilityScore >= 0.55 {
+		card.EarlyStoppingRecommendation = "Do not propose more epochs alone; plateau or instability requires a mechanism change and early stopping."
+	}
+	card.Evidence = cappedStrings([]string{
+		fmt.Sprintf("best %s %.3f from %s", targetMetric, card.BestMetric, card.BestJobID),
+		fmt.Sprintf("final train/validation loss gap %.3f", card.TrainValidationLossGap),
+		fmt.Sprintf("last-3-epoch %s slope %.3f", targetMetric, card.MetricSlopeLastNEpochs),
+		fmt.Sprintf("plateau %.2f instability %.2f", card.PlateauScore, card.InstabilityScore),
+	}, 6)
+	return card
+}
+
+func plannerPerClassErrorCard(input ExperimentPlannerInput) PlannerPerClassErrorCard {
+	card := PlannerPerClassErrorCard{
+		ImbalanceActive:       input.DeterministicDiagnosis.ClassImbalanceScore >= 0.45,
+		MinorityFailureActive: input.DeterministicDiagnosis.MinorityClassFailureScore >= 0.45,
+	}
+	bestEvaluation, bestSummary, ok := bestEvaluationForPlanner(input)
+	if ok {
+		card.WorstClasses = worstPlannerClasses(bestEvaluation.PerClassMetrics, 5)
+		card.TopConfusionPairs = topPlannerConfusionPairs(bestEvaluation.ConfusionMatrix, plannerClassNames(input, bestEvaluation.PerClassMetrics), 5)
+		card.AccuracyMacroF1Gap = roundDiagnosis(bestSummary.BestAccuracy - bestSummary.BestMacroF1)
+	}
+	card.ClassBalancingUseful = card.ImbalanceActive || card.MinorityFailureActive || card.AccuracyMacroF1Gap >= 0.10 || weakWorstClass(card.WorstClasses)
+	evidence := []string{}
+	if card.AccuracyMacroF1Gap > 0 {
+		evidence = append(evidence, fmt.Sprintf("accuracy exceeds macro-F1 by %.3f", card.AccuracyMacroF1Gap))
+	}
+	if len(card.WorstClasses) > 0 {
+		evidence = append(evidence, fmt.Sprintf("worst class %s recall %.3f f1 %.3f", card.WorstClasses[0].ClassName, card.WorstClasses[0].Recall, card.WorstClasses[0].F1))
+	}
+	if len(card.TopConfusionPairs) > 0 {
+		pair := card.TopConfusionPairs[0]
+		evidence = append(evidence, fmt.Sprintf("top confusion %s -> %s count %d", pair.ActualClass, pair.PredictedClass, pair.Count))
+	}
+	if card.ImbalanceActive {
+		evidence = append(evidence, fmt.Sprintf("dataset imbalance score %.2f", input.DeterministicDiagnosis.ClassImbalanceScore))
+	}
+	card.Evidence = cappedStrings(evidence, 8)
+	return card
+}
+
+func plannerDeploymentCard(input ExperimentPlannerInput) PlannerDeploymentCard {
+	card := PlannerDeploymentCard{
+		ObjectiveWeights:     input.ObjectiveContext.RankingWeights,
+		DeploymentPriorities: cappedStrings(input.ObjectiveContext.DeploymentPriorities, 8),
+		TradeoffSummary:      "No deployment profile is available; require any quality challenger to explain latency and cost tradeoffs.",
+	}
+	bestEvaluation, bestSummary, ok := bestEvaluationForPlanner(input)
+	if ok {
+		card.BestModel = bestSummary.Model
+		card.BestLatencyMS = roundDiagnosis(firstPositivePayloadFloat(bestEvaluation.ModelProfile, "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms"))
+		card.BestThroughput = roundDiagnosis(firstPositivePayloadFloat(bestEvaluation.ModelProfile, "throughput_images_per_second", "throughput", "images_per_second"))
+		card.BestParameterCount = firstPositivePayloadFloat(bestEvaluation.ModelProfile, "parameter_count", "parameters", "num_parameters")
+		card.BestModelSizeMB = roundDiagnosis(firstPositivePayloadFloat(bestEvaluation.ModelProfile, "model_size_mb", "size_mb", "artifact_size_mb"))
+	}
+	if input.CurrentChampion != nil {
+		card.CompactChampion = input.CurrentChampion.Model
+	}
+	card.ChampionLatencyMS = championLatency(input)
+	card.QualityChallenger = bestQualityChallenger(input)
+	scoreDelta := input.DeterministicDiagnosis.BestMetricDeltaVsChampion
+	latencyPenalty := input.DeterministicDiagnosis.LatencyPenalty
+	card.CanBeatChampionAfterLatencyPenalty = scoreDelta >= input.MinimumMeaningfulImprovement && latencyPenalty < 0.55
+	switch {
+	case latencyPenalty >= 0.55:
+		card.TradeoffSummary = "Latency pressure is active; prefer deployment_latency or compact challengers unless quality gain is clearly meaningful."
+	case card.CanBeatChampionAfterLatencyPenalty:
+		card.TradeoffSummary = "A quality challenger may be viable after objective penalties if it clears the minimum meaningful improvement."
+	case input.CurrentChampion != nil:
+		card.TradeoffSummary = "Current champion remains the deployment anchor; challengers need a clear quality or latency advantage."
+	}
+	card.Evidence = cappedStrings([]string{
+		fmt.Sprintf("best model %s latency %.1fms", card.BestModel, card.BestLatencyMS),
+		fmt.Sprintf("champion latency %.1fms", card.ChampionLatencyMS),
+		fmt.Sprintf("best delta vs champion %.3f", scoreDelta),
+		fmt.Sprintf("latency penalty %.2f", latencyPenalty),
+	}, 8)
+	return card
+}
+
+func plannerMechanismCoverageCard(input ExperimentPlannerInput) PlannerMechanismCoverageCard {
+	coverage := plannerSearchCoverage(input)
+	tried := map[string]bool{}
+	for _, mechanism := range coverage.TriedMechanisms {
+		tried[mechanism] = true
+	}
+	blocked := mechanismsFromRejectedOptions(input.RejectedStrategyMemory)
+	failedLessons := plannerFailedMechanismLessons(input)
+	bestResults := plannerBestResultByMechanism(input)
+	return PlannerMechanismCoverageCard{
+		TriedMechanisms:        coverage.TriedMechanisms,
+		BlockedMechanisms:      capSortedMapKeys(blocked, plannerSnapshotMaxMechanisms),
+		EligibleMechanisms:     eligiblePlannerMechanisms(tried, blocked),
+		BestResultByMechanism:  bestResults,
+		FailedMechanismLessons: failedLessons,
+		ShallowRepeatWarnings:  plannerShallowRepeatWarnings(input, coverage.TriedMechanisms),
+	}
+}
+
+func plannerLabelQualityCard(input ExperimentPlannerInput) PlannerLabelQualityCard {
+	perClass := plannerPerClassErrorCard(input)
+	card := PlannerLabelQualityCard{
+		SuspectClasses:       suspectPlannerClasses(perClass.WorstClasses),
+		AsymmetricConfusions: asymmetricPlannerConfusions(input, 5),
+	}
+	for _, evaluation := range append(append([]runs.TrainingRunEvaluation(nil), input.PlanEvaluations...), input.PriorEvaluations...) {
+		card.Signals = append(card.Signals, labelQualitySignalsFromPayload(evaluation.HolisticScores)...)
+		card.HighConfidenceErrorCount += int(firstPositivePayloadFloat(evaluation.HolisticScores, "high_confidence_error_count", "high_confidence_wrong_count"))
+		if nested := plannerNestedMap(evaluation.HolisticScores, "label_quality"); nested != nil {
+			card.Signals = append(card.Signals, labelQualitySignalsFromPayload(nested)...)
+			card.HighConfidenceErrorCount += int(firstPositivePayloadFloat(nested, "high_confidence_error_count", "high_confidence_wrong_count"))
+		}
+	}
+	if len(card.AsymmetricConfusions) > 0 {
+		pair := card.AsymmetricConfusions[0]
+		card.Signals = append(card.Signals, fmt.Sprintf("asymmetric confusion %s -> %s count %d vs reverse %d", pair.ActualClass, pair.PredictedClass, pair.Count, pair.ReverseCount))
+	}
+	if perClass.MinorityFailureActive && len(card.SuspectClasses) > 0 {
+		card.Signals = append(card.Signals, "weak per-class recall/F1 can indicate minority failure or label-quality review need")
+	}
+	card.Signals = cappedStrings(card.Signals, 8)
+	card.AuditRecommended = len(card.Signals) > 0 || card.HighConfidenceErrorCount > 0
+	if card.AuditRecommended {
+		card.Evidence = append(card.Evidence, "use label_noise_audit or hard_example_audit only as an audit/reporting recommendation; do not mutate labels automatically")
+	}
+	card.Evidence = append(card.Evidence, card.Signals...)
+	card.Evidence = cappedStrings(card.Evidence, 8)
+	return card
+}
+
 func plannerSearchCoverage(input ExperimentPlannerInput) PlannerSearchCoverage {
 	models := map[string]bool{}
 	families := map[string]bool{}
@@ -1265,7 +1651,7 @@ func plannerSearchCoverage(input ExperimentPlannerInput) PlannerSearchCoverage {
 				models[strings.ToLower(strings.TrimSpace(experiment.Model))] = true
 				families[inferExperimentFamily(experiment.Model)] = true
 			}
-			mechanisms[plannerExperimentMechanismSignature(experiment)] = true
+			mechanisms[plannerExperimentMechanism(experiment, "")] = true
 		}
 	}
 	for _, summary := range input.PriorSummaries {
@@ -1326,14 +1712,19 @@ func plannerStrategyLessons(input ExperimentPlannerInput) []PlannerStrategyLesso
 	}
 	for _, scorecard := range input.StrategyScorecards {
 		out = append(out, PlannerStrategyLesson{
-			Source:      "strategy_scorecard",
-			ScorecardID: scorecard.ID,
-			Outcome:     scorecard.Outcome,
-			Lesson:      scorecard.Lesson,
-			Models:      cappedStrings(stringsFromAny(scorecard.ProposedChanges["models"]), 8),
-			Tags:        cappedStrings(scorecard.Tags, 8),
-			CostUSD:     scorecard.CostUSD,
-			RuntimeSecs: scorecard.RuntimeSeconds,
+			Source:            "strategy_scorecard",
+			ScorecardID:       scorecard.ID,
+			Outcome:           scorecard.Outcome,
+			Mechanism:         mechanismFromScorecard(scorecard),
+			Intervention:      stringFromAny(scorecard.ProposedChanges["intervention"]),
+			DiagnosisTriggers: cappedStrings(stringsFromAny(scorecard.ProposedChanges["diagnosis_triggers"]), 8),
+			ExpectedDelta:     scorecard.ExpectedDelta,
+			ActualDelta:       scorecard.ActualDelta,
+			Lesson:            scorecard.Lesson,
+			Models:            cappedStrings(stringsFromAny(scorecard.ProposedChanges["models"]), 8),
+			Tags:              cappedStrings(scorecard.Tags, 8),
+			CostUSD:           scorecard.CostUSD,
+			RuntimeSecs:       scorecard.RuntimeSeconds,
 		})
 	}
 	if len(out) > plannerSnapshotMaxStrategyLessons {
@@ -1356,23 +1747,25 @@ func plannerStopContinueCard(input ExperimentPlannerInput) PlannerStopContinueCa
 
 func plannerExperimentCard(experiment plans.PlannedExperiment) PlannerExperiment {
 	return PlannerExperiment{
-		Template:           experiment.Template,
-		Model:              experiment.Model,
-		ModelFamily:        inferExperimentFamily(experiment.Model),
-		Epochs:             experiment.Epochs,
-		BatchSize:          experiment.BatchSize,
-		LearningRate:       experiment.LearningRate,
-		ImageSize:          experiment.ImageSize,
-		ResolutionStrategy: experiment.ResolutionStrategy,
-		Optimizer:          experiment.Optimizer,
-		Scheduler:          experiment.Scheduler,
-		WeightDecay:        experiment.WeightDecay,
-		AugmentationPolicy: experiment.AugmentationPolicy,
-		ClassBalancing:     experiment.ClassBalancing,
-		SamplingStrategy:   experiment.SamplingStrategy,
-		FineTuneStrategy:   experiment.FineTuneStrategy,
-		Mechanism:          plannerExperimentMechanismSignature(experiment),
-		MeaningfulAxes:     plannerMeaningfulAxes(experiment),
+		Template:                 experiment.Template,
+		Model:                    experiment.Model,
+		ModelFamily:              inferExperimentFamily(experiment.Model),
+		Epochs:                   experiment.Epochs,
+		BatchSize:                experiment.BatchSize,
+		LearningRate:             experiment.LearningRate,
+		ImageSize:                experiment.ImageSize,
+		ResolutionStrategy:       experiment.ResolutionStrategy,
+		Optimizer:                experiment.Optimizer,
+		Scheduler:                experiment.Scheduler,
+		WeightDecay:              experiment.WeightDecay,
+		AugmentationPolicy:       experiment.AugmentationPolicy,
+		AugmentationPolicyConfig: experiment.AugmentationPolicyConfig,
+		ClassBalancing:           experiment.ClassBalancing,
+		ClassBalancingConfig:     experiment.ClassBalancingConfig,
+		SamplingStrategy:         experiment.SamplingStrategy,
+		FineTuneStrategy:         experiment.FineTuneStrategy,
+		Mechanism:                plannerExperimentMechanism(experiment, ""),
+		MeaningfulAxes:           plannerMeaningfulAxes(experiment),
 	}
 }
 
@@ -1382,23 +1775,25 @@ func plannerExperimentFromJob(job jobs.ExperimentJob) plans.PlannedExperiment {
 		config = map[string]any{}
 	}
 	experiment := plans.PlannedExperiment{
-		Template:           plannerConfigString(config, "experiment_template"),
-		Model:              plannerConfigString(config, "model"),
-		Epochs:             plannerConfigIntDefault(config, "epochs"),
-		BatchSize:          plannerConfigIntDefault(config, "batch_size"),
-		LearningRate:       plannerConfigFloatDefault(config, "learning_rate"),
-		ImageSize:          plannerConfigIntDefault(config, "image_size"),
-		ResolutionStrategy: plannerConfigString(config, "resolution_strategy"),
-		Optimizer:          plannerConfigString(config, "optimizer"),
-		Scheduler:          plannerConfigString(config, "scheduler"),
-		WeightDecay:        plannerConfigFloatDefault(config, "weight_decay"),
-		Augmentation:       plannerConfigMap(config, "augmentation"),
-		AugmentationPolicy: plannerConfigString(config, "augmentation_policy"),
-		ClassBalancing:     plannerConfigString(config, "class_balancing"),
-		SamplingStrategy:   plannerConfigString(config, "sampling_strategy"),
-		Pretrained:         plannerConfigBoolDefault(config, "pretrained"),
-		FreezeBackbone:     plannerConfigBoolDefault(config, "freeze_backbone"),
-		FineTuneStrategy:   plannerConfigString(config, "fine_tune_strategy"),
+		Template:                 plannerConfigString(config, "experiment_template"),
+		Model:                    plannerConfigString(config, "model"),
+		Epochs:                   plannerConfigIntDefault(config, "epochs"),
+		BatchSize:                plannerConfigIntDefault(config, "batch_size"),
+		LearningRate:             plannerConfigFloatDefault(config, "learning_rate"),
+		ImageSize:                plannerConfigIntDefault(config, "image_size"),
+		ResolutionStrategy:       plannerConfigString(config, "resolution_strategy"),
+		Optimizer:                plannerConfigString(config, "optimizer"),
+		Scheduler:                plannerConfigString(config, "scheduler"),
+		WeightDecay:              plannerConfigFloatDefault(config, "weight_decay"),
+		Augmentation:             plannerConfigMap(config, "augmentation"),
+		AugmentationPolicy:       plannerConfigString(config, "augmentation_policy"),
+		AugmentationPolicyConfig: plannerConfigAugmentationPolicyConfig(config, "augmentation_policy_config"),
+		ClassBalancing:           plannerConfigString(config, "class_balancing"),
+		ClassBalancingConfig:     plannerConfigMap(config, "class_balancing_config"),
+		SamplingStrategy:         plannerConfigString(config, "sampling_strategy"),
+		Pretrained:               plannerConfigBoolDefault(config, "pretrained"),
+		FreezeBackbone:           plannerConfigBoolDefault(config, "freeze_backbone"),
+		FineTuneStrategy:         plannerConfigString(config, "fine_tune_strategy"),
 	}
 	if experiment.Template == "" {
 		experiment.Template = plannerConfigString(config, "template")
@@ -1413,7 +1808,7 @@ func plannerExperimentMechanism(experiment plans.PlannedExperiment, fallbackMode
 	if strings.TrimSpace(experiment.Model) == "" && strings.TrimSpace(fallbackModel) != "" {
 		experiment.Model = fallbackModel
 	}
-	return plannerExperimentMechanismSignature(experiment)
+	return inferExperimentMechanismTaxonomy(experiment)
 }
 
 func plannerRunOutcome(summary runs.TrainingRunSummary, champion *ExperimentChampion) string {
@@ -1448,7 +1843,7 @@ func plannerMeaningfulAxes(experiment plans.PlannedExperiment) []string {
 	if experiment.Preprocessing != nil {
 		axes = append(axes, "preprocessing")
 	}
-	if strings.TrimSpace(experiment.AugmentationPolicy) != "" || len(experiment.Augmentation) > 0 {
+	if strings.TrimSpace(experiment.AugmentationPolicy) != "" || len(experiment.Augmentation) > 0 || experiment.AugmentationPolicyConfig != nil {
 		axes = append(axes, "augmentation")
 	}
 	if strings.TrimSpace(experiment.ClassBalancing) != "" || strings.TrimSpace(experiment.SamplingStrategy) != "" {
@@ -1465,6 +1860,8 @@ func plannerMeaningfulAxes(experiment plans.PlannedExperiment) []string {
 
 func plannerExperimentSignature(experiment plans.PlannedExperiment) string {
 	augmentationBlob, _ := json.Marshal(experiment.Augmentation)
+	augmentationPolicyConfigBlob, _ := json.Marshal(experiment.AugmentationPolicyConfig)
+	classBalancingConfigBlob, _ := json.Marshal(experiment.ClassBalancingConfig)
 	preprocessingBlob, _ := json.Marshal(experiment.Preprocessing)
 	return strings.Join([]string{
 		strings.ToLower(strings.TrimSpace(experiment.Template)),
@@ -1480,7 +1877,9 @@ func plannerExperimentSignature(experiment plans.PlannedExperiment) string {
 		fmt.Sprintf("%g", experiment.WeightDecay),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
+		string(augmentationPolicyConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
+		string(classBalancingConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.SamplingStrategy)),
 		fmt.Sprintf("%d", experiment.EarlyStoppingPatience),
 		fmt.Sprintf("%t", experiment.Pretrained),
@@ -1491,6 +1890,8 @@ func plannerExperimentSignature(experiment plans.PlannedExperiment) string {
 
 func plannerExperimentMechanismSignature(experiment plans.PlannedExperiment) string {
 	augmentationBlob, _ := json.Marshal(experiment.Augmentation)
+	augmentationPolicyConfigBlob, _ := json.Marshal(experiment.AugmentationPolicyConfig)
+	classBalancingConfigBlob, _ := json.Marshal(experiment.ClassBalancingConfig)
 	preprocessingBlob, _ := json.Marshal(experiment.Preprocessing)
 	return strings.Join([]string{
 		strings.ToLower(strings.TrimSpace(experiment.Template)),
@@ -1503,12 +1904,434 @@ func plannerExperimentMechanismSignature(experiment plans.PlannedExperiment) str
 		fmt.Sprintf("%g", experiment.WeightDecay),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
+		string(augmentationPolicyConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
+		string(classBalancingConfigBlob),
 		strings.ToLower(strings.TrimSpace(experiment.SamplingStrategy)),
 		fmt.Sprintf("%t", experiment.Pretrained),
 		fmt.Sprintf("%t", experiment.FreezeBackbone),
 		strings.ToLower(strings.TrimSpace(experiment.FineTuneStrategy)),
 	}, ":")
+}
+
+func bestRunSummary(summaries []runs.TrainingRunSummary, targetMetric string) (runs.TrainingRunSummary, bool) {
+	best := runs.TrainingRunSummary{}
+	found := false
+	for _, summary := range summaries {
+		if !strings.EqualFold(summary.Status, jobs.StatusSucceeded) {
+			continue
+		}
+		score := diagnosisSummaryMetric(summary, targetMetric)
+		if !found || score > diagnosisSummaryMetric(best, targetMetric) {
+			best = summary
+			found = true
+		}
+	}
+	return best, found
+}
+
+func metricSlopeLastN(values []float64, n int) float64 {
+	if len(values) < 2 {
+		return 0
+	}
+	if n < 2 {
+		n = 2
+	}
+	start := len(values) - n
+	if start < 0 {
+		start = 0
+	}
+	return values[len(values)-1] - values[start]
+}
+
+func bestEvaluationForPlanner(input ExperimentPlannerInput) (runs.TrainingRunEvaluation, runs.TrainingRunSummary, bool) {
+	targetMetric := normalizedDiagnosisMetric(input.SourcePlan.TargetMetric)
+	summaries := append([]runs.TrainingRunSummary(nil), input.PlanSummaries...)
+	if len(summaries) == 0 {
+		summaries = append(summaries, input.PriorSummaries...)
+	}
+	best, ok := bestRunSummary(summaries, targetMetric)
+	if !ok {
+		return runs.TrainingRunEvaluation{}, runs.TrainingRunSummary{}, false
+	}
+	evaluations := append(append([]runs.TrainingRunEvaluation(nil), input.PlanEvaluations...), input.PriorEvaluations...)
+	for _, evaluation := range evaluations {
+		if evaluation.JobID == best.JobID {
+			return evaluation, best, true
+		}
+	}
+	return runs.TrainingRunEvaluation{}, best, false
+}
+
+func worstPlannerClasses(perClass map[string]any, limit int) []PlannerClassError {
+	out := []PlannerClassError{}
+	for label, raw := range perClass {
+		normalized := strings.ToLower(strings.TrimSpace(label))
+		if normalized == "" || strings.Contains(normalized, "avg") || normalized == "accuracy" {
+			continue
+		}
+		stats, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		recall := firstPositivePayloadFloat(stats, "recall")
+		f1 := firstPositivePayloadFloat(stats, "f1-score", "f1")
+		support := firstPositivePayloadFloat(stats, "support")
+		if recall <= 0 && f1 <= 0 {
+			continue
+		}
+		out = append(out, PlannerClassError{
+			ClassName: label,
+			Recall:    roundDiagnosis(recall),
+			F1:        roundDiagnosis(f1),
+			Support:   support,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		left := out[i].Recall
+		if left == 0 {
+			left = out[i].F1
+		}
+		right := out[j].Recall
+		if right == 0 {
+			right = out[j].F1
+		}
+		if left == right {
+			return out[i].F1 < out[j].F1
+		}
+		return left < right
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func topPlannerConfusionPairs(matrix [][]int, classNames []string, limit int) []PlannerConfusionPair {
+	pairs := []PlannerConfusionPair{}
+	for actualIndex, row := range matrix {
+		for predictedIndex, count := range row {
+			if actualIndex == predictedIndex || count <= 0 {
+				continue
+			}
+			reverse := 0
+			if predictedIndex < len(matrix) && actualIndex < len(matrix[predictedIndex]) {
+				reverse = matrix[predictedIndex][actualIndex]
+			}
+			pairs = append(pairs, PlannerConfusionPair{
+				ActualClass:    plannerClassName(classNames, actualIndex),
+				PredictedClass: plannerClassName(classNames, predictedIndex),
+				Count:          count,
+				ReverseCount:   reverse,
+			})
+		}
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		return pairs[i].Count > pairs[j].Count
+	})
+	if len(pairs) > limit {
+		pairs = pairs[:limit]
+	}
+	return pairs
+}
+
+func plannerClassNames(input ExperimentPlannerInput, perClass map[string]any) []string {
+	for _, raw := range []any{
+		input.Dataset.Profile["class_names"],
+		input.Dataset.Profile["classes"],
+		input.Dataset.Profile["class_labels"],
+	} {
+		if values := stringsFromAny(raw); len(values) > 0 {
+			return values
+		}
+	}
+	names := []string{}
+	for label := range perClass {
+		normalized := strings.ToLower(strings.TrimSpace(label))
+		if normalized == "" || strings.Contains(normalized, "avg") || normalized == "accuracy" {
+			continue
+		}
+		names = append(names, label)
+	}
+	if len(names) == 0 {
+		for label := range input.DatasetInsights.ClassDistribution {
+			names = append(names, label)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func plannerClassName(classNames []string, index int) string {
+	if index >= 0 && index < len(classNames) && strings.TrimSpace(classNames[index]) != "" {
+		return classNames[index]
+	}
+	return fmt.Sprintf("class_%d", index)
+}
+
+func weakWorstClass(classes []PlannerClassError) bool {
+	if len(classes) == 0 {
+		return false
+	}
+	worst := classes[0]
+	return (worst.Recall > 0 && worst.Recall < 0.68) || (worst.F1 > 0 && worst.F1 < 0.68)
+}
+
+func championLatency(input ExperimentPlannerInput) float64 {
+	if input.CurrentChampion == nil {
+		return 0
+	}
+	for _, evaluation := range append(append([]runs.TrainingRunEvaluation(nil), input.PlanEvaluations...), input.PriorEvaluations...) {
+		if evaluation.JobID == input.CurrentChampion.JobID {
+			return roundDiagnosis(firstPositivePayloadFloat(evaluation.ModelProfile, "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms"))
+		}
+	}
+	return 0
+}
+
+func bestQualityChallenger(input ExperimentPlannerInput) string {
+	for _, delta := range input.SourcePlanDeltas {
+		if delta.MeaningfullyImprovedOver && delta.Model != "" {
+			return delta.Model
+		}
+	}
+	targetMetric := normalizedDiagnosisMetric(input.SourcePlan.TargetMetric)
+	best, ok := bestRunSummary(input.PlanSummaries, targetMetric)
+	if ok && input.CurrentChampion != nil && !strings.EqualFold(best.JobID, input.CurrentChampion.JobID) {
+		return best.Model
+	}
+	return ""
+}
+
+func mechanismsFromRejectedOptions(options []RejectedPlannerOption) map[string]bool {
+	blocked := map[string]bool{}
+	for _, option := range options {
+		text := strings.ToLower(strings.Join(append([]string{option.Option, option.Reason, option.Evidence}, option.AppliesWhen...), " "))
+		for _, mechanism := range plannerMechanismTaxonomy() {
+			if strings.Contains(text, mechanism) || strings.Contains(text, strings.ReplaceAll(mechanism, "_", " ")) {
+				blocked[mechanism] = true
+			}
+		}
+	}
+	return blocked
+}
+
+func plannerFailedMechanismLessons(input ExperimentPlannerInput) []PlannerMechanismLesson {
+	lessons := []PlannerMechanismLesson{}
+	for _, scorecard := range input.StrategyScorecards {
+		if scorecard.Outcome != ExperimentPlanningOutcomeNoImprovement && scorecard.Outcome != ExperimentPlanningOutcomeFailed {
+			continue
+		}
+		mechanism := mechanismFromScorecard(scorecard)
+		if mechanism == "" {
+			mechanism = scorecard.StrategyType
+		}
+		lessons = append(lessons, PlannerMechanismLesson{
+			Mechanism:    mechanism,
+			Outcome:      scorecard.Outcome,
+			Lesson:       scorecard.Lesson,
+			Intervention: stringFromAny(scorecard.ProposedChanges["intervention"]),
+			Tags:         cappedStrings(scorecard.Tags, 6),
+		})
+		if len(lessons) >= 6 {
+			break
+		}
+	}
+	for _, memory := range input.FailedStrategyMemory {
+		if len(lessons) >= 6 {
+			break
+		}
+		lessons = append(lessons, PlannerMechanismLesson{
+			Mechanism: strings.Join(cappedStrings(memory.Tags, 2), ","),
+			Outcome:   memory.OutcomeStatus,
+			Lesson:    memory.Lesson,
+			Tags:      cappedStrings(memory.Tags, 6),
+		})
+	}
+	return lessons
+}
+
+func plannerBestResultByMechanism(input ExperimentPlannerInput) []PlannerMechanismResult {
+	ledger := plannerCompletedExperimentLedger(input)
+	best := map[string]PlannerMechanismResult{}
+	for _, entry := range ledger {
+		mechanism := normalizeMechanism(entry.Mechanism)
+		if mechanism == "" {
+			continue
+		}
+		current, ok := best[mechanism]
+		if !ok || entry.Score > current.BestScore {
+			best[mechanism] = PlannerMechanismResult{
+				Mechanism:      mechanism,
+				BestScore:      roundDiagnosis(entry.Score),
+				BestModel:      entry.Model,
+				BestJobID:      entry.JobID,
+				Outcome:        entry.Outcome,
+				CostUSD:        entry.CostUSD,
+				RuntimeSeconds: entry.RuntimeSeconds,
+			}
+		}
+	}
+	out := make([]PlannerMechanismResult, 0, len(best))
+	for _, value := range best {
+		out = append(out, value)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].BestScore == out[j].BestScore {
+			return out[i].Mechanism < out[j].Mechanism
+		}
+		return out[i].BestScore > out[j].BestScore
+	})
+	if len(out) > 8 {
+		out = out[:8]
+	}
+	return out
+}
+
+func eligiblePlannerMechanisms(tried map[string]bool, blocked map[string]bool) []string {
+	eligible := []string{}
+	for _, mechanism := range plannerMechanismTaxonomy() {
+		if mechanism == "stop_select_champion" || mechanism == "distillation" {
+			continue
+		}
+		if tried[mechanism] || blocked[mechanism] {
+			continue
+		}
+		eligible = append(eligible, mechanism)
+	}
+	return cappedStrings(eligible, 12)
+}
+
+func plannerShallowRepeatWarnings(input ExperimentPlannerInput, triedMechanisms []string) []string {
+	warnings := []string{}
+	if len(input.ExistingExperimentSignatures) > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d exact signatures already exist; avoid duplicate configs", len(input.ExistingExperimentSignatures)))
+	}
+	if len(triedMechanisms) > 0 {
+		warnings = append(warnings, "do not repeat tried mechanisms with only epochs, learning rate, or batch size changed")
+	}
+	for _, option := range input.RejectedStrategyMemory {
+		if strings.TrimSpace(option.Option) != "" {
+			warnings = append(warnings, fmt.Sprintf("blocked repeat: %s", option.Option))
+		}
+		if len(warnings) >= 6 {
+			break
+		}
+	}
+	return cappedStrings(warnings, 6)
+}
+
+func suspectPlannerClasses(classes []PlannerClassError) []string {
+	suspects := []string{}
+	for _, class := range classes {
+		if (class.Recall > 0 && class.Recall < 0.55) || (class.F1 > 0 && class.F1 < 0.55) {
+			suspects = append(suspects, class.ClassName)
+		}
+	}
+	return cappedStrings(suspects, 6)
+}
+
+func asymmetricPlannerConfusions(input ExperimentPlannerInput, limit int) []PlannerConfusionPair {
+	evaluation, _, ok := bestEvaluationForPlanner(input)
+	if !ok {
+		return nil
+	}
+	pairs := topPlannerConfusionPairs(evaluation.ConfusionMatrix, plannerClassNames(input, evaluation.PerClassMetrics), 12)
+	asymmetric := []PlannerConfusionPair{}
+	for _, pair := range pairs {
+		if pair.Count >= 2 && pair.Count >= pair.ReverseCount*2+1 {
+			asymmetric = append(asymmetric, pair)
+		}
+	}
+	if len(asymmetric) > limit {
+		asymmetric = asymmetric[:limit]
+	}
+	return asymmetric
+}
+
+func labelQualitySignalsFromPayload(payload map[string]any) []string {
+	if len(payload) == 0 {
+		return nil
+	}
+	signals := []string{}
+	for _, key := range []string{"label_noise_signal", "label_quality_signal", "label_noise", "suspicious_samples", "high_confidence_errors"} {
+		switch value := payload[key].(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				signals = append(signals, value)
+			}
+		case []string:
+			signals = append(signals, value...)
+		case []any:
+			for _, item := range value {
+				if text, ok := item.(string); ok {
+					signals = append(signals, text)
+				}
+			}
+		case bool:
+			if value {
+				signals = append(signals, key)
+			}
+		case float64:
+			if value > 0 {
+				signals = append(signals, fmt.Sprintf("%s=%.3f", key, value))
+			}
+		case int:
+			if value > 0 {
+				signals = append(signals, fmt.Sprintf("%s=%d", key, value))
+			}
+		}
+	}
+	return signals
+}
+
+func mechanismFromScorecard(scorecard PlannerStrategyScorecard) string {
+	for _, key := range []string{"mechanism", "mechanism_group"} {
+		if mechanism := normalizeMechanism(stringFromAny(scorecard.ProposedChanges[key])); mechanism != "" {
+			return mechanism
+		}
+	}
+	if mechanisms, ok := scorecard.ProposedChanges["proposal_mechanisms"].([]any); ok {
+		for _, item := range mechanisms {
+			if typed, ok := item.(map[string]any); ok {
+				if mechanism := normalizeMechanism(stringFromAny(typed["mechanism"])); mechanism != "" {
+					return mechanism
+				}
+			}
+		}
+	}
+	return normalizeMechanism(scorecard.StrategyType)
+}
+
+func stringFromAny(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return ""
+	}
+}
+
+func plannerMechanismTaxonomy() []string {
+	return []string{
+		"stop_select_champion",
+		"baseline_control",
+		"architecture_challenge",
+		"capacity_finetune",
+		"optimizer_scheduler",
+		"regularization",
+		"augmentation_basic",
+		"augmentation_auto",
+		"augmentation_mixed_sample",
+		"class_imbalance",
+		"minority_targeting",
+		"resolution_crop",
+		"bbox_crop_ablation",
+		"label_noise_audit",
+		"hard_example_audit",
+		"deployment_latency",
+		"distillation",
+	}
 }
 
 func capRejectedPlannerOptions(values []RejectedPlannerOption, limit int) []RejectedPlannerOption {
@@ -1701,6 +2524,27 @@ func plannerConfigPreprocessing(config map[string]any, key string) *plans.Prepro
 			CropStrategy:            plannerConfigString(value, "crop_strategy"),
 			BBoxMode:                plannerConfigString(value, "bbox_mode"),
 			UseDatasetNormalization: plannerConfigBoolDefault(value, "use_dataset_normalization"),
+		}
+	default:
+		return nil
+	}
+}
+
+func plannerConfigAugmentationPolicyConfig(config map[string]any, key string) *plans.AugmentationPolicyConfig {
+	switch value := config[key].(type) {
+	case *plans.AugmentationPolicyConfig:
+		return value
+	case plans.AugmentationPolicyConfig:
+		copy := value
+		return &copy
+	case map[string]any:
+		return &plans.AugmentationPolicyConfig{
+			PolicyType:       plannerConfigString(value, "policy_type"),
+			Magnitude:        plannerConfigIntDefault(value, "magnitude"),
+			NumOps:           plannerConfigIntDefault(value, "num_ops"),
+			NumMagnitudeBins: plannerConfigIntDefault(value, "num_magnitude_bins"),
+			Probability:      plannerConfigFloatDefault(value, "probability"),
+			Alpha:            plannerConfigFloatDefault(value, "alpha"),
 		}
 	default:
 		return nil

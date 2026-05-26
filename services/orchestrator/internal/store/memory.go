@@ -1156,25 +1156,31 @@ func (s *MemoryStore) CreateStrategyScorecard(scorecard strategies.StrategyScore
 	if scorecard.Outcome == "" {
 		scorecard.Outcome = strategies.OutcomePending
 	}
+	mechanism, intervention, diagnosisTriggers, evidenceUsed, expectedEffect := hydrateStrategyScorecardMechanismFields(scorecard)
 	now := time.Now().UTC()
 	created := strategies.StrategyScorecard{
-		ID:               s.newID("strategy_scorecard"),
-		ProjectID:        scorecard.ProjectID,
-		DatasetID:        scorecard.DatasetID,
-		SourceDecisionID: scorecard.SourceDecisionID,
-		SourcePlanID:     scorecard.SourcePlanID,
-		FollowUpPlanID:   scorecard.FollowUpPlanID,
-		StrategyType:     scorecard.StrategyType,
-		PlanningMode:     scorecard.PlanningMode,
-		DatasetTraits:    emptyMapIfNil(scorecard.DatasetTraits),
-		ObjectiveProfile: emptyMapIfNil(scorecard.ObjectiveProfile),
-		ProposedChanges:  emptyMapIfNil(scorecard.ProposedChanges),
-		ExpectedDelta:    scorecard.ExpectedDelta,
-		ConfidenceBefore: scorecard.ConfidenceBefore,
-		Outcome:          scorecard.Outcome,
-		Lesson:           scorecard.Lesson,
-		Tags:             append([]string(nil), scorecard.Tags...),
-		CreatedAt:        now,
+		ID:                s.newID("strategy_scorecard"),
+		ProjectID:         scorecard.ProjectID,
+		DatasetID:         scorecard.DatasetID,
+		SourceDecisionID:  scorecard.SourceDecisionID,
+		SourcePlanID:      scorecard.SourcePlanID,
+		FollowUpPlanID:    scorecard.FollowUpPlanID,
+		StrategyType:      scorecard.StrategyType,
+		PlanningMode:      scorecard.PlanningMode,
+		Mechanism:         mechanism,
+		Intervention:      intervention,
+		DiagnosisTriggers: diagnosisTriggers,
+		EvidenceUsed:      evidenceUsed,
+		ExpectedEffect:    expectedEffect,
+		DatasetTraits:     emptyMapIfNil(scorecard.DatasetTraits),
+		ObjectiveProfile:  emptyMapIfNil(scorecard.ObjectiveProfile),
+		ProposedChanges:   emptyMapIfNil(scorecard.ProposedChanges),
+		ExpectedDelta:     scorecard.ExpectedDelta,
+		ConfidenceBefore:  scorecard.ConfidenceBefore,
+		Outcome:           scorecard.Outcome,
+		Lesson:            scorecard.Lesson,
+		Tags:              append([]string(nil), scorecard.Tags...),
+		CreatedAt:         now,
 	}
 	s.strategyScorecards[created.ID] = created
 	return created, nil

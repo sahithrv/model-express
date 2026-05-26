@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import os
+import random
 from pathlib import Path
+
+from worker.training.augmentation import (
+    MIXED_SAMPLE_POLICY_TYPES,
+    normalize_augmentation_config,
+    structured_policy_type,
+)
 
 try:
     import modal
@@ -11,6 +18,16 @@ except Exception:  # pragma: no cover - local helper tests can run without Modal
 
 APP_NAME = "model-express-training"
 DEFAULT_GPU = os.getenv("MODAL_GPU_TYPE", "T4")
+
+EFFECTIVE_NUMBER_CLASS_BALANCING = {
+    "effective_number",
+    "effective_number_loss",
+    "effective_number_class_balanced_loss",
+    "class_balanced_loss",
+    "class_balanced_effective_number",
+}
+BBOX_CROP_STRATEGIES = {"bbox_crop_if_available", "bbox_crop_ablation"}
+BBOX_CROP_MODES = {"crop_if_available", "crop_and_compare_full_image"}
 
 if modal is not None:
     image = (
@@ -41,6 +58,34 @@ else:
     app = _UnavailableModalApp()
 
 
+class _BBoxCropDataset:
+    def __init__(self, dataset, bbox_lookup: dict[str, tuple[int, int, int, int]], required: bool):
+        self.dataset = dataset
+        self.bbox_lookup = bbox_lookup
+        self.required = required
+        self.classes = getattr(dataset, "classes", [])
+        self.targets = getattr(dataset, "targets", [])
+        self.samples = getattr(dataset, "samples", [])
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        image = self.dataset.loader(path)
+        bbox = _bbox_for_image_path(path, self.bbox_lookup)
+        if bbox is None:
+            if self.required:
+                raise ValueError(f"Missing bbox annotation for image '{path}'.")
+        else:
+            image = _crop_image_to_bbox(image, bbox)
+        if self.dataset.transform is not None:
+            image = self.dataset.transform(image)
+        if self.dataset.target_transform is not None:
+            target = self.dataset.target_transform(target)
+        return image, target
+
+
 
 @app.function(image=image, gpu=DEFAULT_GPU, timeout=60 * 60)
 def train_image_classifier(payload: dict) -> dict:
@@ -68,8 +113,11 @@ def train_image_classifier(payload: dict) -> dict:
     optimizer_name = str(config.get("optimizer", "adamw")).lower()
     scheduler_name = str(config.get("scheduler", "none")).lower()
     weight_decay = _non_negative_float(config.get("weight_decay"), default=0.0)
-    augmentation = config.get("augmentation") if isinstance(config.get("augmentation"), dict) else {}
-    augmentation_policy = str(config.get("augmentation_policy", "")).lower()
+    augmentation = normalize_augmentation_config(
+        config.get("augmentation"),
+        config.get("augmentation_policy", ""),
+        config.get("augmentation_policy_config"),
+    )
     class_balancing = str(config.get("class_balancing", "")).lower()
     sampling_strategy = str(config.get("sampling_strategy", "")).lower()
     preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
@@ -85,15 +133,15 @@ def train_image_classifier(payload: dict) -> dict:
     download_s3_uri(dataset["storage_uri"], archive_path)
     dataset_dir = extract_dataset_archive(archive_path, dataset_id)
 
-    train_loader, val_loader, test_loader, class_names, class_weights = _load_image_data(
+    train_loader, val_loader, test_loader, class_names, class_weights, execution_metadata = _load_image_data(
         dataset_dir,
         batch_size,
         image_size,
         augmentation,
-        augmentation_policy,
         class_balancing,
         sampling_strategy,
         preprocessing,
+        config.get("class_balancing_config") if isinstance(config.get("class_balancing_config"), dict) else {},
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _build_model(model_name, len(class_names), pretrained, freeze_backbone, fine_tune_strategy).to(device)
@@ -110,7 +158,7 @@ def train_image_classifier(payload: dict) -> dict:
     final_eval_details = {"confusion_matrix": [], "per_class_metrics": {}}
 
     for epoch in range(1, epochs + 1):
-        train_loss = _train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = _train_one_epoch(model, train_loader, criterion, optimizer, device, augmentation, len(class_names))
         val_loss, accuracy, macro_f1, final_eval_details = _evaluate(model, val_loader, criterion, device, class_names)
         improved = macro_f1 > best_macro_f1
         if improved:
@@ -164,9 +212,24 @@ def train_image_classifier(payload: dict) -> dict:
 
     runtime_seconds = time.time() - started_at
     estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
-    test_loss, test_accuracy, test_macro_f1, test_eval_details = _evaluate(model, test_loader, criterion, device, class_names)
+    test_loss, test_accuracy, test_macro_f1, test_eval_details = _evaluate(
+        model,
+        test_loader,
+        criterion,
+        device,
+        class_names,
+        collect_examples=_label_quality_audit_requested(config),
+    )
     if test_eval_details.get("confusion_matrix"):
         final_eval_details = test_eval_details
+    bbox_ablation = _bbox_ablation_evaluation(
+        model,
+        execution_metadata,
+        criterion,
+        device,
+        class_names,
+        crop_metrics={"accuracy": test_accuracy, "macro_f1": test_macro_f1, "loss": test_loss},
+    )
     model_profile = _model_profile(model, model_name, image_size, device, val_loader)
     _post_training_run_summary(
         orchestrator_url,
@@ -208,6 +271,18 @@ def train_image_classifier(payload: dict) -> dict:
                 "fine_tune_strategy": fine_tune_strategy,
             },
             "holistic_scores": _holistic_scores(best_macro_f1, best_accuracy, estimated_cost_usd, runtime_seconds, model_profile),
+            "preprocessing_summary": {
+                "augmentation_policy": str(config.get("augmentation_policy", "")),
+                "augmentation_policy_config": config.get("augmentation_policy_config")
+                if isinstance(config.get("augmentation_policy_config"), dict)
+                else {},
+                "class_balancing": class_balancing,
+                "sampling_strategy": sampling_strategy,
+                "preprocessing": preprocessing,
+                "worker_execution_metadata": _public_execution_metadata(execution_metadata),
+                "bbox_crop_ablation": bbox_ablation,
+            },
+            "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
             "recommendation_summary": (
                 f"{model_name} finished with macro-F1 {best_macro_f1:.3f}, "
                 f"accuracy {best_accuracy:.3f}, and estimated latency "
@@ -264,23 +339,52 @@ def _load_image_data(
     batch_size: int,
     image_size: int,
     augmentation: dict,
-    augmentation_policy: str,
     class_balancing: str,
     sampling_strategy: str,
     preprocessing: dict,
+    class_balancing_config: dict | None = None,
 ):
     import torch
     from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
     from torchvision import datasets
 
-    augmentation = _augmentation_from_policy(augmentation, augmentation_policy)
     normalization_metadata = _dataset_normalization_metadata(dataset_dir, preprocessing)
     if normalization_metadata is not None:
         preprocessing = {**preprocessing, "normalization_metadata": normalization_metadata}
     train_transform = _image_transform(image_size, augmentation, preprocessing, training=True)
     val_transform = _image_transform(image_size, {}, preprocessing, training=False)
+    crop_strategy = str(preprocessing.get("crop_strategy", "")).lower()
+    bbox_mode = str(preprocessing.get("bbox_mode", "")).lower()
+    bbox_crop_requested = crop_strategy in BBOX_CROP_STRATEGIES or bbox_mode in BBOX_CROP_MODES
+    bbox_required = crop_strategy == "bbox_crop_ablation" or bbox_mode == "crop_and_compare_full_image"
+    bbox_compare_requested = crop_strategy == "bbox_crop_ablation" or bbox_mode == "crop_and_compare_full_image"
+    bbox_lookup: dict[str, tuple[int, int, int, int]] = {}
+    execution_metadata: dict = {
+        "bbox_crop": {
+            "requested": bbox_crop_requested,
+            "applied": False,
+            "annotation_count": 0,
+            "mode": bbox_mode or crop_strategy or "none",
+            "compare_full_image": bbox_compare_requested,
+        }
+    }
+    if bbox_crop_requested:
+        bbox_lookup = _load_bbox_lookup(dataset_dir)
+        execution_metadata["bbox_crop"]["annotation_count"] = len(bbox_lookup)
+        if not bbox_lookup:
+            message = (
+                "BBox crop was requested, but no Pascal VOC XML or annotation JSON bounding boxes "
+                "were found in the extracted dataset."
+            )
+            execution_metadata["bbox_crop"]["status"] = "missing_annotations"
+            if bbox_required or crop_strategy == "bbox_crop_if_available" or bbox_mode == "crop_if_available":
+                raise ValueError(message)
+        else:
+            execution_metadata["bbox_crop"]["applied"] = True
+            execution_metadata["bbox_crop"]["status"] = "applied"
 
-    base_dataset = datasets.ImageFolder(dataset_dir)
+    uses_metadata_aware_dataset = _has_root_metadata_dirs(dataset_dir)
+    base_dataset = _image_folder_dataset(datasets, dataset_dir)
     if len(base_dataset.classes) < 2:
         raise ValueError("Training requires at least two image classes.")
     if len(base_dataset) < 2:
@@ -304,11 +408,17 @@ def _load_image_data(
     if not test_indices:
         test_indices = val_indices
 
-    train_dataset = datasets.ImageFolder(dataset_dir, transform=train_transform)
-    val_dataset = datasets.ImageFolder(dataset_dir, transform=val_transform)
+    train_dataset = _image_folder_dataset(datasets, dataset_dir, transform=train_transform)
+    val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
+    full_image_val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
+    if bbox_lookup:
+        train_dataset = _BBoxCropDataset(train_dataset, bbox_lookup, required=bbox_required)
+        val_dataset = _BBoxCropDataset(val_dataset, bbox_lookup, required=bbox_required)
     train_data = Subset(train_dataset, train_indices)
     val_data = Subset(val_dataset, val_indices)
     test_data = Subset(val_dataset, test_indices)
+    full_image_val_data = Subset(full_image_val_dataset, val_indices)
+    full_image_test_data = Subset(full_image_val_dataset, test_indices)
 
     sampler = None
     if _uses_weighted_sampler(class_balancing, sampling_strategy):
@@ -319,28 +429,60 @@ def _load_image_data(
         weights = [float(1.0 / counts[int(base_dataset.targets[index])]) for index in train_indices]
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=sampler is None, sampler=sampler, num_workers=2)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=2)
-    class_weights = _class_weights(base_dataset.targets, train_indices, len(base_dataset.classes), class_balancing)
-    return train_loader, val_loader, test_loader, base_dataset.classes, class_weights
+    loader_workers = 0 if uses_metadata_aware_dataset else 2
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=sampler is None, sampler=sampler, num_workers=loader_workers)
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=loader_workers)
+    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=loader_workers)
+    if bbox_lookup and bbox_compare_requested:
+        execution_metadata["_full_image_val_loader"] = DataLoader(
+            full_image_val_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=loader_workers,
+        )
+        execution_metadata["_full_image_test_loader"] = DataLoader(
+            full_image_test_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=loader_workers,
+        )
+    class_weights = _class_weights(
+        base_dataset.targets,
+        train_indices,
+        len(base_dataset.classes),
+        class_balancing,
+        class_balancing_config or {},
+    )
+    return train_loader, val_loader, test_loader, base_dataset.classes, class_weights, execution_metadata
 
 
 def _augmentation_from_policy(augmentation: dict, policy: str) -> dict:
-    merged = dict(augmentation)
-    if policy == "light":
-        merged.setdefault("horizontal_flip", True)
-    elif policy == "moderate":
-        merged.setdefault("horizontal_flip", True)
-        merged.setdefault("color_jitter", True)
-        merged.setdefault("random_crop", True)
-    elif policy == "strong":
-        merged.setdefault("horizontal_flip", True)
-        merged.setdefault("color_jitter", True)
-        merged.setdefault("random_crop", True)
-        merged.setdefault("random_rotation", True)
-        merged.setdefault("random_erasing", True)
-    return merged
+    return normalize_augmentation_config(augmentation, policy)
+
+
+def _image_folder_dataset(datasets, dataset_dir: Path, transform=None):
+    metadata_names = {"annotation", "annotations", "metadata", "meta", "splits"}
+    if not _has_root_metadata_dirs(dataset_dir):
+        return datasets.ImageFolder(dataset_dir, transform=transform)
+
+    class MetadataAwareImageFolder(datasets.ImageFolder):
+        def find_classes(self, directory):
+            classes = sorted(
+                entry.name
+                for entry in os.scandir(directory)
+                if entry.is_dir() and entry.name.lower() not in metadata_names
+            )
+            if not classes:
+                raise FileNotFoundError(f"No class folders found in {directory}.")
+            class_to_idx = {class_name: index for index, class_name in enumerate(classes)}
+            return classes, class_to_idx
+
+    return MetadataAwareImageFolder(dataset_dir, transform=transform)
+
+
+def _has_root_metadata_dirs(dataset_dir: Path) -> bool:
+    metadata_names = {"annotation", "annotations", "metadata", "meta", "splits"}
+    return any(child.is_dir() and child.name.lower() in metadata_names for child in dataset_dir.iterdir())
 
 
 def _image_transform(image_size: int, augmentation: dict, preprocessing: dict, training: bool):
@@ -365,10 +507,14 @@ def _image_transform(image_size: int, augmentation: dict, preprocessing: dict, t
 
     if training and augmentation.get("horizontal_flip"):
         steps.append(transforms.RandomHorizontalFlip())
+    if training and augmentation.get("vertical_flip"):
+        steps.append(transforms.RandomVerticalFlip())
     if training and augmentation.get("color_jitter"):
         steps.append(transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.12, hue=0.03))
     if training and augmentation.get("random_rotation"):
         steps.append(transforms.RandomRotation(10))
+    if training:
+        steps.extend(_advanced_augmentation_steps(transforms, augmentation))
 
     steps.append(transforms.ToTensor())
     if training and augmentation.get("random_erasing"):
@@ -378,6 +524,62 @@ def _image_transform(image_size: int, augmentation: dict, preprocessing: dict, t
         mean, std = normalization_values
         steps.append(transforms.Normalize(mean=mean, std=std))
     return transforms.Compose(steps)
+
+
+def _advanced_augmentation_steps(transforms, augmentation: dict) -> list:
+    policy_type = structured_policy_type(augmentation)
+    if policy_type in {"", "basic", "none", "custom", "light", "moderate", "strong"} | MIXED_SAMPLE_POLICY_TYPES:
+        return []
+
+    probability = float(augmentation.get("probability", 1.0))
+    if policy_type == "randaugment":
+        transform = _torchvision_transform(
+            transforms,
+            "RandAugment",
+            num_ops=int(augmentation.get("num_ops", 2)),
+            magnitude=int(augmentation.get("magnitude", 9)),
+        )
+    elif policy_type == "trivialaugment":
+        transform = _torchvision_transform(
+            transforms,
+            "TrivialAugmentWide",
+            num_magnitude_bins=int(augmentation.get("num_magnitude_bins", 31)),
+        )
+    elif policy_type == "autoaugment":
+        transform = _autoaugment_transform(transforms, augmentation)
+    else:
+        raise ValueError(f"Unsupported image augmentation policy_type '{policy_type}'.")
+
+    if probability >= 1.0:
+        return [transform]
+    return [transforms.RandomApply([transform], p=probability)]
+
+
+def _torchvision_transform(transforms, name: str, **kwargs):
+    transform_factory = getattr(transforms, name, None)
+    if transform_factory is None:
+        raise ValueError(f"torchvision.transforms.{name} is unavailable in this worker image.")
+    return transform_factory(**kwargs)
+
+
+def _autoaugment_transform(transforms, augmentation: dict):
+    transform_factory = getattr(transforms, "AutoAugment", None)
+    if transform_factory is None:
+        raise ValueError("torchvision.transforms.AutoAugment is unavailable in this worker image.")
+
+    policy_name = str(augmentation.get("autoaugment_policy") or "imagenet").strip().lower()
+    policy_enum = getattr(transforms, "AutoAugmentPolicy", None)
+    if policy_enum is None:
+        return transform_factory()
+
+    policies = {
+        "imagenet": policy_enum.IMAGENET,
+        "cifar10": policy_enum.CIFAR10,
+        "svhn": policy_enum.SVHN,
+    }
+    if policy_name not in policies:
+        raise ValueError("AutoAugment policy must be one of: imagenet, cifar10, svhn.")
+    return transform_factory(policy=policies[policy_name])
 
 
 def _resize_with_padding(image, image_size: int):
@@ -392,8 +594,112 @@ def _resize_with_padding(image, image_size: int):
     return canvas
 
 
-def _class_weights(targets: list[int], train_indices: list[int], class_count: int, class_balancing: str):
-    if class_balancing not in {"weighted_loss", "class_weighted_loss", "focal_loss"}:
+def _load_bbox_lookup(dataset_dir: Path) -> dict[str, tuple[int, int, int, int]]:
+    from worker.datasets.annotations import parse_annotation_json_bboxes, parse_pascal_voc_bboxes
+
+    lookup: dict[str, tuple[int, int, int, int]] = {}
+    for path in sorted(dataset_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            if path.suffix.lower() == ".xml":
+                payload = parse_pascal_voc_bboxes(path)
+            elif path.suffix.lower() == ".json" and "annotation" in path.name.lower():
+                payload = parse_annotation_json_bboxes(path)
+            else:
+                continue
+        except Exception:
+            continue
+        bbox = _union_annotation_bbox(payload.get("objects"))
+        if bbox is None:
+            continue
+        filename = str(payload.get("filename") or "").strip()
+        keys = {path.stem.lower(), path.name.lower()}
+        if filename:
+            keys.add(filename.lower())
+            keys.add(Path(filename).stem.lower())
+            matching_path = _resolve_annotation_image_path(dataset_dir, filename)
+            if matching_path is not None:
+                keys.add(str(matching_path.resolve()).lower())
+        for key in keys:
+            if key:
+                lookup[key] = bbox
+    return lookup
+
+
+def _resolve_annotation_image_path(dataset_dir: Path, filename: str) -> Path | None:
+    candidate = dataset_dir / filename
+    if candidate.exists():
+        return candidate
+    filename_lower = Path(filename).name.lower()
+    for image_path in dataset_dir.rglob("*"):
+        if image_path.is_file() and image_path.name.lower() == filename_lower:
+            return image_path
+    return None
+
+
+def _union_annotation_bbox(objects: object) -> tuple[int, int, int, int] | None:
+    if not isinstance(objects, list):
+        return None
+    boxes = []
+    for item in objects:
+        if not isinstance(item, dict) or not isinstance(item.get("bbox"), dict):
+            continue
+        bbox = item["bbox"]
+        try:
+            xmin = int(bbox["xmin"])
+            ymin = int(bbox["ymin"])
+            xmax = int(bbox["xmax"])
+            ymax = int(bbox["ymax"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if xmax > xmin and ymax > ymin:
+            boxes.append((xmin, ymin, xmax, ymax))
+    if not boxes:
+        return None
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def _bbox_for_image_path(path: str, lookup: dict[str, tuple[int, int, int, int]]) -> tuple[int, int, int, int] | None:
+    image_path = Path(path)
+    for key in (str(image_path.resolve()).lower(), image_path.name.lower(), image_path.stem.lower()):
+        bbox = lookup.get(key)
+        if bbox is not None:
+            return bbox
+    return None
+
+
+def _crop_image_to_bbox(image, bbox: tuple[int, int, int, int]):
+    image = image.convert("RGB")
+    width, height = image.size
+    xmin, ymin, xmax, ymax = bbox
+    pad_x = max(1, int((xmax - xmin) * 0.05))
+    pad_y = max(1, int((ymax - ymin) * 0.05))
+    crop_box = (
+        max(0, xmin - pad_x),
+        max(0, ymin - pad_y),
+        min(width, xmax + pad_x),
+        min(height, ymax + pad_y),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return image
+    return image.crop(crop_box)
+
+
+def _class_weights(
+    targets: list[int],
+    train_indices: list[int],
+    class_count: int,
+    class_balancing: str,
+    class_balancing_config: dict | None = None,
+):
+    weighted_modes = {"weighted_loss", "class_weighted_loss", "focal_loss"} | EFFECTIVE_NUMBER_CLASS_BALANCING
+    if class_balancing not in weighted_modes:
         return None
 
     import torch
@@ -402,6 +708,16 @@ def _class_weights(targets: list[int], train_indices: list[int], class_count: in
     for index in train_indices:
         counts[int(targets[index])] += 1.0
     counts = torch.clamp(counts, min=1.0)
+    if class_balancing in EFFECTIVE_NUMBER_CLASS_BALANCING:
+        beta = _bounded_float(
+            (class_balancing_config or {}).get("effective_number_beta"),
+            default=0.9999,
+            minimum=0.9,
+            maximum=0.99999,
+        )
+        effective_number = 1.0 - torch.pow(torch.tensor(beta, dtype=torch.float32), counts)
+        weights = (1.0 - beta) / torch.clamp(effective_number, min=1e-8)
+        return weights * (class_count / torch.clamp(weights.sum(), min=1e-8))
     weights = counts.sum() / (counts * class_count)
     return weights
 
@@ -469,13 +785,65 @@ def _build_criterion(class_weights, class_balancing: str, device):
                 self.gamma = gamma
 
             def forward(self, logits, targets):
-                cross_entropy = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+                if targets.dtype.is_floating_point:
+                    log_probabilities = F.log_softmax(logits, dim=1)
+                    weights = self.weight.view(1, -1) if self.weight is not None else 1.0
+                    cross_entropy = -(targets * log_probabilities * weights).sum(dim=1)
+                else:
+                    cross_entropy = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
                 probability = torch.exp(-cross_entropy)
                 loss = ((1 - probability) ** self.gamma) * cross_entropy
                 return loss.mean()
 
         return FocalLoss(weight=weight_tensor)
     return nn.CrossEntropyLoss(weight=weight_tensor)
+
+
+def _apply_mixed_sample_augmentation(inputs, labels, augmentation: dict, class_count: int, device):
+    import torch
+    import torch.nn.functional as F
+
+    policy_type = structured_policy_type(augmentation)
+    if policy_type not in MIXED_SAMPLE_POLICY_TYPES or inputs.size(0) < 2:
+        return inputs, labels
+    probability = float(augmentation.get("probability", 1.0))
+    if probability <= 0.0 or random.random() > probability:
+        return inputs, labels
+    alpha = float(augmentation.get("alpha", 0.2))
+    if alpha <= 0.0:
+        return inputs, labels
+
+    beta_distribution = torch.distributions.Beta(alpha, alpha)
+    lam = float(beta_distribution.sample().item())
+    permutation = torch.randperm(inputs.size(0), device=device)
+    labels_one_hot = F.one_hot(labels, num_classes=class_count).to(dtype=inputs.dtype)
+    mixed_labels = (lam * labels_one_hot) + ((1.0 - lam) * labels_one_hot[permutation])
+
+    if policy_type == "mixup":
+        mixed_inputs = (lam * inputs) + ((1.0 - lam) * inputs[permutation])
+        return mixed_inputs, mixed_labels
+
+    mixed_inputs, adjusted_lam = _apply_cutmix(inputs, permutation, lam)
+    mixed_labels = (adjusted_lam * labels_one_hot) + ((1.0 - adjusted_lam) * labels_one_hot[permutation])
+    return mixed_inputs, mixed_labels
+
+
+def _apply_cutmix(inputs, permutation, lam: float):
+    _, _, height, width = inputs.shape
+    cut_ratio = (1.0 - lam) ** 0.5
+    cut_width = max(1, int(width * cut_ratio))
+    cut_height = max(1, int(height * cut_ratio))
+    center_x = random.randint(0, max(width - 1, 0))
+    center_y = random.randint(0, max(height - 1, 0))
+    x1 = max(center_x - cut_width // 2, 0)
+    y1 = max(center_y - cut_height // 2, 0)
+    x2 = min(center_x + cut_width // 2, width)
+    y2 = min(center_y + cut_height // 2, height)
+    mixed_inputs = inputs.clone()
+    mixed_inputs[:, :, y1:y2, x1:x2] = inputs[permutation, :, y1:y2, x1:x2]
+    area = max(0, x2 - x1) * max(0, y2 - y1)
+    adjusted_lam = 1.0 - (area / max(1, width * height))
+    return mixed_inputs, float(adjusted_lam)
 
 
 def _build_model(model_name: str, class_count: int, pretrained: bool = True, freeze_backbone: bool = True, fine_tune_strategy: str = "head_only"):
@@ -595,18 +963,20 @@ def _build_scheduler(scheduler_name: str, optimizer, epochs: int):
     return None
 
 
-def _train_one_epoch(model, loader, criterion, optimizer, device) -> float:
+def _train_one_epoch(model, loader, criterion, optimizer, device, augmentation: dict | None = None, class_count: int = 0) -> float:
     model.train()
     total_loss = 0.0
     total_examples = 0
+    augmentation = augmentation or {}
 
     for inputs, labels in loader:
         inputs = inputs.to(device)
         labels = labels.to(device)
+        inputs, loss_labels = _apply_mixed_sample_augmentation(inputs, labels, augmentation, max(1, class_count), device)
 
         optimizer.zero_grad(set_to_none=True)
         outputs = model(inputs)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs, loss_labels)
         loss.backward()
         optimizer.step()
 
@@ -617,7 +987,14 @@ def _train_one_epoch(model, loader, criterion, optimizer, device) -> float:
     return total_loss / max(total_examples, 1)
 
 
-def _evaluate(model, loader, criterion, device, class_names: list[str]) -> tuple[float, float, float, dict]:
+def _evaluate(
+    model,
+    loader,
+    criterion,
+    device,
+    class_names: list[str],
+    collect_examples: bool = False,
+) -> tuple[float, float, float, dict]:
     import torch
     from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
@@ -626,6 +1003,8 @@ def _evaluate(model, loader, criterion, device, class_names: list[str]) -> tuple
     total_examples = 0
     predictions = []
     targets = []
+    confidences = []
+    sample_paths = _sample_paths_from_loader(loader) if collect_examples else []
 
     with torch.no_grad():
         for inputs, labels in loader:
@@ -639,8 +1018,11 @@ def _evaluate(model, loader, criterion, device, class_names: list[str]) -> tuple
             total_examples += batch_size
 
             predicted = outputs.argmax(dim=1)
+            probabilities = torch.softmax(outputs, dim=1)
+            batch_confidences = probabilities.max(dim=1).values
             predictions.extend(predicted.cpu().tolist())
             targets.extend(labels.cpu().tolist())
+            confidences.extend(batch_confidences.cpu().tolist())
 
     correct = sum(1 for prediction, target in zip(predictions, targets) if prediction == target)
     accuracy = correct / max(len(targets), 1)
@@ -659,7 +1041,131 @@ def _evaluate(model, loader, criterion, device, class_names: list[str]) -> tuple
         if targets
         else {},
     }
+    if collect_examples:
+        details["example_predictions"] = _example_prediction_records(
+            predictions,
+            targets,
+            confidences,
+            sample_paths,
+            class_names,
+        )
     return total_loss / max(total_examples, 1), accuracy, float(macro_f1), details
+
+
+def _sample_paths_from_loader(loader) -> list[str]:
+    dataset = getattr(loader, "dataset", None)
+    indices = getattr(dataset, "indices", None)
+    source = getattr(dataset, "dataset", dataset)
+    samples = getattr(source, "samples", None)
+    if not isinstance(samples, list):
+        return []
+    if indices is None:
+        return [str(sample[0]) for sample in samples]
+    return [str(samples[int(index)][0]) for index in indices if int(index) < len(samples)]
+
+
+def _example_prediction_records(
+    predictions: list[int],
+    targets: list[int],
+    confidences: list[float],
+    sample_paths: list[str],
+    class_names: list[str],
+) -> list[dict]:
+    records = []
+    for index, (prediction, target) in enumerate(zip(predictions, targets)):
+        confidence = float(confidences[index]) if index < len(confidences) else 0.0
+        records.append(
+            {
+                "path": sample_paths[index] if index < len(sample_paths) else "",
+                "predicted_class": class_names[prediction] if prediction < len(class_names) else str(prediction),
+                "true_class": class_names[target] if target < len(class_names) else str(target),
+                "confidence": round(confidence, 6),
+                "correct": prediction == target,
+            }
+        )
+    return records
+
+
+def _label_quality_audit_requested(config: dict) -> bool:
+    mechanism = str(config.get("mechanism", "")).lower()
+    audit_config = config.get("label_quality_audit") if isinstance(config.get("label_quality_audit"), dict) else {}
+    if mechanism in {"label_noise_audit", "hard_example_audit"}:
+        return True
+    if audit_config:
+        return _bool(audit_config.get("enabled"), default=False)
+    return _bool(config.get("label_quality_audit"), default=False)
+
+
+def _label_quality_audit(config: dict, eval_details: dict, class_names: list[str]) -> dict:
+    if not _label_quality_audit_requested(config):
+        return {
+            "status": "not_requested",
+            "report_only": True,
+        }
+    records = eval_details.get("example_predictions") if isinstance(eval_details, dict) else []
+    if not isinstance(records, list):
+        records = []
+    high_confidence_wrong = [
+        record
+        for record in records
+        if not record.get("correct") and float(record.get("confidence") or 0.0) >= 0.7
+    ]
+    low_confidence_correct = [
+        record
+        for record in records
+        if record.get("correct") and float(record.get("confidence") or 0.0) <= 0.55
+    ]
+    hard_examples = sorted(
+        records,
+        key=lambda record: (bool(record.get("correct")), -float(record.get("confidence") or 0.0)),
+    )
+    return {
+        "status": "completed",
+        "report_only": True,
+        "sample_count": len(records),
+        "class_names": class_names,
+        "high_confidence_wrong": high_confidence_wrong[:25],
+        "low_confidence_correct": low_confidence_correct[:25],
+        "hard_examples": hard_examples[:50],
+        "notes": "Audit artifacts are report-only; worker does not mutate datasets or labels.",
+    }
+
+
+def _bbox_ablation_evaluation(model, execution_metadata: dict, criterion, device, class_names: list[str], crop_metrics: dict) -> dict:
+    bbox_metadata = execution_metadata.get("bbox_crop") if isinstance(execution_metadata, dict) else {}
+    if not isinstance(bbox_metadata, dict) or not bbox_metadata.get("compare_full_image"):
+        return {"status": "not_requested"}
+    full_image_loader = execution_metadata.get("_full_image_test_loader")
+    if full_image_loader is None:
+        return {
+            "status": "unavailable",
+            "reason": "full_image_loader_missing",
+            "crop_metrics": crop_metrics,
+        }
+    full_loss, full_accuracy, full_macro_f1, _details = _evaluate(
+        model,
+        full_image_loader,
+        criterion,
+        device,
+        class_names,
+    )
+    return {
+        "status": "completed",
+        "crop_metrics": {
+            "loss": round(float(crop_metrics.get("loss") or 0.0), 6),
+            "accuracy": round(float(crop_metrics.get("accuracy") or 0.0), 6),
+            "macro_f1": round(float(crop_metrics.get("macro_f1") or 0.0), 6),
+        },
+        "full_image_metrics": {
+            "loss": round(float(full_loss), 6),
+            "accuracy": round(float(full_accuracy), 6),
+            "macro_f1": round(float(full_macro_f1), 6),
+        },
+    }
+
+
+def _public_execution_metadata(execution_metadata: dict) -> dict:
+    return {key: value for key, value in execution_metadata.items() if not key.startswith("_")}
 
 
 def _model_profile(model, model_name: str, image_size: int, device, loader) -> dict:
@@ -824,4 +1330,12 @@ def _non_negative_float(value: object, default: float) -> float:
 
 def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
     parsed = _positive_int(value, default=default)
+    return max(minimum, min(maximum, parsed))
+
+
+def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
     return max(minimum, min(maximum, parsed))

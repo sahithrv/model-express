@@ -16,6 +16,7 @@ Current durable dataset profile data is stored as JSON in `datasets.profile` and
 - imbalance/corruption: `imbalance_ratio`, `corrupt_file_count`, legacy `corrupt_image_count`, capped `corrupt_images`
 - dimensions: legacy `width_min`, `width_max`, `height_min`, `height_max`, plus `image_dimension_stats.width|height|aspect_ratio.{min,max,mean,median}`
 - dataset quality/context: `split_summary`, `metadata_summary`, `leakage_warnings`, `dataset_traits`
+- deterministic visual traits: `visual_trait_summary` with object scale, object-area ratio, background dominance, blur likelihood, lighting variation, fine-grained possibility, and crop plausibility signals
 - artifacts: capped `artifacts` list with `artifact_type`, `path`, `format`, optional `description`, optional `detected_schema`
 
 The Go `DatasetProfile` struct mirrors this richer shape while preserving legacy keys used by existing planners.
@@ -35,7 +36,7 @@ The Go `DatasetProfile` struct mirrors this richer shape while preserving legacy
 - `class_balancing`: `none`, `weighted_loss`, `class_weighted_loss`, `class_balanced_sampler`, `weighted_random_sampler`, `focal_loss`
 - `sampling_strategy`: `none`, `class_balanced_sampler`, `weighted_random_sampler`
 
-Backend validation owns the allowed values. Workers currently implement a safe subset: ImageNet or no normalization, basic resize/crop transforms, augmentation policies, weighted losses/focal loss, and weighted sampling. `normalization: "dataset"` and bbox/crop modes are future-facing unless worker support is added.
+Backend validation owns the allowed values. Workers currently implement ImageNet/no/dataset normalization, basic resize/crop transforms, structured augmentation policies, training-only MixUp/CutMix, weighted/focal/effective-number losses, weighted sampling, and bbox crop execution when annotations are available.
 
 ## Artifacts And Traits
 
@@ -57,6 +58,7 @@ Current profiler traits include:
 - distribution: `imbalanced`
 - dimensions: `low_resolution`, `high_resolution`, `variable_image_dimensions`
 - metadata/data quality: `bbox_available`, `metadata_available`, `corrupt_files_detected`
+- visual/crop evidence: `small_objects_possible`, `background_dominant_possible`, `blur_possible`, `lighting_variation`, `crop_plausible`
 
 Use these traits as planning evidence, not automatic prescriptions. For example, `bbox_available` should suggest a controlled crop ablation against full-image training, not a blanket replacement.
 
@@ -67,6 +69,8 @@ Use these traits as planning evidence, not automatic prescriptions. For example,
 Until that is wired, treat `datasets.profile` JSON as the source of truth. If adding persistence later, either fully wire `dataset_profiles` as the latest normalized profile path or clearly keep it deferred to avoid split-brain profile state.
 
 Latest integration decision: `datasets.profile` remains authoritative for PR 1/8. `dataset_artifacts` is still deferred; profile `artifacts`, `demo_images`, and `visual_exemplars` arrays are the current compact JSON source for planner/demo surfaces. Worker helper modules can parse split/annotation metadata and generate capped visual exemplar packs, and the backend can persist accepted exemplar/demo image patches through `POST /datasets/:id/visual-exemplars`.
+
+Worker `label_quality_audit` jobs also write report-only audit metadata into `datasets.profile` through `label_quality_audit`, capped `label_quality_audits`, and an additive `label_quality_audit` artifact record. These jobs use existing profile facts and do not mutate labels, files, or split assignments.
 
 ## Profiler And Planner Touchpoints
 
@@ -91,12 +95,12 @@ Backend planner insight flow:
 High-value follow-ups for this agent:
 
 - Add first-class `dataset_artifacts` records if artifact history, file-level metadata, annotation parsing, or provenance becomes important.
-- Wire helper-level annotation XML/JSON and split-file parsing into profiling/training where safe; labels CSV/class hierarchy/metadata folder parsing remain future work.
+- Annotation XML/JSON parsing is now used by profiling for visual crop/object-scale traits and by worker training for bounded bbox crop execution when preprocessing requests it. Split-file execution, labels CSV/class hierarchy parsing, and richer metadata folder parsing remain future work.
 - Wire explicit train/validation/test split files into worker training and champion/demo image selection.
 - Add production object-storage upload and durable history for generated visual exemplars beyond current profile JSON patches.
 - Current PR 8 slice exposes budget-capped visual exemplar/demo image metadata from `datasets.profile`, accepts capped backend profile merges, and worker helpers can generate downscaled exemplars locally.
 - Compute dataset-specific normalization statistics and apply them only when worker support makes `normalization: "dataset"` real.
-- Implement bbox crop/full-image paired ablations and keep them controlled against a full-image baseline.
+- Keep bbox crop/full-image ablations controlled against a full-image heldout comparison and rely on backend validation as the main scheduling gate.
 - Normalize dataset profiles into durable rows or document/defer the table path deliberately.
 
 ## Safe Boundaries And Shared Contracts
@@ -104,7 +108,7 @@ High-value follow-ups for this agent:
 - Do not change dataset/profile/preprocessing fields without checking backend validation, planner prompt context, candidate signatures, worker config consumption, and Mission Control display.
 - Keep source-of-truth writes deterministic. Agents may create `dataset_analysis` or `preprocessing_recommendation` memory in future, but profile facts should come from deterministic profiling or validated parsers.
 - Keep profile payloads compact. Cap artifact lists and visual exemplar payloads by count, bytes, and prompt budget.
-- Treat annotations, split files, and bbox data as evidence until worker execution actually supports them.
+- Treat annotations, split files, and bbox data as backend-validated evidence. Bbox crop execution is now supported when annotations are present; split-file execution remains future work.
 - Preserve legacy profile keys while older planners still read them.
 - Shared contract owners are Dataset Intelligence, Backend/Planner, Worker Training, and Mission Control. Backend validation is the final execution gate.
 

@@ -23,27 +23,42 @@ type ExperimentPlan struct {
 }
 
 type PlannedExperiment struct {
-	Template              string         `json:"template"`
-	Model                 string         `json:"model"`
-	Epochs                int            `json:"epochs"`
-	BatchSize             int            `json:"batch_size"`
-	LearningRate          float64        `json:"learning_rate"`
-	Reason                string         `json:"reason"`
-	ImageSize             int            `json:"image_size,omitempty"`
-	ResolutionStrategy    string         `json:"resolution_strategy,omitempty"`
-	Preprocessing         *Preprocessing `json:"preprocessing,omitempty"`
-	Optimizer             string         `json:"optimizer,omitempty"`
-	Scheduler             string         `json:"scheduler,omitempty"`
-	WeightDecay           float64        `json:"weight_decay,omitempty"`
-	Augmentation          map[string]any `json:"augmentation,omitempty"`
-	AugmentationPolicy    string         `json:"augmentation_policy,omitempty"`
-	ClassBalancing        string         `json:"class_balancing,omitempty"`
-	SamplingStrategy      string         `json:"sampling_strategy,omitempty"`
-	EarlyStoppingPatience int            `json:"early_stopping_patience,omitempty"`
-	Strategy              string         `json:"strategy,omitempty"`
-	Pretrained            bool           `json:"pretrained,omitempty"`
-	FreezeBackbone        bool           `json:"freeze_backbone,omitempty"`
-	FineTuneStrategy      string         `json:"fine_tune_strategy,omitempty"`
+	Template                 string                    `json:"template"`
+	Model                    string                    `json:"model"`
+	Mechanism                string                    `json:"mechanism,omitempty"`
+	Intervention             string                    `json:"intervention,omitempty"`
+	EvidenceUsed             []string                  `json:"evidence_used,omitempty"`
+	ExpectedEffect           string                    `json:"expected_effect,omitempty"`
+	Epochs                   int                       `json:"epochs"`
+	BatchSize                int                       `json:"batch_size"`
+	LearningRate             float64                   `json:"learning_rate"`
+	Reason                   string                    `json:"reason"`
+	ImageSize                int                       `json:"image_size,omitempty"`
+	ResolutionStrategy       string                    `json:"resolution_strategy,omitempty"`
+	Preprocessing            *Preprocessing            `json:"preprocessing,omitempty"`
+	Optimizer                string                    `json:"optimizer,omitempty"`
+	Scheduler                string                    `json:"scheduler,omitempty"`
+	WeightDecay              float64                   `json:"weight_decay,omitempty"`
+	Augmentation             map[string]any            `json:"augmentation,omitempty"`
+	AugmentationPolicy       string                    `json:"augmentation_policy,omitempty"`
+	AugmentationPolicyConfig *AugmentationPolicyConfig `json:"augmentation_policy_config,omitempty"`
+	ClassBalancing           string                    `json:"class_balancing,omitempty"`
+	ClassBalancingConfig     map[string]any            `json:"class_balancing_config,omitempty"`
+	SamplingStrategy         string                    `json:"sampling_strategy,omitempty"`
+	EarlyStoppingPatience    int                       `json:"early_stopping_patience,omitempty"`
+	Strategy                 string                    `json:"strategy,omitempty"`
+	Pretrained               bool                      `json:"pretrained,omitempty"`
+	FreezeBackbone           bool                      `json:"freeze_backbone,omitempty"`
+	FineTuneStrategy         string                    `json:"fine_tune_strategy,omitempty"`
+}
+
+type AugmentationPolicyConfig struct {
+	PolicyType       string  `json:"policy_type,omitempty"`
+	Magnitude        int     `json:"magnitude,omitempty"`
+	NumOps           int     `json:"num_ops,omitempty"`
+	NumMagnitudeBins int     `json:"num_magnitude_bins,omitempty"`
+	Probability      float64 `json:"probability,omitempty"`
+	Alpha            float64 `json:"alpha,omitempty"`
 }
 
 type Preprocessing struct {

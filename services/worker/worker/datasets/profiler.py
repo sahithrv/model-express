@@ -57,6 +57,7 @@ def profile_image_folder(dataset_dir: Path) -> dict:
     metadata_summary = _metadata_summary(artifacts)
     split_summary = split_summary_from_artifacts(artifacts)
     leakage_warnings = _leakage_warnings(image_paths)
+    visual_traits = _visual_trait_summary(image_paths, artifacts, class_counts)
     traits = _dataset_traits(
         class_count=len(class_counts),
         image_count=total_images,
@@ -64,6 +65,7 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         dimension_stats=dimension_stats,
         artifacts=artifacts,
         corrupt_file_count=len(corrupt_images),
+        visual_traits=visual_traits,
     )
     
     return {
@@ -87,6 +89,7 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         "imbalance_ratio": round(imbalance_ratio, 3),
         "split_summary": split_summary,
         "metadata_summary": metadata_summary,
+        "visual_trait_summary": visual_traits,
         "leakage_warnings": leakage_warnings,
         "dataset_traits": traits,
         "artifacts": artifacts,
@@ -262,6 +265,143 @@ def _metadata_summary(artifacts: list[dict]) -> dict:
     }
 
 
+def _visual_trait_summary(image_paths: list[Path], artifacts: list[dict], class_counts: dict[str, int]) -> dict:
+    sample_paths = sorted(image_paths)[:100]
+    brightness_values: list[float] = []
+    edge_values: list[float] = []
+    border_dominance_values: list[float] = []
+    for image_path in sample_paths:
+        try:
+            with Image.open(image_path) as image:
+                rgb_image = image.convert("RGB").resize((32, 32))
+                grayscale = rgb_image.convert("L")
+                pixels = list(grayscale.getdata())
+                brightness_values.append(statistics.fmean(pixels) / 255.0)
+                edge_values.append(_edge_strength(grayscale))
+                border_dominance_values.append(_border_dominance(rgb_image))
+        except Exception:
+            continue
+
+    bbox_summary = _bbox_trait_summary(artifacts)
+    lighting_variation = _safe_stdev(brightness_values)
+    edge_mean = statistics.fmean(edge_values) if edge_values else 0.0
+    border_dominance = statistics.fmean(border_dominance_values) if border_dominance_values else 0.0
+    fine_grained_possible = len(class_counts) >= 10 and sum(class_counts.values()) / max(len(class_counts), 1) < 120
+    crop_plausibility_score = 0.0
+    if bbox_summary["bbox_count"]:
+        crop_plausibility_score = max(0.0, min(1.0, 1.0 - abs(bbox_summary["median_area_ratio"] - 0.45)))
+
+    return {
+        "schema_version": "visual_traits_v1",
+        "sampled_image_count": len(brightness_values),
+        "object_scale": bbox_summary["object_scale"],
+        "object_area_ratio_median": bbox_summary["median_area_ratio"],
+        "bbox_count": bbox_summary["bbox_count"],
+        "background_dominance": _level(border_dominance, low=0.35, high=0.62),
+        "background_dominance_score": round(border_dominance, 4),
+        "blur_likelihood": _blur_level(edge_mean),
+        "edge_strength_mean": round(edge_mean, 4),
+        "lighting_variation": _level(lighting_variation, low=0.08, high=0.18),
+        "lighting_variation_score": round(lighting_variation, 4),
+        "fine_grained_possible": fine_grained_possible,
+        "crop_plausibility": _level(crop_plausibility_score, low=0.25, high=0.55),
+        "crop_plausibility_score": round(crop_plausibility_score, 4),
+    }
+
+
+def _edge_strength(image) -> float:
+    width, height = image.size
+    pixels = image.load()
+    diffs: list[float] = []
+    for y in range(height - 1):
+        for x in range(width - 1):
+            current = int(pixels[x, y])
+            diffs.append(abs(current - int(pixels[x + 1, y])) / 255.0)
+            diffs.append(abs(current - int(pixels[x, y + 1])) / 255.0)
+    return statistics.fmean(diffs) if diffs else 0.0
+
+
+def _border_dominance(image) -> float:
+    width, height = image.size
+    pixels = image.load()
+    border_pixels = []
+    for x in range(width):
+        border_pixels.append(pixels[x, 0])
+        border_pixels.append(pixels[x, height - 1])
+    for y in range(height):
+        border_pixels.append(pixels[0, y])
+        border_pixels.append(pixels[width - 1, y])
+    border_mean = tuple(statistics.fmean(pixel[channel] for pixel in border_pixels) for channel in range(3))
+    all_pixels = list(image.getdata())
+    close_to_border = 0
+    for pixel in all_pixels:
+        distance = sum(abs(float(pixel[channel]) - border_mean[channel]) for channel in range(3)) / (255.0 * 3)
+        if distance <= 0.12:
+            close_to_border += 1
+    return close_to_border / max(len(all_pixels), 1)
+
+
+def _bbox_trait_summary(artifacts: list[dict]) -> dict:
+    from worker.datasets.annotations import parse_annotation_json_bboxes, parse_pascal_voc_bboxes
+
+    area_ratios: list[float] = []
+    for artifact in artifacts:
+        if artifact.get("artifact_type") not in {"bounding_boxes", "annotation_json"}:
+            continue
+        path = Path(str(artifact.get("path") or ""))
+        try:
+            if path.suffix.lower() == ".xml":
+                payload = parse_pascal_voc_bboxes(path)
+            elif path.suffix.lower() == ".json":
+                payload = parse_annotation_json_bboxes(path)
+            else:
+                continue
+        except Exception:
+            continue
+        image_size = payload.get("image_size") if isinstance(payload.get("image_size"), dict) else {}
+        image_area = (image_size.get("width") or 0) * (image_size.get("height") or 0)
+        for item in payload.get("objects") or []:
+            bbox = item.get("bbox") if isinstance(item, dict) else None
+            if not isinstance(bbox, dict):
+                continue
+            try:
+                area = max(0, int(bbox["xmax"]) - int(bbox["xmin"])) * max(0, int(bbox["ymax"]) - int(bbox["ymin"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if image_area > 0 and area > 0:
+                area_ratios.append(max(0.0, min(1.0, area / image_area)))
+    median_area = round(float(statistics.median(area_ratios)), 4) if area_ratios else 0.0
+    if not area_ratios:
+        object_scale = "unknown"
+    elif median_area < 0.15:
+        object_scale = "small"
+    elif median_area > 0.65:
+        object_scale = "large"
+    else:
+        object_scale = "medium"
+    return {"bbox_count": len(area_ratios), "median_area_ratio": median_area, "object_scale": object_scale}
+
+
+def _safe_stdev(values: list[float]) -> float:
+    return statistics.stdev(values) if len(values) >= 2 else 0.0
+
+
+def _level(value: float, low: float, high: float) -> str:
+    if value >= high:
+        return "high"
+    if value >= low:
+        return "medium"
+    return "low"
+
+
+def _blur_level(edge_strength: float) -> str:
+    if edge_strength <= 0.025:
+        return "high"
+    if edge_strength <= 0.06:
+        return "medium"
+    return "low"
+
+
 def split_summary_from_artifacts(artifacts: list[dict]) -> dict:
     split_files = [artifact for artifact in artifacts if artifact.get("artifact_type") == "split_file"]
     return {
@@ -289,6 +429,7 @@ def _dataset_traits(
     dimension_stats: dict,
     artifacts: list[dict],
     corrupt_file_count: int,
+    visual_traits: dict | None = None,
 ) -> list[str]:
     traits: list[str] = []
     if image_count < 500:
@@ -320,4 +461,17 @@ def _dataset_traits(
         traits.append("metadata_available")
     if corrupt_file_count:
         traits.append("corrupt_files_detected")
+    visual_traits = visual_traits or {}
+    if visual_traits.get("object_scale") == "small":
+        traits.append("small_objects_possible")
+    if visual_traits.get("background_dominance") == "high":
+        traits.append("background_dominant_possible")
+    if visual_traits.get("blur_likelihood") == "high":
+        traits.append("blur_possible")
+    if visual_traits.get("lighting_variation") == "high":
+        traits.append("lighting_variation")
+    if visual_traits.get("fine_grained_possible"):
+        traits.append("fine_grained_possible")
+    if visual_traits.get("crop_plausibility") in {"medium", "high"}:
+        traits.append("crop_plausible")
     return sorted(set(traits))

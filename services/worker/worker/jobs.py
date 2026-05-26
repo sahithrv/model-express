@@ -9,6 +9,7 @@ from worker.datasets.cache import (
     should_persist_dataset_cache,
 )
 from worker.datasets.profiler import profile_image_folder
+from worker.datasets.label_quality import build_label_quality_profile_patch
 from worker.datasets.storage import download_s3_uri
 from worker.champion_jobs import (
     run_champion_demo_prediction_job,
@@ -36,6 +37,9 @@ def run_job(client: OrchestratorClient, job: dict) -> None:
     if template == "generate_visual_exemplars":
         run_generate_visual_exemplars_job(client, job)
         return
+    if template == "label_quality_audit":
+        run_label_quality_audit_job(client, job)
+        return
     raise ValueError(f"Unsupported job template: {template}")
 
 def run_profile_dataset_job(client: OrchestratorClient, job: dict) -> None:
@@ -61,6 +65,19 @@ def run_profile_dataset_job(client: OrchestratorClient, job: dict) -> None:
     finally:
         if not should_persist_dataset_cache():
             cleanup_dataset_cache(dataset_id)
+
+
+def run_label_quality_audit_job(client: OrchestratorClient, job: dict) -> None:
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    dataset_id = str(config.get("dataset_id") or "")
+    if not dataset_id:
+        raise ValueError("label_quality_audit jobs require config.dataset_id.")
+
+    dataset = client.get_dataset(dataset_id)
+    profile = dataset.get("profile") if isinstance(dataset, dict) else {}
+    profile_patch = build_label_quality_profile_patch(config, profile if isinstance(profile, dict) else {})
+    client.update_dataset_profile(dataset_id, profile_patch)
+    client.complete_job(job["id"], mlflow_run_id="")
 
 
 def _profile_provider(job: dict) -> str:

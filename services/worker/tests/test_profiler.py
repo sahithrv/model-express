@@ -45,6 +45,9 @@ class DatasetProfilerTests(unittest.TestCase):
             self.assertTrue(profile["split_summary"]["has_explicit_split"])
             self.assertTrue(profile["metadata_summary"]["bbox_available"])
             self.assertIn("bbox_available", profile["dataset_traits"])
+            self.assertEqual(profile["visual_trait_summary"]["schema_version"], "visual_traits_v1")
+            self.assertGreaterEqual(profile["visual_trait_summary"]["sampled_image_count"], 2)
+            self.assertIn(profile["visual_trait_summary"]["object_scale"], {"small", "medium", "large", "unknown"})
 
     def test_compute_image_normalization_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

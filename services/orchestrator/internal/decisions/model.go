@@ -3,10 +3,11 @@ package decisions
 import "time"
 
 const (
-	TypeWait           = "WAIT"
-	TypeSelectChampion = "SELECT_CHAMPION"
-	TypeAddExperiments = "ADD_EXPERIMENTS"
-	TypeStopProject    = "STOP_PROJECT"
+	TypeWait                  = "WAIT"
+	TypeSelectChampion        = "SELECT_CHAMPION"
+	TypeAddExperiments        = "ADD_EXPERIMENTS"
+	TypeStopProject           = "STOP_PROJECT"
+	TypeReopenExperimentation = "REOPEN_EXPERIMENTATION"
 )
 
 type AgentDecision struct {

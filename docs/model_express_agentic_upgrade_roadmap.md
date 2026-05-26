@@ -1,6 +1,6 @@
 # Model Express Agentic Upgrade Roadmap
 
-Status: planning document only. This roadmap describes the next implementation sequence for making Model Express plan image-classification experiments like a senior data scientist instead of repeatedly trying random model families or longer epoch counts.
+Status: non-PR9 roadmap slices are implemented. PR 9 remains deferred by choice: model routing, prompt caching, and vector/cross-project retrieval should wait until the mechanism outcome data has had a real loop test.
 
 The core safety boundary remains unchanged:
 
@@ -14,14 +14,14 @@ Do not let an LLM directly create jobs, run Modal work, mutate datasets, pick ar
 
 The system already has useful ingredients:
 
-- `PlannedExperiment` supports model, epochs, batch size, learning rate, image size, `resolution_strategy`, `preprocessing`, optimizer, scheduler, weight decay, augmentation, `augmentation_policy`, class balancing, sampling, early stopping, pretrained/freeze flags, and `fine_tune_strategy`.
+- `PlannedExperiment` supports model, epochs, batch size, learning rate, image size, `resolution_strategy`, `preprocessing`, optimizer, scheduler, weight decay, augmentation, `augmentation_policy`, `augmentation_policy_config`, class balancing, `class_balancing_config`, sampling, early stopping, pretrained/freeze flags, `fine_tune_strategy`, and first-class mechanism metadata.
 - The planner prompt accepts `candidate_hypotheses`, `planning_mode`, diagnosis evidence, rejected options, score components, and compact `planner_context_snapshot`.
 - Deterministic diagnosis covers overfitting, underfitting, plateau, instability, class imbalance, minority-class failure, cost, latency, and improvement stagnation.
 - Backend novelty checks reject exact repeats and minor-only same-mechanism follow-ups.
-- Backend stop guards can select a champion when bounded metrics are near ceiling or repeated follow-ups fail to beat the champion.
-- Modal/local worker paths already understand several execution knobs such as transforms, optimizer/scheduler, class weights, focal loss, weighted sampling, dataset normalization, and fine-tuning depth.
+- Backend stop guards can select a champion when bounded metrics are near ceiling or repeated follow-ups fail to beat the champion, and a persisted champion is terminal until explicit user reopen.
+- Modal/local worker paths already understand several execution knobs such as transforms, MixUp/CutMix, optimizer/scheduler, class weights, focal/effective-number loss, weighted sampling, bbox/crop ablations, dataset normalization, and fine-tuning depth.
 
-The important gap is not that image classification has too few real experiment options. The gap is that Model Express has not made the experiment action space explicit enough. The planner still sees a loose bag of fields, so it can collapse back to architecture shopping:
+The important gap this roadmap addressed was not that image classification had too few real experiment options. The gap was that Model Express had not made the experiment action space explicit enough. The planner could see a loose bag of fields and collapse back to architecture shopping:
 
 ```text
 Try EfficientNet.
@@ -29,7 +29,7 @@ Try ResNet.
 Train longer.
 ```
 
-The next upgrade should make every follow-up experiment pass through:
+The implemented upgrade now routes follow-up experiments through:
 
 ```text
 diagnosis -> mechanism -> intervention -> controlled config -> backend validation -> outcome memory
@@ -48,7 +48,7 @@ Key files:
 - `services/orchestrator/internal/plans/model.go`
 - `services/worker/worker/training/modal_app.py`
 
-The planner already has broad fields, but there is no first-class `mechanism` field on `plans.PlannedExperiment`. A mechanism is inferred from config text/signatures. That is good enough for duplicate filtering, but not strong enough for an agentic search policy.
+The planner now has broad fields and a first-class mechanism contract on `plans.PlannedExperiment`. Backend validation still infers signatures from controlled config fields, but LLM-originated `ADD_EXPERIMENTS` must include explicit `mechanism`, `intervention`, `evidence_used`, and `expected_effect` either directly or through the validated `proposal_mechanisms` sidecar.
 
 ### Existing Backend Gates
 
@@ -61,9 +61,9 @@ Backend validation already knows allowed values for:
 - normalization: `imagenet`, `dataset`, `none`
 - crop strategies: `none`, `center_crop`, `random_resized_crop`, `bbox_crop_if_available`, `bbox_crop_ablation`
 - bbox modes: `ignore`, `crop_if_available`, `crop_and_compare_full_image`, `use_boxes_as_metadata`
-- augmentation policy: `none`, `light`, `moderate`, `strong`, `custom`
+- augmentation policy: `none`, `light`, `moderate`, `strong`, `custom`, `basic`, `randaugment`, `trivialaugment`, `trivialaugmentwide`, `autoaugment`, `mixup`, `cutmix`
 - augmentation keys: `horizontal_flip`, `vertical_flip`, `color_jitter`, `random_crop`, `random_rotation`, `random_erasing`
-- class balancing: `none`, `weighted_loss`, `class_weighted_loss`, `class_balanced_sampler`, `weighted_random_sampler`, `focal_loss`
+- class balancing: `none`, `weighted_loss`, `class_weighted_loss`, `class_balanced_sampler`, `weighted_random_sampler`, `focal_loss`, `effective_number_loss`
 - sampling: `none`, `class_balanced_sampler`, `weighted_random_sampler`
 - fine-tuning: `head_only`, `last_block`, `full`
 
@@ -71,7 +71,7 @@ These fields are enough to support more thoughtful experiments, but the planner 
 
 ### Current Risk
 
-The planner can still produce superficially varied plans that are really the same search move:
+The planner can still propose superficially varied plans, but backend validation now blocks or filters plans that are really the same search move:
 
 - same model family with only epochs or learning-rate changes
 - several architecture challengers without a diagnosis
@@ -81,29 +81,29 @@ The planner can still produce superficially varied plans that are really the sam
 - more experiments when the champion is already near the metric ceiling
 - a terminal champion selection followed by new autonomous follow-up experiments
 
-Backend validation should keep these from becoming scheduled work.
+Backend validation keeps these from becoming scheduled work. If every candidate is filtered out, no plan/jobs are created and a blocked backend event is recorded.
 
-### Newly Observed Bug: Champion Selection Is Not Terminal
+### Fixed Bug: Champion Selection Is Terminal
 
 A run-through showed the system selecting a champion and then later proposing more experiments. That is a control-plane bug, not a model-quality issue.
 
-Expected behavior:
+Implemented behavior:
 
-- Once a project has a persisted `SELECT_CHAMPION` decision or project champion, autonomous follow-up scheduling should stop.
-- Existing stale `ADD_EXPERIMENTS` decisions should not create new follow-up plans after champion selection.
-- The only way to continue after champion selection should be an explicit user action such as "start a new exploration round" or "reopen experimentation", with a new source decision/event.
-- If an autonomous scheduler encounters a selected champion, it should create no plan/jobs and record a clear blocked event such as `backend_stop_guard: champion_selected_guard`.
+- Once a project has a persisted `SELECT_CHAMPION` decision or project champion, autonomous follow-up scheduling stops.
+- Existing stale `ADD_EXPERIMENTS` decisions cannot create new follow-up plans after champion selection.
+- Continuing after champion selection requires `POST /projects/:id/experimentation/reopen`, which records `REOPEN_EXPERIMENTATION` and `EXPERIMENTATION_REOPENED`.
+- If an autonomous scheduler encounters a selected champion without a newer reopen decision, it creates no plan/jobs and records `backend_stop_guard: champion_selected_guard`.
 
-Likely areas to inspect:
+Key implementation areas:
 
 - `schedulePlannerDecision`
-- `plannerFollowUpStopReason`
 - `ensureFollowUpPlan`
 - `experimentPlannerDecisionForPlan`
 - `actionDecisionForPlan`
 - `followUpSourceDecision`
 - `followUpPlanForDecision`
 - project champion persistence and lookup paths
+- `reopenProjectExperimentation`
 
 ## Research-Backed Experiment Levers
 
@@ -386,7 +386,15 @@ This card is the key to avoiding repeated ResNet/EfficientNet loops.
 
 ## Recommended PR Sequence
 
-### PR 1: Mechanism Taxonomy And Contract
+### PR 1: Mechanism Taxonomy And Contract - Done
+
+Implementation status:
+
+- [x] First-class mechanism metadata is stored on `PlannedExperiment`: `mechanism`, `intervention`, `evidence_used`, `expected_effect`.
+- [x] LLM planner outputs must provide mechanism metadata through direct experiment fields or the validated `proposal_mechanisms` sidecar.
+- [x] Backend validates the curated mechanism taxonomy for LLM-originated `ADD_EXPERIMENTS`.
+- [x] Candidate ranking is mechanism-aware and penalizes architecture-only shopping and same-mechanism minor variants.
+- [x] Planner prompt makes model family a parameter inside a mechanism.
 
 Goal: make the experiment action space explicit without changing worker behavior.
 
@@ -427,7 +435,18 @@ Tests:
 - Architecture-only challengers are penalized when no diagnosis supports them.
 - Candidate ranking rewards a diagnosis-matched non-model mechanism.
 
-### PR 2: Mechanism Coverage And Final Scheduling Gates
+### PR 2: Mechanism Coverage And Final Scheduling Gates - Done
+
+Implementation status:
+
+- [x] Planner context includes mechanism coverage through `mechanism_coverage_card`.
+- [x] Stale `ADD_EXPERIMENTS` decisions are revalidated before follow-up plan creation.
+- [x] Same-mechanism minor-only repeats are blocked/filtered across project plan history.
+- [x] All-filtered proposals create no plan and no jobs, and record a backend blocked event.
+- [x] Near-ceiling champions stop follow-up scheduling.
+- [x] A persisted project champion or persisted `SELECT_CHAMPION` decision is terminal for autonomous follow-up plan creation, follow-up execution, and new planner calls.
+- [x] Post-champion blocked attempts record `backend_stop_guard: champion_selected_guard`.
+- [x] Explicit user-facing reopen/new-exploration action after champion selection is implemented with `POST /projects/:id/experimentation/reopen`, `REOPEN_EXPERIMENTATION`, and `EXPERIMENTATION_REOPENED`.
 
 Goal: prevent stale or shallow decisions from scheduling work even if they came from older stored payloads.
 
@@ -468,7 +487,15 @@ Tests:
 - Explicit user-initiated reopening/new-exploration behavior is the only accepted way to continue experimentation after champion selection.
 - Valid diagnosis-matched new mechanism still schedules in dry-run/local tests.
 
-### PR 3: Planner Context Cards V2
+### PR 3: Planner Context Cards V2 - Done
+
+Implementation status:
+
+- [x] `planner_context_snapshot` includes `training_dynamics_card`, `per_class_error_card`, `deployment_card`, `mechanism_coverage_card`, and `label_quality_card`.
+- [x] Planner prompt uses those cards for mechanism-first, diagnosis-driven planning.
+- [x] Planner context tests cover training dynamics, per-class errors, deployment, mechanism coverage, blocked repeats, label-quality signals, and scorecard mechanism lessons.
+- [x] Training Monitor input uses compact cards instead of raw plan/job/evaluation/epoch dumps.
+- [x] Approximate prompt/input-size telemetry is recorded in monitor prompt budget metadata.
 
 Goal: give the LLM less context but better context.
 
@@ -504,7 +531,16 @@ Tests:
 - Training Monitor context excludes full epoch/profile dumps while preserving trend and per-class summary.
 - Snapshot includes worst-class and top-confusion facts when available.
 
-### PR 4: Advanced Augmentation Contract
+### PR 4: Advanced Augmentation Contract - Done
+
+Implementation status:
+
+- [x] Added backend/plan `augmentation_policy_config` with bounded `policy_type`, `magnitude`, `num_ops`, `num_magnitude_bins`, `probability`, and `alpha`.
+- [x] Backend rejects unknown structured policies and unsafe caps.
+- [x] Worker supports structured `basic`, `randaugment`, `trivialaugment`/`TrivialAugmentWide`, and `autoaugment` image transforms in train-only transform construction.
+- [x] Worker supports MixUp/CutMix batch/label mixing only during training batches.
+- [x] Legacy `augmentation_policy` and `augmentation` map behavior remains supported.
+- [x] Worker and backend tests validate policy parsing, caps, train-only transform behavior, unknown policies, and MixUp/CutMix support.
 
 Goal: expand beyond `light|moderate|strong` without turning augmentation into free-form JSON.
 
@@ -539,7 +575,16 @@ Tests:
 - MixUp/CutMix are applied only in training and only with compatible labels.
 - No Modal jobs are run in tests.
 
-### PR 5: Class Imbalance, Minority Targeting, And Label Quality
+### PR 5: Class Imbalance, Minority Targeting, And Label Quality - Done
+
+Implementation status:
+
+- [x] Planner context now includes per-class error and label-quality cards.
+- [x] Backend gates `class_imbalance`/`minority_targeting` mechanisms on class-balancing config plus imbalance, per-class, or minority-failure evidence.
+- [x] Worker supports weighted loss, focal loss, effective-number class-balanced loss, class-balanced/weighted sampling paths.
+- [x] Label-noise and hard-example mechanisms are blocked from creating training jobs unless represented as explicit `label_quality_audit` report-only jobs.
+- [x] Label-quality audit artifact/job path is implemented as a local worker job that updates capped profile audit metadata and never mutates labels.
+- [x] Effective-number class-balanced loss is implemented with bounded `class_balancing_config.effective_number_beta`.
 
 Goal: make class-specific failures actionable.
 
@@ -578,7 +623,16 @@ Tests:
 - Label-noise audit proposals do not create training jobs unless explicitly represented as an audit job type.
 - Backend rejects class-balancing repeats after a no-improvement outcome.
 
-### PR 6: Resolution, Crop, And Visual Evidence Mechanisms
+### PR 6: Resolution, Crop, And Visual Evidence Mechanisms - Done
+
+Implementation status:
+
+- [x] Planner context carries evidence-only visual exemplar/trait context and the new mechanism/context cards.
+- [x] Backend rejects `bbox_crop_ablation` unless bbox/annotation evidence exists in backend-profiled dataset metadata.
+- [x] Backend rejects high-resolution/crop mechanisms unless profile or planner evidence supports object scale, fine-grained classes, variable dimensions, crop mismatch, aspect ratio, or related visual traits.
+- [x] Tests cover bbox rejection without annotations, bbox acceptance with annotation evidence, and high-resolution rejection without object-scale/crop evidence.
+- [x] Worker bbox crop/full-image ablation execution is implemented for supported annotation formats and reports crop-vs-full-image heldout metadata.
+- [x] Dataset profiling emits richer visual trait summaries for object scale, background dominance, blur, lighting variation, fine-grained possibility, and crop plausibility.
 
 Goal: let the planner use image structure, not just scalar metrics.
 
@@ -617,7 +671,15 @@ Tests:
 - High-resolution mechanism is rejected without object-scale/crop evidence.
 - Visual evidence appears only as evidence and never as execution authority.
 
-### PR 7: Outcome Learning By Mechanism
+### PR 7: Outcome Learning By Mechanism - Done Except Deferred Retrieval
+
+Implementation status:
+
+- [x] Strategy scorecard context can expose mechanism, intervention, diagnosis triggers, expected delta, and actual delta from compact `proposed_changes`.
+- [x] Planner `strategy_lessons` includes scorecard-derived mechanism outcome lessons.
+- [x] Candidate ranking already uses strategy memory/scorecards to reward similar successes and penalize similar failures.
+- [x] Store schema promotes mechanism fields to first-class scorecard columns with additive Postgres migration and in-memory parity.
+- [ ] Cross-project mechanism retrieval remains deferred under PR 9.
 
 Goal: teach future planner calls which mechanisms worked, not just which model names won.
 
@@ -654,7 +716,16 @@ Tests:
 - Successful `resolution_crop` scorecard boosts a similar dataset with variable dimensions.
 - Strategy memory remains compact and does not dump raw decision payloads.
 
-### PR 8: Mission Control Mechanism Visibility
+### PR 8: Mission Control Mechanism Visibility - Done
+
+Implementation status:
+
+- [x] Mission Control shows mechanism/intervention/evidence/expected-effect metadata in decision, plan, job, timeline, candidate, and scorecard views where payloads expose it.
+- [x] Mission Control shows mechanism coverage rows from planner payloads/context.
+- [x] Mission Control exposes dry-run/review/autonomous state from automation settings and plan execution state.
+- [x] Mission Control shows structured augmentation policy metadata when present.
+- [x] Mission Control handles audit-only plans and displays class-balancing config metadata when present.
+- [x] `npm run build` passes.
 
 Goal: make agent behavior inspectable before spending credits.
 
@@ -691,7 +762,11 @@ Checks:
 - `npm run build`
 - UI smoke with auto execution disabled.
 
-### PR 9: Model Routing, Prompt Caching, And Retrieval Later
+### PR 9: Model Routing, Prompt Caching, And Retrieval Later - Deferred
+
+Implementation status:
+
+- [ ] Not started in this slice by design. Mechanism contracts, validation, and UI visibility came first.
 
 Goal: reduce token cost and improve reasoning only after the planner has a clean decision contract.
 

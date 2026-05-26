@@ -2,11 +2,13 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
+	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 )
@@ -81,6 +83,13 @@ func TestTrainingMonitorAgentReturnsInvocationTrace(t *testing.T) {
 	if string(trace.RawOutput) == "" {
 		t.Fatal("expected raw output to be captured")
 	}
+	promptBudget, ok := trace.PromptContext["prompt_budget"].(map[string]any)
+	if !ok {
+		t.Fatal("expected prompt budget metadata in trace input context")
+	}
+	if promptBudget["approx_context_bytes"] == nil || promptBudget["approx_input_bytes"] == nil {
+		t.Fatalf("expected approximate prompt size telemetry, got %#v", promptBudget)
+	}
 }
 
 func TestTrainingMonitorAgentRejectsUnknownAction(t *testing.T) {
@@ -107,6 +116,138 @@ func TestTrainingMonitorAgentRejectsUnknownAction(t *testing.T) {
 	_, err := agent.Evaluate(context.Background(), testTrainingMonitorInput())
 	if err == nil || !strings.Contains(err.Error(), "invalid action_type") {
 		t.Fatalf("expected invalid action_type error, got %v", err)
+	}
+}
+
+func TestTrainingMonitorPromptContextUsesCompactRunEvaluationCards(t *testing.T) {
+	input := testTrainingMonitorInput()
+	input.Plan.Experiments = []plans.PlannedExperiment{
+		{
+			Template:           jobs.TemplateTrainExperiment,
+			Model:              "efficientnet_b0",
+			Mechanism:          "regularization",
+			Intervention:       "AdamW with light augmentation",
+			EvidenceUsed:       []string{"validation loss gap", "stable macro-F1"},
+			ExpectedEffect:     "Improve validation quality without increasing latency.",
+			Epochs:             12,
+			BatchSize:          32,
+			LearningRate:       0.0003,
+			ImageSize:          224,
+			Optimizer:          "adamw",
+			Scheduler:          "cosine",
+			AugmentationPolicy: "light",
+		},
+	}
+	input.Job.Config = map[string]any{
+		"model":             "efficientnet_b0",
+		"full_profile_dump": "SENTINEL_FULL_DUMP",
+		"class_names":       []string{"class_a", "class_b", "class_c"},
+	}
+	input.Summary.EpochsCompleted = 12
+	input.Summary.FinalTrainLoss = 0.18
+	input.Summary.FinalValLoss = 0.31
+	input.Summary.RuntimeSeconds = 410
+	input.Summary.EstimatedCostUSD = 0.42
+	input.Evaluation = &runs.TrainingRunEvaluation{
+		JobID:     "job_1",
+		ProjectID: "project_1",
+		PlanID:    "plan_1",
+		ObjectiveProfile: map[string]any{
+			"target_metric": "macro_f1",
+		},
+		PerClassMetrics: map[string]any{
+			"class_a":   map[string]any{"precision": 0.91, "recall": 0.88, "f1-score": 0.89, "support": 50},
+			"class_b":   map[string]any{"precision": 0.72, "recall": 0.55, "f1-score": 0.62, "support": 12},
+			"class_c":   map[string]any{"precision": 0.84, "recall": 0.79, "f1-score": 0.81, "support": 31},
+			"macro avg": map[string]any{"precision": 0.82, "recall": 0.74, "f1-score": 0.77, "support": 93},
+		},
+		ConfusionMatrix: [][]int{
+			{44, 4, 2},
+			{5, 7, 0},
+			{1, 4, 26},
+		},
+		ModelProfile: map[string]any{
+			"estimated_latency_ms":                   11.4,
+			"estimated_throughput_images_per_second": 87.7,
+			"parameter_count":                        5300000,
+			"model_size_mb":                          20.2,
+			"full_profile_dump":                      "SENTINEL_FULL_DUMP",
+		},
+		HolisticScores: map[string]any{
+			"quality_score": 0.81,
+			"latency_score": 0.93,
+			"overall_score": 0.84,
+		},
+		RecommendationSummary: "Compact model is accurate and fast.",
+	}
+	input.Metrics = []jobs.EpochMetric{}
+	for epoch := 1; epoch <= 12; epoch++ {
+		input.Metrics = append(input.Metrics, jobs.EpochMetric{
+			JobID: "job_1",
+			Epoch: epoch,
+			Metrics: map[string]float64{
+				"macro_f1":   0.50 + float64(epoch)*0.025,
+				"accuracy":   0.54 + float64(epoch)*0.024,
+				"train_loss": 0.90 - float64(epoch)*0.055,
+				"val_loss":   0.98 - float64(epoch)*0.045,
+			},
+		})
+	}
+	input.MemoryRecords = []memory.AgentMemoryRecord{
+		{AgentName: "training_monitor", Kind: memory.KindTrainingEvaluation, Summary: "Previous run plateaued.", Tags: []string{"plateau"}},
+	}
+
+	context := trainingMonitorPromptContext(input)
+	for _, forbidden := range []string{"plan", "job", "summary", "run_evaluation", "epoch_metrics", "prior_memory"} {
+		if _, ok := context[forbidden]; ok {
+			t.Fatalf("expected compact context to omit raw key %q", forbidden)
+		}
+	}
+
+	encoded, err := json.Marshal(context)
+	if err != nil {
+		t.Fatalf("marshal context: %v", err)
+	}
+	contextJSON := string(encoded)
+	if strings.Contains(contextJSON, "SENTINEL_FULL_DUMP") {
+		t.Fatal("compact context leaked raw profile/config dump")
+	}
+
+	dynamics := requirePromptMap(t, context, "training_dynamics_card")
+	recentEpochs, ok := dynamics["recent_epochs"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected compact recent epochs, got %#v", dynamics["recent_epochs"])
+	}
+	if len(recentEpochs) != trainingMonitorMaxRecentEpochs {
+		t.Fatalf("expected %d recent epochs, got %d", trainingMonitorMaxRecentEpochs, len(recentEpochs))
+	}
+	if recentEpochs[0]["epoch"] != 8 {
+		t.Fatalf("expected recent epochs to start at 8, got %#v", recentEpochs[0]["epoch"])
+	}
+	if dynamics["recent_metric_delta"] == 0.0 {
+		t.Fatalf("expected recent metric trend, got %#v", dynamics)
+	}
+
+	perClass := requirePromptMap(t, context, "per_class_confusion_card")
+	if perClass["minority_or_imbalance_signal"] != true {
+		t.Fatalf("expected minority/per-class signal, got %#v", perClass)
+	}
+	if !strings.Contains(contextJSON, "class_b") {
+		t.Fatal("expected compact worst-class signal to be retained")
+	}
+	if !strings.Contains(contextJSON, "top_confusion_pairs") {
+		t.Fatal("expected compact confusion signal to be retained")
+	}
+
+	deployment := requirePromptMap(t, context, "deployment_model_profile_card")
+	modelProfile := requirePromptMap(t, deployment, "model_profile_summary")
+	if modelProfile["estimated_latency_ms"] != 11.4 {
+		t.Fatalf("expected deployment latency summary, got %#v", modelProfile)
+	}
+
+	budget := requirePromptMap(t, context, "prompt_budget")
+	if budget["approx_context_bytes"] == nil || budget["approx_input_bytes"] == nil {
+		t.Fatalf("expected approximate byte telemetry, got %#v", budget)
 	}
 }
 
@@ -146,4 +287,13 @@ func testTrainingMonitorInput() TrainingMonitorInput {
 			{JobID: "job_1", Epoch: 2, Metrics: map[string]float64{"macro_f1": 0.82}},
 		},
 	}
+}
+
+func requirePromptMap(t *testing.T, parent map[string]any, key string) map[string]any {
+	t.Helper()
+	value, ok := parent[key].(map[string]any)
+	if !ok {
+		t.Fatalf("expected map at %s, got %#v", key, parent[key])
+	}
+	return value
 }
