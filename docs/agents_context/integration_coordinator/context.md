@@ -82,10 +82,10 @@ Always check these contracts before accepting changes from multiple agents:
   - future idempotency constraints require migration/data review
 - Champion export/demo:
   - export records, model artifact metadata, inference API, held-out image selection, and frontend demo must land as compatible pieces
-  - current slice has idempotent backend export records/API, durable demo prediction audit/history, worker export/inference helpers, and frontend panel/history rendering; backend-scheduled worker export/inference remains deferred
+  - current slice has idempotent backend export records/API, backend-scheduled worker export/inference jobs, durable demo prediction audit/history, worker export/inference handlers, and frontend panel/history rendering
 - Visual exemplars:
   - sampling/downscaling, prompt budget, audit fields, multimodal LLM input, and backend validation must remain coordinated
-  - current slice uses capped `datasets.profile.visual_exemplars` metadata, worker exemplar-generation helpers, and evidence-only planner context with caps/audit; upload/persistence and multimodal attachments remain deferred
+  - current slice uses capped `datasets.profile.visual_exemplars` metadata, backend profile merge for worker-generated exemplar patches, worker exemplar-generation helpers, and evidence-only planner context with caps/audit; durable history and multimodal attachments remain deferred
 
 ## Integration Checklist
 
@@ -112,7 +112,7 @@ For future multi-agent work:
 - Bbox/crop support has helper-level annotation parsing but no training ablation wiring yet.
 - `normalization: "dataset"` is validated and worker-computed in bounded form when requested.
 - Mission Control can display many reasoning fields but still lacks a normalized validation-failure/rejection feed.
-- Champion export/demo and visual class exemplars now have safe vertical slices: backend contracts, frontend display/actions, worker metadata/export/inference/exemplar helpers, and planner evidence-only context. Backend-scheduled export/inference jobs, exemplar upload/persistence, and durable invocation audit remain deferred.
+- Champion export/demo and visual class exemplars now have backend contracts, frontend display/actions, worker export/inference/exemplar jobs, backend result callbacks, profile exemplar persistence, and planner evidence-only context. Production artifact upload, durable exemplar history, and durable invocation audit remain future hardening.
 - `docs/me_ground_truth.md` and `docs/model_express_end_to_end_checklist.md` are maintained by integration.
 
 ## Updating `me_ground_truth.md`

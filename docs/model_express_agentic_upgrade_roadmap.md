@@ -1,616 +1,764 @@
 # Model Express Agentic Upgrade Roadmap
 
-## Integration Summary
+Status: planning document only. This roadmap describes the next implementation sequence for making Model Express plan image-classification experiments like a senior data scientist instead of repeatedly trying random model families or longer epoch counts.
 
-This pass split the agentic experimentation upgrade into PR-sized tracks and kept the core safety boundary intact:
+The core safety boundary remains unchanged:
 
 ```text
-LLMs propose structured plans -> backend validates -> backend stores/schedules -> workers execute
+LLM proposes structured JSON -> backend validates -> backend stores/schedules -> workers execute
 ```
 
-The repo now has stronger support for dataset intelligence, preprocessing-aware experiment configs, deterministic planner diagnosis, candidate ranking, strategy scorecards, and Mission Control visibility. The work should still be merged as multiple PRs rather than one large change.
+Do not let an LLM directly create jobs, run Modal work, mutate datasets, pick arbitrary files, bypass backend validation, or weaken duplicate and stop guards.
 
-Final implementation status is tracked in:
+## Current Position
 
-- `docs/model_express_pr_completion_report.md`
-- `docs/model_express_end_to_end_checklist.md`
-- `docs/me_ground_truth.md`
+The system already has useful ingredients:
 
-This roadmap also includes three additional product goals:
+- `PlannedExperiment` supports model, epochs, batch size, learning rate, image size, `resolution_strategy`, `preprocessing`, optimizer, scheduler, weight decay, augmentation, `augmentation_policy`, class balancing, sampling, early stopping, pretrained/freeze flags, and `fine_tune_strategy`.
+- The planner prompt accepts `candidate_hypotheses`, `planning_mode`, diagnosis evidence, rejected options, score components, and compact `planner_context_snapshot`.
+- Deterministic diagnosis covers overfitting, underfitting, plateau, instability, class imbalance, minority-class failure, cost, latency, and improvement stagnation.
+- Backend novelty checks reject exact repeats and minor-only same-mechanism follow-ups.
+- Backend stop guards can select a champion when bounded metrics are near ceiling or repeated follow-ups fail to beat the champion.
+- Modal/local worker paths already understand several execution knobs such as transforms, optimizer/scheduler, class weights, focal loss, weighted sampling, dataset normalization, and fine-tuning depth.
 
-- Export the selected champion model for real use.
-- Add a Mission Control champion demo that runs live predictions on held-out/test images.
-- Give the LLM planner a small, backend-curated set of downscaled class example images so it can connect dataset statistics to actual visual evidence.
-- Create `docs/me_ground_truth.md` as the durable system reference for how Model Express works.
+The important gap is not that image classification has too few real experiment options. The gap is that Model Express has not made the experiment action space explicit enough. The planner still sees a loose bag of fields, so it can collapse back to architecture shopping:
 
-## What Was Implemented
+```text
+Try EfficientNet.
+Try ResNet.
+Train longer.
+```
 
-### Dataset Profiling And Preprocessing
+The next upgrade should make every follow-up experiment pass through:
 
-Implemented in PR 1 scope:
+```text
+diagnosis -> mechanism -> intervention -> controlled config -> backend validation -> outcome memory
+```
 
-- Richer dataset profile structs in `services/orchestrator/internal/datasets/model.go`.
-- Worker profiler fields for class distribution, image count, imbalance ratio, image dimension stats, corrupt files, metadata/artifacts, leakage warnings, and dataset traits.
-- Optional `PlannedExperiment` fields for:
-  - `resolution_strategy`
-  - `preprocessing`
-  - `augmentation_policy`
-  - `sampling_strategy`
-- Backend validation for supported preprocessing, augmentation, sampling, optimizer, scheduler, and class-balancing options.
-- Experiment signatures now include preprocessing fields so duplicates are detected correctly.
-- Execution config passes validated preprocessing fields to workers.
-- Local and Modal workers understand a safe preprocessing/class-balancing subset.
-- Focused backend validation tests and Python compile checks.
+## Codebase Findings
 
-### LLM Decision Quality
+### Existing Planner Contract
 
-Implemented in PR 3/4 scope:
-
-- Deterministic planner diagnosis fields already exist and are passed to planner context.
-- Explicit planning modes are validated.
-- Candidate hypotheses can be ranked deterministically when the LLM leaves `proposed_experiments` empty.
-- Candidate rankings now include `score_components` so decisions are explainable.
-- Rejected options and strategy scorecards are represented in planner context and decision payloads.
-- Planner prompt requires evidence, diagnosis, rejected options, stop conditions, and champion comparison.
-
-### Mission Control UX
-
-Implemented in PR 5 scope:
-
-- Experiment lifecycle timeline.
-- Dataset intelligence panel.
-- Agent reasoning and backend gate cards.
-- Candidate rejection visibility.
-- Champion comparison panel.
-- Responsive layout cleanup and richer empty/loading states.
-
-### Champion Export And Demo
-
-Implemented as a safe control-plane/helper slice:
-
-- The backend stores idempotent champion export records after validating a selected champion and completed run.
-- Missing artifacts are represented as `PENDING_ARTIFACT`, not fake readiness.
-- Worker export helpers can create manifest/checkpoint metadata and guarded TorchScript/ONNX artifacts when dependencies and model objects exist.
-- The backend stores durable demo prediction audit rows and returns `RUNTIME_UNAVAILABLE` until worker-backed inference is scheduled.
-- Mission Control includes an Export/Demo panel with export status, use-case fit, selected demo image, next/random controls, prediction history, top-k, latency, true-label, correctness, and runtime-unavailable display.
-- Backend-scheduled export/inference worker jobs and production serving remain deferred.
-
-### LLM Visual Dataset Exemplars
-
-Implemented as a safe evidence-only slice:
-
-- Backend APIs expose capped exemplars from `datasets.profile.visual_exemplars` / `demo_images`.
-- Planner context treats visual exemplars as backend-curated evidence only and carries caps/audit details.
-- Worker helper code can generate class-balanced downscaled/compressed exemplar packs with image/byte caps.
-- LLM output remains JSON only and backend validation remains unchanged.
-- Uploading generated exemplars into backend profile/artifact storage and true multimodal image attachment remain deferred.
-
-### Ground Truth System Document
-
-Implemented:
-
-- `docs/me_ground_truth.md` is the durable system reference.
-- `docs/model_express_pr_completion_report.md` records PR-by-PR completion details.
-- `docs/model_express_end_to_end_checklist.md` records acceptance, verification, manual demo steps, and remaining explicit deferrals.
-
-### Orchestrator/System Design
-
-Implemented in PR 6 scope:
-
-- System design report with current architecture, bottlenecks, reliability gaps, and future eventing guidance.
-- Additive Postgres indexes for project/status scans, follow-up plan lookup, plan-scoped decisions, worker requirements, and agent memory/invocation filters.
-
-## Partially Implemented
-
-- `dataset_profiles` exists in the migration, but profile persistence still primarily uses `datasets.profile` JSON. No store/API path writes full `dataset_profiles` rows yet.
-- Dataset artifacts are represented in profile JSON and Go structs, not a dedicated `dataset_artifacts` table.
-- Bounding box support is schema/spec-level only. Actual bbox crop execution should be a later PR.
-- `normalization: "dataset"` is validated as future-facing, but workers do not compute and apply dataset-specific normalization yet.
-- The implemented `augmentation_policy` is a safe string subset: `none|light|moderate|strong|custom`. The original target object form with `basic|randaugment|trivialaugment|autoaugment|mixup|cutmix` is not implemented yet.
-- The planner prompt examples still need to be updated to show the new PR 1 preprocessing fields explicitly.
-- Mission Control can display defensive profile/reasoning fields, but it still depends on generic payloads instead of normalized rejection/invocation summary endpoints.
-
-## Conflict Check
-
-### Schema And Config
-
-- Backend `PlannedExperiment`, backend validation, execution config, candidate signatures, and worker config now agree on the PR 1 preprocessing fields.
-- Candidate ranking and API duplicate detection both include preprocessing, augmentation policy, sampling strategy, and resolution strategy in signatures.
-- The frontend reads most new data defensively through generic records, so it does not require backend migrations to render.
-
-### Known Mismatches To Resolve
-
-- Augmentation policy shape differs from the original requested object schema. Keep PR 1's string policy as the initial safe contract, then add object-shaped advanced policies in PR 2.
-- `DatasetProfile` Go structs and `dataset_profiles` SQL table are not yet wired together. Either wire persistence in PR 1 follow-up or document `datasets.profile` JSON as the current source of truth.
-- LLM planner prompt now includes `preprocessing`, `sampling_strategy`, `resolution_strategy`, and the supported value list.
-- Mission Control wants validation failures even when no `agent_decisions` row is persisted. That requires an agent invocation summary endpoint or rejection event stream.
-
-## Work Still Needed After Final Pass
-
-### Backend
-
-- Fully promote normalized `dataset_profiles`, or keep the table permanently documented as dormant.
-- Add a first-class `dataset_artifacts` table only if artifact tracking needs history, file-level metadata, annotation parsing, or provenance.
-- Wire backend-scheduled worker jobs for champion export artifact production and demo inference.
-- Prefer test/held-out split images when split parsing is wired into training/profile state.
-- Persist/upload worker-generated visual exemplar packs so backend profile/API paths can serve generated images, not only profile metadata.
-- Add advanced augmentation policy validation once workers support RandAugment, TrivialAugment, AutoAugment, MixUp, and CutMix.
-- Add normalized rejection events for failed LLM validation.
-- Add job lease/requeue support and durable idempotency keys.
-
-### Worker
-
-- Implement real bbox crop/full-image paired ablations.
-- Wire helper-level annotation XML/JSON and split-file parsing into training/profile behavior; labels CSV, class hierarchy, and metadata folder parsing remain future work.
-- Add real advanced augmentation policies beyond the safe current subset.
-- Wire explicit split-file training.
-- Wire export manifest/checkpoint helpers into real training/export job outputs and object storage.
-- Wire lightweight demo inference helper into backend-scheduled worker execution.
-- Upload worker-side visual exemplar outputs or embed compact metadata into `datasets.profile`.
-
-### Frontend
-
-- Add a compact planner validation/rejection feed.
-- Link scorecards, decisions, invocations, follow-up plans, and outcomes together in the UI.
-- Add download/use instructions once artifacts are available.
-- Show `SUCCEEDED` live predictions once backend-scheduled inference exists.
-
-### Migrations
-
-- Current additive indexes are safe.
-- Future migrations should add, only when needed:
-  - `dataset_artifacts`
-  - `dataset_visual_exemplars` or equivalent artifact records for class example images
-  - persisted normalized `dataset_profiles` writes or latest-profile helper view
-  - optional stricter export idempotency constraint after duplicate export row migration review
-  - worker inference result/update tables or status fields if a future job path needs them
-  - job lease fields and retry attempts
-  - idempotency keys/constraints for plan execution and planner outcomes
-  - event cursor fields for SSE
-
-### Tests
-
-- Keep existing backend validation tests.
-- Add backend tests for future worker-backed export/inference job transitions.
-- Add UI component tests or Playwright smoke once Mission Control grows section navigation.
-- Add duplicate plan execution/idempotency tests.
-- Add stale worker/job recovery tests after lease support lands.
-
-## Recommended PR Sequence
-
-### PR 1: Dataset Profiling + Preprocessing Schema + Backend Validation
-
-Owner: Data Preprocessing / Dataset Intelligence Agent
-
-Files/features:
-
-- `services/orchestrator/internal/plans/model.go`
-- `services/orchestrator/internal/datasets/model.go`
-- `services/orchestrator/internal/api/handlers.go`
-- `services/orchestrator/internal/api/handlers_test.go`
-- `services/orchestrator/internal/agents/experiment_planner_llm.go` only for dataset insight structs if needed
-- `services/orchestrator/internal/agents/candidate_ranking.go` only for signatures if needed
-- `services/worker/worker/datasets/profiler.py`
-- `services/worker/worker/training/local.py`
-- `services/worker/worker/training/modal_app.py`
-- `docs/data_preprocessing_agent_report.md`
-
-Dependencies: none.
-
-Defer from PR 1:
-
-- advanced augmentation object schema
-- real bbox crop execution
-- dataset normalization computation
-- dedicated `dataset_artifacts` table
-
-### PR 2: Python Worker Preprocessing Support + Preprocessing Ablations
-
-Owner: Data/Worker follow-up
-
-Files/features:
-
-- worker transform tests
-- annotation parsing
-- bbox crop vs full-image paired ablations
-- dataset-computed normalization
-- split-file training
-- advanced augmentation policies
-
-Dependencies: PR 1.
-
-### PR 3: LLM Planner Schema/Prompt Upgrades + Planning Modes
-
-Owner: LLM Decision Quality Agent
-
-Files/features:
+Key files:
 
 - `services/orchestrator/internal/agents/experiment_planner_llm.go`
 - `services/orchestrator/internal/agents/diagnosis.go`
-- planner prompt examples
-- tests for required evidence, diagnosis, stop conditions, rejected options, and preprocessing-aware planner outputs
-- `docs/llm_decision_quality_report.md`
-
-Dependencies: PR 1 for preprocessing field names and supported values.
-
-### PR 4: Strategy Scorecards + Candidate Ranking + Rejected Options Memory
-
-Owner: LLM Decision Quality Agent
-
-Files/features:
-
 - `services/orchestrator/internal/agents/candidate_ranking.go`
-- `services/orchestrator/internal/strategies/model.go`
-- store/API scorecard methods
-- planner outcome memory updates
-- candidate `score_components`
-- tests for ranking, outcome idempotency, and rejected memory retrieval
+- `services/orchestrator/internal/api/handlers.go`
+- `services/orchestrator/internal/plans/model.go`
+- `services/worker/worker/training/modal_app.py`
 
-Dependencies: PR 3, plus PR 1 for preprocessing-aware signatures.
+The planner already has broad fields, but there is no first-class `mechanism` field on `plans.PlannedExperiment`. A mechanism is inferred from config text/signatures. That is good enough for duplicate filtering, but not strong enough for an agentic search policy.
 
-### PR 5: Frontend Mission Control UI Improvements
+### Existing Backend Gates
 
-Owner: Frontend / Mission Control UX Agent
+Backend validation already knows allowed values for:
 
-Files/features:
+- optimizers: `adamw`, `adam`, `sgd`
+- schedulers: `none`, `cosine`, `step`
+- resolution strategies: `fixed`, `low_latency`, `compare_224_256`, `high_resolution_ablation`
+- resize strategies: `squash`, `preserve_aspect_pad`, `center_crop`, `random_resized_crop`, `bbox_crop_if_available`
+- normalization: `imagenet`, `dataset`, `none`
+- crop strategies: `none`, `center_crop`, `random_resized_crop`, `bbox_crop_if_available`, `bbox_crop_ablation`
+- bbox modes: `ignore`, `crop_if_available`, `crop_and_compare_full_image`, `use_boxes_as_metadata`
+- augmentation policy: `none`, `light`, `moderate`, `strong`, `custom`
+- augmentation keys: `horizontal_flip`, `vertical_flip`, `color_jitter`, `random_crop`, `random_rotation`, `random_erasing`
+- class balancing: `none`, `weighted_loss`, `class_weighted_loss`, `class_balanced_sampler`, `weighted_random_sampler`, `focal_loss`
+- sampling: `none`, `class_balanced_sampler`, `weighted_random_sampler`
+- fine-tuning: `head_only`, `last_block`, `full`
 
-- `apps/mission-control/src/App.tsx`
-- `apps/mission-control/src/styles.css`
-- `apps/mission-control/src/types.ts` when new backend fields are finalized
-- `docs/frontend_mission_control_report.md`
+These fields are enough to support more thoughtful experiments, but the planner should be forced to name the mechanism and the evidence that makes that mechanism appropriate.
 
-Dependencies: PRs 1, 3, and 4 for complete backend payloads. Can merge earlier if defensive rendering remains.
+### Current Risk
 
-### PR 6: Orchestrator/System Design Cleanup And Observability
+The planner can still produce superficially varied plans that are really the same search move:
 
-Owner: Orchestrator / System Design Agent
+- same model family with only epochs or learning-rate changes
+- several architecture challengers without a diagnosis
+- augmentation changes when no overfitting, blur, crop, or visual-variance signal exists
+- class balancing when macro-F1 and per-class recall are already strong
+- high-resolution challengers without object-scale or crop evidence
+- more experiments when the champion is already near the metric ceiling
+- a terminal champion selection followed by new autonomous follow-up experiments
 
-Files/features:
+Backend validation should keep these from becoming scheduled work.
 
-- `services/orchestrator/internal/store/migrations/001_init.sql`
-- `docs/orchestrator_system_design_report.md`
-- optional follow-up code for event rows, query limits, and metrics
+### Newly Observed Bug: Champion Selection Is Not Terminal
 
-Dependencies: none for additive indexes. Later reliability work depends on PRs 3/4 if moving agent work off request paths.
+A run-through showed the system selecting a champion and then later proposing more experiments. That is a control-plane bug, not a model-quality issue.
 
-### PR 7: Champion Export + Live Demo
+Expected behavior:
 
-Owner: Backend/Worker + Frontend
+- Once a project has a persisted `SELECT_CHAMPION` decision or project champion, autonomous follow-up scheduling should stop.
+- Existing stale `ADD_EXPERIMENTS` decisions should not create new follow-up plans after champion selection.
+- The only way to continue after champion selection should be an explicit user action such as "start a new exploration round" or "reopen experimentation", with a new source decision/event.
+- If an autonomous scheduler encounters a selected champion, it should create no plan/jobs and record a clear blocked event such as `backend_stop_guard: champion_selected_guard`.
 
-Files/features:
+Likely areas to inspect:
 
-- champion export records and API
-- exported model artifact metadata
-- worker export support for the selected champion
-- lightweight inference endpoint/runtime for demo images
-- Mission Control Champion Export panel
-- Mission Control live demo screen using held-out/test images
-- use-case explanation generated from metrics, objective context, deployment profile, and model metadata
+- `schedulePlannerDecision`
+- `plannerFollowUpStopReason`
+- `ensureFollowUpPlan`
+- `experimentPlannerDecisionForPlan`
+- `actionDecisionForPlan`
+- `followUpSourceDecision`
+- `followUpPlanForDecision`
+- project champion persistence and lookup paths
 
-Dependencies: PRs 1, 4, and 5.
+## Research-Backed Experiment Levers
 
-Defer from PR 7:
+These are the levers worth exposing as first-class, diagnosis-driven mechanisms.
 
-- production deployment hosting
-- continuous camera/webcam inference
-- model registry integrations
-- advanced explainability overlays such as Grad-CAM
+### 1. Capacity And Fine-Tuning
 
-### PR 8: Visual Class Exemplars For LLM Planning
+Use when there is underfitting, low training quality, or a strong sign that the frozen head cannot adapt.
 
-Owner: Dataset/Backend + LLM Decision Quality
+Controls:
 
-Files/features:
+- model family or capacity tier
+- `fine_tune_strategy`: `head_only`, `last_block`, `full`
+- `freeze_backbone`
+- optimizer and scheduler
+- learning rate range by fine-tuning depth
 
-- class-balanced image exemplar sampling
-- downscaling/compression and strict prompt budget controls
-- optional multimodal planner context
-- planner prompt updates explaining how to use image examples as evidence
-- backend validation remains unchanged: LLM still proposes JSON and backend still validates
-- audit fields recording whether visual exemplars were used in a planner invocation
+Backend rule:
 
-Dependencies: PRs 1 and 3.
+- More epochs alone is not a capacity mechanism unless the curve is still improving and the run is not near ceiling.
 
-Defer from PR 8:
+### 2. Regularization And Optimization
 
-- semantic image retrieval across projects
-- large image batches in prompts
-- allowing LLMs to mutate datasets or choose files directly
+Use when there is overfitting, instability, noisy validation curves, or a small dataset.
 
-### PR 9: `me_ground_truth.md` System Reference
+Controls:
 
-Owner: Final Integration / Documentation
+- weight decay
+- dropout if supported by model head later
+- label smoothing
+- early stopping
+- AdamW vs SGD
+- cosine schedule vs step schedule
+- Sharpness-Aware Minimization as a later advanced optimizer option
 
-Files/features:
+Research signal:
 
-- `docs/me_ground_truth.md`
-- explain the system architecture, data model, and end-to-end data movement
-- document major orchestrator, worker, frontend, planner, memory, export, and demo flows
-- document backend validation boundaries and why LLMs cannot execute directly
-- keep this document updated as PRs land
+- Label smoothing is a known classification regularizer in Inception-style training.
+- SAM targets flatter minima and can improve generalization, but should be deferred until the worker has focused tests because it changes optimizer behavior.
 
-Dependencies: can start immediately, but should be refreshed after PRs 1-8 land.
+### 3. Augmentation Policy
 
-## Future Execution Prompt
+Use when the dataset has small sample count, lighting variation, background variation, viewpoint variation, blur, or overfitting.
 
-Use this prompt in a future Codex session to continue implementation from this roadmap without restating the whole project context.
+Controls:
 
-```text
-You are working in the Model Express repo.
+- current safe policy: `none`, `light`, `moderate`, `strong`, `custom`
+- structured policy later: `basic`, `randaugment`, `trivialaugment`, `autoaugment`
+- transform knobs: flips, color jitter, rotation, random crop, random erasing
+- policy strength/magnitude and probability caps
 
-Primary roadmap:
-- docs/model_express_agentic_upgrade_roadmap.md
+Research signal:
 
-Agent context folder:
-- docs/agents_context/README.md
-- docs/agents_context/frontend_mission_control/context.md
-- docs/agents_context/orchestrator_backend/context.md
-- docs/agents_context/python_worker_training/context.md
-- docs/agents_context/data_dataset_intelligence/context.md
-- docs/agents_context/llm_decision_intelligence/context.md
-- docs/agents_context/system_architecture_review/context.md
-- docs/agents_context/integration_coordinator/context.md
-
-Supporting docs:
-- docs/llm_agent_decision_context.md
-- docs/data_preprocessing_agent_report.md
-- docs/llm_decision_quality_report.md
-- docs/frontend_mission_control_report.md
-- docs/orchestrator_system_design_report.md
-- docs/smarter_agentic_orchestration_plan.md
-- docs/agentic.md
-- docs/final_distributed_agentic_vision_training_platform_plan.md
-
-Goal:
-Finish implementing the remaining roadmap PRs while preserving Model Express's safety boundary:
-
-LLMs propose structured JSON -> backend validates -> backend stores/schedules -> workers execute.
-
-Do not let any LLM directly execute jobs, mutate datasets, create workers, bypass backend validation, choose arbitrary files, or weaken backend guardrails.
-
-Work style:
-- Do not implement this as one giant undifferentiated change.
-- Split work by PR boundary and agent ownership.
-- If a PR is too large, implement the smallest safe vertical slice and document exactly what remains.
-- Keep migrations safe and additive unless explicitly justified.
-- Preserve existing propose/autonomous modes and max follow-up rounds.
-- Prefer existing repo patterns.
-- Do not add Kafka, Redis, NATS, WebSockets, or a workflow engine unless the architecture review shows they are truly justified. Prefer Postgres hardening, idempotency, leases, and SSE first.
-- Use subagents in parallel where write scopes do not conflict.
-- Do not let subagents edit the same files at the same time. If two agents need the same schema/API field, the Integration Coordinator defines the shared contract and assigns one owner.
-
-Before implementation:
-1. Read docs/model_express_agentic_upgrade_roadmap.md.
-2. Read docs/agents_context/README.md.
-3. Each subagent must read its own context file and any supporting docs listed there.
-4. Run `git status --short` and preserve user/other-agent changes. Do not revert unrelated work.
-5. Create a short execution plan mapping each PR to owner, files, tests, and dependencies.
-
-Use these agents:
-
-1. Data / Dataset Intelligence Agent
-   Context:
-   - docs/agents_context/data_dataset_intelligence/context.md
-   - docs/data_preprocessing_agent_report.md
-   - docs/model_express_agentic_upgrade_roadmap.md
-
-   Owns:
-   - Dataset profile contract finalization.
-   - Deciding whether `datasets.profile` JSON remains the source of truth or whether `dataset_profiles` rows become the active normalized path.
-   - `dataset_artifacts` design/implementation if needed.
-   - Annotation XML/JSON, labels CSV, split-file, metadata folder, class hierarchy, and bounding-box artifact parsing.
-   - Dataset traits and preprocessing recommendations.
-   - Visual class exemplar sampling policy: class-balanced, downscaled, compressed, capped by count/bytes/prompt budget.
-
-   Work on:
-   - Complete remaining PR 1 follow-ups that are still safe and needed.
-   - Support PR 2 where dataset parsing affects worker training.
-   - Own the data side of PR 8 visual exemplars.
-
-2. Python Worker / Training Agent
-   Context:
-   - docs/agents_context/python_worker_training/context.md
-   - docs/data_preprocessing_agent_report.md
-   - docs/model_express_agentic_upgrade_roadmap.md
-
-   Owns:
-   - Worker-side training execution and test coverage.
-   - Real transform behavior for preprocessing fields.
-   - Bbox crop vs full-image ablations when annotations are available.
-   - Dataset-computed normalization.
-   - Explicit split-file training.
-   - Advanced augmentation policies beyond the current safe string subset.
-   - Champion export artifact production.
-   - Lightweight champion inference path for demo images.
-   - Worker-side visual exemplar generation if backend delegates it.
-
-   Work on:
-   - PR 2: Python worker preprocessing support + preprocessing ablations.
-   - Worker slice of PR 7: champion export and inference.
-   - Worker slice of PR 8: exemplar generation/processing.
-
-3. Orchestrator / Backend Agent
-   Context:
-   - docs/agents_context/orchestrator_backend/context.md
-   - docs/orchestrator_system_design_report.md
-   - docs/model_express_agentic_upgrade_roadmap.md
-
-   Owns:
-   - API contracts, validation, stores, migrations, idempotency, execution events, and backend safety.
-   - Dataset profile/artifact persistence if Data Agent defines the contract.
-   - Advanced preprocessing validation after Worker Agent supports it.
-   - Champion export records and APIs.
-   - Demo image listing and prediction APIs.
-   - Visual exemplar APIs and invocation audit fields.
-   - Planner validation/rejection feed.
-   - Durable idempotency keys, job leases/requeue, and SSE/event stream if included in the current implementation scope.
-
-   Work on:
-   - Backend pieces of PR 1 follow-ups, PR 2 validation, PR 7, PR 8, and selected PR 6 reliability/observability follow-ups.
-   - Keep all execution-facing changes behind deterministic backend validation.
-
-4. LLM Decision Intelligence Agent
-   Context:
-   - docs/agents_context/llm_decision_intelligence/context.md
-   - docs/llm_decision_quality_report.md
-   - docs/llm_agent_decision_context.md
-   - docs/model_express_agentic_upgrade_roadmap.md
-
-   Owns:
-   - Planner prompt/schema upgrades.
-   - Preprocessing-aware prompt examples using the finalized PR 1/2 contract.
-   - Visual exemplar prompt/context design for PR 8.
-   - Planner tests for visual exemplar budget handling and JSON-only output.
-   - Rejected options, candidate scoring, strategy scorecard use, and semantic memory follow-up if scoped.
-
-   Work on:
-   - PR 3 remaining prompt/schema updates.
-   - PR 4 refinements only where necessary.
-   - LLM side of PR 8 visual exemplars.
-
-5. Frontend / Mission Control Agent
-   Context:
-   - docs/agents_context/frontend_mission_control/context.md
-   - docs/frontend_mission_control_report.md
-   - docs/model_express_agentic_upgrade_roadmap.md
-
-   Owns:
-   - Mission Control UI and TypeScript types.
-   - Section navigation/tabs for the long workspace.
-   - Typed display for preprocessing fields once backend contracts are stable.
-   - Candidate `score_components`, rejected options, scorecards, and invocation/rejection visibility.
-   - Champion Export panel.
-   - Champion Use Case explanation box.
-   - Live champion demo screen showing held-out/test image, predicted label, true label if known, confidence, top-k results, latency, and correctness.
-
-   Work on:
-   - PR 5 remaining UX improvements.
-   - Frontend slice of PR 7 champion export + live demo.
-
-6. System Architecture Review Agent
-   Context:
-   - docs/agents_context/system_architecture_review/context.md
-   - docs/orchestrator_system_design_report.md
-   - docs/model_express_agentic_upgrade_roadmap.md
-
-   Owns:
-   - Architecture review and risk analysis.
-   - Reviewing idempotency, job leases, SSE/eventing, polling pressure, migration safety, and export/demo architecture.
-   - Recommending whether PR 6 reliability work should be implemented now or deferred.
-
-   Work on:
-   - Review proposed backend/worker/frontend changes before final integration.
-   - Do not add Kafka/Redis/NATS unless clearly justified.
-   - Produce notes for the final report.
-
-7. Integration Coordinator Agent
-   Context:
-   - docs/agents_context/integration_coordinator/context.md
-   - docs/agents_context/README.md
-   - docs/model_express_agentic_upgrade_roadmap.md
-
-   Owns:
-   - Coordinating subagents and PR boundaries.
-   - Resolving schema/API conflicts.
-   - Checking that frontend expectations match backend responses.
-   - Checking that planner proposals are validated by backend and supported by workers.
-   - Checking migrations and store implementations.
-   - Running final verification.
-   - Writing final documentation.
-
-   Work on:
-   - Create or update docs/me_ground_truth.md.
-   - Create docs/model_express_pr_completion_report.md after implementation.
-   - The report must be ordered by PR and include:
-     - PR number and title.
-     - Owning agent(s).
-     - What changed.
-     - Files changed.
-     - New APIs, schemas, migrations, config fields, and UI surfaces.
-     - Tests/build checks run and results.
-     - What remains deferred and why.
-     - Any known risks or manual demo steps.
-
-Required implementation targets:
-
-PR 1 remaining:
-- Resolve or document the `datasets.profile` JSON vs `dataset_profiles` table source-of-truth path.
-- Add/complete dataset artifact persistence only if it is needed for PR 2, PR 7, or PR 8.
-- Keep preprocessing schema aligned across backend, worker, LLM prompts, and frontend.
-
-PR 2:
-- Add worker tests for transform construction, sampler/loss selection, and profile artifact detection.
-- Implement the next safe slice of preprocessing ablations:
-  - dataset-computed normalization if feasible,
-  - explicit split-file training if feasible,
-  - bbox crop vs full-image ablation if annotations are available,
-  - advanced augmentation policy support only if backend validation and tests land with it.
-
-PR 3:
-- Update planner prompt/examples to include finalized preprocessing fields:
-  - `resolution_strategy`
-  - `preprocessing`
-  - `augmentation_policy`
-  - `sampling_strategy`
-  - class balancing/loss options.
-- Keep output valid JSON and strongly typed.
-- Add tests for preprocessing-aware planner outputs.
-
-PR 4:
-- Ensure candidate ranking, rejected options, scorecards, and memory remain compatible with any new preprocessing, export, or exemplar fields.
-- Add tests only where behavior changes.
-
-PR 5:
-- Add section navigation/tabs if it improves demo clarity.
-- Add UI for candidate score components and validation/rejection feed if backend exposes it.
-- Add frontend support for champion export/demo APIs from PR 7.
-
-PR 6:
-- Implement only low-risk reliability/observability improvements that fit current scale.
-- Strong candidates: event rows for job lifecycle, idempotency tests, positive epoch validation, or SSE if scope allows.
-- Defer job leases or async automation if they would balloon the change.
-
-PR 7:
-- Add champion export records/API and worker export support.
-- Add model metadata/use-case explanation.
-- Add lightweight inference/demo API.
-- Add Mission Control export/demo panel.
-- Demo should use held-out/test images when possible and show image, prediction, true label if available, confidence/top-k, latency, and correctness.
-
-PR 8:
-- Add class-balanced downscaled visual exemplars for planner context.
-- Add strict budget caps and audit fields.
-- Add prompt/context support so LLM can use images as evidence.
-- LLM still returns JSON only; backend validation remains the execution gate.
-
-PR 9:
-- Create docs/me_ground_truth.md.
-- Explain the complete system: architecture, data model, major flows, functions/modules that move data, dataset/profile/training/evaluation/planning/champion/export/demo flow, LLM context, memory, and backend validation.
-- Keep it as a durable system reference, not a changelog.
-
-Final integration requirements:
-- Run appropriate checks after code changes:
-  - `go test ./...` from `services/orchestrator`
-  - `npm run build` from `apps/mission-control`
-  - Python compile or tests for touched worker files
-  - any new focused tests added by agents
-- If a check fails, fix it if feasible. If not feasible, document:
-  - failing command
-  - failing file/test
-  - likely cause
-  - suggested fix
-- Update relevant files in docs/agents_context if a PR changes durable responsibilities or contracts.
-- Create docs/model_express_pr_completion_report.md with the final PR-by-PR explanation.
-- Final assistant response should summarize:
-  - major implemented changes,
-  - report file path,
-  - tests run,
-  - any deferred work.
+- RandAugment reduces the augmentation search space and is meant for practical automated augmentation.
+- Torchvision supports AutoAugment, RandAugment, TrivialAugmentWide, MixUp, and CutMix in the transforms API.
+
+### 4. Mixed-Sample Augmentation
+
+Use when overfitting, small data, class boundary ambiguity, or calibration/generalization is the likely issue.
+
+Controls:
+
+- MixUp
+- CutMix
+- alpha/probability
+- apply only to training batches
+- avoid for tasks where localized class evidence makes mixing misleading
+
+Backend rule:
+
+- Treat MixUp/CutMix as distinct mechanisms from ordinary augmentation. They affect labels and batching, not just image transforms.
+
+Research signal:
+
+- MixUp trains on convex combinations of examples and labels.
+- CutMix replaces image regions and mixes labels, preserving localizable visual evidence better than plain regional dropout.
+
+### 5. Class Imbalance And Minority Failure
+
+Use when imbalance ratio is high, accuracy exceeds macro-F1, or per-class recall/F1 has a weak minority class.
+
+Controls:
+
+- weighted cross entropy
+- effective-number class-balanced loss
+- focal loss
+- weighted random sampler
+- class-balanced sampler
+- targeted augmentation for minority classes
+- target metric switch toward macro-F1 or worst-class recall
+
+Backend rule:
+
+- Class-balancing mechanisms need actual imbalance or per-class weakness evidence. Do not schedule them when all per-class scores are already strong.
+
+Research signal:
+
+- Focal loss was introduced to address extreme class imbalance.
+- Class-Balanced Loss reweights by effective number of samples instead of raw inverse frequency.
+
+### 6. Resolution, Crop, And Object Scale
+
+Use when visual evidence or dataset profile suggests variable image dimensions, small objects, aspect ratio distortion, background dominance, or object localization issues.
+
+Controls:
+
+- `image_size`
+- `resolution_strategy`
+- `preserve_aspect_pad` vs `squash`
+- `center_crop` vs `random_resized_crop`
+- bbox crop if annotations exist
+- train/eval crop consistency
+- high-resolution ablation only when expected gain justifies latency cost
+
+Backend rule:
+
+- Higher image size is not meaningful by itself. It must be tied to object scale, fine-grained classes, crop mismatch, or visual evidence.
+
+Research signal:
+
+- FixRes-style work highlights train/test resolution and crop discrepancies in image classification.
+
+### 7. Label Noise And Hard-Example Review
+
+Use when heldout/test metrics look suspicious, the confusion matrix has asymmetric class confusions, validation losses are unstable, or high-confidence mistakes cluster by class.
+
+Controls:
+
+- high-loss sample audit
+- low-confidence correct sample audit
+- high-confidence wrong sample audit
+- label noise scorecard
+- robust loss later, such as generalized cross entropy
+- quarantine/report only at first; do not mutate labels automatically
+
+Backend rule:
+
+- Initial label-noise mechanisms should create an audit/review artifact, not automatically relabel or drop samples.
+
+Research signal:
+
+- Maximum softmax confidence is a simple baseline for detecting misclassified/OOD examples.
+- Co-teaching and generalized cross entropy are research-backed robust training paths, but they are larger worker changes and should be later PRs.
+
+### 8. Deployment And Compression
+
+Use when a larger model beats the compact champion but violates latency/cost goals.
+
+Controls:
+
+- compact model challenger
+- latency-constrained ranking
+- distillation from a stronger teacher to a smaller student later
+- final validation against heldout/test images
+
+Backend rule:
+
+- Quality-only improvements should not displace a champion if latency, model size, or runtime violate the project objective.
+
+Research signal:
+
+- Knowledge distillation is a standard way to transfer a larger model or ensemble into a smaller deployable model, but it is a later execution-plane feature.
+
+## Target Mechanism Taxonomy
+
+Add a first-class mechanism vocabulary before adding more model names.
+
+Recommended mechanisms:
+
+- `stop_select_champion`
+- `baseline_control`
+- `architecture_challenge`
+- `capacity_finetune`
+- `optimizer_scheduler`
+- `regularization`
+- `augmentation_basic`
+- `augmentation_auto`
+- `augmentation_mixed_sample`
+- `class_imbalance`
+- `minority_targeting`
+- `resolution_crop`
+- `bbox_crop_ablation`
+- `label_noise_audit`
+- `hard_example_audit`
+- `deployment_latency`
+- `distillation`
+
+Each mechanism should have:
+
+- allowed diagnosis triggers
+- required evidence fields
+- allowed config knobs
+- disallowed cosmetic changes
+- expected metric target
+- expected tradeoff
+- backend novelty signature
+- worker support status
+- UI display label
+
+Example:
+
+```json
+{
+  "mechanism": "resolution_crop",
+  "hypothesis": "Variable image dimensions and object scale are causing avoidable validation errors.",
+  "evidence_used": [
+    "dataset_card.image_dimension_stats shows high width/height variance",
+    "visual_evidence reports background-dominant examples"
+  ],
+  "intervention": "random_resized_crop with ImageNet normalization at 256px",
+  "expected_effect": "Improve robustness to object scale and crop variation",
+  "expected_tradeoffs": ["slower inference", "may reduce accuracy if crops remove key context"]
+}
 ```
 
-## Deferred Architecture
+## Data The LLM Should Receive
 
-- Do not add Kafka now.
-- Do not add Redis Streams or NATS now.
-- Prefer Postgres row locks, targeted queries, durable idempotency, job leases, and SSE first.
-- Revisit Redis Streams or NATS only when multiple orchestrator instances, independent consumers, or higher event volume make Postgres-backed events awkward.
+The planner should not receive raw table dumps. It should receive compact, decision-ready cards.
+
+### Dataset Decision Card
+
+Include:
+
+- class count and images per class summary
+- imbalance ratio and minority classes
+- image dimension and aspect-ratio summary
+- corrupt image count and leakage/split warnings
+- detected artifacts: bbox annotations, split files, labels CSV, metadata, class hierarchy
+- visual exemplar traits: object scale, background dominance, blur, lighting, fine-grained classes
+- recommended metrics and preprocessing
+
+Exclude:
+
+- raw file lists
+- full profile JSON
+- all visual exemplar metadata
+- full prior memory blobs
+
+### Training Dynamics Card
+
+Include:
+
+- best/final metric
+- train/validation loss gap
+- metric slope over last N epochs
+- plateau and instability scores
+- whether more epochs are justified
+- early stopping recommendation
+
+### Per-Class Error Card
+
+Include:
+
+- worst classes by recall/F1
+- top confusion pairs
+- accuracy vs macro-F1 gap
+- whether imbalance or minority failure is active
+
+### Deployment Card
+
+Include:
+
+- latency, throughput, parameter count, model size
+- objective weights
+- compact champion vs quality challenger tradeoff
+- whether the proposed experiment can realistically beat the champion after cost/latency penalties
+
+### Mechanism Coverage Card
+
+Include:
+
+- tried mechanisms
+- blocked mechanisms
+- mechanisms still eligible
+- best result by mechanism
+- failed mechanism lessons
+- shallow repeat warnings
+
+This card is the key to avoiding repeated ResNet/EfficientNet loops.
+
+## Recommended PR Sequence
+
+### PR 1: Mechanism Taxonomy And Contract
+
+Goal: make the experiment action space explicit without changing worker behavior.
+
+Primary files:
+
+- `services/orchestrator/internal/plans/model.go`
+- `services/orchestrator/internal/agents/experiment_planner_llm.go`
+- `services/orchestrator/internal/agents/candidate_ranking.go`
+- `services/orchestrator/internal/api/handlers.go`
+- `services/orchestrator/internal/api/handlers_test.go`
+- `docs/agents_context/llm_decision_intelligence/context.md`
+- `docs/agents_context/orchestrator_backend/context.md`
+
+Implementation slices:
+
+1. Add first-class mechanism fields to planner-facing structures.
+   - Preferred: `mechanism` and `intervention` on `CandidateHypothesis`.
+   - Consider adding `Mechanism string` to `plans.PlannedExperiment` only if it is persisted and useful to workers/UI. If not, store mechanism in the decision payload and derive execution config from existing fields.
+
+2. Add backend allowed-mechanism validation.
+   - Reject unknown mechanisms.
+   - Reject `ADD_EXPERIMENTS` if every candidate lacks a mechanism.
+   - Require mechanism-specific evidence for high-cost or high-risk proposals.
+
+3. Update candidate ranking.
+   - Score mechanism novelty separately from model novelty.
+   - Penalize model changes that do not change mechanism.
+   - Penalize mechanisms that conflict with diagnosis.
+
+4. Update planner prompt.
+   - Require `diagnosis -> mechanism -> intervention -> expected_effect`.
+   - Make model family a parameter inside a mechanism, not the mechanism itself.
+
+Tests:
+
+- Planner output with no mechanism is rejected.
+- Same model with more epochs cannot pass as a mechanism unless training-dynamics evidence says undertrained.
+- Architecture-only challengers are penalized when no diagnosis supports them.
+- Candidate ranking rewards a diagnosis-matched non-model mechanism.
+
+### PR 2: Mechanism Coverage And Final Scheduling Gates
+
+Goal: prevent stale or shallow decisions from scheduling work even if they came from older stored payloads.
+
+Primary files:
+
+- `services/orchestrator/internal/api/handlers.go`
+- `services/orchestrator/internal/api/handlers_test.go`
+- `services/orchestrator/internal/agents/experiment_planner_llm.go`
+- `services/orchestrator/internal/agents/candidate_ranking.go`
+
+Implementation slices:
+
+1. Build a `mechanism_coverage` card from all prior project plans.
+   - attempted mechanisms
+   - best score by mechanism
+   - no-improvement mechanisms
+   - blocked repeats
+   - eligible next mechanisms
+
+2. Add final validation in follow-up plan creation.
+   - Revalidate stale `ADD_EXPERIMENTS` decisions against current mechanism coverage.
+   - Block same-mechanism minor-only repeats across all prior project plans.
+   - Block high-cost mechanisms when near-ceiling stop guard is active.
+   - Block all autonomous follow-up creation after a champion has already been selected for the project unless there is an explicit user-initiated reopen/new-exploration action.
+
+3. Add blocked decision events.
+   - If all experiments are filtered out, create no plan/jobs.
+   - Record a clear backend event with `backend_validation_status: blocked`.
+   - For post-champion follow-up attempts, record `backend_stop_guard: champion_selected_guard`.
+
+Tests:
+
+- Stale architecture-repeat decision cannot create a plan.
+- All-filtered proposal creates no plan/jobs.
+- Repeated `resnet18` or `efficientnet_b1` with only epoch/LR changes is blocked.
+- After a `SELECT_CHAMPION` decision or persisted project champion exists, stale `ADD_EXPERIMENTS` decisions cannot create a follow-up plan.
+- After champion selection, autonomous scheduler paths create no jobs and record a blocked event.
+- Explicit user-initiated reopening/new-exploration behavior is the only accepted way to continue experimentation after champion selection.
+- Valid diagnosis-matched new mechanism still schedules in dry-run/local tests.
+
+### PR 3: Planner Context Cards V2
+
+Goal: give the LLM less context but better context.
+
+Primary files:
+
+- `services/orchestrator/internal/agents/experiment_planner_llm.go`
+- `services/orchestrator/internal/agents/experiment_planner_llm_test.go`
+- `services/orchestrator/internal/agents/training_monitor_llm.go`
+- `services/orchestrator/internal/agents/training_monitor_llm_test.go`
+- `docs/agents_context/llm_decision_intelligence/context.md`
+
+Implementation slices:
+
+1. Add decision-ready cards to `planner_context_snapshot`.
+   - `training_dynamics_card`
+   - `per_class_error_card`
+   - `deployment_card`
+   - `mechanism_coverage_card`
+   - `label_quality_card`
+
+2. Compact Training Monitor input.
+   - Replace raw-ish context with a compact run-evaluation card.
+   - Keep full run data in backend storage.
+   - Store the compact monitor prompt context in `agent_invocations.input_context`.
+
+3. Add prompt budget telemetry.
+   - Record approximate input sizes for each invocation.
+   - Do not add vector DB yet.
+
+Tests:
+
+- Planner context excludes raw history and includes mechanism coverage.
+- Training Monitor context excludes full epoch/profile dumps while preserving trend and per-class summary.
+- Snapshot includes worst-class and top-confusion facts when available.
+
+### PR 4: Advanced Augmentation Contract
+
+Goal: expand beyond `light|moderate|strong` without turning augmentation into free-form JSON.
+
+Primary files:
+
+- `services/orchestrator/internal/plans/model.go`
+- `services/orchestrator/internal/api/handlers.go`
+- `services/orchestrator/internal/api/handlers_test.go`
+- `services/worker/worker/training/modal_app.py`
+- worker tests under `services/worker/tests`
+- `docs/agents_context/python_worker_training/context.md`
+
+Implementation slices:
+
+1. Add structured augmentation object support.
+   - `policy_type`: `basic`, `randaugment`, `trivialaugment`, `autoaugment`, `mixup`, `cutmix`
+   - `magnitude`, `probability`, `alpha`, and safe caps by policy type
+
+2. Keep policy support explicit.
+   - No arbitrary transform names.
+   - No unbounded transform strengths.
+   - No worker execution unless backend validation accepts the policy.
+
+3. Implement one safe vertical slice first.
+   - Recommended first slice: RandAugment or TrivialAugmentWide for image transforms.
+   - Recommended second slice: MixUp/CutMix because they require batch/label handling.
+
+Tests:
+
+- Backend rejects unknown policy types and unsafe parameters.
+- Worker transform builder creates expected transform objects.
+- MixUp/CutMix are applied only in training and only with compatible labels.
+- No Modal jobs are run in tests.
+
+### PR 5: Class Imbalance, Minority Targeting, And Label Quality
+
+Goal: make class-specific failures actionable.
+
+Primary files:
+
+- `services/orchestrator/internal/agents/diagnosis.go`
+- `services/orchestrator/internal/agents/candidate_ranking.go`
+- `services/orchestrator/internal/api/handlers.go`
+- `services/worker/worker/training/modal_app.py`
+- `services/worker/worker/datasets/profiler.py`
+- worker/backend tests
+
+Implementation slices:
+
+1. Add richer per-class diagnosis.
+   - worst recall/F1 classes
+   - confusion pairs
+   - accuracy vs macro-F1 gap
+   - minority class support
+
+2. Add mechanism-specific controls.
+   - `class_imbalance`
+   - `minority_targeting`
+   - `label_noise_audit`
+   - `hard_example_audit`
+
+3. Add label-quality audit artifact path.
+   - First version should report suspicious samples only.
+   - Do not relabel, delete, or resample files automatically.
+
+4. Add effective-number class-balanced loss as a later slice if focal/weighted loss is not enough.
+
+Tests:
+
+- Class-balancing proposals require imbalance or minority-failure evidence.
+- Label-noise audit proposals do not create training jobs unless explicitly represented as an audit job type.
+- Backend rejects class-balancing repeats after a no-improvement outcome.
+
+### PR 6: Resolution, Crop, And Visual Evidence Mechanisms
+
+Goal: let the planner use image structure, not just scalar metrics.
+
+Primary files:
+
+- `services/orchestrator/internal/agents/experiment_planner_llm.go`
+- `services/orchestrator/internal/api/handlers.go`
+- `services/worker/worker/datasets/profiler.py`
+- `services/worker/worker/datasets/annotations.py`
+- `services/worker/worker/training/modal_app.py`
+- `services/worker/worker/datasets/exemplars.py`
+- backend/worker tests
+
+Implementation slices:
+
+1. Add visual trait summary to planner context.
+   - object scale
+   - background dominance
+   - lighting variation
+   - blur
+   - fine-grained classes
+   - bbox/crop plausibility
+
+2. Add bbox/crop ablation only when annotations exist.
+   - full image vs crop
+   - crop_if_available
+   - crop_and_compare_full_image
+
+3. Add resolution/crop guardrails.
+   - Higher image size requires visual or per-class evidence.
+   - High-resolution candidates must declare latency tradeoff.
+
+Tests:
+
+- Bbox mechanism is rejected when no bbox artifact exists.
+- High-resolution mechanism is rejected without object-scale/crop evidence.
+- Visual evidence appears only as evidence and never as execution authority.
+
+### PR 7: Outcome Learning By Mechanism
+
+Goal: teach future planner calls which mechanisms worked, not just which model names won.
+
+Primary files:
+
+- `services/orchestrator/internal/agents/experiment_planner_llm.go`
+- `services/orchestrator/internal/agents/candidate_ranking.go`
+- `services/orchestrator/internal/store/*`
+- `services/orchestrator/internal/api/handlers.go`
+- `docs/agents_context/llm_decision_intelligence/context.md`
+
+Implementation slices:
+
+1. Extend strategy scorecards with mechanism fields.
+   - mechanism
+   - intervention
+   - diagnosis triggers
+   - expected vs actual delta
+   - cost and runtime
+   - outcome status
+
+2. Retrieve mechanism lessons into compact context.
+   - Successful mechanism on similar dataset traits: bonus.
+   - Failed/no-improvement mechanism on similar traits: penalty.
+   - Rejected mechanism: blocked repeat warning.
+
+3. Make candidate ranking mechanism-aware.
+   - Penalize repeating failed mechanisms.
+   - Do not penalize a mechanism when the new intervention is materially different and evidence-backed.
+
+Tests:
+
+- Failed `architecture_challenge` scorecard penalizes another architecture-only challenger.
+- Successful `resolution_crop` scorecard boosts a similar dataset with variable dimensions.
+- Strategy memory remains compact and does not dump raw decision payloads.
+
+### PR 8: Mission Control Mechanism Visibility
+
+Goal: make agent behavior inspectable before spending credits.
+
+Primary files:
+
+- `apps/mission-control/src/App.tsx`
+- `apps/mission-control/src/types.ts`
+- `apps/mission-control/src/styles.css`
+- `services/orchestrator/internal/api/handlers.go`
+
+Implementation slices:
+
+1. Add mechanism coverage UI.
+   - tried
+   - eligible
+   - blocked
+   - best result
+   - no-improvement outcomes
+
+2. Add planner decision card.
+   - diagnosis
+   - selected mechanism
+   - intervention
+   - expected effect
+   - rejected alternatives
+   - backend validation status
+
+3. Add dry-run review state.
+   - Show proposed plan without running workers.
+   - Make it obvious when auto scheduling/execution are disabled.
+
+Checks:
+
+- `npm run build`
+- UI smoke with auto execution disabled.
+
+### PR 9: Model Routing, Prompt Caching, And Retrieval Later
+
+Goal: reduce token cost and improve reasoning only after the planner has a clean decision contract.
+
+Do later, not first:
+
+- route high-value experiment planning to a stronger model only when needed
+- keep Training Monitor and JSON repair on cheaper models
+- add prompt token/cached-token telemetry
+- stabilize static prompt prefixes for provider-side prompt caching
+- consider pgvector for cross-project similarity after mechanism outcome memory is clean
+
+Reason:
+
+- A stronger model will still repeat weak experiments if the backend action space is vague.
+- Vector retrieval is only useful after the stored memories have high-quality mechanism/outcome labels.
+- Prompt caching helps cost, but it does not fix bad experiment semantics.
+
+## Acceptance Criteria
+
+The system is ready to re-enable autonomous Modal execution only when all of these are true:
+
+- Every `ADD_EXPERIMENTS` decision names a first-class mechanism and evidence-backed intervention.
+- Backend rejects unknown, unsupported, stale, or diagnosis-mismatched mechanisms.
+- Same-family and same-mechanism minor-only repeats are blocked across all project plans.
+- Near-ceiling champions become `SELECT_CHAMPION`, not more training.
+- Persisted champion selection is terminal for autonomous follow-up scheduling unless the user explicitly reopens experimentation.
+- If all candidates are filtered out, no plan and no jobs are created.
+- Planner context remains compact and decision-ready.
+- Mission Control shows the mechanism, evidence, expected effect, backend validation result, and rejected alternatives.
+- Regression tests prove stale `ADD_EXPERIMENTS` payloads cannot bypass current validation.
+- No Modal jobs are run in automated tests.
+
+## Verification Before Re-Enabling Modal
+
+Use these settings while testing planner logic:
+
+```env
+MODEL_EXPRESS_AUTO_EXECUTE_PLANS=false
+MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS=false
+```
+
+Recommended verification loop:
+
+1. Run backend unit tests from `services/orchestrator`.
+2. Use in-memory/store fixtures to create prior plans with repeated mechanisms.
+3. Inspect `agent_invocations.input_context` and confirm the LLM sees compact cards, not raw history.
+4. Inspect `agent_decisions.payload` and confirm mechanism, evidence, intervention, expected effect, rejected options, and backend validation fields are present.
+5. Confirm blocked proposals create no jobs and record a clear event.
+6. Confirm that a persisted champion blocks stale or new autonomous `ADD_EXPERIMENTS` scheduling.
+7. Review Mission Control in dry-run mode.
+8. Restart the dev server before testing against the UI so compiled code paths are current.
+9. Only then re-enable auto scheduling/execution for a low-cost controlled dataset.
+
+## Research References
+
+- Torchvision transforms v2 docs: https://docs.pytorch.org/vision/stable/transforms.html
+- Torchvision CutMix/MixUp docs: https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.v2.CutMix.html
+- RandAugment: https://arxiv.org/abs/1909.13719
+- MixUp: https://arxiv.org/abs/1710.09412
+- CutMix: https://arxiv.org/abs/1905.04899
+- Focal Loss: https://arxiv.org/abs/1708.02002
+- Class-Balanced Loss: https://arxiv.org/abs/1901.05555
+- Label smoothing in Inception-style classification training: https://arxiv.org/abs/1512.00567
+- Bag of Tricks for Image Classification: https://openaccess.thecvf.com/content_CVPR_2019/papers/He_Bag_of_Tricks_for_Image_Classification_With_Convolutional_Neural_Networks_CVPR_2019_paper.pdf
+- Sharpness-Aware Minimization: https://arxiv.org/abs/2010.01412
+- Fixing the Train-Test Resolution Discrepancy: https://arxiv.org/abs/1906.06423
+- Maximum softmax confidence baseline for misclassification/OOD detection: https://arxiv.org/abs/1610.02136
+- Co-teaching for noisy labels: https://arxiv.org/abs/1804.06872
+- Generalized Cross Entropy for noisy labels: https://arxiv.org/abs/1805.07836
+- Knowledge distillation: https://arxiv.org/abs/1503.02531

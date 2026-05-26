@@ -27,15 +27,17 @@ Core principle: agents reason, orchestrator controls, workers execute, durable s
 
 ## Known Bottlenecks And Risks
 
+- Large dataset upload was hardened on May 25, 2026: Electron now streams a zip archive directly to S3 instead of synchronously creating and hashing a temp zip on the Electron main event loop. This removes the desktop freeze and local temp archive growth without adding Kafka/Redis/NATS.
+- Modal-first profiling was added for workers launched with `GPU_TYPE=modal` or `MODEL_EXPRESS_DATASET_PROFILE_PROVIDER=modal`. Local profile jobs still exist, but their dataset cache is cleaned by default unless `MODEL_EXPRESS_PERSIST_DATASET_CACHE=1` is set.
 - Mission Control project detail refresh fans out every few seconds across many endpoints. This is acceptable for small projects but becomes polling tax as projects/jobs grow.
 - Planner context assembly still relies on broad project reads and in-memory filtering. Targeted plan/job/summary/evaluation/metric queries should arrive before large experiment histories.
 - Durable idempotency is partial. Some duplicate prevention still depends on application scans instead of explicit idempotency keys or database constraints.
-- Stale worker/job recovery is the biggest unattended-run risk. Workers can go offline while jobs remain assigned/running without a durable lease/requeue loop.
+- Job leases and stale recovery now exist for assigned/running jobs, with requeue until `max_attempts` and failure afterward. The remaining unattended-run risk is the lack of a standalone recovery ticker when no workers poll.
 - Completion/failure endpoints may synchronously trigger LLM evaluation, planner review, follow-up scheduling, and worker requirement creation. Burst completions can turn terminal job HTTP paths into slow control-plane work.
 - `autoReviewMu` coordinates one orchestrator process only. Multi-instance orchestration needs database-backed work claims, locks, or task rows.
 - `execution_events` are useful audit rows, but not yet a full event model with cursors, stable job lifecycle events, correlation IDs, attempt IDs, worker lease IDs, or metrics.
 - Dataset profile/artifact support is richer in structs/profile JSON than in normalized tables. Avoid assuming dedicated `dataset_artifacts` or fully persisted `dataset_profiles` flows are complete.
-- Champion/export/demo now has an additive backend/frontend contract, a `champion_exports` table, durable `champion_demo_predictions` audit rows, and worker helper modules for export manifests and dependency-guarded inference. Backend-scheduled artifact production and live inference runtime are still deferred, so review it as a safe control-plane plus helper slice rather than a production serving path.
+- Champion/export/demo now has backend-scheduled `export_champion` and `champion_demo_prediction` jobs, worker result callbacks, durable export/prediction rows, and frontend rendering. Production storage upload and real reconstruction from arbitrary completed training artifacts remain future hardening.
 
 ## Kafka, Redis, NATS, SSE, WebSockets
 
@@ -52,9 +54,9 @@ Current stance: do not add Kafka, Redis Streams, or NATS just because the system
 ## Recommended Architecture Phases
 
 1. Current-scale hardening: keep Postgres-backed polling and row locks; add targeted indexes/query limits; emit stable job lifecycle events; validate positive epochs; add duplicate execution tests; improve structured logs and metrics.
-2. Reliability loop: add job leases, renewal, stale job requeue/fail after max attempts, durable idempotency keys, and idempotent terminal job handling.
+2. Reliability loop: keep the landed job leases/renewal/stale requeue-fail behavior, then add a standalone recovery ticker, durable idempotency keys, and idempotent terminal job handling tests.
 3. Async automation: move Training Monitor, Experiment Planner, follow-up scheduling, and outcome recording off terminal job request paths into Postgres-backed background tasks with retry state.
-4. UI realtime: add `GET /projects/:id/events/stream` with SSE events and event cursors so Mission Control can replace broad polling with event-triggered refreshes.
+4. UI realtime: continue using `GET /projects/:id/events/stream` as an SSE refresh hint, and add more stable/cursorable job lifecycle events before reducing broad polling further.
 5. Multi-instance orchestration: replace process-local coordination with durable work claims, advisory locks or `FOR UPDATE SKIP LOCKED` task claiming, and retry/dead-letter state.
 6. External event bus only if needed: start with Redis Streams for durable processing or NATS for service pub/sub; avoid Kafka until the product shape demands it.
 

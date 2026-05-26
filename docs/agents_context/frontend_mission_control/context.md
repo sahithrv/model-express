@@ -110,11 +110,14 @@ Important payload conventions:
 
 From `docs/frontend_mission_control_report.md` and `docs/model_express_agentic_upgrade_roadmap.md`:
 
+- Dataset upload no longer uses synchronous `adm-zip`, a temp archive file, or whole-archive `readFileSync` in Electron main. `apps/mission-control/electron/main.cjs` now streams a generated zip archive from the selected folder directly into S3 while computing SHA-256 on the stream, and `apps/mission-control/electron/zip-stream.cjs` owns the zip writer.
+- New-project dataset profiling now respects the current automation default provider. When `default_training_provider` is `modal`, Mission Control starts the profile worker with `GPU_TYPE=modal`, so the worker submits profiling to Modal instead of downloading/extracting the dataset into the local project cache.
 - Added experiment lifecycle timeline.
 - Added dataset intelligence panel using current profile payloads.
 - Expanded agent decision visibility with reasoning cards.
 - Added backend gate/rejection visibility for rejected planner options and candidate-ranking failures.
-- Added champion comparison table across completed training summaries/evaluations.
+- Added champion comparison table across completed training summaries/evaluations, including backend train/validation diagnostics, seed variance for repeated seeded runs, and a holistic rank score.
+- Added selected-run evaluation details for backend diagnostics, per-class precision/recall/F1, and confusion matrix preview.
 - Added sticky section navigation/tabs for Overview, Data, Agents, Runs, Operations, and Export/Demo.
 - Added typed display for preprocessing fields on planned experiments and candidate score-component visibility from planner rankings.
 - Added Champion Export / Demo panel wired defensively to champion export records, backend demo images, and backend demo prediction requests.
@@ -123,7 +126,7 @@ From `docs/frontend_mission_control_report.md` and `docs/model_express_agentic_u
 - Improved responsive behavior for panels, tables, timeline, settings, and reasoning cards.
 - Backend/worker work added richer dataset profile structs and worker profiler fields.
 - Planner work added deterministic diagnosis, planning modes, candidate hypotheses/ranking, rejected options, strategy scorecards, and richer decision payloads.
-- Orchestrator report added current architecture notes and additive indexes; SSE, leases, idempotency, and eventing are still future work.
+- Orchestrator now exposes durable execution events through optional SSE refresh hints; polling remains the fallback. Leases/requeue landed, while durable DB idempotency keys remain future work.
 
 ## Backend Data Still Needed
 
@@ -134,9 +137,9 @@ These would make Mission Control less defensive and more useful:
 - Normalized rejection event list instead of inferring from `rejected_options`, `candidate_rankings`, and `validation_error`.
 - Stable execution event types for dataset upload/profile completion, monitor evaluation, planner accepted/rejected, job lifecycle transitions, and champion persistence.
 - Normalized champion export records, export artifact metadata, and export status are now exposed via `/projects/:id/champion/exports` and displayed in the Export/Demo panel.
-- Backend demo image listing is displayed when `/projects/:id/champion/demo-images` returns images. Demo prediction requests and history call `/projects/:id/champion/demo-predictions`; live inference currently records `RUNTIME_UNAVAILABLE` until worker inference lands.
+- Backend demo image listing is displayed when `/projects/:id/champion/demo-images` returns images. Demo prediction requests and history call `/projects/:id/champion/demo-predictions`; worker-backed jobs can return `SUCCEEDED`, `FAILED`, or `RUNTIME_UNAVAILABLE`.
 - Consistent deployment fields on evaluations/champions: `estimated_latency_ms`, `model_size_mb`, `parameter_count`, objective-fit score.
-- Event stream or SSE for project updates to reduce polling fan-out.
+- More granular stable job lifecycle events to make SSE refreshes more targeted.
 
 ## Safe Implementation Rules
 
@@ -166,8 +169,8 @@ These would make Mission Control less defensive and more useful:
 - Add planner validation/rejection feed when backend exposes one.
 - Link scorecards, decisions, invocations, follow-up plans, and outcomes.
 - Improve manual job creation with a safer form-based queue builder.
-- Champion Export panel is present and calls the backend export API. Demo prediction history renders durable backend audit rows. Complete live `SUCCEEDED` predictions after worker/backend inference runtime is implemented.
-- Replace polling fan-out with SSE when the backend adds a project event stream.
+- Champion Export panel is present and calls the backend export API. Demo prediction history renders durable backend audit rows, including successful worker prediction results when a worker-visible manifest/runtime is available.
+- Continue using SSE as a refresh hint while preserving polling fallback.
 - Add Playwright smoke coverage once tabs/navigation or export/demo flows land.
 
 ## Supporting Docs To Read

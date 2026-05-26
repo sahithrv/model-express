@@ -6,6 +6,17 @@ This report reviews the current Model Express orchestration path across the Go o
 
 The key safety boundary is already correct: LLM agents propose structured decisions, while deterministic backend code validates, stores, schedules, and executes. LLMs do not directly create workers, mutate datasets, enqueue jobs, or bypass backend validation.
 
+## Implementation Status Update
+
+Since this report was first written, several recommended current-scale hardening items have landed:
+
+- Job leases now track attempt count, owner, expiry, and last heartbeat; expired assigned/running jobs are requeued or failed on poll/manual recovery.
+- `GET /projects/:id/events/stream` now exposes durable `execution_events` over SSE as a Mission Control refresh hint.
+- Champion export and demo prediction work now flows through backend-scheduled worker jobs and validated worker result callbacks.
+- Worker-generated visual exemplar metadata can be persisted through a backend-capped `POST /datasets/:id/visual-exemplars` profile merge.
+
+Remaining reliability work is narrower: durable DB idempotency keys, a standalone lease-recovery ticker, moving LLM automation off terminal job HTTP paths, richer event names/cursors, and production artifact storage.
+
 ## Current System Summary
 
 Model Express currently uses a pragmatic request/response orchestrator:
@@ -343,4 +354,3 @@ This PR should stay focused on orchestrator/system design cleanup and observabil
 - Avoid planner/preprocessing schema changes.
 - Avoid frontend changes beyond documenting polling/SSE recommendations.
 - Leave durable job leases, idempotency constraints, and event streaming as follow-up implementation work.
-

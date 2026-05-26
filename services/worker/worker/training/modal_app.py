@@ -233,6 +233,25 @@ def train_image_classifier(payload: dict) -> dict:
     }
 
 
+@app.function(image=image, timeout=60 * 20)
+def profile_image_dataset(payload: dict) -> dict:
+    import tempfile
+
+    from worker.datasets.cache import dataset_archive_path, extract_dataset_archive
+    from worker.datasets.profiler import profile_image_folder
+    from worker.datasets.storage import download_s3_uri
+
+    _configure_storage_env(payload)
+
+    dataset = payload["dataset"]
+    dataset_id = dataset["id"]
+    with tempfile.TemporaryDirectory(prefix=f"model-express-profile-{dataset_id}-") as cache_root:
+        archive_path = dataset_archive_path(dataset_id, cache_root)
+        download_s3_uri(dataset["storage_uri"], archive_path)
+        dataset_dir = extract_dataset_archive(archive_path, dataset_id, cache_root)
+        return profile_image_folder(dataset_dir)
+
+
 def _configure_storage_env(payload: dict) -> None:
     os.environ["S3_ENDPOINT_URL"] = payload["s3_endpoint_url"]
     os.environ["AWS_ACCESS_KEY_ID"] = payload["aws_access_key_id"]
@@ -687,7 +706,7 @@ def _holistic_scores(best_macro_f1: float, best_accuracy: float, estimated_cost_
     latency_ms = float(model_profile.get("estimated_latency_ms") or 0)
     quality_score = (best_macro_f1 * 0.65) + (best_accuracy * 0.35)
     latency_score = max(0.0, min(1.0, 1.0 - latency_ms / 160.0))
-    cost_score = max(0.0, min(1.0, 1.0 - estimated_cost_usd / 0.25))
+    cost_score = max(0.0, min(1.0, 1.0 - estimated_cost_usd / 10.0))
     runtime_score = max(0.0, min(1.0, 1.0 - runtime_seconds / 1800.0))
     overall_score = (quality_score * 0.62) + (latency_score * 0.18) + (cost_score * 0.12) + (runtime_score * 0.08)
     return {

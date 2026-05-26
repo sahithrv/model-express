@@ -10,7 +10,7 @@ Primary scope:
 - Postgres and in-memory store behavior, migrations, indexes, constraints, and idempotency.
 - Project, dataset, plan, job, worker, run summary/evaluation, champion, automation, memory, decision, scorecard, worker requirement, and execution event state.
 - Agentic loop gating: LLM outputs are parsed, validated, stored, and scheduled only through backend guardrails.
-- Backend-facing follow-ups for champion export, demo inference APIs, visual exemplar APIs, SSE/eventing, durable job leases, and idempotency keys.
+- Backend-facing follow-ups for champion export, demo inference APIs, visual exemplar APIs, SSE/eventing, durable job leases, idempotency keys, and future production artifact storage.
 
 Do not own Python training implementation, Mission Control UI layout, or LLM prompt strategy except where backend contracts, validation, or stored context require it.
 
@@ -76,19 +76,21 @@ Backend validation is the execution gate.
 Known safety gaps to preserve in context:
 
 - Durable idempotency is partial. Plan execution, follow-up creation, planner outcomes, and agent decisions still rely partly on application-level scans.
-- No durable job lease/requeue loop exists yet, so dead workers can leave assigned/running jobs stranded.
+- Job lease/requeue support now exists through assignment lease fields, lease renewal, and poll/manual recovery; a standalone recovery ticker remains future work.
 - Terminal job endpoints can still trigger LLM review/planning and follow-up work synchronously.
 - `autoReviewMu` is single-process only.
-- `execution_events` are audit rows, not yet a cursor/SSE event stream.
+- `execution_events` are durable audit rows and are exposed through `GET /projects/:id/events/stream` as SSE refresh hints; they are not a full event-sourcing model.
 
 ## Recent Work Already Done
 
 - Dataset/profile/preprocessing support: richer `DatasetProfile` structs, worker profile fields, optional planned experiment fields for `resolution_strategy`, `preprocessing`, `augmentation_policy`, and `sampling_strategy`, backend validation, preprocessing-aware duplicate signatures, and worker-visible execution config.
 - LLM decision quality: deterministic planner diagnosis, planning modes, candidate hypotheses, deterministic candidate ranking with `score_components`, rejected options memory, strategy scorecards, and planner outcome memory.
-- Objective/champion support: project `Goal` is converted into objective context; run evaluations support per-class/confusion/model/holistic payloads; `SELECT_CHAMPION` persists a project champion with metrics, evaluation, deployment profile, model-card-like pending export notes, and `CHAMPION_SELECTED` event.
+- Objective/champion support: project `Goal` is converted into objective context; run evaluations support per-class/confusion/model/holistic payloads plus backend `training_diagnostics`; `SELECT_CHAMPION` persists a project champion with metrics, evaluation, deployment profile, model-card-like pending export notes, and `CHAMPION_SELECTED` event. A terminal `STOP_PROJECT` without `champion_job_id` now falls back to the best successful run so the user still gets a usable champion model.
+- Follow-up safety: backend novelty checks reject LLM proposals and filter deterministic follow-up payloads that repeat an already-tested experiment mechanism with only minor tuning changes such as epochs, batch size, or learning rate.
+- Planner correction loop: when an LLM planner output passes JSON/schema validation but fails backend proposal validation, the backend records the rejected invocation outcome and retries the planner once with `planner_validation_feedback`; the corrected JSON must still pass the same backend validation gates before any decision/plan is stored or scheduled.
 - Mission Control visibility: frontend can render timeline, dataset intelligence, agent reasoning, backend gate/rejection cues, champion comparison, and selected champion from existing backend payloads.
 - System design cleanup: additive Postgres indexes were added for project/status scans, follow-up lookup, plan-scoped decisions, worker requirements, agent invocations, and memory retrieval.
-- Champion export/demo contract: `champion_exports` table plus `GET/POST /projects/:id/champion/exports`, `champion_demo_predictions` table plus `GET/POST /projects/:id/champion/demo-predictions`, `GET /projects/:id/champion/demo-images`, `GET /datasets/:id/visual-exemplars`, `CHAMPION_EXPORT_REQUESTED`, `CHAMPION_DEMO_PREDICTION`, and positive epoch validation. Export requests are idempotent per project/champion/format at the store/API behavior level. Demo prediction requests persist `RUNTIME_UNAVAILABLE` audit rows until worker inference is wired.
+- Champion export/demo contract: `champion_exports` table plus `GET/POST /projects/:id/champion/exports`, `POST /jobs/:id/champion-export-result`, `champion_demo_predictions` table plus `GET/POST /projects/:id/champion/demo-predictions`, `POST /jobs/:id/champion-demo-prediction-result`, `GET /projects/:id/champion/demo-images`, `GET/POST /datasets/:id/visual-exemplars`, `CHAMPION_EXPORT_REQUESTED`, `CHAMPION_DEMO_PREDICTION`, and positive epoch validation. Export requests are idempotent per project/champion/format at the store/API behavior level. Demo prediction requests queue worker inference when a `READY` export exists and record `RUNTIME_UNAVAILABLE` when artifacts/runtime are missing.
 
 ## Follow-Up Backend Work
 
@@ -106,7 +108,7 @@ Demo APIs:
 - Prefer test/held-out split images when available; degrade gracefully when no split exists.
 - Prediction audit/history now uses `champion_demo_predictions`.
 - Coordinate with worker/runtime ownership for actual inference execution.
-- Current slice lists capped demo images from `datasets.profile.demo_images` or `datasets.profile.visual_exemplars` and records `RUNTIME_UNAVAILABLE` prediction rows, but does not run inference yet.
+- Current slice lists capped demo images from `datasets.profile.demo_images` or `datasets.profile.visual_exemplars`, queues worker prediction jobs when possible, and persists worker result rows.
 
 Visual exemplars:
 
@@ -114,7 +116,7 @@ Visual exemplars:
 - Cap exemplars by class count, total images, bytes, and prompt budget.
 - Expose exemplars as optional planner context only; LLM output remains JSON and backend validation remains unchanged.
 - Record whether exemplars were used in an invocation.
-- Current slice reads capped `visual_exemplars` from `datasets.profile`, exposes them through API, and injects evidence-only class summary metadata into planner context. Durable generation/audit history remains deferred.
+- Current slice reads capped `visual_exemplars` from `datasets.profile`, exposes them through API, accepts capped worker-generated exemplar patches through `POST /datasets/:id/visual-exemplars`, and injects evidence-only class summary metadata into planner context. Durable generation/audit history remains deferred.
 
 Idempotency:
 
@@ -125,17 +127,17 @@ Idempotency:
 
 SSE/eventing:
 
-- Add stable job lifecycle execution events and a project event stream such as `GET /projects/:id/events/stream`.
+- Continue expanding stable job lifecycle execution events behind the existing `GET /projects/:id/events/stream` endpoint.
 - Use SSE before WebSockets; most updates are server-to-client.
 - Include event IDs/cursors and resource identifiers: project, plan, job, worker, decision, invocation.
 - Mission Control should use events to reduce broad polling fan-out.
 
 Job leases:
 
-- Add lease fields such as `lease_owner_worker_id`, `lease_expires_at`, `attempt`, `max_attempts`, and `last_heartbeat_at`.
-- Assignment should create/renew a lease; workers should renew while running.
-- Add a backend recovery loop to requeue expired assigned/running jobs or fail them after max attempts.
-- Add stale worker/job recovery tests.
+- Lease fields `lease_owner_worker_id`, `lease_expires_at`, `lease_last_heartbeat_at`, `attempt`, and `max_attempts` are additive migration fields.
+- Assignment and metric reporting renew leases.
+- Poll/manual store recovery requeues expired assigned/running jobs or fails them after max attempts.
+- A standalone backend recovery ticker remains future work.
 
 Other useful backend follow-ups:
 

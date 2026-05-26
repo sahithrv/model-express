@@ -154,10 +154,15 @@ export type ChampionExport = {
   model_uri?: string;
   download_url?: string;
   size_bytes?: number;
+  requested_at?: string;
+  started_at?: string;
+  completed_at?: string;
+  failed_at?: string;
   validation_errors?: string[];
   created_at?: string;
   updated_at?: string;
   error?: string;
+  error_message?: string;
   metadata?: Record<string, unknown>;
 };
 
@@ -179,6 +184,8 @@ export type ChampionDemoImage = {
 
 export type ChampionDemoPrediction = {
   id?: string;
+  project_id?: string;
+  champion_id?: string;
   image_id?: string;
   image_uri?: string;
   status?: string;
@@ -187,11 +194,16 @@ export type ChampionDemoPrediction = {
   confidence?: number;
   latency_ms?: number;
   correct?: boolean;
-  top_k?: Array<{ label?: string; class_name?: string; confidence?: number; score?: number }>;
+  top_k?: Array<{ label?: string; class_name?: string; confidence?: number; probability?: number; score?: number }>;
   error?: string;
   error_message?: string;
   runtime_unavailable?: boolean;
+  requested_at?: string;
+  started_at?: string;
+  completed_at?: string;
   created_at?: string;
+  updated_at?: string;
+  metadata?: Record<string, unknown>;
 };
 
 export type AgentDecision = {

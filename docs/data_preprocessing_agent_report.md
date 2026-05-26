@@ -22,7 +22,7 @@
   - class balancing: `weighted_loss`, `class_weighted_loss`, `focal_loss`
   - sampling: `class_balanced_sampler`, `weighted_random_sampler`
 - Kept `datasets.profile` JSON as the active source of truth. The existing `dataset_profiles` table remains deferred to avoid split-brain profile reads/writes.
-- Added safe visual exemplar/demo-image API support from capped `datasets.profile.visual_exemplars` and `datasets.profile.demo_images` metadata; generic `dataset_artifacts` persistence remains deferred.
+- Added safe visual exemplar/demo-image API support from capped `datasets.profile.visual_exemplars` and `datasets.profile.demo_images` metadata, plus backend-capped profile merge for worker-generated exemplar packs through `POST /datasets/:id/visual-exemplars`; generic `dataset_artifacts` persistence remains deferred.
 - Added focused backend tests for structured preprocessing validation and unsupported augmentation rejection.
 
 ## Supported Experiment Options

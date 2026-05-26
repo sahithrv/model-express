@@ -20,9 +20,13 @@ Even in autonomous mode, the LLM must not directly create jobs, start workers, m
 
 ## Planner Intelligence Surface
 
-Planner input should stay compact and evidence-rich. Current context includes project goal, dataset profile, source plan, dataset planning insights, objective context, deterministic diagnosis, supported model catalog, current champion, baseline champion, run deltas, no-improvement rounds, stop signals, strategy memory, scorecards, plan jobs/summaries/evaluations/metrics, prior plans/jobs/evaluations, prior memory, existing experiment signatures, and follow-up limits.
+Planner prompt context is now a compact `planner_context_snapshot`, not a raw dump of every project table. The backend still loads full Postgres history for validation and ranking, but the LLM sees a distilled decision brief: project card, dataset card, source-plan card, objective context, champion card, completed experiment ledger, failure diagnosis, search coverage, strategy lessons, blocked repeats, visual evidence, model catalog, retry validation feedback, stop/continue pressure, and prompt-budget metadata.
+
+The snapshot deliberately omits raw `dataset.profile`, raw plan/job/evaluation lists, full epoch metric history, and unbounded memory payloads. Those fields are either summarized into cards or kept backend-only. This keeps prompt size stable as a project accumulates follow-up rounds while preserving the evidence needed for senior-data-scientist-style decisions.
 
 Deterministic diagnosis is computed before the LLM call in `diagnosis.go`. It exposes scores for overfitting, underfitting, plateau, instability, class imbalance, minority-class failure, cost efficiency, latency penalty, and improvement stagnation, plus recommended failure modes and concise evidence strings. Planner outputs should cite these signals rather than inventing diagnosis.
+
+Backend stop criteria can override an LLM `ADD_EXPERIMENTS` recommendation and persist `SELECT_CHAMPION`. This happens after repeated no-improvement follow-up rounds and now also when the current champion is within the minimum meaningful improvement threshold of a bounded metric ceiling, such as accuracy or macro-F1 near 1.0. The LLM should treat near-ceiling performance as a strong stop/select signal, not as an invitation to spend credits chasing impossible gains.
 
 Supported planning modes are `explore`, `exploit`, `champion_challenge`, `preprocessing_ablation`, `class_imbalance_ablation`, and `stop_or_select`. Mode-specific backend rules reject shallow or mismatched plans, such as explore batches with too few model families or class-imbalance ablations that do not target balancing/per-class metrics.
 
@@ -30,9 +34,13 @@ Candidate hypotheses are the preferred search shape. The planner can return 6-12
 
 Candidate ranking scores expected gain, novelty, cost, risk, deployment fit, redundancy, diagnosis alignment, and memory similarity. Rankings include `score_components`, selected/rejected flags, rejection reasons, and experiment signatures. Duplicates, tiny-only changes, weak high-cost candidates, poor objective fit, and diagnosis-mismatched ideas should be rejected or penalized. Preprocessing, resolution, sampling, crop/bbox, normalization, and augmentation-policy changes count as meaningful mechanisms when they are evidence-backed.
 
-Rejected options are first-class planner output. Each item should include `option`, `reason`, `evidence`, and `applies_when`. Prior rejected options become `rejected_strategy_memory` so future planner calls avoid known-bad patterns.
+If a planner output passes JSON/schema validation but fails backend proposal validation, the backend may retry the planner once with `planner_validation_feedback` in context. That feedback includes the deterministic rejection reason, rejected models/experiments, and instructions to return corrected JSON only. The corrected response is still accepted only through backend validation.
 
-Strategy scorecards are structured outcome memory separate from raw agent memory. They track strategy type, planning mode, dataset traits, objective profile, proposed changes, expected delta, actual delta, confidence before/after, cost, runtime, outcome, lesson, and tags. Future planner prompts should prefer `improved_champion` patterns and avoid similar failed/no-improvement strategies.
+Rejected options are first-class planner output. Each item should include `option`, `reason`, `evidence`, and `applies_when`. Prior rejected options become `blocked_repeats` inside the compact snapshot so future planner calls avoid known-bad patterns.
+
+Strategy scorecards are structured outcome memory separate from raw agent memory. They track strategy type, planning mode, dataset traits, objective profile, proposed changes, expected delta, actual delta, confidence before/after, cost, runtime, outcome, lesson, and tags. Future planner prompts receive these as compact `strategy_lessons`; they should prefer `improved_champion` lessons and avoid similar failed/no-improvement lessons.
+
+The snapshot is reasoning context only; backend schema validation, model catalog checks, duplicate detection, same-mechanism filtering, final plan creation, and scheduling gates remain unchanged.
 
 ## Recent Work And Known Gaps
 
@@ -40,7 +48,9 @@ Recent work added richer dataset profiles, preprocessing-aware planned experimen
 
 Preprocessing prompt update: backend and worker contracts now include `resolution_strategy`, `preprocessing`, `augmentation_policy`, `sampling_strategy`, class balancing, optimizer, scheduler, and fine-tuning fields. The planner prompt/examples now explicitly show the supported preprocessing contract and JSON shape.
 
-Visual exemplars: the current slice supports optional evidence-only `visual_exemplar_context` in planner input. Backend caps exemplars from `datasets.profile.visual_exemplars` and passes class summary metadata, caps, budgets, warnings, and audit details, not executable authority. The LLM must still return JSON only and backend validation stays unchanged.
+Planner context compaction: recent planning-context work replaces raw LLM prompt dumps with `planner_context_snapshot_v1`. The goal is smaller planner calls and cleaner review/audit surfaces while retaining the distilled evidence used to choose or reject planner actions.
+
+Visual exemplars: the current slice supports optional evidence-only visual evidence inside `planner_context_snapshot.visual_evidence`. Backend caps exemplars from `datasets.profile.visual_exemplars` and passes class summary metadata, caps, budgets, warnings, and audit details, not executable authority. The LLM must still return JSON only and backend validation stays unchanged.
 
 Semantic memory: not implemented. Current retrieval is mostly project/dataset scoped. Future retrieval should find similar datasets, objectives, imbalance profiles, model families, and strategy outcomes without bloating prompts.
 
@@ -101,7 +111,7 @@ Worker agents own actual transforms, training loops, artifact export, Modal/loca
 - Keep planner tests covering preprocessing-aware outputs, diagnosis evidence, planning modes, rejected options, candidate ranking behavior, visual exemplar evidence-only context, caps/audit details, and JSON-only/backend-validation wording.
 - Add durable invocation audit fields for whether exemplars were used.
 - Add semantic retrieval for similar dataset/objective/strategy memory.
-- Keep prompt context compact by capping memories, metrics, exemplars, and scorecards.
+- Keep prompt context compact by capping memories, metrics, exemplars, and scorecards, and by using compact planner context snapshots instead of raw prompt dumps.
 - Add UI support for candidate `score_components`, rejected options, strategy scorecards, and decision/outcome links.
 - Add normalized validation/rejection events so failed LLM outputs are visible even without durable decisions.
 - Preserve the safety contract: LLM JSON proposal first, backend validation and execution always.

@@ -80,6 +80,33 @@ class OrchestratorClient:
         response.raise_for_status()
         return response.json()
 
+    def report_champion_export_result(self, job_id: str, result: dict) -> dict:
+        response = requests.post(
+            f"{self.base_url}/jobs/{job_id}/champion-export-result",
+            json=result,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def report_champion_demo_prediction_result(self, job_id: str, result: dict) -> dict:
+        response = requests.post(
+            f"{self.base_url}/jobs/{job_id}/champion-demo-prediction-result",
+            json=result,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def report_dataset_visual_exemplars(self, dataset_id: str, payload: dict) -> dict:
+        response = requests.post(
+            f"{self.base_url}/datasets/{dataset_id}/visual-exemplars",
+            json=payload,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def complete_job(self, job_id: str, mlflow_run_id: str = "") -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/complete",

@@ -14,7 +14,7 @@ import (
 
 const (
 	defaultChampionThreshold = 0.90
-	defaultCostBudgetUSD     = 0.25
+	defaultCostBudgetUSD     = 10.00
 )
 
 type ExperimentReviewer struct {
@@ -273,31 +273,116 @@ func fallbackExperiments() []plans.PlannedExperiment {
 }
 
 func followUpExperiments(best runs.TrainingRunSummary) []plans.PlannedExperiment {
-	model := best.Model
-	if model == "" {
-		model = "mobilenet_v3_small"
+	bestFamily := modelFamily(best.Model)
+	experiments := []plans.PlannedExperiment{
+		{
+			Template:              "efficientnet_transfer",
+			Model:                 "efficientnet_b0",
+			Epochs:                10,
+			BatchSize:             16,
+			LearningRate:          0.0002,
+			Reason:                "Try a quality/latency challenger with moderate augmentation instead of extending the current best model's epoch budget.",
+			ImageSize:             224,
+			ResolutionStrategy:    "fixed",
+			Optimizer:             "adamw",
+			Scheduler:             "cosine",
+			WeightDecay:           0.01,
+			Augmentation:          map[string]any{"horizontal_flip": true, "color_jitter": true},
+			AugmentationPolicy:    "moderate",
+			ClassBalancing:        "weighted_loss",
+			SamplingStrategy:      "none",
+			EarlyStoppingPatience: 3,
+			Strategy:              "deterministic quality challenger",
+			Pretrained:            true,
+			FreezeBackbone:        true,
+			FineTuneStrategy:      "head_only",
+		},
+		{
+			Template:              "mobilenet_transfer",
+			Model:                 "mobilenet_v3_large",
+			Epochs:                10,
+			BatchSize:             16,
+			LearningRate:          0.0003,
+			Reason:                "Test a compact live-inference challenger with class-balanced sampling rather than repeating the prior mechanism.",
+			ImageSize:             224,
+			ResolutionStrategy:    "low_latency",
+			Optimizer:             "adamw",
+			Scheduler:             "cosine",
+			WeightDecay:           0.005,
+			Augmentation:          map[string]any{"horizontal_flip": true},
+			AugmentationPolicy:    "light",
+			ClassBalancing:        "class_balanced_sampler",
+			SamplingStrategy:      "class_balanced_sampler",
+			EarlyStoppingPatience: 3,
+			Strategy:              "deterministic deployment challenger",
+			Pretrained:            true,
+			FreezeBackbone:        true,
+			FineTuneStrategy:      "head_only",
+		},
 	}
-	template := "mobilenet_transfer"
-	if strings.Contains(strings.ToLower(model), "efficientnet") {
-		template = "efficientnet_transfer"
+	if bestFamily == "efficientnet" {
+		experiments[0] = plans.PlannedExperiment{
+			Template:              "regnet_transfer",
+			Model:                 "regnet_y_400mf",
+			Epochs:                10,
+			BatchSize:             16,
+			LearningRate:          0.0002,
+			Reason:                "Try a compact non-EfficientNet architecture with regularization to avoid repeating the current best family.",
+			ImageSize:             224,
+			ResolutionStrategy:    "low_latency",
+			Optimizer:             "adamw",
+			Scheduler:             "cosine",
+			WeightDecay:           0.01,
+			Augmentation:          map[string]any{"horizontal_flip": true, "color_jitter": true},
+			AugmentationPolicy:    "moderate",
+			ClassBalancing:        "weighted_loss",
+			SamplingStrategy:      "none",
+			EarlyStoppingPatience: 3,
+			Strategy:              "deterministic architecture challenger",
+			Pretrained:            true,
+			FreezeBackbone:        true,
+			FineTuneStrategy:      "head_only",
+		}
 	}
+	if bestFamily == "mobilenet" {
+		experiments[1] = plans.PlannedExperiment{
+			Template:              "regnet_transfer",
+			Model:                 "regnet_y_400mf",
+			Epochs:                10,
+			BatchSize:             16,
+			LearningRate:          0.0002,
+			Reason:                "Compare a compact architecture family against the MobileNet champion without simply increasing epochs.",
+			ImageSize:             224,
+			ResolutionStrategy:    "low_latency",
+			Optimizer:             "adamw",
+			Scheduler:             "cosine",
+			WeightDecay:           0.01,
+			Augmentation:          map[string]any{"horizontal_flip": true, "color_jitter": true},
+			AugmentationPolicy:    "moderate",
+			ClassBalancing:        "weighted_loss",
+			SamplingStrategy:      "none",
+			EarlyStoppingPatience: 3,
+			Strategy:              "deterministic architecture challenger",
+			Pretrained:            true,
+			FreezeBackbone:        true,
+			FineTuneStrategy:      "head_only",
+		}
+	}
+	return experiments
+}
 
-	return []plans.PlannedExperiment{
-		{
-			Template:     template,
-			Model:        model,
-			Epochs:       best.EpochsCompleted + 4,
-			BatchSize:    12,
-			LearningRate: 0.0001,
-			Reason:       "Extend the current best model with a lower learning rate to see if validation performance improves.",
-		},
-		{
-			Template:     "resnet_transfer",
-			Model:        "resnet18",
-			Epochs:       10,
-			BatchSize:    16,
-			LearningRate: 0.0002,
-			Reason:       "Try a different transfer-learning family to reduce model-family bias in the search.",
-		},
+func modelFamily(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasPrefix(normalized, "mobilenet"):
+		return "mobilenet"
+	case strings.HasPrefix(normalized, "efficientnet"):
+		return "efficientnet"
+	case strings.HasPrefix(normalized, "regnet"):
+		return "regnet"
+	case strings.HasPrefix(normalized, "resnet"):
+		return "resnet"
+	default:
+		return normalized
 	}
 }

@@ -19,6 +19,11 @@ import (
 	"model-express/services/orchestrator/internal/workers"
 )
 
+const (
+	defaultJobLeaseDuration = 2 * time.Hour
+	defaultJobMaxAttempts   = 3
+)
+
 type MemoryStore struct {
 	mu sync.Mutex
 
@@ -255,6 +260,16 @@ func (s *MemoryStore) HeartbeatWorker(id string) (workers.Worker, error) {
 	}
 
 	worker.LastHeartbeat = time.Now().UTC()
+	if worker.CurrentJobID != "" {
+		if job, ok := s.jobs[worker.CurrentJobID]; ok && !isTerminalJobStatus(job.Status) {
+			now := worker.LastHeartbeat
+			leaseExpiresAt := now.Add(defaultJobLeaseDuration)
+			job.LeaseLastHeartbeatAt = &now
+			job.LeaseExpiresAt = &leaseExpiresAt
+			job.LeaseOwnerWorkerID = worker.ID
+			s.jobs[job.ID] = job
+		}
+	}
 	s.workers[id] = worker
 
 	return worker, nil
@@ -268,9 +283,21 @@ func (s *MemoryStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
+	now := time.Now().UTC()
+	s.recoverExpiredJobLeasesLocked(now)
+	worker = s.workers[workerID]
 
 	if worker.CurrentJobID != "" {
 		job := s.jobs[worker.CurrentJobID]
+		if !isTerminalJobStatus(job.Status) {
+			leaseExpiresAt := now.Add(defaultJobLeaseDuration)
+			job.LeaseOwnerWorkerID = workerID
+			job.LeaseLastHeartbeatAt = &now
+			job.LeaseExpiresAt = &leaseExpiresAt
+			s.jobs[job.ID] = job
+		}
+		worker.LastHeartbeat = now
+		s.workers[workerID] = worker
 		return &job, nil
 	}
 
@@ -282,10 +309,17 @@ func (s *MemoryStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 			continue
 		}
 
-		now := time.Now().UTC()
 		job.WorkerID = workerID
 		job.Status = jobs.StatusAssigned
+		job.Attempt++
+		if job.MaxAttempts < 1 {
+			job.MaxAttempts = defaultJobMaxAttempts
+		}
 		job.StartedAt = &now
+		job.LeaseOwnerWorkerID = workerID
+		job.LeaseLastHeartbeatAt = &now
+		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
+		job.LeaseExpiresAt = &leaseExpiresAt
 		s.jobs[id] = job
 
 		worker.Status = workers.StatusRunning
@@ -296,7 +330,7 @@ func (s *MemoryStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 		return &job, nil
 	}
 
-	worker.LastHeartbeat = time.Now().UTC()
+	worker.LastHeartbeat = now
 	s.workers[workerID] = worker
 
 	return nil, ErrNoJob
@@ -314,12 +348,13 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 	}
 
 	job := jobs.ExperimentJob{
-		ID:        s.newID("job"),
-		ProjectID: projectID,
-		Template:  template,
-		Status:    jobs.StatusQueued,
-		Config:    config,
-		CreatedAt: time.Now().UTC(),
+		ID:          s.newID("job"),
+		ProjectID:   projectID,
+		Template:    template,
+		Status:      jobs.StatusQueued,
+		Config:      config,
+		MaxAttempts: defaultJobMaxAttempts,
+		CreatedAt:   time.Now().UTC(),
 	}
 
 	s.jobs[job.ID] = job
@@ -356,6 +391,56 @@ func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, e
 	return out, nil
 }
 
+func (s *MemoryStore) RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.recoverExpiredJobLeasesLocked(now.UTC()), nil
+}
+
+func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.ExperimentJob {
+	recovered := []jobs.ExperimentJob{}
+	for id, job := range s.jobs {
+		if job.LeaseExpiresAt == nil || job.LeaseExpiresAt.After(now) {
+			continue
+		}
+		if job.Status != jobs.StatusAssigned && job.Status != jobs.StatusRunning {
+			continue
+		}
+		if job.MaxAttempts < 1 {
+			job.MaxAttempts = defaultJobMaxAttempts
+		}
+		if job.Attempt >= job.MaxAttempts {
+			job.Status = jobs.StatusFailed
+			job.Error = "job lease expired after maximum attempts"
+			completedAt := now
+			job.CompletedAt = &completedAt
+		} else {
+			job.Status = jobs.StatusQueued
+			job.Error = ""
+			job.WorkerID = ""
+			job.StartedAt = nil
+		}
+		job.LeaseOwnerWorkerID = ""
+		job.LeaseExpiresAt = nil
+		job.LeaseLastHeartbeatAt = nil
+		s.jobs[id] = job
+		recovered = append(recovered, job)
+
+		for workerID, worker := range s.workers {
+			if worker.CurrentJobID != id {
+				continue
+			}
+			worker.CurrentJobID = ""
+			if worker.Status != workers.StatusOffline {
+				worker.Status = workers.StatusIdle
+			}
+			s.workers[workerID] = worker
+		}
+	}
+	return recovered
+}
+
 func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -370,14 +455,21 @@ func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]fl
 
 	if job.Status == jobs.StatusAssigned {
 		job.Status = jobs.StatusRunning
-		s.jobs[jobID] = job
 	}
+	now := time.Now().UTC()
+	if job.WorkerID != "" {
+		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
+		job.LeaseOwnerWorkerID = job.WorkerID
+		job.LeaseLastHeartbeatAt = &now
+		job.LeaseExpiresAt = &leaseExpiresAt
+	}
+	s.jobs[jobID] = job
 
 	metric := jobs.EpochMetric{
 		JobID:     jobID,
 		Epoch:     epoch,
 		Metrics:   values,
-		CreatedAt: time.Now().UTC(),
+		CreatedAt: now,
 	}
 
 	s.metrics[jobID] = append(s.metrics[jobID], metric)
@@ -606,6 +698,34 @@ func (s *MemoryStore) ListProjectChampionExports(projectID string) ([]runs.Champ
 	return out, nil
 }
 
+func (s *MemoryStore) UpdateChampionExport(id string, update runs.ChampionExportUpdate) (runs.ChampionExport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	export, ok := s.championExports[id]
+	if !ok {
+		return runs.ChampionExport{}, ErrNotFound
+	}
+	if update.Status != "" {
+		export.Status = update.Status
+	}
+	if update.ArtifactURI != "" {
+		export.ArtifactURI = update.ArtifactURI
+	}
+	if update.Metadata != nil {
+		export.Metadata = emptyMapIfNil(update.Metadata)
+	}
+	if update.ValidationErrors != nil {
+		export.ValidationErrors = append([]string(nil), update.ValidationErrors...)
+	}
+	if update.Error != "" {
+		export.ValidationErrors = append(export.ValidationErrors, update.Error)
+	}
+	export.UpdatedAt = time.Now().UTC()
+	s.championExports[id] = export
+	return export, nil
+}
+
 func (s *MemoryStore) CreateChampionDemoPrediction(prediction runs.ChampionDemoPredictionCreate) (runs.ChampionDemoPrediction, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -658,6 +778,45 @@ func (s *MemoryStore) ListProjectChampionDemoPredictions(projectID string) ([]ru
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
 	return out, nil
+}
+
+func (s *MemoryStore) UpdateChampionDemoPrediction(id string, update runs.ChampionDemoPredictionUpdate) (runs.ChampionDemoPrediction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prediction, ok := s.demoPredictions[id]
+	if !ok {
+		return runs.ChampionDemoPrediction{}, ErrNotFound
+	}
+	if update.Status != "" {
+		prediction.Status = update.Status
+	}
+	if update.PredictedLabel != "" {
+		prediction.PredictedLabel = update.PredictedLabel
+	}
+	if update.TrueLabel != "" {
+		prediction.TrueLabel = update.TrueLabel
+	}
+	if update.Confidence != nil {
+		prediction.Confidence = update.Confidence
+	}
+	if update.TopK != nil {
+		prediction.TopK = append([]runs.DemoPredictionTopK(nil), update.TopK...)
+	}
+	if update.LatencyMS != nil {
+		prediction.LatencyMS = update.LatencyMS
+	}
+	if update.Correct != nil {
+		prediction.Correct = update.Correct
+	}
+	if update.Error != "" {
+		prediction.Error = update.Error
+	}
+	if update.ImageMetadata != nil {
+		prediction.ImageMetadata = emptyMapIfNil(update.ImageMetadata)
+	}
+	s.demoPredictions[id] = prediction
+	return prediction, nil
 }
 
 func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
@@ -1166,6 +1325,9 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	job.MLflowRunID = mlflowRunID
 	job.Error = message
 	job.CompletedAt = &now
+	job.LeaseOwnerWorkerID = ""
+	job.LeaseExpiresAt = nil
+	job.LeaseLastHeartbeatAt = nil
 	s.jobs[jobID] = job
 
 	if job.WorkerID != "" {
@@ -1178,6 +1340,10 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	}
 
 	return job, nil
+}
+
+func isTerminalJobStatus(status string) bool {
+	return status == jobs.StatusSucceeded || status == jobs.StatusFailed
 }
 
 func (s *MemoryStore) newID(prefix string) string {

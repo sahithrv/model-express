@@ -18,9 +18,12 @@ Non-goals for this agent unless explicitly requested: Go store migrations, front
 
 `worker.jobs.run_job` dispatches by job template:
 
-- `profile_dataset`: fetch dataset metadata from `GET /datasets/:id`, download the `s3://` archive through MinIO/S3 settings, extract to `.cache/datasets/:dataset_id`, run `profile_image_folder`, post profile JSON to `POST /datasets/:id/profile`, then complete the job.
+- `profile_dataset`: fetch dataset metadata from `GET /datasets/:id`. When the worker is running with `GPU_TYPE=modal` or `MODEL_EXPRESS_DATASET_PROFILE_PROVIDER=modal`, submit a Modal profile function that downloads/extracts inside Modal temporary storage and returns profile JSON. Otherwise download the `s3://` archive through MinIO/S3 settings, extract locally, run `profile_image_folder`, post profile JSON to `POST /datasets/:id/profile`, then complete the job.
 - `train_experiment`: call `run_training_job`, which selects `config.provider` with default `local`.
-- Unknown templates currently run the fake metric loop in `OrchestratorClient.run_fake_job`.
+- `export_champion`: produce a controlled export manifest/artifact result when a worker-visible artifact/model is available, then report through `/jobs/:id/champion-export-result`.
+- `champion_demo_prediction`: run dependency-guarded demo inference from a worker-owned export manifest, then report `SUCCEEDED`, `FAILED`, or `RUNTIME_UNAVAILABLE` through `/jobs/:id/champion-demo-prediction-result`.
+- `generate_visual_exemplars`: generate capped class-balanced exemplars and persist the accepted profile patch through `/datasets/:id/visual-exemplars`.
+- Unknown templates fail closed instead of fake-running.
 
 Training providers:
 
@@ -43,6 +46,7 @@ Training providers:
 - `services/worker/worker/training/modal_app.py`: real transforms, data split, model build, training loop, evaluation, cost/latency estimates.
 - `services/worker/worker/exporting/artifacts.py`: worker-owned export manifest/checkpoint helpers with guarded TorchScript/ONNX export paths.
 - `services/worker/worker/exporting/inference.py`: TorchScript demo inference helper that returns ranked predictions or deterministic pending/error payloads.
+- `services/worker/worker/champion_jobs.py`: export/demo/exemplar job handlers and backend result payload construction.
 - `services/orchestrator/internal/api/router.go`: canonical endpoint list.
 - `services/orchestrator/internal/jobs/model.go`, `plans/model.go`, `runs/model.go`, `datasets/model.go`, `workers/model.go`: worker-visible contracts.
 - `apps/mission-control/src/types.ts` and `apps/mission-control/src/App.tsx`: frontend expectations for worker, job, profile, summary, evaluation, and champion data.
@@ -68,7 +72,9 @@ Validated or documented options:
 
 Worker implementation details:
 
-- Modal currently applies ImageNet normalization unless `normalization: "none"` is requested; `normalization: "dataset"` is future-facing.
+- Dataset upload from Mission Control streams a zip directly to object storage; workers should continue treating `datasets.storage_uri` as the canonical dataset artifact.
+- Local dataset profile cache under `.cache/datasets/:dataset_id` is cleaned after profiling by default. Set `MODEL_EXPRESS_PERSIST_DATASET_CACHE=1` only when intentionally debugging/reusing local extracted data. `MODEL_EXPRESS_DATASET_CACHE_ROOT` can override the root for local dataset jobs.
+- Modal dataset profiling uses a per-call `tempfile.TemporaryDirectory`, so Modal-only workflows do not populate the user's local `.cache/datasets` tree.
 - Modal now computes dataset normalization metadata when `normalization: "dataset"` or `use_dataset_normalization` is requested and applies the resulting mean/std in transforms.
 - Modal supports `preserve_aspect_pad`, `center_crop`, random resized crop, ImageFolder train/val/test split, weighted sampler, weighted/focal loss, Adam/AdamW/SGD, cosine/step scheduler, early stopping, pretrained/frozen/last-block/full fine-tuning.
 - Worker helper tests cover transform construction, sampler/loss selection, profile artifact detection, normalization metadata, and pure export/demo payload shapes.
@@ -85,11 +91,9 @@ Keep these as explicit future work, not accidental partial implementations:
 - Extend dataset normalization beyond the current bounded mean/std helper if future training paths need cached stats or explicit provenance.
 - Wire explicit split-file training instead of always using the deterministic random split.
 - Add advanced augmentation policies beyond the current safe string subset.
-- Wire champion export helpers into a backend-scheduled worker job that saves artifacts to configured storage.
-- Wire lightweight champion inference into a backend-scheduled worker job or controlled runtime endpoint with top-k labels, confidence, latency, and true-label support when available.
 - Generate model-card/export metadata: input size, normalization, class labels, latency, model size, training config, and limitations.
-- Current worker slice provides export metadata, manifest/checkpoint helpers, dependency-guarded TorchScript/ONNX export paths, and TorchScript inference helpers. Backend job wiring and artifact upload remain deferred.
-- Generate visual exemplar packs already exists as a helper; backend/profile upload wiring remains deferred.
+- Add production storage upload for worker-local `file://` export/exemplar artifacts.
+- Add real model reconstruction/export from completed training runs when no worker-visible artifact exists.
 
 ## Backend And Frontend Contracts
 
@@ -104,8 +108,11 @@ Backend endpoints the worker uses:
 - `POST /jobs/:id/training-run-evaluation`: upserts objective/per-class/confusion/model/holistic evaluation data.
 - `POST /jobs/:id/complete`: marks terminal success; train jobs can trigger monitor/planner loops.
 - `POST /jobs/:id/fail`: marks terminal failure; train jobs can still trigger review/planning logic.
+- `POST /jobs/:id/champion-export-result`: reports validated export job results to the backend.
+- `POST /jobs/:id/champion-demo-prediction-result`: reports validated demo prediction results to the backend.
+- `POST /datasets/:id/visual-exemplars`: persists capped exemplar/demo image metadata into canonical profile JSON.
 - `GET /projects/:id/champion/demo-predictions`: Mission Control reads durable prediction history.
-- `POST /projects/:id/champion/demo-predictions`: backend currently creates `RUNTIME_UNAVAILABLE` audit rows; a future worker-backed path should report `SUCCEEDED`/`FAILED` prediction records without bypassing backend validation.
+- `POST /projects/:id/champion/demo-predictions`: backend creates audit rows and queues worker prediction jobs when a `READY` export exists.
 
 Job config is produced by executing an experiment plan. The orchestrator injects `plan_id`, `dataset_id`, `experiment_index`, `experiment_template`, `model`, `epochs`, `batch_size`, `learning_rate`, `target_metric`, `provider`, `gpu_type`, plus optional planned experiment fields.
 

@@ -91,10 +91,21 @@ CREATE TABLE IF NOT EXISTS experiment_jobs (
   config jsonb NOT NULL DEFAULT '{}'::jsonb,
   mlflow_run_id text NOT NULL DEFAULT '',
   error text NOT NULL DEFAULT '',
+  attempt integer NOT NULL DEFAULT 0,
+  max_attempts integer NOT NULL DEFAULT 3,
+  lease_owner_worker_id text NOT NULL DEFAULT '',
+  lease_expires_at timestamptz,
+  lease_last_heartbeat_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   started_at timestamptz,
   completed_at timestamptz
 );
+
+ALTER TABLE experiment_jobs ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 0;
+ALTER TABLE experiment_jobs ADD COLUMN IF NOT EXISTS max_attempts integer NOT NULL DEFAULT 3;
+ALTER TABLE experiment_jobs ADD COLUMN IF NOT EXISTS lease_owner_worker_id text NOT NULL DEFAULT '';
+ALTER TABLE experiment_jobs ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
+ALTER TABLE experiment_jobs ADD COLUMN IF NOT EXISTS lease_last_heartbeat_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS epoch_metrics (
   job_id text NOT NULL REFERENCES experiment_jobs(id) ON DELETE CASCADE,
@@ -312,6 +323,7 @@ CREATE TABLE IF NOT EXISTS strategy_scorecards (
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_id ON experiment_jobs(project_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status_created_at ON experiment_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_project_status_created_at ON experiment_jobs(project_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_experiment_jobs_lease_expires_at ON experiment_jobs(status, lease_expires_at) WHERE lease_expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_epoch_metrics_job_id ON epoch_metrics(job_id);
 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
 CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id);

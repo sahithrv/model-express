@@ -66,7 +66,7 @@ Use these traits as planning evidence, not automatic prescriptions. For example,
 
 Until that is wired, treat `datasets.profile` JSON as the source of truth. If adding persistence later, either fully wire `dataset_profiles` as the latest normalized profile path or clearly keep it deferred to avoid split-brain profile state.
 
-Latest integration decision: `datasets.profile` remains authoritative for PR 1/8. `dataset_artifacts` is still deferred; profile `artifacts`, `demo_images`, and `visual_exemplars` arrays are the current compact JSON source for planner/demo surfaces. Worker helper modules can now parse split/annotation metadata and generate capped visual exemplar packs, but those helpers are not yet wired into backend profile uploads.
+Latest integration decision: `datasets.profile` remains authoritative for PR 1/8. `dataset_artifacts` is still deferred; profile `artifacts`, `demo_images`, and `visual_exemplars` arrays are the current compact JSON source for planner/demo surfaces. Worker helper modules can parse split/annotation metadata and generate capped visual exemplar packs, and the backend can persist accepted exemplar/demo image patches through `POST /datasets/:id/visual-exemplars`.
 
 ## Profiler And Planner Touchpoints
 
@@ -93,8 +93,8 @@ High-value follow-ups for this agent:
 - Add first-class `dataset_artifacts` records if artifact history, file-level metadata, annotation parsing, or provenance becomes important.
 - Wire helper-level annotation XML/JSON and split-file parsing into profiling/training where safe; labels CSV/class hierarchy/metadata folder parsing remain future work.
 - Wire explicit train/validation/test split files into worker training and champion/demo image selection.
-- Add backend/profile upload for generated visual exemplars.
-- Current PR 8 slice exposes budget-capped visual exemplar/demo image metadata from `datasets.profile` through backend APIs and worker helpers can generate downscaled exemplars locally. Persisting/uploading generated exemplars remains future work.
+- Add production object-storage upload and durable history for generated visual exemplars beyond current profile JSON patches.
+- Current PR 8 slice exposes budget-capped visual exemplar/demo image metadata from `datasets.profile`, accepts capped backend profile merges, and worker helpers can generate downscaled exemplars locally.
 - Compute dataset-specific normalization statistics and apply them only when worker support makes `normalization: "dataset"` real.
 - Implement bbox crop/full-image paired ablations and keep them controlled against a full-image baseline.
 - Normalize dataset profiles into durable rows or document/defer the table path deliberately.

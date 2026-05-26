@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from worker.champion_jobs import (
+    _validated_exemplar_payload,
+    run_champion_demo_prediction_job,
+    run_export_champion_job,
+)
+from worker.jobs import run_job
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.export_results: list[tuple[str, dict]] = []
+        self.prediction_results: list[tuple[str, dict]] = []
+        self.completed: list[str] = []
+        self.failed: list[tuple[str, str]] = []
+        self.datasets: dict[str, dict] = {}
+
+    def get_dataset(self, dataset_id: str) -> dict:
+        return self.datasets[dataset_id]
+
+    def report_champion_export_result(self, job_id: str, result: dict) -> dict:
+        self.export_results.append((job_id, result))
+        return {"ok": True}
+
+    def report_champion_demo_prediction_result(self, job_id: str, result: dict) -> dict:
+        self.prediction_results.append((job_id, result))
+        return {"ok": True}
+
+    def complete_job(self, job_id: str, mlflow_run_id: str = "") -> dict:
+        self.completed.append(job_id)
+        return {"ok": True}
+
+    def fail_job(self, job_id: str, error: str) -> dict:
+        self.failed.append((job_id, error))
+        return {"ok": True}
+
+
+class ChampionJobTests(unittest.TestCase):
+    def test_export_reports_ready_only_when_existing_artifact_is_copied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.onnx"
+            source.write_bytes(b"real onnx bytes")
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "onnx",
+                    "champion_job_id": "train_1",
+                    "artifact_path": str(source),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 64,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(root / "exports")}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "READY")
+            self.assertEqual(result["format"], "onnx")
+            self.assertTrue(result["artifact_uri"].startswith("file://"))
+            self.assertTrue((root / "exports" / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
+            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.failed, [])
+
+    def test_export_without_artifact_reports_pending_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {"format": "torchscript", "class_names": ["cat"], "image_size": 32},
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(Path(temp_dir) / "exports")}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "PENDING_ARTIFACT")
+            self.assertEqual(result["artifact_uri"], "")
+            self.assertIn("MODEL_UNAVAILABLE", result["error"])
+            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.failed, [])
+
+    def test_demo_prediction_reports_runtime_unavailable_without_manifest(self) -> None:
+        client = FakeClient()
+        job = {
+            "id": "job_predict",
+            "template": "champion_demo_prediction",
+            "config": {"image_uri": "missing.jpg", "true_label": "cat"},
+        }
+
+        run_champion_demo_prediction_job(client, job)
+
+        _, result = client.prediction_results[0]
+        self.assertEqual(result["status"], "RUNTIME_UNAVAILABLE")
+        self.assertEqual(result["error_code"], "MANIFEST_NOT_CONFIGURED")
+        self.assertEqual(client.completed, ["job_predict"])
+        self.assertEqual(client.failed, [])
+
+    def test_dispatch_rejects_unknown_templates_instead_of_faking_success(self) -> None:
+        client = FakeClient()
+        with self.assertRaises(ValueError):
+            run_job(client, {"id": "job_unknown", "template": "not_real", "config": {}})
+
+    def test_exemplar_payload_enforces_image_and_byte_caps(self) -> None:
+        pack = {
+            "status": "created",
+            "visual_exemplars": [
+                {"id": "a", "class_name": "cat", "path": "a.jpg", "source_path": "a.png", "bytes": 10},
+                {"id": "b", "class_name": "dog", "path": "b.jpg", "source_path": "b.png", "bytes": 50},
+                {"id": "c", "class_name": "dog", "path": "c.jpg", "source_path": "c.png", "bytes": 10},
+            ],
+        }
+        payload = _validated_exemplar_payload(
+            pack,
+            {
+                "images_per_class": 2,
+                "max_total_images": 2,
+                "max_image_bytes": 20,
+                "max_total_bytes": 25,
+                "image_size": 160,
+                "quality": 75,
+            },
+        )
+
+        self.assertEqual(payload["status"], "created")
+        self.assertEqual([item["id"] for item in payload["visual_exemplars"]], ["a", "c"])
+        self.assertEqual(payload["summary"]["total_bytes"], 20)
+        self.assertEqual(payload["profile_patch"]["demo_images"], payload["visual_exemplars"])
+
+
+if __name__ == "__main__":
+    unittest.main()

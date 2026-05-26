@@ -100,13 +100,17 @@ type ReasoningSection = {
 type ChampionComparisonRow = {
   jobId: string;
   model: string;
+  rankScore: number;
   accuracy: number;
   macroF1: number;
   runtimeSeconds: number;
   costUsd: number;
   latencyMs: number;
-  modelSizeMb: number;
   objectiveFit: number;
+  trainValidationGap: number | null;
+  divergenceStatus: string;
+  seedVariance: number | null;
+  seedRunCount: number;
   isChampion: boolean;
 };
 
@@ -213,6 +217,7 @@ export function App() {
   const [demoPredictionLoading, setDemoPredictionLoading] = useState(false);
   const [selectedDemoImageIndex, setSelectedDemoImageIndex] = useState(0);
   const supervisingRequirements = useRef<Set<string>>(new Set());
+  const eventRefreshInFlight = useRef(false);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -256,8 +261,8 @@ export function App() {
     [latestDecision],
   );
   const championComparison = useMemo(
-    () => buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.champion),
-    [detail.champion, detail.runEvaluations, detail.runSummaries],
+    () => buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.jobs, detail.champion),
+    [detail.champion, detail.jobs, detail.runEvaluations, detail.runSummaries],
   );
   const candidateScores = useMemo(
     () => (latestDecision ? candidateScoreRows(latestDecision) : []),
@@ -536,6 +541,38 @@ export function App() {
   }, [refreshLive]);
 
   useEffect(() => {
+    if (!selectedProjectId || typeof EventSource === "undefined") return;
+
+    let closed = false;
+    const streamUrl = new URL(`/projects/${selectedProjectId}/events/stream`, baseUrl);
+    const events = new EventSource(streamUrl.toString());
+    const triggerRefresh = () => {
+      if (closed || eventRefreshInFlight.current) return;
+      eventRefreshInFlight.current = true;
+      window.setTimeout(() => {
+        refreshLive()
+          .catch(() => undefined)
+          .finally(() => {
+            eventRefreshInFlight.current = false;
+          });
+      }, 150);
+    };
+
+    events.onmessage = triggerRefresh;
+    events.addEventListener("execution_event", triggerRefresh);
+    events.addEventListener("project_event", triggerRefresh);
+    events.onerror = () => {
+      closed = true;
+      events.close();
+    };
+
+    return () => {
+      closed = true;
+      events.close();
+    };
+  }, [baseUrl, refreshLive, selectedProjectId]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       superviseWorkerRequirements().catch(() => undefined);
     }, 3000);
@@ -578,15 +615,18 @@ export function App() {
         body: metadata,
       });
 
-      let workerMessage = "Profiling worker started.";
+      const profileProvider = automationSettings.default_training_provider === "modal" ? "modal" : "local";
+      let workerMessage = profileProvider === "modal" ? "Modal profiling worker started." : "Profiling worker started.";
       try {
         const workerProcess = await window.missionControl.ensureProjectWorker({
           projectId: project.id,
           baseUrl,
-          name: `profile-worker-${project.id}`,
-          gpuType: "local",
+          name: `${profileProvider}-profile-worker-${project.id}`,
+          gpuType: profileProvider,
         });
-        workerMessage = workerProcess.started ? "Profiling worker started." : "Profiling worker is already running.";
+        workerMessage = workerProcess.started
+          ? workerMessage
+          : `${profileProvider === "modal" ? "Modal profiling" : "Profiling"} worker is already running.`;
       } catch (error) {
         workerMessage = `Worker did not start: ${error instanceof Error ? error.message : String(error)}`;
       }
@@ -1240,12 +1280,14 @@ export function App() {
               <div className="comparison-table">
                 <div className="comparison-row comparison-head">
                   <span>Model</span>
+                  <span>Rank</span>
                   <span>Macro-F1</span>
                   <span>Accuracy</span>
+                  <span>Gap</span>
+                  <span>Seed Var</span>
                   <span>Runtime</span>
                   <span>Cost</span>
                   <span>Latency</span>
-                  <span>Size</span>
                   <span>Fit</span>
                 </div>
                 {championComparison.map((row) => (
@@ -1258,12 +1300,14 @@ export function App() {
                       <strong>{row.model || "unknown"}</strong>
                       <small>{row.isChampion ? "selected champion" : row.jobId}</small>
                     </span>
+                    <strong>{formatMaybeMetric(row.rankScore)}</strong>
                     <strong>{formatMaybeMetric(row.macroF1)}</strong>
                     <span>{formatMaybeMetric(row.accuracy)}</span>
+                    <span title={row.divergenceStatus || undefined}>{formatLossGap(row.trainValidationGap)}</span>
+                    <span>{formatSeedVariance(row.seedVariance, row.seedRunCount)}</span>
                     <span>{formatSeconds(row.runtimeSeconds)}</span>
                     <span>{formatCurrency(row.costUsd)}</span>
                     <span>{formatLatency(row.latencyMs)}</span>
-                    <span>{row.modelSizeMb ? `${row.modelSizeMb.toFixed(row.modelSizeMb < 10 ? 2 : 1)} MB` : "-"}</span>
                     <span>{formatMaybeMetric(row.objectiveFit)}</span>
                   </button>
                 ))}
@@ -1711,6 +1755,7 @@ export function App() {
                   metricKey={selectedMetricKey}
                   label={metricOptions.find((metric) => metric.key === selectedMetricKey)?.label ?? selectedMetricKey}
                 />
+                {selectedRunEvaluation && <RunEvaluationDetails evaluation={selectedRunEvaluation} />}
               </div>
             ) : (
               <div className="empty">No job selected</div>
@@ -1830,17 +1875,35 @@ function ChampionExportDemoPanel({
           {data.exports.length > 0 ? (
             <div className="export-record-list">
               {data.exports.slice(0, 4).map((exportRecord, index) => (
-                <div className="export-record" key={exportRecord.id || `${exportRecord.format}-${index}`}>
+                <div
+                  className={`export-record ${statusToneClass(exportRecord.status)}`}
+                  key={exportRecord.id || `${exportRecord.format}-${index}`}
+                >
                   <span>
                     <strong>{exportRecord.format || "model artifact"}</strong>
-                    <small>{exportRecord.artifact_uri || exportRecord.model_uri || exportRecord.download_url || "artifact URI pending"}</small>
+                    <small>
+                      {exportRecord.artifact_uri ||
+                        exportRecord.model_uri ||
+                        exportRecord.download_url ||
+                        exportStatusMessage(exportRecord.status)}
+                    </small>
                   </span>
                   <span>
                     <Badge value={exportRecord.status || "PENDING"} />
-                    <small>{exportRecord.size_bytes ? formatBytes(exportRecord.size_bytes) : exportRecord.updated_at || exportRecord.created_at || ""}</small>
+                    <small>
+                      {exportRecord.size_bytes
+                        ? formatBytes(exportRecord.size_bytes)
+                        : exportRecord.completed_at ||
+                          exportRecord.failed_at ||
+                          exportRecord.updated_at ||
+                          exportRecord.started_at ||
+                          exportRecord.requested_at ||
+                          exportRecord.created_at ||
+                          ""}
+                    </small>
                   </span>
-                  {(exportRecord.error || (exportRecord.validation_errors ?? []).length > 0) && (
-                    <p>{exportRecord.error || exportRecord.validation_errors?.join("; ")}</p>
+                  {(exportRecord.error || exportRecord.error_message || (exportRecord.validation_errors ?? []).length > 0) && (
+                    <p>{exportRecord.error || exportRecord.error_message || exportRecord.validation_errors?.join("; ")}</p>
                   )}
                 </div>
               ))}
@@ -1935,36 +1998,11 @@ function ChampionExportDemoPanel({
           {predictionRows.length > 0 ? (
             <div className="prediction-list">
               {predictionRows.slice(0, 6).map((predictionRow, index) => (
-                <div className="prediction-row" key={predictionRow.id || `${predictionRow.image_id}-${index}`}>
-                  <span>
-                    <strong>{predictionRow.predicted_label || "prediction pending"}</strong>
-                    <small>
-                      {[
-                        predictionRow.status || "",
-                        predictionRow.true_label ? `true: ${predictionRow.true_label}` : "",
-                        predictionRow.image_id || predictionRow.image_uri || "",
-                      ].filter(Boolean).join(" - ") || "image id pending"}
-                    </small>
-                  </span>
-                  <span>
-                    {typeof predictionRow.correct === "boolean" && <Badge value={predictionRow.correct ? "CORRECT" : "MISSED"} />}
-                    {predictionRow.runtime_unavailable && <Badge value="RUNTIME_UNAVAILABLE" />}
-                    <small>
-                      {typeof predictionRow.confidence === "number" ? `${Math.round(predictionRow.confidence * 100)}%` : ""}
-                      {typeof predictionRow.latency_ms === "number" ? ` ${formatLatency(predictionRow.latency_ms)}` : ""}
-                    </small>
-                  </span>
-                  {(predictionRow.error || predictionRow.error_message) && <p>{predictionRow.error || predictionRow.error_message}</p>}
-                  {Array.isArray(predictionRow.top_k) && predictionRow.top_k.length > 0 && (
-                    <div className="topk-list">
-                      {predictionRow.top_k.slice(0, 3).map((item, topIndex) => (
-                        <small key={`${predictionRow.id || index}-${topIndex}`}>
-                          {item.label || item.class_name || "class"} {formatTopKScore(item.confidence ?? item.score)}
-                        </small>
-                      ))}
-                    </div>
-                  )}
-                </div>
+                <PredictionRow
+                  key={predictionRow.id || `${predictionRow.image_id}-${index}`}
+                  prediction={predictionRow}
+                  index={index}
+                />
               ))}
             </div>
           ) : (
@@ -1972,6 +2010,132 @@ function ChampionExportDemoPanel({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function PredictionRow({ prediction, index }: { prediction: ChampionDemoPrediction; index: number }) {
+  const status = normalizedStatus(prediction.status || (prediction.runtime_unavailable ? "RUNTIME_UNAVAILABLE" : "PENDING"));
+  const displayLabel = prediction.predicted_label || predictionStatusMessage(status);
+  const confidence = numericValue(prediction.confidence);
+  const topK = Array.isArray(prediction.top_k) ? prediction.top_k : [];
+  const imageSrc = prediction.image_uri || recordString(recordObject(prediction.metadata), "thumbnail_uri");
+  const timestamp =
+    prediction.completed_at || prediction.updated_at || prediction.started_at || prediction.requested_at || prediction.created_at || "";
+
+  return (
+    <div className={`prediction-row ${statusToneClass(status)}`}>
+      {imageSrc ? (
+        <img className="prediction-thumb" src={imageSrc} alt={prediction.true_label || prediction.predicted_label || "prediction image"} />
+      ) : (
+        <div className="prediction-thumb placeholder">image</div>
+      )}
+      <span>
+        <strong>{displayLabel}</strong>
+        <small>
+          {[
+            status,
+            prediction.true_label ? `true: ${prediction.true_label}` : "true label pending",
+            prediction.image_id || prediction.image_uri || "",
+          ]
+            .filter(Boolean)
+            .join(" - ")}
+        </small>
+      </span>
+      <span className="prediction-result-stack">
+        <Badge value={status} />
+        {typeof prediction.correct === "boolean" && <Badge value={prediction.correct ? "CORRECT" : "MISSED"} />}
+        <small>{timestamp}</small>
+      </span>
+      <div className="prediction-facts">
+        <span>
+          <small>Confidence</small>
+          <strong>{confidence ? formatTopKScore(confidence) : "-"}</strong>
+        </span>
+        <span>
+          <small>Latency</small>
+          <strong>{typeof prediction.latency_ms === "number" ? formatLatency(prediction.latency_ms) : "-"}</strong>
+        </span>
+        <span>
+          <small>Correctness</small>
+          <strong>{typeof prediction.correct === "boolean" ? (prediction.correct ? "correct" : "missed") : "-"}</strong>
+        </span>
+      </div>
+      {(prediction.error || prediction.error_message) && <p>{prediction.error || prediction.error_message}</p>}
+      {topK.length > 0 && (
+        <div className="topk-list">
+          {topK.slice(0, 5).map((item, topIndex) => (
+            <small key={`${prediction.id || index}-${topIndex}`}>
+              {item.label || item.class_name || "class"} {formatTopKScore(item.confidence ?? item.probability ?? item.score)}
+            </small>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RunEvaluationDetails({ evaluation }: { evaluation: TrainingRunEvaluation }) {
+  const diagnostics = recordObject(evaluation.holistic_scores.training_diagnostics);
+  const perClassRows = perClassMetricRows(evaluation.per_class_metrics);
+  const matrix = normalizedConfusionMatrix(evaluation.confusion_matrix);
+
+  return (
+    <div className="evaluation-details">
+      <div className="evaluation-card">
+        <strong>Training diagnostics</strong>
+        <div className="evaluation-facts">
+          <span>
+            <small>Status</small>
+            <Badge value={recordString(diagnostics, "status") || recordString(evaluation.holistic_scores, "divergence_status") || "stable"} />
+          </span>
+          <span>
+            <small>Loss gap</small>
+            <b>{formatLossGap(numberPayload(diagnostics.train_validation_gap) ?? numberPayload(evaluation.holistic_scores.train_validation_gap))}</b>
+          </span>
+          <span>
+            <small>Severity</small>
+            <b>{formatMetricNumber(numberPayload(diagnostics.severity))}</b>
+          </span>
+        </div>
+      </div>
+
+      {perClassRows.length > 0 && (
+        <div className="evaluation-card">
+          <strong>Per-class metrics</strong>
+          <div className="per-class-table">
+            <div className="per-class-row per-class-head">
+              <span>Class</span>
+              <span>Prec</span>
+              <span>Rec</span>
+              <span>F1</span>
+            </div>
+            {perClassRows.slice(0, 6).map((row) => (
+              <div className="per-class-row" key={row.label}>
+                <span>{row.label}</span>
+                <span>{formatMetricNumber(row.precision)}</span>
+                <span>{formatMetricNumber(row.recall)}</span>
+                <span>{formatMetricNumber(row.f1)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {matrix.length > 0 && (
+        <div className="evaluation-card">
+          <strong>Confusion matrix</strong>
+          <div className="confusion-preview">
+            {matrix.slice(0, 6).map((row, rowIndex) => (
+              <div key={`selected-run-matrix-${rowIndex}`}>
+                {row.slice(0, 6).map((value, colIndex) => (
+                  <span key={`${rowIndex}-${colIndex}`}>{value}</span>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2248,6 +2412,7 @@ function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: Agent
   const heightMax = recordNumber(profile, "height_max");
   const metadataSummary = recordObject(profile.metadata_summary);
   const metadataAvailable = profile.metadata_available === true || Object.keys(metadataSummary).length > 0;
+  const exemplarStatus = exemplarStatusFromProfile(profile);
   const recommendedMetrics = stringArrayPayload(plannerInsights.recommended_metrics);
   const recommendedPreprocessing = stringArrayPayload(plannerInsights.recommended_preprocessing);
   const recommendedAugmentations = stringArrayPayload(plannerInsights.recommended_augmentations);
@@ -2269,7 +2434,8 @@ function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: Agent
     "image folders",
     metadataAvailable ? "metadata detected" : "metadata not reported",
     corruptCount > 0 ? `${corruptCount} corrupt image(s)` : "no corrupt images reported",
-  ];
+    exemplarStatus,
+  ].filter(Boolean);
   const warnings = [
     ...(imbalanceRatio >= 1.5 ? [`Class imbalance ratio ${imbalanceRatio.toFixed(2)}; prefer macro-F1 and per-class checks.`] : []),
     ...(corruptCount > 0 ? [`${corruptCount} corrupt image(s) detected by profiler.`] : []),
@@ -2374,33 +2540,144 @@ function decisionRejections(decision: AgentDecision) {
 function buildChampionComparison(
   summaries: TrainingRunSummary[],
   evaluations: TrainingRunEvaluation[],
+  jobs: Job[],
   champion: ProjectChampion | null,
 ): ChampionComparisonRow[] {
   const evaluationByJob = new Map(evaluations.map((evaluation) => [evaluation.job_id, evaluation]));
+  const jobById = new Map(jobs.map((job) => [job.id, job]));
+  const seedVarianceBySignature = buildSeedVarianceBySignature(summaries, jobById);
   const championJobId = champion?.job_id ?? "";
   return summaries
     .map((summary) => {
       const evaluation = evaluationByJob.get(summary.job_id);
+      const job = jobById.get(summary.job_id);
       const modelProfile = evaluation?.model_profile ?? {};
       const holisticScores = evaluation?.holistic_scores ?? {};
+      const diagnostics = recordObject(holisticScores.training_diagnostics);
+      const objectiveFit = recordNumber(holisticScores, "overall_score") || recordNumber(holisticScores, "objective_fit");
+      const trainValidationGap =
+        numberPayload(diagnostics.train_validation_gap) ?? numberPayload(holisticScores.train_validation_gap);
+      const divergenceStatus =
+        recordString(diagnostics, "status") || recordString(holisticScores, "divergence_status") || "";
+      const signature = job ? experimentComparisonSignature(job.config) : "";
+      const seedVariance = signature ? seedVarianceBySignature.get(signature) : undefined;
+      const latencyMs = recordNumber(modelProfile, "estimated_latency_ms");
+      const rankScore = experimentRankScore({
+        macroF1: summary.best_macro_f1,
+        accuracy: summary.best_accuracy,
+        costUsd: summary.estimated_cost_usd,
+        runtimeSeconds: summary.runtime_seconds,
+        latencyMs,
+        objectiveFit,
+        trainValidationGap,
+        divergenceStatus,
+        seedVariance: seedVariance?.variance ?? null,
+      });
       return {
         jobId: summary.job_id,
         model: summary.model,
+        rankScore,
         accuracy: summary.best_accuracy,
         macroF1: summary.best_macro_f1,
         runtimeSeconds: summary.runtime_seconds,
         costUsd: summary.estimated_cost_usd,
-        latencyMs: recordNumber(modelProfile, "estimated_latency_ms"),
-        modelSizeMb: recordNumber(modelProfile, "model_size_mb") || recordNumber(modelProfile, "estimated_model_size_mb"),
-        objectiveFit: recordNumber(holisticScores, "overall_score") || recordNumber(holisticScores, "objective_fit"),
+        latencyMs,
+        objectiveFit,
+        trainValidationGap,
+        divergenceStatus,
+        seedVariance: seedVariance?.variance ?? null,
+        seedRunCount: seedVariance?.runCount ?? 0,
         isChampion: summary.job_id === championJobId,
       };
     })
     .sort((left, right) => {
       if (left.isChampion !== right.isChampion) return left.isChampion ? -1 : 1;
-      return right.macroF1 - left.macroF1;
+      return right.rankScore - left.rankScore;
     })
     .slice(0, 8);
+}
+
+function buildSeedVarianceBySignature(summaries: TrainingRunSummary[], jobById: Map<string, Job>) {
+  const groups = new Map<string, Array<{ seed: string; score: number }>>();
+  for (const summary of summaries) {
+    const job = jobById.get(summary.job_id);
+    if (!job || normalizedStatus(summary.status) !== "SUCCEEDED") continue;
+    const signature = experimentComparisonSignature(job.config);
+    if (!signature) continue;
+    const seed = experimentSeed(job.config);
+    if (!seed) continue;
+    const rows = groups.get(signature) ?? [];
+    rows.push({ seed, score: summary.best_macro_f1 });
+    groups.set(signature, rows);
+  }
+
+  const out = new Map<string, { variance: number; runCount: number }>();
+  for (const [signature, rows] of groups.entries()) {
+    const uniqueSeeds = new Set(rows.map((row) => row.seed));
+    if (rows.length < 2 || uniqueSeeds.size < 2) continue;
+    const mean = rows.reduce((sum, row) => sum + row.score, 0) / rows.length;
+    const variance = rows.reduce((sum, row) => sum + Math.pow(row.score - mean, 2), 0) / (rows.length - 1);
+    out.set(signature, { variance, runCount: rows.length });
+  }
+  return out;
+}
+
+function experimentRankScore(input: {
+  macroF1: number;
+  accuracy: number;
+  costUsd: number;
+  runtimeSeconds: number;
+  latencyMs: number;
+  objectiveFit: number;
+  trainValidationGap: number | null;
+  divergenceStatus: string;
+  seedVariance: number | null;
+}) {
+  const quality = input.macroF1 * 0.65 + input.accuracy * 0.35;
+  const latencyScore = input.latencyMs ? clamp01(1 - input.latencyMs / 160) : 0.5;
+  const costScore = clamp01(1 - input.costUsd / 10);
+  const runtimeScore = clamp01(1 - input.runtimeSeconds / 1800);
+  const base = input.objectiveFit || quality * 0.74 + latencyScore * 0.12 + costScore * 0.08 + runtimeScore * 0.06;
+  const gapPenalty =
+    input.trainValidationGap !== null && input.trainValidationGap > 0
+      ? Math.min(0.08, input.trainValidationGap * 0.08)
+      : 0;
+  const divergencePenalty =
+    input.divergenceStatus === "diverging" ? 0.07 : input.divergenceStatus === "overfitting_risk" ? 0.04 : 0;
+  const seedPenalty = input.seedVariance !== null ? Math.min(0.06, input.seedVariance * 20) : 0;
+  return clamp01(base - gapPenalty - divergencePenalty - seedPenalty);
+}
+
+function experimentComparisonSignature(config: Record<string, unknown>) {
+  const normalized = normalizeComparisonConfig(config) as Record<string, unknown>;
+  return Object.keys(normalized).length > 0 ? stableStringify(normalized) : "";
+}
+
+function normalizeComparisonConfig(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => normalizeComparisonConfig(item));
+  if (!value || typeof value !== "object") return value;
+  const ignoredKeys = new Set(["seed", "random_seed", "experiment_index", "plan_id", "dataset_id"]);
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !ignoredKeys.has(key))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, normalizeComparisonConfig(child)]),
+  );
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(normalizeComparisonConfig(value));
+}
+
+function experimentSeed(config: Record<string, unknown>) {
+  const seed = config.seed ?? config.random_seed;
+  if (typeof seed === "number" && Number.isFinite(seed)) return String(seed);
+  if (typeof seed === "string" && seed.trim()) return seed.trim();
+  return "";
+}
+
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value));
 }
 
 function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[] {
@@ -2640,6 +2917,57 @@ function recordObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
+function normalizedStatus(value: string) {
+  return value.trim().toUpperCase() || "PENDING";
+}
+
+function statusToneClass(value?: string) {
+  const status = normalizedStatus(value || "PENDING").toLowerCase();
+  if (["succeeded", "ready", "correct", "completed"].includes(status)) return "status-good";
+  if (["failed", "error", "missed", "runtime_unavailable"].includes(status)) return "status-bad";
+  if (["requested", "running", "pending", "pending_artifact", "queued"].includes(status)) return "status-wait";
+  return "";
+}
+
+function exportStatusMessage(value?: string) {
+  const status = normalizedStatus(value || "PENDING");
+  if (status === "READY" || status === "SUCCEEDED") return "export artifact ready";
+  if (status === "FAILED") return "export failed";
+  if (status === "RUNNING") return "export worker running";
+  if (status === "REQUESTED" || status === "QUEUED") return "export queued by backend";
+  if (status === "PENDING_ARTIFACT") return "waiting for champion artifact";
+  return "artifact URI pending";
+}
+
+function predictionStatusMessage(value?: string) {
+  const status = normalizedStatus(value || "PENDING");
+  if (status === "SUCCEEDED") return "prediction complete";
+  if (status === "FAILED") return "prediction failed";
+  if (status === "RUNTIME_UNAVAILABLE") return "runtime unavailable";
+  if (status === "RUNNING") return "prediction running";
+  if (status === "REQUESTED" || status === "QUEUED") return "prediction queued";
+  return "prediction pending";
+}
+
+function exemplarStatusFromProfile(profile: Record<string, unknown>) {
+  const directStatus =
+    recordString(profile, "visual_exemplar_status") ||
+    recordString(profile, "exemplar_generation_status") ||
+    recordString(profile, "exemplar_persistence_status");
+  if (directStatus) return `exemplars ${directStatus.toLowerCase()}`;
+
+  const audit = recordObject(profile.visual_exemplar_audit ?? profile.exemplar_audit);
+  const auditStatus =
+    recordString(audit, "status") ||
+    recordString(audit, "generation_status") ||
+    recordString(audit, "persistence_status");
+  if (auditStatus) return `exemplars ${auditStatus.toLowerCase()}`;
+
+  const exemplars = Array.isArray(profile.visual_exemplars) ? profile.visual_exemplars.length : 0;
+  if (exemplars > 0) return `${exemplars} visual exemplar(s) exposed`;
+  return "";
+}
+
 function stringArrayPayload(value: unknown) {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string" && item.length > 0);
@@ -2666,8 +2994,8 @@ function normalizeDemoPredictionResponse(value: ChampionDemoPrediction | { predi
     recordObject(wrapped).id || Object.keys(recordObject(wrapped)).length > 0
       ? (wrapped as ChampionDemoPrediction)
       : (value as ChampionDemoPrediction);
-  if (String(prediction.status || "").toUpperCase() === "RUNTIME_UNAVAILABLE") {
-    return { ...prediction, runtime_unavailable: true };
+  if (normalizedStatus(prediction.status || "") === "RUNTIME_UNAVAILABLE") {
+    return { ...prediction, status: "RUNTIME_UNAVAILABLE", runtime_unavailable: true };
   }
   return prediction;
 }
@@ -2759,11 +3087,30 @@ function championModelProfile(champion: ProjectChampion): Record<string, unknown
 }
 
 function championConfusionMatrix(champion: ProjectChampion) {
-  const matrix = champion.evaluation.confusion_matrix;
+  return normalizedConfusionMatrix(champion.evaluation.confusion_matrix);
+}
+
+function normalizedConfusionMatrix(value: unknown) {
+  const matrix = value;
   if (!Array.isArray(matrix)) return [];
   return matrix
     .filter((row): row is unknown[] => Array.isArray(row))
     .map((row) => row.map((value) => (typeof value === "number" ? value : Number(value) || 0)));
+}
+
+function perClassMetricRows(metrics: Record<string, unknown>) {
+  return Object.entries(metrics)
+    .filter(([label]) => !["accuracy", "macro avg", "weighted avg", "micro avg"].includes(label.toLowerCase()))
+    .map(([label, value]) => {
+      const record = recordObject(value);
+      return {
+        label,
+        precision: numberPayload(record.precision),
+        recall: numberPayload(record.recall),
+        f1: numberPayload(record["f1-score"]) ?? numberPayload(record.f1),
+      };
+    })
+    .filter((row) => row.precision !== null || row.recall !== null || row.f1 !== null);
 }
 
 function formatCurrency(value: number) {
@@ -2780,6 +3127,22 @@ function formatSeconds(value: number) {
 
 function formatMaybeMetric(value: number) {
   if (!value) return "-";
+  return value.toFixed(3);
+}
+
+function formatLossGap(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return "-";
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(3)}`;
+}
+
+function formatSeedVariance(value: number | null, runCount: number) {
+  if (value === null || runCount < 2 || !Number.isFinite(value)) return "-";
+  return `${value.toFixed(5)} (${runCount})`;
+}
+
+function formatMetricNumber(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return "-";
   return value.toFixed(3);
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -92,7 +93,10 @@ const (
 	maxLLMPlannerExperiments            = 5
 	plannerMinimumMeaningfulImprovement = 0.005
 	plannerNoImprovementRoundsToSelect  = 2
+	plannerBackendValidationRetryLimit  = 1
 )
+
+var errNoNovelFollowUpExperiments = fmt.Errorf("%w: no novel follow-up experiments", store.ErrInvalidRequest)
 
 type updateDatasetProfileRequest struct {
 	Profile map[string]any `json:"profile" binding:"required"`
@@ -115,6 +119,32 @@ type createChampionDemoPredictionRequest struct {
 	TrueLabel     string         `json:"true_label"`
 	ImageMetadata map[string]any `json:"image_metadata"`
 	TopK          int            `json:"top_k"`
+}
+
+type championExportResultRequest struct {
+	Status           string         `json:"status"`
+	ArtifactURI      string         `json:"artifact_uri"`
+	Metadata         map[string]any `json:"metadata"`
+	ValidationErrors []string       `json:"validation_errors"`
+	Error            string         `json:"error"`
+}
+
+type championDemoPredictionResultRequest struct {
+	Status         string                    `json:"status"`
+	PredictedLabel string                    `json:"predicted_label"`
+	TrueLabel      string                    `json:"true_label"`
+	Confidence     *float64                  `json:"confidence"`
+	TopK           []runs.DemoPredictionTopK `json:"top_k"`
+	LatencyMS      *float64                  `json:"latency_ms"`
+	Correct        *bool                     `json:"correct"`
+	Error          string                    `json:"error"`
+	ImageMetadata  map[string]any            `json:"image_metadata"`
+}
+
+type mergeDatasetVisualExemplarsRequest struct {
+	VisualExemplars []datasets.VisualExemplar `json:"visual_exemplars"`
+	DemoImages      []datasets.VisualExemplar `json:"demo_images"`
+	Exemplars       []datasets.VisualExemplar `json:"exemplars"`
 }
 
 type reportTrainingRunSummaryRequest = runs.TrainingRunSummaryUpdate
@@ -287,6 +317,66 @@ func (s *Server) listDatasetVisualExemplars(c *gin.Context) {
 	})
 }
 
+func (s *Server) mergeDatasetVisualExemplars(c *gin.Context) {
+	var req mergeDatasetVisualExemplarsRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	dataset, err := s.store.GetDataset(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if dataset.Status != datasets.StatusProfiled {
+		writeStoreError(c, fmt.Errorf("%w: dataset must be profiled before visual exemplars can be merged", store.ErrInvalidRequest))
+		return
+	}
+
+	visualExemplars := req.VisualExemplars
+	if len(visualExemplars) == 0 && len(req.Exemplars) > 0 {
+		visualExemplars = req.Exemplars
+	}
+	if err := validateVisualExemplarPack(visualExemplars, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}); err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if err := validateVisualExemplarPack(req.DemoImages, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}); err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	profile := copyMap(dataset.Profile)
+	if len(visualExemplars) > 0 {
+		profile["visual_exemplars"] = visualExemplarsToProfileValues(mergeVisualExemplars(cappedVisualExemplars(profile, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}, "visual_exemplars"), visualExemplars, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}))
+	}
+	if len(req.DemoImages) > 0 {
+		profile["demo_images"] = visualExemplarsToProfileValues(mergeVisualExemplars(cappedVisualExemplars(profile, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}, "demo_images"), req.DemoImages, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}))
+	}
+	profile["visual_exemplar_audit"] = map[string]any{
+		"updated_at":             time.Now().UTC().Format(time.RFC3339),
+		"visual_exemplar_count":  len(cappedVisualExemplars(profile, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}, "visual_exemplars")),
+		"demo_image_count":       len(cappedVisualExemplars(profile, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}, "demo_images")),
+		"source_of_truth":        "datasets.profile",
+		"max_total_images":       48,
+		"max_images_per_class":   6,
+		"max_total_size_bytes":   3_000_000,
+		"backend_validated_pack": true,
+	}
+
+	updated, err := s.store.UpdateDatasetProfile(dataset.ID, profile)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"dataset":          updated,
+		"visual_exemplars": cappedVisualExemplars(updated.Profile, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}, "visual_exemplars"),
+		"demo_images":      cappedVisualExemplars(updated.Profile, visualExemplarCaps{MaxTotalImages: 48, MaxPerClass: 6, MaxBytes: 3_000_000}, "demo_images"),
+	})
+}
+
 func (s *Server) createJob(c *gin.Context) {
 	var req createJobRequest
 	if !bindJSON(c, &req) {
@@ -386,6 +476,7 @@ func (s *Server) upsertTrainingRunEvaluation(c *gin.Context) {
 		return
 	}
 
+	req = s.enrichTrainingRunEvaluationUpdate(c.Param("id"), req)
 	evaluation, err := s.store.UpsertTrainingRunEvaluation(c.Param("id"), req)
 	if err != nil {
 		writeStoreError(c, err)
@@ -423,6 +514,167 @@ func (s *Server) listProjectTrainingRunEvaluations(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"evaluations": evaluations})
+}
+
+func (s *Server) enrichTrainingRunEvaluationUpdate(jobID string, update runs.TrainingRunEvaluationUpdate) runs.TrainingRunEvaluationUpdate {
+	summary, err := s.store.GetTrainingRunSummary(jobID)
+	if err != nil {
+		return update
+	}
+	metrics, err := s.store.ListJobMetrics(jobID)
+	if err != nil {
+		metrics = nil
+	}
+	diagnostics := trainingRunDiagnostics(summary, metrics)
+	if len(diagnostics) == 0 {
+		return update
+	}
+
+	holisticScores := copyPayloadMap(update.HolisticScores)
+	holisticScores["training_diagnostics"] = diagnostics
+	holisticScores["train_validation_gap"] = diagnostics["train_validation_gap"]
+	holisticScores["divergence_status"] = diagnostics["status"]
+	holisticScores["divergence_detected"] = diagnostics["divergence_detected"]
+	update.HolisticScores = holisticScores
+	return update
+}
+
+func trainingRunDiagnostics(summary runs.TrainingRunSummary, metrics []jobs.EpochMetric) map[string]any {
+	trainLoss, valLoss, hasLosses := finalTrainValidationLosses(summary, metrics)
+	if !hasLosses {
+		return nil
+	}
+
+	firstTrainLoss, lastTrainLoss, hasTrainTrend := metricFirstLast(metrics, "train_loss", "training_loss", "loss")
+	firstValLoss, lastValLoss, hasValTrend := metricFirstLast(metrics, "val_loss", "validation_loss")
+	if !hasTrainTrend {
+		firstTrainLoss = trainLoss
+		lastTrainLoss = trainLoss
+	}
+	if !hasValTrend {
+		firstValLoss = valLoss
+		lastValLoss = valLoss
+	}
+
+	gap := valLoss - trainLoss
+	ratio := 0.0
+	if trainLoss > 0 {
+		ratio = valLoss / trainLoss
+	}
+	trainDelta := lastTrainLoss - firstTrainLoss
+	valDelta := lastValLoss - firstValLoss
+	diverging := hasTrainTrend && hasValTrend && trainDelta < -0.01 && valDelta > 0.01
+
+	status := "stable"
+	interpretation := "Training and validation losses are moving together closely enough for the current run."
+	if diverging {
+		status = "diverging"
+		interpretation = "Training loss is improving while validation loss is worsening; treat this as an overfitting or data-shift signal."
+	} else if gap > 0.20 && ratio > 1.25 {
+		status = "overfitting_risk"
+		interpretation = "Validation loss is materially higher than training loss, so the run may not generalize well."
+	} else if gap < -0.10 && ratio > 0 && ratio < 0.90 {
+		status = "validation_easier_than_train"
+		interpretation = "Validation loss is lower than training loss; check split difficulty before comparing this run to others."
+	}
+
+	severity := 0.0
+	if diverging {
+		severity = 0.75
+	}
+	if gap > 0 {
+		severity = maxFloat(severity, minFloat(1, gap/0.75))
+	}
+	if ratio > 1 {
+		severity = maxFloat(severity, minFloat(1, (ratio-1)/1.5))
+	}
+
+	return map[string]any{
+		"computed_by":           "backend_training_diagnostics_v1",
+		"status":                status,
+		"interpretation":        interpretation,
+		"divergence_detected":   diverging || status == "overfitting_risk",
+		"train_loss":            roundDiagnosticFloat(trainLoss),
+		"val_loss":              roundDiagnosticFloat(valLoss),
+		"train_validation_gap":  roundDiagnosticFloat(gap),
+		"val_train_loss_ratio":  roundDiagnosticFloat(ratio),
+		"train_loss_delta":      roundDiagnosticFloat(trainDelta),
+		"val_loss_delta":        roundDiagnosticFloat(valDelta),
+		"severity":              roundDiagnosticFloat(severity),
+		"epochs_observed":       maxInt(summary.EpochsCompleted, len(metrics)),
+		"trend_epochs_observed": len(metrics),
+	}
+}
+
+func finalTrainValidationLosses(summary runs.TrainingRunSummary, metrics []jobs.EpochMetric) (float64, float64, bool) {
+	trainLoss := 0.0
+	valLoss := 0.0
+	hasTrain := false
+	hasVal := false
+	for _, metric := range metrics {
+		if value, ok := metricFloat(metric.Metrics, "train_loss", "training_loss", "loss"); ok {
+			trainLoss = value
+			hasTrain = true
+		}
+		if value, ok := metricFloat(metric.Metrics, "val_loss", "validation_loss"); ok {
+			valLoss = value
+			hasVal = true
+		}
+	}
+	if hasTrain && hasVal {
+		return trainLoss, valLoss, true
+	}
+	if summary.FinalTrainLoss > 0 && summary.FinalValLoss > 0 {
+		return summary.FinalTrainLoss, summary.FinalValLoss, true
+	}
+	return 0, 0, false
+}
+
+func metricFirstLast(metrics []jobs.EpochMetric, keys ...string) (float64, float64, bool) {
+	first := 0.0
+	last := 0.0
+	found := false
+	for _, metric := range metrics {
+		value, ok := metricFloat(metric.Metrics, keys...)
+		if !ok {
+			continue
+		}
+		if !found {
+			first = value
+		}
+		last = value
+		found = true
+	}
+	return first, last, found
+}
+
+func metricFloat(metrics map[string]float64, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		value, ok := metrics[key]
+		if ok && isFiniteFloat(value) {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func copyPayloadMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func roundDiagnosticFloat(value float64) float64 {
+	if !isFiniteFloat(value) {
+		return 0
+	}
+	return math.Round(value*1_000_000) / 1_000_000
+}
+
+func isFiniteFloat(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func (s *Server) getProjectChampion(c *gin.Context) {
@@ -485,15 +737,18 @@ func (s *Server) createProjectChampionExport(c *gin.Context) {
 		return
 	}
 
-	artifactURI := strings.TrimSpace(req.ArtifactURI)
+	requestArtifactURI := strings.TrimSpace(req.ArtifactURI)
+	artifactURI := requestArtifactURI
 	if artifactURI == "" {
 		artifactURI = championArtifactURI(champion.DeploymentProfile)
 	}
-	status := runs.ChampionExportStatusReady
+	status := runs.ChampionExportStatusPending
 	validationErrors := []string{}
 	if artifactURI == "" {
 		status = runs.ChampionExportStatusPendingArtifact
 		validationErrors = append(validationErrors, "selected champion has no exportable artifact URI yet")
+	} else if requestArtifactURI != "" {
+		status = runs.ChampionExportStatusReady
 	}
 
 	metadata := championExportMetadata(champion, format, req.Metadata)
@@ -510,6 +765,23 @@ func (s *Server) createProjectChampionExport(c *gin.Context) {
 	if err != nil {
 		writeStoreError(c, err)
 		return
+	}
+	datasetID := championDatasetID(champion, job)
+	if datasetID != "" && export.Status != runs.ChampionExportStatusReady {
+		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateExportChampion, map[string]any{
+			"dataset_id":      datasetID,
+			"champion_id":     champion.ID,
+			"champion_job_id": champion.JobID,
+			"export_id":       export.ID,
+			"format":          export.Format,
+			"artifact_uri":    artifactURI,
+			"metadata":        metadata,
+		}, func(existing jobs.ExperimentJob) bool {
+			return jobConfigString(existing.Config, "export_id") == export.ID
+		}); err != nil {
+			writeStoreError(c, err)
+			return
+		}
 	}
 	if _, err := s.store.CreateExecutionEvent(projectID, champion.PlanID, execution.EventChampionExportRequested, fmt.Sprintf("Champion export requested for job %s.", champion.JobID), map[string]any{
 		"champion_id": champion.ID,
@@ -587,6 +859,10 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	datasetID := champion.DatasetID
+	if err == nil {
+		datasetID = dataset.ID
+	}
 	imageID := strings.TrimSpace(req.ImageID)
 	trueLabel := strings.TrimSpace(req.TrueLabel)
 	imageMetadata := map[string]any{}
@@ -617,14 +893,49 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		ImageURI:      imageURI,
 		ImageID:       imageID,
 		ImageMetadata: imageMetadata,
-		Status:        runs.ChampionDemoPredictionStatusRuntimeUnavailable,
+		Status:        runs.ChampionDemoPredictionStatusPending,
 		TrueLabel:     trueLabel,
 		TopK:          []runs.DemoPredictionTopK{},
-		Error:         "champion demo prediction runtime is not wired yet",
 	})
 	if err != nil {
 		writeStoreError(c, err)
 		return
+	}
+	readyExport, hasReadyExport := usableChampionExport(s.store, champion.ProjectID, champion.ID)
+	runtimeAvailable := hasReadyExport
+	if hasReadyExport {
+		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateChampionDemoPrediction, map[string]any{
+			"dataset_id":             datasetID,
+			"champion_id":            champion.ID,
+			"champion_job_id":        champion.JobID,
+			"prediction_id":          prediction.ID,
+			"export_id":              readyExport.ID,
+			"export_format":          readyExport.Format,
+			"export_artifact_uri":    readyExport.ArtifactURI,
+			"manifest_path":          championExportManifestPath(readyExport.Metadata),
+			"export_metadata":        readyExport.Metadata,
+			"image_uri":              imageURI,
+			"image_id":               imageID,
+			"true_label":             trueLabel,
+			"top_k":                  req.TopK,
+			"requested_at":           time.Now().UTC().Format(time.RFC3339),
+			"prediction_contract":    "worker reports via /jobs/:id/champion-demo-prediction-result",
+			"backend_runs_inference": false,
+		}, func(existing jobs.ExperimentJob) bool {
+			return jobConfigString(existing.Config, "prediction_id") == prediction.ID
+		}); err != nil {
+			writeStoreError(c, err)
+			return
+		}
+	} else {
+		prediction, err = s.store.UpdateChampionDemoPrediction(prediction.ID, runs.ChampionDemoPredictionUpdate{
+			Status: runs.ChampionDemoPredictionStatusRuntimeUnavailable,
+			Error:  "no READY champion export is available for worker-backed demo prediction",
+		})
+		if err != nil {
+			writeStoreError(c, err)
+			return
+		}
 	}
 	if _, err := s.store.CreateExecutionEvent(champion.ProjectID, champion.PlanID, execution.EventChampionDemoPrediction, fmt.Sprintf("Champion demo prediction requested for job %s.", champion.JobID), map[string]any{
 		"champion_id":   champion.ID,
@@ -638,7 +949,7 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"prediction":        prediction,
-		"runtime_available": false,
+		"runtime_available": runtimeAvailable,
 		"contract": gin.H{
 			"champion_job_id": champion.JobID,
 			"image_uri":       imageURI,
@@ -676,6 +987,12 @@ func (s *Server) scheduleFollowUpExperiments(c *gin.Context) {
 
 	plan, created, err := s.ensureFollowUpPlan(projectID, sourcePlan, decision)
 	if err != nil {
+		if errors.Is(err, errNoNovelFollowUpExperiments) {
+			c.JSON(http.StatusOK, scheduleFollowUpExperimentsResponse{
+				Decision: decision,
+			})
+			return
+		}
 		writeStoreError(c, err)
 		return
 	}
@@ -775,6 +1092,9 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		return plans.ExperimentPlan{}, false, err
 	}
 	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		if err := s.validateExistingFollowUpPlanStillNovel(projectID, decision.ID, existingPlan, projectPlans); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
 		return existingPlan, false, nil
 	}
 
@@ -782,11 +1102,18 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
+	experiments, skippedExperiments := filterNovelPlannedExperiments(experiments, projectPlans)
+	if len(experiments) == 0 {
+		message := "Follow-up scheduling blocked because every proposed experiment duplicated an existing experiment or only changed minor tuning knobs."
+		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, skippedExperiments)
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: follow-up decision has no novel experiments after filtering duplicate or minor-only repeats", errNoNovelFollowUpExperiments)
+	}
 
 	warnings := []string{
 		fmt.Sprintf("Follow-up plan generated from reviewer decision %s.", decision.ID),
 		fmt.Sprintf("Previous plan: %s.", sourcePlan.ID),
 	}
+	warnings = append(warnings, skippedExperiments...)
 
 	plan, err := s.store.CreateExperimentPlan(
 		projectID,
@@ -806,6 +1133,45 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	}
 
 	return plan, true, nil
+}
+
+func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisionID string, followUpPlan plans.ExperimentPlan, projectPlans []plans.ExperimentPlan) error {
+	priorPlans := make([]plans.ExperimentPlan, 0, len(projectPlans))
+	for _, plan := range projectPlans {
+		if plan.ID == followUpPlan.ID {
+			continue
+		}
+		priorPlans = append(priorPlans, plan)
+	}
+	for index, experiment := range followUpPlan.Experiments {
+		if err := validatePlannedExperiment(experiment, index); err != nil {
+			message := fmt.Sprintf("Existing follow-up plan %s is blocked because experiment %d is no longer valid.", followUpPlan.ID, index)
+			s.recordFollowUpValidationBlocked(projectID, followUpPlan.ID, decisionID, followUpPlan.ID, message, []string{err.Error()})
+			return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+		}
+	}
+	filtered, skippedExperiments := filterNovelPlannedExperiments(followUpPlan.Experiments, priorPlans)
+	if len(skippedExperiments) == 0 && len(filtered) == len(followUpPlan.Experiments) {
+		return nil
+	}
+	message := fmt.Sprintf("Existing follow-up plan %s is blocked because it no longer passes backend novelty validation.", followUpPlan.ID)
+	s.recordFollowUpValidationBlocked(projectID, followUpPlan.ID, decisionID, followUpPlan.ID, message, skippedExperiments)
+	return fmt.Errorf("%w: existing follow-up plan %s is no longer schedulable", errNoNovelFollowUpExperiments, followUpPlan.ID)
+}
+
+func (s *Server) recordFollowUpValidationBlocked(projectID string, planID string, decisionID string, followUpPlanID string, message string, skippedExperiments []string) {
+	payload := map[string]any{
+		"decision_id":               decisionID,
+		"backend_validation_status": "blocked",
+		"backend_validation_error":  "no novel follow-up experiments after filtering duplicate or minor-only repeats",
+		"skipped_experiments":       skippedExperiments,
+	}
+	if followUpPlanID != "" {
+		payload["follow_up_plan_id"] = followUpPlanID
+	}
+	if _, err := s.store.CreateExecutionEvent(projectID, planID, execution.EventAgentOutcomeRecorded, message, payload); err != nil {
+		log.Printf("record follow-up validation block failed for project %s decision %s: %v", projectID, decisionID, err)
+	}
 }
 
 func (s *Server) createPendingStrategyScorecard(projectID string, sourcePlan plans.ExperimentPlan, decision decisions.AgentDecision, followUpPlan plans.ExperimentPlan) (strategies.StrategyScorecard, error) {
@@ -924,8 +1290,15 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 		return result, nil
 	}
 
-	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
-		result.FollowUpPlan = &existingPlan
+	if _, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		followUpPlan, _, err := s.ensureFollowUpPlan(project.ID, latestPlan, decision)
+		if err != nil {
+			if errors.Is(err, errNoNovelFollowUpExperiments) {
+				return result, nil
+			}
+			return automaticExperimentReviewResult{}, err
+		}
+		result.FollowUpPlan = &followUpPlan
 		return s.executeAutomaticFollowUpPlan(result)
 	}
 
@@ -942,6 +1315,9 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 
 	followUpPlan, _, err := s.ensureFollowUpPlan(project.ID, latestPlan, decision)
 	if err != nil {
+		if errors.Is(err, errNoNovelFollowUpExperiments) {
+			return result, nil
+		}
 		return automaticExperimentReviewResult{}, err
 	}
 
@@ -957,6 +1333,9 @@ func (s *Server) executeAutomaticFollowUpPlan(result automaticExperimentReviewRe
 	req := s.defaultExecuteExperimentPlanRequest()
 	planExecution, err := s.executeStoredExperimentPlan(result.FollowUpPlan.ID, req)
 	if err != nil {
+		if errors.Is(err, errNoNovelFollowUpExperiments) {
+			return result, nil
+		}
 		if _, eventErr := s.store.CreateExecutionEvent(
 			result.FollowUpPlan.ProjectID,
 			result.FollowUpPlan.ID,
@@ -1299,6 +1678,194 @@ func (s *Server) listProjectExecutionEvents(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+func (s *Server) streamProjectExecutionEvents(c *gin.Context) {
+	projectID := c.Param("id")
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	interval, _ := strconv.Atoi(c.DefaultQuery("interval_ms", "2000"))
+	if interval < 500 {
+		interval = 500
+	}
+	if interval > 10000 {
+		interval = 10000
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	lastID := c.GetHeader("Last-Event-ID")
+	delivered := map[string]bool{}
+	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
+	defer ticker.Stop()
+
+	send := func() bool {
+		events, err := s.store.ListProjectExecutionEvents(projectID, limit)
+		if err != nil {
+			c.SSEvent("error", gin.H{"error": err.Error()})
+			c.Writer.Flush()
+			return false
+		}
+		sort.Slice(events, func(i, j int) bool {
+			return events[i].CreatedAt.Before(events[j].CreatedAt)
+		})
+		seenLastID := lastID == ""
+		for _, event := range events {
+			if delivered[event.ID] {
+				continue
+			}
+			if !seenLastID {
+				if event.ID == lastID {
+					seenLastID = true
+				}
+				continue
+			}
+			c.Writer.WriteString("id: " + event.ID + "\n")
+			c.SSEvent("execution_event", event)
+			delivered[event.ID] = true
+			lastID = event.ID
+		}
+		if !seenLastID {
+			lastID = ""
+		}
+		c.Writer.Flush()
+		return true
+	}
+
+	send()
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) reportChampionExportResult(c *gin.Context) {
+	var req championExportResultRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	job, err := s.store.GetJob(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if job.Template != jobs.TemplateExportChampion {
+		writeStoreError(c, fmt.Errorf("%w: job is not a champion export job", store.ErrInvalidRequest))
+		return
+	}
+	exportID := jobConfigString(job.Config, "export_id")
+	if exportID == "" {
+		writeStoreError(c, fmt.Errorf("%w: export job is missing export_id", store.ErrInvalidRequest))
+		return
+	}
+	status := normalizeChampionExportResultStatus(req.Status)
+	if status == "" {
+		writeStoreError(c, fmt.Errorf("%w: export status must be READY, FAILED, or PENDING_ARTIFACT", store.ErrInvalidRequest))
+		return
+	}
+	if status == runs.ChampionExportStatusReady && strings.TrimSpace(req.ArtifactURI) == "" {
+		writeStoreError(c, fmt.Errorf("%w: artifact_uri is required for READY export result", store.ErrInvalidRequest))
+		return
+	}
+
+	export, err := s.store.UpdateChampionExport(exportID, runs.ChampionExportUpdate{
+		Status:           status,
+		ArtifactURI:      strings.TrimSpace(req.ArtifactURI),
+		Metadata:         req.Metadata,
+		ValidationErrors: req.ValidationErrors,
+		Error:            strings.TrimSpace(req.Error),
+	})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if status == runs.ChampionExportStatusReady {
+		job, err = s.store.CompleteJob(job.ID, "")
+	} else if status == runs.ChampionExportStatusFailed {
+		message := strings.TrimSpace(req.Error)
+		if message == "" {
+			message = "champion export failed"
+		}
+		job, err = s.store.FailJob(job.ID, message)
+	}
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"export": export, "job": job})
+}
+
+func (s *Server) reportChampionDemoPredictionResult(c *gin.Context) {
+	var req championDemoPredictionResultRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	job, err := s.store.GetJob(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if job.Template != jobs.TemplateChampionDemoPrediction {
+		writeStoreError(c, fmt.Errorf("%w: job is not a champion demo prediction job", store.ErrInvalidRequest))
+		return
+	}
+	predictionID := jobConfigString(job.Config, "prediction_id")
+	if predictionID == "" {
+		writeStoreError(c, fmt.Errorf("%w: prediction job is missing prediction_id", store.ErrInvalidRequest))
+		return
+	}
+	status := normalizeChampionDemoPredictionResultStatus(req.Status)
+	if status == "" {
+		writeStoreError(c, fmt.Errorf("%w: prediction status must be SUCCEEDED, FAILED, or RUNTIME_UNAVAILABLE", store.ErrInvalidRequest))
+		return
+	}
+	if status == runs.ChampionDemoPredictionStatusSucceeded && strings.TrimSpace(req.PredictedLabel) == "" {
+		writeStoreError(c, fmt.Errorf("%w: predicted_label is required for successful prediction", store.ErrInvalidRequest))
+		return
+	}
+
+	prediction, err := s.store.UpdateChampionDemoPrediction(predictionID, runs.ChampionDemoPredictionUpdate{
+		Status:         status,
+		PredictedLabel: strings.TrimSpace(req.PredictedLabel),
+		TrueLabel:      strings.TrimSpace(req.TrueLabel),
+		Confidence:     req.Confidence,
+		TopK:           req.TopK,
+		LatencyMS:      req.LatencyMS,
+		Correct:        req.Correct,
+		Error:          strings.TrimSpace(req.Error),
+		ImageMetadata:  req.ImageMetadata,
+	})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if status == runs.ChampionDemoPredictionStatusSucceeded {
+		job, err = s.store.CompleteJob(job.ID, "")
+	} else if status == runs.ChampionDemoPredictionStatusFailed {
+		message := strings.TrimSpace(req.Error)
+		if message == "" {
+			message = "champion demo prediction failed"
+		}
+		job, err = s.store.FailJob(job.ID, message)
+	} else {
+		job, err = s.store.CompleteJob(job.ID, "")
+	}
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"prediction": prediction, "job": job})
 }
 
 func (s *Server) completeJob(c *gin.Context) {
@@ -1688,12 +2255,8 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 	defer cancel()
 
-	trace, err := agent.PlanWithTrace(ctx, input)
-	acceptedForMemory := err == nil
-	invocation, invocationErr := s.recordExperimentPlannerInvocation(input, config, trace, acceptedForMemory)
-	if invocationErr != nil {
-		log.Printf("experiment planner invocation write failed for plan %s: %v", summary.PlanID, invocationErr)
-	}
+	plannerAttempt, err := s.runExperimentPlannerWithBackendValidationRetry(ctx, agent, input, config, automationSettings.AgentMode)
+	invocation := plannerAttempt.Invocation
 	if err != nil {
 		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Experiment Planner failed for plan %s.", summary.PlanID), map[string]any{
 			"invocation_id": invocation.ID,
@@ -1704,17 +2267,9 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		return false, err
 	}
 
-	recommendation := applyExperimentPlannerStopCriteria(trace.Recommendation, input)
-	payload, err := experimentPlannerDecisionPayload(recommendation, invocation, automationSettings.AgentMode, input)
-	if err != nil {
-		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Experiment Planner proposal failed validation for plan %s.", summary.PlanID), map[string]any{
-			"invocation_id": invocation.ID,
-			"error":         err.Error(),
-		}); eventErr != nil {
-			log.Printf("record experiment planner validation event failed: %v", eventErr)
-		}
-		return false, err
-	}
+	input = plannerAttempt.Input
+	recommendation := plannerAttempt.Recommendation
+	payload := plannerAttempt.Payload
 
 	memoryPayload, err := mapFromStruct(recommendation)
 	if err != nil {
@@ -1906,6 +2461,7 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		StrategyScorecards:           strategyScorecards,
 		PriorPlans:                   projectPlans,
 		PriorJobs:                    projectJobs,
+		PriorSummaries:               summaries,
 		PriorEvaluations:             evaluations,
 		PriorMemory:                  priorMemory,
 		ExistingExperimentSignatures: experimentSignaturesForPlans(projectPlans),
@@ -1947,6 +2503,128 @@ func (s *Server) recordExperimentPlannerInvocation(
 	})
 }
 
+type experimentPlannerAttemptResult struct {
+	Input          agents.ExperimentPlannerInput
+	Trace          agents.ExperimentPlanningTrace
+	Invocation     memory.AgentInvocation
+	Recommendation agents.ExperimentPlanningRecommendation
+	Payload        map[string]any
+}
+
+func (s *Server) runExperimentPlannerWithBackendValidationRetry(
+	ctx context.Context,
+	agent agents.ExperimentPlannerAgent,
+	input agents.ExperimentPlannerInput,
+	config llm.Config,
+	agentMode string,
+) (experimentPlannerAttemptResult, error) {
+	attemptInput := input
+	var result experimentPlannerAttemptResult
+	var lastErr error
+	for attempt := 0; attempt <= plannerBackendValidationRetryLimit; attempt++ {
+		trace, err := agent.PlanWithTrace(ctx, attemptInput)
+		acceptedForMemory := err == nil
+		invocation, invocationErr := s.recordExperimentPlannerInvocation(attemptInput, config, trace, acceptedForMemory)
+		if invocationErr != nil {
+			log.Printf("experiment planner invocation write failed for plan %s: %v", input.SourcePlan.ID, invocationErr)
+		}
+		result = experimentPlannerAttemptResult{
+			Input:      attemptInput,
+			Trace:      trace,
+			Invocation: invocation,
+		}
+		if err != nil {
+			return result, err
+		}
+
+		recommendation := applyExperimentPlannerStopCriteria(trace.Recommendation, attemptInput)
+		payload, err := experimentPlannerDecisionPayload(recommendation, invocation, agentMode, attemptInput)
+		if err == nil {
+			if attempt > 0 {
+				payload["validation_retry_count"] = attempt
+				payload["validation_feedback_applied"] = attemptInput.ValidationFeedback
+			}
+			result.Recommendation = recommendation
+			result.Payload = payload
+			return result, nil
+		}
+
+		lastErr = err
+		s.recordPlannerValidationRejection(invocation, err, attempt, attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation))
+		if attempt >= plannerBackendValidationRetryLimit || !shouldRetryExperimentPlannerValidation(recommendation) {
+			result.Recommendation = recommendation
+			return result, err
+		}
+		attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, err, attempt+1))
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%w: experiment planner validation retry failed", store.ErrInvalidRequest)
+	}
+	return result, lastErr
+}
+
+func (s *Server) recordPlannerValidationRejection(invocation memory.AgentInvocation, validationErr error, attempt int, willRetry bool) {
+	if invocation.ID == "" || validationErr == nil {
+		return
+	}
+	if _, err := s.store.UpdateAgentInvocationDownstreamOutcome(invocation.ID, map[string]any{
+		"backend_validation_status": "rejected",
+		"backend_validation_error":  validationErr.Error(),
+		"retry_attempt":             attempt,
+		"will_retry":                willRetry,
+	}); err != nil {
+		log.Printf("update planner invocation validation outcome failed for invocation %s: %v", invocation.ID, err)
+	}
+}
+
+func shouldRetryExperimentPlannerValidation(recommendation agents.ExperimentPlanningRecommendation) bool {
+	return strings.EqualFold(strings.TrimSpace(recommendation.DecisionType), decisions.TypeAddExperiments)
+}
+
+func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommendation, validationErr error, attempt int) agents.PlannerValidationFeedback {
+	rejectedExperiments := make([]string, 0, len(recommendation.ProposedExperiments))
+	rejectedModels := []string{}
+	seenModels := map[string]bool{}
+	for _, experiment := range recommendation.ProposedExperiments {
+		rejectedExperiments = append(rejectedExperiments, experimentFeedbackSummary(experiment))
+		model := strings.ToLower(strings.TrimSpace(experiment.Model))
+		if model != "" && !seenModels[model] {
+			seenModels[model] = true
+			rejectedModels = append(rejectedModels, experiment.Model)
+		}
+	}
+	return agents.PlannerValidationFeedback{
+		Attempt:             attempt,
+		ValidationError:     validationErr.Error(),
+		RejectedDecision:    recommendation.DecisionType,
+		RejectedModels:      rejectedModels,
+		RejectedExperiments: rejectedExperiments,
+		Instructions: []string{
+			"Return corrected JSON only.",
+			"Do not repeat rejected experiment mechanisms.",
+			"Change a meaningful mechanism such as model family, preprocessing, augmentation policy, sampling/class balancing, scheduler, optimizer, regularization, or resolution strategy.",
+			"Only propose experiments that backend validation can schedule.",
+		},
+	}
+}
+
+func experimentFeedbackSummary(experiment plans.PlannedExperiment) string {
+	return strings.TrimSpace(fmt.Sprintf(
+		"template=%s model=%s epochs=%d batch_size=%d learning_rate=%g image_size=%d resolution_strategy=%s augmentation_policy=%s class_balancing=%s sampling_strategy=%s reason=%s",
+		experiment.Template,
+		experiment.Model,
+		experiment.Epochs,
+		experiment.BatchSize,
+		experiment.LearningRate,
+		experiment.ImageSize,
+		experiment.ResolutionStrategy,
+		experiment.AugmentationPolicy,
+		experiment.ClassBalancing,
+		experiment.SamplingStrategy,
+		experiment.Reason,
+	))
+}
+
 func applyExperimentPlannerStopCriteria(
 	recommendation agents.ExperimentPlanningRecommendation,
 	input agents.ExperimentPlannerInput,
@@ -1956,25 +2634,79 @@ func applyExperimentPlannerStopCriteria(
 	if decisionType != decisions.TypeAddExperiments {
 		return recommendation
 	}
-	if input.CurrentChampion == nil || input.NoImprovementRounds < plannerNoImprovementRoundsToSelect {
+	stopReason, guardTag, ok := experimentPlannerBackendStopReason(input)
+	if !ok {
 		return recommendation
 	}
 
-	stopReason := fmt.Sprintf(
-		"Current champion %s remains unbeaten after %d consecutive follow-up plan(s) with less than %.3f target-metric improvement.",
-		input.CurrentChampion.JobID,
-		input.NoImprovementRounds,
-		input.MinimumMeaningfulImprovement,
-	)
 	recommendation.DecisionType = decisions.TypeSelectChampion
 	recommendation.ChampionJobID = input.CurrentChampion.JobID
 	recommendation.ProposedExperiments = nil
 	recommendation.StopReason = stopReason
-	recommendation.Summary = fmt.Sprintf("Select champion %s; recent follow-ups did not meaningfully improve on it.", input.CurrentChampion.JobID)
+	recommendation.Summary = fmt.Sprintf("Select champion %s; backend stop criteria found no meaningful follow-up upside.", input.CurrentChampion.JobID)
 	recommendation.Rationale = strings.TrimSpace(recommendation.Rationale + " Backend stop criteria applied: " + stopReason)
-	recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend guard converted ADD_EXPERIMENTS to SELECT_CHAMPION after repeated no-improvement rounds.")
-	recommendation.Tags = append(recommendation.Tags, "select_champion", "no_improvement_guard")
+	recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend guard converted ADD_EXPERIMENTS to SELECT_CHAMPION because additional training had insufficient meaningful upside.")
+	recommendation.Tags = append(recommendation.Tags, "select_champion", guardTag)
 	return recommendation
+}
+
+func experimentPlannerBackendStopReason(input agents.ExperimentPlannerInput) (string, string, bool) {
+	if reason, ok := nearMetricCeilingChampionStopReason(input); ok {
+		return reason, "near_metric_ceiling_guard", true
+	}
+	if input.CurrentChampion == nil || input.NoImprovementRounds < plannerNoImprovementRoundsToSelect {
+		return "", "", false
+	}
+	minimumMeaningfulImprovement := plannerMeaningfulImprovementThreshold(input.MinimumMeaningfulImprovement)
+	return fmt.Sprintf(
+		"Current champion %s remains unbeaten after %d consecutive follow-up plan(s) with less than %.3f target-metric improvement.",
+		input.CurrentChampion.JobID,
+		input.NoImprovementRounds,
+		minimumMeaningfulImprovement,
+	), "no_improvement_guard", true
+}
+
+func nearMetricCeilingChampionStopReason(input agents.ExperimentPlannerInput) (string, bool) {
+	if input.CurrentChampion == nil {
+		return "", false
+	}
+	ceiling, ok := boundedHigherIsBetterMetricCeiling(input.CurrentChampion.TargetMetric)
+	if !ok {
+		return "", false
+	}
+	minimumMeaningfulImprovement := plannerMeaningfulImprovementThreshold(input.MinimumMeaningfulImprovement)
+	headroom := ceiling - input.CurrentChampion.Score
+	if headroom < 0 {
+		headroom = 0
+	}
+	if headroom > minimumMeaningfulImprovement {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"Current champion %s already has %s %.3f, leaving %.3f possible headroom before the %.1f metric ceiling, which is below the minimum meaningful improvement %.3f.",
+		input.CurrentChampion.JobID,
+		input.CurrentChampion.TargetMetric,
+		input.CurrentChampion.Score,
+		headroom,
+		ceiling,
+		minimumMeaningfulImprovement,
+	), true
+}
+
+func plannerMeaningfulImprovementThreshold(value float64) float64 {
+	if value > 0 {
+		return value
+	}
+	return plannerMinimumMeaningfulImprovement
+}
+
+func boundedHigherIsBetterMetricCeiling(metric string) (float64, bool) {
+	switch normalizedPlannerTargetMetric(metric) {
+	case "accuracy", "macro_f1":
+		return 1.0, true
+	default:
+		return 0, false
+	}
 }
 
 func experimentPlannerDecisionPayload(
@@ -2037,7 +2769,8 @@ func experimentPlannerDecisionPayload(
 }
 
 func (s *Server) persistProjectChampionFromDecision(projectID string, decision decisions.AgentDecision) error {
-	if strings.ToUpper(strings.TrimSpace(decision.DecisionType)) != decisions.TypeSelectChampion {
+	decisionType := strings.ToUpper(strings.TrimSpace(decision.DecisionType))
+	if decisionType != decisions.TypeSelectChampion && decisionType != decisions.TypeStopProject {
 		return nil
 	}
 
@@ -2046,6 +2779,18 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		if champion, ok := experimentChampionFromPayload(decision.Payload["current_champion"]); ok {
 			championJobID = champion.JobID
 		}
+	}
+	fallbackSelection := false
+	if championJobID == "" && decisionType == decisions.TypeStopProject {
+		fallbackJobID, ok, err := s.bestAvailableChampionJobForStoppedProject(projectID, decision)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		championJobID = fallbackJobID
+		fallbackSelection = true
 	}
 	if championJobID == "" {
 		return fmt.Errorf("%w: SELECT_CHAMPION decision is missing champion_job_id", store.ErrInvalidRequest)
@@ -2097,6 +2842,14 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 	if stopReason := payloadString(decision.Payload, "stop_reason"); stopReason != "" {
 		selectionReason = strings.TrimSpace(selectionReason + " " + stopReason)
 	}
+	if fallbackSelection {
+		fallbackReason := "Backend selected the best successful run so far because the planner stopped the project without naming a champion."
+		if selectionReason == "" {
+			selectionReason = fallbackReason
+		} else {
+			selectionReason = strings.TrimSpace(selectionReason + " " + fallbackReason)
+		}
+	}
 	metrics := map[string]any{
 		"model":                  summary.Model,
 		"status":                 summary.Status,
@@ -2109,6 +2862,9 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		"final_val_loss":         summary.FinalValLoss,
 		"modal_function_call_id": summary.ModalFunctionCallID,
 		"modal_input_id":         summary.ModalInputID,
+	}
+	if fallbackSelection {
+		metrics["selection_source"] = "terminal_stop_best_available"
 	}
 	if job.ID != "" {
 		metrics["job_config"] = job.Config
@@ -2136,9 +2892,44 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		"champion_id":        champion.ID,
 		"champion_job_id":    champion.JobID,
 		"source_decision_id": decision.ID,
+		"selection_source":   metrics["selection_source"],
 		"model":              metrics["model"],
 	})
 	return err
+}
+
+func (s *Server) bestAvailableChampionJobForStoppedProject(projectID string, decision decisions.AgentDecision) (string, bool, error) {
+	targetMetric := payloadString(decision.Payload, "target_metric")
+	if targetMetric == "" && decision.PlanID != "" {
+		if plan, err := s.store.GetExperimentPlan(decision.PlanID); err == nil {
+			targetMetric = plan.TargetMetric
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return "", false, err
+		}
+	}
+	if targetMetric == "" {
+		targetMetric = "macro_f1"
+	}
+
+	summaries, err := s.store.ListProjectTrainingRunSummaries(projectID)
+	if err != nil {
+		return "", false, err
+	}
+	evaluations, err := s.store.ListProjectTrainingRunEvaluations(projectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return "", false, err
+	}
+	goalText := ""
+	if project, err := s.store.GetProject(projectID); err == nil {
+		goalText = project.Goal
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return "", false, err
+	}
+	best, ok := bestSuccessfulTrainingSummaryForObjective(targetMetric, summaries, evaluations, projectObjectiveContext(goalText))
+	if !ok {
+		return "", false, nil
+	}
+	return best.JobID, true, nil
 }
 
 func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.ExperimentPlan, decision decisions.AgentDecision, result automaticExperimentReviewResult) error {
@@ -2146,9 +2937,29 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 	if err != nil {
 		return err
 	}
-	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
-		result.FollowUpPlan = &existingPlan
-		_, err := s.executeAutomaticFollowUpPlan(result)
+	if stopReason, guardTag, ok, err := s.plannerFollowUpStopReason(projectID, sourcePlan, projectPlans); err != nil {
+		return err
+	} else if ok {
+		if _, eventErr := s.store.CreateExecutionEvent(projectID, sourcePlan.ID, execution.EventExecutionFailed, fmt.Sprintf("Planner follow-up scheduling blocked for plan %s.", sourcePlan.ID), map[string]any{
+			"source_decision_id":        decision.ID,
+			"backend_validation_status": "blocked",
+			"backend_stop_guard":        guardTag,
+			"reason":                    stopReason,
+		}); eventErr != nil {
+			log.Printf("record planner follow-up stop event failed: %v", eventErr)
+		}
+		return nil
+	}
+	if _, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		followUpPlan, _, err := s.ensureFollowUpPlan(projectID, sourcePlan, decision)
+		if err != nil {
+			if errors.Is(err, errNoNovelFollowUpExperiments) {
+				return nil
+			}
+			return err
+		}
+		result.FollowUpPlan = &followUpPlan
+		_, err = s.executeAutomaticFollowUpPlan(result)
 		return err
 	}
 
@@ -2165,12 +2976,44 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 
 	followUpPlan, _, err := s.ensureFollowUpPlan(projectID, sourcePlan, decision)
 	if err != nil {
+		if errors.Is(err, errNoNovelFollowUpExperiments) {
+			return nil
+		}
 		return err
 	}
 
 	result.FollowUpPlan = &followUpPlan
 	_, err = s.executeAutomaticFollowUpPlan(result)
 	return err
+}
+
+func (s *Server) plannerFollowUpStopReason(projectID string, sourcePlan plans.ExperimentPlan, projectPlans []plans.ExperimentPlan) (string, string, bool, error) {
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		return "", "", false, err
+	}
+	summaries, err := s.store.ListProjectTrainingRunSummaries(projectID)
+	if err != nil {
+		return "", "", false, err
+	}
+	evaluations, err := s.store.ListProjectTrainingRunEvaluations(projectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return "", "", false, err
+	}
+	currentChampion, _, _, noImprovementRounds, _ := experimentPlannerPerformanceContext(
+		sourcePlan.TargetMetric,
+		projectPlans,
+		summaries,
+		evaluations,
+		projectObjectiveContext(project.Goal),
+		sourcePlan.ID,
+	)
+	stopReason, guardTag, ok := experimentPlannerBackendStopReason(agents.ExperimentPlannerInput{
+		CurrentChampion:              currentChampion,
+		NoImprovementRounds:          noImprovementRounds,
+		MinimumMeaningfulImprovement: plannerMinimumMeaningfulImprovement,
+	})
+	return stopReason, guardTag, ok, nil
 }
 
 func planTrainingRunsComplete(plan plans.ExperimentPlan, summaries []runs.TrainingRunSummary) bool {
@@ -2954,6 +3797,13 @@ func minFloat(left float64, right float64) float64 {
 	return right
 }
 
+func maxInt(left int, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
 func profileString(profile map[string]any, key string) string {
 	value, _ := profile[key].(string)
 	return value
@@ -3243,6 +4093,12 @@ func experimentPlannerStopSignals(champion agents.ExperimentChampion, noImprovem
 	signals := []string{
 		fmt.Sprintf("Current champion is %s (%s) with %s %.3f.", champion.JobID, champion.Model, champion.TargetMetric, champion.Score),
 	}
+	if reason, ok := nearMetricCeilingChampionStopReason(agents.ExperimentPlannerInput{
+		CurrentChampion:              &champion,
+		MinimumMeaningfulImprovement: plannerMinimumMeaningfulImprovement,
+	}); ok {
+		signals = append(signals, reason)
+	}
 	if noImprovementRounds > 0 {
 		signals = append(signals, fmt.Sprintf("%d consecutive completed follow-up plan(s) did not improve the champion by at least %.3f.", noImprovementRounds, plannerMinimumMeaningfulImprovement))
 	}
@@ -3310,7 +4166,7 @@ func holisticRunScore(targetMetric string, summary runs.TrainingRunSummary, eval
 	if latencyMS := payloadFloat(evaluation.ModelProfile, "estimated_latency_ms"); latencyMS > 0 {
 		latencyScore = maxFloat(0, minFloat(1, 1-latencyMS/160))
 	}
-	costScore := maxFloat(0, minFloat(1, 1-summary.EstimatedCostUSD/0.25))
+	costScore := maxFloat(0, minFloat(1, 1-summary.EstimatedCostUSD/10))
 	runtimeScore := maxFloat(0, minFloat(1, 1-summary.RuntimeSeconds/1800))
 
 	if objectiveContext.PrimaryObjective == "low_latency_live_service" {
@@ -3392,13 +4248,16 @@ func experimentSignaturesForPlans(projectPlans []plans.ExperimentPlan) []string 
 
 func validateNovelProposedExperiments(experiments []plans.PlannedExperiment, projectPlans []plans.ExperimentPlan) error {
 	existing := map[string]bool{}
+	existingMechanisms := map[string]bool{}
 	for _, plan := range projectPlans {
 		for _, experiment := range plan.Experiments {
 			existing[experimentSignature(experiment)] = true
+			existingMechanisms[experimentMechanismSignature(experiment)] = true
 		}
 	}
 
 	proposed := map[string]bool{}
+	proposedMechanisms := map[string]bool{}
 	for index, experiment := range experiments {
 		if err := validatePlannedExperiment(experiment, index); err != nil {
 			return err
@@ -3410,9 +4269,48 @@ func validateNovelProposedExperiments(experiments []plans.PlannedExperiment, pro
 		if proposed[signature] {
 			return fmt.Errorf("%w: proposed experiment %d duplicates another proposed experiment signature %s", store.ErrInvalidRequest, index, signature)
 		}
+		mechanismSignature := experimentMechanismSignature(experiment)
+		if existingMechanisms[mechanismSignature] {
+			return fmt.Errorf("%w: proposed experiment %d only changes minor tuning knobs for an already tested experiment mechanism", store.ErrInvalidRequest, index)
+		}
+		if proposedMechanisms[mechanismSignature] {
+			return fmt.Errorf("%w: proposed experiment %d only changes minor tuning knobs relative to another proposed experiment", store.ErrInvalidRequest, index)
+		}
 		proposed[signature] = true
+		proposedMechanisms[mechanismSignature] = true
 	}
 	return nil
+}
+
+func filterNovelPlannedExperiments(experiments []plans.PlannedExperiment, projectPlans []plans.ExperimentPlan) ([]plans.PlannedExperiment, []string) {
+	existing := map[string]bool{}
+	existingMechanisms := map[string]bool{}
+	for _, plan := range projectPlans {
+		for _, experiment := range plan.Experiments {
+			existing[experimentSignature(experiment)] = true
+			existingMechanisms[experimentMechanismSignature(experiment)] = true
+		}
+	}
+
+	out := []plans.PlannedExperiment{}
+	warnings := []string{}
+	proposed := map[string]bool{}
+	proposedMechanisms := map[string]bool{}
+	for index, experiment := range experiments {
+		signature := experimentSignature(experiment)
+		mechanismSignature := experimentMechanismSignature(experiment)
+		switch {
+		case existing[signature] || proposed[signature]:
+			warnings = append(warnings, fmt.Sprintf("Skipped follow-up experiment %d because it duplicated an existing experiment signature.", index))
+		case existingMechanisms[mechanismSignature] || proposedMechanisms[mechanismSignature]:
+			warnings = append(warnings, fmt.Sprintf("Skipped follow-up experiment %d because it only changed minor tuning knobs for an already tested mechanism.", index))
+		default:
+			out = append(out, experiment)
+			proposed[signature] = true
+			proposedMechanisms[mechanismSignature] = true
+		}
+	}
+	return out, warnings
 }
 
 func experimentSignature(experiment plans.PlannedExperiment) string {
@@ -3435,6 +4333,28 @@ func experimentSignature(experiment plans.PlannedExperiment) string {
 		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
 		strings.ToLower(strings.TrimSpace(experiment.SamplingStrategy)),
 		strconv.Itoa(experiment.EarlyStoppingPatience),
+		strconv.FormatBool(experiment.Pretrained),
+		strconv.FormatBool(experiment.FreezeBackbone),
+		strings.ToLower(strings.TrimSpace(experiment.FineTuneStrategy)),
+	}, ":")
+}
+
+func experimentMechanismSignature(experiment plans.PlannedExperiment) string {
+	augmentationBlob, _ := json.Marshal(experiment.Augmentation)
+	preprocessingBlob, _ := json.Marshal(experiment.Preprocessing)
+	return strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(experiment.Template)),
+		strings.ToLower(strings.TrimSpace(experiment.Model)),
+		strconv.Itoa(experiment.ImageSize),
+		strings.ToLower(strings.TrimSpace(experiment.ResolutionStrategy)),
+		string(preprocessingBlob),
+		strings.ToLower(strings.TrimSpace(experiment.Optimizer)),
+		strings.ToLower(strings.TrimSpace(experiment.Scheduler)),
+		strconv.FormatFloat(experiment.WeightDecay, 'g', -1, 64),
+		string(augmentationBlob),
+		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
+		strings.ToLower(strings.TrimSpace(experiment.ClassBalancing)),
+		strings.ToLower(strings.TrimSpace(experiment.SamplingStrategy)),
 		strconv.FormatBool(experiment.Pretrained),
 		strconv.FormatBool(experiment.FreezeBackbone),
 		strings.ToLower(strings.TrimSpace(experiment.FineTuneStrategy)),
@@ -3676,6 +4596,9 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	if len(plan.Experiments) == 0 {
 		return executeExperimentPlanResponse{}, fmt.Errorf("%w: plan has no experiments to execute", store.ErrInvalidRequest)
 	}
+	if err := s.validateFollowUpPlanCanExecute(plan); err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
 
 	provider := req.Provider
 	if provider == "" {
@@ -3747,6 +4670,17 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		Plan: plan,
 		Jobs: out,
 	}, nil
+}
+
+func (s *Server) validateFollowUpPlanCanExecute(plan plans.ExperimentPlan) error {
+	if plan.SourceDecisionID == "" {
+		return nil
+	}
+	projectPlans, err := s.store.ListProjectExperimentPlans(plan.ProjectID)
+	if err != nil {
+		return err
+	}
+	return s.validateExistingFollowUpPlanStillNovel(plan.ProjectID, plan.SourceDecisionID, plan, projectPlans)
 }
 
 func addOptionalExperimentConfig(config map[string]any, experiment plans.PlannedExperiment) {
@@ -4246,6 +5180,211 @@ func championExportMetadata(champion runs.ProjectChampion, format string, reques
 		metadata[key] = value
 	}
 	return metadata
+}
+
+func normalizeChampionExportResultStatus(status string) string {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case runs.ChampionExportStatusReady:
+		return runs.ChampionExportStatusReady
+	case runs.ChampionExportStatusFailed:
+		return runs.ChampionExportStatusFailed
+	case runs.ChampionExportStatusPendingArtifact:
+		return runs.ChampionExportStatusPendingArtifact
+	default:
+		return ""
+	}
+}
+
+func normalizeChampionDemoPredictionResultStatus(status string) string {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case runs.ChampionDemoPredictionStatusSucceeded:
+		return runs.ChampionDemoPredictionStatusSucceeded
+	case runs.ChampionDemoPredictionStatusFailed:
+		return runs.ChampionDemoPredictionStatusFailed
+	case runs.ChampionDemoPredictionStatusRuntimeUnavailable:
+		return runs.ChampionDemoPredictionStatusRuntimeUnavailable
+	default:
+		return ""
+	}
+}
+
+func championExportManifestPath(metadata map[string]any) string {
+	manifest, _ := metadata["manifest"].(map[string]any)
+	if manifestPath := firstString(manifest, "manifest_path", "local_manifest_path"); manifestPath != "" {
+		return manifestPath
+	}
+	return firstString(metadata, "manifest_path", "local_manifest_path", "export_manifest_path")
+}
+
+func championDatasetID(champion runs.ProjectChampion, job jobs.ExperimentJob) string {
+	if champion.DatasetID != "" {
+		return champion.DatasetID
+	}
+	return jobConfigString(job.Config, "dataset_id")
+}
+
+func usableChampionExport(dataStore store.Store, projectID string, championID string) (runs.ChampionExport, bool) {
+	exports, err := dataStore.ListProjectChampionExports(projectID)
+	if err != nil {
+		return runs.ChampionExport{}, false
+	}
+	for _, export := range exports {
+		if export.ChampionID == championID && export.Status == runs.ChampionExportStatusReady && strings.TrimSpace(export.ArtifactURI) != "" {
+			return export, true
+		}
+	}
+	return runs.ChampionExport{}, false
+}
+
+func (s *Server) ensureOpenJob(projectID string, template string, config map[string]any, matches func(jobs.ExperimentJob) bool) (jobs.ExperimentJob, error) {
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	for _, job := range projectJobs {
+		if job.Template != template {
+			continue
+		}
+		if job.Status != jobs.StatusQueued && job.Status != jobs.StatusAssigned && job.Status != jobs.StatusRunning {
+			continue
+		}
+		if matches(job) {
+			return job, nil
+		}
+	}
+	return s.store.CreateJob(projectID, template, config)
+}
+
+func jobConfigString(config map[string]any, key string) string {
+	value, _ := config[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func copyMap(values map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func validateVisualExemplarPack(exemplars []datasets.VisualExemplar, caps visualExemplarCaps) error {
+	if len(exemplars) > caps.MaxTotalImages {
+		return fmt.Errorf("%w: exemplar pack exceeds max_total_images %d", store.ErrInvalidRequest, caps.MaxTotalImages)
+	}
+	perClass := map[string]int{}
+	var totalBytes int64
+	seen := map[string]bool{}
+	for _, exemplar := range exemplars {
+		uri := strings.TrimSpace(exemplar.URI)
+		if uri == "" {
+			return fmt.Errorf("%w: exemplar uri is required", store.ErrInvalidRequest)
+		}
+		className := strings.TrimSpace(exemplar.ClassName)
+		if className == "" {
+			className = strings.TrimSpace(exemplar.Label)
+		}
+		if className == "" {
+			return fmt.Errorf("%w: exemplar class_name or label is required", store.ErrInvalidRequest)
+		}
+		if exemplar.SizeBytes < 0 {
+			return fmt.Errorf("%w: exemplar size_bytes cannot be negative", store.ErrInvalidRequest)
+		}
+		if exemplar.SizeBytes > caps.MaxBytes {
+			return fmt.Errorf("%w: one exemplar exceeds max byte budget", store.ErrInvalidRequest)
+		}
+		totalBytes += exemplar.SizeBytes
+		if totalBytes > caps.MaxBytes {
+			return fmt.Errorf("%w: exemplar pack exceeds max byte budget %d", store.ErrInvalidRequest, caps.MaxBytes)
+		}
+		perClass[className]++
+		if perClass[className] > caps.MaxPerClass {
+			return fmt.Errorf("%w: exemplar pack exceeds max_per_class %d", store.ErrInvalidRequest, caps.MaxPerClass)
+		}
+		key := className + "\x00" + uri
+		if seen[key] {
+			return fmt.Errorf("%w: duplicate exemplar uri for class %s", store.ErrInvalidRequest, className)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func mergeVisualExemplars(existing []datasets.VisualExemplar, incoming []datasets.VisualExemplar, caps visualExemplarCaps) []datasets.VisualExemplar {
+	merged := append([]datasets.VisualExemplar(nil), existing...)
+	index := map[string]int{}
+	for i, exemplar := range merged {
+		index[visualExemplarKey(exemplar)] = i
+	}
+	for _, exemplar := range incoming {
+		exemplar.URI = strings.TrimSpace(exemplar.URI)
+		if exemplar.ClassName == "" {
+			exemplar.ClassName = exemplar.Label
+		}
+		key := visualExemplarKey(exemplar)
+		if existingIndex, ok := index[key]; ok {
+			merged[existingIndex] = exemplar
+			continue
+		}
+		index[key] = len(merged)
+		merged = append(merged, exemplar)
+	}
+	if err := validateVisualExemplarPack(merged, caps); err == nil {
+		return merged
+	}
+	return cappedVisualExemplarList(merged, caps)
+}
+
+func cappedVisualExemplarList(exemplars []datasets.VisualExemplar, caps visualExemplarCaps) []datasets.VisualExemplar {
+	profile := map[string]any{"items": visualExemplarsToProfileValues(exemplars)}
+	return cappedVisualExemplars(profile, caps, "items")
+}
+
+func visualExemplarKey(exemplar datasets.VisualExemplar) string {
+	className := exemplar.ClassName
+	if className == "" {
+		className = exemplar.Label
+	}
+	return strings.TrimSpace(className) + "\x00" + strings.TrimSpace(exemplar.URI)
+}
+
+func visualExemplarsToProfileValues(exemplars []datasets.VisualExemplar) []map[string]any {
+	out := make([]map[string]any, 0, len(exemplars))
+	for _, exemplar := range exemplars {
+		entry := map[string]any{
+			"uri":        strings.TrimSpace(exemplar.URI),
+			"class_name": strings.TrimSpace(exemplar.ClassName),
+		}
+		if exemplar.ID != "" {
+			entry["id"] = exemplar.ID
+		}
+		if exemplar.Label != "" {
+			entry["label"] = exemplar.Label
+		}
+		if exemplar.Width > 0 {
+			entry["width"] = exemplar.Width
+		}
+		if exemplar.Height > 0 {
+			entry["height"] = exemplar.Height
+		}
+		if exemplar.SizeBytes > 0 {
+			entry["size_bytes"] = exemplar.SizeBytes
+		}
+		if exemplar.MimeType != "" {
+			entry["mime_type"] = exemplar.MimeType
+		}
+		if exemplar.Split != "" {
+			entry["split"] = exemplar.Split
+		}
+		if exemplar.Description != "" {
+			entry["description"] = exemplar.Description
+		}
+		if len(exemplar.Metadata) > 0 {
+			entry["metadata"] = exemplar.Metadata
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func firstString(values map[string]any, keys ...string) string {

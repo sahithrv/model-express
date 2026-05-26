@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"time"
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
@@ -42,6 +43,7 @@ type Store interface {
 	CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error)
 	GetJob(id string) (jobs.ExperimentJob, error)
 	ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error)
+	RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error)
 	ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error)
 	ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
 	CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error)
@@ -56,8 +58,10 @@ type Store interface {
 	UpsertProjectChampion(champion runs.ProjectChampionUpsert) (runs.ProjectChampion, error)
 	GetProjectChampion(projectID string) (runs.ProjectChampion, error)
 	CreateChampionExport(export runs.ChampionExportCreate) (runs.ChampionExport, error)
+	UpdateChampionExport(id string, update runs.ChampionExportUpdate) (runs.ChampionExport, error)
 	ListProjectChampionExports(projectID string) ([]runs.ChampionExport, error)
 	CreateChampionDemoPrediction(prediction runs.ChampionDemoPredictionCreate) (runs.ChampionDemoPrediction, error)
+	UpdateChampionDemoPrediction(id string, update runs.ChampionDemoPredictionUpdate) (runs.ChampionDemoPrediction, error)
 	ListProjectChampionDemoPredictions(projectID string) ([]runs.ChampionDemoPrediction, error)
 
 	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)

@@ -2,10 +2,10 @@ const { app, BrowserWindow, dialog, ipcMain, Menu } = require("electron");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
-const AdmZip = require("adm-zip");
+const { Transform } = require("stream");
 const { CreateBucketCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
+const { collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
 
 let mainWindow;
 const projectWorkers = new Map();
@@ -339,23 +339,17 @@ async function uploadDatasetFolder(options) {
 
   const datasetName = path.basename(datasetPath);
   const safeName = datasetName.replace(/[^a-zA-Z0-9._-]/g, "-");
-  const tempDir = path.join(os.tmpdir(), "model-express");
-  fs.mkdirSync(tempDir, { recursive: true });
-
-  const archivePath = path.join(tempDir, `${safeName}-${Date.now()}.zip`);
-  const zip = new AdmZip();
-  zip.addLocalFolder(datasetPath);
-  zip.writeZip(archivePath);
-
-  const checksum = sha256File(archivePath);
-  const sizeBytes = fs.statSync(archivePath).size;
-
   const bucket = options.bucket ?? "model-express";
   const endpoint = options.endpoint ?? "http://localhost:9000";
   const accessKeyId = options.accessKeyId ?? "model_express";
   const secretAccessKey = options.secretAccessKey ?? "model_express_password";
   const region = options.region ?? "us-east-1";
   const key = `datasets/${projectId}/${safeName}.zip`;
+  const entries = await collectDatasetFiles(datasetPath);
+  if (entries.length === 0) {
+    throw new Error(`Dataset folder does not contain any files: ${datasetPath}`);
+  }
+  const archivePlan = planZipArchive(entries);
 
   const client = new S3Client({
     endpoint,
@@ -373,29 +367,30 @@ async function uploadDatasetFolder(options) {
     await client.send(new CreateBucketCommand({ Bucket: bucket }));
   }
 
+  const hash = crypto.createHash("sha256");
+  const hashingStream = new Transform({
+    transform(chunk, _encoding, callback) {
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  const archiveStream = createZipArchiveStream(archivePlan).pipe(hashingStream);
+
   await client.send(
     new PutObjectCommand({
       Bucket: bucket,
       Key: key,
-      Body: fs.createReadStream(archivePath),
+      Body: archiveStream,
+      ContentLength: archivePlan.archiveSize,
       ContentType: "application/zip",
-      Metadata: {
-        "checksum-sha256": checksum,
-      },
     }),
   );
 
+  const checksum = hash.digest("hex");
   return {
     name: datasetName,
     storage_uri: `s3://${bucket}/${key}`,
     checksum_sha256: checksum,
-    size_bytes: sizeBytes,
+    size_bytes: archivePlan.archiveSize,
   };
-}
-
-function sha256File(filePath) {
-  const hash = crypto.createHash("sha256");
-  const buffer = fs.readFileSync(filePath);
-  hash.update(buffer);
-  return hash.digest("hex");
 }

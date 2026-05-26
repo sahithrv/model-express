@@ -329,6 +329,20 @@ func (s *PostgresStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 		return nil, err
 	}
 
+	now := time.Now().UTC()
+	if _, err := s.recoverExpiredJobLeasesTx(ctx, tx, now); err != nil {
+		return nil, err
+	}
+	worker, err = scanWorker(tx.QueryRowContext(ctx, `
+		SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		FROM workers
+		WHERE id = $1
+		FOR UPDATE
+	`, workerID))
+	if err != nil {
+		return nil, err
+	}
+
 	if worker.CurrentJobID != "" {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE workers
@@ -341,6 +355,18 @@ func (s *PostgresStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 		job, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id"), worker.CurrentJobID))
 		if err != nil {
 			return nil, err
+		}
+		if !isTerminalJobStatus(job.Status) {
+			leaseExpiresAt := now.Add(defaultJobLeaseDuration)
+			job, err = scanJob(tx.QueryRowContext(ctx, `
+				UPDATE experiment_jobs
+				SET lease_owner_worker_id = $1, lease_last_heartbeat_at = now(), lease_expires_at = $2
+				WHERE id = $3
+				RETURNING `+jobSelectColumns()+`
+			`, workerID, leaseExpiresAt, job.ID))
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if err := tx.Commit(); err != nil {
@@ -365,7 +391,7 @@ func (s *PostgresStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 	}
 
 	job, err := scanJob(tx.QueryRowContext(ctx, `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, created_at, started_at, completed_at
+		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
 		FROM experiment_jobs
 		WHERE status = $1 AND project_id = $2
 		ORDER BY created_at
@@ -393,10 +419,16 @@ func (s *PostgresStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 
 	assignedJob, err := scanJob(tx.QueryRowContext(ctx, `
 		UPDATE experiment_jobs
-		SET worker_id = $1, status = $2, started_at = now()
+		SET worker_id = $1,
+			status = $2,
+			started_at = now(),
+			attempt = attempt + 1,
+			lease_owner_worker_id = $1,
+			lease_last_heartbeat_at = now(),
+			lease_expires_at = $4
 		WHERE id = $3
-		RETURNING id, project_id, worker_id, template, status, config, mlflow_run_id, error, created_at, started_at, completed_at
-	`, workerID, jobs.StatusAssigned, job.ID))
+		RETURNING `+jobSelectColumns()+`
+	`, workerID, jobs.StatusAssigned, job.ID, now.Add(defaultJobLeaseDuration)))
 	if err != nil {
 		return nil, err
 	}
@@ -430,12 +462,12 @@ func (s *PostgresStore) CreateJob(projectID string, template string, config map[
 	}
 
 	const query = `
-		INSERT INTO experiment_jobs (project_id, template, status, config)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, project_id, worker_id, template, status, config, mlflow_run_id, error, created_at, started_at, completed_at
+		INSERT INTO experiment_jobs (project_id, template, status, config, max_attempts)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
 	`
 
-	return scanJob(s.db.QueryRowContext(context.Background(), query, projectID, template, jobs.StatusQueued, configJSON))
+	return scanJob(s.db.QueryRowContext(context.Background(), query, projectID, template, jobs.StatusQueued, configJSON, defaultJobMaxAttempts))
 }
 
 func (s *PostgresStore) GetJob(id string) (jobs.ExperimentJob, error) {
@@ -448,7 +480,7 @@ func (s *PostgresStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob,
 	}
 
 	const query = `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, created_at, started_at, completed_at
+		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
 		FROM experiment_jobs
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -470,6 +502,101 @@ func (s *PostgresStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob,
 	}
 
 	return out, rows.Err()
+}
+
+func (s *PostgresStore) RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	recovered, err := s.recoverExpiredJobLeasesTx(ctx, tx, now.UTC())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return recovered, nil
+}
+
+func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.Tx, now time.Time) ([]jobs.ExperimentJob, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+jobSelectColumns()+`
+		FROM experiment_jobs
+		WHERE status IN ($1, $2)
+			AND lease_expires_at IS NOT NULL
+			AND lease_expires_at <= $3
+		ORDER BY lease_expires_at ASC
+		FOR UPDATE
+	`, jobs.StatusAssigned, jobs.StatusRunning, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	expired := []jobs.ExperimentJob{}
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		expired = append(expired, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	recovered := []jobs.ExperimentJob{}
+	for _, job := range expired {
+		if job.MaxAttempts < 1 {
+			job.MaxAttempts = defaultJobMaxAttempts
+		}
+		var updated jobs.ExperimentJob
+		if job.Attempt >= job.MaxAttempts {
+			updated, err = scanJob(tx.QueryRowContext(ctx, `
+				UPDATE experiment_jobs
+				SET status = $1,
+					error = $2,
+					worker_id = '',
+					completed_at = $3,
+					lease_owner_worker_id = '',
+					lease_expires_at = NULL,
+					lease_last_heartbeat_at = NULL
+				WHERE id = $4
+				RETURNING `+jobSelectColumns()+`
+			`, jobs.StatusFailed, "job lease expired after maximum attempts", now, job.ID))
+		} else {
+			updated, err = scanJob(tx.QueryRowContext(ctx, `
+				UPDATE experiment_jobs
+				SET status = $1,
+					error = '',
+					worker_id = '',
+					started_at = NULL,
+					lease_owner_worker_id = '',
+					lease_expires_at = NULL,
+					lease_last_heartbeat_at = NULL
+				WHERE id = $2
+				RETURNING `+jobSelectColumns()+`
+			`, jobs.StatusQueued, job.ID))
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE workers
+			SET status = CASE WHEN status = $3 THEN status ELSE $1 END,
+				current_job_id = ''
+			WHERE current_job_id = $2
+		`, workers.StatusIdle, job.ID, workers.StatusOffline); err != nil {
+			return nil, err
+		}
+		recovered = append(recovered, updated)
+	}
+
+	return recovered, nil
 }
 
 func (s *PostgresStore) ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error) {
@@ -504,6 +631,13 @@ func (s *PostgresStore) ReportMetric(jobID string, epoch int, values map[string]
 			SET status = $1, last_heartbeat = now()
 			WHERE id = $2
 		`, workers.StatusRunning, job.WorkerID); err != nil {
+			return jobs.EpochMetric{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE experiment_jobs
+			SET lease_owner_worker_id = $1, lease_last_heartbeat_at = now(), lease_expires_at = $2
+			WHERE id = $3
+		`, job.WorkerID, time.Now().UTC().Add(defaultJobLeaseDuration), jobID); err != nil {
 			return jobs.EpochMetric{}, err
 		}
 	}
@@ -915,6 +1049,42 @@ func (s *PostgresStore) ListProjectChampionExports(projectID string) ([]runs.Cha
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) UpdateChampionExport(id string, update runs.ChampionExportUpdate) (runs.ChampionExport, error) {
+	metadataJSON, err := json.Marshal(emptyMapIfNil(update.Metadata))
+	if err != nil {
+		return runs.ChampionExport{}, fmt.Errorf("marshal champion export metadata: %w", err)
+	}
+	validationErrors := append([]string(nil), update.ValidationErrors...)
+	if update.Error != "" {
+		validationErrors = append(validationErrors, update.Error)
+	}
+	validationErrorsJSON, err := json.Marshal(validationErrors)
+	if err != nil {
+		return runs.ChampionExport{}, fmt.Errorf("marshal champion export validation errors: %w", err)
+	}
+	const query = `
+		UPDATE champion_exports
+		SET status = COALESCE(NULLIF($2, ''), status),
+			artifact_uri = COALESCE(NULLIF($3, ''), artifact_uri),
+			metadata = CASE WHEN $4 THEN $5 ELSE metadata END,
+			validation_errors = CASE WHEN $6 THEN $7 ELSE validation_errors END,
+			updated_at = now()
+		WHERE id = $1
+		RETURNING id, project_id, champion_id, job_id, status, format, artifact_uri, metadata, validation_errors, created_at, updated_at
+	`
+	return scanChampionExport(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		id,
+		update.Status,
+		update.ArtifactURI,
+		update.Metadata != nil,
+		metadataJSON,
+		update.ValidationErrors != nil || update.Error != "",
+		validationErrorsJSON,
+	))
+}
+
 func (s *PostgresStore) CreateChampionDemoPrediction(prediction runs.ChampionDemoPredictionCreate) (runs.ChampionDemoPrediction, error) {
 	if err := s.requireProject(prediction.ProjectID); err != nil {
 		return runs.ChampionDemoPrediction{}, err
@@ -983,6 +1153,48 @@ func (s *PostgresStore) ListProjectChampionDemoPredictions(projectID string) ([]
 		out = append(out, prediction)
 	}
 	return out, rows.Err()
+}
+
+func (s *PostgresStore) UpdateChampionDemoPrediction(id string, update runs.ChampionDemoPredictionUpdate) (runs.ChampionDemoPrediction, error) {
+	topKJSON, err := json.Marshal(update.TopK)
+	if err != nil {
+		return runs.ChampionDemoPrediction{}, fmt.Errorf("marshal champion demo prediction top-k: %w", err)
+	}
+	imageMetadataJSON, err := json.Marshal(emptyMapIfNil(update.ImageMetadata))
+	if err != nil {
+		return runs.ChampionDemoPrediction{}, fmt.Errorf("marshal champion demo prediction image metadata: %w", err)
+	}
+	const query = `
+		UPDATE champion_demo_predictions
+		SET status = COALESCE(NULLIF($2, ''), status),
+			predicted_label = COALESCE(NULLIF($3, ''), predicted_label),
+			true_label = COALESCE(NULLIF($4, ''), true_label),
+			confidence = COALESCE($5, confidence),
+			top_k = CASE WHEN $6 THEN $7 ELSE top_k END,
+			latency_ms = COALESCE($8, latency_ms),
+			correct = COALESCE($9, correct),
+			error = COALESCE(NULLIF($10, ''), error),
+			image_metadata = CASE WHEN $11 THEN $12 ELSE image_metadata END
+		WHERE id = $1
+		RETURNING id, project_id, champion_id, job_id, dataset_id, image_uri, image_id, image_metadata,
+			status, predicted_label, true_label, confidence, top_k, latency_ms, correct, error, created_at
+	`
+	return scanChampionDemoPrediction(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		id,
+		update.Status,
+		update.PredictedLabel,
+		update.TrueLabel,
+		update.Confidence,
+		update.TopK != nil,
+		topKJSON,
+		update.LatencyMS,
+		update.Correct,
+		update.Error,
+		update.ImageMetadata != nil,
+		imageMetadataJSON,
+	))
 }
 
 func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
@@ -1753,9 +1965,15 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 
 	job, err := scanJob(tx.QueryRowContext(ctx, `
 		UPDATE experiment_jobs
-		SET status = $1, mlflow_run_id = $2, error = $3, completed_at = now()
+		SET status = $1,
+			mlflow_run_id = $2,
+			error = $3,
+			completed_at = now(),
+			lease_owner_worker_id = '',
+			lease_expires_at = NULL,
+			lease_last_heartbeat_at = NULL
 		WHERE id = $4
-		RETURNING id, project_id, worker_id, template, status, config, mlflow_run_id, error, created_at, started_at, completed_at
+		RETURNING `+jobSelectColumns()+`
 	`, status, mlflowRunID, message, jobID))
 	if err != nil {
 		return jobs.ExperimentJob{}, err
@@ -1917,6 +2135,8 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 	var configJSON []byte
 	var startedAt sql.NullTime
 	var completedAt sql.NullTime
+	var leaseExpiresAt sql.NullTime
+	var leaseLastHeartbeatAt sql.NullTime
 
 	if err := row.Scan(
 		&job.ID,
@@ -1927,6 +2147,11 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 		&configJSON,
 		&job.MLflowRunID,
 		&job.Error,
+		&job.Attempt,
+		&job.MaxAttempts,
+		&job.LeaseOwnerWorkerID,
+		&leaseExpiresAt,
+		&leaseLastHeartbeatAt,
 		&job.CreatedAt,
 		&startedAt,
 		&completedAt,
@@ -1945,6 +2170,15 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 	}
 	if completedAt.Valid {
 		job.CompletedAt = &completedAt.Time
+	}
+	if leaseExpiresAt.Valid {
+		job.LeaseExpiresAt = &leaseExpiresAt.Time
+	}
+	if leaseLastHeartbeatAt.Valid {
+		job.LeaseLastHeartbeatAt = &leaseLastHeartbeatAt.Time
+	}
+	if job.MaxAttempts < 1 {
+		job.MaxAttempts = defaultJobMaxAttempts
 	}
 
 	return job, nil
@@ -2474,10 +2708,14 @@ func normalizeSQLError(err error) error {
 
 func selectJobSQL(column string) string {
 	return fmt.Sprintf(`
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, created_at, started_at, completed_at
+		SELECT `+jobSelectColumns()+`
 		FROM experiment_jobs
 		WHERE %s = $1
 	`, column)
+}
+
+func jobSelectColumns() string {
+	return "id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at"
 }
 
 func newPostgresTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.TrainingRunSummary {

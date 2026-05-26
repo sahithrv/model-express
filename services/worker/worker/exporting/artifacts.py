@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Iterable
 
@@ -79,6 +80,77 @@ def load_export_manifest(manifest_path: Path) -> dict:
             "error": "Export manifest must be a JSON object.",
         }
     return payload
+
+
+def produce_existing_champion_export_manifest(
+    *,
+    export_dir: Path,
+    source_artifact_path: Path,
+    artifact_format: str,
+    model_name: str,
+    class_names: Iterable[str],
+    image_size: int,
+    preprocessing: dict | None = None,
+    model_profile: dict | None = None,
+    training_config: dict | None = None,
+    sample_input_shape: Iterable[int] | None = None,
+) -> dict:
+    """Copy an existing worker-visible artifact into a controlled export directory."""
+    export_dir.mkdir(parents=True, exist_ok=True)
+    source_path = Path(source_artifact_path)
+    if not source_path.exists() or not source_path.is_file():
+        metadata = build_champion_export_metadata(
+            model_name=model_name,
+            class_names=class_names,
+            image_size=image_size,
+            preprocessing=preprocessing,
+            model_profile=model_profile,
+            training_config=training_config,
+        )
+        manifest = {
+            "schema_version": "champion_export_manifest_v1",
+            "metadata": metadata,
+            "artifacts": [
+                _skipped_artifact(
+                    _manifest_artifact_format(artifact_format),
+                    "ARTIFACT_NOT_FOUND",
+                    f"Source artifact not found: {source_path}",
+                )
+            ],
+            "status": "pending_dependencies",
+        }
+        manifest_path = export_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        manifest["manifest_path"] = str(manifest_path)
+        return manifest
+
+    input_shape = _input_shape(sample_input_shape, image_size)
+    metadata = build_champion_export_metadata(
+        model_name=model_name,
+        class_names=class_names,
+        image_size=image_size,
+        preprocessing=preprocessing,
+        model_profile=model_profile,
+        training_config=training_config,
+    )
+    metadata["input_shape"] = input_shape
+
+    artifact_name = _artifact_filename(artifact_format, source_path)
+    destination = export_dir / artifact_name
+    if source_path.resolve() != destination.resolve():
+        shutil.copy2(source_path, destination)
+
+    artifact = _created_artifact(_manifest_artifact_format(artifact_format), destination)
+    manifest = {
+        "schema_version": "champion_export_manifest_v1",
+        "metadata": metadata,
+        "artifacts": [artifact],
+        "status": "created",
+    }
+    manifest_path = export_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    manifest["manifest_path"] = str(manifest_path)
+    return manifest
 
 
 def _write_framework_native_checkpoint(export_dir: Path, model, metadata: dict) -> dict:
@@ -202,3 +274,24 @@ def _input_shape(sample_input_shape: Iterable[int] | None, image_size: int) -> l
     if len(parsed) != 4:
         raise ValueError("sample_input_shape must have four dimensions.")
     return parsed
+
+
+def _manifest_artifact_format(artifact_format: str) -> str:
+    normalized = str(artifact_format).lower()
+    if normalized in {"pytorch", "checkpoint", "framework_native"}:
+        return "framework_native_checkpoint"
+    return normalized
+
+
+def _artifact_filename(artifact_format: str, source_path: Path) -> str:
+    normalized = str(artifact_format).lower()
+    if normalized == "onnx":
+        return "model.onnx"
+    if normalized == "torchscript":
+        return "model.torchscript.pt"
+    if normalized in {"pytorch", "checkpoint", "framework_native"}:
+        return "model.pt"
+    if normalized == "safetensors":
+        return "model.safetensors"
+    suffix = source_path.suffix or ".bin"
+    return f"model{suffix}"

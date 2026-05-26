@@ -44,9 +44,56 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     )
 
     with app.run():
-        result = train_image_classifier.remote(payload)
+        result = _remote_function(train_image_classifier)(payload)
 
     print(f"Modal training finished for {job['id']}: {result}")
+
+
+def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:
+    config = job["config"]
+    dataset_id = str(config["dataset_id"])
+
+    try:
+        from worker.training.modal_app import app, profile_image_dataset
+    except ModuleNotFoundError as exc:
+        if exc.name == "modal":
+            raise RuntimeError(
+                "Modal is not installed. Install worker dependencies, then run `modal setup`."
+            ) from exc
+        raise
+
+    dataset = client.get_dataset(dataset_id)
+    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
+    _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+
+    payload = {
+        "dataset": dataset,
+        "s3_endpoint_url": s3_endpoint_url,
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
+        "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    }
+
+    print(f"Submitting Modal dataset profile job dataset={dataset_id}")
+    with app.run():
+        profile = _remote_function(profile_image_dataset)(payload)
+
+    if not isinstance(profile, dict):
+        raise RuntimeError("Modal dataset profiler returned an invalid profile payload.")
+
+    client.update_dataset_profile(dataset_id, profile)
+    client.complete_job(job["id"], mlflow_run_id="")
+    print(f"Modal dataset profile finished for {dataset_id}")
+
+
+def _remote_function(function):
+    remote = getattr(function, "remote", None)
+    if remote is None:
+        raise RuntimeError(
+            "Modal is not installed or the Modal function was not registered. "
+            "Install worker dependencies, then run `modal setup`."
+        )
+    return remote
 
 
 def _require_remote_reachable_url(name: str, value: str) -> None:

@@ -2,9 +2,11 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
@@ -100,7 +102,7 @@ func TestExperimentPlannerAgentValidatesAddExperiments(t *testing.T) {
 }
 
 func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(t *testing.T) {
-	request := experimentPlannerJSONRequest("test-model", []byte(`{"visual_exemplar_context":{"enabled":true}}`))
+	request := experimentPlannerJSONRequest("test-model", []byte(`{"planner_context_snapshot":{"visual_evidence":{"enabled":true}}}`))
 	if len(request.Messages) != 2 {
 		t.Fatalf("expected system and user messages")
 	}
@@ -113,9 +115,17 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"sampling_strategy values",
 		"focal_loss",
 		"Return only valid JSON",
-		"visual_exemplar_context, when present, only as backend-curated evidence",
+		"planner_context_snapshot",
+		"visual_evidence, when present, only as backend-curated evidence",
 		"Cite exemplar caps, warnings, or audit details",
 		"Backend validation remains the gate",
+		"planner_validation_feedback",
+		"choose arbitrary files",
+		"mutate datasets",
+		"run export or inference",
+		"create workers",
+		"create jobs",
+		"bypass backend validation",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("expected prompt to contain %q", expected)
@@ -233,6 +243,11 @@ func TestExperimentPlannerAgentRejectsMinorOnlyTweaks(t *testing.T) {
 
 func TestExperimentPlannerPromptContextIncludesDatasetAndStrategyMemory(t *testing.T) {
 	input := testExperimentPlannerInput()
+	input.Dataset = datasets.Dataset{
+		ID:      "dataset_1",
+		Name:    "raw-profile-guard",
+		Profile: map[string]any{"raw_profile_marker": "do not leak this raw profile"},
+	}
 	input.DatasetInsights = DatasetPlanningInsights{
 		Summary:                  "Small imbalanced image dataset.",
 		RecommendedPreprocessing: []string{"weighted_loss"},
@@ -257,14 +272,25 @@ func TestExperimentPlannerPromptContextIncludesDatasetAndStrategyMemory(t *testi
 	}
 
 	context := experimentPlannerPromptContext(input)
-	if context["dataset_planning_insights"] == nil {
-		t.Fatal("expected dataset planning insights in prompt context")
+	if _, ok := context["dataset_planning_insights"]; ok {
+		t.Fatal("expected raw dataset planning insights to be omitted from compact prompt context")
 	}
-	if got := len(context["successful_strategy_memory"].([]PlannerStrategyMemory)); got != 1 {
-		t.Fatalf("expected successful strategy memory, got %d", got)
+	snapshot, ok := context["planner_context_snapshot"].(PlannerContextSnapshot)
+	if !ok {
+		t.Fatalf("expected planner context snapshot, got %#v", context["planner_context_snapshot"])
 	}
-	if got := len(context["failed_strategy_memory"].([]PlannerStrategyMemory)); got != 1 {
-		t.Fatalf("expected failed strategy memory, got %d", got)
+	if snapshot.DatasetCard.Summary != "Small imbalanced image dataset." {
+		t.Fatalf("expected distilled dataset card summary, got %q", snapshot.DatasetCard.Summary)
+	}
+	if got := len(snapshot.StrategyLessons); got != 2 {
+		t.Fatalf("expected successful and failed strategy lessons, got %d", got)
+	}
+	blob, err := json.Marshal(context)
+	if err != nil {
+		t.Fatalf("marshal compact prompt context: %v", err)
+	}
+	if strings.Contains(string(blob), "do not leak this raw profile") {
+		t.Fatal("expected compact planner context to omit raw dataset.profile payload")
 	}
 }
 
@@ -296,9 +322,13 @@ func TestExperimentPlannerPromptContextMarksVisualExemplarsAsEvidenceOnly(t *tes
 	}
 
 	context := experimentPlannerPromptContext(input)
-	exemplarContext, ok := context["visual_exemplar_context"].(map[string]any)
+	snapshot, ok := context["planner_context_snapshot"].(PlannerContextSnapshot)
 	if !ok {
-		t.Fatalf("expected visual exemplar prompt context map, got %#v", context["visual_exemplar_context"])
+		t.Fatalf("expected planner context snapshot, got %#v", context["planner_context_snapshot"])
+	}
+	exemplarContext := snapshot.VisualEvidence
+	if exemplarContext == nil {
+		t.Fatal("expected visual evidence in planner snapshot")
 	}
 	if exemplarContext["enabled"] != true {
 		t.Fatalf("expected visual exemplar context to be enabled")

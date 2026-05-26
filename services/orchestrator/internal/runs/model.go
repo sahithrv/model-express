@@ -4,7 +4,9 @@ import "time"
 
 const (
 	ChampionExportStatusPendingArtifact = "PENDING_ARTIFACT"
+	ChampionExportStatusPending         = "PENDING"
 	ChampionExportStatusReady           = "READY"
+	ChampionExportStatusFailed          = "FAILED"
 )
 
 const (
@@ -128,6 +130,14 @@ type ChampionExportCreate struct {
 	ValidationErrors []string
 }
 
+type ChampionExportUpdate struct {
+	Status           string
+	ArtifactURI      string
+	Metadata         map[string]any
+	ValidationErrors []string
+	Error            string
+}
+
 type DemoPredictionTopK struct {
 	Label      string  `json:"label"`
 	Confidence float64 `json:"confidence"`
@@ -169,4 +179,16 @@ type ChampionDemoPredictionCreate struct {
 	LatencyMS      *float64
 	Correct        *bool
 	Error          string
+}
+
+type ChampionDemoPredictionUpdate struct {
+	Status         string
+	PredictedLabel string
+	TrueLabel      string
+	Confidence     *float64
+	TopK           []DemoPredictionTopK
+	LatencyMS      *float64
+	Correct        *bool
+	Error          string
+	ImageMetadata  map[string]any
 }
