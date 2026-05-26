@@ -11,6 +11,7 @@ import (
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
 
@@ -187,6 +188,338 @@ func TestRunDatasetVisualAnalysisQueuesBackendOwnedJob(t *testing.T) {
 	if !found {
 		t.Fatalf("expected analyze_dataset_visuals job, got %#v", projectJobs)
 	}
+}
+
+func TestRunDatasetVisualAnalysisRespectsCooldownAndMaxRuns(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "60")
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_MAX_RUNS_PER_PROFILE", "3")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4})
+	if err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+	if _, err := memoryStore.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:          project.ID,
+		DatasetID:          dataset.ID,
+		DatasetName:        dataset.Name,
+		ProfileFingerprint: datasetProfileFingerprint(dataset.Profile),
+		SchemaVersion:      datasets.VisualAnalysisSchemaVersion,
+		TriggerReason:      datasets.VisualTriggerInitialProfile,
+		TotalImages:        4,
+		ImagesAnalyzed:     2,
+		Confidence:         "medium",
+		CoverageReport: datasets.VisualCoverageReport{
+			ImagesAvailable:    4,
+			ImagesAnalyzed:     2,
+			ClassesTotal:       2,
+			ClassesCovered:     2,
+			ClassCoverageRatio: 1,
+		},
+	}); err != nil {
+		t.Fatalf("create accepted visual analysis: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analyses/run", strings.NewReader(`{"trigger_reason":"manual"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("expected cooldown conflict, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "cooling down") {
+		t.Fatalf("expected cooldown policy in response, got %s", resp.Body.String())
+	}
+
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "0")
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_MAX_RUNS_PER_PROFILE", "1")
+	req = httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analyses/run", strings.NewReader(`{"trigger_reason":"manual"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp = httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("expected max-run conflict, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "per-profile cap") {
+		t.Fatalf("expected max-run policy in response, got %s", resp.Body.String())
+	}
+}
+
+func TestTrainingRunEvaluationQueuesDeficiencyVisualReanalysis(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "0")
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_MAX_RUNS_PER_PROFILE", "3")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	if _, err := memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 40, "class_count": 2}); err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"model":      "mobilenet_v3_small",
+	})
+	if err != nil {
+		t.Fatalf("create training job: %v", err)
+	}
+	runtimeSeconds := 10.0
+	costUSD := 0.1
+	macroF1 := 0.42
+	accuracy := 0.72
+	epochs := 3
+	if _, err := memoryStore.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
+		Model:            "mobilenet_v3_small",
+		Provider:         "local",
+		Status:           jobs.StatusSucceeded,
+		RuntimeSeconds:   &runtimeSeconds,
+		EstimatedCostUSD: &costUSD,
+		BestMacroF1:      &macroF1,
+		BestAccuracy:     &accuracy,
+		EpochsCompleted:  &epochs,
+	}); err != nil {
+		t.Fatalf("upsert summary: %v", err)
+	}
+
+	body := `{
+		"objective_profile":{"target_metric":"macro_f1"},
+		"per_class_metrics":{"rare":{"recall":0.18,"f1-score":0.16},"common":{"recall":0.91,"f1-score":0.88}},
+		"confusion_matrix":[[12,18],[2,30]],
+		"model_profile":{},
+		"holistic_scores":{},
+		"recommendation_summary":"low rare-class recall"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-evaluation", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected evaluation accepted, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	found := false
+	for _, candidate := range projectJobs {
+		if candidate.Template != jobs.TemplateAnalyzeDatasetVisuals {
+			continue
+		}
+		found = true
+		if candidate.Config["trigger_reason"] != string(datasets.VisualTriggerDeficiencyReanalysis) {
+			t.Fatalf("expected deficiency trigger, got %#v", candidate.Config)
+		}
+		triggerDetails, _ := candidate.Config["trigger_details"].(map[string]any)
+		triggers, _ := triggerDetails["deficiency_triggers"].([]string)
+		if len(triggers) == 0 {
+			t.Fatalf("expected deficiency triggers in job config, got %#v", candidate.Config)
+		}
+	}
+	if !found {
+		t.Fatalf("expected deficiency visual-analysis job, got %#v", projectJobs)
+	}
+}
+
+func TestListDatasetVisualAnalysesExposesRerunPolicy(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "0")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	if _, err := memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4}); err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/datasets/"+dataset.ID+"/visual-analyses", nil)
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected list status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	policy, ok := payload["rerun_policy"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected rerun_policy object, got %#v", payload)
+	}
+	if allowed, _ := policy["manual_run_allowed"].(bool); !allowed {
+		t.Fatalf("expected manual rerun to be allowed, got %#v", policy)
+	}
+	if policy["profile_fingerprint"] == "" {
+		t.Fatalf("expected profile fingerprint in policy, got %#v", policy)
+	}
+}
+
+func TestProfileUpdateQueuesVisualAnalysisBeforeInitialPlan(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "0")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "high accuracy")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{"profile": visualGateProfile()})
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/profile", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected profile status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+
+	plans, err := memoryStore.ListProjectExperimentPlans(project.ID)
+	if err != nil {
+		t.Fatalf("list plans: %v", err)
+	}
+	if len(plans) != 0 {
+		t.Fatalf("expected initial plan to wait for visual analysis, got %#v", plans)
+	}
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if !hasVisualAnalysisJobForDataset(projectJobs, dataset.ID) {
+		t.Fatalf("expected initial visual-analysis job before planning, got %#v", projectJobs)
+	}
+}
+
+func TestInitialVisualAnalysisResultCreatesInitialPlan(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "0")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "high accuracy")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	if _, err := memoryStore.UpdateDatasetProfile(dataset.ID, visualGateProfile()); err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+
+	body, _ := json.Marshal(validVisualAnalysisPayload(dataset))
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analysis-result", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected visual result status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	plans, err := memoryStore.ListProjectExperimentPlans(project.ID)
+	if err != nil {
+		t.Fatalf("list plans: %v", err)
+	}
+	if len(plans) != 1 || plans[0].DatasetID != dataset.ID {
+		t.Fatalf("expected visual result to unblock initial plan, got %#v", plans)
+	}
+}
+
+func TestInitialVisualAnalysisFailureFallsBackToInitialPlan(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "0")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "high accuracy")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{"profile": visualGateProfile()})
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/profile", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected profile status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	var visualJob jobs.ExperimentJob
+	for _, candidate := range projectJobs {
+		if candidate.Template == jobs.TemplateAnalyzeDatasetVisuals {
+			visualJob = candidate
+			break
+		}
+	}
+	if visualJob.ID == "" {
+		t.Fatalf("expected visual job, got %#v", projectJobs)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/jobs/"+visualJob.ID+"/fail", strings.NewReader(`{"error":"visual llm unavailable"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp = httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected visual fail fallback status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	plans, err := memoryStore.ListProjectExperimentPlans(project.ID)
+	if err != nil {
+		t.Fatalf("list plans: %v", err)
+	}
+	if len(plans) != 1 || plans[0].DatasetID != dataset.ID {
+		t.Fatalf("expected visual failure to fall back to initial plan, got %#v", plans)
+	}
+}
+
+func visualGateProfile() map[string]any {
+	return map[string]any{
+		"schema_version":        "dataset_profile_v1",
+		"task_type":             "image_classification",
+		"class_count":           2,
+		"total_images":          120,
+		"imbalance_ratio":       1.2,
+		"corrupt_image_count":   0,
+		"class_names":           []string{"daisy", "rose"},
+		"class_distribution":    map[string]int{"daisy": 60, "rose": 60},
+		"image_dimension_stats": map[string]any{"width": map[string]any{"median": 224}, "height": map[string]any{"median": 224}},
+	}
+}
+
+func hasVisualAnalysisJobForDataset(projectJobs []jobs.ExperimentJob, datasetID string) bool {
+	for _, job := range projectJobs {
+		if job.Template == jobs.TemplateAnalyzeDatasetVisuals && job.Config["dataset_id"] == datasetID {
+			return true
+		}
+	}
+	return false
 }
 
 func validVisualAnalysisPayload(dataset datasets.Dataset) map[string]any {

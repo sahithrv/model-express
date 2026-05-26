@@ -105,6 +105,12 @@ const (
 	plannerMinimumMeaningfulImprovement = 0.005
 	plannerNoImprovementRoundsToSelect  = 2
 	plannerBackendValidationRetryLimit  = 1
+
+	visualAnalysisDefaultCooldownMinutes      = 360
+	visualAnalysisDefaultMaxRunsPerProfile    = 3
+	visualAnalysisDefaultLowMacroF1Threshold  = 0.55
+	visualAnalysisDefaultWorstRecallThreshold = 0.40
+	visualAnalysisDefaultConfusionThreshold   = 0.20
 )
 
 var (
@@ -175,6 +181,37 @@ type datasetVisualAnalysisResultRequest struct {
 	RawOutput      string                              `json:"raw_output"`
 	InputContext   map[string]any                      `json:"input_context"`
 	InputMessages  []map[string]string                 `json:"input_messages"`
+}
+
+type datasetVisualAnalysisRerunPolicy struct {
+	Enabled                  bool       `json:"enabled"`
+	AutomationEnabled        bool       `json:"automation_enabled"`
+	ManualRunAllowed         bool       `json:"manual_run_allowed"`
+	InitialRunAllowed        bool       `json:"initial_run_allowed"`
+	DeficiencyRunAllowed     bool       `json:"deficiency_run_allowed"`
+	RunAllowed               bool       `json:"run_allowed"`
+	DisabledReason           string     `json:"disabled_reason,omitempty"`
+	Reason                   string     `json:"reason,omitempty"`
+	NextAllowedAt            *time.Time `json:"next_allowed_at,omitempty"`
+	CooldownSeconds          int        `json:"cooldown_seconds"`
+	MaxRunsPerProfile        int        `json:"max_runs_per_profile"`
+	RunsForProfile           int        `json:"runs_for_profile"`
+	AcceptedRunsForProfile   int        `json:"accepted_runs_for_profile"`
+	ActiveJobID              string     `json:"active_job_id,omitempty"`
+	ActiveJobStatus          string     `json:"active_job_status,omitempty"`
+	ProfileFingerprint       string     `json:"profile_fingerprint,omitempty"`
+	DeficiencyTriggers       []string   `json:"deficiency_triggers,omitempty"`
+	DeficiencySeverity       float64    `json:"deficiency_severity,omitempty"`
+	LatestAnalysisID         string     `json:"latest_analysis_id,omitempty"`
+	LatestAnalysisCreatedAt  *time.Time `json:"latest_analysis_created_at,omitempty"`
+	LatestAnalysisValidation string     `json:"latest_analysis_validation_status,omitempty"`
+}
+
+type visualAnalysisDeficiencyAssessment struct {
+	Eligible bool
+	Severity float64
+	Triggers []string
+	Details  map[string]any
 }
 
 type reportTrainingRunSummaryRequest = runs.TrainingRunSummaryUpdate
@@ -322,11 +359,21 @@ func (s *Server) updateDatasetProfile(c *gin.Context) {
 		return
 	}
 
-	if err := s.createInitialPlanForDataset(dataset.ID); err != nil {
+	visualQueued, err := s.maybeQueueInitialDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
-	if err := s.maybeQueueInitialDatasetVisualAnalysis(dataset.ID); err != nil {
+	if visualQueued {
+		c.JSON(http.StatusOK, gin.H{
+			"dataset":                         dataset,
+			"initial_experiment_plan_status":  "waiting_for_visual_analysis",
+			"visual_analysis_required_before": "initial_experiment_plan",
+		})
+		return
+	}
+
+	if err := s.createInitialPlanForDataset(dataset.ID); err != nil {
 		writeStoreError(c, err)
 		return
 	}
@@ -422,12 +469,26 @@ func (s *Server) listDatasetVisualAnalyses(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	assessment, assessmentErr := s.assessDatasetVisualDeficiency(dataset, runs.TrainingRunEvaluation{})
+	if assessmentErr != nil {
+		log.Printf("visual analysis deficiency assessment failed for dataset %s: %v", dataset.ID, assessmentErr)
+	}
+	policy, err := s.datasetVisualAnalysisRunPolicy(dataset, datasets.VisualTriggerManual, assessment)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	latest := latestVisualAnalysisFromList(analyses)
 	c.JSON(http.StatusOK, gin.H{
-		"dataset_id":       dataset.ID,
-		"visual_analyses":  analyses,
-		"source_of_truth":  "dataset_visual_analyses",
-		"evidence_only":    true,
-		"raw_images_shown": false,
+		"dataset_id":             dataset.ID,
+		"visual_analyses":        analyses,
+		"latest":                 latest,
+		"rerun_policy":           policy,
+		"manual_run_supported":   true,
+		"source_of_truth":        "dataset_visual_analyses",
+		"evidence_only":          true,
+		"raw_images_shown":       false,
+		"raw_images_for_planner": false,
 	})
 }
 
@@ -469,14 +530,35 @@ func (s *Server) runDatasetVisualAnalysis(c *gin.Context) {
 		writeStoreError(c, fmt.Errorf("%w: unsupported visual analysis trigger_reason %q", store.ErrInvalidRequest, req.TriggerReason))
 		return
 	}
+	assessment := visualAnalysisDeficiencyAssessment{}
+	if trigger == datasets.VisualTriggerDeficiencyReanalysis {
+		assessment, err = s.assessDatasetVisualDeficiency(dataset, runs.TrainingRunEvaluation{})
+		if err != nil {
+			writeStoreError(c, err)
+			return
+		}
+	}
+	policy, err := s.datasetVisualAnalysisRunPolicy(dataset, trigger, assessment)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if !policy.RunAllowed {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":        policy.DisabledReason,
+			"rerun_policy": policy,
+		})
+		return
+	}
 	job, event, err := s.queueDatasetVisualAnalysis(dataset, trigger, req.TriggerDetails, req.Provider, req.MaxImages, req.HighDetailCap)
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
-		"job":   job,
-		"event": event,
+		"job":          job,
+		"event":        event,
+		"rerun_policy": policy,
 	})
 }
 
@@ -513,6 +595,12 @@ func (s *Server) reportDatasetVisualAnalysisResult(c *gin.Context) {
 	}
 	if analysis.PromptVersion == "" {
 		analysis.PromptVersion = datasets.VisualAnalysisSchemaVersion
+	}
+	if analysis.ProfileFingerprint == "" {
+		analysis.ProfileFingerprint = datasetProfileFingerprint(dataset.Profile)
+	}
+	if analysis.ProfileSchemaVersion == "" {
+		analysis.ProfileSchemaVersion = datasetProfileSchemaVersion(dataset.Profile)
 	}
 
 	validationErrors := validateDatasetVisualAnalysisResult(dataset, &analysis, req.SampleManifest, req.RawOutput, req.InputContext)
@@ -567,6 +655,13 @@ func (s *Server) reportDatasetVisualAnalysisResult(c *gin.Context) {
 		"source_job_id":     stored.SourceJobID,
 	}); eventErr != nil {
 		log.Printf("record visual analysis event failed: %v", eventErr)
+	}
+
+	if stored.TriggerReason == datasets.VisualTriggerInitialProfile {
+		if err := s.createInitialPlanForDataset(dataset.ID); err != nil {
+			writeStoreError(c, err)
+			return
+		}
 	}
 
 	if len(validationErrors) > 0 {
@@ -683,6 +778,9 @@ func (s *Server) upsertTrainingRunEvaluation(c *gin.Context) {
 	if err != nil {
 		writeStoreError(c, err)
 		return
+	}
+	if err := s.maybeQueueDeficiencyDatasetVisualAnalysis(evaluation); err != nil {
+		log.Printf("visual dataset deficiency reanalysis check failed for job %s: %v", evaluation.JobID, err)
 	}
 
 	c.JSON(http.StatusOK, evaluation)
@@ -2434,6 +2532,12 @@ func (s *Server) failJob(c *gin.Context) {
 		}
 		s.runTrainingMonitorAfterTrainingJob(job)
 		s.runPlanningLoopAfterTrainingJob(job)
+	}
+	if job.Template == jobs.TemplateAnalyzeDatasetVisuals && jobConfigString(job.Config, "trigger_reason") == string(datasets.VisualTriggerInitialProfile) {
+		if err := s.createInitialPlanForDataset(jobConfigString(job.Config, "dataset_id")); err != nil {
+			writeStoreError(c, err)
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, job)
@@ -4374,6 +4478,24 @@ func payloadMap(payload map[string]any, key string) map[string]any {
 	return out
 }
 
+func mapFromAny(value any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
+	if typed, ok := value.(map[string]any); ok {
+		return typed
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(blob, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
 func payloadFloat(payload map[string]any, key string) float64 {
 	switch value := payload[key].(type) {
 	case float64:
@@ -4389,6 +4511,18 @@ func payloadFloat(payload map[string]any, key string) float64 {
 		return out
 	default:
 		return 0
+	}
+}
+
+func payloadBool(payload map[string]any, key string) bool {
+	switch value := payload[key].(type) {
+	case bool:
+		return value
+	case string:
+		parsed, ok := envFlagValueFromString(value)
+		return ok && parsed
+	default:
+		return false
 	}
 }
 
@@ -6416,26 +6550,433 @@ func usableChampionExport(dataStore store.Store, projectID string, championID st
 	return runs.ChampionExport{}, false
 }
 
-func (s *Server) maybeQueueInitialDatasetVisualAnalysis(datasetID string) error {
-	if !envFlag("MODEL_EXPRESS_VISUAL_ANALYSIS_ENABLED", false) {
+func latestVisualAnalysisFromList(analyses []datasets.DatasetVisualAnalysis) *datasets.DatasetVisualAnalysis {
+	if len(analyses) == 0 {
 		return nil
+	}
+	latest := analyses[0]
+	for _, analysis := range analyses[1:] {
+		if analysis.AnalysisVersion > latest.AnalysisVersion ||
+			(analysis.AnalysisVersion == latest.AnalysisVersion && analysis.CreatedAt.After(latest.CreatedAt)) {
+			latest = analysis
+		}
+	}
+	return &latest
+}
+
+func (s *Server) maybeQueueInitialDatasetVisualAnalysis(datasetID string) (bool, error) {
+	if !visualAnalysisAutomationEnabled() {
+		return false, nil
 	}
 	dataset, err := s.store.GetDataset(datasetID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if dataset.Status != datasets.StatusProfiled {
-		return nil
+		return false, nil
 	}
 	if _, err := s.store.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID); err == nil {
-		return nil
+		return false, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
-		return err
+		return false, err
+	}
+	policy, err := s.datasetVisualAnalysisRunPolicy(dataset, datasets.VisualTriggerInitialProfile, visualAnalysisDeficiencyAssessment{})
+	if err != nil {
+		return false, err
+	}
+	if policy.ActiveJobID != "" {
+		return true, nil
+	}
+	if !policy.RunAllowed {
+		return false, nil
 	}
 	_, _, err = s.queueDatasetVisualAnalysis(dataset, datasets.VisualTriggerInitialProfile, map[string]any{
 		"source": "dataset_profile_update",
 	}, "", 0, 0)
+	return err == nil, err
+}
+
+func (s *Server) maybeQueueDeficiencyDatasetVisualAnalysis(evaluation runs.TrainingRunEvaluation) error {
+	if !visualAnalysisAutomationEnabled() {
+		return nil
+	}
+	if strings.TrimSpace(evaluation.DatasetID) == "" {
+		return nil
+	}
+	dataset, err := s.store.GetDataset(evaluation.DatasetID)
+	if err != nil {
+		return err
+	}
+	assessment, err := s.assessDatasetVisualDeficiency(dataset, evaluation)
+	if err != nil {
+		return err
+	}
+	policy, err := s.datasetVisualAnalysisRunPolicy(dataset, datasets.VisualTriggerDeficiencyReanalysis, assessment)
+	if err != nil {
+		return err
+	}
+	if !policy.RunAllowed {
+		return nil
+	}
+	triggerDetails := copyPayloadMap(assessment.Details)
+	triggerDetails["source"] = "training_run_evaluation"
+	triggerDetails["job_id"] = evaluation.JobID
+	triggerDetails["plan_id"] = evaluation.PlanID
+	triggerDetails["deficiency_triggers"] = assessment.Triggers
+	triggerDetails["deficiency_severity"] = assessment.Severity
+	triggerDetails["cooldown_seconds"] = policy.CooldownSeconds
+	triggerDetails["runs_for_profile"] = policy.RunsForProfile
+	_, _, err = s.queueDatasetVisualAnalysis(dataset, datasets.VisualTriggerDeficiencyReanalysis, triggerDetails, "", 0, 0)
 	return err
+}
+
+func (s *Server) datasetVisualAnalysisRunPolicy(dataset datasets.Dataset, requestedTrigger datasets.VisualReanalysisTrigger, assessment visualAnalysisDeficiencyAssessment) (datasetVisualAnalysisRerunPolicy, error) {
+	cooldown := visualAnalysisCooldownDuration()
+	maxRuns := visualAnalysisMaxRunsPerProfile()
+	profileFingerprint := datasetProfileFingerprint(dataset.Profile)
+	policy := datasetVisualAnalysisRerunPolicy{
+		Enabled:              true,
+		AutomationEnabled:    visualAnalysisAutomationEnabled(),
+		CooldownSeconds:      int(cooldown.Seconds()),
+		MaxRunsPerProfile:    maxRuns,
+		ProfileFingerprint:   profileFingerprint,
+		DeficiencyTriggers:   append([]string(nil), assessment.Triggers...),
+		DeficiencySeverity:   roundDiagnosticFloat(assessment.Severity),
+		ManualRunAllowed:     true,
+		InitialRunAllowed:    true,
+		DeficiencyRunAllowed: assessment.Eligible,
+	}
+
+	if dataset.Status != datasets.StatusProfiled {
+		policy.disableAll("dataset must be profiled before visual analysis can run")
+		return policy.withRequestedTrigger(requestedTrigger), nil
+	}
+
+	analyses, err := s.store.ListDatasetVisualAnalyses(dataset.ID)
+	if err != nil {
+		return policy, err
+	}
+	var latest *datasets.DatasetVisualAnalysis
+	currentProfileRuns := 0
+	currentProfileAcceptedRuns := 0
+	hasAcceptedForCurrentProfile := false
+	for _, analysis := range analyses {
+		if !visualAnalysisMatchesProfileFingerprint(analysis.ProfileFingerprint, profileFingerprint) {
+			continue
+		}
+		currentProfileRuns++
+		if analysis.ValidationStatus == datasets.VisualValidationStatusAccepted {
+			currentProfileAcceptedRuns++
+			hasAcceptedForCurrentProfile = true
+		}
+		if latest == nil || analysis.CreatedAt.After(latest.CreatedAt) {
+			copy := analysis
+			latest = &copy
+		}
+	}
+	policy.RunsForProfile = currentProfileRuns
+	policy.AcceptedRunsForProfile = currentProfileAcceptedRuns
+	if latest != nil {
+		policy.LatestAnalysisID = latest.ID
+		createdAt := latest.CreatedAt
+		policy.LatestAnalysisCreatedAt = &createdAt
+		policy.LatestAnalysisValidation = latest.ValidationStatus
+	}
+
+	activeJob, hasActiveJob, err := s.activeDatasetVisualAnalysisJob(dataset)
+	if err != nil {
+		return policy, err
+	}
+	if hasActiveJob {
+		policy.ActiveJobID = activeJob.ID
+		policy.ActiveJobStatus = activeJob.Status
+		policy.disableAll(fmt.Sprintf("visual analysis job %s is already %s", activeJob.ID, strings.ToLower(activeJob.Status)))
+		return policy.withRequestedTrigger(requestedTrigger), nil
+	}
+
+	if maxRuns > 0 && currentProfileRuns >= maxRuns {
+		policy.disableAll(fmt.Sprintf("visual analysis has reached the per-profile cap of %d run(s)", maxRuns))
+		return policy.withRequestedTrigger(requestedTrigger), nil
+	}
+
+	if latest != nil && cooldown > 0 {
+		nextAllowedAt := latest.CreatedAt.Add(cooldown)
+		if time.Now().UTC().Before(nextAllowedAt) {
+			policy.NextAllowedAt = &nextAllowedAt
+			policy.disableAll(fmt.Sprintf("visual analysis rerun is cooling down until %s", nextAllowedAt.UTC().Format(time.RFC3339)))
+			return policy.withRequestedTrigger(requestedTrigger), nil
+		}
+	}
+
+	if hasAcceptedForCurrentProfile {
+		policy.InitialRunAllowed = false
+	}
+	if !policy.AutomationEnabled {
+		policy.InitialRunAllowed = false
+		policy.DeficiencyRunAllowed = false
+	}
+	if !assessment.Eligible {
+		policy.DeficiencyRunAllowed = false
+		if len(assessment.Triggers) == 0 {
+			policy.Reason = "No severe visual-analysis deficiency trigger is currently active."
+		}
+	}
+
+	return policy.withRequestedTrigger(requestedTrigger), nil
+}
+
+func (policy datasetVisualAnalysisRerunPolicy) withRequestedTrigger(trigger datasets.VisualReanalysisTrigger) datasetVisualAnalysisRerunPolicy {
+	switch trigger {
+	case datasets.VisualTriggerInitialProfile:
+		policy.RunAllowed = policy.InitialRunAllowed
+		if !policy.RunAllowed && policy.DisabledReason == "" {
+			policy.DisabledReason = "initial visual analysis is not allowed for the current profile"
+		}
+	case datasets.VisualTriggerDeficiencyReanalysis:
+		policy.RunAllowed = policy.DeficiencyRunAllowed
+		if !policy.RunAllowed && policy.DisabledReason == "" {
+			policy.DisabledReason = "deficiency visual reanalysis requires severe post-training evidence and enabled automation"
+		}
+	default:
+		policy.RunAllowed = policy.ManualRunAllowed
+		if !policy.RunAllowed && policy.DisabledReason == "" {
+			policy.DisabledReason = "manual visual analysis rerun is not currently allowed"
+		}
+	}
+	return policy
+}
+
+func (policy *datasetVisualAnalysisRerunPolicy) disableAll(reason string) {
+	policy.ManualRunAllowed = false
+	policy.InitialRunAllowed = false
+	policy.DeficiencyRunAllowed = false
+	policy.RunAllowed = false
+	policy.DisabledReason = reason
+}
+
+func (s *Server) activeDatasetVisualAnalysisJob(dataset datasets.Dataset) (jobs.ExperimentJob, bool, error) {
+	projectJobs, err := s.store.ListProjectJobs(dataset.ProjectID)
+	if err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
+	for _, job := range projectJobs {
+		if job.Template != jobs.TemplateAnalyzeDatasetVisuals {
+			continue
+		}
+		switch job.Status {
+		case jobs.StatusQueued, jobs.StatusAssigned, jobs.StatusRunning:
+		default:
+			continue
+		}
+		if jobConfigString(job.Config, "dataset_id") == dataset.ID {
+			return job, true, nil
+		}
+	}
+	return jobs.ExperimentJob{}, false, nil
+}
+
+func visualAnalysisMatchesProfileFingerprint(analysisFingerprint string, currentFingerprint string) bool {
+	analysisFingerprint = strings.TrimSpace(analysisFingerprint)
+	currentFingerprint = strings.TrimSpace(currentFingerprint)
+	return analysisFingerprint == "" || analysisFingerprint == currentFingerprint
+}
+
+func visualAnalysisAutomationEnabled() bool {
+	if value, ok := envFlagValue("MODEL_EXPRESS_VISUAL_ANALYSIS_ENABLED"); ok {
+		return value
+	}
+	return envFlag("MODEL_EXPRESS_VISUAL_LLM_ENABLED", false) || strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY")) != ""
+}
+
+func visualAnalysisCooldownDuration() time.Duration {
+	minutes := envInt("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", visualAnalysisDefaultCooldownMinutes, 0, 24*60*30)
+	return time.Duration(minutes) * time.Minute
+}
+
+func visualAnalysisMaxRunsPerProfile() int {
+	return envInt("MODEL_EXPRESS_VISUAL_ANALYSIS_MAX_RUNS_PER_PROFILE", visualAnalysisDefaultMaxRunsPerProfile, 1, 20)
+}
+
+func (s *Server) assessDatasetVisualDeficiency(dataset datasets.Dataset, evaluation runs.TrainingRunEvaluation) (visualAnalysisDeficiencyAssessment, error) {
+	assessment := visualAnalysisDeficiencyAssessment{
+		Details: map[string]any{
+			"dataset_id":          dataset.ID,
+			"profile_fingerprint": datasetProfileFingerprint(dataset.Profile),
+		},
+	}
+	project, err := s.store.GetProject(dataset.ProjectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return assessment, err
+	}
+	targetMetric := "macro_f1"
+	if evaluation.PlanID != "" {
+		if plan, planErr := s.store.GetExperimentPlan(evaluation.PlanID); planErr == nil && plan.TargetMetric != "" {
+			targetMetric = plan.TargetMetric
+		} else if planErr != nil && !errors.Is(planErr, store.ErrNotFound) {
+			return assessment, planErr
+		}
+	}
+	if metric := payloadString(evaluation.ObjectiveProfile, "target_metric"); metric != "" {
+		targetMetric = metric
+	}
+	assessment.Details["target_metric"] = normalizedPlannerTargetMetric(targetMetric)
+
+	summary, hasSummary, err := s.trainingSummaryForVisualDeficiency(evaluation)
+	if err != nil {
+		return assessment, err
+	}
+	if hasSummary {
+		macroThreshold := envFloat("MODEL_EXPRESS_VISUAL_ANALYSIS_LOW_MACRO_F1_THRESHOLD", visualAnalysisDefaultLowMacroF1Threshold, 0.05, 0.95)
+		if summary.BestMacroF1 > 0 && summary.BestMacroF1 < macroThreshold {
+			severity := 0.65
+			if summary.BestMacroF1 < macroThreshold-0.10 {
+				severity = 0.82
+			}
+			assessment.addTrigger("low_macro_f1", severity, fmt.Sprintf("best_macro_f1 %.3f is below %.3f", summary.BestMacroF1, macroThreshold))
+		}
+		if summary.BestAccuracy > 0 && summary.BestMacroF1 > 0 && summary.BestAccuracy-summary.BestMacroF1 >= 0.12 {
+			assessment.addTrigger("accuracy_macro_f1_gap", 0.68, fmt.Sprintf("accuracy %.3f exceeds macro-F1 %.3f by %.3f", summary.BestAccuracy, summary.BestMacroF1, summary.BestAccuracy-summary.BestMacroF1))
+		}
+		assessment.Details["best_macro_f1"] = summary.BestMacroF1
+		assessment.Details["best_accuracy"] = summary.BestAccuracy
+	}
+
+	worstLabel, worstRecall := worstPerClassRecall(evaluation.PerClassMetrics)
+	if worstLabel != "" {
+		assessment.Details["worst_class"] = worstLabel
+		assessment.Details["worst_class_recall"] = worstRecall
+		recallThreshold := envFloat("MODEL_EXPRESS_VISUAL_ANALYSIS_WORST_RECALL_THRESHOLD", visualAnalysisDefaultWorstRecallThreshold, 0.05, 0.95)
+		if worstRecall > 0 && worstRecall < recallThreshold {
+			severity := 0.67
+			if worstRecall < recallThreshold-0.15 {
+				severity = 0.86
+			}
+			assessment.addTrigger("worst_class_recall_failure", severity, fmt.Sprintf("worst class %s recall/F1 %.3f is below %.3f", worstLabel, worstRecall, recallThreshold))
+		}
+	}
+
+	if pair, ratio := topConfusionPairRatio(evaluation.ConfusionMatrix); pair != "" {
+		assessment.Details["top_confusion_pair"] = pair
+		assessment.Details["top_confusion_ratio"] = ratio
+		confusionThreshold := envFloat("MODEL_EXPRESS_VISUAL_ANALYSIS_TOP_CONFUSION_THRESHOLD", visualAnalysisDefaultConfusionThreshold, 0.05, 0.95)
+		if ratio >= confusionThreshold {
+			assessment.addTrigger("persistent_top_confusion", 0.72, fmt.Sprintf("top confusion %s accounts for %.3f of evaluated samples", pair, ratio))
+		}
+	}
+
+	if payloadBool(evaluation.HolisticScores, "visual_hypotheses_contradicted") || len(payloadStringSlice(evaluation.HolisticScores, "contradicted_visual_hypotheses")) > 0 {
+		assessment.addTrigger("contradicted_visual_hypotheses", 0.82, "training evaluation contradicted one or more accepted visual hypotheses")
+	}
+
+	if dataset.ProjectID != "" {
+		projectPlans, planErr := s.store.ListProjectExperimentPlans(dataset.ProjectID)
+		if planErr != nil && !errors.Is(planErr, store.ErrNotFound) {
+			return assessment, planErr
+		}
+		summaries, summaryErr := s.store.ListProjectTrainingRunSummaries(dataset.ProjectID)
+		if summaryErr != nil && !errors.Is(summaryErr, store.ErrNotFound) {
+			return assessment, summaryErr
+		}
+		evaluations, evalErr := s.store.ListProjectTrainingRunEvaluations(dataset.ProjectID)
+		if evalErr != nil && !errors.Is(evalErr, store.ErrNotFound) {
+			return assessment, evalErr
+		}
+		if len(projectPlans) > 0 && len(summaries) > 0 {
+			_, _, _, noImprovementRounds, _ := experimentPlannerPerformanceContext(targetMetric, projectPlans, summaries, evaluations, projectObjectiveContext(project.Goal), evaluation.PlanID)
+			assessment.Details["no_improvement_rounds"] = noImprovementRounds
+			if noImprovementRounds >= plannerNoImprovementRoundsToSelect {
+				assessment.addTrigger("repeated_no_improvement_rounds", 0.88, fmt.Sprintf("%d consecutive completed follow-up plan(s) did not improve the champion meaningfully", noImprovementRounds))
+			}
+		}
+	}
+
+	assessment.Triggers = uniqueStrings(assessment.Triggers)
+	assessment.Eligible = assessment.Severity >= 0.75 || len(assessment.Triggers) >= 2
+	assessment.Details["deficiency_triggers"] = assessment.Triggers
+	assessment.Details["deficiency_severity"] = roundDiagnosticFloat(assessment.Severity)
+	assessment.Details["eligible"] = assessment.Eligible
+	return assessment, nil
+}
+
+func (assessment *visualAnalysisDeficiencyAssessment) addTrigger(trigger string, severity float64, detail string) {
+	if strings.TrimSpace(trigger) == "" {
+		return
+	}
+	assessment.Triggers = append(assessment.Triggers, strings.TrimSpace(trigger))
+	if assessment.Details == nil {
+		assessment.Details = map[string]any{}
+	}
+	if detail != "" {
+		assessment.Details[trigger] = detail
+	}
+	if severity > assessment.Severity {
+		assessment.Severity = severity
+	}
+}
+
+func (s *Server) trainingSummaryForVisualDeficiency(evaluation runs.TrainingRunEvaluation) (runs.TrainingRunSummary, bool, error) {
+	if evaluation.JobID == "" {
+		return runs.TrainingRunSummary{}, false, nil
+	}
+	summary, err := s.store.GetTrainingRunSummary(evaluation.JobID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return runs.TrainingRunSummary{}, false, nil
+		}
+		return runs.TrainingRunSummary{}, false, err
+	}
+	return summary, true, nil
+}
+
+func worstPerClassRecall(metrics map[string]any) (string, float64) {
+	worstLabel := ""
+	worstRecall := 0.0
+	for label, value := range metrics {
+		normalizedLabel := strings.ToLower(strings.TrimSpace(label))
+		if normalizedLabel == "" || normalizedLabel == "accuracy" || strings.Contains(normalizedLabel, "avg") {
+			continue
+		}
+		stats := mapFromAny(value)
+		recall := payloadFloat(stats, "recall")
+		if recall <= 0 {
+			recall = payloadFloat(stats, "f1-score")
+		}
+		if recall <= 0 {
+			recall = payloadFloat(stats, "f1")
+		}
+		if recall <= 0 {
+			continue
+		}
+		if worstLabel == "" || recall < worstRecall {
+			worstLabel = label
+			worstRecall = recall
+		}
+	}
+	return worstLabel, worstRecall
+}
+
+func topConfusionPairRatio(matrix [][]int) (string, float64) {
+	total := 0
+	topCount := 0
+	topI := -1
+	topJ := -1
+	for i, row := range matrix {
+		for j, count := range row {
+			if count < 0 {
+				continue
+			}
+			total += count
+			if i != j && count > topCount {
+				topCount = count
+				topI = i
+				topJ = j
+			}
+		}
+	}
+	if total <= 0 || topCount <= 0 || topI < 0 || topJ < 0 {
+		return "", 0
+	}
+	return fmt.Sprintf("%d->%d", topI, topJ), float64(topCount) / float64(total)
 }
 
 func (s *Server) queueDatasetVisualAnalysis(dataset datasets.Dataset, trigger datasets.VisualReanalysisTrigger, triggerDetails map[string]any, provider string, maxImages int, highDetailCap int) (jobs.ExperimentJob, execution.ExecutionEvent, error) {
@@ -6729,6 +7270,15 @@ func datasetProfileFingerprint(profile map[string]any) string {
 	blob, _ := json.Marshal(profile)
 	sum := sha256.Sum256(blob)
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func datasetProfileSchemaVersion(profile map[string]any) string {
+	for _, key := range []string{"schema_version", "profile_schema_version"} {
+		if value := strings.TrimSpace(profileString(profile, key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func allowedVisualTrigger(trigger datasets.VisualReanalysisTrigger) bool {
@@ -7145,7 +7695,11 @@ func envFlag(name string, defaultValue bool) bool {
 }
 
 func envFlagValue(name string) (bool, bool) {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	return envFlagValueFromString(os.Getenv(name))
+}
+
+func envFlagValueFromString(input string) (bool, bool) {
+	value := strings.ToLower(strings.TrimSpace(input))
 	switch value {
 	case "1", "true", "yes", "on":
 		return true, true
@@ -7154,6 +7708,42 @@ func envFlagValue(name string) (bool, bool) {
 	}
 
 	return false, false
+}
+
+func envInt(name string, defaultValue int, minValue int, maxValue int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	if parsed < minValue {
+		return minValue
+	}
+	if maxValue >= minValue && parsed > maxValue {
+		return maxValue
+	}
+	return parsed
+}
+
+func envFloat(name string, defaultValue float64, minValue float64, maxValue float64) float64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return defaultValue
+	}
+	if parsed < minValue {
+		return minValue
+	}
+	if maxValue >= minValue && parsed > maxValue {
+		return maxValue
+	}
+	return parsed
 }
 
 func bindJSON(c *gin.Context, value any) bool {

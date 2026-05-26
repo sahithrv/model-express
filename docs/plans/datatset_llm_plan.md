@@ -22,10 +22,16 @@ Status from the current implementation pass:
 - **PR 2: Completed.** Worker-side `analyze_dataset_visuals` job, deterministic bounded sample-pack generation, stable `image_id` manifest entries, image caps, and no-path manifest behavior are implemented and tested.
 - **PR 3: Completed.** The Visual Dataset Analysis Agent now uses a separate worker LLM path with `MODEL_EXPRESS_VISUAL_LLM_*` config, evidence-only prompts, schema parsing, fake-client tests, and malformed-output rejection.
 - **PR 4: Completed.** Training image preprocessing moved behind a tested registry for resize, crop, normalization, augmentation, and bbox-aware modes while preserving the existing Modal training path.
-- **PR 5: Partial.** Backend-owned manual and initial-profile queueing, output validation, accepted/rejected persistence, no-direct-scheduling validation, bbox-evidence checks, and manifest/telemetry leakage guards are implemented. Deferred: full deficiency-trigger evaluator, cooldown windows, and per-profile-version max-rerun policy.
+- **PR 5: Completed.** Backend-owned manual and initial-profile queueing, deficiency-trigger reanalysis, cooldown windows, per-profile-version max-run policy, output validation, accepted/rejected persistence, no-direct-scheduling validation, bbox-evidence checks, and manifest/telemetry leakage guards are implemented.
 - **PR 6: Completed.** Experiment Planner input now fetches only the latest accepted analysis and converts it into capped `PlannerVisualExemplarContext`; raw images, raw Visual Agent output, and Visual Agent prompt history are excluded from planner prompts.
-- **PR 7: Partial.** Go and Python unit/integration-style coverage proves the safe happy path, malformed/rejected output, unsupported/no-authority behavior, path leakage rejection, sampling caps, and planner prompt exclusions without real LLM/Modal spend. Deferred: live Postgres migration smoke, real Modal execution, real visual-LLM provider e2e, and deficiency-trigger e2e.
-- **PR 8: Partial.** Mission Control displays latest/listed visual evidence, trigger/status, coverage, traits, classes to watch, hypotheses, cautions, limitations, validation errors, and manual rerun controls. Deferred: cooldown/running-job disabled states that depend on the deferred rerun policy.
+- **PR 7: Completed.** Go and Python unit/integration-style coverage proves the safe happy path, malformed/rejected output, unsupported/no-authority behavior, path leakage rejection, sampling caps, deficiency-trigger queueing, cooldown/max-run enforcement, and planner prompt exclusions without real LLM/Modal spend.
+- **PR 8: Completed.** Mission Control displays latest/listed visual evidence, trigger/status, coverage, traits, classes to watch, hypotheses, cautions, limitations, validation errors, backend rerun policy, cooldown/max-run status, active-job blocking, and manual rerun controls that ensure a worker is available after a backend-approved rerun is queued.
+
+Operational validation still to run outside this planning implementation:
+
+- First real loop with a configured visual LLM provider and actual image dataset.
+- Real Modal execution of `analyze_dataset_visuals`.
+- Live Postgres migration smoke in the target deployment database.
 
 Boundary status:
 
@@ -35,6 +41,7 @@ Boundary status:
 - Planner consumes compressed accepted evidence only.
 - Visual Agent outputs cannot directly create jobs, plans, dataset mutations, labels, or executable authority.
 - Workers execute only backend-created `analyze_dataset_visuals` jobs and backend-validated training plans.
+- When visual analysis is enabled/configured, the initial experiment plan waits for the initial visual-analysis result; if visual analysis is disabled or the initial visual job fails, backend falls back to normal profile-only planning.
 
 ## 2. Architecture And Data Flow
 
@@ -522,7 +529,7 @@ LLM logic:
 
 ### PR 5: Backend Validation And Trigger Orchestration
 
-- **Status:** Partial. Manual/initial-profile queueing, result validation, accepted/rejected persistence, no-direct-scheduling guards, bbox evidence checks, and leakage guards are implemented. Deficiency rerun thresholds, cooldowns, and max-rerun guards remain deferred.
+- **Status:** Completed in the current implementation pass. Manual/initial-profile queueing, deficiency-trigger reanalysis, result validation, accepted/rejected persistence, no-direct-scheduling guards, bbox evidence checks, leakage guards, cooldowns, and max-run guards are implemented.
 - **Owner:** Backend/schema plus validation/testing subagent
 - **Goal:** Queue visual analysis at the right times and validate outputs before persistence.
 - **Likely modules:** `api/handlers.go`, `jobs/model.go`, store, tests.
@@ -546,7 +553,7 @@ LLM logic:
 
 ### PR 7: End-To-End Validation Harness
 
-- **Status:** Partial. Fake-LLM, backend, planner, worker sampling, schema, and preprocessing checks are implemented. Real visual LLM, real Modal, live Postgres migration, and deficiency-rerun e2e validation remain deferred.
+- **Status:** Completed in the current implementation pass. Fake-LLM, backend, planner, worker sampling, schema, preprocessing, cooldown/max-run, deficiency-rerun, and no-direct-scheduling checks are implemented. Real visual LLM, real Modal, and live deployment Postgres smoke tests remain operational validation items for the first real loop.
 - **Owner:** Validation/testing subagent
 - **Goal:** Prove the complete chain works safely.
 - **Likely modules:** backend integration tests, worker tests, test fixtures.
@@ -558,7 +565,7 @@ LLM logic:
 
 ### PR 8: Mission Control Observability
 
-- **Status:** Partial. Evidence/status display and manual rerun controls are implemented. Cooldown/running-job disabled states remain deferred with the full rerun policy.
+- **Status:** Completed in the current implementation pass. Evidence/status display, backend rerun policy display, cooldown/max-run/active-job disabled states, and manual rerun controls are implemented.
 - **Owner:** UI/observability subagent
 - **Goal:** Make visual analysis status, evidence, cost risk, and rerun controls inspectable.
 - **Likely modules:** `apps/mission-control/src/types.ts`, `App.tsx`, API client.

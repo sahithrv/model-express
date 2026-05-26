@@ -46,6 +46,7 @@ import type {
   StrategyScorecard,
   TrainingRunEvaluation,
   TrainingRunSummary,
+  VisualAnalysisRerunPolicy,
   Worker,
   AutomationSettings,
   WorkerRequirement,
@@ -87,6 +88,7 @@ type VisualAnalysisDetail = {
   status: "available" | "empty" | "unsupported" | "error";
   message: string;
   manualRunSupported: boolean;
+  rerunPolicy?: VisualAnalysisRerunPolicy | null;
 };
 
 type VisualAnalysisListResponse = {
@@ -97,6 +99,8 @@ type VisualAnalysisListResponse = {
   analysis?: DatasetVisualAnalysis;
   latest?: DatasetVisualAnalysis;
   dataset_visual_analysis?: DatasetVisualAnalysis;
+  rerun_policy?: VisualAnalysisRerunPolicy;
+  manual_run_supported?: boolean;
 };
 
 type TimelineItem = {
@@ -358,6 +362,7 @@ export function App() {
           status: "empty",
           message: "Upload a dataset before visual analysis can run.",
           manualRunSupported: false,
+          rerunPolicy: null,
         };
       }
 
@@ -372,7 +377,8 @@ export function App() {
           message: latest
             ? "Latest visual analysis loaded from the backend."
             : "Visual analysis API is available; no analysis has been recorded for this dataset yet.",
-          manualRunSupported: true,
+          manualRunSupported: response.manual_run_supported !== false,
+          rerunPolicy: visualAnalysisRerunPolicyFromResponse(response),
         };
       } catch (listError) {
         try {
@@ -387,6 +393,7 @@ export function App() {
               ? "Latest visual analysis loaded from the backend."
               : "Visual analysis API is available; no analysis has been recorded for this dataset yet.",
             manualRunSupported: true,
+            rerunPolicy: visualAnalysisRerunPolicyFromResponse(response),
           };
         } catch (latestError) {
           if (profileFallback) {
@@ -395,6 +402,7 @@ export function App() {
               status: "available",
               message: "Showing visual analysis stored on the dataset profile; dedicated API endpoints are not available.",
               manualRunSupported: false,
+              rerunPolicy: null,
             };
           }
 
@@ -406,6 +414,7 @@ export function App() {
               ? "This backend does not expose dataset visual-analysis endpoints yet."
               : `Visual analysis lookup failed: ${errorMessage(error)}`,
             manualRunSupported: false,
+            rerunPolicy: null,
           };
         }
       }
@@ -768,6 +777,20 @@ export function App() {
         method: "POST",
         body: { trigger_reason: "manual" },
       });
+      let workerMessage = "Worker is ready to pick it up.";
+      try {
+        const workerProcess = await window.missionControl.ensureProjectWorker({
+          projectId: selectedProjectId,
+          baseUrl,
+          name: `visual-analysis-worker-${selectedProjectId}`,
+          gpuType: "local",
+        });
+        workerMessage = workerProcess.started
+          ? "Started a visual-analysis worker."
+          : "Visual-analysis worker is already running.";
+      } catch (error) {
+        workerMessage = `Queued, but worker did not start: ${errorMessage(error)}`;
+      }
       await refreshProjectDetail(selectedProjectId);
       const responseStatus =
         recordString(response, "status") ||
@@ -776,7 +799,7 @@ export function App() {
         "requested";
       setNotice({
         kind: "info",
-        text: `Manual visual analysis rerun ${responseStatus.toLowerCase()} for ${dataset.name}.`,
+        text: `Manual visual analysis rerun ${responseStatus.toLowerCase()} for ${dataset.name}. ${workerMessage}`,
       });
     } catch (error) {
       setNotice({
@@ -2103,6 +2126,16 @@ function VisualAnalysisPanel({
         </span>
       </div>
 
+      {visualAnalysis.rerunPolicy && (
+        <div className="review-state wait visual-rerun-policy">
+          <Badge value={visualAnalysis.rerunPolicy.manual_run_allowed === false ? "RERUN_BLOCKED" : "RERUN_READY"} />
+          <span>
+            <strong>Backend rerun policy</strong>
+            <small>{visualAnalysisPolicySummary(visualAnalysis.rerunPolicy)}</small>
+          </span>
+        </div>
+      )}
+
       <div className="insight-grid visual-facts">
         {facts.map((item) => (
           <div className={`insight-card ${item.tone ?? ""}`} key={item.label}>
@@ -2965,6 +2998,12 @@ function visualAnalysesFromResponse(value: unknown): DatasetVisualAnalysis[] {
   return analyses;
 }
 
+function visualAnalysisRerunPolicyFromResponse(value: unknown): VisualAnalysisRerunPolicy | null {
+  const record = recordObject(value);
+  const policy = recordObject(record.rerun_policy);
+  return Object.keys(policy).length > 0 ? (policy as VisualAnalysisRerunPolicy) : null;
+}
+
 function arrayVisualAnalyses(value: unknown): DatasetVisualAnalysis[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => recordObject(item) as DatasetVisualAnalysis).filter(hasVisualAnalysisShape);
@@ -3008,6 +3047,7 @@ function visualAnalysisFromProfile(profile: Record<string, unknown>) {
 
 function visualAnalysisFacts(visualAnalysis: VisualAnalysisDetail, activeJob: Job | null): InsightItem[] {
   const analysis = visualAnalysis.analysis;
+  const policy = visualAnalysis.rerunPolicy ?? null;
   const coverage = recordObject(analysis?.coverage_report);
   const status = visualAnalysisStatusBadge(visualAnalysis, activeJob);
   const imagesAnalyzed = recordNumber(coverage, "images_analyzed") || analysis?.images_analyzed || 0;
@@ -3024,6 +3064,16 @@ function visualAnalysisFacts(visualAnalysis: VisualAnalysisDetail, activeJob: Jo
   return [
     { label: "Status", value: status, tone: visualStatusTone(status) },
     { label: "Trigger", value: analysis?.trigger_reason || (activeJob ? "manual" : "-") },
+    {
+      label: "Runs/Profile",
+      value: visualAnalysisPolicyRunCount(policy),
+      tone: policy && policy.max_runs_per_profile && (policy.runs_for_profile ?? 0) >= policy.max_runs_per_profile ? "bad" : "good",
+    },
+    {
+      label: "Rerun",
+      value: visualAnalysisPolicyReadiness(policy),
+      tone: policy?.manual_run_allowed === false ? "warn" : "good",
+    },
     {
       label: "Images",
       value: imagesAvailable ? `${imagesAnalyzed}/${imagesAvailable}` : imagesAnalyzed ? String(imagesAnalyzed) : "-",
@@ -3075,8 +3125,38 @@ function visualAnalysisRerunDisabledReason(
   if (!dataset) return "Upload a dataset first.";
   if (activeJob) return `Visual analysis job is already ${activeJob.status.toLowerCase()}.`;
   if (!visualAnalysis.manualRunSupported) return "Backend manual visual-analysis endpoint is not available.";
+  const policy = visualAnalysis.rerunPolicy;
+  if (policy?.manual_run_allowed === false) {
+    return policy.disabled_reason || policy.reason || "Manual visual-analysis rerun is currently blocked by backend policy.";
+  }
   if (loading) return "Another Mission Control request is in progress.";
   return "";
+}
+
+function visualAnalysisPolicyRunCount(policy: VisualAnalysisRerunPolicy | null) {
+  if (!policy) return "-";
+  const runs = policy.runs_for_profile ?? 0;
+  const maxRuns = policy.max_runs_per_profile ?? 0;
+  return maxRuns ? `${runs}/${maxRuns}` : String(runs);
+}
+
+function visualAnalysisPolicyReadiness(policy: VisualAnalysisRerunPolicy | null) {
+  if (!policy) return "-";
+  if (policy.active_job_status) return normalizedStatus(policy.active_job_status);
+  if (policy.manual_run_allowed === false) {
+    if (policy.next_allowed_at) return `After ${new Date(policy.next_allowed_at).toLocaleTimeString()}`;
+    return "Blocked";
+  }
+  return "Ready";
+}
+
+function visualAnalysisPolicySummary(policy: VisualAnalysisRerunPolicy | null) {
+  if (!policy) return "";
+  if (policy.disabled_reason) return policy.disabled_reason;
+  if (policy.reason) return policy.reason;
+  const triggerCount = policy.deficiency_triggers?.length ?? 0;
+  if (triggerCount > 0) return `${triggerCount} deficiency trigger(s) active; backend may queue a rare reanalysis if automation is enabled.`;
+  return policy.automation_enabled ? "Automatic initial and deficiency reanalysis are enabled." : "Automatic visual analysis is disabled; manual rerun is still backend-gated.";
 }
 
 function visualAnalysisLimitations(analysis: DatasetVisualAnalysis | null) {

@@ -112,6 +112,30 @@ export type DatasetVisualAnalysis = {
   updated_at?: string;
 };
 
+export type VisualAnalysisRerunPolicy = {
+  enabled?: boolean;
+  automation_enabled?: boolean;
+  manual_run_allowed?: boolean;
+  initial_run_allowed?: boolean;
+  deficiency_run_allowed?: boolean;
+  run_allowed?: boolean;
+  disabled_reason?: string;
+  reason?: string;
+  next_allowed_at?: string;
+  cooldown_seconds?: number;
+  max_runs_per_profile?: number;
+  runs_for_profile?: number;
+  accepted_runs_for_profile?: number;
+  active_job_id?: string;
+  active_job_status?: string;
+  profile_fingerprint?: string;
+  deficiency_triggers?: string[];
+  deficiency_severity?: number;
+  latest_analysis_id?: string;
+  latest_analysis_created_at?: string;
+  latest_analysis_validation_status?: string;
+};
+
 export type Worker = {
   id: string;
   project_id: string;
