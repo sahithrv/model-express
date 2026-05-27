@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from worker.datasets.cache import dataset_archive_path, extract_dataset_archive
+from worker.datasets.cache import (
+    cleanup_job_dataset_cache,
+    dataset_archive_path,
+    extract_dataset_archive,
+    job_dataset_cache_root,
+    should_persist_dataset_cache,
+)
 from worker.datasets.exemplars import generate_visual_exemplars
 from worker.datasets.storage import download_s3_uri
 from worker.exporting.artifacts import (
@@ -166,28 +172,33 @@ def run_generate_visual_exemplars_job(client: OrchestratorClient, job: dict) -> 
         return
 
     dataset = client.get_dataset(dataset_id)
-    archive_path = dataset_archive_path(dataset_id)
-    download_s3_uri(dataset["storage_uri"], archive_path)
-    dataset_dir = extract_dataset_archive(archive_path, dataset_id)
-    caps = _exemplar_caps(config)
-    output_dir = _exemplar_dir(dataset_id, job_id)
-    pack = generate_visual_exemplars(
-        dataset_dir=dataset_dir,
-        output_dir=output_dir,
-        images_per_class=caps["images_per_class"],
-        max_total_images=caps["max_total_images"],
-        max_image_bytes=caps["max_image_bytes"],
-        max_total_bytes=caps["max_total_bytes"],
-        image_size=caps["image_size"],
-        quality=caps["quality"],
-        seed=_positive_int(config.get("seed"), 0),
-    )
-    payload = _validated_exemplar_payload(pack, caps)
-    client.report_dataset_visual_exemplars(dataset_id, payload)
-    if payload.get("status") == "unavailable":
-        client.fail_job(job_id, payload.get("error") or "visual exemplar generation unavailable")
-        return
-    client.complete_job(job_id, mlflow_run_id="")
+    cache_root = job_dataset_cache_root(job_id)
+    try:
+        archive_path = dataset_archive_path(dataset_id, cache_root)
+        download_s3_uri(dataset["storage_uri"], archive_path)
+        dataset_dir = extract_dataset_archive(archive_path, dataset_id, cache_root)
+        caps = _exemplar_caps(config)
+        output_dir = _exemplar_dir(dataset_id, job_id)
+        pack = generate_visual_exemplars(
+            dataset_dir=dataset_dir,
+            output_dir=output_dir,
+            images_per_class=caps["images_per_class"],
+            max_total_images=caps["max_total_images"],
+            max_image_bytes=caps["max_image_bytes"],
+            max_total_bytes=caps["max_total_bytes"],
+            image_size=caps["image_size"],
+            quality=caps["quality"],
+            seed=_positive_int(config.get("seed"), 0),
+        )
+        payload = _validated_exemplar_payload(pack, caps)
+        client.report_dataset_visual_exemplars(dataset_id, payload)
+        if payload.get("status") == "unavailable":
+            client.fail_job(job_id, payload.get("error") or "visual exemplar generation unavailable")
+            return
+        client.complete_job(job_id, mlflow_run_id="")
+    finally:
+        if not should_persist_dataset_cache():
+            cleanup_job_dataset_cache(job_id, cache_root)
 
 
 def _config(job: dict) -> dict:

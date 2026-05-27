@@ -80,7 +80,7 @@ func TestDatasetVisualAnalysisResultRejectsExecutionAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create dataset: %v", err)
 	}
-	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4})
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4, "class_count": 2})
 	if err != nil {
 		t.Fatalf("profile dataset: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestDatasetVisualAnalysisResultRejectsSampleManifestPathLeakage(t *testing.
 	if err != nil {
 		t.Fatalf("create dataset: %v", err)
 	}
-	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4})
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4, "class_count": 2})
 	if err != nil {
 		t.Fatalf("profile dataset: %v", err)
 	}
@@ -134,12 +134,324 @@ func TestDatasetVisualAnalysisResultRejectsSampleManifestPathLeakage(t *testing.
 	}
 }
 
+func TestDatasetVisualAnalysisResultDowngradesBBoxHypothesisWithoutProfileEvidence(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4, "class_count": 2})
+	if err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+
+	payload := validVisualAnalysisPayload(dataset)
+	payload["preprocessing_hypotheses"] = append(payload["preprocessing_hypotheses"].([]map[string]any), map[string]any{
+		"id":              "vh_002",
+		"mechanism":       "bbox_crop_ablation",
+		"summary":         "Try bbox crops if annotations exist.",
+		"evidence":        []string{"Subjects look small in sampled images."},
+		"expected_effect": "Improve foreground focus if backend validates bbox annotations.",
+		"confidence":      "medium",
+		"support_status":  "needs_backend_validation",
+		"suggested_preprocessing": map[string]any{
+			"crop_strategy": "bbox_crop_ablation",
+			"bbox_mode":     "crop_and_compare_full_image",
+		},
+	})
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analysis-result", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected accepted evidence-only bbox result status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+
+	latest, err := memoryStore.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
+		t.Fatalf("latest accepted visual analysis: %v", err)
+	}
+	var bboxHypothesis *datasets.PreprocessingHypothesis
+	for index := range latest.PreprocessingHypotheses {
+		if latest.PreprocessingHypotheses[index].ID == "vh_002" {
+			bboxHypothesis = &latest.PreprocessingHypotheses[index]
+			break
+		}
+	}
+	if bboxHypothesis == nil {
+		t.Fatalf("expected downgraded bbox hypothesis to be retained, got %#v", latest.PreprocessingHypotheses)
+	}
+	if bboxHypothesis.SupportStatus != "unsupported" || bboxHypothesis.SuggestedPreprocessing != nil {
+		t.Fatalf("expected bbox hypothesis to be evidence-only unsupported, got %#v", bboxHypothesis)
+	}
+	if !strings.Contains(bboxHypothesis.UnsupportedReason, "backend-profiled bbox evidence") {
+		t.Fatalf("expected bbox unsupported reason to cite backend evidence, got %q", bboxHypothesis.UnsupportedReason)
+	}
+}
+
+func TestDatasetVisualAnalysisResultKeepsBBoxHypothesisWithProfileEvidence(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{
+		"task_type":    "image_classification",
+		"total_images": 4,
+		"class_count":  2,
+		"metadata_summary": map[string]any{
+			"artifact_counts": map[string]any{"annotation_json": 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+
+	payload := validVisualAnalysisPayload(dataset)
+	payload["preprocessing_hypotheses"] = append(payload["preprocessing_hypotheses"].([]map[string]any), map[string]any{
+		"id":              "vh_002",
+		"mechanism":       "bbox_crop_ablation",
+		"summary":         "Compare bbox crops against full-image training.",
+		"evidence":        []string{"Backend profile includes annotation artifacts."},
+		"expected_effect": "Improve foreground focus without changing labels.",
+		"confidence":      "medium",
+		"support_status":  "needs_backend_validation",
+		"suggested_preprocessing": map[string]any{
+			"crop_strategy": "bbox_crop_ablation",
+			"bbox_mode":     "crop_and_compare_full_image",
+		},
+	})
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analysis-result", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected accepted bbox-backed result status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	latest, err := memoryStore.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
+		t.Fatalf("latest accepted visual analysis: %v", err)
+	}
+	bboxHypothesis := latest.PreprocessingHypotheses[len(latest.PreprocessingHypotheses)-1]
+	if bboxHypothesis.SupportStatus != "needs_backend_validation" || bboxHypothesis.SuggestedPreprocessing == nil {
+		t.Fatalf("expected bbox hypothesis to remain planner-visible but gated, got %#v", bboxHypothesis)
+	}
+}
+
+func TestDatasetVisualAnalysisResultAcceptsRealisticLLMOutputContract(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{
+		"task_type":    "image_classification",
+		"total_images": 128,
+		"class_count":  3,
+		"metadata_summary": map[string]any{
+			"artifact_counts": map[string]any{"annotation_json": 2},
+		},
+		"visual_trait_summary": map[string]any{
+			"bbox_count": 2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+
+	payload := realisticVisualLLMOutput(dataset)
+	rawOutput, _ := json.Marshal(payload)
+	payload["project_id"] = dataset.ProjectID
+	payload["provider"] = "fake"
+	payload["model"] = "fake-vision"
+	payload["source_job_id"] = "job_visual_contract"
+	payload["raw_output"] = string(rawOutput)
+	payload["sample_manifest"] = realisticVisualSampleManifest()
+	payload["input_context"] = map[string]any{
+		"caps":                    map[string]any{"max_total_images": 48, "max_image_bytes": 350000},
+		"sample_manifest_summary": map[string]any{"images_analyzed": 4},
+	}
+
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analysis-result", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected realistic LLM output to pass visual validation, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	latest, err := memoryStore.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
+		t.Fatalf("latest accepted visual analysis: %v", err)
+	}
+	if latest.ValidationStatus != datasets.VisualValidationStatusAccepted || len(latest.ValidationErrors) != 0 {
+		t.Fatalf("expected accepted analysis without validation errors, got %#v", latest)
+	}
+	if len(latest.PreprocessingHypotheses) != 4 {
+		t.Fatalf("expected all realistic hypotheses to persist, got %#v", latest.PreprocessingHypotheses)
+	}
+	byID := map[string]datasets.PreprocessingHypothesis{}
+	for _, hypothesis := range latest.PreprocessingHypotheses {
+		byID[hypothesis.ID] = hypothesis
+	}
+	if byID["vh_001"].SuggestedPreprocessing == nil || byID["vh_001"].SuggestedPreprocessing.CropStrategy != "center_crop" {
+		t.Fatalf("expected resolution crop preprocessing to persist, got %#v", byID["vh_001"])
+	}
+	if byID["vh_002"].SuggestedAugmentationConfig == nil || byID["vh_002"].SuggestedAugmentationConfig.PolicyType != "mixup" {
+		t.Fatalf("expected MixUp config to persist, got %#v", byID["vh_002"])
+	}
+	if byID["vh_003"].SupportStatus == "unsupported" || byID["vh_003"].SuggestedPreprocessing == nil {
+		t.Fatalf("expected bbox hypothesis to stay gated but accepted with backend evidence, got %#v", byID["vh_003"])
+	}
+	if byID["vh_004"].SuggestedAugmentationConfig == nil || byID["vh_004"].SuggestedAugmentationConfig.PolicyType != "randaugment" {
+		t.Fatalf("expected RandAugment config to persist, got %#v", byID["vh_004"])
+	}
+}
+
+func TestProfileHasBBoxEvidenceUsesProfiledCounts(t *testing.T) {
+	if !profileHasBBoxEvidence(map[string]any{
+		"visual_trait_summary": map[string]any{"bbox_count": 3},
+	}) {
+		t.Fatal("expected parsed bbox trait count to satisfy bbox evidence")
+	}
+	if !profileHasBBoxEvidence(map[string]any{
+		"metadata_summary": map[string]any{
+			"artifact_counts": map[string]any{"annotation_json": 1},
+		},
+	}) {
+		t.Fatal("expected annotation artifact count to satisfy bbox evidence")
+	}
+	if profileHasBBoxEvidence(map[string]any{
+		"metadata_summary": map[string]any{
+			"artifact_counts": map[string]any{"labels_csv": 1},
+		},
+	}) {
+		t.Fatal("labels-only artifact counts should not satisfy bbox evidence")
+	}
+}
+
+func TestDatasetVisualAnalysisResultAllowsFalseRawImageBoundaryFlags(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{
+		"task_type":    "image_classification",
+		"total_images": 4,
+		"class_count":  2,
+	})
+	if err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+
+	payload := validVisualAnalysisPayload(dataset)
+	payload["input_context"] = map[string]any{
+		"sample_manifest_summary":         map[string]any{"images_analyzed": 2},
+		"caps":                            map[string]any{"max_total_images": 48, "max_image_bytes": 350000, "max_total_bytes": 8000000},
+		"raw_images_included":             false,
+		"raw_images_included_for_planner": false,
+	}
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analysis-result", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected accepted boundary flags status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+}
+
+func TestUnsafeVisualAnalysisContentReasonsExplainMatchedMarker(t *testing.T) {
+	if reasons := unsafeVisualAnalysisContentReasons(`{"raw_images_included_for_planner":false,"raw_images_included":false}`); len(reasons) != 0 {
+		t.Fatalf("false raw-image boundary flags should not be unsafe, got %v", reasons)
+	}
+	if reasons := unsafeVisualAnalysisContentReasons(`{"max_image_bytes":350000,"prepared_bytes":12345}`); len(reasons) != 0 {
+		t.Fatalf("safe byte-count telemetry should not be unsafe, got %v", reasons)
+	}
+	reasons := unsafeVisualAnalysisContentReasons(`{"image_inputs":[{"data_base64":"abc","image_bytes":"raw"}],"path":"C:\\Users\\demo\\image.jpg"}`)
+	blob := strings.Join(reasons, " ")
+	for _, want := range []string{"image inputs field", "base64 image field", "image bytes field", "Windows local path"} {
+		if !strings.Contains(blob, want) {
+			t.Fatalf("expected reason %q in %v", want, reasons)
+		}
+	}
+}
+
+func TestDatasetVisualAnalysisResultSanitizesRawImageInputContext(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "flowers", "s3://bucket/flowers.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4, "class_count": 2})
+	if err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+
+	payload := validVisualAnalysisPayload(dataset)
+	payload["input_context"] = map[string]any{
+		"caps":       map[string]any{"max_image_bytes": 350000},
+		"raw_images": []map[string]any{{"image_id": "img_1", "data_base64": "abc"}},
+		"unsafe":     "C:\\Users\\demo\\image.jpg",
+	}
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analysis-result", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected accepted result with sanitized telemetry status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	latest, err := memoryStore.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
+		t.Fatalf("latest accepted visual analysis: %v", err)
+	}
+	invocation, err := memoryStore.GetAgentInvocation(latest.SourceInvocationID)
+	if err != nil {
+		t.Fatalf("get invocation: %v", err)
+	}
+	contextJSON, _ := json.Marshal(invocation.InputContext)
+	contextText := string(contextJSON)
+	if strings.Contains(contextText, "data_base64") || strings.Contains(contextText, "Users") || strings.Contains(contextText, `"raw_images":[`) {
+		t.Fatalf("expected unsafe telemetry to be dropped, got %s", contextText)
+	}
+	caps, ok := invocation.InputContext["caps"].(map[string]any)
+	if !ok || caps["max_image_bytes"] == nil {
+		t.Fatalf("expected safe caps to be retained, got %#v", invocation.InputContext)
+	}
+}
+
 func TestVisualAnalysisInvocationContextPreservesBoundaryFlags(t *testing.T) {
 	context := visualAnalysisInvocationContext(map[string]any{
-		"caps":                            map[string]any{"max_total_images": 48},
+		"caps":                            map[string]any{"max_total_images": 48, "max_image_bytes": 350000},
 		"raw_images_included":             true,
 		"raw_visual_output_included":      true,
 		"visual_agent_prompt_for_planner": true,
+		"image_inputs":                    []map[string]any{{"data_base64": "abc"}},
 		"unsafe":                          "file:///tmp/image.jpg",
 	}, []datasets.VisualSampleManifestItem{{ImageID: "img_1"}})
 
@@ -149,7 +461,11 @@ func TestVisualAnalysisInvocationContextPreservesBoundaryFlags(t *testing.T) {
 	if _, ok := context["unsafe"]; ok {
 		t.Fatalf("expected unsafe telemetry key to be dropped, got %#v", context)
 	}
-	if context["caps"] == nil || context["visual_agent_stream_is_separate"] != true {
+	if _, ok := context["image_inputs"]; ok {
+		t.Fatalf("expected image_inputs telemetry key to be dropped, got %#v", context)
+	}
+	caps, ok := context["caps"].(map[string]any)
+	if !ok || caps["max_image_bytes"] == nil || context["visual_agent_stream_is_separate"] != true {
 		t.Fatalf("expected safe telemetry and separate-stream marker, got %#v", context)
 	}
 }
@@ -520,6 +836,174 @@ func hasVisualAnalysisJobForDataset(projectJobs []jobs.ExperimentJob, datasetID 
 		}
 	}
 	return false
+}
+
+func realisticVisualLLMOutput(dataset datasets.Dataset) map[string]any {
+	return map[string]any{
+		"schema_version":  datasets.VisualAnalysisSchemaVersion,
+		"dataset_id":      dataset.ID,
+		"dataset_name":    dataset.Name,
+		"total_images":    128,
+		"images_analyzed": 4,
+		"trigger_reason":  "initial_profile",
+		"confidence":      "medium",
+		"coverage_report": map[string]any{
+			"selection_strategy":      "deterministic_risk_and_representative_sampling",
+			"selection_basis":         []string{"class_representative", "aspect_ratio_outlier", "bbox_object_scale_outlier"},
+			"images_available":        128,
+			"images_analyzed":         4,
+			"classes_total":           3,
+			"classes_covered":         3,
+			"class_coverage_ratio":    1,
+			"per_class_counts":        map[string]int{"daisy": 2, "rose": 1, "tulip": 1},
+			"hard_example_count":      1,
+			"edge_case_count":         2,
+			"high_detail_image_count": 2,
+			"limitations":             []string{"Bounded visual sample, not full dataset inspection."},
+		},
+		"visual_traits": []map[string]any{
+			{
+				"trait":             "small_objects",
+				"level":             "medium",
+				"confidence":        "medium",
+				"evidence":          []string{"img_001 and img_004 show foreground objects occupying a small region."},
+				"example_image_ids": []string{"img_001", "img_004"},
+				"affected_classes":  []string{"daisy", "tulip"},
+			},
+			{
+				"trait":             "background_dominance",
+				"level":             "high",
+				"confidence":        "medium",
+				"evidence":          []string{"Several sampled images contain broad background around the subject."},
+				"example_image_ids": []string{"img_001", "img_003"},
+			},
+			{
+				"trait":             "fine_grained_similarity",
+				"level":             "medium",
+				"confidence":        "low",
+				"evidence":          []string{"Rose and tulip examples share similar color and petal texture cues."},
+				"example_image_ids": []string{"img_002", "img_003"},
+				"affected_classes":  []string{"rose", "tulip"},
+			},
+			{
+				"trait":             "crop_bbox_useful",
+				"level":             "medium",
+				"confidence":        "medium",
+				"evidence":          []string{"Manifest bbox metadata indicates object-centered crops are plausible."},
+				"example_image_ids": []string{"img_004"},
+			},
+		},
+		"classes_to_watch": []map[string]any{
+			{
+				"class_name":        "rose",
+				"reason":            "Texture and color overlap with tulip examples.",
+				"related_classes":   []string{"tulip"},
+				"evidence":          []string{"img_002 and img_003 share warm petal colors and soft boundaries."},
+				"example_image_ids": []string{"img_002", "img_003"},
+				"confidence":        "low",
+			},
+		},
+		"preprocessing_hypotheses": []map[string]any{
+			{
+				"id":                    "vh_001",
+				"mechanism":             "resolution_crop",
+				"summary":               "Compare preserve-aspect padding and moderate image size for variable framing.",
+				"evidence":              []string{"Aspect ratio and foreground scale vary across img_001 through img_004.", "Background dominance appears high in multiple samples."},
+				"example_image_ids":     []string{"img_001", "img_003", "img_004"},
+				"suggested_image_sizes": []int{256, 288},
+				"suggested_preprocessing": map[string]any{
+					"resize_strategy": "preserve_aspect_pad",
+					"normalization":   "imagenet",
+					"crop_strategy":   "center_crop",
+					"bbox_mode":       "ignore",
+				},
+				"expected_effect": "Reduce shape distortion and make foreground scale more consistent.",
+				"risk":            "May increase latency compared with the current 224 input.",
+				"confidence":      "medium",
+				"support_status":  "needs_backend_validation",
+			},
+			{
+				"id":                                   "vh_002",
+				"mechanism":                            "augmentation_mixed_sample",
+				"summary":                              "Try MixUp for visually similar flower classes.",
+				"evidence":                             []string{"Rose and tulip samples have overlapping color and petal texture cues."},
+				"example_image_ids":                    []string{"img_002", "img_003"},
+				"suggested_augmentation_policy":        "mixup",
+				"suggested_augmentation_policy_config": map[string]any{"policy_type": "mixup", "probability": 0.45, "alpha": 0.3},
+				"expected_effect":                      "Improve calibration for visually similar classes.",
+				"risk":                                 "Can soften labels too much on a small dataset.",
+				"confidence":                           "low",
+				"support_status":                       "needs_backend_validation",
+			},
+			{
+				"id":                "vh_003",
+				"mechanism":         "bbox_crop_ablation",
+				"summary":           "Compare bbox-centered crop against full-image training when backend annotations exist.",
+				"evidence":          []string{"img_004 includes bbox metadata and a small foreground object."},
+				"example_image_ids": []string{"img_004"},
+				"suggested_preprocessing": map[string]any{
+					"crop_strategy": "bbox_crop_ablation",
+					"bbox_mode":     "crop_and_compare_full_image",
+					"normalization": "imagenet",
+				},
+				"expected_effect": "Check whether reducing background area improves foreground class signal.",
+				"risk":            "Only valid when backend-profiled bbox annotations are available.",
+				"confidence":      "medium",
+				"support_status":  "needs_backend_validation",
+			},
+			{
+				"id":                                   "vh_004",
+				"mechanism":                            "augmentation_auto",
+				"summary":                              "Use a light RandAugment search for brightness and texture variation.",
+				"evidence":                             []string{"Lighting and texture vary across the sampled flowers."},
+				"example_image_ids":                    []string{"img_001", "img_002", "img_003"},
+				"suggested_augmentation_policy":        "randaugment",
+				"suggested_augmentation_policy_config": map[string]any{"policy_type": "randaugment", "magnitude": 6, "num_ops": 2, "num_magnitude_bins": 15, "probability": 0.75},
+				"expected_effect":                      "Improve robustness to bounded visual variation.",
+				"risk":                                 "Aggressive color changes may hurt fine-grained flower cues.",
+				"confidence":                           "medium",
+				"support_status":                       "needs_backend_validation",
+			},
+		},
+		"cautions": []map[string]any{
+			{
+				"operation":         "vertical_flip",
+				"reason":            "Some flowers have orientation cues in the sampled images.",
+				"severity":          "medium",
+				"confidence":        "medium",
+				"example_image_ids": []string{"img_001", "img_004"},
+			},
+			{
+				"operation":         "strong_color_jitter",
+				"reason":            "Color appears class-informative for rose and tulip samples.",
+				"severity":          "medium",
+				"confidence":        "low",
+				"affected_classes":  []string{"rose", "tulip"},
+				"example_image_ids": []string{"img_002", "img_003"},
+			},
+		},
+		"limitations": []string{
+			"Visual evidence comes from a bounded sample and should not be treated as labels.",
+			"Backend validation must approve every runnable preprocessing or augmentation field.",
+		},
+	}
+}
+
+func realisticVisualSampleManifest() []map[string]any {
+	return []map[string]any{
+		{"image_id": "img_001", "class_name": "daisy", "width": 640, "height": 480, "selection_basis": []string{"class_representative"}},
+		{"image_id": "img_002", "class_name": "rose", "width": 512, "height": 512, "selection_basis": []string{"class_representative"}},
+		{"image_id": "img_003", "class_name": "tulip", "width": 480, "height": 640, "selection_basis": []string{"aspect_ratio_outlier"}},
+		{
+			"image_id":        "img_004",
+			"class_name":      "daisy",
+			"width":           800,
+			"height":          600,
+			"selection_basis": []string{"bbox_object_scale_outlier"},
+			"has_bbox":        true,
+			"bbox":            map[string]any{"xmin": 220, "ymin": 160, "xmax": 520, "ymax": 430},
+		},
+	}
 }
 
 func validVisualAnalysisPayload(dataset datasets.Dataset) map[string]any {

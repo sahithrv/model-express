@@ -191,8 +191,8 @@ def validate_visual_analysis_output(
         for item in _list(payload.get("classes_to_watch"))[:MAX_ARRAY_ITEMS]
     ]
     sanitized["preprocessing_hypotheses"] = [
-        _preprocessing_hypothesis(item, manifest_ids)
-        for item in _list(payload.get("preprocessing_hypotheses"))[:MAX_ARRAY_ITEMS]
+        _preprocessing_hypothesis(item, manifest_ids, index)
+        for index, item in enumerate(_list(payload.get("preprocessing_hypotheses"))[:MAX_ARRAY_ITEMS])
     ]
     sanitized["cautions"] = [
         _visual_caution(item, manifest_ids)
@@ -295,10 +295,10 @@ def _class_watch_item(value: Any, manifest_ids: set[str]) -> dict[str, Any]:
     }
 
 
-def _preprocessing_hypothesis(value: Any, manifest_ids: set[str]) -> dict[str, Any]:
+def _preprocessing_hypothesis(value: Any, manifest_ids: set[str], index: int) -> dict[str, Any]:
     item = _object(value, "preprocessing_hypotheses item")
     hypothesis = {
-        "id": _required_text(item, "id", max_length=80),
+        "id": _hypothesis_id(item, index),
         "mechanism": _enum(item.get("mechanism"), MECHANISMS, "preprocessing_hypotheses.mechanism"),
         "summary": _required_text(item, "summary", max_length=MAX_LONG_TEXT_LENGTH),
         "evidence": _texts(item.get("evidence"), limit=MAX_EVIDENCE_ITEMS),
@@ -346,6 +346,13 @@ def _preprocessing_hypothesis(value: Any, manifest_ids: set[str]) -> dict[str, A
             max_length=MAX_LONG_TEXT_LENGTH,
         )
     return hypothesis
+
+
+def _hypothesis_id(item: dict[str, Any], index: int) -> str:
+    supplied = _optional_text(item, "id", max_length=80)
+    if supplied:
+        return supplied
+    return f"vh_{index + 1:03d}"
 
 
 def _visual_caution(value: Any, manifest_ids: set[str]) -> dict[str, Any]:

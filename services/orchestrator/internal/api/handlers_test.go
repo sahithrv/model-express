@@ -1960,6 +1960,212 @@ func TestEnsureFollowUpPlanBlocksHighResolutionWithoutObjectScaleEvidence(t *tes
 	}
 }
 
+func TestEnsureFollowUpPlanAllowsResolutionCropLinkedToAcceptedVisualHypothesis(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	analysis, err := server.store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      projectID,
+		DatasetID:      plan.DatasetID,
+		ImagesAnalyzed: 48,
+		TriggerReason:  datasets.VisualTriggerInitialProfile,
+		CoverageReport: datasets.VisualCoverageReport{
+			ImagesAnalyzed:     48,
+			ClassesTotal:       120,
+			ClassesCovered:     39,
+			ClassCoverageRatio: 0.325,
+		},
+		VisualTraits: []datasets.VisualTrait{
+			{
+				Trait:      "large_objects",
+				Level:      "medium",
+				Confidence: "medium",
+				Evidence:   []string{"sampled subjects occupy large regions with visible background context"},
+			},
+		},
+		PreprocessingHypotheses: []datasets.PreprocessingHypothesis{
+			{
+				ID:             "vh_001",
+				Mechanism:      "resolution_crop",
+				Summary:        "Use subject-centric crops to reduce background context around large dogs.",
+				Evidence:       []string{"dogs are prominent but backgrounds remain visible in multiple sampled images"},
+				ExpectedEffect: "Reduce background distraction while preserving breed morphology.",
+				Confidence:     "medium",
+				SupportStatus:  "needs_backend_validation",
+			},
+		},
+		Limitations: []string{"bounded visual sample"},
+	})
+	if err != nil {
+		t.Fatalf("create accepted visual analysis: %v", err)
+	}
+
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "resolution_crop"
+	experiment.Intervention = "Use preserve-aspect resize with a moderate center crop linked to visual hypothesis vh_001."
+	experiment.EvidenceUsed = []string{"visual hypothesis vh_001"}
+	experiment.ExpectedEffect = "Improve breed-focused learning by reducing background context."
+	experiment.ImageSize = 288
+	experiment.ResolutionStrategy = "compare_224_256"
+	experiment.Preprocessing = &plans.Preprocessing{
+		ResizeStrategy: "preserve_aspect_pad",
+		Normalization:  "imagenet",
+		CropStrategy:   "center_crop",
+		BBoxMode:       "ignore",
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"accepted visual analysis " + analysis.ID})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected visual-hypothesis-linked resolution crop to pass, got %v", err)
+	}
+	if !created || len(followUp.Experiments) != 1 {
+		t.Fatalf("expected one linked follow-up experiment, got created=%v plan=%#v", created, followUp)
+	}
+	evidenceBlob := strings.Join(followUp.Experiments[0].EvidenceUsed, " ")
+	if !strings.Contains(evidenceBlob, analysis.ID) || !strings.Contains(evidenceBlob, "vh_001") || !strings.Contains(evidenceBlob, "large_objects") {
+		t.Fatalf("expected stored experiment evidence to include accepted visual analysis details, got %#v", followUp.Experiments[0].EvidenceUsed)
+	}
+}
+
+func TestEnsureFollowUpPlanBlocksUnsupportedVisualHypothesisEvidence(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	if _, err := server.store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      projectID,
+		DatasetID:      plan.DatasetID,
+		ImagesAnalyzed: 24,
+		TriggerReason:  datasets.VisualTriggerInitialProfile,
+		PreprocessingHypotheses: []datasets.PreprocessingHypothesis{
+			{
+				ID:             "vh_999",
+				Mechanism:      "resolution_crop",
+				Summary:        "Unsupported crop suggestion should remain evidence-only.",
+				Evidence:       []string{"crop evidence should be ignored while unsupported"},
+				ExpectedEffect: "Would change crop behavior if it were supported.",
+				Confidence:     "medium",
+				SupportStatus:  "unsupported",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("create unsupported visual analysis: %v", err)
+	}
+
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "resolution_crop"
+	experiment.Intervention = "Try high-resolution crop based only on visual hypothesis vh_999."
+	experiment.EvidenceUsed = []string{"visual hypothesis vh_999"}
+	experiment.ExpectedEffect = "Check whether higher-resolution cropping improves validation quality."
+	experiment.ImageSize = 384
+	experiment.ResolutionStrategy = "high_resolution_ablation"
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"visual hypothesis vh_999"})
+
+	_, _, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err == nil || !strings.Contains(err.Error(), "object-scale") {
+		t.Fatalf("expected unsupported visual hypothesis not to satisfy mechanism evidence, got %v", err)
+	}
+}
+
+func TestEnsureFollowUpPlanAllowsMixedSampleLinkedToAcceptedVisualHypothesisWithPolicy(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	analysis, err := server.store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      projectID,
+		DatasetID:      plan.DatasetID,
+		ImagesAnalyzed: 48,
+		TriggerReason:  datasets.VisualTriggerInitialProfile,
+		VisualTraits: []datasets.VisualTrait{
+			{
+				Trait:      "fine_grained_similarity",
+				Level:      "high",
+				Confidence: "medium",
+				Evidence:   []string{"sampled classes include visually similar breeds"},
+			},
+		},
+		PreprocessingHypotheses: []datasets.PreprocessingHypothesis{
+			{
+				ID:             "vh_002",
+				Mechanism:      "augmentation_mixed_sample",
+				Summary:        "MixUp or CutMix may smooth decision boundaries among similar classes.",
+				Evidence:       []string{"fine-grained similarity appears high in the visual sample"},
+				ExpectedEffect: "Improve calibration across similar classes.",
+				Confidence:     "medium",
+				SupportStatus:  "needs_backend_validation",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create accepted visual analysis: %v", err)
+	}
+
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "augmentation_mixed_sample"
+	experiment.Intervention = "Use MixUp linked to visual hypothesis vh_002 for visually similar classes."
+	experiment.EvidenceUsed = []string{"visual hypothesis vh_002"}
+	experiment.ExpectedEffect = "Improve calibration and reduce overconfident similar-class errors."
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{
+		PolicyType:  "mixup",
+		Probability: 0.5,
+		Alpha:       0.3,
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"accepted visual analysis " + analysis.ID})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected MixUp visual-hypothesis-linked follow-up to pass, got %v", err)
+	}
+	if !created || len(followUp.Experiments) != 1 {
+		t.Fatalf("expected one MixUp follow-up experiment, got created=%v plan=%#v", created, followUp)
+	}
+	evidenceBlob := strings.Join(followUp.Experiments[0].EvidenceUsed, " ")
+	if !strings.Contains(evidenceBlob, analysis.ID) || !strings.Contains(evidenceBlob, "vh_002") || !strings.Contains(evidenceBlob, "fine_grained_similarity") {
+		t.Fatalf("expected MixUp experiment evidence to include accepted visual analysis details, got %#v", followUp.Experiments[0].EvidenceUsed)
+	}
+}
+
+func TestEnsureFollowUpPlanBlocksMixedSampleVisualHypothesisWithoutPolicy(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	if _, err := server.store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:      projectID,
+		DatasetID:      plan.DatasetID,
+		ImagesAnalyzed: 48,
+		TriggerReason:  datasets.VisualTriggerInitialProfile,
+		PreprocessingHypotheses: []datasets.PreprocessingHypothesis{
+			{
+				ID:             "vh_003",
+				Mechanism:      "augmentation_mixed_sample",
+				Summary:        "Mixed-sample augmentation may help similar classes.",
+				Evidence:       []string{"fine-grained similarity appears high in the visual sample"},
+				ExpectedEffect: "Improve calibration across similar classes.",
+				Confidence:     "medium",
+				SupportStatus:  "needs_backend_validation",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("create accepted visual analysis: %v", err)
+	}
+
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "augmentation_mixed_sample"
+	experiment.Intervention = "Use mixed-sample augmentation linked to visual hypothesis vh_003."
+	experiment.EvidenceUsed = []string{"visual hypothesis vh_003"}
+	experiment.ExpectedEffect = "Improve calibration and reduce similar-class confusion."
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"visual hypothesis vh_003"})
+
+	_, _, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err == nil || !strings.Contains(err.Error(), "MixUp or CutMix") {
+		t.Fatalf("expected visual hypothesis without structured mixed-sample policy to be blocked, got %v", err)
+	}
+}
+
 func TestEnsureFollowUpPlanAllowsDiagnosisMatchedClassImbalanceMechanism(t *testing.T) {
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
@@ -2920,6 +3126,142 @@ func TestExperimentPlannerSkipsNewPlanningAfterChampionSelected(t *testing.T) {
 	}
 	if !hasBackendStopGuardEvent(events, "champion_selected_guard") {
 		t.Fatalf("expected champion-selected guard event, got %#v", events)
+	}
+}
+
+func TestTrainingMonitorFailureRecordsAgentFailedEvent(t *testing.T) {
+	llmCalls := 0
+	requestModels := []string{}
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls++
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode llm request: %v", err)
+		}
+		requestModels = append(requestModels, request.Model)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": "not-json",
+				},
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_MODEL", "visual-fallback-model")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.62)
+
+	server.runTrainingMonitorAfterTrainingJob(job)
+	if llmCalls != 1 {
+		t.Fatalf("expected training monitor to call LLM once, got %d", llmCalls)
+	}
+	if len(requestModels) != 1 || requestModels[0] != "visual-fallback-model" {
+		t.Fatalf("expected training monitor to use visual model fallback, got %#v", requestModels)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasExecutionEvent(events, execution.EventAgentFailed) {
+		t.Fatalf("expected agent failure event, got %#v", events)
+	}
+	if hasExecutionEvent(events, execution.EventExecutionFailed) {
+		t.Fatalf("expected monitor failure not to be recorded as execution failure, got %#v", events)
+	}
+}
+
+func TestExperimentPlannerFailureRecordsAgentFailedEvent(t *testing.T) {
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": "not-json",
+				},
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "test-model")
+	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.62)
+
+	handled, err := server.runExperimentPlannerAfterTrainingJob(job)
+	if err == nil {
+		t.Fatal("expected malformed planner output to fail")
+	}
+	if handled {
+		t.Fatal("expected planner failure not to be handled")
+	}
+	events, eventErr := server.store.ListProjectExecutionEvents(projectID, 10)
+	if eventErr != nil {
+		t.Fatalf("list execution events: %v", eventErr)
+	}
+	if !hasExecutionEvent(events, execution.EventAgentFailed) {
+		t.Fatalf("expected agent failure event, got %#v", events)
+	}
+	if hasExecutionEvent(events, execution.EventExecutionFailed) {
+		t.Fatalf("expected planner failure not to be recorded as execution failure, got %#v", events)
+	}
+}
+
+func TestPlanningLoopDoesNotRunDeterministicReviewerAfterLLMPlannerFailure(t *testing.T) {
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": "not-json",
+				},
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "test-model")
+	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.62)
+
+	server.runPlanningLoopAfterTrainingJob(job)
+	if decisions := listAgentDecisions(t, server, projectID); len(decisions) != 0 {
+		t.Fatalf("expected no deterministic fallback decision after planner failure, got %#v", decisions)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasExecutionEvent(events, execution.EventAgentFailed) {
+		t.Fatalf("expected agent failure event, got %#v", events)
+	}
+	if hasExecutionEvent(events, execution.EventExecutionFailed) {
+		t.Fatalf("expected planner failure not to become execution failure, got %#v", events)
 	}
 }
 

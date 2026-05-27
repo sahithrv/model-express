@@ -27,6 +27,20 @@ Status from the current implementation pass:
 - **PR 7: Completed.** Go and Python unit/integration-style coverage proves the safe happy path, malformed/rejected output, unsupported/no-authority behavior, path leakage rejection, sampling caps, deficiency-trigger queueing, cooldown/max-run enforcement, and planner prompt exclusions without real LLM/Modal spend.
 - **PR 8: Completed.** Mission Control displays latest/listed visual evidence, trigger/status, coverage, traits, classes to watch, hypotheses, cautions, limitations, validation errors, backend rerun policy, cooldown/max-run status, active-job blocking, and manual rerun controls that ensure a worker is available after a backend-approved rerun is queued.
 
+Follow-up validation linkage completed on May 26, 2026:
+
+- Accepted visual hypotheses are now linked into follow-up experiment validation as additional `evidence_used` only when the planner proposes the same mechanism or cites the hypothesis ID, such as `vh_001`.
+- `unsupported` visual hypotheses are ignored by the evidence linker and cannot satisfy mechanism validation.
+- The evidence linker does not create jobs, plans, labels, dataset mutations, preprocessing, or augmentation config. Concrete backend-supported experiment fields are still required; for example `augmentation_mixed_sample` still needs MixUp/CutMix config, and `resolution_crop` still needs image-size, resolution-strategy, or crop/preprocessing changes.
+- Focused Go tests cover linked `resolution_crop`, linked `augmentation_mixed_sample`, unsupported-hypothesis blocking, and structured-policy blocking.
+
+Safe visual callback data-path cleanup completed on May 26, 2026:
+
+- Visual-analysis `input_context` is now treated as optional telemetry: the backend allowlists safe telemetry keys, normalizes the invocation context, strips raw image/path/provider fields, and validates the sanitized context.
+- Numeric/boolean audit fields such as `max_image_bytes`, `prepared_bytes`, and `raw_images_included_for_planner: false` no longer reject an otherwise valid analysis.
+- Required persisted channels remain strict: raw visual output, the top-level sample manifest, and parsed analysis are still rejected if they contain image payloads, local/object-storage paths, direct job authority, commands, or dataset/label mutation instructions.
+- Focused Go tests cover safe byte-count telemetry, unsafe optional telemetry stripping, false raw-image boundary flags, and continued sample-manifest path rejection.
+
 Operational validation still to run outside this planning implementation:
 
 - First real loop with a configured visual LLM provider and actual image dataset.
@@ -39,6 +53,7 @@ Boundary status:
 - Backend validation remains the source of truth for accepted evidence and scheduling authority.
 - Durable accepted/rejected visual evidence is persisted separately from `datasets.profile`.
 - Planner consumes compressed accepted evidence only.
+- Backend may attach accepted visual-analysis evidence to a planner-proposed experiment for validation, but it never converts visual hypotheses into runnable experiments or fills executable config from the Visual Agent.
 - Visual Agent outputs cannot directly create jobs, plans, dataset mutations, labels, or executable authority.
 - Workers execute only backend-created `analyze_dataset_visuals` jobs and backend-validated training plans.
 - When visual analysis is enabled/configured, the initial experiment plan waits for the initial visual-analysis result; if visual analysis is disabled or the initial visual job fails, backend falls back to normal profile-only planning.
@@ -69,6 +84,7 @@ Experiment Planner
   -> loads latest accepted analysis
   -> receives compact PlannerVisualExemplarContext inside planner_context_snapshot.visual_evidence
   -> proposes experiments normally
+  -> cites accepted visual-analysis IDs or hypothesis IDs when visual evidence motivates a mechanism
   -> backend validates mechanisms/preprocessing before scheduling
 ```
 

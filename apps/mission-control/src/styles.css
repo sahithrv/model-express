@@ -2445,6 +2445,7 @@ button {
 }
 
 .badge.execution_failed,
+.badge.agent_failed,
 .badge.cancelled {
   color: #ff6875;
   background: rgba(255, 104, 117, 0.13);

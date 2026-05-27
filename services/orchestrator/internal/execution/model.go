@@ -25,6 +25,7 @@ const (
 	EventExecutionFailed             = "EXECUTION_FAILED"
 	EventAgentRecommendationRecorded = "AGENT_RECOMMENDATION_RECORDED"
 	EventAgentOutcomeRecorded        = "AGENT_OUTCOME_RECORDED"
+	EventAgentFailed                 = "AGENT_FAILED"
 )
 
 type WorkerRequirement struct {

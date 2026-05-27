@@ -603,7 +603,8 @@ func (s *Server) reportDatasetVisualAnalysisResult(c *gin.Context) {
 		analysis.ProfileSchemaVersion = datasetProfileSchemaVersion(dataset.Profile)
 	}
 
-	validationErrors := validateDatasetVisualAnalysisResult(dataset, &analysis, req.SampleManifest, req.RawOutput, req.InputContext)
+	inputContext := visualAnalysisInvocationContext(req.InputContext, req.SampleManifest)
+	validationErrors := validateDatasetVisualAnalysisResult(dataset, &analysis, req.SampleManifest, req.RawOutput, inputContext)
 	validationStatus := memory.InvocationValidationValid
 	if len(validationErrors) > 0 {
 		validationStatus = memory.InvocationValidationInvalid
@@ -620,7 +621,7 @@ func (s *Server) reportDatasetVisualAnalysisResult(c *gin.Context) {
 		Provider:          analysis.Provider,
 		Model:             analysis.Model,
 		InputMessages:     req.InputMessages,
-		InputContext:      visualAnalysisInvocationContext(req.InputContext, req.SampleManifest),
+		InputContext:      inputContext,
 		RawOutput:         req.RawOutput,
 		ParsedOutput:      parsedOutput,
 		ValidationStatus:  validationStatus,
@@ -1508,7 +1509,8 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{err.Error()})
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 	}
-	if err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, sourcePlan.DatasetID, sourcePlan.ID, decision.ID, "", experiments, payloadStringSlice(decision.Payload, "evidence_used")); err != nil {
+	experiments, err = s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, sourcePlan.DatasetID, sourcePlan.ID, decision.ID, "", experiments, payloadStringSlice(decision.Payload, "evidence_used"))
+	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
 	experiments, skippedExperiments := filterNovelPlannedExperiments(experiments, projectPlans)
@@ -1559,7 +1561,7 @@ func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisi
 			return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 		}
 	}
-	if err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, followUpPlan.DatasetID, followUpPlan.ID, decisionID, followUpPlan.ID, followUpPlan.Experiments, nil); err != nil {
+	if _, err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, followUpPlan.DatasetID, followUpPlan.ID, decisionID, followUpPlan.ID, followUpPlan.Experiments, nil); err != nil {
 		return err
 	}
 	filtered, skippedExperiments := filterNovelPlannedExperiments(followUpPlan.Experiments, priorPlans)
@@ -1579,23 +1581,27 @@ func (s *Server) validateFollowUpExperimentMechanismsAgainstDataset(
 	followUpPlanID string,
 	experiments []plans.PlannedExperiment,
 	planEvidence []string,
-) error {
+) ([]plans.PlannedExperiment, error) {
 	if len(experiments) == 0 {
-		return nil
+		return experiments, nil
 	}
 	dataset, err := s.store.GetDataset(datasetID)
 	if err != nil {
-		return err
+		return experiments, err
 	}
-	if err := validateMechanismDatasetEvidence(dataset.Profile, experiments, planEvidence); err != nil {
+	enrichedExperiments, err := s.experimentsWithAcceptedVisualEvidence(dataset, experiments)
+	if err != nil {
+		return experiments, err
+	}
+	if err := validateMechanismDatasetEvidence(dataset.Profile, enrichedExperiments, planEvidence); err != nil {
 		message := "Follow-up scheduling blocked because one or more proposed mechanisms lack backend-verifiable diagnosis or dataset support."
 		if followUpPlanID != "" {
 			message = fmt.Sprintf("Existing follow-up plan %s is blocked because one or more mechanisms lack backend-verifiable diagnosis or dataset support.", followUpPlanID)
 		}
 		s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, []string{err.Error()})
-		return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+		return experiments, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 	}
-	return nil
+	return enrichedExperiments, nil
 }
 
 func (s *Server) recordFollowUpValidationBlocked(projectID string, planID string, decisionID string, followUpPlanID string, message string, skippedExperiments []string) {
@@ -1611,6 +1617,119 @@ func (s *Server) recordFollowUpValidationBlocked(projectID string, planID string
 	if _, err := s.store.CreateExecutionEvent(projectID, planID, execution.EventAgentOutcomeRecorded, message, payload); err != nil {
 		log.Printf("record follow-up validation block failed for project %s decision %s: %v", projectID, decisionID, err)
 	}
+}
+
+func (s *Server) experimentsWithAcceptedVisualEvidence(dataset datasets.Dataset, experiments []plans.PlannedExperiment) ([]plans.PlannedExperiment, error) {
+	if len(experiments) == 0 {
+		return experiments, nil
+	}
+	analysis, err := s.store.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return experiments, nil
+		}
+		return experiments, err
+	}
+	out := append([]plans.PlannedExperiment(nil), experiments...)
+	for index := range out {
+		visualEvidence := acceptedVisualEvidenceForExperiment(analysis, out[index])
+		if len(visualEvidence) == 0 {
+			continue
+		}
+		out[index].EvidenceUsed = uniqueStrings(append(out[index].EvidenceUsed, visualEvidence...))
+	}
+	return out, nil
+}
+
+func acceptedVisualEvidenceForExperiment(analysis datasets.DatasetVisualAnalysis, experiment plans.PlannedExperiment) []string {
+	mechanism := strings.ToLower(strings.TrimSpace(experiment.Mechanism))
+	if mechanism == "" {
+		return nil
+	}
+	experimentText := experimentMechanismEvidenceText(experiment, nil)
+	evidence := []string{}
+	for _, hypothesis := range analysis.PreprocessingHypotheses {
+		if strings.EqualFold(strings.TrimSpace(hypothesis.SupportStatus), "unsupported") {
+			continue
+		}
+		hypothesisMechanism := strings.ToLower(strings.TrimSpace(hypothesis.Mechanism))
+		if hypothesisMechanism != mechanism && !visualHypothesisCited(experimentText, hypothesis.ID) {
+			continue
+		}
+		evidence = append(evidence, visualHypothesisEvidenceText(analysis.ID, hypothesis))
+	}
+	evidence = append(evidence, acceptedVisualTraitEvidenceForMechanism(analysis, mechanism)...)
+	return uniqueStrings(evidence)
+}
+
+func visualHypothesisCited(experimentText string, hypothesisID string) bool {
+	hypothesisID = strings.ToLower(strings.TrimSpace(hypothesisID))
+	return hypothesisID != "" && strings.Contains(strings.ToLower(experimentText), hypothesisID)
+}
+
+func visualHypothesisEvidenceText(analysisID string, hypothesis datasets.PreprocessingHypothesis) string {
+	parts := []string{
+		"accepted visual analysis " + strings.TrimSpace(analysisID),
+		"visual hypothesis " + strings.TrimSpace(hypothesis.ID),
+		"mechanism " + strings.TrimSpace(hypothesis.Mechanism),
+		"support_status " + strings.TrimSpace(hypothesis.SupportStatus),
+		"confidence " + strings.TrimSpace(hypothesis.Confidence),
+		strings.TrimSpace(hypothesis.Summary),
+		strings.TrimSpace(hypothesis.ExpectedEffect),
+	}
+	parts = append(parts, hypothesis.Evidence...)
+	return strings.Join(nonEmptyStringValues(parts), " ")
+}
+
+func acceptedVisualTraitEvidenceForMechanism(analysis datasets.DatasetVisualAnalysis, mechanism string) []string {
+	wanted := map[string]bool{}
+	switch mechanism {
+	case "resolution_crop":
+		wanted = map[string]bool{
+			"small_objects":           true,
+			"large_objects":           true,
+			"background_dominance":    true,
+			"fine_grained_similarity": true,
+			"crop_bbox_useful":        true,
+			"orientation_sensitive":   true,
+			"domain_shift_possible":   true,
+			"color_texture_signal":    true,
+		}
+	case "augmentation_basic", "augmentation_auto":
+		wanted = map[string]bool{
+			"lighting_variation":    true,
+			"blur":                  true,
+			"orientation_sensitive": true,
+			"domain_shift_possible": true,
+			"color_texture_signal":  true,
+			"background_dominance":  true,
+		}
+	case "augmentation_mixed_sample", "regularization":
+		wanted = map[string]bool{
+			"fine_grained_similarity": true,
+			"visual_ambiguity":        true,
+			"color_texture_signal":    true,
+			"background_dominance":    true,
+		}
+	default:
+		return nil
+	}
+	evidence := []string{}
+	for _, trait := range analysis.VisualTraits {
+		traitName := strings.ToLower(strings.TrimSpace(trait.Trait))
+		if !wanted[traitName] {
+			continue
+		}
+		parts := []string{
+			"accepted visual analysis " + strings.TrimSpace(analysis.ID),
+			"visual trait " + traitName,
+			"level " + strings.TrimSpace(trait.Level),
+			"confidence " + strings.TrimSpace(trait.Confidence),
+		}
+		parts = append(parts, trait.Evidence...)
+		evidence = append(evidence, strings.Join(nonEmptyStringValues(parts), " "))
+	}
+	return evidence
 }
 
 func (s *Server) recordChampionSelectedFollowUpBlocked(projectID string, planID string, decisionID string, followUpPlanID string, message string, reason string, details map[string]any) {
@@ -2557,6 +2676,7 @@ func (s *Server) runPlanningLoopAfterTrainingJob(job jobs.ExperimentJob) {
 	handled, err := s.runExperimentPlannerAfterTrainingJob(job)
 	if err != nil {
 		log.Printf("llm experiment planner failed after training job %s: %v", job.ID, err)
+		return
 	}
 	if handled {
 		return
@@ -2742,10 +2862,11 @@ func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
 	}
 	if err != nil {
 		log.Printf("training monitor failed for job %s: %v", job.ID, err)
-		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Training Monitor failed for job %s.", job.ID), map[string]any{
+		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventAgentFailed, fmt.Sprintf("Training Monitor agent failed for job %s.", job.ID), map[string]any{
 			"job_id":        job.ID,
 			"invocation_id": invocation.ID,
 			"error":         err.Error(),
+			"agent_name":    agents.TrainingMonitorAgentName,
 		}); eventErr != nil {
 			log.Printf("record training monitor failure event failed: %v", eventErr)
 		}
@@ -2888,9 +3009,10 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 	plannerAttempt, err := s.runExperimentPlannerWithBackendValidationRetry(ctx, agent, input, config, automationSettings.AgentMode)
 	invocation := plannerAttempt.Invocation
 	if err != nil {
-		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Experiment Planner failed for plan %s.", summary.PlanID), map[string]any{
+		if _, eventErr := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventAgentFailed, fmt.Sprintf("Experiment Planner agent failed for plan %s.", summary.PlanID), map[string]any{
 			"invocation_id": invocation.ID,
 			"error":         err.Error(),
+			"agent_name":    agents.ExperimentPlannerAgentName,
 		}); eventErr != nil {
 			log.Printf("record experiment planner failure event failed: %v", eventErr)
 		}
@@ -3582,7 +3704,7 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 	if stopReason, guardTag, ok, err := s.plannerFollowUpStopReason(projectID, sourcePlan, projectPlans); err != nil {
 		return err
 	} else if ok {
-		if _, eventErr := s.store.CreateExecutionEvent(projectID, sourcePlan.ID, execution.EventExecutionFailed, fmt.Sprintf("Planner follow-up scheduling blocked for plan %s.", sourcePlan.ID), map[string]any{
+		if _, eventErr := s.store.CreateExecutionEvent(projectID, sourcePlan.ID, execution.EventAgentOutcomeRecorded, fmt.Sprintf("Planner follow-up scheduling blocked for plan %s.", sourcePlan.ID), map[string]any{
 			"source_decision_id":        decision.ID,
 			"backend_validation_status": "blocked",
 			"backend_stop_guard":        guardTag,
@@ -5879,11 +6001,19 @@ func classDistributionImbalanceRatio(distribution map[string]any) float64 {
 }
 
 func profileHasBBoxEvidence(profile map[string]any) bool {
-	if profileBool(profile, "bbox_available") || profileBool(profile, "annotations_available") || profileInt(profile, "bbox_annotations_count") > 0 {
+	if profileBool(profile, "bbox_available") || profileBool(profile, "annotations_available") ||
+		profileInt(profile, "bbox_annotations_count") > 0 || payloadNumber(profile["bbox_count"]) > 0 ||
+		artifactCountsHaveBBoxEvidence(profileMap(profile, "artifact_counts")) {
 		return true
 	}
 	metadata := profileMap(profile, "metadata_summary")
-	if metadataBool(metadata, "bbox_available") || metadataBool(metadata, "annotations_available") || payloadNumber(metadata["bbox_annotations_count"]) > 0 {
+	if metadataBool(metadata, "bbox_available") || metadataBool(metadata, "annotations_available") ||
+		payloadNumber(metadata["bbox_annotations_count"]) > 0 ||
+		artifactCountsHaveBBoxEvidence(profileMap(metadata, "artifact_counts")) {
+		return true
+	}
+	visualTraits := profileMap(profile, "visual_trait_summary")
+	if payloadNumber(visualTraits["bbox_count"]) > 0 {
 		return true
 	}
 	traits := profileStringSlice(profile, "dataset_traits")
@@ -5901,8 +6031,40 @@ func profileHasBBoxEvidence(profile map[string]any) bool {
 	return false
 }
 
+func artifactCountsHaveBBoxEvidence(counts map[string]any) bool {
+	for key, value := range counts {
+		if payloadNumber(value) <= 0 {
+			continue
+		}
+		if containsAnyText(strings.ToLower(strings.TrimSpace(key)), "bbox", "bounding_box", "bounding box", "annotation", "coco", "voc") {
+			return true
+		}
+	}
+	return false
+}
+
 func profileOrDiagnosisHasResolutionCropEvidence(profile map[string]any, evidenceText string) bool {
-	if containsAnyText(evidenceText, "small object", "object scale", "fine-grained", "fine grained", "crop mismatch", "background dominance", "aspect ratio", "variable dimensions", "image dimension") {
+	if containsAnyText(
+		evidenceText,
+		"small object",
+		"small_objects",
+		"large object",
+		"large_objects",
+		"object scale",
+		"fine-grained",
+		"fine grained",
+		"fine_grained_similarity",
+		"crop mismatch",
+		"crop_bbox_useful",
+		"background dominance",
+		"background_dominance",
+		"aspect ratio",
+		"variable dimensions",
+		"image dimension",
+		"orientation_sensitive",
+		"domain_shift_possible",
+		"color_texture_signal",
+	) {
 		return true
 	}
 	traits := profileStringSlice(profile, "dataset_traits")
@@ -7115,17 +7277,23 @@ func validateDatasetVisualAnalysisResult(dataset datasets.Dataset, analysis *dat
 		}
 		validationErrors = append(validationErrors, validateExampleImageIDs(fmt.Sprintf("cautions[%d]", index), caution.ExampleImageIDs, imageIDs)...)
 	}
-	if containsUnsafeVisualAnalysisContent(rawOutput) {
-		validationErrors = append(validationErrors, "raw visual output contains forbidden paths or execution authority")
+	if reasons := unsafeVisualAnalysisContentReasons(rawOutput); len(reasons) > 0 {
+		validationErrors = append(validationErrors, visualAnalysisUnsafeContentError("raw visual output contains forbidden paths or execution authority", reasons))
 	}
-	if manifestJSON, err := json.Marshal(manifest); err == nil && containsUnsafeVisualAnalysisContent(string(manifestJSON)) {
-		validationErrors = append(validationErrors, "sample_manifest contains forbidden paths or image bytes")
+	if manifestJSON, err := json.Marshal(manifest); err == nil {
+		if reasons := unsafeVisualAnalysisContentReasons(string(manifestJSON)); len(reasons) > 0 {
+			validationErrors = append(validationErrors, visualAnalysisUnsafeContentError("sample_manifest contains forbidden paths or image bytes", reasons))
+		}
 	}
-	if inputContextJSON, err := json.Marshal(inputContext); err == nil && containsUnsafeVisualAnalysisContent(string(inputContextJSON)) {
-		validationErrors = append(validationErrors, "input_context contains forbidden paths or image bytes")
+	if inputContextJSON, err := json.Marshal(inputContext); err == nil {
+		if reasons := unsafeVisualAnalysisContentReasons(string(inputContextJSON)); len(reasons) > 0 {
+			validationErrors = append(validationErrors, visualAnalysisUnsafeContentError("input_context contains forbidden paths or image bytes", reasons))
+		}
 	}
-	if analysisJSON, err := json.Marshal(analysis); err == nil && containsUnsafeVisualAnalysisContent(string(analysisJSON)) {
-		validationErrors = append(validationErrors, "visual analysis contains forbidden paths or execution authority")
+	if analysisJSON, err := json.Marshal(analysis); err == nil {
+		if reasons := unsafeVisualAnalysisContentReasons(string(analysisJSON)); len(reasons) > 0 {
+			validationErrors = append(validationErrors, visualAnalysisUnsafeContentError("visual analysis contains forbidden paths or execution authority", reasons))
+		}
 	}
 	return uniqueStrings(validationErrors)
 }
@@ -7180,16 +7348,22 @@ func validateVisualPreprocessingHypothesis(profile map[string]any, hypothesis *d
 	if hypothesis.Confidence != "" && !allowedVisualConfidence(hypothesis.Confidence) {
 		validationErrors = append(validationErrors, fmt.Sprintf("preprocessing_hypotheses[%d].confidence is unsupported", index))
 	}
-	if hypothesis.Mechanism == "bbox_crop_ablation" && !profileHasBBoxEvidence(profile) {
-		validationErrors = append(validationErrors, fmt.Sprintf("preprocessing_hypotheses[%d] bbox_crop_ablation requires backend-profiled bbox evidence", index))
+	hasBBoxEvidence := profileHasBBoxEvidence(profile)
+	if hypothesis.Mechanism == "bbox_crop_ablation" && !hasBBoxEvidence {
+		markVisualHypothesisUnsupported(hypothesis, "bbox_crop_ablation requires backend-profiled bbox evidence; retained as evidence only")
+	}
+	if hypothesis.SupportStatus == "unsupported" {
+		sanitizeUnsupportedVisualHypothesis(hypothesis)
+		return validationErrors
 	}
 	if hypothesis.SuggestedPreprocessing != nil {
 		if err := validatePreprocessingConfig(*hypothesis.SuggestedPreprocessing, index); err != nil {
 			validationErrors = append(validationErrors, err.Error())
 		}
-		if (strings.EqualFold(hypothesis.SuggestedPreprocessing.CropStrategy, "bbox_crop_ablation") ||
-			strings.EqualFold(hypothesis.SuggestedPreprocessing.BBoxMode, "crop_and_compare_full_image")) && !profileHasBBoxEvidence(profile) {
-			validationErrors = append(validationErrors, fmt.Sprintf("preprocessing_hypotheses[%d] suggested bbox preprocessing requires backend-profiled bbox evidence", index))
+		if visualPreprocessingRequiresBBoxEvidence(*hypothesis.SuggestedPreprocessing) && !hasBBoxEvidence {
+			markVisualHypothesisUnsupported(hypothesis, "suggested bbox preprocessing requires backend-profiled bbox evidence; retained as evidence only")
+			sanitizeUnsupportedVisualHypothesis(hypothesis)
+			return validationErrors
 		}
 	}
 	for _, imageSize := range hypothesis.SuggestedImageSizes {
@@ -7206,16 +7380,45 @@ func validateVisualPreprocessingHypothesis(profile map[string]any, hypothesis *d
 			validationErrors = append(validationErrors, err.Error())
 		}
 	}
-	if hypothesis.SupportStatus == "unsupported" {
-		hypothesis.SuggestedPreprocessing = nil
-		hypothesis.SuggestedImageSizes = nil
-		hypothesis.SuggestedAugmentationPolicy = ""
-		hypothesis.SuggestedAugmentationConfig = nil
-		if strings.TrimSpace(hypothesis.UnsupportedReason) == "" {
-			hypothesis.UnsupportedReason = "Unsupported visual hypothesis retained as evidence only; no executable preprocessing was persisted."
-		}
-	}
 	return validationErrors
+}
+
+func visualPreprocessingRequiresBBoxEvidence(preprocessing plans.Preprocessing) bool {
+	return containsAnyText(
+		strings.ToLower(preprocessing.ResizeStrategy+" "+preprocessing.CropStrategy+" "+preprocessing.BBoxMode),
+		"bbox",
+		"box",
+	)
+}
+
+func markVisualHypothesisUnsupported(hypothesis *datasets.PreprocessingHypothesis, reason string) {
+	hypothesis.SupportStatus = "unsupported"
+	hypothesis.UnsupportedReason = appendVisualUnsupportedReason(hypothesis.UnsupportedReason, reason)
+}
+
+func appendVisualUnsupportedReason(existing string, reason string) string {
+	existing = strings.TrimSpace(existing)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return existing
+	}
+	if existing == "" {
+		return reason
+	}
+	if strings.Contains(strings.ToLower(existing), strings.ToLower(reason)) {
+		return existing
+	}
+	return existing + "; " + reason
+}
+
+func sanitizeUnsupportedVisualHypothesis(hypothesis *datasets.PreprocessingHypothesis) {
+	hypothesis.SuggestedPreprocessing = nil
+	hypothesis.SuggestedImageSizes = nil
+	hypothesis.SuggestedAugmentationPolicy = ""
+	hypothesis.SuggestedAugmentationConfig = nil
+	if strings.TrimSpace(hypothesis.UnsupportedReason) == "" {
+		hypothesis.UnsupportedReason = "Unsupported visual hypothesis retained as evidence only; no executable preprocessing was persisted."
+	}
 }
 
 func validateExampleImageIDs(prefix string, ids []string, manifestIDs map[string]bool) []string {
@@ -7230,7 +7433,7 @@ func validateExampleImageIDs(prefix string, ids []string, manifestIDs map[string
 
 func visualAnalysisInvocationContext(inputContext map[string]any, manifest []datasets.VisualSampleManifestItem) map[string]any {
 	context := map[string]any{
-		"sample_manifest":                  manifest,
+		"sample_manifest":                  sanitizeVisualAnalysisSampleManifestForContext(manifest),
 		"sample_manifest_count":            len(manifest),
 		"raw_images_included":              false,
 		"raw_images_included_for_planner":  false,
@@ -7242,13 +7445,15 @@ func visualAnalysisInvocationContext(inputContext map[string]any, manifest []dat
 		"evidence_only":                    true,
 	}
 	for key, value := range inputContext {
-		if reservedVisualInvocationContextKey(key) {
+		normalizedKey := strings.ToLower(strings.TrimSpace(key))
+		if reservedVisualInvocationContextKey(normalizedKey) || !allowedVisualInvocationContextKey(normalizedKey) {
 			continue
 		}
-		if valueJSON, err := json.Marshal(value); err == nil && containsUnsafeVisualAnalysisContent(string(valueJSON)) {
+		sanitized, ok := sanitizeVisualInvocationContextValue(normalizedKey, value)
+		if !ok {
 			continue
 		}
-		context[key] = value
+		context[normalizedKey] = sanitized
 	}
 	return context
 }
@@ -7260,6 +7465,159 @@ func reservedVisualInvocationContextKey(key string) bool {
 		"visual_agent_prompt_for_planner", "visual_agent_stream_is_separate",
 		"planner_receives_compressed_only", "evidence_only",
 		"raw_output", "input_messages", "images", "image_inputs", "data_base64":
+		return true
+	default:
+		return false
+	}
+}
+
+func allowedVisualInvocationContextKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "caps", "pack_summary", "sample_manifest_summary", "repair":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeVisualAnalysisSampleManifestForContext(manifest []datasets.VisualSampleManifestItem) []map[string]any {
+	out := make([]map[string]any, 0, len(manifest))
+	for _, item := range manifest {
+		entry := map[string]any{
+			"image_id":        strings.TrimSpace(item.ImageID),
+			"class_name":      strings.TrimSpace(item.ClassName),
+			"class":           strings.TrimSpace(item.ClassLabel),
+			"width":           item.Width,
+			"height":          item.Height,
+			"selection_basis": item.SelectionBasis,
+			"detail_level":    strings.TrimSpace(item.DetailLevel),
+			"has_bbox":        item.HasBBox,
+		}
+		if metadata, ok := sanitizeVisualInvocationContextValue("metadata", item.Metadata); ok {
+			entry["metadata"] = metadata
+		}
+		if bbox, ok := sanitizeVisualInvocationContextValue("bbox", item.BBox); ok {
+			entry["bbox"] = bbox
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func sanitizeVisualInvocationContextValue(key string, value any) (any, bool) {
+	if unsafeVisualTelemetryKey(key) {
+		return nil, false
+	}
+	switch typed := value.(type) {
+	case nil:
+		return nil, true
+	case string:
+		if containsUnsafeVisualAnalysisContent(typed) {
+			return nil, false
+		}
+		return typed, true
+	case bool:
+		return typed, true
+	case int:
+		return typed, true
+	case int8:
+		return typed, true
+	case int16:
+		return typed, true
+	case int32:
+		return typed, true
+	case int64:
+		return typed, true
+	case uint:
+		return typed, true
+	case uint8:
+		return typed, true
+	case uint16:
+		return typed, true
+	case uint32:
+		return typed, true
+	case uint64:
+		return typed, true
+	case float32:
+		return typed, true
+	case float64:
+		return typed, true
+	case json.Number:
+		return typed, true
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if containsUnsafeVisualAnalysisContent(item) {
+				continue
+			}
+			out = append(out, item)
+		}
+		return out, true
+	case []any:
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			if sanitized, ok := sanitizeVisualInvocationContextValue("", item); ok {
+				out = append(out, sanitized)
+			}
+		}
+		return out, true
+	case map[string]any:
+		out := map[string]any{}
+		for nestedKey, nestedValue := range typed {
+			normalizedKey := strings.ToLower(strings.TrimSpace(nestedKey))
+			if sanitized, ok := sanitizeVisualInvocationContextValue(normalizedKey, nestedValue); ok {
+				out[normalizedKey] = sanitized
+			}
+		}
+		return out, true
+	case map[string]string:
+		out := map[string]any{}
+		for nestedKey, nestedValue := range typed {
+			normalizedKey := strings.ToLower(strings.TrimSpace(nestedKey))
+			if sanitized, ok := sanitizeVisualInvocationContextValue(normalizedKey, nestedValue); ok {
+				out[normalizedKey] = sanitized
+			}
+		}
+		return out, true
+	case map[string]int:
+		out := map[string]any{}
+		for nestedKey, nestedValue := range typed {
+			normalizedKey := strings.ToLower(strings.TrimSpace(nestedKey))
+			if sanitized, ok := sanitizeVisualInvocationContextValue(normalizedKey, nestedValue); ok {
+				out[normalizedKey] = sanitized
+			}
+		}
+		return out, true
+	default:
+		blob, err := json.Marshal(typed)
+		if err != nil || containsUnsafeVisualAnalysisContent(string(blob)) {
+			return nil, false
+		}
+		return typed, true
+	}
+}
+
+func unsafeVisualTelemetryKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "data_base64",
+		"image_inputs",
+		"images",
+		"image",
+		"raw_image",
+		"raw_images",
+		"raw_image_bytes",
+		"image_bytes",
+		"path",
+		"file_path",
+		"local_path",
+		"source_path",
+		"relative_path",
+		"absolute_path",
+		"storage_uri",
+		"uri",
+		"url",
+		"input_messages",
+		"raw_output":
 		return true
 	default:
 		return false
@@ -7329,18 +7687,60 @@ func allowedVisualTrait(value string) bool {
 }
 
 func containsUnsafeVisualAnalysisContent(value string) bool {
+	return len(unsafeVisualAnalysisContentReasons(value)) > 0
+}
+
+func unsafeVisualAnalysisContentReasons(value string) []string {
 	lower := strings.ToLower(value)
-	for _, token := range []string{
-		"file://", "s3://", "data:image", "\"data_base64\"", "image_bytes", "raw_image",
-		"c:\\", "\\users\\", "\\\\", "/users/", "/home/", "/tmp/", "/var/", "aws_secret", "secret_access_key",
-		"proposed_experiments", "\"jobs\"", "\"commands\"", "shell command", "execute this", "create job",
-		"schedule job", "mutate dataset", "delete files", "relabel", "labels_to_change",
-	} {
-		if strings.Contains(lower, token) {
-			return true
+	checks := []struct {
+		token  string
+		reason string
+	}{
+		{"file://", "file URI"},
+		{"s3://", "object-storage URI"},
+		{"data:image", "inline image data URI"},
+		{"\"data_base64\"", "base64 image field"},
+		{"\"image_bytes\"", "image bytes field"},
+		{"\"raw_image\"", "raw image field"},
+		{"\"raw_images\"", "raw images field"},
+		{"\"raw_image_bytes\"", "raw image bytes field"},
+		{"\"image_inputs\"", "image inputs field"},
+		{"c:\\", "Windows local path"},
+		{"\\users\\", "Windows user path"},
+		{"\\\\", "UNC path"},
+		{"/users/", "local user path"},
+		{"/home/", "local home path"},
+		{"/tmp/", "temporary local path"},
+		{"/var/", "system local path"},
+		{"aws_secret", "secret marker"},
+		{"secret_access_key", "secret marker"},
+		{"proposed_experiments", "direct experiment proposal"},
+		{"\"jobs\"", "job authority field"},
+		{"\"commands\"", "command authority field"},
+		{"shell command", "shell command text"},
+		{"execute this", "execution instruction"},
+		{"create job", "job creation instruction"},
+		{"schedule job", "job scheduling instruction"},
+		{"mutate dataset", "dataset mutation instruction"},
+		{"delete files", "file deletion instruction"},
+		{"relabel", "label mutation instruction"},
+		{"labels_to_change", "label mutation field"},
+	}
+	reasons := []string{}
+	for _, check := range checks {
+		if strings.Contains(lower, check.token) {
+			reasons = append(reasons, check.reason)
 		}
 	}
-	return false
+	return uniqueStrings(reasons)
+}
+
+func visualAnalysisUnsafeContentError(prefix string, reasons []string) string {
+	reasons = nonEmptyStringValues(reasons)
+	if len(reasons) == 0 {
+		return prefix
+	}
+	return prefix + ": " + strings.Join(reasons, ", ")
 }
 
 func (s *Server) ensureOpenJob(projectID string, template string, config map[string]any, matches func(jobs.ExperimentJob) bool) (jobs.ExperimentJob, error) {
@@ -7546,7 +7946,7 @@ func automationSettingsFromEnv() settings.AutomationSettings {
 		LLMEnabled:              envFlag("MODEL_EXPRESS_LLM_ENABLED", false),
 		AgentMode:               llm.NormalizeAgentMode(os.Getenv("MODEL_EXPRESS_AGENT_MODE")),
 		LLMProvider:             defaultLLMProviderFromEnv(),
-		LLMModel:                strings.TrimSpace(os.Getenv("MODEL_EXPRESS_LLM_MODEL")),
+		LLMModel:                defaultLLMModelFromEnv(),
 		UpdatedAt:               time.Now().UTC(),
 	}
 }
@@ -7672,7 +8072,20 @@ func (s *Server) shouldRunLLMAgents() bool {
 }
 
 func defaultLLMProviderFromEnv() string {
-	return normalizeLLMProvider(os.Getenv("MODEL_EXPRESS_LLM_PROVIDER"))
+	if provider := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_LLM_PROVIDER")); provider != "" {
+		return normalizeLLMProvider(provider)
+	}
+	if provider := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_PROVIDER")); provider != "" {
+		return normalizeLLMProvider(provider)
+	}
+	return llm.ProviderOpenAI
+}
+
+func defaultLLMModelFromEnv() string {
+	if model := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_LLM_MODEL")); model != "" {
+		return model
+	}
+	return strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_MODEL"))
 }
 
 func normalizeLLMProvider(value string) string {
