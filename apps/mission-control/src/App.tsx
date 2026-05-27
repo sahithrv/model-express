@@ -56,12 +56,22 @@ const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localh
 const jobsPerPage = 10;
 
 type MetricKey = "macro_f1" | "accuracy" | "train_loss" | "val_loss";
+type ProjectTabKey = "overview" | "data" | "experiments" | "agents" | "operations" | "export";
 
 const metricOptions: Array<{ key: MetricKey; label: string }> = [
-  { key: "macro_f1", label: "macro_f1" },
-  { key: "accuracy", label: "Accuracy" },
-  { key: "train_loss", label: "Train loss" },
-  { key: "val_loss", label: "Val loss" },
+	{ key: "macro_f1", label: "macro_f1" },
+	{ key: "accuracy", label: "Accuracy" },
+	{ key: "train_loss", label: "Train loss" },
+	{ key: "val_loss", label: "Val loss" },
+];
+
+const projectTabs: Array<{ key: ProjectTabKey; label: string }> = [
+	{ key: "overview", label: "Overview" },
+	{ key: "data", label: "Data" },
+	{ key: "experiments", label: "Experiments" },
+	{ key: "agents", label: "Agents" },
+	{ key: "operations", label: "Operations" },
+	{ key: "export", label: "Export" },
 ];
 
 type ProjectDetail = {
@@ -254,9 +264,10 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectFolder, setNewProjectFolder] = useState<DatasetFolder | null>(null);
-  const [jobPage, setJobPage] = useState(0);
-  const [selectedMetricKey, setSelectedMetricKey] = useState<MetricKey>("macro_f1");
-  const [demoPrediction, setDemoPrediction] = useState<ChampionDemoPrediction | null>(null);
+	const [jobPage, setJobPage] = useState(0);
+	const [selectedMetricKey, setSelectedMetricKey] = useState<MetricKey>("macro_f1");
+	const [activeProjectTab, setActiveProjectTab] = useState<ProjectTabKey>("overview");
+	const [demoPrediction, setDemoPrediction] = useState<ChampionDemoPrediction | null>(null);
   const [demoPredictionError, setDemoPredictionError] = useState("");
   const [demoPredictionLoading, setDemoPredictionLoading] = useState(false);
   const [selectedDemoImageIndex, setSelectedDemoImageIndex] = useState(0);
@@ -1062,7 +1073,7 @@ export function App() {
         </section>
       </aside>
 
-      <section className="workspace">
+			<section className="workspace" data-active-tab={activeProjectTab}>
         <header className="topbar">
           <div>
             <div className="eyebrow">Control Plane</div>
@@ -1076,16 +1087,22 @@ export function App() {
 
         {notice && <div className={`notice ${notice.kind}`}>{notice.text}</div>}
 
-        <nav className="section-tabs" aria-label="Mission Control sections">
-          <a href="#overview">Overview</a>
-          <a href="#data">Data</a>
-          <a href="#agents">Agents</a>
-          <a href="#runs">Runs</a>
-          <a href="#operations">Operations</a>
-          <a href="#export-demo">Export/Demo</a>
-        </nav>
+				<nav className="section-tabs" aria-label="Project detail tabs" role="tablist">
+					{projectTabs.map((tab) => (
+						<button
+							key={tab.key}
+							type="button"
+							role="tab"
+							className={activeProjectTab === tab.key ? "active" : ""}
+							aria-selected={activeProjectTab === tab.key}
+							onClick={() => setActiveProjectTab(tab.key)}
+						>
+							{tab.label}
+						</button>
+					))}
+				</nav>
 
-        <section className="summary-grid" id="overview">
+				<section className="summary-grid" id="overview" data-project-tab="overview">
           <MetricCard icon={<Box size={18} />} label="Datasets" value={detail.datasets.length} />
           <MetricCard icon={<Activity size={18} />} label="Jobs" value={detail.jobs.length} />
           <MetricCard icon={<ClipboardList size={18} />} label="Plans" value={detail.plans.length} />
@@ -1097,8 +1114,8 @@ export function App() {
           />
         </section>
 
-        <section className="content-grid mission-grid">
-          <Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide>
+				<section className="content-grid mission-grid">
+					<Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide tab="overview">
             <div className="timeline">
               {timelineItems.map((item) => (
                 <div className={`timeline-item ${item.status}`} key={item.label}>
@@ -1114,7 +1131,7 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Dataset Intelligence" icon={<BarChart3 size={17} />} wide id="data">
+					<Panel title="Dataset Intelligence" icon={<BarChart3 size={17} />} wide id="data" tab="data">
             {datasetIntelligence.dataset ? (
               <div className="dataset-intelligence">
                 <div className="insight-grid">
@@ -1179,7 +1196,7 @@ export function App() {
             )}
           </Panel>
 
-          <Panel title="Visual Dataset Analysis" icon={<Eye size={17} />} wide>
+					<Panel title="Visual Dataset Analysis" icon={<Eye size={17} />} wide tab="data">
             <VisualAnalysisPanel
               dataset={detail.datasets[0] ?? null}
               jobs={detail.jobs}
@@ -1191,7 +1208,7 @@ export function App() {
         </section>
 
         <section className="content-grid">
-          <Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide id="operations">
+					<Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide id="operations" tab="operations">
             <div className="settings-panel">
               <div className="settings-grid">
                 <label className="toggle-row">
@@ -1318,7 +1335,7 @@ export function App() {
           </Panel>
 
           {detail.champion && (
-            <Panel title="Selected Champion" icon={<Trophy size={17} />} wide>
+						<Panel title="Selected Champion" icon={<Trophy size={17} />} wide tab="overview">
               <div className="champion-panel">
                 <div className="champion-head">
                   <span>
@@ -1373,7 +1390,7 @@ export function App() {
             </Panel>
           )}
 
-          <Panel title="Champion Export / Demo" icon={<Trophy size={17} />} wide id="export-demo">
+					<Panel title="Champion Export / Demo" icon={<Trophy size={17} />} wide id="export-demo" tab="export">
             <ChampionExportDemoPanel
               data={championExportDemo}
               prediction={demoPrediction}
@@ -1388,7 +1405,7 @@ export function App() {
             />
           </Panel>
 
-          <Panel title="Training Run Summary" icon={<Trophy size={17} />} wide id="runs">
+					<Panel title="Training Run Summary" icon={<Trophy size={17} />} wide id="runs" tab="experiments">
             <div className="run-summary">
               <div className="run-overview">
                 <div>
@@ -1443,7 +1460,7 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Champion Comparison" icon={<Trophy size={17} />} wide>
+					<Panel title="Champion Comparison" icon={<Trophy size={17} />} wide tab="experiments">
             {championComparison.length > 0 ? (
               <div className="comparison-table">
                 <div className="comparison-row comparison-head">
@@ -1485,7 +1502,7 @@ export function App() {
             )}
           </Panel>
 
-          <Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agents">
+					<Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agents" tab="agents">
             <div className="decision-panel">
               <div className="decision-actions">
                 <div>
@@ -1660,7 +1677,7 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide>
+					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide tab="operations">
             <div className="automation-grid">
               <div className="automation-block">
                 <strong>Worker Requirements</strong>
@@ -1704,7 +1721,7 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide>
+					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide tab="agents">
             {detail.agentMemory.length > 0 ? (
               <div className="memory-list">
                 {detail.agentMemory.map((record) => (
@@ -1730,7 +1747,7 @@ export function App() {
             )}
           </Panel>
 
-          <Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide id="plans">
+					<Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide id="plans" tab="experiments">
             {latestPlan ? (
               <div className="plan-card">
                 <div className="plan-actions">
@@ -1838,7 +1855,7 @@ export function App() {
             )}
           </Panel>
 
-          <Panel title="Manual Job Queue" icon={<Play size={17} />} wide>
+					<Panel title="Manual Job Queue" icon={<Play size={17} />} wide tab="operations">
             <form
               className="job-create-grid"
               onSubmit={(event) => {
@@ -1865,7 +1882,7 @@ export function App() {
             </form>
           </Panel>
 
-          <Panel title="Workers" icon={<MonitorDot size={17} />} wide>
+					<Panel title="Workers" icon={<MonitorDot size={17} />} wide tab="operations">
             <div className="table">
               <div className="table-row table-head">
                 <span>Name</span>
@@ -1887,7 +1904,7 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Datasets" icon={<Database size={17} />} wide>
+					<Panel title="Datasets" icon={<Database size={17} />} wide tab="data">
             <div className="table">
               <div className="table-row table-head">
                 <span>Name</span>
@@ -1909,7 +1926,7 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide>
+					<Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide tab="experiments">
             <div className="job-panel-head">
               <span>
                 Showing {visibleJobs.length} of {detail.jobs.length}
@@ -1955,7 +1972,7 @@ export function App() {
             </div>
           </Panel>
 
-          <Panel title="Run Metrics" icon={<Activity size={17} />} wide>
+					<Panel title="Run Metrics" icon={<Activity size={17} />} wide tab="experiments">
             {selectedJob ? (
               <div className="metric-area">
                 <div className="selected-job">
@@ -2044,23 +2061,25 @@ export function App() {
 }
 
 function Panel({
-  id,
-  title,
-  icon,
-  wide = false,
-  children,
+	id,
+	title,
+	icon,
+	wide = false,
+	tab,
+	children,
 }: {
-  id?: string;
-  title: string;
-  icon: ReactNode;
-  wide?: boolean;
-  children: ReactNode;
+	id?: string;
+	title: string;
+	icon: ReactNode;
+	wide?: boolean;
+	tab?: ProjectTabKey;
+	children: ReactNode;
 }) {
-  return (
-    <section className={wide ? "panel wide" : "panel"} id={id}>
-      <header>
-        <span>{icon}</span>
-        <h3>{title}</h3>
+	return (
+		<section className={wide ? "panel wide" : "panel"} id={id} data-project-tab={tab}>
+			<header>
+				<span>{icon}</span>
+				<h3>{title}</h3>
       </header>
       {children}
     </section>

@@ -525,23 +525,42 @@ button {
   backdrop-filter: blur(12px);
 }
 
-.section-tabs a {
-  display: inline-flex;
-  align-items: center;
-  min-height: 32px;
-  border: 1px solid #22302b;
-  border-radius: 7px;
-  padding: 0 11px;
-  color: #a6b2ad;
-  font-size: 12px;
-  font-weight: 900;
-  text-decoration: none;
+.section-tabs button {
+	display: inline-flex;
+	align-items: center;
+	min-height: 32px;
+	border: 1px solid #22302b;
+	border-radius: 7px;
+	padding: 0 11px;
+	background: transparent;
+	color: #a6b2ad;
+	font-size: 12px;
+	font-weight: 900;
+	cursor: pointer;
 }
 
-.section-tabs a:hover {
-  border-color: rgba(0, 212, 126, 0.42);
-  color: #eef3f0;
-  background: rgba(0, 212, 126, 0.08);
+.section-tabs button:hover,
+.section-tabs button.active {
+	border-color: rgba(0, 212, 126, 0.42);
+	color: #eef3f0;
+	background: rgba(0, 212, 126, 0.08);
+}
+
+.section-tabs button.active {
+	color: #00d47e;
+}
+
+.workspace[data-active-tab="overview"] [data-project-tab]:not([data-project-tab="overview"]),
+.workspace[data-active-tab="data"] [data-project-tab]:not([data-project-tab="data"]),
+.workspace[data-active-tab="experiments"] [data-project-tab]:not([data-project-tab="experiments"]),
+.workspace[data-active-tab="agents"] [data-project-tab]:not([data-project-tab="agents"]),
+.workspace[data-active-tab="operations"] [data-project-tab]:not([data-project-tab="operations"]),
+.workspace[data-active-tab="export"] [data-project-tab]:not([data-project-tab="export"]),
+.workspace[data-active-tab="experiments"] .mission-grid,
+.workspace[data-active-tab="agents"] .mission-grid,
+.workspace[data-active-tab="operations"] .mission-grid,
+.workspace[data-active-tab="export"] .mission-grid {
+	display: none;
 }
 
 #overview,
