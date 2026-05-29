@@ -1,6 +1,10 @@
 package plans
 
-import "time"
+import (
+	"time"
+
+	"model-express/services/orchestrator/internal/automl"
+)
 
 const (
 	StatusProposed = "PROPOSED"
@@ -39,6 +43,12 @@ type PlannedExperiment struct {
 	Optimizer                string                    `json:"optimizer,omitempty"`
 	Scheduler                string                    `json:"scheduler,omitempty"`
 	WeightDecay              float64                   `json:"weight_decay,omitempty"`
+	Dropout                  float64                   `json:"dropout,omitempty"`
+	OptimizerMomentum        float64                   `json:"optimizer_momentum,omitempty"`
+	SchedulerStepSize        int                       `json:"scheduler_step_size,omitempty"`
+	SchedulerGamma           float64                   `json:"scheduler_gamma,omitempty"`
+	LabelSmoothing           float64                   `json:"label_smoothing,omitempty"`
+	GradientClipNorm         float64                   `json:"gradient_clip_norm,omitempty"`
 	Augmentation             map[string]any            `json:"augmentation,omitempty"`
 	AugmentationPolicy       string                    `json:"augmentation_policy,omitempty"`
 	AugmentationPolicyConfig *AugmentationPolicyConfig `json:"augmentation_policy_config,omitempty"`
@@ -50,6 +60,7 @@ type PlannedExperiment struct {
 	Pretrained               bool                      `json:"pretrained,omitempty"`
 	FreezeBackbone           bool                      `json:"freeze_backbone,omitempty"`
 	FineTuneStrategy         string                    `json:"fine_tune_strategy,omitempty"`
+	AutoML                   *automl.ExperimentAutoML  `json:"automl,omitempty"`
 }
 
 type AugmentationPolicyConfig struct {

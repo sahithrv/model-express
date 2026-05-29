@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
@@ -89,6 +90,14 @@ type Store interface {
 	CreateStrategyScorecard(scorecard strategies.StrategyScorecardCreate) (strategies.StrategyScorecard, error)
 	UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPlanID string, update strategies.StrategyScorecardOutcomeUpdate) (strategies.StrategyScorecard, error)
 	ListProjectStrategyScorecards(projectID string, limit int) ([]strategies.StrategyScorecard, error)
+	CreateOptimizerStudy(study automl.OptimizerStudy) (automl.OptimizerStudy, error)
+	ListProjectOptimizerStudies(projectID string, limit int) ([]automl.OptimizerStudy, error)
+	CreateOptimizerSuggestion(suggestion automl.OptimizerSuggestion) (automl.OptimizerSuggestion, error)
+	UpdateOptimizerSuggestionJob(suggestionID string, jobID string) (automl.OptimizerSuggestion, error)
+	ListPlanOptimizerSuggestions(planID string) ([]automl.OptimizerSuggestion, error)
+	UpsertOptimizerTrial(trial automl.OptimizerTrial) (automl.OptimizerTrial, error)
+	ListProjectOptimizerTrials(projectID string, limit int) ([]automl.OptimizerTrial, error)
+	ListStudyOptimizerTrials(studyID string) ([]automl.OptimizerTrial, error)
 
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)

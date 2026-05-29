@@ -175,6 +175,25 @@ class VisualAnalysisAgentTests(unittest.TestCase):
 
         self.assertEqual(fake_client.calls, [])
 
+    def test_visual_analysis_repair_does_not_retry_raw_image_leaks(self) -> None:
+        bad_response = llm_response()
+        bad_response["image_bytes"] = "data:image/jpeg;base64,/9j/4AAQSkZJRg"
+        fake_client = SequenceVisualClient([llm_response()])
+
+        with self.assertRaises(VisualAnalysisValidationError):
+            jobs._validate_visual_analysis_with_repair(
+                raw_output=json.dumps(bad_response),
+                llm_client=fake_client,
+                sample_manifest=[{"image_id": "img_1", "class_name": "daisy"}],
+                dataset_metadata={"dataset_id": "ds_1", "dataset_name": "flowers"},
+                total_images=4,
+                trigger_reason="initial_profile",
+                max_images_analyzed=1,
+                schema_values={"schema_version": SCHEMA_VERSION},
+            )
+
+        self.assertEqual(fake_client.calls, [])
+
     def test_visual_llm_config_uses_separate_environment(self) -> None:
         with patch.dict(
             "os.environ",
@@ -186,6 +205,12 @@ class VisualAnalysisAgentTests(unittest.TestCase):
                 "MODEL_EXPRESS_VISUAL_LLM_API_KEY": "visual-key",
                 "MODEL_EXPRESS_VISUAL_LLM_MODEL": "visual-model",
                 "MODEL_EXPRESS_VISUAL_LLM_TIMEOUT_SECONDS": "7",
+                "MODEL_EXPRESS_VISUAL_LLM_TEMPERATURE": "0.2",
+                "MODEL_EXPRESS_VISUAL_LLM_API_STYLE": "responses",
+                "MODEL_EXPRESS_VISUAL_LLM_REASONING_EFFORT": "low",
+                "MODEL_EXPRESS_VISUAL_LLM_MAX_TOOL_ROUNDS": "4",
+                "MODEL_EXPRESS_VISUAL_LLM_MAX_RETRIES": "3",
+                "MODEL_EXPRESS_VISUAL_LLM_RETRY_BACKOFF_SECONDS": "0.5",
             },
             clear=True,
         ):
@@ -197,6 +222,18 @@ class VisualAnalysisAgentTests(unittest.TestCase):
         self.assertEqual(config.api_key, "visual-key")
         self.assertEqual(config.model, "visual-model")
         self.assertEqual(config.timeout_seconds, 7)
+        self.assertEqual(config.temperature, 0.2)
+        self.assertEqual(config.api_style, "responses")
+        self.assertEqual(config.reasoning_effort, "low")
+        self.assertEqual(config.max_tool_rounds, 4)
+        self.assertEqual(config.max_retries, 3)
+        self.assertEqual(config.retry_backoff_seconds, 0.5)
+
+    def test_visual_llm_config_defaults_to_longer_visual_timeout(self) -> None:
+        with patch.dict("os.environ", {"MODEL_EXPRESS_VISUAL_LLM_API_KEY": "visual-key"}, clear=True):
+            config = VisualLLMConfig.from_env()
+
+        self.assertEqual(config.timeout_seconds, 180)
 
     def test_debug_request_and_fingerprint_omit_image_bytes(self) -> None:
         request = VisualAnalysisRequest(

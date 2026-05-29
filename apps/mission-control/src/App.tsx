@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import type {
   AgentDecision,
+  AgentInvocation,
   AgentMemoryRecord,
   ChampionDemoImage,
   ChampionDemoPrediction,
@@ -89,6 +90,7 @@ type ProjectDetail = {
   workers: Worker[];
   workerRequirements: WorkerRequirement[];
   executionEvents: ExecutionEvent[];
+  agentInvocations: AgentInvocation[];
   agentMemory: AgentMemoryRecord[];
   strategyScorecards: StrategyScorecard[];
 };
@@ -111,6 +113,12 @@ type VisualAnalysisListResponse = {
   dataset_visual_analysis?: DatasetVisualAnalysis;
   rerun_policy?: VisualAnalysisRerunPolicy;
   manual_run_supported?: boolean;
+};
+
+type AgentInvocationsResponse = {
+  invocations?: AgentInvocation[];
+  agent_invocations?: AgentInvocation[];
+  items?: AgentInvocation[];
 };
 
 type TimelineItem = {
@@ -160,6 +168,34 @@ type CandidateScoreRow = {
   components: Array<{ label: string; value: number | string }>;
 };
 
+type AgentInvocationAuditRow = {
+  id: string;
+  agentName: string;
+  createdAt: string;
+  target: string;
+  validationStatus: string;
+  validationError: string;
+  apiStyle: string;
+  providerModel: string;
+  reasoningEffort: string;
+  toolRounds: string;
+  toolNames: string[];
+  rejectedToolCalls: string[];
+  dryRunValidationResults: Array<{ status: string; text: string }>;
+  decisionLink: string;
+};
+
+type DecisionChatTurn = {
+  decision: AgentDecision;
+  question: string;
+  opening: string;
+  highlights: Array<{ label: string; value: string }>;
+  sections: ReasoningSection[];
+  rejections: Array<{ kind: string; text: string }>;
+  mechanismCoverage: MechanismCoverageRow[];
+  candidateScores: CandidateScoreRow[];
+};
+
 type MechanismCoverageRow = {
   mechanism: string;
   status: string;
@@ -207,6 +243,8 @@ type AutomationSettingsUpdate = Partial<
     | "agent_mode"
     | "llm_provider"
     | "llm_model"
+    | "automl_enabled"
+    | "automl_sampler"
   >
 >;
 
@@ -221,6 +259,8 @@ const defaultAutomationSettings: AutomationSettings = {
   agent_mode: "propose",
   llm_provider: "openai",
   llm_model: "",
+  automl_enabled: false,
+  automl_sampler: "seeded_random",
   updated_at: "",
 };
 
@@ -245,6 +285,7 @@ function emptyProjectDetail(message = "Select a dataset to load visual analysis 
     workers: [],
     workerRequirements: [],
     executionEvents: [],
+    agentInvocations: [],
     agentMemory: [],
     strategyScorecards: [],
   };
@@ -298,6 +339,7 @@ export function App() {
   const latestDecisionHasFollowUpPlan = latestDecision
     ? detail.plans.some((plan) => plan.source_decision_id === latestDecision.id)
     : false;
+  const decisionChatTurns = useMemo(() => buildDecisionChatTurns(detail.decisions), [detail.decisions]);
   const runTotals = useMemo(() => summarizeTrainingRuns(detail.runSummaries), [detail.runSummaries]);
   const timelineItems = useMemo(
     () => buildExperimentTimeline(selectedProject, detail),
@@ -307,25 +349,9 @@ export function App() {
     () => buildDatasetIntelligence(detail.datasets[0] ?? null, latestDecision),
     [detail.datasets, latestDecision],
   );
-  const reasoningSections = useMemo(
-    () => (latestDecision ? decisionReasoningSections(latestDecision) : []),
-    [latestDecision],
-  );
-  const rejectionItems = useMemo(
-    () => (latestDecision ? decisionRejections(latestDecision) : []),
-    [latestDecision],
-  );
-  const mechanismCoverage = useMemo(
-    () => (latestDecision ? mechanismCoverageRows(latestDecision.payload) : []),
-    [latestDecision],
-  );
   const championComparison = useMemo(
     () => buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.jobs, detail.champion),
     [detail.champion, detail.jobs, detail.runEvaluations, detail.runSummaries],
-  );
-  const candidateScores = useMemo(
-    () => (latestDecision ? candidateScoreRows(latestDecision) : []),
-    [latestDecision],
   );
   const championExportDemo = useMemo(() => buildChampionExportDemo(detail), [detail]);
   const reviewState = automationReviewState(automationSettings);
@@ -451,6 +477,7 @@ export function App() {
         workers,
         workerRequirements,
         executionEvents,
+        agentInvocations,
         agentMemory,
         strategyScorecards,
       ] =
@@ -465,6 +492,9 @@ export function App() {
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
         request<{ requirements: WorkerRequirement[] }>(`/projects/${projectId}/worker-requirements`),
         request<{ events: ExecutionEvent[] }>(`/projects/${projectId}/execution-events?limit=8`),
+        request<AgentInvocationsResponse>(`/projects/${projectId}/agent-invocations?limit=8`).catch(
+          (): AgentInvocationsResponse => ({ invocations: [] }),
+        ),
         request<{ records: AgentMemoryRecord[] }>(`/projects/${projectId}/agent-memory?limit=6`),
         request<{ scorecards: StrategyScorecard[] }>(`/projects/${projectId}/strategy-scorecards?limit=6`),
       ]);
@@ -505,6 +535,7 @@ export function App() {
         workers: workers.workers,
         workerRequirements: workerRequirements.requirements,
         executionEvents: executionEvents.events,
+        agentInvocations: agentInvocationsFromResponse(agentInvocations),
         agentMemory: agentMemory.records,
         strategyScorecards: strategyScorecards.scorecards,
       });
@@ -993,6 +1024,8 @@ export function App() {
           agent_mode: settingsDraft.agent_mode,
           llm_provider: settingsDraft.llm_provider,
           llm_model: settingsDraft.llm_model,
+          automl_enabled: settingsDraft.automl_enabled,
+          automl_sampler: settingsDraft.automl_sampler,
         },
       });
 
@@ -1255,6 +1288,17 @@ export function App() {
                     <small>{automationSettings.llm_enabled ? "on" : "off"}</small>
                   </span>
                 </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.automl_enabled}
+                    onChange={(event) => updateSettingsDraft({ automl_enabled: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>AutoML HPO</strong>
+                    <small>{automationSettings.automl_enabled ? "on" : "off"}</small>
+                  </span>
+                </label>
                 <label className="setting-field">
                   <span>Agent Mode</span>
                   <select
@@ -1263,6 +1307,17 @@ export function App() {
                   >
                     <option value="propose">propose</option>
                     <option value="autonomous">autonomous</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>AutoML Sampler</span>
+                  <select
+                    value={settingsDraft.automl_sampler}
+                    onChange={(event) => updateSettingsDraft({ automl_sampler: event.currentTarget.value })}
+                  >
+                    <option value="seeded_random">seeded_random</option>
+                    <option value="grid">grid</option>
+                    <option value="adaptive_bayesian">adaptive_bayesian</option>
                   </select>
                 </label>
                 <label className="setting-field">
@@ -1523,156 +1578,10 @@ export function App() {
                 </div>
               </div>
 
-              {latestDecision ? (
-                <div className="decision-card">
-                  <div className="decision-card-head">
-                    <span>
-                      <Badge value={latestDecision.decision_type} />
-                      <small>{new Date(latestDecision.created_at).toLocaleString()}</small>
-                    </span>
-                    <small>{latestDecision.plan_id || "no plan"}</small>
-                  </div>
-                  <p>{latestDecision.rationale}</p>
-                  <div className="decision-payload">
-                    {decisionHighlights(latestDecision).map((item) => (
-                      <span key={item.label}>
-                        <small>{item.label}</small>
-                        <strong>{item.value}</strong>
-                      </span>
-                    ))}
-                  </div>
-                  {reasoningSections.length > 0 && (
-                    <div className="reasoning-grid">
-                      {reasoningSections.map((section) => (
-                        <div className="reasoning-card" key={section.title}>
-                          <strong>{section.title}</strong>
-                          {section.items.map((item) => (
-                            <p key={item}>{item}</p>
-                          ))}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {mechanismCoverage.length > 0 && (
-                    <div className="mechanism-coverage-panel">
-                      <strong>Mechanism Coverage</strong>
-                      <div className="mechanism-coverage-list">
-                        {mechanismCoverage.map((item) => (
-                          <div className="mechanism-coverage-row" key={`${item.status}-${item.mechanism}-${item.detail}`}>
-                            <span>
-                              <strong>{item.mechanism}</strong>
-                              <small>{item.detail}</small>
-                            </span>
-                            <Badge value={item.status} />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {rejectionItems.length > 0 && (
-                    <div className="rejection-panel">
-                      <strong>Backend Gate And Rejections</strong>
-                      <div className="rejection-list">
-                        {rejectionItems.map((item) => (
-                          <span key={`${item.kind}-${item.text}`}>
-                            <small>{item.kind}</small>
-                            {item.text}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {candidateScores.length > 0 && (
-                    <div className="candidate-score-panel">
-                      <strong>Candidate Scores</strong>
-                      <div className="candidate-score-list">
-                        {candidateScores.map((candidate) => (
-                          <div className="candidate-score-row" key={candidate.label}>
-                            <div className="candidate-score-head">
-                              <span>
-                                <strong>{candidate.label}</strong>
-                                <small>
-                                  {[
-                                    candidate.mechanism ? `mechanism ${candidate.mechanism}` : "",
-                                    candidate.intervention,
-                                    ...candidate.reasons.slice(0, 2),
-                                  ]
-                                    .filter(Boolean)
-                                    .join("; ") || "No rejection reason reported."}
-                                </small>
-                              </span>
-                              <Badge value={candidate.status} />
-                            </div>
-                            <div className="score-component-list">
-                              {candidate.mechanism && (
-                                <span>
-                                  <small>Mechanism</small>
-                                  <strong>{candidate.mechanism}</strong>
-                                </span>
-                              )}
-                              {candidate.expectedEffect && (
-                                <span>
-                                  <small>Expected Effect</small>
-                                  <strong>{candidate.expectedEffect}</strong>
-                                </span>
-                              )}
-                              {candidate.validationStatus && (
-                                <span>
-                                  <small>Validation</small>
-                                  <strong>{candidate.validationStatus}</strong>
-                                </span>
-                              )}
-                              {candidate.totalScore !== null && (
-                                <span>
-                                  <small>Total</small>
-                                  <strong>{candidate.totalScore.toFixed(3)}</strong>
-                                </span>
-                              )}
-                              {candidate.components.map((component) => (
-                                <span key={`${candidate.label}-${component.label}`}>
-                                  <small>{component.label}</small>
-                                  <strong>{typeof component.value === "number" ? component.value.toFixed(3) : component.value}</strong>
-                                </span>
-                              ))}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
+              {decisionChatTurns.length > 0 ? (
+                <AgentDecisionChat turns={decisionChatTurns} />
               ) : (
                 <div className="empty">No agent decisions yet. Run the reviewer after experiments finish.</div>
-              )}
-
-              {detail.decisions.length > 1 && (
-                <div className="decision-history">
-                  {detail.decisions.slice(1, 5).map((decision) => (
-                    <div key={decision.id}>
-                      <Badge value={decision.decision_type} />
-                      <span>{decisionHistorySummary(decision)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {detail.strategyScorecards.length > 0 && (
-                <div className="decision-history">
-                  {detail.strategyScorecards.slice(0, 4).map((scorecard) => (
-                    <div key={scorecard.id}>
-                      <Badge value={scorecard.outcome} />
-                      <span>
-                        {[
-                          scorecard.mechanism || scorecard.planning_mode || scorecard.strategy_type || "strategy",
-                          scorecard.intervention,
-                          `expected ${scorecard.expected_delta.toFixed(3)}, actual ${scorecard.actual_delta.toFixed(3)}`,
-                        ]
-                          .filter(Boolean)
-                          .join(" - ")}
-                      </span>
-                    </div>
-                  ))}
-                </div>
               )}
             </div>
           </Panel>
@@ -1719,6 +1628,10 @@ export function App() {
                 )}
               </div>
             </div>
+          </Panel>
+
+					<Panel title="Agent Invocation Audit" icon={<SquareTerminal size={17} />} wide tab="agents">
+            <AgentInvocationAuditPanel invocations={detail.agentInvocations} decisions={detail.decisions} />
           </Panel>
 
 					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide tab="agents">
@@ -1806,11 +1719,20 @@ export function App() {
                           </span>
                         </>
                       )}
-                      {(experiment.image_size || experiment.optimizer || experiment.scheduler || experiment.class_balancing) && (
+                      {(experiment.image_size ||
+                        experiment.optimizer ||
+                        experiment.scheduler ||
+                        experiment.class_balancing ||
+                        experiment.dropout ||
+                        experiment.label_smoothing ||
+                        experiment.gradient_clip_norm) && (
                         <span>
                           {experiment.image_size ? <small>{experiment.image_size}px</small> : null}
                           {experiment.optimizer ? <small>{experiment.optimizer}</small> : null}
                           {experiment.scheduler ? <small>{experiment.scheduler}</small> : null}
+                          {experiment.dropout ? <small>dropout {formatMetricNumber(experiment.dropout)}</small> : null}
+                          {experiment.label_smoothing ? <small>smooth {formatMetricNumber(experiment.label_smoothing)}</small> : null}
+                          {experiment.gradient_clip_norm ? <small>clip {formatMetricNumber(experiment.gradient_clip_norm)}</small> : null}
                           {experiment.class_balancing ? <small>{experiment.class_balancing}</small> : null}
                         </span>
                       )}
@@ -1829,6 +1751,16 @@ export function App() {
                         <div className="experiment-preprocessing">
                           {experimentPreprocessingItems(experiment).map((item) => (
                             <span key={`${latestPlan.id}-${experiment.model}-${item.label}`}>
+                              <small>{item.label}</small>
+                              <strong>{item.value}</strong>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {experimentAutoMLItems(experiment).length > 0 && (
+                        <div className="experiment-automl">
+                          {experimentAutoMLItems(experiment).map((item) => (
+                            <span key={`${latestPlan.id}-${index}-automl-${item.label}`}>
                               <small>{item.label}</small>
                               <strong>{item.value}</strong>
                             </span>
@@ -2083,6 +2015,225 @@ function Panel({
       </header>
       {children}
     </section>
+  );
+}
+
+function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
+  return (
+    <div className="decision-chat">
+      {turns.map((turn) => (
+        <div className="decision-chat-turn" key={turn.decision.id}>
+          <div className="message-row user">
+            <div className="message-bubble user-bubble">
+              <span>{turn.question}</span>
+            </div>
+          </div>
+
+          <div className="message-row agent">
+            <div className="message-avatar">
+              <BrainCircuit size={15} />
+            </div>
+            <div className="message-bubble agent-bubble">
+              <div className="decision-message-head">
+                <span>
+                  <Badge value={turn.decision.decision_type} />
+                  <small>{new Date(turn.decision.created_at).toLocaleString()}</small>
+                </span>
+                <small>{turn.decision.plan_id || "no plan"}</small>
+              </div>
+
+              <p>{turn.opening}</p>
+
+              <div className="decision-payload message-facts">
+                {turn.highlights.map((item) => (
+                  <span key={`${turn.decision.id}-${item.label}`}>
+                    <small>{item.label}</small>
+                    <strong>{item.value}</strong>
+                  </span>
+                ))}
+              </div>
+
+              {turn.sections.length > 0 && (
+                <div className="message-section-list">
+                  {turn.sections.map((section) => (
+                    <div className="message-section" key={`${turn.decision.id}-${section.title}`}>
+                      <strong>{section.title}</strong>
+                      {section.items.slice(0, 4).map((item) => (
+                        <p key={`${section.title}-${item}`}>{item}</p>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {turn.mechanismCoverage.length > 0 && (
+                <div className="mechanism-coverage-panel compact">
+                  <strong>Mechanism Coverage</strong>
+                  <div className="mechanism-coverage-list">
+                    {turn.mechanismCoverage.slice(0, 6).map((item) => (
+                      <div
+                        className="mechanism-coverage-row"
+                        key={`${turn.decision.id}-${item.status}-${item.mechanism}-${item.detail}`}
+                      >
+                        <span>
+                          <strong>{item.mechanism}</strong>
+                          <small>{item.detail}</small>
+                        </span>
+                        <Badge value={item.status} />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {turn.rejections.length > 0 && (
+                <div className="rejection-panel compact">
+                  <strong>Backend Gate And Rejections</strong>
+                  <div className="rejection-list">
+                    {turn.rejections.slice(0, 5).map((item) => (
+                      <span key={`${turn.decision.id}-${item.kind}-${item.text}`}>
+                        <small>{item.kind}</small>
+                        {item.text}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {turn.candidateScores.length > 0 && (
+                <div className="candidate-score-panel compact">
+                  <strong>Candidate Scores</strong>
+                  <div className="candidate-score-list">
+                    {turn.candidateScores.slice(0, 4).map((candidate) => (
+                      <div className="candidate-score-row" key={`${turn.decision.id}-${candidate.label}`}>
+                        <div className="candidate-score-head">
+                          <span>
+                            <strong>{candidate.label}</strong>
+                            <small>
+                              {[
+                                candidate.mechanism ? `mechanism ${candidate.mechanism}` : "",
+                                candidate.intervention,
+                                ...candidate.reasons.slice(0, 2),
+                              ]
+                                .filter(Boolean)
+                                .join("; ") || "No rejection reason reported."}
+                            </small>
+                          </span>
+                          <Badge value={candidate.status} />
+                        </div>
+                        <div className="score-component-list">
+                          {[
+                            candidate.mechanism ? { label: "Mechanism", value: candidate.mechanism } : null,
+                            candidate.expectedEffect ? { label: "Expected Effect", value: candidate.expectedEffect } : null,
+                            candidate.validationStatus ? { label: "Validation", value: candidate.validationStatus } : null,
+                            candidate.totalScore !== null ? { label: "Total", value: candidate.totalScore.toFixed(3) } : null,
+                          ]
+                            .filter((item): item is { label: string; value: string } => item !== null)
+                            .map((item) => (
+                              <span key={`${turn.decision.id}-${candidate.label}-${item.label}`}>
+                                <small>{item.label}</small>
+                                <strong>{item.value}</strong>
+                              </span>
+                            ))}
+                          {candidate.components.slice(0, 4).map((component) => (
+                            <span key={`${turn.decision.id}-${candidate.label}-${component.label}`}>
+                              <small>{component.label}</small>
+                              <strong>{typeof component.value === "number" ? component.value.toFixed(3) : component.value}</strong>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AgentInvocationAuditPanel({
+  invocations,
+  decisions,
+}: {
+  invocations: AgentInvocation[];
+  decisions: AgentDecision[];
+}) {
+  const rows = buildAgentInvocationAuditRows(invocations, decisions);
+
+  if (rows.length === 0) {
+    return <div className="empty">Agent invocation metadata will appear after LLM calls are recorded.</div>;
+  }
+
+  return (
+    <div className="agent-audit-list">
+      {rows.map((row) => (
+        <div className="agent-audit-row" key={row.id}>
+          <div className="agent-audit-head">
+            <span>
+              <strong>{row.agentName}</strong>
+              <small>{[row.createdAt ? new Date(row.createdAt).toLocaleString() : "", row.id].filter(Boolean).join(" - ")}</small>
+              <small>{row.target}</small>
+            </span>
+            <Badge value={row.validationStatus} />
+          </div>
+
+          <div className="agent-audit-facts">
+            {[
+              { label: "API Style", value: row.apiStyle },
+              { label: "Provider / Model", value: row.providerModel },
+              { label: "Reasoning", value: row.reasoningEffort },
+              { label: "Tool Rounds", value: row.toolRounds },
+              { label: "Tool Names", value: row.toolNames.length > 0 ? row.toolNames.join(", ") : "-" },
+              { label: "Decision", value: row.decisionLink },
+            ].map((item) => (
+              <span key={`${row.id}-${item.label}`}>
+                <small>{item.label}</small>
+                <strong title={item.value}>{item.value}</strong>
+              </span>
+            ))}
+          </div>
+
+          {row.validationError && (
+            <div className="agent-audit-note error">
+              <small>Validation Error</small>
+              <span>{row.validationError}</span>
+            </div>
+          )}
+
+          {row.rejectedToolCalls.length > 0 && (
+            <div className="agent-audit-subsection rejected">
+              <strong>Rejected Tool Calls</strong>
+              <div className="agent-audit-result-list">
+                {row.rejectedToolCalls.map((item) => (
+                  <div className="agent-audit-result" key={`${row.id}-rejected-${item}`}>
+                    <Badge value="REJECTED" />
+                    <span>{item}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {row.dryRunValidationResults.length > 0 && (
+            <div className="agent-audit-subsection">
+              <strong>Dry-run Validation</strong>
+              <div className="agent-audit-result-list">
+                {row.dryRunValidationResults.map((item) => (
+                  <div className="agent-audit-result" key={`${row.id}-dry-run-${item.status}-${item.text}`}>
+                    <Badge value={item.status} />
+                    <span>{item.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -3064,6 +3215,92 @@ function visualAnalysisFromProfile(profile: Record<string, unknown>) {
   return latestVisualAnalysis(analyses);
 }
 
+function agentInvocationsFromResponse(response: AgentInvocationsResponse): AgentInvocation[] {
+  return response.invocations ?? response.agent_invocations ?? response.items ?? [];
+}
+
+function buildAgentInvocationAuditRows(invocations: AgentInvocation[], decisions: AgentDecision[]): AgentInvocationAuditRow[] {
+  return invocations.map((invocation) => {
+    const inputContext = recordObject(invocation.input_context);
+    const runtime = invocationRuntimeRecord(inputContext);
+    const downstreamOutcome = recordObject(invocation.downstream_outcome);
+    const direct = recordObject(invocation);
+    const records = [downstreamOutcome, runtime, inputContext, direct];
+    const validationStatus =
+      firstAuditString(records, ["backend_validation_status", "validation_status", "planner_validation_status"]) ||
+      invocation.validation_status ||
+      "unknown";
+    const validationError = shortAuditText(
+      firstAuditString(records, ["backend_validation_error", "validation_error", "planner_validation_error", "error"]),
+      220,
+    );
+    const provider = invocation.provider || firstAuditString([runtime, inputContext], ["provider", "llm_provider"]);
+    const model = invocation.model || firstAuditString([runtime, inputContext], ["model", "llm_model"]);
+    const toolNames = uniqueStrings([
+      ...auditToolNamesFromValue(firstAuditValue(records, ["tool_names", "toolNames", "tools"])),
+      ...auditToolNamesFromValue(firstAuditValue(records, ["tool_calls", "toolCalls", "information_requests"])),
+      ...auditToolNamesFromValue(firstAuditValue(records, ["tool_results", "toolResults"])),
+    ]).slice(0, 8);
+
+    return {
+      id: invocation.id,
+      agentName: invocation.agent_name || "agent",
+      createdAt: invocation.created_at,
+      target: invocationTarget(invocation),
+      validationStatus,
+      validationError,
+      apiStyle: firstAuditString([runtime, inputContext, downstreamOutcome], ["api_style", "llm_api_style", "apiStyle", "style"]) || "-",
+      providerModel: [provider, model].filter(Boolean).join(" / ") || "-",
+      reasoningEffort:
+        firstAuditString([runtime, inputContext, downstreamOutcome], ["reasoning_effort", "reasoningEffort", "effort"]) || "-",
+      toolRounds: auditCountValue(firstAuditValue(records, ["tool_rounds", "toolRounds", "rounds", "round_count"])),
+      toolNames,
+      rejectedToolCalls: auditRejectedToolCallSummaries(
+        firstAuditValue(records, ["rejected_tool_calls", "rejectedToolCalls", "tool_rejections"]),
+      ),
+      dryRunValidationResults: auditDryRunValidationSummaries(
+        firstAuditValue(records, ["dry_run_validation_results", "dryRunValidationResults", "dry_run_validation", "validation_results"]),
+      ),
+      decisionLink: invocationDecisionLink(invocation, records, decisions),
+    };
+  });
+}
+
+function invocationRuntimeRecord(inputContext: Record<string, unknown>) {
+  for (const key of ["invocation_runtime", "runtime", "llm_runtime", "responses_runtime"]) {
+    const runtime = recordObject(inputContext[key]);
+    if (Object.keys(runtime).length > 0) return runtime;
+  }
+  return {};
+}
+
+function invocationTarget(invocation: AgentInvocation) {
+  const parts = [
+    invocation.plan_id ? `plan ${invocation.plan_id}` : "",
+    invocation.job_id ? `job ${invocation.job_id}` : "",
+    invocation.dataset_id ? `dataset ${invocation.dataset_id}` : "",
+  ].filter(Boolean);
+  return parts.join(" - ") || (invocation.project_id ? `project ${invocation.project_id}` : "project scope");
+}
+
+function invocationDecisionLink(
+  invocation: AgentInvocation,
+  records: Record<string, unknown>[],
+  decisions: AgentDecision[],
+) {
+  const directDecisionID = firstAuditString(records, ["decision_id", "final_decision_id"]);
+  const sourceDecisionID = firstAuditString(records, ["source_decision_id"]);
+  const linkedDecision =
+    decisions.find((decision) => decision.id === directDecisionID) ??
+    decisions.find((decision) => recordString(decision.payload ?? {}, "invocation_id") === invocation.id) ??
+    decisions.find((decision) => decision.id === sourceDecisionID);
+
+  if (linkedDecision) return `${linkedDecision.id} / ${linkedDecision.decision_type}`;
+  if (directDecisionID) return directDecisionID;
+  if (sourceDecisionID) return `source ${sourceDecisionID}`;
+  return "-";
+}
+
 function visualAnalysisFacts(visualAnalysis: VisualAnalysisDetail, activeJob: Job | null): InsightItem[] {
   const analysis = visualAnalysis.analysis;
   const policy = visualAnalysis.rerunPolicy ?? null;
@@ -3215,6 +3452,36 @@ function visualPerClassCoverageRows(coverage: Record<string, unknown>) {
     .map(([label, value]) => ({ label, value: String(numericValue(value)) }))
     .filter((row) => row.value !== "0")
     .slice(0, 10);
+}
+
+function buildDecisionChatTurns(decisions: AgentDecision[]): DecisionChatTurn[] {
+  return decisions
+    .slice()
+    .reverse()
+    .map((decision, index) => ({
+      decision,
+      question: decisionChatQuestion(decision, index),
+      opening: decisionChatOpening(decision),
+      highlights: decisionHighlights(decision),
+      sections: decisionReasoningSections(decision).filter((section) => section.title !== "Summary"),
+      rejections: decisionRejections(decision),
+      mechanismCoverage: mechanismCoverageRows(decision.payload),
+      candidateScores: candidateScoreRows(decision),
+    }));
+}
+
+function decisionChatQuestion(decision: AgentDecision, index: number) {
+  const payload = decision.payload ?? {};
+  const planID =
+    decision.plan_id ||
+    recordFirstString(payload, ["plan_id", "source_plan_id", "followup_plan_id", "follow_up_plan_id"]) ||
+    `decision_${index + 1}`;
+  return `What is ${planID}?`;
+}
+
+function decisionChatOpening(decision: AgentDecision) {
+  const summary = recordString(decision.payload ?? {}, "summary");
+  return uniqueStrings([summary, decision.rationale]).join(" ");
 }
 
 function decisionReasoningSections(decision: AgentDecision): ReasoningSection[] {
@@ -3619,6 +3886,31 @@ function augmentationPolicyConfigSummary(config: PlannedExperiment["augmentation
   return [config.policy_type, ...details].join(" / ");
 }
 
+function experimentAutoMLItems(experiment: PlannedExperiment) {
+  const config = experiment.automl;
+  if (!config?.enabled) return [];
+  const finalValues = recordObject(config.final_values ?? config.suggestion?.final_values);
+  const provenance = recordObject(config.value_provenance ?? config.suggestion?.provenance);
+  const tuned = Object.entries(finalValues)
+    .slice(0, 8)
+    .map(([key, value]) => {
+      const source = recordString(provenance, key);
+      return `${key}=${formatUnknownValue(value)}${source ? ` (${source})` : ""}`;
+    })
+    .join(" / ");
+  const searchNames = (config.search_space?.parameters ?? [])
+    .map((parameter) => parameter.name)
+    .filter(Boolean)
+    .slice(0, 8)
+    .join(", ");
+  return [
+    { label: "AutoML", value: config.validation_status || "enabled" },
+    { label: "sampler", value: config.sampler },
+    { label: "search", value: searchNames },
+    { label: "suggestion", value: tuned },
+  ].filter((item): item is { label: string; value: string } => typeof item.value === "string" && item.value.length > 0);
+}
+
 function experimentMechanismItems(experiment: PlannedExperiment) {
   const evidence = stringArrayPayload(experiment.evidence_used).slice(0, 2).join("; ");
   return [
@@ -3635,7 +3927,9 @@ function jobMechanismSummary(job: Job) {
   const mechanism = recordString(job.config, "mechanism");
   const intervention = recordString(job.config, "intervention");
   const validation = recordFirstString(job.config, ["backend_validation_status", "validation_status"]);
-  return [mechanism ? `mechanism ${mechanism}` : "", intervention, validation ? `validation ${validation}` : ""]
+  const automlSummary = recordObject(job.config.automl_summary);
+  const automl = recordString(automlSummary, "suggestion_id") ? `AutoML ${recordString(automlSummary, "sampler") || "suggestion"}` : "";
+  return [mechanism ? `mechanism ${mechanism}` : "", intervention, automl, validation ? `validation ${validation}` : ""]
     .filter(Boolean)
     .join(" / ");
 }
@@ -3914,6 +4208,232 @@ function recordNumber(record: Record<string, unknown>, key: string) {
 
 function recordObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function firstAuditValue(records: Record<string, unknown>[], keys: string[]) {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = record[key];
+      if (value !== undefined && value !== null && value !== "") return value;
+    }
+  }
+  return undefined;
+}
+
+function firstAuditString(records: Record<string, unknown>[], keys: string[]) {
+  const value = firstAuditValue(records, keys);
+  if (typeof value === "string") return shortAuditText(value);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function auditCountValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && value.trim()) return shortAuditText(value, 40);
+  if (Array.isArray(value)) return String(value.length);
+
+  const record = recordObject(value);
+  const count = firstAuditValue([record], ["count", "total", "rounds", "round_count", "tool_rounds"]);
+  if (typeof count === "number" && Number.isFinite(count)) return String(count);
+  if (typeof count === "string" && count.trim()) return shortAuditText(count, 40);
+  return "-";
+}
+
+function auditToolNamesFromValue(value: unknown): string[] {
+  if (!value) return [];
+  if (typeof value === "string") {
+    return value
+      .split(/[,\n]/)
+      .map((item) => shortAuditText(item, 64))
+      .filter(Boolean);
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(auditToolNamesFromValue);
+  }
+
+  const record = recordObject(value);
+  const functionRecord = recordObject(record.function);
+  const direct = firstAuditString([record, functionRecord], ["tool_name", "name", "tool", "function_name"]);
+  if (direct) return [direct];
+  return Object.keys(record)
+    .filter((key) => !isSensitiveAuditKey(key))
+    .map((key) => shortAuditText(key, 64))
+    .filter(Boolean);
+}
+
+function auditRejectedToolCallSummaries(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => auditRejectedToolCallSummaries(auditRejectionItem(item, index))).slice(0, 5);
+  }
+
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) {
+    return typeof value === "string" ? [shortAuditText(value)] : [];
+  }
+
+  if (hasAuditRejectionShape(record)) {
+    const direct = auditRejectionItem(record, 0);
+    if (typeof direct === "string") return [direct];
+  }
+  return Object.entries(record)
+    .filter(([key]) => !isSensitiveAuditKey(key))
+    .slice(0, 5)
+    .map(([key, entry]) => {
+      const entryRecord = recordObject(entry);
+      const reason =
+        firstAuditString([entryRecord], ["reason", "error", "validation_error", "message", "status"]) ||
+        auditPrimitiveSummary(entry);
+      return shortAuditText(`${humanizeAuditKey(key)}: ${reason || "rejected"}`);
+    })
+    .filter(Boolean);
+}
+
+function hasAuditRejectionShape(record: Record<string, unknown>) {
+  return [
+    "tool_name",
+    "name",
+    "tool",
+    "function_name",
+    "function",
+    "reason",
+    "error",
+    "validation_error",
+    "message",
+    "status",
+    "rejection",
+  ].some((key) => key in record);
+}
+
+function auditRejectionItem(value: unknown, index: number): string | Record<string, unknown> {
+  if (typeof value === "string") return shortAuditText(value);
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) return {};
+
+  const functionRecord = recordObject(record.function);
+  const name =
+    firstAuditString([record, functionRecord], ["tool_name", "name", "tool", "function_name"]) ||
+    `tool call ${index + 1}`;
+  const reason =
+    firstAuditString([record], ["reason", "error", "validation_error", "message", "status"]) ||
+    firstAuditString([recordObject(record.rejection)], ["reason", "error", "message"]);
+  return shortAuditText(`${name}: ${reason || "rejected"}`);
+}
+
+function auditDryRunValidationSummaries(value: unknown): Array<{ status: string; text: string }> {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => auditDryRunValidationItem(item, index)).slice(0, 5);
+  }
+
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) {
+    const text = auditPrimitiveSummary(value);
+    return text ? [{ status: "reported", text }] : [];
+  }
+
+  const nested = firstAuditValue([record], ["results", "items", "experiments", "candidates", "validations"]);
+  if (Array.isArray(nested)) return auditDryRunValidationSummaries(nested);
+
+  if (hasAuditValidationShape(record)) return auditDryRunValidationItem(record, 0);
+
+  return Object.entries(record)
+    .filter(([key]) => !isSensitiveAuditKey(key))
+    .slice(0, 5)
+    .flatMap(([key, entry], index) => auditDryRunValidationItem(entry, index, humanizeAuditKey(key)));
+}
+
+function auditDryRunValidationItem(value: unknown, index: number, fallbackLabel?: string): Array<{ status: string; text: string }> {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    const text = auditPrimitiveSummary(value);
+    return text ? [{ status: "reported", text: fallbackLabel ? `${fallbackLabel}: ${text}` : text }] : [];
+  }
+
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) return [];
+
+  if (!hasAuditValidationShape(record)) {
+    return Object.entries(record)
+      .filter(([key]) => !isSensitiveAuditKey(key))
+      .slice(0, 3)
+      .map(([key, entry]) => ({
+        status: "reported",
+        text: shortAuditText(`${fallbackLabel || humanizeAuditKey(key)}: ${auditPrimitiveSummary(entry) || "reported"}`),
+      }));
+  }
+
+  const status =
+    firstAuditString([record], ["backend_validation_status", "validation_status", "status", "result"]) ||
+    (record.valid === true ? "valid" : record.valid === false ? "invalid" : "reported");
+  const label =
+    firstAuditString([record], ["experiment_id", "candidate_id", "model", "template", "name", "tool_name"]) ||
+    fallbackLabel ||
+    `item ${index + 1}`;
+  const mechanism = firstAuditString([record], ["mechanism", "intervention", "decision_type"]);
+  const error = firstAuditString([record], ["backend_validation_error", "validation_error", "error", "message", "reason"]);
+  const text = [label, mechanism, error].filter(Boolean).join(" - ");
+  return [{ status, text: shortAuditText(text || label, 180) }];
+}
+
+function hasAuditValidationShape(record: Record<string, unknown>) {
+  return [
+    "backend_validation_status",
+    "validation_status",
+    "status",
+    "result",
+    "valid",
+    "backend_validation_error",
+    "validation_error",
+    "error",
+    "reason",
+  ].some((key) => key in record);
+}
+
+function auditPrimitiveSummary(value: unknown) {
+  if (typeof value === "string") return shortAuditText(value);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `${value.length} item(s)`;
+  if (value && typeof value === "object") return "object";
+  return "";
+}
+
+function shortAuditText(value: string, maxLength = 160) {
+  const collapsed = value.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  if (isLikelyEncodedPayload(collapsed)) return "[redacted payload]";
+  const redacted = collapsed
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "[redacted uri]")
+    .replace(/[A-Za-z]:\\[^\s]+/g, "[redacted path]")
+    .replace(/\/(?:[^/\s]+\/){2,}[^/\s]+/g, "[redacted path]");
+  return redacted.length > maxLength ? `${redacted.slice(0, maxLength - 3)}...` : redacted;
+}
+
+function isLikelyEncodedPayload(value: string) {
+  const lower = value.toLowerCase();
+  return lower.startsWith("data:image") || lower.includes(";base64,") || (value.length > 180 && /^[A-Za-z0-9+/=]+$/.test(value));
+}
+
+function isSensitiveAuditKey(key: string) {
+  const normalized = key.toLowerCase();
+  return (
+    normalized === "input_messages" ||
+    normalized === "raw_output" ||
+    normalized === "parsed_output" ||
+    normalized === "input_context" ||
+    normalized === "content" ||
+    normalized === "payload" ||
+    normalized.includes("prompt") ||
+    normalized.includes("image") ||
+    normalized.includes("base64") ||
+    normalized.includes("manifest") ||
+    normalized.includes("uri") ||
+    normalized.includes("url") ||
+    normalized.includes("path")
+  );
+}
+
+function humanizeAuditKey(key: string) {
+  return key.replace(/[_-]+/g, " ");
 }
 
 function normalizedStatus(value: string) {
@@ -4213,4 +4733,12 @@ function formatModelSize(profile: Record<string, unknown>) {
 function formatChartValue(value: number) {
   if (Math.abs(value) >= 10) return value.toFixed(2);
   return value.toFixed(4);
+}
+
+function formatUnknownValue(value: unknown) {
+  if (typeof value === "number") return formatMetricNumber(value);
+  if (typeof value === "string") return value;
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (value === null || value === undefined) return "";
+  return JSON.stringify(value);
 }

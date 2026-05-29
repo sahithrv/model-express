@@ -332,9 +332,9 @@ func mechanismReflectedInExperimentConfig(mechanism string, experiment plans.Pla
 	case "resolution_crop":
 		return (experiment.ImageSize > 0 && experiment.ImageSize != 224) || nonDefaultText(experiment.ResolutionStrategy, "fixed") || experiment.Preprocessing != nil
 	case "regularization":
-		return experiment.WeightDecay > 0 || nonDefaultText(experiment.AugmentationPolicy, "none") || len(experiment.Augmentation) > 0 || experiment.AugmentationPolicyConfig != nil
+		return experiment.WeightDecay > 0 || experiment.Dropout > 0 || experiment.LabelSmoothing > 0 || experiment.GradientClipNorm > 0 || nonDefaultText(experiment.AugmentationPolicy, "none") || len(experiment.Augmentation) > 0 || experiment.AugmentationPolicyConfig != nil
 	case "optimizer_scheduler":
-		return nonDefaultText(experiment.Optimizer, "adamw") || nonDefaultText(experiment.Scheduler, "none") || experiment.WeightDecay > 0
+		return nonDefaultText(experiment.Optimizer, "adamw") || nonDefaultText(experiment.Scheduler, "none") || experiment.WeightDecay > 0 || experiment.OptimizerMomentum > 0 || experiment.SchedulerStepSize > 0 || experiment.SchedulerGamma > 0
 	case "capacity_finetune":
 		return nonDefaultText(experiment.FineTuneStrategy, "head_only") || (experiment.Pretrained && !experiment.FreezeBackbone) || isHigherCapacityFamily(experiment.Model)
 	case "deployment_latency":
@@ -476,7 +476,7 @@ func candidateRedundancyPenalty(input ExperimentPlannerInput, candidate Candidat
 func meaningfullyChangesExperiment(candidate CandidateHypothesis) bool {
 	for key := range candidate.ProposedChanges {
 		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "mechanism", "intervention", "expected_effect", "model", "model_family", "architecture", "image_size", "resolution_strategy", "augmentation", "augmentation_policy", "preprocessing", "resize_strategy", "normalization", "crop", "crop_strategy", "bbox_mode", "class_balancing", "sampling_strategy", "fine_tune_strategy", "scheduler", "optimizer", "weight_decay", "loss":
+		case "mechanism", "intervention", "expected_effect", "model", "model_family", "architecture", "image_size", "resolution_strategy", "augmentation", "augmentation_policy", "preprocessing", "resize_strategy", "normalization", "crop", "crop_strategy", "bbox_mode", "class_balancing", "sampling_strategy", "fine_tune_strategy", "scheduler", "optimizer", "weight_decay", "dropout", "optimizer_momentum", "scheduler_step_size", "scheduler_gamma", "label_smoothing", "gradient_clip_norm", "loss":
 			return true
 		}
 	}
@@ -560,6 +560,12 @@ func experimentsDifferOnlyMinor(left plans.PlannedExperiment, right plans.Planne
 		strings.EqualFold(strings.TrimSpace(left.Optimizer), strings.TrimSpace(right.Optimizer)) &&
 		strings.EqualFold(strings.TrimSpace(left.Scheduler), strings.TrimSpace(right.Scheduler)) &&
 		left.WeightDecay == right.WeightDecay &&
+		left.Dropout == right.Dropout &&
+		left.OptimizerMomentum == right.OptimizerMomentum &&
+		left.SchedulerStepSize == right.SchedulerStepSize &&
+		left.SchedulerGamma == right.SchedulerGamma &&
+		left.LabelSmoothing == right.LabelSmoothing &&
+		left.GradientClipNorm == right.GradientClipNorm &&
 		strings.EqualFold(strings.TrimSpace(left.AugmentationPolicy), strings.TrimSpace(right.AugmentationPolicy)) &&
 		strings.EqualFold(strings.TrimSpace(left.ClassBalancing), strings.TrimSpace(right.ClassBalancing)) &&
 		strings.EqualFold(strings.TrimSpace(left.SamplingStrategy), strings.TrimSpace(right.SamplingStrategy)) &&
@@ -708,6 +714,12 @@ func candidateExperimentSignature(experiment plans.PlannedExperiment) string {
 		strings.ToLower(strings.TrimSpace(experiment.Optimizer)),
 		strings.ToLower(strings.TrimSpace(experiment.Scheduler)),
 		strconv.FormatFloat(experiment.WeightDecay, 'g', -1, 64),
+		strconv.FormatFloat(experiment.Dropout, 'g', -1, 64),
+		strconv.FormatFloat(experiment.OptimizerMomentum, 'g', -1, 64),
+		strconv.Itoa(experiment.SchedulerStepSize),
+		strconv.FormatFloat(experiment.SchedulerGamma, 'g', -1, 64),
+		strconv.FormatFloat(experiment.LabelSmoothing, 'g', -1, 64),
+		strconv.FormatFloat(experiment.GradientClipNorm, 'g', -1, 64),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
 		string(augmentationPolicyConfigBlob),

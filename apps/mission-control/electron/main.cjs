@@ -161,6 +161,8 @@ function ensureProjectWorker(options) {
     throw new Error(`Worker directory does not exist: ${workerDir}`);
   }
 
+  const logDir = resolveLogDir(repoRoot);
+  fs.mkdirSync(logDir, { recursive: true });
   const targetCount = normalizeWorkerCount(options.count);
   const repoEnv = loadRepoEnv(repoRoot);
   const pids = [];
@@ -184,6 +186,8 @@ function ensureProjectWorker(options) {
       PROJECT_ID: projectId,
       WORKER_NAME: workerName,
       GPU_TYPE: options.gpuType ?? "local",
+      MODEL_EXPRESS_ROOT: repoRoot,
+      MODEL_EXPRESS_LOG_DIR: process.env.MODEL_EXPRESS_LOG_DIR ?? repoEnv.MODEL_EXPRESS_LOG_DIR ?? logDir,
       PYTHONUNBUFFERED: "1",
     };
 
@@ -213,6 +217,13 @@ function ensureProjectWorker(options) {
 function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
   const python = resolveWorkerPython(workerDir, childEnv);
   console.log(`[worker:${projectId}:${slot}] starting with python=${python}`);
+  appendDiagnosticLog(childEnv.MODEL_EXPRESS_LOG_DIR, "info", "worker_process_starting", {
+    project_id: projectId,
+    slot,
+    worker_name: childEnv.WORKER_NAME,
+    gpu_type: childEnv.GPU_TYPE,
+    python,
+  });
   console.log(
     `[worker:${projectId}:${slot}] modal env orchestrator=${childEnv.MODAL_ORCHESTRATOR_URL ?? "(unset)"} ` +
     `s3=${childEnv.MODAL_S3_ENDPOINT_URL ?? "(unset)"}`,
@@ -229,10 +240,12 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
 
   child.stdout.on("data", (data) => {
     console.log(`[worker:${projectId}:${slot}] ${data.toString().trimEnd()}`);
+    appendWorkerStreamLog(childEnv.MODEL_EXPRESS_LOG_DIR, "stdout", projectId, slot, data);
   });
 
   child.stderr.on("data", (data) => {
     console.error(`[worker:${projectId}:${slot}] ${data.toString().trimEnd()}`);
+    appendWorkerStreamLog(childEnv.MODEL_EXPRESS_LOG_DIR, "stderr", projectId, slot, data);
   });
 
   child.on("exit", (code, signal) => {
@@ -241,6 +254,12 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
       projectWorkers.delete(key);
     }
     console.log(`[worker:${projectId}:${slot}] exited code=${code} signal=${signal}`);
+    appendDiagnosticLog(childEnv.MODEL_EXPRESS_LOG_DIR, "warn", "worker_process_exited", {
+      project_id: projectId,
+      slot,
+      code,
+      signal,
+    });
   });
 
   child.on("error", (error) => {
@@ -249,6 +268,11 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
       projectWorkers.delete(key);
     }
     console.error(`[worker:${projectId}:${slot}] failed to start: ${error.message}`);
+    appendDiagnosticLog(childEnv.MODEL_EXPRESS_LOG_DIR, "error", "worker_process_start_failed", {
+      project_id: projectId,
+      slot,
+      error: error.message,
+    });
   });
 
   if (!child.pid) {
@@ -289,6 +313,77 @@ function resolveWorkerPython(workerDir, env) {
   }
 
   return process.platform === "win32" ? "python" : "python3";
+}
+
+function resolveLogDir(repoRoot) {
+  return process.env.MODEL_EXPRESS_LOG_DIR ?? path.join(repoRoot, "artifacts", "logs");
+}
+
+function appendDiagnosticLog(logDir, level, event, fields = {}) {
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+    const record = {
+      ts: new Date().toISOString(),
+      level,
+      component: "mission-control",
+      event,
+      ...safeLogObject(fields),
+    };
+    fs.appendFileSync(path.join(logDir, "mission-control.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+  } catch {
+    // Diagnostics must never break the app.
+  }
+}
+
+function appendWorkerStreamLog(logDir, stream, projectId, slot, data) {
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+    const record = {
+      ts: new Date().toISOString(),
+      level: stream === "stderr" ? "error" : "info",
+      component: "mission-control",
+      event: `worker_${stream}`,
+      project_id: projectId,
+      slot,
+      message: safeLogText(data.toString().trimEnd()),
+    };
+    fs.appendFileSync(path.join(logDir, "workers.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+  } catch {
+    // Diagnostics must never break the app.
+  }
+}
+
+function safeLogObject(value) {
+  const out = {};
+  for (const [key, child] of Object.entries(value ?? {})) {
+    out[key] = sensitiveLogKey(key) ? "[redacted]" : safeLogValue(child);
+  }
+  return out;
+}
+
+function safeLogValue(value) {
+  if (value === null || value === undefined || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 24).map((item) => safeLogValue(item));
+  }
+  if (typeof value === "object") {
+    return safeLogObject(value);
+  }
+  return safeLogText(String(value));
+}
+
+function safeLogText(value) {
+  const redacted = String(value ?? "")
+    .replace(/data:image\/[a-z0-9.+-]+;base64,[^\s"]+/gi, "[redacted]")
+    .replace(/bearer\s+[a-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/(aws_access_key|api[_-]?key|secret|token|password)\s*[:=]\s*[^\s"]+/gi, "$1=[redacted]");
+  return redacted.length > 1800 ? `${redacted.slice(0, 1799).trimEnd()}...` : redacted;
+}
+
+function sensitiveLogKey(key) {
+  return /api[_-]?key|authorization|base64|credential|image|password|prompt|raw_output|secret|storage_uri|token|uri|url/i.test(key);
 }
 
 function loadRepoEnv(repoRoot) {

@@ -20,6 +20,12 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     optimizer = str(config.get("optimizer", "adamw")).lower()
     scheduler = str(config.get("scheduler", "none")).lower()
     weight_decay = _positive_float(config.get("weight_decay"), default=0.0)
+    dropout = _bounded_float(config.get("dropout"), default=0.0, minimum=0.0, maximum=0.7)
+    optimizer_momentum = _bounded_float(config.get("optimizer_momentum"), default=0.9, minimum=0.0, maximum=0.99)
+    scheduler_gamma = _bounded_float(config.get("scheduler_gamma"), default=0.5, minimum=0.05, maximum=0.95)
+    scheduler_step_size = _positive_int(config.get("scheduler_step_size"), default=max(1, epochs // 3))
+    label_smoothing = _bounded_float(config.get("label_smoothing"), default=0.0, minimum=0.0, maximum=0.3)
+    gradient_clip_norm = _bounded_float(config.get("gradient_clip_norm"), default=0.0, minimum=0.0, maximum=10.0)
     augmentation = normalize_augmentation_config(
         config.get("augmentation"),
         config.get("augmentation_policy", ""),
@@ -37,8 +43,18 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     model_score = _model_score(model)
     image_bonus = 0.015 if image_size >= 256 else 0.0
     optimizer_bonus = 0.012 if optimizer in {"adamw", "sgd"} else 0.0
+    if optimizer == "sgd" and 0.75 <= optimizer_momentum <= 0.95:
+        optimizer_bonus += 0.004
     scheduler_bonus = 0.01 if scheduler in {"cosine", "step"} else 0.0
+    if scheduler == "step" and 0.2 <= scheduler_gamma <= 0.8 and scheduler_step_size >= 1:
+        scheduler_bonus += 0.003
     regularization_bonus = 0.01 if 0 < weight_decay <= 0.05 else 0.0
+    if 0.05 <= dropout <= 0.35:
+        regularization_bonus += 0.006
+    if 0.02 <= label_smoothing <= 0.15:
+        regularization_bonus += 0.004
+    if 0.5 <= gradient_clip_norm <= 5:
+        regularization_bonus += 0.003
     augmentation_bonus = 0.0
     if augmentation.get("horizontal_flip"):
         augmentation_bonus += 0.006
@@ -244,6 +260,23 @@ def _local_evaluation_payload(config: dict, model: str, best_macro_f1: float, be
             "class_balancing": str(config.get("class_balancing", "")),
             "sampling_strategy": str(config.get("sampling_strategy", "")),
             "preprocessing": config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {},
+            "training_hyperparameters": {
+                "optimizer": str(config.get("optimizer", "adamw")),
+                "scheduler": str(config.get("scheduler", "none")),
+                "weight_decay": _positive_float(config.get("weight_decay"), default=0.0),
+                "dropout": _bounded_float(config.get("dropout"), default=0.0, minimum=0.0, maximum=0.7),
+                "optimizer_momentum": _bounded_float(config.get("optimizer_momentum"), default=0.9, minimum=0.0, maximum=0.99)
+                if str(config.get("optimizer", "adamw")).lower() == "sgd"
+                else 0,
+                "scheduler_step_size": _positive_int(config.get("scheduler_step_size"), default=1)
+                if str(config.get("scheduler", "none")).lower() == "step"
+                else 0,
+                "scheduler_gamma": _bounded_float(config.get("scheduler_gamma"), default=0.5, minimum=0.05, maximum=0.95)
+                if str(config.get("scheduler", "none")).lower() == "step"
+                else 0,
+                "label_smoothing": _bounded_float(config.get("label_smoothing"), default=0.0, minimum=0.0, maximum=0.3),
+                "gradient_clip_norm": _bounded_float(config.get("gradient_clip_norm"), default=0.0, minimum=0.0, maximum=10.0),
+            },
         },
         "label_quality_audit": _local_label_quality_audit(config, per_class_metrics),
     }
@@ -275,6 +308,7 @@ def _local_model_profile(model: str, config: dict) -> dict:
         "image_size": image_size,
         "fine_tune_strategy": str(config.get("fine_tune_strategy", "head_only")),
         "pretrained": bool(config.get("pretrained", True)),
+        "dropout": _bounded_float(config.get("dropout"), default=0.0, minimum=0.0, maximum=0.7),
     }
 
 
@@ -334,3 +368,11 @@ def _positive_float(value: object, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))

@@ -12,10 +12,12 @@ import (
 )
 
 type Server struct {
-	store              store.Store
-	autoReviewMu       sync.Mutex
-	automationSettings settings.AutomationSettings
-	settingsMu         sync.RWMutex
+	store                       store.Store
+	autoReviewMu                sync.Mutex
+	trainingTerminalHooksMu     sync.Mutex
+	trainingTerminalHooksQueued map[string]bool
+	automationSettings          settings.AutomationSettings
+	settingsMu                  sync.RWMutex
 }
 
 func NewRouter(store store.Store) *gin.Engine {
@@ -24,6 +26,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router := gin.Default()
 
 	router.GET("/healthz", server.health)
+	router.GET("/automl/capabilities", server.getAutoMLCapabilities)
 	router.GET("/settings/automation", server.getAutomationSettings)
 	router.PATCH("/settings/automation", server.updateAutomationSettings)
 
@@ -92,8 +95,9 @@ func NewRouter(store store.Store) *gin.Engine {
 
 func newServer(store store.Store) *Server {
 	server := &Server{
-		store:              store,
-		automationSettings: automationSettingsFromEnv(),
+		store:                       store,
+		trainingTerminalHooksQueued: make(map[string]bool),
+		automationSettings:          automationSettingsFromEnv(),
 	}
 
 	if automationSettings, err := store.GetAutomationSettings(); err == nil {
@@ -103,6 +107,7 @@ func newServer(store store.Store) *Server {
 	if server.automationSettings.LLMProvider == "" {
 		server.automationSettings.LLMProvider = llm.ProviderOpenAI
 	}
+	server.automationSettings.AutoMLSampler = normalizeAutoMLSampler(server.automationSettings.AutoMLSampler)
 
 	return server
 }

@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover - local helper tests can run without Modal
 
 APP_NAME = "model-express-training"
 DEFAULT_GPU = os.getenv("MODAL_GPU_TYPE", "T4")
+DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS = 300
 
 EFFECTIVE_NUMBER_CLASS_BALANCING = {
     "effective_number",
@@ -118,6 +119,12 @@ def train_image_classifier(payload: dict) -> dict:
     optimizer_name = str(config.get("optimizer", "adamw")).lower()
     scheduler_name = str(config.get("scheduler", "none")).lower()
     weight_decay = _non_negative_float(config.get("weight_decay"), default=0.0)
+    dropout = _bounded_float(config.get("dropout"), default=0.0, minimum=0.0, maximum=0.7)
+    optimizer_momentum = _bounded_float(config.get("optimizer_momentum"), default=0.9, minimum=0.0, maximum=0.99)
+    scheduler_step_size = _bounded_int(config.get("scheduler_step_size"), default=max(1, epochs // 3), minimum=1, maximum=max(1, epochs))
+    scheduler_gamma = _bounded_float(config.get("scheduler_gamma"), default=0.5, minimum=0.05, maximum=0.95)
+    label_smoothing = _bounded_float(config.get("label_smoothing"), default=0.0, minimum=0.0, maximum=0.3)
+    gradient_clip_norm = _bounded_float(config.get("gradient_clip_norm"), default=0.0, minimum=0.0, maximum=10.0)
     augmentation = normalize_augmentation_config(
         config.get("augmentation"),
         config.get("augmentation_policy", ""),
@@ -126,6 +133,7 @@ def train_image_classifier(payload: dict) -> dict:
     class_balancing = str(config.get("class_balancing", "")).lower()
     sampling_strategy = str(config.get("sampling_strategy", "")).lower()
     preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
+    class_balancing_config = config.get("class_balancing_config") if isinstance(config.get("class_balancing_config"), dict) else {}
     early_stopping_patience = _positive_int(config.get("early_stopping_patience"), default=0)
     model_name = str(config.get("model", "mobilenet_v3_small"))
     pretrained = _bool(config.get("pretrained"), default=True)
@@ -146,15 +154,15 @@ def train_image_classifier(payload: dict) -> dict:
         class_balancing,
         sampling_strategy,
         preprocessing,
-        config.get("class_balancing_config") if isinstance(config.get("class_balancing_config"), dict) else {},
+        class_balancing_config,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_model(model_name, len(class_names), pretrained, freeze_backbone, fine_tune_strategy).to(device)
+    model = _build_model(model_name, len(class_names), pretrained, freeze_backbone, fine_tune_strategy, dropout).to(device)
 
-    criterion = _build_criterion(class_weights, class_balancing, device)
+    criterion = _build_criterion(class_weights, class_balancing, device, label_smoothing, class_balancing_config)
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = _build_optimizer(optimizer_name, trainable_parameters, learning_rate, weight_decay)
-    scheduler = _build_scheduler(scheduler_name, optimizer, epochs)
+    optimizer = _build_optimizer(optimizer_name, trainable_parameters, learning_rate, weight_decay, optimizer_momentum)
+    scheduler = _build_scheduler(scheduler_name, optimizer, epochs, scheduler_step_size, scheduler_gamma)
 
     best_macro_f1 = 0.0
     best_accuracy = 0.0
@@ -163,7 +171,16 @@ def train_image_classifier(payload: dict) -> dict:
     final_eval_details = {"confusion_matrix": [], "per_class_metrics": {}}
 
     for epoch in range(1, epochs + 1):
-        train_loss = _train_one_epoch(model, train_loader, criterion, optimizer, device, augmentation, len(class_names))
+        train_loss = _train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            augmentation,
+            len(class_names),
+            gradient_clip_norm,
+        )
         val_loss, accuracy, macro_f1, final_eval_details = _evaluate(model, val_loader, criterion, device, class_names)
         improved = macro_f1 > best_macro_f1
         if improved:
@@ -190,6 +207,12 @@ def train_image_classifier(payload: dict) -> dict:
                     "learning_rate": learning_rate,
                     "image_size": image_size,
                     "weight_decay": weight_decay,
+                    "dropout": dropout,
+                    "optimizer_momentum": optimizer_momentum,
+                    "scheduler_step_size": scheduler_step_size if scheduler_name == "step" else 0,
+                    "scheduler_gamma": scheduler_gamma if scheduler_name == "step" else 0,
+                    "label_smoothing": label_smoothing,
+                    "gradient_clip_norm": gradient_clip_norm,
                 },
             },
         )
@@ -274,6 +297,7 @@ def train_image_classifier(payload: dict) -> dict:
                 "pretrained": pretrained,
                 "freeze_backbone": freeze_backbone,
                 "fine_tune_strategy": fine_tune_strategy,
+                "dropout": dropout,
             },
             "holistic_scores": _holistic_scores(best_macro_f1, best_accuracy, estimated_cost_usd, runtime_seconds, model_profile),
             "preprocessing_summary": {
@@ -286,6 +310,26 @@ def train_image_classifier(payload: dict) -> dict:
                 "preprocessing": preprocessing,
                 "worker_execution_metadata": _public_execution_metadata(execution_metadata),
                 "bbox_crop_ablation": bbox_ablation,
+                "training_hyperparameters": {
+                    "optimizer": optimizer_name,
+                    "scheduler": scheduler_name,
+                    "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
+                    "dropout": dropout,
+                    "optimizer_momentum": optimizer_momentum if optimizer_name == "sgd" else 0,
+                    "scheduler_step_size": scheduler_step_size if scheduler_name == "step" else 0,
+                    "scheduler_gamma": scheduler_gamma if scheduler_name == "step" else 0,
+                    "label_smoothing": label_smoothing,
+                    "gradient_clip_norm": gradient_clip_norm,
+                    "focal_loss_gamma": _bounded_float(
+                        class_balancing_config.get("focal_loss_gamma"),
+                        default=2.0,
+                        minimum=0.5,
+                        maximum=5.0,
+                    )
+                    if class_balancing == "focal_loss"
+                    else 0,
+                },
             },
             "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
             "recommendation_summary": (
@@ -722,12 +766,19 @@ def _three_positive_float_tuple(value: object) -> tuple[float, float, float] | N
     return parsed
 
 
-def _build_criterion(class_weights, class_balancing: str, device):
+def _build_criterion(class_weights, class_balancing: str, device, label_smoothing: float = 0.0, class_balancing_config: dict | None = None):
     import torch
     from torch import nn
     import torch.nn.functional as F
 
     weight_tensor = class_weights.to(device) if class_weights is not None else None
+    label_smoothing = _bounded_float(label_smoothing, default=0.0, minimum=0.0, maximum=0.3)
+    focal_gamma = _bounded_float(
+        (class_balancing_config or {}).get("focal_loss_gamma"),
+        default=2.0,
+        minimum=0.5,
+        maximum=5.0,
+    )
     if class_balancing == "focal_loss":
         class FocalLoss(nn.Module):
             def __init__(self, weight=None, gamma: float = 2.0):
@@ -746,8 +797,8 @@ def _build_criterion(class_weights, class_balancing: str, device):
                 loss = ((1 - probability) ** self.gamma) * cross_entropy
                 return loss.mean()
 
-        return FocalLoss(weight=weight_tensor)
-    return nn.CrossEntropyLoss(weight=weight_tensor)
+        return FocalLoss(weight=weight_tensor, gamma=focal_gamma)
+    return nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
 
 
 def _apply_mixed_sample_augmentation(inputs, labels, augmentation: dict, class_count: int, device):
@@ -797,78 +848,102 @@ def _apply_cutmix(inputs, permutation, lam: float):
     return mixed_inputs, float(adjusted_lam)
 
 
-def _build_model(model_name: str, class_count: int, pretrained: bool = True, freeze_backbone: bool = True, fine_tune_strategy: str = "head_only"):
+def _build_model(
+    model_name: str,
+    class_count: int,
+    pretrained: bool = True,
+    freeze_backbone: bool = True,
+    fine_tune_strategy: str = "head_only",
+    dropout: float = 0.0,
+):
     from torch import nn
     from torchvision import models
 
     normalized = model_name.lower()
+    dropout = _bounded_float(dropout, default=0.0, minimum=0.0, maximum=0.7)
 
     if "efficientnet_b2" in normalized:
         model = _torchvision_model(models.efficientnet_b2, models.EfficientNet_B2_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.classifier[-1].in_features, class_count)
+        in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-        model.classifier[-1] = head
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
     if "efficientnet_b1" in normalized:
         model = _torchvision_model(models.efficientnet_b1, models.EfficientNet_B1_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.classifier[-1].in_features, class_count)
+        in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-        model.classifier[-1] = head
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
     if "efficientnet" in normalized:
         model = _torchvision_model(models.efficientnet_b0, models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.classifier[-1].in_features, class_count)
+        in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-        model.classifier[-1] = head
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
     if "resnet34" in normalized:
         model = _torchvision_model(models.resnet34, models.ResNet34_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.fc.in_features, class_count)
+        in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
-        model.fc = head
+        model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
     if "resnet" in normalized:
         model = _torchvision_model(models.resnet18, models.ResNet18_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.fc.in_features, class_count)
+        in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
-        model.fc = head
+        model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
     if "regnet_y_400mf" in normalized:
         model = _torchvision_model(models.regnet_y_400mf, models.RegNet_Y_400MF_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.fc.in_features, class_count)
+        in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
-        model.fc = head
+        model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
     if "convnext_tiny" in normalized:
         model = _torchvision_model(models.convnext_tiny, models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.classifier[-1].in_features, class_count)
+        in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-        model.classifier[-1] = head
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
     if "swin_t" in normalized:
         model = _torchvision_model(models.swin_t, models.Swin_T_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.head.in_features, class_count)
+        in_features = model.head.in_features
         _apply_transfer_strategy(model, "head", freeze_backbone, fine_tune_strategy)
-        model.head = head
+        model.head = _classification_head(nn, in_features, class_count, dropout)
         return model
     if "vit_b_16" in normalized:
         model = _torchvision_model(models.vit_b_16, models.ViT_B_16_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.heads.head.in_features, class_count)
+        in_features = model.heads.head.in_features
         _apply_transfer_strategy(model, "heads", freeze_backbone, fine_tune_strategy)
-        model.heads.head = head
+        model.heads.head = _classification_head(nn, in_features, class_count, dropout)
         return model
     if "mobilenet_v3_large" in normalized:
         model = _torchvision_model(models.mobilenet_v3_large, models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None)
-        head = nn.Linear(model.classifier[-1].in_features, class_count)
+        in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-        model.classifier[-1] = head
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
 
     model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
-    head = nn.Linear(model.classifier[-1].in_features, class_count)
+    in_features = model.classifier[-1].in_features
     _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-    model.classifier[-1] = head
+    _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
     return model
+
+
+def _classification_head(nn, in_features: int, class_count: int, dropout: float = 0.0):
+    head = nn.Linear(in_features, class_count)
+    dropout = _bounded_float(dropout, default=0.0, minimum=0.0, maximum=0.7)
+    if dropout <= 0:
+        return head
+    return nn.Sequential(nn.Dropout(p=dropout), head)
+
+
+def _replace_classifier_head(nn, classifier, in_features: int, class_count: int, dropout: float = 0.0) -> None:
+    if len(classifier) >= 2 and isinstance(classifier[-2], nn.Dropout):
+        classifier[-2].p = _bounded_float(dropout, default=0.0, minimum=0.0, maximum=0.7)
+        classifier[-1] = nn.Linear(in_features, class_count)
+        return
+    classifier[-1] = _classification_head(nn, in_features, class_count, dropout)
 
 
 def _torchvision_model(factory, weights):
@@ -894,31 +969,47 @@ def _apply_transfer_strategy(model, head_name: str, freeze_backbone: bool, fine_
             parameter.requires_grad = True
 
 
-def _build_optimizer(optimizer_name: str, parameters, learning_rate: float, weight_decay: float):
+def _build_optimizer(optimizer_name: str, parameters, learning_rate: float, weight_decay: float, momentum: float = 0.9):
     import torch
 
     if optimizer_name == "sgd":
-        return torch.optim.SGD(parameters, lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
+        return torch.optim.SGD(parameters, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
     if optimizer_name == "adam":
         return torch.optim.Adam(parameters, lr=learning_rate, weight_decay=weight_decay)
     return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
 
 
-def _build_scheduler(scheduler_name: str, optimizer, epochs: int):
+def _build_scheduler(scheduler_name: str, optimizer, epochs: int, step_size: int | None = None, gamma: float = 0.5):
     import torch
 
     if scheduler_name == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
     if scheduler_name == "step":
-        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, epochs // 3), gamma=0.5)
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=max(1, int(step_size or max(1, epochs // 3))),
+            gamma=_bounded_float(gamma, default=0.5, minimum=0.05, maximum=0.95),
+        )
     return None
 
 
-def _train_one_epoch(model, loader, criterion, optimizer, device, augmentation: dict | None = None, class_count: int = 0) -> float:
+def _train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    augmentation: dict | None = None,
+    class_count: int = 0,
+    gradient_clip_norm: float = 0.0,
+) -> float:
+    import torch
+
     model.train()
     total_loss = 0.0
     total_examples = 0
     augmentation = augmentation or {}
+    gradient_clip_norm = _bounded_float(gradient_clip_norm, default=0.0, minimum=0.0, maximum=10.0)
 
     for inputs, labels in loader:
         inputs = inputs.to(device)
@@ -929,6 +1020,8 @@ def _train_one_epoch(model, loader, criterion, optimizer, device, augmentation: 
         outputs = model(inputs)
         loss = criterion(outputs, loss_labels)
         loss.backward()
+        if gradient_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
         optimizer.step()
 
         batch_size = labels.size(0)
@@ -1202,8 +1295,19 @@ def _fallback_latency_ms(model_name: str, image_size: int) -> float:
 def _post_json(url: str, payload: dict) -> None:
     import requests
 
-    response = requests.post(url, json=payload, timeout=30)
+    response = requests.post(url, json=payload, timeout=_orchestrator_report_timeout_seconds())
     response.raise_for_status()
+
+
+def _orchestrator_report_timeout_seconds() -> int:
+    value = os.getenv("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", "").strip()
+    if not value:
+        return DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS
+    try:
+        parsed = int(value)
+    except ValueError:
+        return DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS
+    return parsed if parsed > 0 else DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS
 
 
 def _post_training_run_summary(orchestrator_url: str, job_id: str, payload: dict) -> None:

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
@@ -27,48 +28,54 @@ const (
 type MemoryStore struct {
 	mu sync.Mutex
 
-	nextID             uint64
-	projects           map[string]projects.Project
-	datasets           map[string]datasets.Dataset
-	workers            map[string]workers.Worker
-	jobs               map[string]jobs.ExperimentJob
-	metrics            map[string][]jobs.EpochMetric
-	plans              map[string]plans.ExperimentPlan
-	summaries          map[string]runs.TrainingRunSummary
-	evaluations        map[string]runs.TrainingRunEvaluation
-	champions          map[string]runs.ProjectChampion
-	championExports    map[string]runs.ChampionExport
-	demoPredictions    map[string]runs.ChampionDemoPrediction
-	visualAnalyses     map[string]datasets.DatasetVisualAnalysis
-	decisions          map[string]decisions.AgentDecision
-	workerRequirements map[string]execution.WorkerRequirement
-	executionEvents    map[string]execution.ExecutionEvent
-	agentMemoryRecords map[string]memory.AgentMemoryRecord
-	agentInvocations   map[string]memory.AgentInvocation
-	strategyScorecards map[string]strategies.StrategyScorecard
-	automationSettings *settings.AutomationSettings
+	nextID               uint64
+	projects             map[string]projects.Project
+	datasets             map[string]datasets.Dataset
+	workers              map[string]workers.Worker
+	jobs                 map[string]jobs.ExperimentJob
+	metrics              map[string][]jobs.EpochMetric
+	plans                map[string]plans.ExperimentPlan
+	summaries            map[string]runs.TrainingRunSummary
+	evaluations          map[string]runs.TrainingRunEvaluation
+	champions            map[string]runs.ProjectChampion
+	championExports      map[string]runs.ChampionExport
+	demoPredictions      map[string]runs.ChampionDemoPrediction
+	visualAnalyses       map[string]datasets.DatasetVisualAnalysis
+	decisions            map[string]decisions.AgentDecision
+	workerRequirements   map[string]execution.WorkerRequirement
+	executionEvents      map[string]execution.ExecutionEvent
+	agentMemoryRecords   map[string]memory.AgentMemoryRecord
+	agentInvocations     map[string]memory.AgentInvocation
+	strategyScorecards   map[string]strategies.StrategyScorecard
+	optimizerStudies     map[string]automl.OptimizerStudy
+	optimizerSuggestions map[string]automl.OptimizerSuggestion
+	optimizerTrials      map[string]automl.OptimizerTrial
+	automationSettings   *settings.AutomationSettings
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		projects:           make(map[string]projects.Project),
-		datasets:           make(map[string]datasets.Dataset),
-		workers:            make(map[string]workers.Worker),
-		jobs:               make(map[string]jobs.ExperimentJob),
-		metrics:            make(map[string][]jobs.EpochMetric),
-		plans:              make(map[string]plans.ExperimentPlan),
-		summaries:          make(map[string]runs.TrainingRunSummary),
-		evaluations:        make(map[string]runs.TrainingRunEvaluation),
-		champions:          make(map[string]runs.ProjectChampion),
-		championExports:    make(map[string]runs.ChampionExport),
-		demoPredictions:    make(map[string]runs.ChampionDemoPrediction),
-		visualAnalyses:     make(map[string]datasets.DatasetVisualAnalysis),
-		decisions:          make(map[string]decisions.AgentDecision),
-		workerRequirements: make(map[string]execution.WorkerRequirement),
-		executionEvents:    make(map[string]execution.ExecutionEvent),
-		agentMemoryRecords: make(map[string]memory.AgentMemoryRecord),
-		agentInvocations:   make(map[string]memory.AgentInvocation),
-		strategyScorecards: make(map[string]strategies.StrategyScorecard),
+		projects:             make(map[string]projects.Project),
+		datasets:             make(map[string]datasets.Dataset),
+		workers:              make(map[string]workers.Worker),
+		jobs:                 make(map[string]jobs.ExperimentJob),
+		metrics:              make(map[string][]jobs.EpochMetric),
+		plans:                make(map[string]plans.ExperimentPlan),
+		summaries:            make(map[string]runs.TrainingRunSummary),
+		evaluations:          make(map[string]runs.TrainingRunEvaluation),
+		champions:            make(map[string]runs.ProjectChampion),
+		championExports:      make(map[string]runs.ChampionExport),
+		demoPredictions:      make(map[string]runs.ChampionDemoPrediction),
+		visualAnalyses:       make(map[string]datasets.DatasetVisualAnalysis),
+		decisions:            make(map[string]decisions.AgentDecision),
+		workerRequirements:   make(map[string]execution.WorkerRequirement),
+		executionEvents:      make(map[string]execution.ExecutionEvent),
+		agentMemoryRecords:   make(map[string]memory.AgentMemoryRecord),
+		agentInvocations:     make(map[string]memory.AgentInvocation),
+		strategyScorecards:   make(map[string]strategies.StrategyScorecard),
+		optimizerStudies:     make(map[string]automl.OptimizerStudy),
+		optimizerSuggestions: make(map[string]automl.OptimizerSuggestion),
+		optimizerTrials:      make(map[string]automl.OptimizerTrial),
 	}
 }
 
@@ -1291,6 +1298,200 @@ func (s *MemoryStore) ListProjectStrategyScorecards(projectID string, limit int)
 	if len(out) > limit {
 		out = out[:limit]
 	}
+	return out, nil
+}
+
+func (s *MemoryStore) CreateOptimizerStudy(study automl.OptimizerStudy) (automl.OptimizerStudy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[study.ProjectID]; !ok {
+		return automl.OptimizerStudy{}, ErrNotFound
+	}
+	if err := s.requireDatasetBelongsToProject(study.ProjectID, study.DatasetID); err != nil {
+		return automl.OptimizerStudy{}, err
+	}
+	if study.ID == "" {
+		study.ID = s.newID("automl_study")
+	}
+	study.SearchSpace.Parameters = append([]automl.HyperparameterParameterSpec(nil), study.SearchSpace.Parameters...)
+	study.StrategySnapshot = emptyMapIfNil(study.StrategySnapshot)
+	study.CreatedAt = time.Now().UTC()
+	s.optimizerStudies[study.ID] = study
+	return study, nil
+}
+
+func (s *MemoryStore) ListProjectOptimizerStudies(projectID string, limit int) ([]automl.OptimizerStudy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	out := []automl.OptimizerStudy{}
+	for _, study := range s.optimizerStudies {
+		if study.ProjectID == projectID {
+			out = append(out, study)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) CreateOptimizerSuggestion(suggestion automl.OptimizerSuggestion) (automl.OptimizerSuggestion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[suggestion.ProjectID]; !ok {
+		return automl.OptimizerSuggestion{}, ErrNotFound
+	}
+	if suggestion.StudyID != "" {
+		if _, ok := s.optimizerStudies[suggestion.StudyID]; !ok {
+			return automl.OptimizerSuggestion{}, ErrNotFound
+		}
+	}
+	if suggestion.ID == "" {
+		suggestion.ID = s.newID("automl_suggestion")
+	}
+	suggestion.Values = emptyMapIfNil(suggestion.Values)
+	suggestion.FinalValues = emptyMapIfNil(suggestion.FinalValues)
+	if suggestion.Provenance == nil {
+		suggestion.Provenance = map[string]automl.HyperparameterProvenance{}
+	}
+	if suggestion.ValidationErrors == nil {
+		suggestion.ValidationErrors = []string{}
+	}
+	if suggestion.ValidationStatus == "" {
+		suggestion.ValidationStatus = "valid"
+	}
+	suggestion.CreatedAt = time.Now().UTC()
+	s.optimizerSuggestions[suggestion.ID] = suggestion
+	return suggestion, nil
+}
+
+func (s *MemoryStore) UpdateOptimizerSuggestionJob(suggestionID string, jobID string) (automl.OptimizerSuggestion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	suggestion, ok := s.optimizerSuggestions[suggestionID]
+	if !ok {
+		return automl.OptimizerSuggestion{}, ErrNotFound
+	}
+	if _, ok := s.jobs[jobID]; !ok {
+		return automl.OptimizerSuggestion{}, ErrNotFound
+	}
+	suggestion.JobID = jobID
+	s.optimizerSuggestions[suggestionID] = suggestion
+	return suggestion, nil
+}
+
+func (s *MemoryStore) ListPlanOptimizerSuggestions(planID string) ([]automl.OptimizerSuggestion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.plans[planID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []automl.OptimizerSuggestion{}
+	for _, suggestion := range s.optimizerSuggestions {
+		if suggestion.PlanID == planID {
+			out = append(out, suggestion)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *MemoryStore) UpsertOptimizerTrial(trial automl.OptimizerTrial) (automl.OptimizerTrial, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[trial.ProjectID]; !ok {
+		return automl.OptimizerTrial{}, ErrNotFound
+	}
+	if trial.JobID != "" {
+		if _, ok := s.jobs[trial.JobID]; !ok {
+			return automl.OptimizerTrial{}, ErrNotFound
+		}
+	}
+	now := time.Now().UTC()
+	for id, existing := range s.optimizerTrials {
+		if trial.JobID != "" && existing.JobID == trial.JobID {
+			if trial.ID == "" {
+				trial.ID = id
+			}
+			if trial.CreatedAt.IsZero() {
+				trial.CreatedAt = existing.CreatedAt
+			}
+			trial.UpdatedAt = now
+			trial.Metrics = emptyMapIfNil(trial.Metrics)
+			s.optimizerTrials[id] = trial
+			return trial, nil
+		}
+	}
+	if trial.ID == "" {
+		trial.ID = s.newID("automl_trial")
+	}
+	if trial.CreatedAt.IsZero() {
+		trial.CreatedAt = now
+	}
+	trial.UpdatedAt = now
+	trial.Metrics = emptyMapIfNil(trial.Metrics)
+	s.optimizerTrials[trial.ID] = trial
+	return trial, nil
+}
+
+func (s *MemoryStore) ListProjectOptimizerTrials(projectID string, limit int) ([]automl.OptimizerTrial, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	out := []automl.OptimizerTrial{}
+	for _, trial := range s.optimizerTrials {
+		if trial.ProjectID == projectID {
+			out = append(out, trial)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) ListStudyOptimizerTrials(studyID string) ([]automl.OptimizerTrial, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.optimizerStudies[studyID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []automl.OptimizerTrial{}
+	for _, trial := range s.optimizerTrials {
+		if trial.StudyID == studyID {
+			out = append(out, trial)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
 	return out, nil
 }
 

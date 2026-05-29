@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
@@ -43,8 +44,12 @@ const (
 )
 
 type ExperimentPlannerAgent struct {
-	generator llm.JSONGenerator
-	model     string
+	generator              llm.JSONGenerator
+	model                  string
+	informationToolOptions PlannerInformationToolOptions
+	reasoningEffort        string
+	plateauReasoningEffort string
+	maxToolRounds          int
 }
 
 type ExperimentPlannerInput struct {
@@ -70,6 +75,7 @@ type ExperimentPlannerInput struct {
 	FailedStrategyMemory         []PlannerStrategyMemory
 	RejectedStrategyMemory       []RejectedPlannerOption
 	StrategyScorecards           []PlannerStrategyScorecard
+	OptimizerFeedback            []automl.OptimizerFeedbackSummary
 	PriorPlans                   []plans.ExperimentPlan
 	PriorJobs                    []jobs.ExperimentJob
 	PriorSummaries               []runs.TrainingRunSummary
@@ -83,27 +89,29 @@ type ExperimentPlannerInput struct {
 }
 
 type PlannerContextSnapshot struct {
-	ContextVersion         string                       `json:"context_version"`
-	Project                PlannerProjectCard           `json:"project"`
-	DatasetCard            PlannerDatasetCard           `json:"dataset_card"`
-	SourcePlanCard         PlannerSourcePlanCard        `json:"source_plan_card"`
-	ObjectiveContext       ProjectObjectiveContext      `json:"objective_context"`
-	ChampionCard           PlannerChampionCard          `json:"champion_card"`
-	CompletedExperimentLog []PlannerExperimentLog       `json:"completed_experiment_ledger"`
-	FailureDiagnosis       PlannerFailureDiagnosis      `json:"failure_diagnosis"`
-	TrainingDynamicsCard   PlannerTrainingDynamicsCard  `json:"training_dynamics_card"`
-	PerClassErrorCard      PlannerPerClassErrorCard     `json:"per_class_error_card"`
-	DeploymentCard         PlannerDeploymentCard        `json:"deployment_card"`
-	MechanismCoverageCard  PlannerMechanismCoverageCard `json:"mechanism_coverage_card"`
-	LabelQualityCard       PlannerLabelQualityCard      `json:"label_quality_card"`
-	SearchCoverage         PlannerSearchCoverage        `json:"search_coverage"`
-	StrategyLessons        []PlannerStrategyLesson      `json:"strategy_lessons"`
-	BlockedRepeats         []RejectedPlannerOption      `json:"blocked_repeats"`
-	VisualEvidence         map[string]any               `json:"visual_evidence"`
-	ModelCatalog           []SupportedModelSpec         `json:"model_catalog"`
-	ValidationFeedback     []PlannerValidationFeedback  `json:"planner_validation_feedback,omitempty"`
-	StopOrContinuePressure PlannerStopContinueCard      `json:"stop_or_continue_pressure"`
-	PromptBudget           PlannerPromptBudget          `json:"prompt_budget"`
+	ContextVersion         string                            `json:"context_version"`
+	Project                PlannerProjectCard                `json:"project"`
+	DatasetCard            PlannerDatasetCard                `json:"dataset_card"`
+	SourcePlanCard         PlannerSourcePlanCard             `json:"source_plan_card"`
+	ObjectiveContext       ProjectObjectiveContext           `json:"objective_context"`
+	ChampionCard           PlannerChampionCard               `json:"champion_card"`
+	CompletedExperimentLog []PlannerExperimentLog            `json:"completed_experiment_ledger"`
+	FailureDiagnosis       PlannerFailureDiagnosis           `json:"failure_diagnosis"`
+	TrainingDynamicsCard   PlannerTrainingDynamicsCard       `json:"training_dynamics_card"`
+	PerClassErrorCard      PlannerPerClassErrorCard          `json:"per_class_error_card"`
+	DeploymentCard         PlannerDeploymentCard             `json:"deployment_card"`
+	MechanismCoverageCard  PlannerMechanismCoverageCard      `json:"mechanism_coverage_card"`
+	BackendGatedMethods    []PlannerBackendGatedMethod       `json:"backend_validation_gated_methods"`
+	LabelQualityCard       PlannerLabelQualityCard           `json:"label_quality_card"`
+	SearchCoverage         PlannerSearchCoverage             `json:"search_coverage"`
+	StrategyLessons        []PlannerStrategyLesson           `json:"strategy_lessons"`
+	OptimizerFeedback      []automl.OptimizerFeedbackSummary `json:"optimizer_feedback_summary,omitempty"`
+	BlockedRepeats         []RejectedPlannerOption           `json:"blocked_repeats"`
+	VisualEvidence         map[string]any                    `json:"visual_evidence"`
+	ModelCatalog           []SupportedModelSpec              `json:"model_catalog"`
+	ValidationFeedback     []PlannerValidationFeedback       `json:"planner_validation_feedback,omitempty"`
+	StopOrContinuePressure PlannerStopContinueCard           `json:"stop_or_continue_pressure"`
+	PromptBudget           PlannerPromptBudget               `json:"prompt_budget"`
 }
 
 type PlannerProjectCard struct {
@@ -154,6 +162,12 @@ type PlannerExperiment struct {
 	Optimizer                string                          `json:"optimizer,omitempty"`
 	Scheduler                string                          `json:"scheduler,omitempty"`
 	WeightDecay              float64                         `json:"weight_decay,omitempty"`
+	Dropout                  float64                         `json:"dropout,omitempty"`
+	OptimizerMomentum        float64                         `json:"optimizer_momentum,omitempty"`
+	SchedulerStepSize        int                             `json:"scheduler_step_size,omitempty"`
+	SchedulerGamma           float64                         `json:"scheduler_gamma,omitempty"`
+	LabelSmoothing           float64                         `json:"label_smoothing,omitempty"`
+	GradientClipNorm         float64                         `json:"gradient_clip_norm,omitempty"`
 	AugmentationPolicy       string                          `json:"augmentation_policy,omitempty"`
 	AugmentationPolicyConfig *plans.AugmentationPolicyConfig `json:"augmentation_policy_config,omitempty"`
 	ClassBalancing           string                          `json:"class_balancing,omitempty"`
@@ -162,6 +176,7 @@ type PlannerExperiment struct {
 	FineTuneStrategy         string                          `json:"fine_tune_strategy,omitempty"`
 	Mechanism                string                          `json:"mechanism"`
 	MeaningfulAxes           []string                        `json:"meaningful_axes,omitempty"`
+	AutoMLSummary            map[string]any                  `json:"automl_summary,omitempty"`
 }
 
 type PlannerResultSummary struct {
@@ -295,6 +310,21 @@ type PlannerMechanismCoverageCard struct {
 	BestResultByMechanism  []PlannerMechanismResult `json:"best_result_by_mechanism"`
 	FailedMechanismLessons []PlannerMechanismLesson `json:"failed_mechanism_lessons"`
 	ShallowRepeatWarnings  []string                 `json:"shallow_repeat_warnings"`
+}
+
+type PlannerBackendGatedMethod struct {
+	Mechanism               string         `json:"mechanism"`
+	ProposalStatus          string         `json:"proposal_status"`
+	Source                  string         `json:"source"`
+	SourceID                string         `json:"source_id,omitempty"`
+	Summary                 string         `json:"summary"`
+	Evidence                []string       `json:"evidence"`
+	RequiredConcreteFields  []string       `json:"required_concrete_fields"`
+	RequiredBackendEvidence []string       `json:"required_backend_evidence"`
+	MissingRequirements     []string       `json:"missing_requirements"`
+	SupportedConfigHints    map[string]any `json:"supported_config_hints,omitempty"`
+	PlannerUse              string         `json:"planner_use"`
+	SchedulingAuthority     bool           `json:"scheduling_authority"`
 }
 
 type PlannerLabelQualityCard struct {
@@ -598,21 +628,39 @@ type CandidateRanking struct {
 }
 
 type ExperimentPlanningTrace struct {
-	Recommendation   ExperimentPlanningRecommendation
-	Request          llm.JSONRequest
-	PromptContext    map[string]any
-	RawOutput        []byte
-	ParsedOutput     map[string]any
-	ValidationStatus string
-	ValidationError  string
-	AgentVersion     string
-	PromptVersion    string
+	Recommendation          ExperimentPlanningRecommendation
+	Request                 llm.JSONRequest
+	PromptContext           map[string]any
+	RawOutput               []byte
+	ParsedOutput            map[string]any
+	ValidationStatus        string
+	ValidationError         string
+	AgentVersion            string
+	PromptVersion           string
+	ResponseID              string
+	PreviousResponseID      string
+	ToolRounds              int
+	ToolCalls               []AgentToolCallTrace
+	ToolResults             []AgentToolResultTrace
+	RejectedToolCalls       []AgentToolResultTrace
+	DryRunValidationResults []map[string]any
 }
 
 func NewExperimentPlannerAgent(generator llm.JSONGenerator, model string) ExperimentPlannerAgent {
 	return ExperimentPlannerAgent{
 		generator: generator,
 		model:     model,
+	}
+}
+
+func NewExperimentPlannerAgentWithRuntime(generator llm.JSONGenerator, model string, config llm.Config, options PlannerInformationToolOptions) ExperimentPlannerAgent {
+	return ExperimentPlannerAgent{
+		generator:              generator,
+		model:                  model,
+		informationToolOptions: options,
+		reasoningEffort:        config.ReasoningEffort,
+		plateauReasoningEffort: config.PlateauReasoningEffort,
+		maxToolRounds:          config.MaxToolRounds,
 	}
 }
 
@@ -644,7 +692,8 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 	}
 
 	trace.Request = experimentPlannerJSONRequest(a.model, contextBlob)
-	raw, err := a.generator.GenerateJSON(ctx, trace.Request)
+	trace.Request.ReasoningEffort = a.reasoningEffortForInput(input)
+	raw, err := a.generatePlannerJSON(ctx, &trace, input)
 	if err != nil {
 		trace.ValidationError = err.Error()
 		return trace, err
@@ -688,6 +737,66 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 	return trace, nil
 }
 
+type plannerToolLoopGenerator interface {
+	GenerateJSONWithTools(context.Context, llm.ToolLoopRequest) (llm.ToolLoopResult, error)
+}
+
+func (a ExperimentPlannerAgent) generatePlannerJSON(ctx context.Context, trace *ExperimentPlanningTrace, input ExperimentPlannerInput) ([]byte, error) {
+	toolGenerator, ok := a.generator.(plannerToolLoopGenerator)
+	if !ok {
+		return a.generator.GenerateJSON(ctx, trace.Request)
+	}
+
+	result, err := toolGenerator.GenerateJSONWithTools(ctx, llm.ToolLoopRequest{
+		JSONRequest:   trace.Request,
+		Tools:         llmToolDefinitions(ExperimentPlannerInformationToolSpecs()),
+		ToolAnswerer:  plannerInformationAnswerer{input: input, options: a.informationToolOptions},
+		MaxToolRounds: a.maxToolRounds,
+	})
+	if err != nil {
+		return nil, err
+	}
+	trace.ResponseID = result.ResponseID
+	trace.PreviousResponseID = result.PreviousResponseID
+	trace.ToolRounds = result.ToolRounds
+	trace.ToolCalls = toolCallTraces(result.ToolCalls)
+	trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults = toolResultTraces(result.ToolResults)
+	return result.FinalJSON, nil
+}
+
+func (a ExperimentPlannerAgent) reasoningEffortForInput(input ExperimentPlannerInput) string {
+	if input.NoImprovementRounds > 0 && strings.TrimSpace(a.plateauReasoningEffort) != "" {
+		return a.plateauReasoningEffort
+	}
+	return a.reasoningEffort
+}
+
+type plannerInformationAnswerer struct {
+	input   ExperimentPlannerInput
+	options PlannerInformationToolOptions
+}
+
+func (a plannerInformationAnswerer) AnswerInformationToolCall(_ context.Context, call llm.ToolCall) (llm.ToolResult, error) {
+	args := map[string]any{}
+	if len(call.Arguments) > 0 {
+		if err := json.Unmarshal(call.Arguments, &args); err != nil {
+			result := AgentInformationToolResult{
+				ToolName: strings.TrimSpace(call.Name),
+				Accepted: false,
+				Error:    "tool arguments must be a JSON object",
+			}
+			encoded, _ := json.Marshal(result)
+			return llm.ToolResult{CallID: call.CallID, Name: call.Name, Output: encoded}, nil
+		}
+	}
+	result := ExecuteExperimentPlannerInformationTool(a.input, call.Name, args, a.options)
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return llm.ToolResult{CallID: call.CallID, Name: call.Name}, fmt.Errorf("encode planner tool result: %w", err)
+	}
+	return llm.ToolResult{CallID: call.CallID, Name: call.Name, Output: encoded}, nil
+}
+
 func experimentPlannerJSONRequest(model string, contextBlob []byte) llm.JSONRequest {
 	return llm.JSONRequest{
 		Model:       model,
@@ -696,15 +805,21 @@ func experimentPlannerJSONRequest(model string, contextBlob []byte) llm.JSONRequ
 			{
 				Role: "system",
 				Content: strings.TrimSpace(`You are the Model Express Experiment Planning Agent.
-Return only valid JSON. You run after a whole experiment plan has completed, not after one run.
+You run after a whole experiment plan has completed, not after one run.
 Design the next image-classification experiment batch from all plan results and prior memory.
+When approved information tools are available, you may ask bounded backend questions before finalizing.
+Tool calls are questions only: they cannot create plans, jobs, workers, champions, exports, inference runs, or dataset mutations.
+After any information requests, Return only valid JSON as the final answer.
 Be willing to change model family, image size, resolution_strategy, preprocessing, augmentation_policy,
 augmentation_policy_config,
 sampling_strategy, optimizer, scheduler, class balancing or loss strategy,
 weight decay, learning rate, batch size, and training budget when the evidence supports it.
+AutoML is only a backend hyperparameter suggestion layer. You remain responsible for model family, preprocessing,
+augmentation policy type, class-balancing strategy, fine-tuning strategy, exploration/exploitation intent, and bounded
+hyperparameter constraints. AutoML may only fill concrete hyperparameters inside backend-validated constraints.
 Use planner_context_snapshot: dataset_card, training_dynamics_card, per_class_error_card, deployment_card,
 mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, search_coverage, strategy_lessons,
-model_catalog, objective_context, visual_evidence, and planner_validation_feedback. Prefer changes that address
+model_catalog, objective_context, optimizer_feedback_summary, visual_evidence, and planner_validation_feedback. Prefer changes that address
 the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps, not cosmetic hyperparameter nudges.
 Keep live inference cost and latency in view.
 If visual_evidence is present, treat it only as backend-curated advisory evidence about visible dataset traits.
@@ -770,6 +885,9 @@ Deterministic backend policy will validate and schedule accepted experiment prop
         "optimizer": "adamw",
         "scheduler": "cosine",
         "weight_decay": 0.01,
+        "dropout": 0.1,
+        "label_smoothing": 0.05,
+        "gradient_clip_norm": 1.0,
         "augmentation": {"horizontal_flip": true, "color_jitter": true},
         "augmentation_policy": "moderate",
         "augmentation_policy_config": {"policy_type": "basic", "probability": 1.0},
@@ -779,7 +897,24 @@ Deterministic backend policy will validate and schedule accepted experiment prop
         "strategy": "class imbalance ablation",
         "pretrained": true,
         "freeze_backbone": true,
-        "fine_tune_strategy": "head_only"
+        "fine_tune_strategy": "head_only",
+        "automl": {
+          "enabled": false,
+          "intent": {
+            "summary": "Use backend AutoML only for concrete hyperparameter selection inside this LLM-approved strategy.",
+            "allowed_parameters": ["learning_rate", "weight_decay", "batch_size"]
+          },
+          "sampler": "adaptive_bayesian",
+          "search_space": {
+            "parameters": [
+              {"name": "learning_rate", "type": "float", "min": 0.00001, "max": 0.0003, "scale": "log"},
+              {"name": "weight_decay", "type": "float", "min": 0.0, "max": 0.08},
+              {"name": "batch_size", "type": "integer", "int_choices": [16, 32, 64]},
+              {"name": "dropout", "type": "float", "min": 0.0, "max": 0.3},
+              {"name": "label_smoothing", "type": "float", "min": 0.0, "max": 0.12}
+            ]
+          }
+        }
       }
     }
   ],
@@ -803,6 +938,9 @@ Deterministic backend policy will validate and schedule accepted experiment prop
       "optimizer": "adamw",
       "scheduler": "cosine",
       "weight_decay": 0.01,
+      "dropout": 0.1,
+      "label_smoothing": 0.05,
+      "gradient_clip_norm": 1.0,
       "augmentation": {"horizontal_flip": true, "color_jitter": true, "random_crop": true},
       "augmentation_policy": "moderate",
       "augmentation_policy_config": {"policy_type": "basic", "probability": 1.0},
@@ -854,6 +992,7 @@ Rules:
 - Use only model names from planner_context_snapshot.model_catalog.
 - Use only supported optimizers: adamw, adam, sgd.
 - Use only supported schedulers: none, cosine, step.
+- Use dropout 0-0.7, label_smoothing 0-0.3, gradient_clip_norm 0-10, optimizer_momentum 0-0.99 only with optimizer sgd, and scheduler_step_size 1-100 plus scheduler_gamma 0.05-0.95 only with scheduler step.
 - Use only supported resolution_strategy values: fixed, low_latency, compare_224_256, high_resolution_ablation.
 - Use preprocessing.resize_strategy values: squash, preserve_aspect_pad, center_crop, random_resized_crop, bbox_crop_if_available.
 - Use preprocessing.normalization values: imagenet, dataset, none.
@@ -863,10 +1002,14 @@ Rules:
 - Use augmentation_policy_config for structured augmentation: policy_type basic, randaugment, trivialaugment, trivialaugmentwide, autoaugment, mixup, or cutmix; magnitude 0-15, num_ops 0-3, num_magnitude_bins 2-31 when set, probability 0-1, alpha 0-1.
 - Keep augmentation as a small object of supported boolean knobs only when needed.
 - Use class_balancing values: none, weighted_loss, class_weighted_loss, class_balanced_sampler, weighted_random_sampler, focal_loss, effective_number_loss.
-- Use class_balancing_config only with effective_number_loss, currently effective_number_beta between 0.9 and 0.99999.
+- Use class_balancing_config.effective_number_beta only with effective_number_loss, between 0.9 and 0.99999; use class_balancing_config.focal_loss_gamma only with focal_loss, between 0.5 and 5.
 - Use sampling_strategy values: none, class_balanced_sampler, weighted_random_sampler.
 - Keep epochs between 3 and 40, batch_size between 4 and 128, image_size between 96 and 384.
 - Use fine_tune_strategy values head_only, last_block, or full.
+- Optional AutoML fields live under proposed_experiments[].automl and are only hyperparameter search constraints; omit or set enabled=false when not needed. Samplers: seeded_random, grid, adaptive_bayesian.
+- AutoML may tune only learning_rate, weight_decay, batch_size, epochs, early_stopping_patience, optimizer, scheduler, dropout, optimizer_momentum when optimizer is sgd, scheduler_step_size and scheduler_gamma when scheduler is step, label_smoothing, gradient_clip_norm, augmentation_policy_config.magnitude, augmentation_policy_config.num_ops, augmentation_policy_config.num_magnitude_bins, augmentation_policy_config.probability, augmentation_policy_config.alpha, class_balancing_config.effective_number_beta, and class_balancing_config.focal_loss_gamma.
+- AutoML must not tune model, template, preprocessing, resolution_strategy, image_size, augmentation_policy, augmentation_policy_config.policy_type, class_balancing, sampling_strategy, pretrained, freeze_backbone, or fine_tune_strategy.
+- Use optimizer_feedback_summary as compact prior HPO evidence. Do not request raw trial dumps unless an approved backend information tool exposes a bounded summary.
 - Choose exactly one first-class planning_mode and justify it using planner_context_snapshot.failure_diagnosis.
 - Do not merely suggest more epochs, tiny learning-rate changes, or repeated model variants. Every proposed experiment must test a named mechanism tied to the diagnosis, dataset profile, champion weakness, or prior strategy outcome.
 - If prior runs are weak or unstable, try model/preprocessing/regularization changes.
@@ -879,6 +1022,7 @@ Rules:
 - Use planner_context_snapshot.per_class_error_card for class_imbalance, minority_targeting, focal/weighted loss, sampler, and metric-target decisions.
 - Use planner_context_snapshot.deployment_card to compare quality challengers against latency, cost, parameter count, throughput, and objective weights before proposing heavy models.
 - Use planner_context_snapshot.mechanism_coverage_card to avoid tried/blocked/failed mechanisms and to prefer eligible mechanisms with diagnosis support.
+- Use planner_context_snapshot.backend_validation_gated_methods as proposal-only method guidance. These cards are not experiments and have no scheduling authority; convert one into a proposed_experiment only when you supply every required concrete field and cite backend-verifiable evidence.
 - Use planner_context_snapshot.label_quality_card only to recommend label_noise_audit or hard_example_audit as report-only work with template label_quality_audit; never mutate labels or turn audit mechanisms into training jobs.
 - Use planner_context_snapshot.objective_context and dataset_card to decide resolution_strategy, preprocessing, augmentation_policy, augmentation_policy_config, sampling_strategy, class balancing/loss, model family, metrics, and deployment tradeoffs.
 - Use planner_context_snapshot.visual_evidence, when present, only as backend-curated advisory evidence for visible traits such as object scale, background dominance, blur, lighting variation, fine-grained classes, or bbox/crop plausibility. Cite latest accepted visual-analysis IDs, coverage, caps, limitations, warnings, or audit details if they limit confidence. Backend validation remains the gate for every proposed field.
@@ -893,11 +1037,11 @@ Rules:
 - Good: if overfitting is high, test stronger augmentation_policy, regularization, smaller model, or less aggressive fine-tuning.
 - Good: if underfitting is high, test a larger pretrained model or fuller fine-tuning.
 - Good: if the champion is low latency but weak on fine-grained classes, challenge with EfficientNet/ConvNeXt at a higher image size and compare deployment tradeoff.
-- Good: if validation improvement has stalled, select the champion instead of running low-value experiments.
+- Good: if validation improvement has stalled, pivot to a substantive untried mechanism instead of running low-value repeats.
 - Bad: same model, 2 more epochs, tiny learning-rate change.
 - Bad: ResNet/EfficientNet/model-family shopping with no mechanism-specific evidence.
 - Bad: repeating the same mechanism with only epochs, learning rate, or batch size changed.
-- If stop_signals say the project has repeated no-improvement follow-up rounds, prefer SELECT_CHAMPION or STOP_PROJECT.
+- If stop_signals say the project has repeated no-improvement follow-up rounds, treat that as evidence to pivot mechanisms. Do not select a champion or stop solely because a monitored iteration streak has not improved yet.
 - Set champion_job_id when selecting a champion or when a champion anchors your recommendation.
 - Set why_can_beat_champion for ADD_EXPERIMENTS; set stop_reason for SELECT_CHAMPION or STOP_PROJECT.
 - Do not repeat mechanisms or signatures summarized in planner_context_snapshot.search_coverage or mechanism_coverage_card; backend validation checks the full project history even when only a capped signature sample is shown.
@@ -1219,16 +1363,31 @@ func validatePlannedExperimentShape(experiment plans.PlannedExperiment, index in
 	if strings.TrimSpace(experiment.Model) == "" {
 		return fmt.Errorf("proposed experiment %d is missing model", index)
 	}
-	if experiment.Epochs < 1 {
+	if experiment.Epochs < 1 && !plannerAutoMLCovers(experiment, "epochs") {
 		return fmt.Errorf("proposed experiment %d must have at least one epoch", index)
 	}
-	if experiment.BatchSize < 1 {
+	if experiment.BatchSize < 1 && !plannerAutoMLCovers(experiment, "batch_size") {
 		return fmt.Errorf("proposed experiment %d must have a positive batch size", index)
 	}
-	if experiment.LearningRate <= 0 {
+	if experiment.LearningRate <= 0 && !plannerAutoMLCovers(experiment, "learning_rate") {
 		return fmt.Errorf("proposed experiment %d must have a positive learning rate", index)
 	}
 	return nil
+}
+
+func plannerAutoMLCovers(experiment plans.PlannedExperiment, name string) bool {
+	if experiment.AutoML == nil || !experiment.AutoML.Enabled {
+		return false
+	}
+	if automl.CoversParameter(experiment.AutoML.SearchSpace, name) {
+		return true
+	}
+	for _, allowed := range experiment.AutoML.Intent.AllowedParameters {
+		if automl.NormalizeParameterName(allowed) == automl.NormalizeParameterName(name) {
+			return true
+		}
+	}
+	return false
 }
 
 func experimentPlannerPromptContext(input ExperimentPlannerInput) map[string]any {
@@ -1251,9 +1410,11 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		PerClassErrorCard:      plannerPerClassErrorCard(input),
 		DeploymentCard:         plannerDeploymentCard(input),
 		MechanismCoverageCard:  plannerMechanismCoverageCard(input),
+		BackendGatedMethods:    plannerBackendGatedMethods(input),
 		LabelQualityCard:       plannerLabelQualityCard(input),
 		SearchCoverage:         plannerSearchCoverage(input),
 		StrategyLessons:        plannerStrategyLessons(input),
+		OptimizerFeedback:      capOptimizerFeedback(input.OptimizerFeedback, 5),
 		BlockedRepeats:         capRejectedPlannerOptions(input.RejectedStrategyMemory, plannerSnapshotMaxBlockedRepeats),
 		VisualEvidence:         visualExemplarPromptContext(input.VisualExemplarContext),
 		ModelCatalog:           input.ModelCatalog,
@@ -1270,6 +1431,8 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 				"prior_jobs",
 				"prior_evaluations",
 				"prior_memory",
+				"automl_trials_full",
+				"automl_raw_search_history",
 				"visual_images",
 				"visual_agent_prompt_messages",
 				"raw_visual_agent_output",
@@ -1381,7 +1544,7 @@ func plannerChampionInterpretation(input ExperimentPlannerInput) string {
 		return "No current champion is available; use completed run evidence before proposing more work."
 	}
 	if input.NoImprovementRounds > 0 {
-		return fmt.Sprintf("The project has %d no-improvement follow-up rounds; only propose more experiments with a clear path beyond the champion.", input.NoImprovementRounds)
+		return fmt.Sprintf("The project has %d no-improvement follow-up rounds; use them as memory for a sharper pivot instead of treating the current champion as terminal.", input.NoImprovementRounds)
 	}
 	if input.SourcePlanBaselineChampion != nil && input.CurrentChampion.JobID == input.SourcePlanBaselineChampion.JobID {
 		return "The latest source plan did not beat the existing champion; avoid shallow repeats."
@@ -1760,9 +1923,9 @@ func plannerStrategyLessons(input ExperimentPlannerInput) []PlannerStrategyLesso
 }
 
 func plannerStopContinueCard(input ExperimentPlannerInput) PlannerStopContinueCard {
-	instruction := "Continue only when a proposal tests a substantive mechanism that can beat the champion."
+	instruction := "Continue when a proposal tests a substantive backend-valid mechanism; repeated misses should drive sharper pivots, not automatic stopping."
 	if input.CurrentChampion != nil && input.NoImprovementRounds >= 2 {
-		instruction = "Prefer SELECT_CHAMPION or STOP_PROJECT unless new experiments directly address an unresolved diagnosis with meaningful novelty."
+		instruction = "Prefer a diagnosis-driven pivot with meaningful novelty over SELECT_CHAMPION or STOP_PROJECT while the user is monitoring the loop."
 	}
 	return PlannerStopContinueCard{
 		NoImprovementRounds: input.NoImprovementRounds,
@@ -1784,6 +1947,12 @@ func plannerExperimentCard(experiment plans.PlannedExperiment) PlannerExperiment
 		Optimizer:                experiment.Optimizer,
 		Scheduler:                experiment.Scheduler,
 		WeightDecay:              experiment.WeightDecay,
+		Dropout:                  experiment.Dropout,
+		OptimizerMomentum:        experiment.OptimizerMomentum,
+		SchedulerStepSize:        experiment.SchedulerStepSize,
+		SchedulerGamma:           experiment.SchedulerGamma,
+		LabelSmoothing:           experiment.LabelSmoothing,
+		GradientClipNorm:         experiment.GradientClipNorm,
 		AugmentationPolicy:       experiment.AugmentationPolicy,
 		AugmentationPolicyConfig: experiment.AugmentationPolicyConfig,
 		ClassBalancing:           experiment.ClassBalancing,
@@ -1792,7 +1961,29 @@ func plannerExperimentCard(experiment plans.PlannedExperiment) PlannerExperiment
 		FineTuneStrategy:         experiment.FineTuneStrategy,
 		Mechanism:                plannerExperimentMechanism(experiment, ""),
 		MeaningfulAxes:           plannerMeaningfulAxes(experiment),
+		AutoMLSummary:            plannerAutoMLSummary(experiment.AutoML),
 	}
+}
+
+func plannerAutoMLSummary(config *automl.ExperimentAutoML) map[string]any {
+	if config == nil || !config.Enabled {
+		return nil
+	}
+	out := map[string]any{
+		"enabled":           true,
+		"sampler":           config.Sampler,
+		"final_values":      config.FinalValues,
+		"value_provenance":  config.ValueProvenance,
+		"validation_status": config.ValidationStatus,
+	}
+	if config.SearchSpace != nil {
+		names := []string{}
+		for _, parameter := range config.SearchSpace.Parameters {
+			names = append(names, parameter.Name)
+		}
+		out["search_parameters"] = names
+	}
+	return out
 }
 
 func plannerExperimentFromJob(job jobs.ExperimentJob) plans.PlannedExperiment {
@@ -1811,6 +2002,12 @@ func plannerExperimentFromJob(job jobs.ExperimentJob) plans.PlannedExperiment {
 		Optimizer:                plannerConfigString(config, "optimizer"),
 		Scheduler:                plannerConfigString(config, "scheduler"),
 		WeightDecay:              plannerConfigFloatDefault(config, "weight_decay"),
+		Dropout:                  plannerConfigFloatDefault(config, "dropout"),
+		OptimizerMomentum:        plannerConfigFloatDefault(config, "optimizer_momentum"),
+		SchedulerStepSize:        plannerConfigIntDefault(config, "scheduler_step_size"),
+		SchedulerGamma:           plannerConfigFloatDefault(config, "scheduler_gamma"),
+		LabelSmoothing:           plannerConfigFloatDefault(config, "label_smoothing"),
+		GradientClipNorm:         plannerConfigFloatDefault(config, "gradient_clip_norm"),
 		Augmentation:             plannerConfigMap(config, "augmentation"),
 		AugmentationPolicy:       plannerConfigString(config, "augmentation_policy"),
 		AugmentationPolicyConfig: plannerConfigAugmentationPolicyConfig(config, "augmentation_policy_config"),
@@ -1878,8 +2075,11 @@ func plannerMeaningfulAxes(experiment plans.PlannedExperiment) []string {
 	if strings.TrimSpace(experiment.FineTuneStrategy) != "" || !experiment.FreezeBackbone {
 		axes = append(axes, "fine_tuning")
 	}
-	if strings.TrimSpace(experiment.Optimizer) != "" || strings.TrimSpace(experiment.Scheduler) != "" || experiment.WeightDecay > 0 {
+	if strings.TrimSpace(experiment.Optimizer) != "" || strings.TrimSpace(experiment.Scheduler) != "" || experiment.WeightDecay > 0 || experiment.OptimizerMomentum > 0 || experiment.SchedulerStepSize > 0 || experiment.SchedulerGamma > 0 || experiment.GradientClipNorm > 0 {
 		axes = append(axes, "optimization")
+	}
+	if experiment.Dropout > 0 || experiment.LabelSmoothing > 0 {
+		axes = append(axes, "regularization")
 	}
 	return axes
 }
@@ -1901,6 +2101,12 @@ func plannerExperimentSignature(experiment plans.PlannedExperiment) string {
 		strings.ToLower(strings.TrimSpace(experiment.Optimizer)),
 		strings.ToLower(strings.TrimSpace(experiment.Scheduler)),
 		fmt.Sprintf("%g", experiment.WeightDecay),
+		fmt.Sprintf("%g", experiment.Dropout),
+		fmt.Sprintf("%g", experiment.OptimizerMomentum),
+		fmt.Sprintf("%d", experiment.SchedulerStepSize),
+		fmt.Sprintf("%g", experiment.SchedulerGamma),
+		fmt.Sprintf("%g", experiment.LabelSmoothing),
+		fmt.Sprintf("%g", experiment.GradientClipNorm),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
 		string(augmentationPolicyConfigBlob),
@@ -1928,6 +2134,12 @@ func plannerExperimentMechanismSignature(experiment plans.PlannedExperiment) str
 		strings.ToLower(strings.TrimSpace(experiment.Optimizer)),
 		strings.ToLower(strings.TrimSpace(experiment.Scheduler)),
 		fmt.Sprintf("%g", experiment.WeightDecay),
+		fmt.Sprintf("%g", experiment.Dropout),
+		fmt.Sprintf("%g", experiment.OptimizerMomentum),
+		fmt.Sprintf("%d", experiment.SchedulerStepSize),
+		fmt.Sprintf("%g", experiment.SchedulerGamma),
+		fmt.Sprintf("%g", experiment.LabelSmoothing),
+		fmt.Sprintf("%g", experiment.GradientClipNorm),
 		string(augmentationBlob),
 		strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicy)),
 		string(augmentationPolicyConfigBlob),
@@ -2365,6 +2577,16 @@ func capRejectedPlannerOptions(values []RejectedPlannerOption, limit int) []Reje
 		return append([]RejectedPlannerOption(nil), values...)
 	}
 	return append([]RejectedPlannerOption(nil), values[:limit]...)
+}
+
+func capOptimizerFeedback(values []automl.OptimizerFeedbackSummary, limit int) []automl.OptimizerFeedbackSummary {
+	if len(values) == 0 || limit <= 0 {
+		return nil
+	}
+	if len(values) <= limit {
+		return append([]automl.OptimizerFeedbackSummary(nil), values...)
+	}
+	return append([]automl.OptimizerFeedbackSummary(nil), values[:limit]...)
 }
 
 func cappedStrings(values []string, limit int) []string {

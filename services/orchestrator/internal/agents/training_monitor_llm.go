@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
@@ -29,18 +30,21 @@ const (
 )
 
 type TrainingMonitorAgent struct {
-	generator llm.JSONGenerator
-	model     string
+	generator       llm.JSONGenerator
+	model           string
+	reasoningEffort string
+	maxToolRounds   int
 }
 
 type TrainingMonitorInput struct {
-	Plan             plans.ExperimentPlan
-	Job              jobs.ExperimentJob
-	Summary          runs.TrainingRunSummary
-	Evaluation       *runs.TrainingRunEvaluation
-	Metrics          []jobs.EpochMetric
-	ObjectiveContext ProjectObjectiveContext
-	MemoryRecords    []memory.AgentMemoryRecord
+	Plan              plans.ExperimentPlan
+	Job               jobs.ExperimentJob
+	Summary           runs.TrainingRunSummary
+	Evaluation        *runs.TrainingRunEvaluation
+	Metrics           []jobs.EpochMetric
+	ObjectiveContext  ProjectObjectiveContext
+	MemoryRecords     []memory.AgentMemoryRecord
+	OptimizerFeedback *automl.OptimizerFeedbackSummary
 }
 
 type TrainingEvaluationRecommendation struct {
@@ -57,21 +61,37 @@ type TrainingEvaluationRecommendation struct {
 }
 
 type TrainingMonitorEvaluationTrace struct {
-	Recommendation   TrainingEvaluationRecommendation
-	Request          llm.JSONRequest
-	PromptContext    map[string]any
-	RawOutput        []byte
-	ParsedOutput     map[string]any
-	ValidationStatus string
-	ValidationError  string
-	AgentVersion     string
-	PromptVersion    string
+	Recommendation          TrainingEvaluationRecommendation
+	Request                 llm.JSONRequest
+	PromptContext           map[string]any
+	RawOutput               []byte
+	ParsedOutput            map[string]any
+	ValidationStatus        string
+	ValidationError         string
+	AgentVersion            string
+	PromptVersion           string
+	ResponseID              string
+	PreviousResponseID      string
+	ToolRounds              int
+	ToolCalls               []AgentToolCallTrace
+	ToolResults             []AgentToolResultTrace
+	RejectedToolCalls       []AgentToolResultTrace
+	DryRunValidationResults []map[string]any
 }
 
 func NewTrainingMonitorAgent(generator llm.JSONGenerator, model string) TrainingMonitorAgent {
 	return TrainingMonitorAgent{
 		generator: generator,
 		model:     model,
+	}
+}
+
+func NewTrainingMonitorAgentWithRuntime(generator llm.JSONGenerator, model string, config llm.Config) TrainingMonitorAgent {
+	return TrainingMonitorAgent{
+		generator:       generator,
+		model:           model,
+		reasoningEffort: config.ReasoningEffort,
+		maxToolRounds:   config.MaxToolRounds,
 	}
 }
 
@@ -103,7 +123,8 @@ func (a TrainingMonitorAgent) EvaluateWithTrace(ctx context.Context, input Train
 	}
 
 	trace.Request = trainingMonitorJSONRequest(a.model, contextBlob)
-	raw, err := a.generator.GenerateJSON(ctx, trace.Request)
+	trace.Request.ReasoningEffort = a.reasoningEffort
+	raw, err := a.generateTrainingMonitorJSON(ctx, &trace, input)
 	if err != nil {
 		trace.ValidationError = err.Error()
 		return trace, err
@@ -133,6 +154,58 @@ func (a TrainingMonitorAgent) EvaluateWithTrace(ctx context.Context, input Train
 	return trace, nil
 }
 
+type trainingMonitorToolLoopGenerator interface {
+	GenerateJSONWithTools(context.Context, llm.ToolLoopRequest) (llm.ToolLoopResult, error)
+}
+
+func (a TrainingMonitorAgent) generateTrainingMonitorJSON(ctx context.Context, trace *TrainingMonitorEvaluationTrace, input TrainingMonitorInput) ([]byte, error) {
+	toolGenerator, ok := a.generator.(trainingMonitorToolLoopGenerator)
+	if !ok {
+		return a.generator.GenerateJSON(ctx, trace.Request)
+	}
+
+	result, err := toolGenerator.GenerateJSONWithTools(ctx, llm.ToolLoopRequest{
+		JSONRequest:   trace.Request,
+		Tools:         llmToolDefinitions(TrainingMonitorInformationToolSpecs()),
+		ToolAnswerer:  trainingMonitorInformationAnswerer{input: input},
+		MaxToolRounds: a.maxToolRounds,
+	})
+	if err != nil {
+		return nil, err
+	}
+	trace.ResponseID = result.ResponseID
+	trace.PreviousResponseID = result.PreviousResponseID
+	trace.ToolRounds = result.ToolRounds
+	trace.ToolCalls = toolCallTraces(result.ToolCalls)
+	trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults = toolResultTraces(result.ToolResults)
+	return result.FinalJSON, nil
+}
+
+type trainingMonitorInformationAnswerer struct {
+	input TrainingMonitorInput
+}
+
+func (a trainingMonitorInformationAnswerer) AnswerInformationToolCall(_ context.Context, call llm.ToolCall) (llm.ToolResult, error) {
+	args := map[string]any{}
+	if len(call.Arguments) > 0 {
+		if err := json.Unmarshal(call.Arguments, &args); err != nil {
+			result := AgentInformationToolResult{
+				ToolName: strings.TrimSpace(call.Name),
+				Accepted: false,
+				Error:    "tool arguments must be a JSON object",
+			}
+			encoded, _ := json.Marshal(result)
+			return llm.ToolResult{CallID: call.CallID, Name: call.Name, Output: encoded}, nil
+		}
+	}
+	result := ExecuteTrainingMonitorInformationTool(a.input, call.Name, args, TrainingMonitorInformationToolOptions{})
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return llm.ToolResult{CallID: call.CallID, Name: call.Name}, fmt.Errorf("encode training monitor tool result: %w", err)
+	}
+	return llm.ToolResult{CallID: call.CallID, Name: call.Name, Output: encoded}, nil
+}
+
 func trainingMonitorJSONRequest(model string, contextBlob []byte) llm.JSONRequest {
 	return llm.JSONRequest{
 		Model:       model,
@@ -141,10 +214,13 @@ func trainingMonitorJSONRequest(model string, contextBlob []byte) llm.JSONReques
 			{
 				Role: "system",
 				Content: strings.TrimSpace(`You are the Model Express Training Monitor Agent.
-Return only valid JSON. Evaluate image-classification training runs holistically.
+Evaluate image-classification training runs holistically.
+When approved information tools are available, you may ask bounded run-scoped backend questions before finalizing.
+Tool calls are questions only: they cannot propose experiments, create plans, create jobs, create workers, export champions, run inference, or mutate datasets.
+After any information requests, return only final valid JSON.
 Consider validation quality, macro-F1, accuracy, per-class metrics, confusion matrix,
 train/validation gap, metric stability, plateauing, cost, runtime, inference latency,
-model size, and whether the run should inform future experiments.
+model size, compact optimizer feedback if present, and whether the run should inform future experiments.
 This agent evaluates one run only. Do not propose new experiments or plan a follow-up batch.
 Produce signals that the plan-level Experiment Planning Agent can use later.`),
 			},
@@ -206,6 +282,9 @@ func validateTrainingEvaluation(recommendation TrainingEvaluationRecommendation)
 	if strings.TrimSpace(action.Rationale) == "" {
 		return fmt.Errorf("training monitor recommendation missing action rationale")
 	}
+	if key, found := trainingMonitorPayloadHasForbiddenAuthority(action.Payload); found {
+		return fmt.Errorf("training monitor recommendation payload contains forbidden scheduling or planning authority %q", key)
+	}
 	if recommendation.RankScore < 0 || recommendation.RankScore > 1 {
 		return fmt.Errorf("training monitor recommendation rank_score must be between 0 and 1")
 	}
@@ -234,6 +313,9 @@ func trainingMonitorPromptContext(input TrainingMonitorInput) map[string]any {
 		"objective_fit_card":                    trainingMonitorObjectiveFitCard(input),
 		"memory_summary":                        compactMemoryRecords(input.MemoryRecords),
 		"backend_full_data_preservation_notice": "Full run summary, evaluation, epoch metrics, plan, and job config remain in backend storage; this prompt contains compact decision cards only.",
+	}
+	if input.OptimizerFeedback != nil {
+		context["optimizer_feedback_summary"] = input.OptimizerFeedback
 	}
 	attachTrainingMonitorPromptBudget(context)
 	return context
@@ -468,6 +550,12 @@ func compactPlannedExperimentProfile(experiment plans.PlannedExperiment) map[str
 		"optimizer":               experiment.Optimizer,
 		"scheduler":               experiment.Scheduler,
 		"weight_decay":            experiment.WeightDecay,
+		"dropout":                 experiment.Dropout,
+		"optimizer_momentum":      experiment.OptimizerMomentum,
+		"scheduler_step_size":     experiment.SchedulerStepSize,
+		"scheduler_gamma":         experiment.SchedulerGamma,
+		"label_smoothing":         experiment.LabelSmoothing,
+		"gradient_clip_norm":      experiment.GradientClipNorm,
 		"augmentation_policy":     experiment.AugmentationPolicy,
 		"class_balancing":         experiment.ClassBalancing,
 		"sampling_strategy":       experiment.SamplingStrategy,
@@ -487,6 +575,9 @@ func compactPlannedExperimentProfile(experiment plans.PlannedExperiment) map[str
 	}
 	if experiment.AugmentationPolicyConfig != nil {
 		out["augmentation_policy_config"] = experiment.AugmentationPolicyConfig
+	}
+	if experiment.AutoML != nil && experiment.AutoML.Enabled {
+		out["automl_summary"] = compactAutoMLPlanSummary(experiment.AutoML)
 	}
 	return compactNonZeroMap(out)
 }
@@ -510,6 +601,12 @@ func compactJobConfigProfile(config map[string]any) map[string]any {
 		"optimizer",
 		"scheduler",
 		"weight_decay",
+		"dropout",
+		"optimizer_momentum",
+		"scheduler_step_size",
+		"scheduler_gamma",
+		"label_smoothing",
+		"gradient_clip_norm",
 		"augmentation_policy",
 		"class_balancing",
 		"sampling_strategy",
@@ -517,12 +614,15 @@ func compactJobConfigProfile(config map[string]any) map[string]any {
 		"pretrained",
 		"freeze_backbone",
 		"fine_tune_strategy",
+		"automl_study_id",
+		"automl_suggestion_id",
+		"automl_summary",
 	} {
 		if value, ok := config[key]; ok {
 			out[key] = compactAnyValue(value)
 		}
 	}
-	for _, key := range []string{"preprocessing", "augmentation_policy_config"} {
+	for _, key := range []string{"preprocessing", "augmentation_policy_config", "class_balancing_config"} {
 		if value, ok := config[key]; ok {
 			if nested, ok := value.(map[string]any); ok {
 				out[key] = compactAnyMap(nested, 8)
@@ -531,6 +631,29 @@ func compactJobConfigProfile(config map[string]any) map[string]any {
 	}
 	if value, ok := config["evidence_used"]; ok {
 		out["evidence_used"] = cappedStrings(stringsFromAny(value), 6)
+	}
+	return compactNonZeroMap(out)
+}
+
+func compactAutoMLPlanSummary(config *automl.ExperimentAutoML) map[string]any {
+	if config == nil || !config.Enabled {
+		return nil
+	}
+	out := map[string]any{
+		"enabled":           config.Enabled,
+		"sampler":           config.Sampler,
+		"seed":              config.Seed,
+		"final_values":      config.FinalValues,
+		"value_provenance":  config.ValueProvenance,
+		"validation_status": config.ValidationStatus,
+		"validation_errors": config.ValidationErrors,
+	}
+	if config.SearchSpace != nil {
+		names := []string{}
+		for _, parameter := range config.SearchSpace.Parameters {
+			names = append(names, parameter.Name)
+		}
+		out["search_parameters"] = names
 	}
 	return compactNonZeroMap(out)
 }
@@ -886,6 +1009,8 @@ func attachTrainingMonitorPromptBudget(context map[string]any) {
 			"job.config_full",
 			"training_run_evaluation_full",
 			"epoch_metrics_full",
+			"automl_trials_full",
+			"automl_raw_search_history",
 			"prior_memory_payloads",
 		},
 		"max_recent_epochs":   trainingMonitorMaxRecentEpochs,

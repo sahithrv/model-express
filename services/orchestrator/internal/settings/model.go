@@ -13,6 +13,8 @@ type AutomationSettings struct {
 	AgentMode               string    `json:"agent_mode"`
 	LLMProvider             string    `json:"llm_provider"`
 	LLMModel                string    `json:"llm_model"`
+	AutoMLEnabled           bool      `json:"automl_enabled"`
+	AutoMLSampler           string    `json:"automl_sampler"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 
@@ -27,4 +29,6 @@ type AutomationSettingsUpdate struct {
 	AgentMode               *string `json:"agent_mode"`
 	LLMProvider             *string `json:"llm_provider"`
 	LLMModel                *string `json:"llm_model"`
+	AutoMLEnabled           *bool   `json:"automl_enabled"`
+	AutoMLSampler           *string `json:"automl_sampler"`
 }

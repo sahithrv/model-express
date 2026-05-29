@@ -4,6 +4,7 @@ import base64
 import json
 import os
 
+from worker.diagnostics import log_event
 from worker.datasets.cache import (
     cleanup_job_dataset_cache,
     dataset_archive_path,
@@ -115,11 +116,26 @@ def run_analyze_dataset_visuals_job(client: OrchestratorClient, job: dict) -> No
         if pack.get("status") == "unavailable":
             client.fail_job(job["id"], pack.get("error") or "visual sample pack generation unavailable")
             return
+        manifest = pack.get("sample_manifest") if isinstance(pack.get("sample_manifest"), dict) else {}
+        if _positive_int(manifest.get("images_analyzed"), 0) <= 0:
+            client.fail_job(job["id"], "visual sample pack contained no analyzable images")
+            return
         try:
             llm_result = _run_visual_llm_analysis(dataset, config, pack)
         except Exception as exc:
-            client.fail_job(job["id"], str(exc))
-            return
+            log_event(
+                "warn",
+                "visual_analysis_llm_unavailable",
+                job_id=job.get("id"),
+                project_id=job.get("project_id"),
+                dataset_id=dataset_id,
+                template=job.get("template"),
+                provider=os.getenv("MODEL_EXPRESS_VISUAL_LLM_PROVIDER", "openai"),
+                model=os.getenv("MODEL_EXPRESS_VISUAL_LLM_MODEL", ""),
+                api_style=os.getenv("MODEL_EXPRESS_VISUAL_LLM_API_STYLE", "chat"),
+                error=str(exc),
+            )
+            llm_result = _visual_analysis_unavailable_result(dataset, config, pack, exc)
         payload = _visual_analysis_result_payload(job, dataset, config, pack, caps, llm_result)
         client.report_dataset_visual_analysis_result(dataset_id, payload)
         client.complete_job(job["id"], mlflow_run_id="")
@@ -230,6 +246,79 @@ def _run_visual_llm_analysis(dataset: dict, config: dict, pack: dict) -> dict:
         "agent_version": AGENT_VERSION,
         "prompt_version": PROMPT_VERSION,
         "repair": repair,
+    }
+
+
+def _visual_analysis_unavailable_result(dataset: dict, config: dict, pack: dict, exc: Exception) -> dict:
+    from worker.visual_analysis.schema import AGENT_VERSION, PROMPT_VERSION, SCHEMA_VERSION, compact_json
+
+    manifest = pack.get("sample_manifest") if isinstance(pack.get("sample_manifest"), dict) else {}
+    samples = manifest.get("samples") if isinstance(manifest.get("samples"), list) else []
+    images_analyzed = _positive_int(manifest.get("images_analyzed"), len(samples))
+    total_images = _positive_int(manifest.get("images_available"), images_analyzed)
+    trigger_reason = str(config.get("trigger_reason") or "initial_profile")
+    limitations = [
+        str(item)
+        for item in manifest.get("limitations", [])
+        if item not in (None, "")
+    ][:8] if isinstance(manifest.get("limitations"), list) else []
+    limitations.extend(
+        [
+            "Visual LLM unavailable; no visual traits or preprocessing hypotheses were inferred from the bounded sample.",
+            "Planner should rely on dataset profile statistics and backend validation until visual analysis is rerun.",
+        ]
+    )
+    analysis = {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_id": str(config.get("dataset_id") or dataset.get("id") or ""),
+        "dataset_name": str(dataset.get("name") or config.get("dataset_name") or ""),
+        "total_images": total_images,
+        "images_analyzed": images_analyzed,
+        "trigger_reason": trigger_reason,
+        "confidence": "low",
+        "coverage_report": {
+            "selection_strategy": manifest.get("selection_strategy") or "deterministic_risk_and_representative_sampling",
+            "selection_basis": manifest.get("selection_basis") if isinstance(manifest.get("selection_basis"), list) else [],
+            "images_available": total_images,
+            "images_analyzed": images_analyzed,
+            "classes_total": _positive_int(manifest.get("classes_total"), 0),
+            "classes_covered": _positive_int(manifest.get("classes_covered"), 0),
+            "class_coverage_ratio": manifest.get("class_coverage_ratio") or 0,
+            "per_class_counts": manifest.get("per_class_counts") if isinstance(manifest.get("per_class_counts"), dict) else {},
+            "hard_example_count": _positive_int(manifest.get("hard_example_count"), 0),
+            "edge_case_count": _positive_int(manifest.get("edge_case_count"), 0),
+            "high_detail_image_count": _positive_int(manifest.get("high_detail_image_count"), 0),
+            "limitations": limitations,
+        },
+        "classes_to_watch": [],
+        "visual_traits": [],
+        "preprocessing_hypotheses": [],
+        "cautions": [
+            {
+                "operation": "visual_llm_analysis",
+                "reason": "The visual LLM request did not complete, so no image-level conclusions were produced.",
+                "severity": "medium",
+                "confidence": "high",
+                "affected_classes": [],
+                "example_image_ids": [],
+            }
+        ],
+        "limitations": limitations,
+    }
+    return {
+        "analysis": analysis,
+        "raw_output": compact_json(analysis),
+        "input_messages": [],
+        "provider": os.getenv("MODEL_EXPRESS_VISUAL_LLM_PROVIDER", "openai"),
+        "model": os.getenv("MODEL_EXPRESS_VISUAL_LLM_MODEL", ""),
+        "agent_version": AGENT_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "repair": {
+            "attempted": False,
+            "llm_unavailable": True,
+            "fallback_record": True,
+            "failure_type": exc.__class__.__name__,
+        },
     }
 
 

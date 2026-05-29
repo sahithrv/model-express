@@ -627,6 +627,184 @@ func TestPlannerVisualAnalysisContextCapsAndExcludesRawPayloads(t *testing.T) {
 	}
 }
 
+func TestPlannerContextIncludesBackendValidationGatedMethodProposals(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.DatasetInsights = DatasetPlanningInsights{
+		ImbalanceRatio:    3.2,
+		ClassDistribution: map[string]any{"rare": 10, "common": 80},
+	}
+	input.VisualExemplarContext = &PlannerVisualExemplarContext{
+		Enabled:      true,
+		EvidenceOnly: true,
+		Source:       "dataset_visual_analysis",
+		AnalysisID:   "analysis_1",
+		PreprocessingHypotheses: []datasets.PreprocessingHypothesis{
+			{
+				ID:                     "vh_bbox_001",
+				Mechanism:              "bbox_crop_ablation",
+				Summary:                "Background dominates small subjects; bbox crop may focus the model.",
+				Evidence:               []string{"background dominance around small subjects"},
+				SuggestedPreprocessing: &plans.Preprocessing{ResizeStrategy: "bbox_crop_if_available", CropStrategy: "bbox_crop_ablation", BBoxMode: "crop_if_available", Normalization: "imagenet"},
+				ExpectedEffect:         "Reduce background overfitting.",
+				Confidence:             "medium",
+				SupportStatus:          "needs_backend_validation",
+			},
+		},
+	}
+
+	snapshot := BuildPlannerContextSnapshot(input)
+	if len(snapshot.BackendGatedMethods) == 0 {
+		t.Fatal("expected backend-validation-gated method proposals")
+	}
+	for _, method := range snapshot.BackendGatedMethods {
+		if method.SchedulingAuthority {
+			t.Fatalf("gated method %s unexpectedly has scheduling authority", method.Mechanism)
+		}
+	}
+	bbox, ok := findBackendGatedTestMethod(snapshot.BackendGatedMethods, "bbox_crop_ablation")
+	if !ok {
+		t.Fatalf("expected bbox gated proposal, got %#v", snapshot.BackendGatedMethods)
+	}
+	if bbox.SourceID != "vh_bbox_001" {
+		t.Fatalf("expected visual hypothesis source id to be retained, got %#v", bbox)
+	}
+	if !containsTestSubstring(bbox.MissingRequirements, "bbox/annotation") {
+		t.Fatalf("expected bbox proposal to require backend bbox evidence, got %#v", bbox.MissingRequirements)
+	}
+	if _, ok := bbox.SupportedConfigHints["preprocessing"]; !ok {
+		t.Fatalf("expected bbox proposal to retain preprocessing hints, got %#v", bbox.SupportedConfigHints)
+	}
+	if bbox.ProposalStatus != "backend_validation_required" {
+		t.Fatalf("expected bbox proposal to be gated, got %q", bbox.ProposalStatus)
+	}
+
+	classImbalance, ok := findBackendGatedTestMethod(snapshot.BackendGatedMethods, "class_imbalance")
+	if !ok {
+		t.Fatalf("expected class imbalance proposal, got %#v", snapshot.BackendGatedMethods)
+	}
+	if !containsTestSubstring(classImbalance.MissingRequirements, "class_balancing") {
+		t.Fatalf("expected class imbalance proposal to require concrete balancing config, got %#v", classImbalance.MissingRequirements)
+	}
+	if containsTestSubstring(classImbalance.MissingRequirements, "evidence") {
+		t.Fatalf("expected imbalance evidence to be satisfied by dataset profile, got %#v", classImbalance.MissingRequirements)
+	}
+}
+
+func TestPlannerMechanismCoverageToolReturnsBackendGatedMethodProposals(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.Dataset.Profile = map[string]any{"bbox_available": true}
+
+	result := ExecuteExperimentPlannerInformationTool(input, PlannerToolMechanismCoverage, nil, PlannerInformationToolOptions{})
+	if !result.Accepted {
+		t.Fatalf("expected mechanism coverage tool to be accepted: %#v", result)
+	}
+	if result.Payload["gated_methods_have_scheduling_power"] != false {
+		t.Fatalf("expected gated methods to have no scheduling power, got %#v", result.Payload)
+	}
+	methods, ok := result.Payload["backend_validation_gated_methods"].([]PlannerBackendGatedMethod)
+	if !ok {
+		t.Fatalf("expected typed gated methods payload, got %#v", result.Payload["backend_validation_gated_methods"])
+	}
+	bbox, ok := findBackendGatedTestMethod(methods, "bbox_crop_ablation")
+	if !ok {
+		t.Fatalf("expected bbox gated proposal from profile evidence, got %#v", methods)
+	}
+	if bbox.SchedulingAuthority {
+		t.Fatalf("bbox gated proposal should not schedule work: %#v", bbox)
+	}
+	if !containsTestSubstring(bbox.MissingRequirements, "bbox crop preprocessing") {
+		t.Fatalf("expected bbox proposal to require concrete config, got %#v", bbox.MissingRequirements)
+	}
+}
+
+func TestInformationValidationToolsUseStringifiedDraftSchemas(t *testing.T) {
+	plannerSpec, ok := findInformationToolSpec(ExperimentPlannerInformationToolSpecs(), PlannerToolValidateCandidateExperiments)
+	if !ok {
+		t.Fatal("expected planner validation tool spec")
+	}
+	assertStringifiedDraftSchema(t, plannerSpec.Parameters, "recommendation_json")
+
+	monitorSpec, ok := findInformationToolSpec(TrainingMonitorInformationToolSpecs(), TrainingMonitorToolValidateRecommendationDraft)
+	if !ok {
+		t.Fatal("expected training monitor validation tool spec")
+	}
+	assertStringifiedDraftSchema(t, monitorSpec.Parameters, "recommendation_json")
+}
+
+func TestPlannerValidateCandidateExperimentsAcceptsRecommendationJSON(t *testing.T) {
+	recommendation := validExperimentPlannerRecommendationForMode("explore")
+	blob, err := json.Marshal(recommendation)
+	if err != nil {
+		t.Fatalf("marshal recommendation: %v", err)
+	}
+	called := false
+
+	result := ExecuteExperimentPlannerInformationTool(
+		testExperimentPlannerInput(),
+		PlannerToolValidateCandidateExperiments,
+		map[string]any{"recommendation_json": string(blob)},
+		PlannerInformationToolOptions{
+			ValidateCandidateExperiments: func(draft ExperimentPlanningRecommendation) PlannerCandidateDryRunResult {
+				called = true
+				if draft.Summary != recommendation.Summary {
+					t.Fatalf("unexpected decoded recommendation summary %q", draft.Summary)
+				}
+				return PlannerCandidateDryRunResult{
+					Valid:                   true,
+					ValidationStatus:        "valid",
+					ProposedExperimentCount: len(draft.ProposedExperiments),
+					WouldWriteRows:          false,
+					WouldScheduleJobs:       false,
+				}
+			},
+		},
+	)
+	if !result.Accepted || !called {
+		t.Fatalf("expected dry-run validation to accept stringified recommendation, got %#v called=%v", result, called)
+	}
+	validation, ok := result.Payload["dry_run_validation"].(PlannerCandidateDryRunResult)
+	if !ok || !validation.Valid || validation.WouldScheduleJobs {
+		t.Fatalf("expected valid dry-run-only result, got %#v", result.Payload["dry_run_validation"])
+	}
+}
+
+func TestTrainingMonitorValidateRecommendationDraftAcceptsRecommendationJSON(t *testing.T) {
+	recommendation := TrainingEvaluationRecommendation{
+		Summary: "The run is stable enough to rank.",
+		RecommendedAction: decisions.AgentActionProposal{
+			ActionType: "RANK_MODELS",
+			Confidence: 0.82,
+			Rationale:  "Metrics are complete and no scheduling action is required.",
+			Payload:    map[string]any{"rank_basis": "macro_f1"},
+		},
+		QualitySummary:   "Validation quality is usable.",
+		TrainingDynamics: "Metrics are stable.",
+		CostSummary:      "Cost is bounded.",
+		Risks:            []string{"small evaluation sample"},
+		Findings:         []string{"macro-F1 is available"},
+		RankScore:        0.74,
+		Tags:             []string{"dry_run"},
+	}
+	blob, err := json.Marshal(recommendation)
+	if err != nil {
+		t.Fatalf("marshal monitor recommendation: %v", err)
+	}
+
+	result := ExecuteTrainingMonitorInformationTool(
+		TrainingMonitorInput{},
+		TrainingMonitorToolValidateRecommendationDraft,
+		map[string]any{"recommendation_json": string(blob)},
+		TrainingMonitorInformationToolOptions{},
+	)
+	if !result.Accepted {
+		t.Fatalf("expected monitor draft validation to accept stringified recommendation, got %#v", result)
+	}
+	validation, ok := result.Payload["dry_run_validation"].(map[string]any)
+	if !ok || validation["valid"] != true || validation["would_schedule_jobs"] != false {
+		t.Fatalf("expected valid dry-run-only monitor validation, got %#v", result.Payload["dry_run_validation"])
+	}
+}
+
 func TestComputePlannerDiagnosisFlagsEvidenceDrivenFailures(t *testing.T) {
 	input := testExperimentPlannerInput()
 	input.SourcePlan.TargetMetric = "macro_f1"
@@ -1126,6 +1304,58 @@ func containsTestString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func containsTestSubstring(values []string, target string) bool {
+	for _, value := range values {
+		if strings.Contains(value, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func findBackendGatedTestMethod(values []PlannerBackendGatedMethod, mechanism string) (PlannerBackendGatedMethod, bool) {
+	for _, value := range values {
+		if value.Mechanism == mechanism {
+			return value, true
+		}
+	}
+	return PlannerBackendGatedMethod{}, false
+}
+
+func findInformationToolSpec(values []AgentInformationToolSpec, name string) (AgentInformationToolSpec, bool) {
+	for _, value := range values {
+		if value.Name == name {
+			return value, true
+		}
+	}
+	return AgentInformationToolSpec{}, false
+}
+
+func assertStringifiedDraftSchema(t *testing.T, schema map[string]any, propertyName string) {
+	t.Helper()
+	if schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("expected strict top-level object schema, got %#v", schema)
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected schema properties, got %#v", schema["properties"])
+	}
+	property, ok := properties[propertyName].(map[string]any)
+	if !ok {
+		t.Fatalf("expected %s property, got %#v", propertyName, properties)
+	}
+	if property["type"] != "string" {
+		t.Fatalf("expected %s to be a string, got %#v", propertyName, property)
+	}
+	if _, exists := properties["recommendation"]; exists {
+		t.Fatalf("strict tool schema must not expose open recommendation object: %#v", properties["recommendation"])
+	}
+	required, ok := schema["required"].([]string)
+	if !ok || !containsTestString(required, propertyName) {
+		t.Fatalf("expected %s to be required, got %#v", propertyName, schema["required"])
+	}
 }
 
 func testExperimentPlannerInput() ExperimentPlannerInput {

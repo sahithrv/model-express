@@ -39,6 +39,9 @@ Major tables and store concepts:
 - `agent_memory_records`: distilled training/planning memory.
 - `agent_decisions`: accepted project decisions such as `ADD_EXPERIMENTS`, `SELECT_CHAMPION`, or `REOPEN_EXPERIMENTATION`.
 - `strategy_scorecards`: structured follow-up outcome memory, including first-class mechanism/intervention/evidence metadata.
+- `automl_studies`: backend-owned hyperparameter optimization studies linked to project, plan, dataset, experiment index, LLM-owned strategy snapshot, sampler, seed, and validated search space.
+- `automl_suggestions`: concrete hyperparameter suggestions with per-value provenance, validation status/errors, and optional linked job ID.
+- `automl_trials`: compact observed trial results linked to study/suggestion/job with target metric, score, metrics summary, and error text.
 - `worker_requirements`: durable requests for Mission Control to satisfy worker capacity.
 - `execution_events`: audit events for queued jobs, worker requirements, agent outcomes, champion selection, champion export requests, and demo prediction requests. The project SSE endpoint streams these durable rows as refresh hints.
 
@@ -72,10 +75,14 @@ Supported execution-facing planning fields include:
 - `class_balancing`
 - `class_balancing_config`
 - `sampling_strategy`
-- optimizer, scheduler, weight decay, fine-tune strategy, pretrained/freeze flags
+- optimizer, scheduler, weight decay, dropout, optimizer momentum, scheduler step parameters, label smoothing, gradient clipping, fine-tune strategy, pretrained/freeze flags
 - first-class mechanism metadata: `mechanism`, `intervention`, `evidence_used`, `expected_effect`
 
-The backend validates allowed model names, epochs, batch size, learning rate, image size, optimizer, scheduler, preprocessing values, augmentation keys, augmentation policy, class balancing, sampling strategy, early stopping, and fine-tune strategy.
+The backend validates allowed model names, epochs, batch size, learning rate, image size, optimizer, scheduler, optimizer-specific knobs, scheduler-specific knobs, dropout, label smoothing, gradient clipping, preprocessing values, augmentation keys, augmentation policy, class balancing config, sampling strategy, early stopping, and fine-tune strategy.
+
+AutoML is an optional backend hyperparameter suggestion layer, disabled by default through `automation_settings.automl_enabled`. When enabled, it operates only from `PlannedExperiment.automl` metadata that has already passed backend validation. The LLM remains responsible for strategy: model/template, preprocessing, image size/resolution intent, augmentation policy type, class-balancing strategy, sampling strategy, pretrained/freeze/fine-tune strategy, exploration/exploitation intent, and bounded search constraints.
+
+AutoML may tune only backend/worker-supported hyperparameters: `learning_rate`, `weight_decay`, `batch_size`, `epochs`, `early_stopping_patience`, `optimizer`, `scheduler`, `dropout`, `optimizer_momentum` only with SGD, `scheduler_step_size` and `scheduler_gamma` only with the step scheduler, `label_smoothing`, `gradient_clip_norm`, selected structured augmentation config values after the LLM chose the policy type, `class_balancing_config.effective_number_beta` only with effective-number class balancing, and `class_balancing_config.focal_loss_gamma` only with focal loss. It cannot tune strategy-owned fields such as `model`, `template`, `preprocessing`, `resolution_strategy`, `image_size`, `augmentation_policy`, `augmentation_policy_config.policy_type`, `class_balancing`, `sampling_strategy`, `pretrained`, `freeze_backbone`, or `fine_tune_strategy`. Samplers are `seeded_random`, `grid`, and lightweight `adaptive_bayesian`, which exploits compact persisted trial history without adding a heavy Bayesian dependency.
 
 Duplicate experiment signatures include preprocessing, augmentation policy/config, class-balancing config, sampling strategy, and resolution strategy. Backend follow-up validation also rejects or filters repeated mechanisms where the only changes are minor tuning knobs such as epochs, batch size, or learning rate.
 
@@ -93,7 +100,9 @@ When an LLM planner proposal passes JSON/schema parsing but fails backend valida
 6. Workers report epoch metrics, summary updates, and final evaluation.
 7. Workers complete or fail the job through backend APIs.
 
-Worker-side preprocessing currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, structured image augmentation, training-only MixUp/CutMix, weighted/focal/effective-number loss, weighted sampling, and bbox crop/full-image ablations when backend-validated annotations are available.
+For AutoML-enabled experiments, the orchestrator samples concrete hyperparameters before job creation, persists study/suggestion provenance, and places only compact `automl_summary`, `automl_study_id`, and `automl_suggestion_id` metadata in the job config. Workers still receive concrete training config and do not run search, schedule follow-up jobs, mutate datasets, or choose strategies.
+
+Worker-side training currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, structured image augmentation, training-only MixUp/CutMix, weighted/focal/effective-number loss, weighted sampling, dropout heads, SGD momentum, step scheduler size/gamma, label smoothing, focal-loss gamma, gradient clipping, and bbox crop/full-image ablations when backend-validated annotations are available.
 
 Training evaluations for image classification include confusion matrices and per-class precision/recall/F1 when real validation/test labels are available. The backend enriches final evaluation payloads with deterministic `training_diagnostics` inside `holistic_scores`, including train/validation loss gap, divergence status, severity, and trend deltas derived from persisted epoch metrics and run summaries.
 
@@ -123,6 +132,8 @@ Planner input is compacted into decision-ready cards rather than raw table dumps
 
 Training Monitor input is also compacted into run-evaluation cards. The backend still stores full run summaries, evaluations, epoch metrics, plans, and job configs, but the LLM receives capped cards and prompt-budget telemetry.
 
+When AutoML trials exist, the Planner and Training Monitor receive compact `optimizer_feedback_summary` cards: trial counts, best score/job, best hyperparameters, train/validation gap, trend, failed-trial count/patterns, and bounded narrowing advice. Raw trial dumps are not included in default LLM context.
+
 Visual exemplars are evidence only. Backend-curated/capped metadata may help the planner cite object scale, background dominance, blur, lighting, fine-grained classes, or bbox/crop plausibility. Planner context includes exemplar caps and audit details when available. Planner output is still JSON only, and backend validation remains the gate.
 
 ## Champion Flow
@@ -139,7 +150,7 @@ If a validated `STOP_PROJECT` decision does not name a champion but successful r
 
 Mission Control displays the selected champion, champion comparison table, objective fit, model profile, confusion preview, train/validation gap, seed variance when repeated seeded runs exist, and deployment notes.
 
-Champion selection is terminal for autonomous follow-up scheduling. A project champion or persisted `SELECT_CHAMPION` decision blocks new planner calls, stale/new follow-up plan creation, and follow-up execution. Continuing after champion selection requires explicit `POST /projects/:id/experimentation/reopen`, which records `REOPEN_EXPERIMENTATION` and `EXPERIMENTATION_REOPENED`.
+Champion selection records the current best deployment candidate, but it is no longer terminal for the monitored autonomous improvement loop by default. A selected champion can remain the comparison anchor while the Planner continues proposing backend-validated follow-up experiments and accumulating richer strategy memory. Legacy terminal champion/near-ceiling/no-improvement guards can be re-enabled with `MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS=true`. The reopen endpoint still records `REOPEN_EXPERIMENTATION` and `EXPERIMENTATION_REOPENED` when an operator wants an explicit audit marker.
 
 ## Export And Demo Flow
 
@@ -179,6 +190,8 @@ Mission Control polls project detail endpoints and optionally consumes `GET /pro
 
 Mission Control does not invent orchestration state. It uses backend APIs, renders partial data defensively, and surfaces rejection/failure states as part of operator trust.
 
+Mission Control exposes AutoML HPO settings, including enabled/disabled state and sampler. Experiment plan cards show compact AutoML status, sampler, search parameters, concrete suggestions, and provenance per displayed value. Job summaries surface that a job came from an AutoML suggestion without exposing raw trial history.
+
 ## Reliability State
 
 Implemented/current-scale hardening:
@@ -194,6 +207,7 @@ Implemented/current-scale hardening:
 - Worker requirements and execution events for local worker supervision.
 - Additive indexes for common project/status/agent/memory/scorecard reads.
 - Follow-up rounds remain bounded by automation settings and max follow-up rounds.
+- AutoML is settings-gated, backend-validated, persisted with provenance, and linked to normal plan/job execution rather than owning scheduling.
 
 Known reliability gaps:
 
@@ -211,6 +225,7 @@ Known reliability gaps:
 - Advanced augmentation object policies.
 - Production storage upload for generated export/exemplar artifacts beyond current worker-local `file://` URIs.
 - Real model reconstruction/export from completed training runs when no worker-visible artifact exists.
+- Heavier Bayesian/TPE/GP AutoML dependencies and richer multi-trial acquisition policies beyond the current lightweight adaptive sampler.
 - Durable idempotency keys, async agent task queue, and a standalone lease-recovery loop.
 
 Do not add Kafka, Redis, NATS, WebSockets, or a workflow engine until Postgres hardening, leases, idempotency, and SSE are no longer sufficient.

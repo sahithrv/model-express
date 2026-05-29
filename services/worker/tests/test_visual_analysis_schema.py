@@ -384,6 +384,19 @@ class VisualAnalysisSchemaTests(unittest.TestCase):
         with self.assertRaises(VisualAnalysisValidationError):
             validate_visual_analysis_output(payload, sample_manifest=[{"image_id": "img_1"}])
 
+    def test_rejects_raw_image_and_prompt_leakage(self) -> None:
+        payload = valid_payload()
+        payload["visual_traits"][0]["evidence"] = ["data:image/jpeg;base64,/9j/4AAQSkZJRg"]
+
+        with self.assertRaises(VisualAnalysisValidationError):
+            validate_visual_analysis_output(payload, sample_manifest=[{"image_id": "img_1"}])
+
+        payload = valid_payload()
+        payload["raw_prompt"] = "hidden prompt"
+
+        with self.assertRaises(VisualAnalysisValidationError):
+            validate_visual_analysis_output(payload, sample_manifest=[{"image_id": "img_1"}])
+
 
 if __name__ == "__main__":
     unittest.main()

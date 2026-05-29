@@ -64,6 +64,54 @@ def test_analyze_dataset_visuals_dispatch_posts_sample_pack_and_completes(tmp_pa
     assert "relative_path" not in serialized
 
 
+def test_analyze_dataset_visuals_completes_with_unavailable_record_on_llm_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_EXPRESS_DATASET_CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setenv("MODEL_EXPRESS_VISUAL_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("MODEL_EXPRESS_VISUAL_LLM_MODEL", "vision-model")
+    monkeypatch.delenv("MODEL_EXPRESS_PERSIST_DATASET_CACHE", raising=False)
+
+    def fake_download(storage_uri: str, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(destination, "w") as archive:
+            archive.writestr("cat/one.jpg", _image_bytes((80, 60), (220, 30, 30)))
+            archive.writestr("dog/one.jpg", _image_bytes((24, 160), (30, 30, 220)))
+        return destination
+
+    def fail_visual_llm(dataset: dict, config: dict, pack: dict) -> dict:
+        raise TimeoutError("simulated visual timeout")
+
+    monkeypatch.setattr(jobs, "download_s3_uri", fake_download)
+    monkeypatch.setattr(jobs, "_run_visual_llm_analysis", fail_visual_llm)
+    client = _FakeClient()
+    job = {
+        "id": "job_visual_timeout",
+        "template": "analyze_dataset_visuals",
+        "config": {
+            "dataset_id": "dataset_1",
+            "max_total_images": 2,
+            "max_high_detail_images": 1,
+            "max_image_bytes": 20_000,
+            "max_total_bytes": 50_000,
+            "image_size": 64,
+            "seed": 11,
+        },
+    }
+
+    jobs.run_job(client, job)
+
+    payload = client.visual_analysis_payload
+    assert client.completed_job_id == "job_visual_timeout"
+    assert client.failed == []
+    assert payload["provider"] == "openai"
+    assert payload["model"] == "vision-model"
+    assert payload["confidence"] == "low"
+    assert payload["visual_traits"] == []
+    assert payload["preprocessing_hypotheses"] == []
+    assert "simulated visual timeout" not in payload["raw_output"]
+    assert payload["input_context"]["repair"]["llm_unavailable"] is True
+    assert any("Visual LLM unavailable" in item for item in payload["limitations"])
+
+
 def _fake_visual_llm_analysis(dataset: dict, config: dict, pack: dict) -> dict:
     manifest = pack["sample_manifest"]
     analysis = {

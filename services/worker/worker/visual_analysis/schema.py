@@ -123,6 +123,10 @@ LOCAL_PATH_RE = re.compile(
     r"([A-Za-z]:\\|file://|s3://|aws_access_key|/Users/|/home/|/tmp/|\\\\)",
     re.IGNORECASE,
 )
+RAW_IMAGE_RE = re.compile(
+    r"(data:image/[a-z0-9.+-]+;base64,|base64\s*[:=,]|/9j/4AAQSkZJRg|iVBORw0KGgo)",
+    re.IGNORECASE,
+)
 MAX_TEXT_LENGTH = 500
 MAX_LONG_TEXT_LENGTH = 900
 MAX_ARRAY_ITEMS = 12
@@ -481,13 +485,21 @@ def _reject_path_leakage(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             normalized_key = _normalize(key)
-            if "path" in normalized_key or normalized_key in {"uri", "url"}:
+            if any(fragment in normalized_key for fragment in ("path", "uri", "url", "storage")):
                 raise VisualAnalysisValidationError(
                     f"visual analysis output included forbidden file reference field {path}.{key}"
                 )
+            if any(fragment in normalized_key for fragment in ("base64", "bytes", "raw_image")):
+                raise VisualAnalysisValidationError(
+                    f"visual analysis output included forbidden raw image field {path}.{key}"
+                )
+            if "prompt" in normalized_key:
+                raise VisualAnalysisValidationError(
+                    f"visual analysis output included forbidden raw prompt field {path}.{key}"
+                )
             if any(fragment in normalized_key for fragment in SENSITIVE_KEY_FRAGMENTS):
                 raise VisualAnalysisValidationError(
-                    f"visual analysis output included sensitive field {path}.{key}"
+                    f"visual analysis output included forbidden sensitive field {path}.{key}"
                 )
             _reject_path_leakage(child, f"{path}.{key}")
     elif isinstance(value, list):
@@ -495,6 +507,8 @@ def _reject_path_leakage(value: Any, path: str = "$") -> None:
             _reject_path_leakage(child, f"{path}[{index}]")
     elif isinstance(value, str) and LOCAL_PATH_RE.search(value):
         raise VisualAnalysisValidationError(f"visual analysis output leaked a file reference at {path}")
+    elif isinstance(value, str) and RAW_IMAGE_RE.search(value):
+        raise VisualAnalysisValidationError(f"visual analysis output leaked raw image content at {path}")
 
 
 def _manifest_image_ids(sample_manifest: list[dict[str, Any]] | None) -> set[str]:

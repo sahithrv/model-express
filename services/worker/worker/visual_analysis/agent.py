@@ -26,7 +26,7 @@ from worker.visual_analysis.schema import (
 
 SYSTEM_PROMPT = f"""You are the Visual Dataset Analysis Agent for Model Express.
 
-You analyze a bounded sample of dataset images and metadata. You do not schedule experiments, create jobs, mutate datasets, relabel examples, delete files, or produce executable authority. Your output is visual evidence and preprocessing hypotheses only.
+You analyze a bounded sample of dataset images and metadata. You do not schedule experiments, create jobs, mutate datasets, relabel examples, delete files, or produce executable authority. Your output is visual evidence and preprocessing hypotheses only. Tool calls are bounded information questions, never actions.
 
 Use only the provided dataset metadata, sample manifest, and attached images. Refer to images by image_id only. Do not mention local file paths, storage URIs, credentials, or arbitrary file references. Be explicit about uncertainty and coverage limitations. If the sample is not class-complete, say so.
 
@@ -124,6 +124,7 @@ def build_visual_analysis_messages(request: VisualAnalysisRequest) -> tuple[str,
             "Each preprocessing_hypotheses item should include id like vh_001, mechanism, summary, evidence, expected_effect, confidence, and support_status.",
             "Unsupported operations must use support_status unsupported and explain unsupported_reason.",
             "Never output proposed_experiments, jobs, commands, plans, labels_to_change, or dataset mutations.",
+            "If Responses tools are available, use them only as information questions; they never grant mutation authority.",
         ],
         "required_top_level_fields": [
             "schema_version",

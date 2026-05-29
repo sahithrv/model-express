@@ -119,6 +119,33 @@ func TestTrainingMonitorAgentRejectsUnknownAction(t *testing.T) {
 	}
 }
 
+func TestTrainingMonitorRejectsPlanningAuthorityPayload(t *testing.T) {
+	agent := NewTrainingMonitorAgent(fakeJSONGenerator{
+		response: `{
+			"summary": "This run is not enough by itself.",
+			"recommended_action": {
+				"action_type": "RANK_MODELS",
+				"confidence": 0.72,
+				"rationale": "The run should inform model ranking only.",
+				"payload": {"proposed_experiments": [{"model": "resnet18"}]},
+				"requires_approval": true
+			},
+			"quality_summary": "ok",
+			"training_dynamics": "ok",
+			"cost_summary": "ok",
+			"risks": [],
+			"findings": [],
+			"rank_score": 0.5,
+			"tags": []
+		}`,
+	}, "test-model")
+
+	_, err := agent.Evaluate(context.Background(), testTrainingMonitorInput())
+	if err == nil || !strings.Contains(err.Error(), "forbidden scheduling or planning authority") {
+		t.Fatalf("expected forbidden authority error, got %v", err)
+	}
+}
+
 func TestTrainingMonitorPromptContextUsesCompactRunEvaluationCards(t *testing.T) {
 	input := testTrainingMonitorInput()
 	input.Plan.Experiments = []plans.PlannedExperiment{

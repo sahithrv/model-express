@@ -4,6 +4,7 @@ import importlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -19,6 +20,23 @@ class ModalTrainingHelperTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.modal_app = _import_modal_app()
+
+    def test_modal_orchestrator_post_uses_longer_report_timeout(self) -> None:
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_post(url: str, *, json: dict, timeout: int):
+            calls.append({"url": url, "json": json, "timeout": timeout})
+            return Response()
+
+        with patch.dict("os.environ", {"MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS": "240"}):
+            with patch("requests.post", fake_post):
+                self.modal_app._post_json("http://orchestrator.test/jobs/job_1/complete", {"mlflow_run_id": "run_1"})
+
+        self.assertEqual(calls[0]["timeout"], 240)
 
     def test_transform_uses_dataset_normalization_metadata(self) -> None:
         try:
@@ -225,6 +243,50 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(focal_loss.__class__.__name__, "FocalLoss")
         self.assertTrue(torch.equal(weighted_loss.weight, weights))
         self.assertTrue(torch.equal(focal_loss.weight, weights))
+
+    def test_deferred_hyperparameters_are_worker_configurable(self) -> None:
+        try:
+            import torch
+            from torch import nn
+        except Exception as exc:  # pragma: no cover - depends on optional training deps
+            raise unittest.SkipTest(f"torch is unavailable: {exc}") from exc
+
+        parameter = nn.Parameter(torch.ones(1, requires_grad=True))
+        optimizer = self.modal_app._build_optimizer(
+            "sgd",
+            [parameter],
+            learning_rate=0.01,
+            weight_decay=0.02,
+            momentum=0.82,
+        )
+        scheduler = self.modal_app._build_scheduler(
+            "step",
+            optimizer,
+            epochs=9,
+            step_size=2,
+            gamma=0.35,
+        )
+        criterion = self.modal_app._build_criterion(
+            None,
+            "none",
+            torch.device("cpu"),
+            label_smoothing=0.12,
+        )
+        focal = self.modal_app._build_criterion(
+            None,
+            "focal_loss",
+            torch.device("cpu"),
+            class_balancing_config={"focal_loss_gamma": 3.0},
+        )
+        head = self.modal_app._classification_head(nn, 4, 2, dropout=0.25)
+
+        self.assertEqual(optimizer.param_groups[0]["momentum"], 0.82)
+        self.assertEqual(scheduler.step_size, 2)
+        self.assertEqual(scheduler.gamma, 0.35)
+        self.assertEqual(criterion.label_smoothing, 0.12)
+        self.assertEqual(focal.gamma, 3.0)
+        self.assertIsInstance(head[0], nn.Dropout)
+        self.assertEqual(head[0].p, 0.25)
 
     def test_effective_number_class_weights_are_normalized(self) -> None:
         try:

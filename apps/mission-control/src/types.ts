@@ -187,6 +187,12 @@ export type PlannedExperiment = {
   optimizer?: string;
   scheduler?: string;
   weight_decay?: number;
+  dropout?: number;
+  optimizer_momentum?: number;
+  scheduler_step_size?: number;
+  scheduler_gamma?: number;
+  label_smoothing?: number;
+  gradient_clip_norm?: number;
   augmentation?: Record<string, unknown>;
   augmentation_policy?: string;
   augmentation_policy_config?: {
@@ -205,6 +211,53 @@ export type PlannedExperiment = {
   pretrained?: boolean;
   freeze_backbone?: boolean;
   fine_tune_strategy?: string;
+  automl?: ExperimentAutoML;
+};
+
+export type AutoMLParameterSpec = {
+  name: string;
+  type: "float" | "integer" | "categorical" | string;
+  min?: number;
+  max?: number;
+  step?: number;
+  scale?: "linear" | "log" | string;
+  choices?: string[];
+  int_choices?: number[];
+  default?: unknown;
+  source?: string;
+  condition?: { field?: string; equals?: string };
+  notes?: string;
+};
+
+export type ExperimentAutoML = {
+  enabled?: boolean;
+  intent?: {
+    summary?: string;
+    planning_mode?: string;
+    exploration_intent?: string;
+    goals?: string[];
+    allowed_parameters?: string[];
+    strategy_description?: string;
+  };
+  sampler?: string;
+  seed?: number;
+  search_space?: { parameters?: AutoMLParameterSpec[] };
+  suggestion?: {
+    id?: string;
+    study_id?: string;
+    sampler?: string;
+    seed?: number;
+    values?: Record<string, unknown>;
+    final_values?: Record<string, unknown>;
+    provenance?: Record<string, string>;
+    validation_status?: string;
+    validation_errors?: string[];
+  };
+  final_values?: Record<string, unknown>;
+  value_provenance?: Record<string, string>;
+  strategy_snapshot?: Record<string, unknown>;
+  validation_status?: string;
+  validation_errors?: string[];
 };
 
 export type ExperimentPlan = {
@@ -430,15 +483,15 @@ export type AgentInvocation = {
   prompt_version?: string;
   provider?: string;
   model?: string;
-  input_messages: Array<Record<string, string>>;
-  input_context: Record<string, unknown>;
-  raw_output: string;
-  parsed_output: Record<string, unknown>;
-  validation_status: string;
+  input_messages?: Array<Record<string, string>>;
+  input_context?: Record<string, unknown>;
+  raw_output?: string;
+  parsed_output?: Record<string, unknown>;
+  validation_status?: string;
   validation_error?: string;
-  accepted_for_memory: boolean;
-  human_feedback: Record<string, unknown>;
-  downstream_outcome: Record<string, unknown>;
+  accepted_for_memory?: boolean;
+  human_feedback?: Record<string, unknown>;
+  downstream_outcome?: Record<string, unknown>;
   created_at: string;
 };
 
@@ -466,5 +519,7 @@ export type AutomationSettings = {
   agent_mode: string;
   llm_provider: string;
   llm_model: string;
+  automl_enabled: boolean;
+  automl_sampler: string;
   updated_at: string;
 };

@@ -2,13 +2,14 @@ import requests
 import os
 import time
 
-REQUEST_TIMEOUT_SECONDS = 10
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
+DEFAULT_REPORT_TIMEOUT_SECONDS = 300
 POLL_INTERVAL_SECONDS = 5
 
 class OrchestratorClient:
-    def __init__(self, base_url: str, timeout: int = 5):
+    def __init__(self, base_url: str, timeout: int | None = None):
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else request_timeout_seconds()
     
     def get_dataset(self, dataset_id: str) -> dict:
         response = requests.get(
@@ -34,7 +35,7 @@ class OrchestratorClient:
                 "name": os.getenv("WORKER_NAME", "local-worker-1"),
                 "gpu_type": os.getenv("GPU_TYPE", "local"),
             },
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=request_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -43,7 +44,7 @@ class OrchestratorClient:
     def poll_job(self, worker_id: str) -> dict | None:
         response = requests.post(
             f"{self.base_url}/workers/{worker_id}/poll",
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=request_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()["job"]
@@ -56,7 +57,7 @@ class OrchestratorClient:
                 "epoch": epoch,
                 "metrics": metrics,
             },
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -66,7 +67,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/training-run-summary",
             json=summary,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -75,7 +76,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/training-run-evaluation",
             json=evaluation,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -84,7 +85,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/champion-export-result",
             json=result,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -93,7 +94,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/champion-demo-prediction-result",
             json=result,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -102,7 +103,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/datasets/{dataset_id}/visual-exemplars",
             json=payload,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -111,7 +112,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/datasets/{dataset_id}/visual-analysis-result",
             json=payload,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -120,7 +121,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/complete",
             json={"mlflow_run_id": mlflow_run_id},
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -130,7 +131,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/fail",
             json={"error": error},
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
@@ -155,3 +156,22 @@ class OrchestratorClient:
         except Exception as exc:
             self.fail_job(job_id, str(exc))
             raise
+
+
+def request_timeout_seconds() -> int:
+    return _positive_int_env("MODEL_EXPRESS_WORKER_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+
+
+def report_timeout_seconds() -> int:
+    return _positive_int_env("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", DEFAULT_REPORT_TIMEOUT_SECONDS)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default

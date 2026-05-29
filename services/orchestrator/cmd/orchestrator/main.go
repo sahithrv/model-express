@@ -10,6 +10,7 @@ import (
 
 	"model-express/services/orchestrator/internal/api"
 	"model-express/services/orchestrator/internal/config"
+	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/store"
 )
 
@@ -21,6 +22,7 @@ func main() {
 	}
 	if err := config.LoadRepoEnv(repoRoot); err != nil {
 		logger.Warn("failed to load repo env files", "error", err)
+		diagnostics.Event("warn", "repo_env_load_failed", map[string]any{"error": err.Error()})
 	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -34,6 +36,7 @@ func main() {
 	postgresStore, err := store.NewPostgresStore(ctx, databaseURL)
 	if err != nil {
 		logger.Error("failed to connect to postgres", "error", err)
+		diagnostics.Event("error", "postgres_connect_failed", map[string]any{"error": err.Error()})
 		os.Exit(1)
 	}
 	defer postgresStore.Close()
@@ -48,8 +51,10 @@ func main() {
 	}
 
 	logger.Info("starting orchestrator", "addr", addr)
+	diagnostics.Event("info", "orchestrator_started", map[string]any{"addr": addr})
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("orchestrator stopped", "error", err)
+		diagnostics.Event("error", "orchestrator_stopped", map[string]any{"error": err.Error()})
 		os.Exit(1)
 	}
 }

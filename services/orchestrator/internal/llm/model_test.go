@@ -1,6 +1,9 @@
 package llm
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestConfigFromEnvUsesVisualModelFallback(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "")
@@ -34,5 +37,42 @@ func TestConfigFromEnvPrefersGeneralModelOverVisualFallback(t *testing.T) {
 	config := ConfigFromEnv(true, ProviderLocal, "")
 	if config.Model != "planner-model" {
 		t.Fatalf("expected general LLM model, got %q", config.Model)
+	}
+}
+
+func TestConfigFromEnvReadsResponsesSettings(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_LLM_API_STYLE", "responses")
+	t.Setenv("MODEL_EXPRESS_LLM_REASONING_EFFORT", "high")
+	t.Setenv("MODEL_EXPRESS_LLM_PLATEAU_REASONING_EFFORT", "xhigh")
+	t.Setenv("MODEL_EXPRESS_LLM_STORED_RESPONSES", "false")
+	t.Setenv("MODEL_EXPRESS_LLM_MAX_TOOL_ROUNDS", "7")
+	t.Setenv("MODEL_EXPRESS_LLM_TIMEOUT_SECONDS", "240")
+
+	config := ConfigFromEnv(true, ProviderOpenAI, "test-model")
+	if config.APIStyle != APIStyleResponses {
+		t.Fatalf("expected responses API style, got %q", config.APIStyle)
+	}
+	if config.ReasoningEffort != ReasoningEffortHigh {
+		t.Fatalf("expected high reasoning effort, got %q", config.ReasoningEffort)
+	}
+	if config.PlateauReasoningEffort != ReasoningEffortXHigh {
+		t.Fatalf("expected xhigh plateau reasoning effort, got %q", config.PlateauReasoningEffort)
+	}
+	if config.StoredResponses {
+		t.Fatalf("expected stored responses to be disabled")
+	}
+	if config.MaxToolRounds != 7 {
+		t.Fatalf("expected max tool rounds 7, got %d", config.MaxToolRounds)
+	}
+	if config.Timeout != 240*time.Second {
+		t.Fatalf("expected timeout 240s, got %s", config.Timeout)
+	}
+}
+
+func TestConfigFromEnvDefaultsToLongerLLMTimeout(t *testing.T) {
+	config := ConfigFromEnv(true, ProviderOpenAI, "test-model")
+
+	if config.Timeout != DefaultTimeoutSeconds*time.Second {
+		t.Fatalf("expected default timeout %ds, got %s", DefaultTimeoutSeconds, config.Timeout)
 	}
 }
