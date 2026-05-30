@@ -112,6 +112,40 @@ def test_analyze_dataset_visuals_completes_with_unavailable_record_on_llm_failur
     assert any("Visual LLM unavailable" in item for item in payload["limitations"])
 
 
+def test_visual_dataset_metadata_merges_active_safe_metadata_summary():
+    dataset = {
+        "id": "dataset_1",
+        "name": "CUB",
+        "profile": {
+            "class_count": 1,
+            "total_images": 11796,
+            "class_distribution": {"CUB_200_2011": 11796},
+            "metadata_summary": {"bbox_available": False},
+        },
+    }
+    config = {
+        "dataset_id": "dataset_1",
+        "agent_safe_metadata_summary": {
+            "class_count": 200,
+            "sample_count": 11788,
+            "bbox_annotation_count": 11788,
+            "bbox_sample_count": 11788,
+            "bbox_coverage_ratio": 1.0,
+            "annotation_counts": {"bbox": 11788},
+            "capabilities": {"bbox_annotations": True},
+        },
+    }
+    manifest = {"images_available": 11796, "classes_total": 1}
+
+    metadata = jobs._visual_dataset_metadata(dataset, config, manifest)
+
+    assert metadata["class_count"] == 200
+    assert metadata["total_images"] == 11796
+    assert metadata["agent_safe_metadata_summary"]["bbox_annotation_count"] == 11788
+    assert metadata["metadata_summary"]["bbox_sample_count"] == 11788
+    assert metadata["profile"]["agent_safe_metadata_summary"]["capabilities"]["bbox_annotations"] is True
+
+
 def _fake_visual_llm_analysis(dataset: dict, config: dict, pack: dict) -> dict:
     manifest = pack["sample_manifest"]
     analysis = {

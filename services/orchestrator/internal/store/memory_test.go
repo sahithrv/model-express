@@ -136,3 +136,118 @@ func TestMemoryStoreDatasetVisualAnalysisCRUD(t *testing.T) {
 		t.Fatalf("unexpected visual analysis ordering: %#v", analyses)
 	}
 }
+
+func TestMemoryStoreDatasetMetadataImportActiveSwapAndBundle(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("metadata project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	dataset, err := store.CreateDataset(project.ID, "birds", "s3://bucket/birds.zip", "sha", 2048)
+	if err != nil {
+		t.Fatalf("CreateDataset() error = %v", err)
+	}
+
+	first, err := store.CreateDatasetMetadataImport(datasets.DatasetMetadataImport{
+		DatasetID: dataset.ID,
+		Status:    datasets.MetadataImportStatusSucceeded,
+		Active:    true,
+		Sources: []datasets.DatasetMetadataSource{{
+			ID:             "source_csv",
+			DatasetID:      dataset.ID,
+			RelativePath:   "labels.csv",
+			DetectedFormat: datasets.MetadataFormatCSVManifest,
+			Status:         datasets.MetadataSourceStatusParsed,
+		}},
+		Classes: []datasets.DatasetClass{{
+			DatasetID: dataset.ID,
+			ClassKey:  "cat",
+			ClassName: "cat",
+			SourceID:  "source_csv",
+		}},
+		ManifestRecords: []datasets.DatasetManifestRecord{{
+			DatasetID:    dataset.ID,
+			SampleKey:    "cat/one.jpg",
+			MediaType:    datasets.MetadataMediaTypeImage,
+			RelativePath: "cat/one.jpg",
+			LabelKey:     "cat",
+			LabelName:    "cat",
+			Split:        "train",
+			SourceID:     "source_csv",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateDatasetMetadataImport() first error = %v", err)
+	}
+	if !first.Active || first.ImportVersion != 1 {
+		t.Fatalf("first import active/version = %t/%d", first.Active, first.ImportVersion)
+	}
+
+	second, err := store.CreateDatasetMetadataImport(datasets.DatasetMetadataImport{
+		DatasetID: dataset.ID,
+		Status:    datasets.MetadataImportStatusSucceeded,
+		Active:    true,
+		Sources: []datasets.DatasetMetadataSource{{
+			ID:             "source_voc",
+			DatasetID:      dataset.ID,
+			RelativePath:   "annotations/one.xml",
+			DetectedFormat: datasets.MetadataFormatPascalVOC,
+			Status:         datasets.MetadataSourceStatusParsed,
+		}},
+		Classes: []datasets.DatasetClass{{
+			DatasetID: dataset.ID,
+			ClassKey:  "dog",
+			ClassName: "dog",
+			SourceID:  "source_voc",
+		}},
+		ManifestRecords: []datasets.DatasetManifestRecord{{
+			DatasetID:    dataset.ID,
+			SampleKey:    "dog/one.jpg",
+			MediaType:    datasets.MetadataMediaTypeImage,
+			RelativePath: "dog/one.jpg",
+			LabelKey:     "dog",
+			LabelName:    "dog",
+			Split:        "test",
+			SourceID:     "source_voc",
+		}},
+		Annotations: []datasets.DatasetAnnotation{{
+			DatasetID:      dataset.ID,
+			SampleKey:      "dog/one.jpg",
+			AnnotationType: datasets.MetadataAnnotationBBox,
+			LabelKey:       "dog",
+			LabelName:      "dog",
+			BBox:           map[string]any{"xmin": 1, "ymin": 2, "xmax": 10, "ymax": 20},
+			SourceID:       "source_voc",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateDatasetMetadataImport() second error = %v", err)
+	}
+	if second.ImportVersion != 2 || !second.Active {
+		t.Fatalf("second import active/version = %t/%d", second.Active, second.ImportVersion)
+	}
+	active, err := store.GetActiveDatasetMetadataImport(dataset.ID)
+	if err != nil {
+		t.Fatalf("GetActiveDatasetMetadataImport() error = %v", err)
+	}
+	if active.ID != second.ID {
+		t.Fatalf("active import = %s, want %s", active.ID, second.ID)
+	}
+	reloadedFirst, err := store.GetDatasetMetadataImport(first.ID)
+	if err != nil {
+		t.Fatalf("GetDatasetMetadataImport(first) error = %v", err)
+	}
+	if reloadedFirst.Active {
+		t.Fatal("first import should have been deactivated")
+	}
+	bundle, err := store.GetDatasetMetadataBundle(dataset.ID, "", true, 10, 0)
+	if err != nil {
+		t.Fatalf("GetDatasetMetadataBundle() error = %v", err)
+	}
+	if bundle.ImportID != second.ID || len(bundle.ManifestRecords) != 1 || len(bundle.Annotations) != 1 {
+		t.Fatalf("unexpected bundle: %#v", bundle)
+	}
+	if !active.AgentSafeSummary.Capabilities["bbox_annotations"] {
+		t.Fatalf("expected active safe summary bbox capability: %#v", active.AgentSafeSummary)
+	}
+}

@@ -4,7 +4,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { Transform } = require("stream");
-const { CreateBucketCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
+const { pathToFileURL } = require("url");
+const { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 const { collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
 
 let mainWindow;
@@ -94,7 +95,15 @@ ipcMain.handle("orchestrator:request", async (_event, request) => {
       payload && typeof payload === "object" && payload.error
         ? payload.error
         : text || response.statusText;
-    throw new Error(`${response.status} ${message}`);
+    return {
+      __mission_control_http_error: true,
+      status: response.status,
+      statusText: response.statusText,
+      message,
+      path: requestPath,
+      url: url.toString(),
+      payload,
+    };
   }
 
   return payload;
@@ -142,9 +151,142 @@ ipcMain.handle("dataset:uploadFolder", async (_event, options) => {
   return uploadDatasetFolder(options);
 });
 
+ipcMain.handle("demo:selectImage", async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Select image for champion test",
+    properties: ["openFile"],
+    filters: [
+      { name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "bmp"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  const imagePath = result.filePaths[0];
+  const stats = fs.statSync(imagePath);
+  const imageURI = pathToFileURL(imagePath).toString();
+
+  return {
+    path: imagePath,
+    name: path.basename(imagePath),
+    uri: imageURI,
+    image_uri: imageURI,
+    image_id: path.basename(imagePath),
+    thumbnail_uri: demoImagePreviewURI(imagePath, imageURI, stats.size),
+    split: "custom",
+    size_bytes: stats.size,
+    metadata: {
+      source: "local_file",
+      file_name: path.basename(imagePath),
+      size_bytes: stats.size,
+    },
+  };
+});
+
+ipcMain.handle("artifact:loadModel", async (_event, request) => {
+  const artifactUri = String(request?.artifactUri ?? "").trim();
+  if (!artifactUri) {
+    throw new Error("artifactUri is required.");
+  }
+  const buffer = artifactUri.startsWith("s3://")
+    ? await readS3ObjectBuffer(artifactUri, request)
+    : readLocalArtifactBuffer(artifactUri);
+  return {
+    artifact_uri: artifactUri,
+    size_bytes: buffer.byteLength,
+    bytes: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
+  };
+});
+
 ipcMain.handle("worker:ensureProjectWorker", async (_event, options) => {
   return ensureProjectWorker(options);
 });
+
+function demoImagePreviewURI(imagePath, fallbackURI, sizeBytes) {
+  const maxInlinePreviewBytes = 8 * 1024 * 1024;
+  if (sizeBytes > maxInlinePreviewBytes) {
+    return fallbackURI;
+  }
+  try {
+    const encoded = fs.readFileSync(imagePath).toString("base64");
+    return `data:${imageMimeType(imagePath)};base64,${encoded}`;
+  } catch {
+    return fallbackURI;
+  }
+}
+
+function imageMimeType(imagePath) {
+  switch (path.extname(imagePath).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".webp":
+      return "image/webp";
+    case ".bmp":
+      return "image/bmp";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function readLocalArtifactBuffer(artifactUri) {
+  const artifactPath = artifactPathFromURI(artifactUri);
+  if (!artifactPath) {
+    throw new Error(`Unsupported model artifact URI: ${artifactUri}`);
+  }
+  return fs.readFileSync(artifactPath);
+}
+
+function artifactPathFromURI(value) {
+  if (process.platform === "win32" && value.length > 2 && value[1] === ":") {
+    return value;
+  }
+  if (value.startsWith("file://")) {
+    return new URL(value);
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    return null;
+  }
+  return value;
+}
+
+async function readS3ObjectBuffer(artifactUri, options = {}) {
+  const parsed = new URL(artifactUri);
+  const bucket = parsed.hostname;
+  const key = parsed.pathname.replace(/^\/+/, "");
+  if (!bucket || !key) {
+    throw new Error(`Invalid S3 model artifact URI: ${artifactUri}`);
+  }
+  const client = createS3Client(options);
+  const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  return streamToBuffer(response.Body);
+}
+
+function createS3Client(options = {}) {
+  return new S3Client({
+    endpoint: options.endpoint ?? process.env.S3_ENDPOINT_URL ?? "http://localhost:9000",
+    region: options.region ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1",
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: options.accessKeyId ?? process.env.AWS_ACCESS_KEY_ID ?? "model_express",
+      secretAccessKey: options.secretAccessKey ?? process.env.AWS_SECRET_ACCESS_KEY ?? "model_express_password",
+    },
+  });
+}
+
+async function streamToBuffer(stream) {
+  if (!stream) return Buffer.alloc(0);
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
 
 function ensureProjectWorker(options) {
   const { projectId, baseUrl } = options;

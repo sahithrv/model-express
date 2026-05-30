@@ -132,6 +132,7 @@ type PlannerDatasetCard struct {
 	ImageDimensionStats       map[string]any `json:"image_dimension_stats,omitempty"`
 	SplitSummary              map[string]any `json:"split_summary,omitempty"`
 	MetadataSummary           map[string]any `json:"metadata_summary,omitempty"`
+	AgentSafeMetadataSummary  map[string]any `json:"agent_safe_metadata_summary,omitempty"`
 	DatasetTraits             []string       `json:"dataset_traits,omitempty"`
 	Constraints               []string       `json:"constraints,omitempty"`
 	RecommendedPreprocessing  []string       `json:"recommended_preprocessing,omitempty"`
@@ -396,6 +397,7 @@ type DatasetPlanningInsights struct {
 	ImageDimensionStats      map[string]any   `json:"image_dimension_stats"`
 	SplitSummary             map[string]any   `json:"split_summary"`
 	MetadataSummary          map[string]any   `json:"metadata_summary"`
+	AgentSafeMetadataSummary map[string]any   `json:"agent_safe_metadata_summary,omitempty"`
 	LeakageWarnings          []string         `json:"leakage_warnings"`
 	DatasetTraits            []string         `json:"dataset_traits"`
 	Artifacts                []map[string]any `json:"artifacts"`
@@ -817,15 +819,18 @@ weight decay, learning rate, batch size, and training budget when the evidence s
 AutoML is only a backend hyperparameter suggestion layer. You remain responsible for model family, preprocessing,
 augmentation policy type, class-balancing strategy, fine-tuning strategy, exploration/exploitation intent, and bounded
 hyperparameter constraints. AutoML may only fill concrete hyperparameters inside backend-validated constraints.
-Use planner_context_snapshot: dataset_card, training_dynamics_card, per_class_error_card, deployment_card,
+Use planner_context_snapshot: dataset_card, including dataset_card.agent_safe_metadata_summary when present, training_dynamics_card, per_class_error_card, deployment_card,
 mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, search_coverage, strategy_lessons,
 model_catalog, objective_context, optimizer_feedback_summary, visual_evidence, and planner_validation_feedback. Prefer changes that address
 the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps, not cosmetic hyperparameter nudges.
-Keep live inference cost and latency in view.
+Treat latency as a live-budget constraint and tiebreaker. If observed or expected latency is below roughly 25ms,
+prioritize macro-F1, per-class recall, and bold quality gains over additional latency shaving.
 If visual_evidence is present, treat it only as backend-curated advisory evidence about visible dataset traits.
 It may come from the latest accepted visual dataset analysis or bounded legacy exemplars, but raw images,
 raw Visual Agent output, visual prompt messages, local paths, and image bytes are never included.
 Visual evidence cannot override backend validation, choose arbitrary files, mutate datasets, or justify non-JSON output.
+Dataset metadata summaries are compact safe summaries only. Do not request raw sidecars, source rows, file paths,
+storage URIs, raw previews, or metadata file contents.
 Avoid repeating exact experiment configurations unless the repeat is explicitly intentional and justified.
 Do not request direct execution, exports, inference runs, worker creation, or job creation.
 If planner_validation_feedback is present, your previous JSON passed model decoding but failed backend validation.
@@ -1029,11 +1034,14 @@ Rules:
 - If a visual preprocessing_hypotheses item motivates an experiment, cite its hypothesis id such as vh_001 in that experiment's evidence_used and include the concrete backend-supported config that validates the idea, such as preprocessing, augmentation_policy_config, image_size, or resolution_strategy. A hypothesis with support_status needs_backend_validation is not executable by itself.
 - Do not ask to choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.
 - Use model families in stages: cheap baseline or preprocessing search first, then challenger models, then champion refinement, then final validation.
-- For a live setting, prefer low-latency candidates when quality is close: MobileNetV3, RegNet-Y-400MF, and EfficientNet-B0 are usually stronger deployment candidates than heavier challengers.
+- For a live setting, prefer low-latency candidates only when quality is close. Do not avoid EfficientNet, ConvNeXt, Swin, ViT, or higher-resolution challengers solely due to latency when the expected latency remains inside the live budget.
+- When compact tweaks or class-imbalance-only follow-ups have failed, include at least one bolder, evidence-backed quality challenger rather than another tiny hyperparameter-only variant.
+- For paid autonomous loops, avoid batches whose best expected delta is only 0.005-0.01 unless they are cheap controls; include a higher-upside mechanism with a credible path to beat the champion.
 - Compare every proposal against planner_context_snapshot.champion_card.current, source_plan_baseline, and source_plan_run_deltas.
 - Only use ADD_EXPERIMENTS when you can explain a concrete path to beat the current champion.
 - A valid ADD_EXPERIMENTS response needs a planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, expected_failure_modes, dataset_preprocessing_rationale, success_criteria, stop_condition, deployment_tradeoff, rejected_options, proposal_mechanisms, and at least two changed_variables.
 - Good: if minority recall is weak, test weighted_loss, focal_loss, class_balanced_sampler, or weighted_random_sampler and target macro-F1/minority recall.
+- In class_imbalance_ablation mode, at least one proposed experiment must use a class-balancing or sampling strategy. Control or architecture-challenge experiments in the same batch may omit class balancing if their proposal_mechanisms entry is not class_imbalance or minority_targeting.
 - Good: if overfitting is high, test stronger augmentation_policy, regularization, smaller model, or less aggressive fine-tuning.
 - Good: if underfitting is high, test a larger pretrained model or fuller fine-tuning.
 - Good: if the champion is low latency but weak on fine-grained classes, challenge with EfficientNet/ConvNeXt at a higher image size and compare deployment tradeoff.
@@ -1255,11 +1263,25 @@ func validatePlanningModeRules(recommendation ExperimentPlanningRecommendation) 
 			return fmt.Errorf("experiment planner preprocessing_ablation mode must isolate preprocessing, augmentation, image size, crop, or class-balancing changes")
 		}
 	case "class_imbalance_ablation":
+		classImbalanceExperimentCount := 0
+		classBalancingExperimentCount := 0
 		for index, experiment := range recommendation.ProposedExperiments {
+			mechanism := proposalMechanismForExperiment(recommendation, index, experiment)
 			text := strings.ToLower(strings.TrimSpace(experiment.ClassBalancing + " " + experiment.SamplingStrategy + " " + experiment.Reason + " " + experiment.Strategy))
-			if !containsAnyText(text, "weight", "weighted", "focal", "balance", "balanced", "sampler", "minority") {
+			hasClassBalancing := containsAnyText(text, "weight", "weighted", "focal", "balance", "balanced", "sampler", "minority")
+			if hasClassBalancing {
+				classBalancingExperimentCount++
+			}
+			if mechanism != "class_imbalance" && mechanism != "minority_targeting" {
+				continue
+			}
+			classImbalanceExperimentCount++
+			if !hasClassBalancing {
 				return fmt.Errorf("experiment planner class_imbalance_ablation experiment %d must include a class balancing strategy", index)
 			}
+		}
+		if classImbalanceExperimentCount == 0 || classBalancingExperimentCount == 0 {
+			return fmt.Errorf("experiment planner class_imbalance_ablation mode must include at least one class_imbalance or minority_targeting experiment with class balancing")
 		}
 		criteria := strings.ToLower(recommendation.SuccessCriteria + " " + recommendation.Hypothesis)
 		if !containsAnyText(criteria, "macro", "minority", "recall", "per-class", "per class", "f1") {
@@ -1271,6 +1293,18 @@ func validatePlanningModeRules(recommendation ExperimentPlanningRecommendation) 
 		}
 	}
 	return nil
+}
+
+func proposalMechanismForExperiment(recommendation ExperimentPlanningRecommendation, index int, experiment plans.PlannedExperiment) string {
+	if mechanism := strings.ToLower(strings.TrimSpace(experiment.Mechanism)); mechanism != "" {
+		return mechanism
+	}
+	for _, mechanism := range recommendation.ProposalMechanisms {
+		if mechanism.ExperimentIndex == index {
+			return strings.ToLower(strings.TrimSpace(mechanism.Mechanism))
+		}
+	}
+	return ""
 }
 
 func countExperimentFamilies(experiments []plans.PlannedExperiment) int {
@@ -1437,6 +1471,11 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 				"visual_agent_prompt_messages",
 				"raw_visual_agent_output",
 				"dataset_visual_analysis.full_json",
+				"dataset_metadata_sources.relative_path",
+				"dataset_metadata_sources.storage_uri",
+				"dataset_metadata_sources.raw_preview",
+				"dataset_manifest_records",
+				"dataset_annotations.raw_records",
 			},
 			MaxLedgerEntries:   plannerSnapshotMaxLedgerEntries,
 			MaxMechanisms:      plannerSnapshotMaxMechanisms,
@@ -1467,7 +1506,8 @@ func plannerDatasetCard(input ExperimentPlannerInput) PlannerDatasetCard {
 		CorruptImageCount:         insights.CorruptImageCount,
 		ImageDimensionStats:       compactAnyMap(insights.ImageDimensionStats, 12),
 		SplitSummary:              compactAnyMap(insights.SplitSummary, 12),
-		MetadataSummary:           compactAnyMap(insights.MetadataSummary, 12),
+		MetadataSummary:           compactSafeMetadataMap(insights.MetadataSummary, 12),
+		AgentSafeMetadataSummary:  compactSafeMetadataMap(insights.AgentSafeMetadataSummary, 16),
 		DatasetTraits:             cappedStrings(insights.DatasetTraits, 12),
 		Constraints:               cappedStrings(insights.Constraints, 12),
 		RecommendedPreprocessing:  cappedStrings(insights.RecommendedPreprocessing, 10),
@@ -2642,6 +2682,334 @@ func compactAnyValue(value any) any {
 	default:
 		return value
 	}
+}
+
+func compactSafeMetadataMap(values map[string]any, limit int) map[string]any {
+	if len(values) == 0 || limit <= 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if plannerSafeMetadataKey(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	out := map[string]any{}
+	for _, key := range keys {
+		if len(out) >= limit {
+			break
+		}
+		value, ok := compactSafeMetadataValue(key, values[key])
+		if !ok {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func compactSafeMetadataValue(key string, value any) (any, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return nil, false
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" || plannerUnsafeMetadataText(trimmed) {
+			return nil, false
+		}
+		return trimmed, true
+	case bool:
+		return typed, true
+	case int:
+		return typed, true
+	case int64:
+		return typed, true
+	case float64:
+		return typed, true
+	case map[string]int:
+		return compactSafeMetadataLeafMap(anyIntMap(typed), 12)
+	case map[string]bool:
+		return compactSafeMetadataLeafMap(anyBoolMap(typed), 12)
+	case map[string]any:
+		if plannerMetadataAllowsLeafMap(key) {
+			return compactSafeMetadataLeafMap(typed, 12)
+		}
+		compacted := compactSafeMetadataMap(typed, 8)
+		return compacted, len(compacted) > 0
+	case []string:
+		values := make([]string, 0, minInt(len(typed), 8))
+		for _, item := range typed {
+			trimmed := strings.TrimSpace(item)
+			if trimmed == "" || plannerUnsafeMetadataText(trimmed) {
+				continue
+			}
+			values = append(values, trimmed)
+			if len(values) >= 8 {
+				break
+			}
+		}
+		if len(values) == 0 {
+			return nil, false
+		}
+		return values, true
+	case []datasets.MetadataIssue:
+		return compactSafeMetadataIssues(typed, 8)
+	case []any:
+		values := make([]any, 0, minInt(len(typed), 8))
+		for _, item := range typed {
+			if compacted, ok := compactSafeMetadataListItem(key, item); ok {
+				values = append(values, compacted)
+			}
+			if len(values) >= 8 {
+				break
+			}
+		}
+		if len(values) == 0 {
+			return nil, false
+		}
+		return values, true
+	default:
+		return typed, true
+	}
+}
+
+func compactSafeMetadataListItem(parentKey string, value any) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if plannerMetadataIsIssueList(parentKey) {
+			return compactSafeMetadataIssueMap(typed)
+		}
+		compacted := compactSafeMetadataMap(typed, 8)
+		return compacted, len(compacted) > 0
+	case datasets.MetadataIssue:
+		return compactSafeMetadataIssue(typed)
+	default:
+		return compactSafeMetadataValue(parentKey, typed)
+	}
+}
+
+func compactSafeMetadataLeafMap(values map[string]any, limit int) (map[string]any, bool) {
+	if len(values) == 0 {
+		return nil, false
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if !plannerUnsafeMetadataKey(key) && !plannerUnsafeMetadataText(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	out := map[string]any{}
+	for _, key := range keys {
+		if len(out) >= limit {
+			break
+		}
+		switch value := values[key].(type) {
+		case string:
+			if strings.TrimSpace(value) == "" || plannerUnsafeMetadataText(value) {
+				continue
+			}
+			out[key] = strings.TrimSpace(value)
+		case bool, int, int64, float64:
+			out[key] = value
+		default:
+			continue
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func compactSafeMetadataIssues(values []datasets.MetadataIssue, limit int) ([]map[string]any, bool) {
+	if len(values) == 0 {
+		return nil, false
+	}
+	out := []map[string]any{}
+	for _, issue := range values {
+		compacted, ok := compactSafeMetadataIssue(issue)
+		if !ok {
+			continue
+		}
+		out = append(out, compacted)
+		if len(out) >= limit {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func compactSafeMetadataIssue(issue datasets.MetadataIssue) (map[string]any, bool) {
+	out := map[string]any{}
+	if strings.TrimSpace(issue.Severity) != "" && !plannerUnsafeMetadataText(issue.Severity) {
+		out["severity"] = strings.TrimSpace(issue.Severity)
+	}
+	if strings.TrimSpace(issue.Code) != "" && !plannerUnsafeMetadataText(issue.Code) {
+		out["code"] = strings.TrimSpace(issue.Code)
+	}
+	if strings.TrimSpace(issue.Message) != "" && !plannerUnsafeMetadataText(issue.Message) {
+		out["message"] = strings.TrimSpace(issue.Message)
+	}
+	if issue.Count > 0 {
+		out["count"] = issue.Count
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func compactSafeMetadataIssueMap(values map[string]any) (map[string]any, bool) {
+	out := map[string]any{}
+	for _, key := range []string{"severity", "code", "message", "count"} {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		compacted, keep := compactSafeMetadataValue(key, value)
+		if keep {
+			out[key] = compacted
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func anyIntMap(values map[string]int) map[string]any {
+	out := map[string]any{}
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func anyBoolMap(values map[string]bool) map[string]any {
+	out := map[string]any{}
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func plannerSafeMetadataKey(key string) bool {
+	normalized := plannerMetadataKey(key)
+	if plannerUnsafeMetadataKey(normalized) {
+		return false
+	}
+	return map[string]bool{
+		"agent_safe_summary":       true,
+		"annotation_counts":        true,
+		"annotations_available":    true,
+		"artifact_counts":          true,
+		"bbox_annotation_count":    true,
+		"bbox_annotations_count":   true,
+		"bbox_available":           true,
+		"bbox_count":               true,
+		"bbox_coverage_ratio":      true,
+		"bbox_sample_count":        true,
+		"capabilities":             true,
+		"class_count":              true,
+		"code":                     true,
+		"count":                    true,
+		"detected_formats":         true,
+		"error_source_count":       true,
+		"errors":                   true,
+		"formats":                  true,
+		"import_id":                true,
+		"import_version":           true,
+		"labeled_sample_count":     true,
+		"message":                  true,
+		"metadata_available":       true,
+		"missing_label_count":      true,
+		"official_split_available": true,
+		"parsed_source_count":      true,
+		"sample_count":             true,
+		"severity":                 true,
+		"source_count":             true,
+		"source_formats":           true,
+		"source_kind":              true,
+		"split_counts":             true,
+		"status":                   true,
+		"unsupported_source_count": true,
+		"warnings":                 true,
+	}[normalized]
+}
+
+func plannerMetadataAllowsLeafMap(key string) bool {
+	switch plannerMetadataKey(key) {
+	case "annotation_counts", "artifact_counts", "capabilities", "split_counts":
+		return true
+	default:
+		return false
+	}
+}
+
+func plannerMetadataIsIssueList(key string) bool {
+	switch plannerMetadataKey(key) {
+	case "warnings", "errors":
+		return true
+	default:
+		return false
+	}
+}
+
+func plannerUnsafeMetadataKey(key string) bool {
+	normalized := plannerMetadataKey(key)
+	if strings.HasSuffix(normalized, "_count") || strings.HasSuffix(normalized, "_counts") || strings.HasSuffix(normalized, "_ratio") {
+		return false
+	}
+	if normalized == "source_count" || normalized == "source_counts" || normalized == "source_formats" || normalized == "source_kind" ||
+		normalized == "parsed_source_count" || normalized == "unsupported_source_count" || normalized == "error_source_count" {
+		return false
+	}
+	return containsAnyText(
+		normalized,
+		"path",
+		"uri",
+		"url",
+		"raw",
+		"preview",
+		"content",
+		"sidecar",
+		"storage",
+		"checksum",
+		"filename",
+		"file_name",
+		"manifest_record",
+		"source_row",
+	)
+}
+
+func plannerUnsafeMetadataText(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "://") || strings.Contains(lower, `:\`) || strings.HasPrefix(lower, "/") {
+		return true
+	}
+	if strings.Contains(lower, "/") && containsAnyText(lower, ".csv", ".json", ".xml", ".txt", ".tsv", ".jpg", ".jpeg", ".png", ".parquet", ".yaml", ".yml") {
+		return true
+	}
+	return containsAnyText(lower, "raw_preview", "raw row", "source row", "sidecar content", "storage uri", "local path")
+}
+
+func plannerMetadataKey(key string) string {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, " ", "_")
+	return normalized
 }
 
 func sortedMapKeys(values map[string]bool) []string {

@@ -13,6 +13,7 @@ from worker.datasets.cache import (
     should_persist_dataset_cache,
 )
 from worker.datasets.profiler import profile_image_folder
+from worker.datasets.metadata_discovery import build_metadata_import_payload
 from worker.datasets.label_quality import build_label_quality_profile_patch
 from worker.datasets.storage import download_s3_uri
 from worker.datasets.visual_sampling import generate_visual_sample_pack
@@ -67,6 +68,7 @@ def run_profile_dataset_job(client: OrchestratorClient, job: dict) -> None:
         dataset_dir = _download_and_extract_dataset(dataset_id, dataset["storage_uri"], cache_root)
         profile = profile_image_folder(dataset_dir)
 
+        _send_dataset_metadata_import(client, dataset_id, dataset_dir)
         client.update_dataset_profile(dataset_id, profile)
         client.complete_job(job["id"], mlflow_run_id="")
     finally:
@@ -162,6 +164,27 @@ def _download_and_extract_dataset(dataset_id: str, storage_uri: str, cache_root=
     if not archive_path.exists():
         download_s3_uri(storage_uri, archive_path)
     return extract_dataset_archive(archive_path, dataset_id, cache_root)
+
+
+def _send_dataset_metadata_import(client: OrchestratorClient, dataset_id: str, dataset_dir) -> None:
+    try:
+        payload = build_metadata_import_payload(dataset_dir)
+        result = client.import_dataset_metadata(dataset_id, payload)
+        if isinstance(result, dict) and result.get("status") == "unavailable":
+            log_event(
+                "warn",
+                "dataset_metadata_import_unavailable",
+                dataset_id=dataset_id,
+                reason=result.get("reason"),
+                status_code=result.get("status_code"),
+            )
+    except Exception as exc:
+        log_event(
+            "warn",
+            "dataset_metadata_import_failed_nonfatal",
+            dataset_id=dataset_id,
+            error=str(exc),
+        )
 
 
 def _visual_sample_caps(config: dict) -> dict:
@@ -446,6 +469,7 @@ def _visual_analysis_result_payload(
             "input_context": {
                 "sample_manifest_summary": _manifest_summary(manifest),
                 "caps": caps,
+                "metadata_summary": _safe_config_metadata_summary(config),
                 "pack_summary": pack.get("summary") if isinstance(pack.get("summary"), dict) else {},
                 "repair": llm_result.get("repair") if isinstance(llm_result.get("repair"), dict) else {"attempted": False},
                 "evidence_only": True,
@@ -458,16 +482,48 @@ def _visual_analysis_result_payload(
 
 def _visual_dataset_metadata(dataset: dict, config: dict, manifest: dict) -> dict:
     profile = dataset.get("profile") if isinstance(dataset.get("profile"), dict) else {}
+    safe_metadata_summary = _safe_config_metadata_summary(config)
+    if not safe_metadata_summary:
+        candidate = profile.get("agent_safe_metadata_summary") or profile.get("normalized_metadata_summary") or profile.get("metadata_summary")
+        safe_metadata_summary = candidate if isinstance(candidate, dict) else {}
+    merged_metadata_summary = profile.get("metadata_summary") if isinstance(profile.get("metadata_summary"), dict) else {}
+    if safe_metadata_summary:
+        merged_metadata_summary = {**merged_metadata_summary, **safe_metadata_summary}
+    profile_for_prompt = dict(profile)
+    if safe_metadata_summary:
+        profile_for_prompt["agent_safe_metadata_summary"] = safe_metadata_summary
+        profile_for_prompt["metadata_summary"] = merged_metadata_summary
     dataset_id = str(config.get("dataset_id") or dataset.get("id") or "")
+    total_images = max(
+        _positive_int(manifest.get("images_available"), 0),
+        _positive_int(profile.get("total_images"), 0),
+        _positive_int(profile.get("image_count"), 0),
+        _positive_int(safe_metadata_summary.get("sample_count"), 0),
+    )
+    class_count = max(
+        _positive_int(manifest.get("classes_total"), 0),
+        _positive_int(profile.get("class_count"), 0),
+        _positive_int(safe_metadata_summary.get("class_count"), 0),
+    )
     return {
         "dataset_id": dataset_id,
         "dataset_name": str(dataset.get("name") or config.get("dataset_name") or ""),
-        "profile": profile,
-        "total_images": manifest.get("images_available", profile.get("total_images", 0)),
-        "class_count": manifest.get("classes_total", profile.get("class_count", 0)),
+        "profile": profile_for_prompt,
+        "total_images": total_images,
+        "class_count": class_count,
         "class_distribution": profile.get("class_distribution") or profile.get("images_per_class") or {},
+        "metadata_summary": merged_metadata_summary,
+        "agent_safe_metadata_summary": safe_metadata_summary,
         "visual_trait_summary": profile.get("visual_trait_summary") if isinstance(profile.get("visual_trait_summary"), dict) else {},
     }
+
+
+def _safe_config_metadata_summary(config: dict) -> dict:
+    for key in ("agent_safe_metadata_summary", "metadata_summary", "normalized_metadata_summary"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _agent_image_inputs(image_inputs: object) -> list:

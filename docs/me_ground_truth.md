@@ -25,8 +25,14 @@ LLMs never directly create workers, mutate datasets, choose arbitrary filesystem
 Major tables and store concepts:
 
 - `projects`: project name, goal, status.
-- `datasets`: dataset metadata and canonical `profile` JSON.
+- `datasets`: dataset metadata and canonical legacy `profile` JSON.
 - `dataset_profiles`: exists in migration but is not active. `datasets.profile` is the current source of truth.
+- `dataset_metadata_imports`: backend-owned normalized metadata import attempts/versions with active-import selection, parser provenance, full summary, agent-safe summary, warnings, and errors.
+- `dataset_metadata_sources`: bounded provenance for discovered/imported sidecars, including parser status and bounded raw previews for backend/operator debugging only.
+- `dataset_classes`: normalized class vocabulary for an import.
+- `dataset_manifest_records`: canonical sample records with relative path, label, split, dimensions/checksum fields, and source provenance.
+- `dataset_annotations`: optional normalized per-sample annotations such as bounding boxes.
+- `dataset_splits`: explicit or derived split declarations/counts.
 - `experiment_plans`: planned experiment batches and source decision linkage.
 - `experiment_jobs`: queued/assigned/running/terminal worker jobs with attempt counts and lease fields for stale-job recovery.
 - `epoch_metrics`: idempotent metrics keyed by `(job_id, epoch)`.
@@ -49,13 +55,23 @@ Major tables and store concepts:
 
 1. Mission Control creates a project and streams an image-folder dataset as a zip archive directly to configured object storage.
 2. The backend creates a dataset row and queues a `profile_dataset` job.
-3. A worker profiles the dataset. Modal-mode profile workers submit profiling to Modal, where the dataset archive is downloaded/extracted in temporary Modal storage. Local profile workers can still download/extract locally, but `.cache/datasets/:dataset_id` is cleaned by default after profiling unless `MODEL_EXPRESS_PERSIST_DATASET_CACHE=1` is set.
-4. The worker posts profile JSON to `POST /datasets/:id/profile`.
-5. The backend stores that JSON in `datasets.profile`, marks the dataset profiled, and creates the initial experiment plan if one does not exist.
+3. A worker profiles the dataset. Modal-mode profile workers submit profiling to Modal, where the dataset archive is downloaded/extracted in temporary Modal storage. Local profile workers can still download/extract locally, but `.cache/datasets/:dataset_id` is cleaned by default after profiling unless `MODEL_EXPRESS_PERSIST_DATASET_CACHE=1` is set. The legacy image-folder profiler resolves common dataset layouts before counting classes, including single archive-wrapper folders and common image roots such as `images/`, `JPEGImages/`, `img(s)/`, and `data/`.
+4. The worker discovers bounded metadata sidecar candidates and dataset file inventory, posts them opportunistically to `POST /datasets/:id/metadata/imports`, then posts legacy profile JSON to `POST /datasets/:id/profile`. If the metadata endpoint is unavailable, profiling continues through the legacy profile path.
+5. The backend stores normalized metadata imports additively, makes the latest successful/partial import active only after persistence succeeds, stores agent-safe summaries separately from raw source previews, then stores profile JSON in `datasets.profile`, marks the dataset profiled, and creates the initial experiment plan if one does not exist.
 
-Profile JSON includes class counts, image counts, image dimension stats, corrupt-file counts, split summaries, metadata/artifact detection, leakage warnings, dataset traits, normalization metadata, and optional `visual_exemplars`/`demo_images` arrays.
+Profile JSON includes class counts, image counts, image dimension stats, corrupt-file counts, split summaries, metadata/artifact detection, leakage warnings, dataset traits, layout summary, normalization metadata, and optional `visual_exemplars`/`demo_images` arrays. CUB-style `bounding_boxes.txt` is treated as bbox evidence in the legacy profile/visual-trait summary, even though normalized metadata remains the richer source for executable bbox crops.
 
-`dataset_profiles` rows are deferred. They should not become active until there is a complete write path, latest-profile read path, backfill plan, and tests proving one canonical source.
+Normalized dataset metadata imports currently support image/split-folder inventory, single archive-wrapper folders, common image roots such as `images/`, `JPEGImages/`, `img(s)/`, and `data/`, generic CSV manifests, CUB sidecars, CUB part-location keypoints, and Pascal VOC XML bounding-box evidence. Manifest and sidecar paths are canonicalized against the dataset inventory when possible so metadata that omits the wrapper or image-root prefix can still resolve to the stored dataset path. Worker discovery sends up to 50,000 inventory files by default so common 10k-image datasets can be canonicalized without truncating the image inventory. Unsupported metadata-like files, including attribute/part/keypoint candidates outside supported parsers, are recorded as warnings rather than blocking normal registration in non-strict mode. `datasets.profile` remains the legacy profile surface; normalized imports live beside it and do not activate `dataset_profiles`.
+
+Current dataset metadata APIs:
+
+- `POST /datasets/:id/metadata/imports`
+- `GET /datasets/:id/metadata/imports`
+- `GET /datasets/:id/metadata/imports/:import_id`
+- `GET /datasets/:id/metadata/summary` defaults to agent-safe output.
+- `GET /datasets/:id/metadata/bundle?purpose=training&include=bbox&limit=&offset=`
+
+`GET /datasets/:id/metadata/summary` returns an empty 200 response when the dataset exists but has no active metadata import yet. `dataset_profiles` rows are still deferred. They should not become active until there is a complete write path, latest-profile read path, backfill plan, and tests proving one canonical source.
 
 ## Planning And Validation Flow
 
@@ -80,7 +96,7 @@ Supported execution-facing planning fields include:
 
 The backend validates allowed model names, epochs, batch size, learning rate, image size, optimizer, scheduler, optimizer-specific knobs, scheduler-specific knobs, dropout, label smoothing, gradient clipping, preprocessing values, augmentation keys, augmentation policy, class balancing config, sampling strategy, early stopping, and fine-tune strategy.
 
-AutoML is an optional backend hyperparameter suggestion layer, disabled by default through `automation_settings.automl_enabled`. When enabled, it operates only from `PlannedExperiment.automl` metadata that has already passed backend validation. The LLM remains responsible for strategy: model/template, preprocessing, image size/resolution intent, augmentation policy type, class-balancing strategy, sampling strategy, pretrained/freeze/fine-tune strategy, exploration/exploitation intent, and bounded search constraints.
+AutoML is an optional backend hyperparameter suggestion layer, disabled by default through `automation_settings.automl_enabled`. When enabled, the backend can synthesize a default validated AutoML search space for a proposed experiment that omits `PlannedExperiment.automl`, so the LLM does not have to remember the AutoML JSON shape for every run. LLM-provided AutoML metadata is still honored when present, and an explicit disabled AutoML block remains disabled. The LLM remains responsible for strategy: model/template, preprocessing, image size/resolution intent, augmentation policy type, class-balancing strategy, sampling strategy, pretrained/freeze/fine-tune strategy, exploration/exploitation intent, and bounded search constraints.
 
 AutoML may tune only backend/worker-supported hyperparameters: `learning_rate`, `weight_decay`, `batch_size`, `epochs`, `early_stopping_patience`, `optimizer`, `scheduler`, `dropout`, `optimizer_momentum` only with SGD, `scheduler_step_size` and `scheduler_gamma` only with the step scheduler, `label_smoothing`, `gradient_clip_norm`, selected structured augmentation config values after the LLM chose the policy type, `class_balancing_config.effective_number_beta` only with effective-number class balancing, and `class_balancing_config.focal_loss_gamma` only with focal loss. It cannot tune strategy-owned fields such as `model`, `template`, `preprocessing`, `resolution_strategy`, `image_size`, `augmentation_policy`, `augmentation_policy_config.policy_type`, `class_balancing`, `sampling_strategy`, `pretrained`, `freeze_backbone`, or `fine_tune_strategy`. Samplers are `seeded_random`, `grid`, and lightweight `adaptive_bayesian`, which exploits compact persisted trial history without adding a heavy Bayesian dependency.
 
@@ -100,22 +116,23 @@ When an LLM planner proposal passes JSON/schema parsing but fails backend valida
 6. Workers report epoch metrics, summary updates, and final evaluation.
 7. Workers complete or fail the job through backend APIs.
 
-For AutoML-enabled experiments, the orchestrator samples concrete hyperparameters before job creation, persists study/suggestion provenance, and places only compact `automl_summary`, `automl_study_id`, and `automl_suggestion_id` metadata in the job config. Workers still receive concrete training config and do not run search, schedule follow-up jobs, mutate datasets, or choose strategies.
+For AutoML-enabled experiments, the orchestrator samples concrete hyperparameters before job creation, persists study/suggestion provenance, and places only compact `automl_summary`, `automl_study_id`, and `automl_suggestion_id` metadata in the job config. Backend default AutoML samples concrete knobs such as learning rate, weight decay, batch size, epochs, early stopping, dropout, label smoothing, gradient clipping, optimizer/scheduler conditional numeric knobs, and numeric policy/loss parameters only after the LLM has selected the owning strategy. Workers still receive concrete training config and do not run search, schedule follow-up jobs, mutate datasets, or choose strategies.
 
-Worker-side training currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, structured image augmentation, training-only MixUp/CutMix, weighted/focal/effective-number loss, weighted sampling, dropout heads, SGD momentum, step scheduler size/gamma, label smoothing, focal-loss gamma, gradient clipping, and bbox crop/full-image ablations when backend-validated annotations are available.
+Worker-side training currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, structured image augmentation, training-only MixUp/CutMix, weighted/focal/effective-number loss, weighted sampling, dropout heads, SGD momentum, step scheduler size/gamma, label smoothing, focal-loss gamma, gradient clipping, and bbox crop/full-image ablations when backend-validated annotations are available. Modal training fetches the active normalized metadata bundle when present and can use backend-owned labels, official splits, and bbox annotations; train/test-only metadata derives a deterministic validation subset from train while keeping test held out. If the bundle is absent or unavailable, legacy ImageFolder/random split behavior remains the fallback, with single archive wrappers and common image roots such as `images/` handled before falling back to the archive root.
 
 Training evaluations for image classification include confusion matrices and per-class precision/recall/F1 when real validation/test labels are available. The backend enriches final evaluation payloads with deterministic `training_diagnostics` inside `holistic_scores`, including train/validation loss gap, divergence status, severity, and trend deltas derived from persisted epoch metrics and run summaries.
 
 Worker utility modules also include:
 
-- split-file, Pascal VOC XML, and annotation JSON parsers
-- class-balanced visual exemplar generation with PIL downscale/compression and byte/image caps
+- bounded metadata discovery handoff for sidecars/inventory, including common labels/manifests, CUB files, attributes, parts, landmarks, and keypoints, without semantic parsing in the worker
+- split-file, Pascal VOC XML, and annotation JSON helper parsers
+- class-balanced visual exemplar and visual-analysis sample generation with PIL downscale/compression and byte/image caps; both unwrap single archive folders and common image roots before treating immediate subfolders as classes
 - report-only label-quality audit jobs that persist capped profile audit metadata without label mutation
 - champion export manifest/checkpoint helpers with guarded TorchScript/ONNX paths
 - TorchScript demo inference helper that returns a ranked payload when a valid worker-owned artifact exists, or a deterministic pending/error payload when dependencies/artifacts are missing
 - champion job handlers for `export_champion`, `champion_demo_prediction`, and `generate_visual_exemplars`
 
-Explicit split-file training remains deferred. Model routing, prompt caching, vector retrieval, and cross-project mechanism retrieval are also intentionally deferred.
+Arbitrary split-file parsing in workers remains deferred, but backend-normalized official splits from supported imports can now drive Modal training. Model routing, prompt caching, vector retrieval, and cross-project mechanism retrieval are also intentionally deferred.
 
 ## Agent Flow
 
@@ -128,13 +145,17 @@ Experiment Planner reviews completed plans and can recommend:
 - `STOP_PROJECT`
 - `WAIT`
 
-Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional visual evidence, objective context, deterministic diagnosis, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, validation feedback, and existing experiment signatures.
+Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional agent-safe normalized metadata summaries, optional visual evidence, objective context, deterministic diagnosis, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, validation feedback, and existing experiment signatures.
+
+Live/real-time objective handling treats latency as a budget and tiebreaker rather than a primary search driver. Latency below roughly 25ms is considered acceptable for live use, so the Planner and Training Monitor should prioritize macro-F1, per-class recall, and meaningful quality gains unless latency exceeds the budget or quality is otherwise close.
 
 Training Monitor input is also compacted into run-evaluation cards. The backend still stores full run summaries, evaluations, epoch metrics, plans, and job configs, but the LLM receives capped cards and prompt-budget telemetry.
 
 When AutoML trials exist, the Planner and Training Monitor receive compact `optimizer_feedback_summary` cards: trial counts, best score/job, best hyperparameters, train/validation gap, trend, failed-trial count/patterns, and bounded narrowing advice. Raw trial dumps are not included in default LLM context.
 
 Visual exemplars are evidence only. Backend-curated/capped metadata may help the planner cite object scale, background dominance, blur, lighting, fine-grained classes, or bbox/crop plausibility. Planner context includes exemplar caps and audit details when available. Planner output is still JSON only, and backend validation remains the gate.
+
+Normalized dataset metadata summaries are also evidence only in visual-analysis and planner context. Queued visual-analysis jobs include the active agent-safe metadata summary when present, and result validation merges the active summary into the profile evidence before gating bbox-dependent hypotheses. Initial planning also merges active metadata counts/capabilities so a corrected normalized import can prevent stale legacy profile fields from blocking plan creation. Planner tools expose `dataset_metadata_summary` as a compact safe summary and exclude source rows, relative paths, storage URIs, raw previews, sidecar contents, and manifest record dumps. Backend gates can use normalized bbox evidence from the safe summary in addition to legacy profile traits, and safe capability flags now include bbox, attribute, and keypoint annotation availability.
 
 ## Champion Flow
 
@@ -163,6 +184,8 @@ Current backend export/demo APIs:
 - `POST /projects/:id/champion/demo-predictions`
 - `GET /datasets/:id/visual-exemplars`
 - `POST /datasets/:id/visual-exemplars`
+- `GET /datasets/:id/metadata/summary`
+- `GET /datasets/:id/metadata/imports`
 - `POST /jobs/:id/champion-export-result`
 - `POST /jobs/:id/champion-demo-prediction-result`
 
@@ -179,7 +202,7 @@ Mission Control can request an ONNX export record, show export status/errors, li
 Mission Control polls project detail endpoints and optionally consumes `GET /projects/:id/events/stream` as a server-sent-event refresh hint. Polling remains the durable fallback. It renders:
 
 - section navigation for Overview, Data, Agents, Runs, Operations, Export/Demo
-- dataset intelligence and preprocessing recommendations
+- dataset intelligence, normalized metadata import status, and preprocessing recommendations
 - automation settings and worker requirements
 - experiment timeline and execution events
 - agent decisions, rejections, candidate score components, and scorecards
@@ -188,9 +211,11 @@ Mission Control polls project detail endpoints and optionally consumes `GET /pro
 - selected champion and export/demo panel
 - champion demo prediction history and runtime-unavailable audit rows
 
-Mission Control does not invent orchestration state. It uses backend APIs, renders partial data defensively, and surfaces rejection/failure states as part of operator trust.
+Mission Control does not invent orchestration state. It uses backend APIs, renders partial data defensively, and surfaces rejection/failure states as part of operator trust. The Electron orchestrator request bridge returns HTTP error envelopes to the renderer instead of throwing inside the IPC handler, so expected optional-endpoint or empty-state failures can be handled without noisy main-process handler errors.
 
 Mission Control exposes AutoML HPO settings, including enabled/disabled state and sampler. Experiment plan cards show compact AutoML status, sampler, search parameters, concrete suggestions, and provenance per displayed value. Job summaries surface that a job came from an AutoML suggestion without exposing raw trial history.
+
+Mission Control also reads dataset metadata summary/import endpoints defensively. When available, Dataset Intelligence shows import status, source kinds/formats, class/sample counts, official split availability, split/annotation counts, bbox coverage, unsupported-source warnings, and errors. Missing metadata endpoints fall back to the legacy profile display.
 
 ## Reliability State
 
@@ -208,6 +233,7 @@ Implemented/current-scale hardening:
 - Additive indexes for common project/status/agent/memory/scorecard reads.
 - Follow-up rounds remain bounded by automation settings and max follow-up rounds.
 - AutoML is settings-gated, backend-validated, persisted with provenance, and linked to normal plan/job execution rather than owning scheduling.
+- Normalized dataset metadata imports are additive, active-import replacement is transactional in Postgres, and agent-safe summaries are separated from raw source previews.
 
 Known reliability gaps:
 
@@ -221,7 +247,8 @@ Known reliability gaps:
 
 - Fully promote `dataset_profiles` or keep it permanently documented as deferred.
 - Persist visual exemplar generation/audit history beyond compact profile JSON/planner context.
-- Wire parsed annotations, explicit split-file training, and bbox crop/full-image ablations into training.
+- Expand normalized metadata parsers beyond the MVP CSV/CUB/VOC/image-folder set, including COCO, YOLO, OpenImages, CVAT, Label Studio, JSONL/YAML, and video metadata.
+- Add richer worker/local-training support for normalized metadata bundles beyond the Modal path.
 - Advanced augmentation object policies.
 - Production storage upload for generated export/exemplar artifacts beyond current worker-local `file://` URIs.
 - Real model reconstruction/export from completed training runs when no worker-visible artifact exists.

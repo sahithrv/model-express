@@ -248,6 +248,94 @@ func TestDatasetVisualAnalysisResultKeepsBBoxHypothesisWithProfileEvidence(t *te
 	}
 }
 
+func TestDatasetVisualAnalysisResultKeepsBBoxHypothesisWithActiveMetadataEvidence(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "cub", "s3://bucket/cub.zip", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4, "class_count": 1})
+	if err != nil {
+		t.Fatalf("profile dataset: %v", err)
+	}
+	if _, err := memoryStore.CreateDatasetMetadataImport(datasets.DatasetMetadataImport{
+		DatasetID:  dataset.ID,
+		ProjectID:  project.ID,
+		Status:     datasets.MetadataImportStatusSucceeded,
+		SourceKind: datasets.MetadataSourceKindWorkerDiscovery,
+		Active:     true,
+		Classes: []datasets.DatasetClass{{
+			DatasetID:  dataset.ID,
+			ClassKey:   "bird",
+			ClassName:  "bird",
+			ClassIndex: intPtr(1),
+		}, {
+			DatasetID:  dataset.ID,
+			ClassKey:   "other",
+			ClassName:  "other",
+			ClassIndex: intPtr(2),
+		}},
+		ManifestRecords: []datasets.DatasetManifestRecord{{
+			DatasetID:    dataset.ID,
+			SampleKey:    "images/bird/one.jpg",
+			MediaType:    datasets.MetadataMediaTypeImage,
+			RelativePath: "images/bird/one.jpg",
+			LabelKey:     "bird",
+			LabelName:    "bird",
+		}, {
+			DatasetID:    dataset.ID,
+			SampleKey:    "images/other/two.jpg",
+			MediaType:    datasets.MetadataMediaTypeImage,
+			RelativePath: "images/other/two.jpg",
+			LabelKey:     "other",
+			LabelName:    "other",
+		}},
+		Annotations: []datasets.DatasetAnnotation{{
+			DatasetID:      dataset.ID,
+			SampleKey:      "images/bird/one.jpg",
+			AnnotationType: datasets.MetadataAnnotationBBox,
+			BBox:           map[string]any{"xmin": 1, "ymin": 2, "xmax": 20, "ymax": 30},
+		}},
+	}); err != nil {
+		t.Fatalf("create metadata import: %v", err)
+	}
+
+	payload := validVisualAnalysisPayload(dataset)
+	payload["preprocessing_hypotheses"] = append(payload["preprocessing_hypotheses"].([]map[string]any), map[string]any{
+		"id":              "vh_002",
+		"mechanism":       "bbox_crop_ablation",
+		"summary":         "Compare bbox crops against full-image training.",
+		"evidence":        []string{"Active normalized metadata import reports bbox annotations."},
+		"expected_effect": "Improve foreground focus without changing labels.",
+		"confidence":      "medium",
+		"support_status":  "needs_backend_validation",
+		"suggested_preprocessing": map[string]any{
+			"crop_strategy": "bbox_crop_ablation",
+			"bbox_mode":     "crop_and_compare_full_image",
+		},
+	})
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analysis-result", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected accepted active-metadata bbox result status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	latest, err := memoryStore.GetLatestAcceptedDatasetVisualAnalysis(dataset.ID)
+	if err != nil {
+		t.Fatalf("latest accepted visual analysis: %v", err)
+	}
+	bboxHypothesis := latest.PreprocessingHypotheses[len(latest.PreprocessingHypotheses)-1]
+	if bboxHypothesis.SupportStatus != "needs_backend_validation" || bboxHypothesis.SuggestedPreprocessing == nil {
+		t.Fatalf("expected active metadata to preserve bbox hypothesis, got %#v", bboxHypothesis)
+	}
+}
+
 func TestDatasetVisualAnalysisResultAcceptsRealisticLLMOutputContract(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
@@ -335,6 +423,14 @@ func TestProfileHasBBoxEvidenceUsesProfiledCounts(t *testing.T) {
 		},
 	}) {
 		t.Fatal("expected annotation artifact count to satisfy bbox evidence")
+	}
+	if !profileHasBBoxEvidence(map[string]any{
+		"agent_safe_metadata_summary": map[string]any{
+			"bbox_annotation_count": 4,
+			"annotation_counts":     map[string]any{"bbox": 4},
+		},
+	}) {
+		t.Fatal("expected normalized safe metadata bbox counts to satisfy bbox evidence")
 	}
 	if profileHasBBoxEvidence(map[string]any{
 		"metadata_summary": map[string]any{
@@ -483,6 +579,30 @@ func TestRunDatasetVisualAnalysisQueuesBackendOwnedJob(t *testing.T) {
 	if _, err := memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{"task_type": "image_classification", "total_images": 4}); err != nil {
 		t.Fatalf("profile dataset: %v", err)
 	}
+	metadataImport, err := memoryStore.CreateDatasetMetadataImport(datasets.DatasetMetadataImport{
+		DatasetID:  dataset.ID,
+		ProjectID:  project.ID,
+		Status:     datasets.MetadataImportStatusSucceeded,
+		SourceKind: datasets.MetadataSourceKindWorkerDiscovery,
+		Active:     true,
+		ManifestRecords: []datasets.DatasetManifestRecord{{
+			DatasetID:    dataset.ID,
+			SampleKey:    "images/daisy/one.jpg",
+			MediaType:    datasets.MetadataMediaTypeImage,
+			RelativePath: "images/daisy/one.jpg",
+			LabelKey:     "daisy",
+			LabelName:    "daisy",
+		}},
+		Annotations: []datasets.DatasetAnnotation{{
+			DatasetID:      dataset.ID,
+			SampleKey:      "images/daisy/one.jpg",
+			AnnotationType: datasets.MetadataAnnotationBBox,
+			BBox:           map[string]any{"xmin": 1, "ymin": 2, "xmax": 20, "ymax": 30},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create metadata import: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/visual-analyses/run", strings.NewReader(`{"trigger_reason":"manual"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -499,6 +619,13 @@ func TestRunDatasetVisualAnalysisQueuesBackendOwnedJob(t *testing.T) {
 	for _, job := range projectJobs {
 		if job.Template == jobs.TemplateAnalyzeDatasetVisuals && job.Config["dataset_id"] == dataset.ID {
 			found = true
+			if job.Config["metadata_import_id"] != metadataImport.ID {
+				t.Fatalf("expected active metadata import id in visual job config, got %#v", job.Config)
+			}
+			summary, ok := job.Config["agent_safe_metadata_summary"].(map[string]any)
+			if !ok || payloadNumber(summary["bbox_annotation_count"]) <= 0 {
+				t.Fatalf("expected active safe metadata summary with bbox evidence, got %#v", job.Config)
+			}
 		}
 	}
 	if !found {
@@ -1077,4 +1204,8 @@ func validVisualAnalysisPayload(dataset datasets.Dataset) map[string]any {
 		},
 		"limitations": []string{"No experiment should be scheduled from this output without backend validation."},
 	}
+}
+
+func intPtr(value int) *int {
+	return &value
 }

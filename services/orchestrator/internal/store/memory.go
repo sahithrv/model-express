@@ -8,6 +8,7 @@ import (
 
 	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
+	datasetmetadata "model-express/services/orchestrator/internal/datasets/metadata"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
@@ -40,6 +41,7 @@ type MemoryStore struct {
 	champions            map[string]runs.ProjectChampion
 	championExports      map[string]runs.ChampionExport
 	demoPredictions      map[string]runs.ChampionDemoPrediction
+	metadataImports      map[string]datasets.DatasetMetadataImport
 	visualAnalyses       map[string]datasets.DatasetVisualAnalysis
 	decisions            map[string]decisions.AgentDecision
 	workerRequirements   map[string]execution.WorkerRequirement
@@ -66,6 +68,7 @@ func NewMemoryStore() *MemoryStore {
 		champions:            make(map[string]runs.ProjectChampion),
 		championExports:      make(map[string]runs.ChampionExport),
 		demoPredictions:      make(map[string]runs.ChampionDemoPrediction),
+		metadataImports:      make(map[string]datasets.DatasetMetadataImport),
 		visualAnalyses:       make(map[string]datasets.DatasetVisualAnalysis),
 		decisions:            make(map[string]decisions.AgentDecision),
 		workerRequirements:   make(map[string]execution.WorkerRequirement),
@@ -191,6 +194,164 @@ func (s *MemoryStore) UpdateDatasetProfile(id string, profile map[string]any) (d
 	s.datasets[id] = dataset
 
 	return dataset, nil
+}
+
+func (s *MemoryStore) CreateDatasetMetadataImport(importRecord datasets.DatasetMetadataImport) (datasets.DatasetMetadataImport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dataset, ok := s.datasets[importRecord.DatasetID]
+	if !ok {
+		return datasets.DatasetMetadataImport{}, ErrNotFound
+	}
+	if importRecord.ProjectID == "" {
+		importRecord.ProjectID = dataset.ProjectID
+	}
+	if importRecord.ProjectID != dataset.ProjectID {
+		return datasets.DatasetMetadataImport{}, fmt.Errorf("%w: dataset_id does not belong to this project", ErrInvalidRequest)
+	}
+	if importRecord.Status == "" {
+		importRecord.Status = datasets.MetadataImportStatusSucceeded
+	}
+	if importRecord.ParserRegistryVersion == "" {
+		importRecord.ParserRegistryVersion = datasets.MetadataParserRegistryV1
+	}
+	if importRecord.SourceKind == "" {
+		importRecord.SourceKind = datasets.MetadataSourceKindUploadedSidecar
+	}
+	if importRecord.Status == datasets.MetadataImportStatusFailed {
+		importRecord.Active = false
+	}
+	now := time.Now().UTC()
+	importRecord.ID = s.newID("dataset_metadata_import")
+	importRecord.ImportVersion = s.nextDatasetMetadataImportVersionLocked(importRecord.DatasetID)
+	if importRecord.CreatedAt.IsZero() {
+		importRecord.CreatedAt = now
+	}
+	if importRecord.CompletedAt == nil {
+		completedAt := now
+		importRecord.CompletedAt = &completedAt
+	}
+	importRecord.DatasetChecksumSHA256 = firstNonEmptyText(importRecord.DatasetChecksumSHA256, dataset.ChecksumSHA256)
+	importRecord.Warnings = append([]datasets.MetadataIssue(nil), importRecord.Warnings...)
+	importRecord.Errors = append([]datasets.MetadataIssue(nil), importRecord.Errors...)
+	rewriteDatasetMetadataImportIDs(&importRecord, func(prefix string) string { return s.newID(prefix) })
+	importRecord.Summary = datasetmetadata.BuildSummary(importRecord)
+	importRecord.AgentSafeSummary = datasetmetadata.BuildAgentSafeSummary(importRecord.Summary)
+
+	if importRecord.Active {
+		for id, existing := range s.metadataImports {
+			if existing.DatasetID == importRecord.DatasetID && existing.Active {
+				existing.Active = false
+				s.metadataImports[id] = existing
+			}
+		}
+	}
+	s.metadataImports[importRecord.ID] = importRecord
+	return importRecord, nil
+}
+
+func (s *MemoryStore) GetDatasetMetadataImport(importID string) (datasets.DatasetMetadataImport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	importRecord, ok := s.metadataImports[importID]
+	if !ok {
+		return datasets.DatasetMetadataImport{}, ErrNotFound
+	}
+	return importRecord, nil
+}
+
+func (s *MemoryStore) GetActiveDatasetMetadataImport(datasetID string) (datasets.DatasetMetadataImport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.datasets[datasetID]; !ok {
+		return datasets.DatasetMetadataImport{}, ErrNotFound
+	}
+	var active datasets.DatasetMetadataImport
+	for _, importRecord := range s.metadataImports {
+		if importRecord.DatasetID != datasetID || !importRecord.Active {
+			continue
+		}
+		if active.ID == "" || importRecord.ImportVersion > active.ImportVersion || importRecord.CreatedAt.After(active.CreatedAt) {
+			active = importRecord
+		}
+	}
+	if active.ID == "" {
+		return datasets.DatasetMetadataImport{}, ErrNotFound
+	}
+	return active, nil
+}
+
+func (s *MemoryStore) ListDatasetMetadataImports(datasetID string) ([]datasets.DatasetMetadataImport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.datasets[datasetID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []datasets.DatasetMetadataImport{}
+	for _, importRecord := range s.metadataImports {
+		if importRecord.DatasetID == datasetID {
+			out = append(out, importRecord)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ImportVersion == out[j].ImportVersion {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ImportVersion > out[j].ImportVersion
+	})
+	return out, nil
+}
+
+func (s *MemoryStore) GetDatasetMetadataBundle(datasetID string, importID string, includeAnnotations bool, limit int, offset int) (datasets.DatasetMetadataBundle, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	importRecord, err := s.datasetMetadataImportForBundleLocked(datasetID, importID)
+	if err != nil {
+		return datasets.DatasetMetadataBundle{}, err
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	total := len(importRecord.ManifestRecords)
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	if offset > total {
+		offset = total
+		end = total
+	}
+	var nextOffset *int
+	if end < total {
+		next := end
+		nextOffset = &next
+	}
+	annotations := []datasets.DatasetAnnotation{}
+	if includeAnnotations {
+		annotations = append(annotations, importRecord.Annotations...)
+	}
+	return datasets.DatasetMetadataBundle{
+		DatasetID:       importRecord.DatasetID,
+		ImportID:        importRecord.ID,
+		ImportVersion:   importRecord.ImportVersion,
+		Purpose:         "training",
+		Classes:         append([]datasets.DatasetClass(nil), importRecord.Classes...),
+		ManifestRecords: append([]datasets.DatasetManifestRecord(nil), importRecord.ManifestRecords[offset:end]...),
+		Annotations:     annotations,
+		Splits:          append([]datasets.DatasetSplit(nil), importRecord.Splits...),
+		Limit:           limit,
+		Offset:          offset,
+		NextOffset:      nextOffset,
+		TotalRecords:    total,
+	}, nil
 }
 
 func (s *MemoryStore) CreateDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis) (datasets.DatasetVisualAnalysis, error) {
@@ -1657,6 +1818,42 @@ func (s *MemoryStore) requireDatasetBelongsToProject(projectID string, datasetID
 	return nil
 }
 
+func (s *MemoryStore) nextDatasetMetadataImportVersionLocked(datasetID string) int {
+	maxVersion := 0
+	for _, importRecord := range s.metadataImports {
+		if importRecord.DatasetID == datasetID && importRecord.ImportVersion > maxVersion {
+			maxVersion = importRecord.ImportVersion
+		}
+	}
+	return maxVersion + 1
+}
+
+func (s *MemoryStore) datasetMetadataImportForBundleLocked(datasetID string, importID string) (datasets.DatasetMetadataImport, error) {
+	if _, ok := s.datasets[datasetID]; !ok {
+		return datasets.DatasetMetadataImport{}, ErrNotFound
+	}
+	if importID != "" {
+		importRecord, ok := s.metadataImports[importID]
+		if !ok || importRecord.DatasetID != datasetID {
+			return datasets.DatasetMetadataImport{}, ErrNotFound
+		}
+		return importRecord, nil
+	}
+	var active datasets.DatasetMetadataImport
+	for _, importRecord := range s.metadataImports {
+		if importRecord.DatasetID != datasetID || !importRecord.Active {
+			continue
+		}
+		if active.ID == "" || importRecord.ImportVersion > active.ImportVersion || importRecord.CreatedAt.After(active.CreatedAt) {
+			active = importRecord
+		}
+	}
+	if active.ID == "" {
+		return datasets.DatasetMetadataImport{}, ErrNotFound
+	}
+	return active, nil
+}
+
 func (s *MemoryStore) createDatasetVisualAnalysisLocked(analysis datasets.DatasetVisualAnalysis, validationStatus string) (datasets.DatasetVisualAnalysis, error) {
 	dataset, ok := s.datasets[analysis.DatasetID]
 	if !ok {
@@ -1799,6 +1996,80 @@ func emptyMapIfNil(value map[string]any) map[string]any {
 		return map[string]any{}
 	}
 	return value
+}
+
+func firstNonEmptyText(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func rewriteDatasetMetadataImportIDs(importRecord *datasets.DatasetMetadataImport, newID func(prefix string) string) {
+	sourceIDs := map[string]string{}
+	for index := range importRecord.Sources {
+		oldID := firstNonEmptyText(importRecord.Sources[index].ID, importRecord.Sources[index].RelativePath)
+		newSourceID := newID("dataset_metadata_source")
+		importRecord.Sources[index].ID = newSourceID
+		importRecord.Sources[index].ImportID = importRecord.ID
+		importRecord.Sources[index].DatasetID = importRecord.DatasetID
+		if importRecord.Sources[index].Warnings == nil {
+			importRecord.Sources[index].Warnings = []datasets.MetadataIssue{}
+		}
+		if importRecord.Sources[index].Errors == nil {
+			importRecord.Sources[index].Errors = []datasets.MetadataIssue{}
+		}
+		sourceIDs[oldID] = newSourceID
+		sourceIDs[importRecord.Sources[index].RelativePath] = newSourceID
+	}
+	for index := range importRecord.Classes {
+		importRecord.Classes[index].ID = newID("dataset_class")
+		importRecord.Classes[index].ImportID = importRecord.ID
+		importRecord.Classes[index].DatasetID = importRecord.DatasetID
+		importRecord.Classes[index].SourceID = remapMetadataSourceID(importRecord.Classes[index].SourceID, sourceIDs)
+		if importRecord.Classes[index].Metadata == nil {
+			importRecord.Classes[index].Metadata = map[string]any{}
+		}
+	}
+	for index := range importRecord.ManifestRecords {
+		importRecord.ManifestRecords[index].ID = newID("dataset_manifest_record")
+		importRecord.ManifestRecords[index].ImportID = importRecord.ID
+		importRecord.ManifestRecords[index].DatasetID = importRecord.DatasetID
+		importRecord.ManifestRecords[index].SourceID = remapMetadataSourceID(importRecord.ManifestRecords[index].SourceID, sourceIDs)
+		if importRecord.ManifestRecords[index].Metadata == nil {
+			importRecord.ManifestRecords[index].Metadata = map[string]any{}
+		}
+	}
+	for index := range importRecord.Annotations {
+		importRecord.Annotations[index].ID = newID("dataset_annotation")
+		importRecord.Annotations[index].ImportID = importRecord.ID
+		importRecord.Annotations[index].DatasetID = importRecord.DatasetID
+		importRecord.Annotations[index].SourceID = remapMetadataSourceID(importRecord.Annotations[index].SourceID, sourceIDs)
+		if importRecord.Annotations[index].Metadata == nil {
+			importRecord.Annotations[index].Metadata = map[string]any{}
+		}
+	}
+	for index := range importRecord.Splits {
+		importRecord.Splits[index].ID = newID("dataset_split")
+		importRecord.Splits[index].ImportID = importRecord.ID
+		importRecord.Splits[index].DatasetID = importRecord.DatasetID
+		importRecord.Splits[index].SourceID = remapMetadataSourceID(importRecord.Splits[index].SourceID, sourceIDs)
+		if importRecord.Splits[index].Metadata == nil {
+			importRecord.Splits[index].Metadata = map[string]any{}
+		}
+	}
+}
+
+func remapMetadataSourceID(sourceID string, sourceIDs map[string]string) string {
+	if sourceID == "" {
+		return ""
+	}
+	if mapped, ok := sourceIDs[sourceID]; ok {
+		return mapped
+	}
+	return sourceID
 }
 
 func memoryRecordMatchesFilter(record memory.AgentMemoryRecord, filter memory.AgentMemoryFilter) bool {

@@ -63,6 +63,11 @@ func NewRouter(store store.Store) *gin.Engine {
 
 	router.GET("/datasets/:id", server.getDataset)
 	router.POST("/datasets/:id/profile", server.updateDatasetProfile)
+	router.POST("/datasets/:id/metadata/imports", server.importDatasetMetadata)
+	router.GET("/datasets/:id/metadata/imports", server.listDatasetMetadataImports)
+	router.GET("/datasets/:id/metadata/imports/:import_id", server.getDatasetMetadataImport)
+	router.GET("/datasets/:id/metadata/summary", server.getDatasetMetadataSummary)
+	router.GET("/datasets/:id/metadata/bundle", server.getDatasetMetadataBundle)
 	router.GET("/datasets/:id/visual-exemplars", server.listDatasetVisualExemplars)
 	router.POST("/datasets/:id/visual-exemplars", server.mergeDatasetVisualExemplars)
 	router.GET("/datasets/:id/visual-analyses", server.listDatasetVisualAnalyses)

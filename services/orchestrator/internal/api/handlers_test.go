@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -102,6 +103,105 @@ func TestReportMetricRejectsNonPositiveEpoch(t *testing.T) {
 	}
 }
 
+func TestDatasetMetadataImportSummaryAndBundleEndpoints(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("metadata demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "s3://bucket/dataset.zip", "dataset-sha", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	emptySummaryReq := httptest.NewRequest(http.MethodGet, "/datasets/"+dataset.ID+"/metadata/summary", nil)
+	emptySummaryResp := httptest.NewRecorder()
+	router.ServeHTTP(emptySummaryResp, emptySummaryReq)
+	if emptySummaryResp.Code != http.StatusOK {
+		t.Fatalf("expected empty summary status %d, got %d: %s", http.StatusOK, emptySummaryResp.Code, emptySummaryResp.Body.String())
+	}
+	var emptySummaryPayload struct {
+		Summary          *datasets.AgentSafeDatasetMetadataSummary `json:"summary"`
+		MetadataImportID string                                    `json:"metadata_import_id"`
+	}
+	if err := json.Unmarshal(emptySummaryResp.Body.Bytes(), &emptySummaryPayload); err != nil {
+		t.Fatalf("decode empty summary response: %v", err)
+	}
+	if emptySummaryPayload.Summary != nil || emptySummaryPayload.MetadataImportID != "" {
+		t.Fatalf("expected no active metadata import yet, got %#v", emptySummaryPayload)
+	}
+
+	csvContent := "path,label,split\ntrain/cat/one.jpg,cat,train\nval/dog/two.jpg,dog,valid\n"
+	importPayload := map[string]any{
+		"strict_mode": false,
+		"source_kind": "worker_discovery",
+		"sources": []map[string]any{{
+			"relative_path":   "metadata/labels.csv",
+			"declared_format": "csv_manifest",
+			"content_base64":  base64.StdEncoding.EncodeToString([]byte(csvContent)),
+			"size_bytes":      len(csvContent),
+		}},
+		"inventory": map[string]any{"files": []map[string]any{
+			{"relative_path": "train/cat/one.jpg", "size_bytes": 10},
+			{"relative_path": "val/dog/two.jpg", "size_bytes": 11},
+		}},
+	}
+	body, _ := json.Marshal(importPayload)
+	req := httptest.NewRequest(http.MethodPost, "/datasets/"+dataset.ID+"/metadata/imports", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected import status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	var importResponse struct {
+		MetadataImport datasets.DatasetMetadataImport `json:"metadata_import"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &importResponse); err != nil {
+		t.Fatalf("decode import response: %v", err)
+	}
+	if !importResponse.MetadataImport.Active || importResponse.MetadataImport.AgentSafeSummary.SampleCount != 2 {
+		t.Fatalf("unexpected metadata import: %#v", importResponse.MetadataImport)
+	}
+
+	summaryReq := httptest.NewRequest(http.MethodGet, "/datasets/"+dataset.ID+"/metadata/summary", nil)
+	summaryResp := httptest.NewRecorder()
+	router.ServeHTTP(summaryResp, summaryReq)
+	if summaryResp.Code != http.StatusOK {
+		t.Fatalf("expected summary status %d, got %d: %s", http.StatusOK, summaryResp.Code, summaryResp.Body.String())
+	}
+	summaryBody := summaryResp.Body.String()
+	if strings.Contains(summaryBody, "labels.csv") || strings.Contains(summaryBody, "s3://") || strings.Contains(summaryBody, "train/cat/one.jpg") {
+		t.Fatalf("safe summary leaked raw path/source content: %s", summaryBody)
+	}
+	var summaryPayload struct {
+		Summary datasets.AgentSafeDatasetMetadataSummary `json:"summary"`
+	}
+	if err := json.Unmarshal(summaryResp.Body.Bytes(), &summaryPayload); err != nil {
+		t.Fatalf("decode summary response: %v", err)
+	}
+	if summaryPayload.Summary.SampleCount != 2 || !summaryPayload.Summary.OfficialSplitAvailable {
+		t.Fatalf("unexpected safe summary: %#v", summaryPayload.Summary)
+	}
+
+	bundleReq := httptest.NewRequest(http.MethodGet, "/datasets/"+dataset.ID+"/metadata/bundle?purpose=training&limit=1&offset=0", nil)
+	bundleResp := httptest.NewRecorder()
+	router.ServeHTTP(bundleResp, bundleReq)
+	if bundleResp.Code != http.StatusOK {
+		t.Fatalf("expected bundle status %d, got %d: %s", http.StatusOK, bundleResp.Code, bundleResp.Body.String())
+	}
+	var bundlePayload struct {
+		Bundle datasets.DatasetMetadataBundle `json:"bundle"`
+	}
+	if err := json.Unmarshal(bundleResp.Body.Bytes(), &bundlePayload); err != nil {
+		t.Fatalf("decode bundle response: %v", err)
+	}
+	if bundlePayload.Bundle.ImportID != importResponse.MetadataImport.ID || len(bundlePayload.Bundle.ManifestRecords) != 1 || bundlePayload.Bundle.NextOffset == nil {
+		t.Fatalf("unexpected bundle payload: %#v", bundlePayload.Bundle)
+	}
+}
+
 func TestCompleteJobAcknowledgesBeforePostTrainingHooksFinish(t *testing.T) {
 	llmStarted := make(chan struct{}, 1)
 	releaseLLM := make(chan struct{})
@@ -145,6 +245,7 @@ func TestCompleteJobAcknowledgesBeforePostTrainingHooksFinish(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
 	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
 	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "test-model")
+	t.Setenv("MODEL_EXPRESS_TRAINING_MONITOR_LLM_ENABLED", "true")
 
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
@@ -1099,8 +1200,14 @@ func TestProjectObjectiveContextRecognizesLiveGoal(t *testing.T) {
 	if objective.PrimaryObjective != "low_latency_live_service" {
 		t.Fatalf("expected low latency live objective, got %s", objective.PrimaryObjective)
 	}
-	if objective.RankingWeights["latency"] <= 0.1 {
-		t.Fatalf("expected latency to be weighted strongly, got %.3f", objective.RankingWeights["latency"])
+	if objective.RankingWeights["latency"] > 0.1 {
+		t.Fatalf("expected latency to be relaxed into a budget/tiebreaker, got %.3f", objective.RankingWeights["latency"])
+	}
+	if objective.RankingWeights["macro_f1"] <= objective.RankingWeights["latency"] {
+		t.Fatalf("expected quality to dominate latency under live budget, got weights %#v", objective.RankingWeights)
+	}
+	if !strings.Contains(strings.Join(objective.DeploymentPriorities, " "), "25ms") {
+		t.Fatalf("expected live latency budget guidance, got %#v", objective.DeploymentPriorities)
 	}
 	if len(objective.MetricPreferences) < 2 {
 		t.Fatalf("expected multiple metric preferences, got %#v", objective.MetricPreferences)
@@ -1243,6 +1350,7 @@ func TestPrepareAutoMLExperimentsDisabledNoOps(t *testing.T) {
 	if _, err := server.store.SaveAutomationSettings(settings); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
+	server.setAutomationSettings(settings)
 	experiment := testExperiment("efficientnet_b0", 8)
 	experiment.AutoML = &automl.ExperimentAutoML{
 		Enabled: true,
@@ -1263,6 +1371,78 @@ func TestPrepareAutoMLExperimentsDisabledNoOps(t *testing.T) {
 	}
 	if err := validatePlannedExperiment(prepared[0], 0); err != nil {
 		t.Fatalf("disabled AutoML block should not affect validation: %v", err)
+	}
+}
+
+func TestPrepareAutoMLExperimentsAutoEnablesBackendDefaultWhenEnabled(t *testing.T) {
+	server, _, _ := newAutomaticReviewFixture(t, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 6)})
+	settings := server.currentAutomationSettings()
+	settings.AutoMLEnabled = true
+	settings.AutoMLSampler = automl.SamplerSeededRandom
+	if _, err := server.store.SaveAutomationSettings(settings); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+	server.setAutomationSettings(settings)
+	experiment := testExperiment("efficientnet_b0", 8)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Optimizer = "sgd"
+	experiment.Scheduler = "step"
+	experiment.WeightDecay = 0.01
+	experiment.Dropout = 0.1
+	experiment.LabelSmoothing = 0.03
+	experiment.GradientClipNorm = 1.0
+	experiment.AugmentationPolicy = "randaugment"
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{PolicyType: "randaugment"}
+	experiment.ClassBalancing = "focal_loss"
+	experiment.FineTuneStrategy = "last_block"
+
+	prepared, warnings, err := server.prepareAutoMLExperiments([]plans.PlannedExperiment{experiment})
+	if err != nil {
+		t.Fatalf("prepare AutoML experiments: %v", err)
+	}
+	if len(warnings) == 0 || !strings.Contains(warnings[0], "auto-enabled") {
+		t.Fatalf("expected auto-enabled warning, got %#v", warnings)
+	}
+	got := prepared[0]
+	if got.AutoML == nil || !got.AutoML.Enabled || got.AutoML.Suggestion == nil {
+		t.Fatalf("expected backend AutoML suggestion, got %#v", got.AutoML)
+	}
+	for _, name := range []string{
+		"learning_rate",
+		"weight_decay",
+		"batch_size",
+		"epochs",
+		"early_stopping_patience",
+		"dropout",
+		"label_smoothing",
+		"gradient_clip_norm",
+		"optimizer_momentum",
+		"scheduler_step_size",
+		"scheduler_gamma",
+		"augmentation_policy_config.magnitude",
+		"class_balancing_config.focal_loss_gamma",
+	} {
+		if !automl.CoversParameter(got.AutoML.SearchSpace, name) {
+			t.Fatalf("expected backend default search space to cover %s: %#v", name, got.AutoML.SearchSpace)
+		}
+		if _, ok := got.AutoML.Suggestion.Values[name]; !ok {
+			t.Fatalf("expected suggestion value for %s: %#v", name, got.AutoML.Suggestion.Values)
+		}
+	}
+	if got.AutoML.SearchSpace.Parameters[0].Source != automl.ProvenanceBackendDefault {
+		t.Fatalf("expected backend-default search-space provenance, got %#v", got.AutoML.SearchSpace.Parameters[0])
+	}
+	if got.AutoML.ValueProvenance["learning_rate"] != automl.ProvenanceRandomSearch {
+		t.Fatalf("expected sampled learning_rate provenance, got %#v", got.AutoML.ValueProvenance)
+	}
+	if got.Model != experiment.Model || got.Template != experiment.Template || got.FineTuneStrategy != experiment.FineTuneStrategy {
+		t.Fatalf("AutoML changed LLM-owned strategy fields: before %#v after %#v", experiment, got)
+	}
+	if got.AugmentationPolicy != "randaugment" || got.AugmentationPolicyConfig.PolicyType != "randaugment" || got.ClassBalancing != "focal_loss" {
+		t.Fatalf("AutoML changed LLM-owned augmentation/class-balancing strategy: %#v", got)
+	}
+	if err := validatePlannedExperiment(got, 0); err != nil {
+		t.Fatalf("prepared backend AutoML experiment should validate: %v", err)
 	}
 }
 
@@ -3638,6 +3818,7 @@ func TestTrainingMonitorFailureRecordsAgentFailedEvent(t *testing.T) {
 	defer llmServer.Close()
 
 	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_TRAINING_MONITOR_LLM_ENABLED", "true")
 	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
 	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
 	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "")
@@ -3664,6 +3845,47 @@ func TestTrainingMonitorFailureRecordsAgentFailedEvent(t *testing.T) {
 	}
 	if hasExecutionEvent(events, execution.EventExecutionFailed) {
 		t.Fatalf("expected monitor failure not to be recorded as execution failure, got %#v", events)
+	}
+}
+
+func TestTrainingMonitorDisabledByDefaultSkipsLLM(t *testing.T) {
+	llmCalls := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": `{"summary":"ok","recommended_action":{"action_type":"RANK_MODELS","confidence":0.5,"rationale":"ok","payload":{},"requires_approval":true},"quality_summary":"ok","training_dynamics":"ok","cost_summary":"ok","risks":[],"findings":[],"rank_score":0.5,"tags":[]}`,
+				},
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "test-model")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.62)
+
+	server.runTrainingMonitorAfterTrainingJob(job)
+	if llmCalls != 0 {
+		t.Fatalf("expected disabled training monitor to skip LLM, got %d calls", llmCalls)
+	}
+	records, err := server.store.ListProjectAgentMemoryRecords(projectID, memory.AgentMemoryFilter{
+		Kind:  memory.KindTrainingEvaluation,
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("list memory records: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no training monitor memory records, got %#v", records)
 	}
 }
 

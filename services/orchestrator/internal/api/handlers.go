@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
+	datasetmetadata "model-express/services/orchestrator/internal/datasets/metadata"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/execution"
@@ -114,6 +116,9 @@ const (
 	visualAnalysisDefaultLowMacroF1Threshold  = 0.55
 	visualAnalysisDefaultWorstRecallThreshold = 0.40
 	visualAnalysisDefaultConfusionThreshold   = 0.20
+
+	datasetMetadataMaxSourceBytes      = 2_000_000
+	datasetMetadataMaxTotalSourceBytes = 10_000_000
 )
 
 var (
@@ -123,6 +128,33 @@ var (
 
 type updateDatasetProfileRequest struct {
 	Profile map[string]any `json:"profile" binding:"required"`
+}
+
+type activeDatasetMetadataImportGetter interface {
+	GetActiveDatasetMetadataImport(datasetID string) (datasets.DatasetMetadataImport, error)
+}
+
+type activeDatasetMetadataImportGetterWithContext interface {
+	GetActiveDatasetMetadataImport(ctx context.Context, datasetID string) (datasets.DatasetMetadataImport, error)
+}
+
+type importDatasetMetadataRequest struct {
+	StrictMode      bool                                 `json:"strict_mode"`
+	SourceKind      string                               `json:"source_kind"`
+	Sources         []datasetMetadataSourceRequest       `json:"sources"`
+	Inventory       datasetmetadata.DatasetFileInventory `json:"inventory"`
+	WorkerDiscovery map[string]any                       `json:"worker_discovery"`
+	Warnings        []datasets.MetadataIssue             `json:"warnings"`
+}
+
+type datasetMetadataSourceRequest struct {
+	RelativePath   string   `json:"relative_path"`
+	StorageURI     string   `json:"storage_uri"`
+	ChecksumSHA256 string   `json:"checksum_sha256"`
+	SizeBytes      int64    `json:"size_bytes"`
+	DeclaredFormat string   `json:"declared_format"`
+	ContentBase64  string   `json:"content_base64"`
+	Warnings       []string `json:"warnings"`
 }
 
 type reportMetricRequest struct {
@@ -394,6 +426,235 @@ func (s *Server) updateDatasetProfile(c *gin.Context) {
 	c.JSON(http.StatusOK, dataset)
 }
 
+func (s *Server) importDatasetMetadata(c *gin.Context) {
+	var req importDatasetMetadataRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	dataset, err := s.store.GetDataset(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	parseRequest, warnings, err := datasetMetadataParseRequest(req)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if parseRequest.SourceKind == "" && len(req.WorkerDiscovery) > 0 {
+		parseRequest.SourceKind = datasets.MetadataSourceKindWorkerDiscovery
+	}
+	importRecord, err := datasetmetadata.NewService().Parse(dataset, parseRequest)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	importRecord.Warnings = append(importRecord.Warnings, normalizeMetadataIssues(req.Warnings)...)
+	importRecord.Warnings = append(importRecord.Warnings, warnings...)
+	importRecord.Summary = datasetmetadata.BuildSummary(importRecord)
+	importRecord.AgentSafeSummary = datasetmetadata.BuildAgentSafeSummary(importRecord.Summary)
+
+	stored, err := s.store.CreateDatasetMetadataImport(importRecord)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"metadata_import":    stored,
+		"summary":            stored.Summary,
+		"agent_safe_summary": stored.AgentSafeSummary,
+	})
+}
+
+func (s *Server) listDatasetMetadataImports(c *gin.Context) {
+	dataset, err := s.store.GetDataset(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	imports, err := s.store.ListDatasetMetadataImports(dataset.ID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"dataset_id":        dataset.ID,
+		"metadata_imports":  imports,
+		"source_of_truth":   "dataset_metadata_imports",
+		"safe_summary_only": false,
+	})
+}
+
+func (s *Server) getDatasetMetadataImport(c *gin.Context) {
+	dataset, err := s.store.GetDataset(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	importRecord, err := s.store.GetDatasetMetadataImport(c.Param("import_id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if importRecord.DatasetID != dataset.ID {
+		writeStoreError(c, store.ErrNotFound)
+		return
+	}
+	c.JSON(http.StatusOK, importRecord)
+}
+
+func (s *Server) getDatasetMetadataSummary(c *gin.Context) {
+	dataset, err := s.store.GetDataset(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	importRecord, err := s.store.GetActiveDatasetMetadataImport(dataset.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusOK, gin.H{
+				"dataset_id":         dataset.ID,
+				"metadata_import_id": "",
+				"summary":            nil,
+				"agent_safe_summary": nil,
+				"source_of_truth":    "dataset_metadata_imports",
+				"safe_summary_only":  true,
+				"message":            "No active dataset metadata import has been recorded.",
+			})
+			return
+		}
+		writeStoreError(c, err)
+		return
+	}
+	if strings.EqualFold(c.Query("safe"), "false") || strings.EqualFold(c.Query("agent_safe"), "false") {
+		c.JSON(http.StatusOK, gin.H{
+			"dataset_id":           dataset.ID,
+			"metadata_import_id":   importRecord.ID,
+			"summary":              importRecord.Summary,
+			"agent_safe_summary":   importRecord.AgentSafeSummary,
+			"source_of_truth":      "dataset_metadata_imports",
+			"raw_sources_included": false,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"dataset_id":         dataset.ID,
+		"metadata_import_id": importRecord.ID,
+		"summary":            importRecord.AgentSafeSummary,
+		"agent_safe_summary": importRecord.AgentSafeSummary,
+		"source_of_truth":    "dataset_metadata_imports",
+		"safe_summary_only":  true,
+	})
+}
+
+func (s *Server) getDatasetMetadataBundle(c *gin.Context) {
+	dataset, err := s.store.GetDataset(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	limit := queryInt(c, "limit", 1000, 1, 1000)
+	offset := queryInt(c, "offset", 0, 0, 1_000_000_000)
+	importID := strings.TrimSpace(c.Query("metadata_import_id"))
+	if importID == "" {
+		importID = strings.TrimSpace(c.Query("import_id"))
+	}
+	includeAnnotations := false
+	for _, include := range strings.Split(c.Query("include"), ",") {
+		if strings.EqualFold(strings.TrimSpace(include), "bbox") || strings.EqualFold(strings.TrimSpace(include), "annotations") {
+			includeAnnotations = true
+		}
+	}
+	bundle, err := s.store.GetDatasetMetadataBundle(dataset.ID, importID, includeAnnotations, limit, offset)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	purpose := strings.TrimSpace(c.Query("purpose"))
+	if purpose != "" {
+		bundle.Purpose = purpose
+	}
+	c.JSON(http.StatusOK, gin.H{"bundle": bundle})
+}
+
+func datasetMetadataParseRequest(req importDatasetMetadataRequest) (datasetmetadata.ImportRequest, []datasets.MetadataIssue, error) {
+	out := datasetmetadata.ImportRequest{
+		StrictMode: req.StrictMode,
+		SourceKind: strings.TrimSpace(req.SourceKind),
+		Inventory:  req.Inventory,
+		Sources:    make([]datasetmetadata.SourceInput, 0, len(req.Sources)),
+	}
+	warnings := []datasets.MetadataIssue{}
+	var totalBytes int64
+	for _, source := range req.Sources {
+		input := datasetmetadata.SourceInput{
+			RelativePath:   source.RelativePath,
+			StorageURI:     source.StorageURI,
+			ChecksumSHA256: source.ChecksumSHA256,
+			SizeBytes:      source.SizeBytes,
+			DeclaredFormat: source.DeclaredFormat,
+		}
+		for _, warning := range source.Warnings {
+			warnings = append(warnings, datasets.MetadataIssue{
+				Severity: "warning",
+				Code:     strings.TrimSpace(warning),
+				Message:  metadataWarningMessage(warning),
+			})
+		}
+		if strings.TrimSpace(source.ContentBase64) != "" {
+			decoded, err := base64.StdEncoding.DecodeString(source.ContentBase64)
+			if err != nil {
+				return datasetmetadata.ImportRequest{}, nil, fmt.Errorf("%w: metadata source content_base64 is invalid", store.ErrInvalidRequest)
+			}
+			if len(decoded) > datasetMetadataMaxSourceBytes {
+				warnings = append(warnings, datasets.MetadataIssue{Severity: "warning", Code: "backend_source_size_cap", Message: "metadata source content exceeded backend source byte cap and was skipped"})
+			} else if totalBytes+int64(len(decoded)) > datasetMetadataMaxTotalSourceBytes {
+				warnings = append(warnings, datasets.MetadataIssue{Severity: "warning", Code: "backend_total_source_size_cap", Message: "metadata source content exceeded backend total byte cap and was skipped"})
+			} else {
+				input.Content = decoded
+				totalBytes += int64(len(decoded))
+			}
+		}
+		out.Sources = append(out.Sources, input)
+	}
+	return out, warnings, nil
+}
+
+func normalizeMetadataIssues(issues []datasets.MetadataIssue) []datasets.MetadataIssue {
+	out := make([]datasets.MetadataIssue, 0, len(issues))
+	for _, issue := range issues {
+		issue.Code = strings.TrimSpace(issue.Code)
+		issue.Message = strings.TrimSpace(issue.Message)
+		if issue.Code == "" && issue.Message == "" {
+			continue
+		}
+		if issue.Severity == "" {
+			issue.Severity = "warning"
+		}
+		out = append(out, issue)
+	}
+	return out
+}
+
+func metadataWarningMessage(code string) string {
+	code = strings.TrimSpace(code)
+	switch code {
+	case "unsupported_metadata_format":
+		return "metadata candidate was marked unsupported by worker discovery"
+	case "content_skipped_source_size_cap":
+		return "metadata candidate content was skipped by the worker source byte cap"
+	case "content_skipped_total_size_cap":
+		return "metadata candidate content was skipped by the worker total byte cap"
+	default:
+		if code == "" {
+			return "metadata candidate warning"
+		}
+		return strings.ReplaceAll(code, "_", " ")
+	}
+}
+
 func (s *Server) listDatasetVisualExemplars(c *gin.Context) {
 	dataset, err := s.store.GetDataset(c.Param("id"))
 	if err != nil {
@@ -616,8 +877,17 @@ func (s *Server) reportDatasetVisualAnalysisResult(c *gin.Context) {
 		analysis.ProfileSchemaVersion = datasetProfileSchemaVersion(dataset.Profile)
 	}
 
+	validationDataset := dataset
+	metadataSummary, err := s.activeAgentSafeDatasetMetadataSummary(dataset)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if len(metadataSummary) > 0 {
+		validationDataset.Profile = profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary)
+	}
 	inputContext := visualAnalysisInvocationContext(req.InputContext, req.SampleManifest)
-	validationErrors := validateDatasetVisualAnalysisResult(dataset, &analysis, req.SampleManifest, req.RawOutput, inputContext)
+	validationErrors := validateDatasetVisualAnalysisResult(validationDataset, &analysis, req.SampleManifest, req.RawOutput, inputContext)
 	validationStatus := memory.InvocationValidationValid
 	if len(validationErrors) > 0 {
 		validationStatus = memory.InvocationValidationInvalid
@@ -1078,6 +1348,8 @@ func (s *Server) createProjectChampionExport(c *gin.Context) {
 	if artifactURI == "" {
 		status = runs.ChampionExportStatusPendingArtifact
 		validationErrors = append(validationErrors, "selected champion has no exportable artifact URI yet")
+	} else if artifactMatchesChampionExportFormat(artifactURI, format) {
+		status = runs.ChampionExportStatusReady
 	} else if requestArtifactURI != "" {
 		status = runs.ChampionExportStatusReady
 	}
@@ -1140,7 +1412,10 @@ func (s *Server) listProjectChampionDemoImages(c *gin.Context) {
 		return
 	}
 	caps := visualExemplarCapsFromQuery(c, 24, 4, 1_500_000)
-	exemplars := cappedVisualExemplars(dataset.Profile, caps, "demo_images", "visual_exemplars")
+	exemplars := cappedVisualExemplars(championHeldoutDemoImageProfile(champion), caps, "heldout_demo_images", "demo_images", "test_images")
+	if len(exemplars) == 0 {
+		exemplars = testOnlyVisualExemplars(cappedVisualExemplars(dataset.Profile, caps, "demo_images", "visual_exemplars", "test_images"))
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"project_id":      projectID,
@@ -1634,7 +1909,11 @@ func (s *Server) validateFollowUpExperimentMechanismsAgainstDataset(
 	if err != nil {
 		return experiments, err
 	}
-	if err := validateMechanismDatasetEvidence(dataset.Profile, enrichedExperiments, planEvidence); err != nil {
+	metadataSummary, err := s.activeAgentSafeDatasetMetadataSummary(dataset)
+	if err != nil {
+		return experiments, err
+	}
+	if err := validateMechanismDatasetEvidence(profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary), enrichedExperiments, planEvidence); err != nil {
 		message := "Follow-up scheduling blocked because one or more proposed mechanisms lack backend-verifiable diagnosis or dataset support."
 		if followUpPlanID != "" {
 			message = fmt.Sprintf("Existing follow-up plan %s is blocked because one or more mechanisms lack backend-verifiable diagnosis or dataset support.", followUpPlanID)
@@ -2913,6 +3192,9 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 }
 
 func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
+	if !trainingMonitorLLMEnabled() {
+		return
+	}
 	if !s.shouldRunLLMAgents() {
 		return
 	}
@@ -3039,6 +3321,10 @@ func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
 	}); err != nil {
 		log.Printf("record training monitor event failed: %v", err)
 	}
+}
+
+func trainingMonitorLLMEnabled() bool {
+	return envFlag("MODEL_EXPRESS_TRAINING_MONITOR_LLM_ENABLED", false)
 }
 
 func (s *Server) recordTrainingMonitorInvocation(
@@ -3354,6 +3640,10 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	if err != nil {
 		return agents.ExperimentPlannerInput{}, false, err
 	}
+	metadataSummary, err := s.activeAgentSafeDatasetMetadataSummary(dataset)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
 
 	partialInput := agents.ExperimentPlannerInput{
 		Project:                    project,
@@ -3363,7 +3653,7 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		PlanSummaries:              planSummaries,
 		PlanEvaluations:            planEvaluations,
 		PlanMetrics:                planMetrics,
-		DatasetInsights:            datasetPlanningInsights(dataset),
+		DatasetInsights:            datasetPlanningInsights(dataset, metadataSummary),
 		VisualExemplarContext:      visualContext,
 		ObjectiveContext:           objectiveContext,
 		CurrentChampion:            currentChampion,
@@ -3599,7 +3889,7 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 					return invalidPlannerDryRunResult(result, err)
 				}
 			}
-			if err := validateMechanismDatasetEvidence(input.Dataset.Profile, experiments, recommendation.EvidenceUsed); err != nil {
+			if err := validateMechanismDatasetEvidence(profileWithAgentSafeMetadataSummary(input.Dataset.Profile, input.DatasetInsights.AgentSafeMetadataSummary), experiments, recommendation.EvidenceUsed); err != nil {
 				return invalidPlannerDryRunResult(result, err)
 			}
 			result.Details["validated_experiment_count"] = len(experiments)
@@ -3892,6 +4182,17 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		deploymentProfile["model_profile"] = evaluation.ModelProfile
 		deploymentProfile["holistic_scores"] = evaluation.HolisticScores
 		deploymentProfile["diagnostics"] = "available"
+		if artifactURI := championArtifactURIFromEvaluation(evaluation.ModelProfile); artifactURI != "" {
+			deploymentProfile["artifact_uri"] = artifactURI
+			deploymentProfile["onnx_artifact_uri"] = artifactURI
+			deploymentProfile["export_status"] = firstString(evaluation.ModelProfile, "export_status")
+		}
+		if manifestURI := firstString(evaluation.ModelProfile, "export_manifest_uri", "manifest_uri"); manifestURI != "" {
+			deploymentProfile["export_manifest_uri"] = manifestURI
+		}
+		if manifest := payloadMap(evaluation.ModelProfile, "export_manifest"); len(manifest) > 0 {
+			deploymentProfile["export_manifest"] = manifest
+		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
@@ -4121,7 +4422,7 @@ func experimentPlannerDecisionForPlan(agentDecisions []decisions.AgentDecision, 
 	return decisions.AgentDecision{}, false
 }
 
-func datasetPlanningInsights(dataset datasets.Dataset) agents.DatasetPlanningInsights {
+func datasetPlanningInsights(dataset datasets.Dataset, agentSafeMetadataSummary map[string]any) agents.DatasetPlanningInsights {
 	profile := dataset.Profile
 	taskType := profileString(profile, "task_type")
 	if taskType == "" {
@@ -4130,6 +4431,17 @@ func datasetPlanningInsights(dataset datasets.Dataset) agents.DatasetPlanningIns
 	classCount := profileInt(profile, "class_count")
 	totalImages := profileInt(profile, "total_images")
 	imageCount := profileInt(profile, "image_count")
+	if metadataClassCount := int(payloadNumber(agentSafeMetadataSummary["class_count"])); metadataClassCount > classCount {
+		classCount = metadataClassCount
+	}
+	if metadataSampleCount := int(payloadNumber(agentSafeMetadataSummary["sample_count"])); metadataSampleCount > 0 {
+		if totalImages == 0 {
+			totalImages = metadataSampleCount
+		}
+		if imageCount == 0 {
+			imageCount = metadataSampleCount
+		}
+	}
 	if totalImages == 0 {
 		totalImages = imageCount
 	}
@@ -4155,7 +4467,10 @@ func datasetPlanningInsights(dataset datasets.Dataset) agents.DatasetPlanningIns
 	}
 	imageDimensionStats := profileMap(profile, "image_dimension_stats")
 	splitSummary := profileMap(profile, "split_summary")
-	metadataSummary := profileMap(profile, "metadata_summary")
+	metadataSummary := safeLegacyMetadataSummary(profileMap(profile, "metadata_summary"))
+	if len(agentSafeMetadataSummary) > 0 {
+		metadataSummary = mergeMetadataEvidenceSummary(metadataSummary, agentSafeMetadataSummary)
+	}
 	leakageWarnings := profileStringSlice(profile, "leakage_warnings")
 	datasetTraits := profileStringSlice(profile, "dataset_traits")
 	artifacts := profileMapSlice(profile, "artifacts")
@@ -4189,7 +4504,7 @@ func datasetPlanningInsights(dataset datasets.Dataset) agents.DatasetPlanningIns
 	if len(leakageWarnings) > 0 {
 		constraints = append(constraints, leakageWarnings...)
 	}
-	if metadataBool(metadataSummary, "bbox_available") || containsString(datasetTraits, "bbox_available") {
+	if metadataSummaryHasBBoxEvidence(metadataSummary) || containsString(datasetTraits, "bbox_available") {
 		recommendedPreprocessing = append(recommendedPreprocessing, "bbox_crop_if_available as an ablation against full-image training")
 	}
 	if metadataBool(metadataSummary, "metadata_available") || containsString(datasetTraits, "metadata_available") {
@@ -4244,6 +4559,7 @@ func datasetPlanningInsights(dataset datasets.Dataset) agents.DatasetPlanningIns
 		ImageDimensionStats:      imageDimensionStats,
 		SplitSummary:             splitSummary,
 		MetadataSummary:          metadataSummary,
+		AgentSafeMetadataSummary: agentSafeMetadataSummary,
 		LeakageWarnings:          leakageWarnings,
 		DatasetTraits:            datasetTraits,
 		Artifacts:                artifacts,
@@ -4253,6 +4569,262 @@ func datasetPlanningInsights(dataset datasets.Dataset) agents.DatasetPlanningIns
 		RecommendedMetrics:       uniqueStrings(recommendedMetrics),
 		LiveInferencePriorities:  liveInferencePriorities,
 	}
+}
+
+func (s *Server) activeAgentSafeDatasetMetadataSummary(dataset datasets.Dataset) (map[string]any, error) {
+	var metadataImport datasets.DatasetMetadataImport
+	var err error
+	switch getter := any(s.store).(type) {
+	case activeDatasetMetadataImportGetterWithContext:
+		metadataImport, err = getter.GetActiveDatasetMetadataImport(context.Background(), dataset.ID)
+	case activeDatasetMetadataImportGetter:
+		metadataImport, err = getter.GetActiveDatasetMetadataImport(dataset.ID)
+	default:
+		return nil, nil
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if metadataImport.DatasetID != "" && metadataImport.DatasetID != dataset.ID {
+		return nil, fmt.Errorf("%w: metadata import dataset_id does not match planner dataset", store.ErrInvalidRequest)
+	}
+	if metadataImport.ProjectID != "" && metadataImport.ProjectID != dataset.ProjectID {
+		return nil, fmt.Errorf("%w: metadata import project_id does not match planner project", store.ErrInvalidRequest)
+	}
+	summary := metadataImport.AgentSafeSummary
+	if summary.DatasetID == "" {
+		summary.DatasetID = metadataImport.DatasetID
+	}
+	if summary.ImportID == "" {
+		summary.ImportID = metadataImport.ID
+	}
+	if summary.Status == "" {
+		summary.Status = metadataImport.Status
+	}
+	if summary.ImportVersion == 0 {
+		summary.ImportVersion = metadataImport.ImportVersion
+	}
+	if summary.SourceKind == "" {
+		summary.SourceKind = metadataImport.SourceKind
+	}
+	return agentSafeDatasetMetadataSummaryMap(summary), nil
+}
+
+func agentSafeDatasetMetadataSummaryMap(summary datasets.AgentSafeDatasetMetadataSummary) map[string]any {
+	out := map[string]any{}
+	addString := func(key string, value string) {
+		if strings.TrimSpace(value) != "" {
+			out[key] = strings.TrimSpace(value)
+		}
+	}
+	addInt := func(key string, value int) {
+		if value > 0 {
+			out[key] = value
+		}
+	}
+	addFloat := func(key string, value float64) {
+		if value > 0 && isFiniteFloat(value) {
+			out[key] = roundDiagnosticFloat(value)
+		}
+	}
+	addString("dataset_id", summary.DatasetID)
+	addString("import_id", summary.ImportID)
+	addString("status", summary.Status)
+	addInt("import_version", summary.ImportVersion)
+	addString("source_kind", summary.SourceKind)
+	addInt("source_count", summary.SourceCount)
+	addInt("parsed_source_count", summary.ParsedSourceCount)
+	addInt("unsupported_source_count", summary.UnsupportedSourceCount)
+	addInt("error_source_count", summary.ErrorSourceCount)
+	if len(summary.SourceFormats) > 0 {
+		out["source_formats"] = uniqueStrings(summary.SourceFormats)
+	}
+	addInt("class_count", summary.ClassCount)
+	addInt("sample_count", summary.SampleCount)
+	addInt("labeled_sample_count", summary.LabeledSampleCount)
+	addInt("missing_label_count", summary.MissingLabelCount)
+	if len(summary.SplitCounts) > 0 {
+		out["split_counts"] = copyStringIntMap(summary.SplitCounts)
+	}
+	if summary.OfficialSplitAvailable {
+		out["official_split_available"] = true
+	}
+	if len(summary.AnnotationCounts) > 0 {
+		out["annotation_counts"] = copyStringIntMap(summary.AnnotationCounts)
+	}
+	addInt("bbox_annotation_count", summary.BBoxAnnotationCount)
+	addInt("bbox_sample_count", summary.BBoxSampleCount)
+	addFloat("bbox_coverage_ratio", summary.BBoxCoverageRatio)
+	if len(summary.Warnings) > 0 {
+		out["warnings"] = metadataIssueSummaries(summary.Warnings, 8)
+	}
+	if len(summary.Errors) > 0 {
+		out["errors"] = metadataIssueSummaries(summary.Errors, 8)
+	}
+	if len(summary.Capabilities) > 0 {
+		out["capabilities"] = copyStringBoolMap(summary.Capabilities)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func metadataIssueSummaries(issues []datasets.MetadataIssue, limit int) []map[string]any {
+	out := []map[string]any{}
+	for _, issue := range issues {
+		item := map[string]any{}
+		if strings.TrimSpace(issue.Severity) != "" {
+			item["severity"] = strings.TrimSpace(issue.Severity)
+		}
+		if strings.TrimSpace(issue.Code) != "" {
+			item["code"] = strings.TrimSpace(issue.Code)
+		}
+		if strings.TrimSpace(issue.Message) != "" && !metadataSummaryTextLooksRaw(issue.Message) {
+			item["message"] = strings.TrimSpace(issue.Message)
+		}
+		if issue.Count > 0 {
+			item["count"] = issue.Count
+		}
+		if len(item) == 0 {
+			continue
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func safeLegacyMetadataSummary(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return nil
+	}
+	allowed := map[string]bool{
+		"annotation_counts":        true,
+		"annotations_available":    true,
+		"artifact_counts":          true,
+		"bbox_annotation_count":    true,
+		"bbox_annotations_count":   true,
+		"bbox_available":           true,
+		"bbox_count":               true,
+		"bbox_coverage_ratio":      true,
+		"bbox_sample_count":        true,
+		"capabilities":             true,
+		"class_count":              true,
+		"detected_formats":         true,
+		"error_source_count":       true,
+		"errors":                   true,
+		"formats":                  true,
+		"import_id":                true,
+		"import_version":           true,
+		"labeled_sample_count":     true,
+		"metadata_available":       true,
+		"missing_label_count":      true,
+		"official_split_available": true,
+		"parsed_source_count":      true,
+		"sample_count":             true,
+		"source_count":             true,
+		"source_formats":           true,
+		"source_kind":              true,
+		"split_counts":             true,
+		"status":                   true,
+		"unsupported_source_count": true,
+		"warnings":                 true,
+	}
+	out := map[string]any{}
+	for key, value := range input {
+		normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "-", "_")
+		if !allowed[normalized] || metadataSummaryKeyLooksRaw(normalized) {
+			continue
+		}
+		if text, ok := value.(string); ok && metadataSummaryTextLooksRaw(text) {
+			continue
+		}
+		out[normalized] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mergeMetadataEvidenceSummary(base map[string]any, overlay map[string]any) map[string]any {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+	out := copyPayloadMap(base)
+	for key, value := range overlay {
+		out[key] = value
+	}
+	return out
+}
+
+func profileWithAgentSafeMetadataSummary(profile map[string]any, summary map[string]any) map[string]any {
+	if len(summary) == 0 {
+		return profile
+	}
+	out := copyPayloadMap(profile)
+	out["agent_safe_metadata_summary"] = summary
+	out["metadata_summary"] = mergeMetadataEvidenceSummary(safeLegacyMetadataSummary(profileMap(profile, "metadata_summary")), summary)
+	if classCount := int(payloadNumber(summary["class_count"])); classCount > profileInt(out, "class_count") {
+		out["class_count"] = classCount
+	}
+	if sampleCount := int(payloadNumber(summary["sample_count"])); sampleCount > 0 {
+		if profileInt(out, "total_images") == 0 {
+			out["total_images"] = sampleCount
+		}
+		if profileInt(out, "image_count") == 0 {
+			out["image_count"] = sampleCount
+		}
+	}
+	if metadataSummaryHasBBoxEvidence(summary) {
+		out["bbox_available"] = true
+	}
+	out["metadata_available"] = true
+	return out
+}
+
+func metadataSummaryKeyLooksRaw(key string) bool {
+	normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "-", "_")
+	if strings.HasSuffix(normalized, "_count") || strings.HasSuffix(normalized, "_counts") || strings.HasSuffix(normalized, "_ratio") {
+		return false
+	}
+	return containsAnyText(normalized, "path", "uri", "url", "raw", "preview", "content", "sidecar", "storage", "checksum", "filename", "file_name", "manifest_record", "source_row")
+}
+
+func metadataSummaryTextLooksRaw(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "://") || strings.Contains(lower, `:\`) || strings.HasPrefix(lower, "/") {
+		return true
+	}
+	if strings.Contains(lower, "/") && containsAnyText(lower, ".csv", ".json", ".xml", ".txt", ".tsv", ".jpg", ".jpeg", ".png", ".parquet", ".yaml", ".yml") {
+		return true
+	}
+	return containsAnyText(lower, "raw_preview", "raw row", "source row", "sidecar content", "storage uri", "local path")
+}
+
+func copyStringIntMap(input map[string]int) map[string]int {
+	out := make(map[string]int, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func copyStringBoolMap(input map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func (s *Server) plannerVisualEvidenceContext(dataset datasets.Dataset) (*agents.PlannerVisualExemplarContext, error) {
@@ -4414,12 +4986,12 @@ func projectObjectiveContext(goal string) agents.ProjectObjectiveContext {
 
 	if containsAny(normalized, "live", "real-time", "realtime", "instant", "fast", "quick", "low latency") {
 		context.PrimaryObjective = "low_latency_live_service"
-		context.DeploymentPriorities = append(context.DeploymentPriorities, "prioritize fast inference when quality is close", "prefer compact models for live serving")
-		context.Constraints = append(context.Constraints, "avoid heavy challenger models unless they clearly improve quality")
-		context.RankingWeights["latency"] = 0.22
-		context.RankingWeights["model_size"] = 0.10
-		context.RankingWeights["macro_f1"] = 0.28
-		context.RankingWeights["accuracy"] = 0.20
+		context.DeploymentPriorities = append(context.DeploymentPriorities, "treat inference latency under roughly 25ms as acceptable for live use", "use latency as a tiebreaker when quality is close")
+		context.Constraints = append(context.Constraints, "allow stronger quality challengers when expected or observed latency remains within the live budget")
+		context.RankingWeights["latency"] = 0.08
+		context.RankingWeights["model_size"] = 0.04
+		context.RankingWeights["macro_f1"] = 0.40
+		context.RankingWeights["accuracy"] = 0.26
 	}
 	if containsAny(normalized, "cheap", "budget", "cost", "low cost", "inexpensive") {
 		if context.PrimaryObjective == "balanced_quality" {
@@ -4434,8 +5006,9 @@ func projectObjectiveContext(goal string) agents.ProjectObjectiveContext {
 			context.PrimaryObjective = "quality_first"
 		}
 		context.DeploymentPriorities = append(context.DeploymentPriorities, "allow stronger models when they produce meaningful quality gains")
-		context.RankingWeights["macro_f1"] = 0.38
+		context.RankingWeights["macro_f1"] = 0.45
 		context.RankingWeights["accuracy"] = 0.30
+		context.RankingWeights["per_class_behavior"] = 0.18
 	}
 	if containsAny(normalized, "imbalanced", "minority", "rare class", "rare classes", "fair", "per-class", "per class") {
 		context.MetricPreferences = append(context.MetricPreferences, "per_class_f1", "recall_by_class")
@@ -4444,10 +5017,10 @@ func projectObjectiveContext(goal string) agents.ProjectObjectiveContext {
 		context.RankingWeights["macro_f1"] = 0.40
 	}
 	if containsAny(normalized, "mobile", "edge", "browser", "desktop", "cpu") {
-		context.DeploymentPriorities = append(context.DeploymentPriorities, "prefer compact CPU-friendly models and smaller image sizes")
-		context.Constraints = append(context.Constraints, "consider model size and inference latency as first-class selection criteria")
-		context.RankingWeights["model_size"] = 0.16
-		context.RankingWeights["latency"] = 0.20
+		context.DeploymentPriorities = append(context.DeploymentPriorities, "prefer compact CPU-friendly models only when quality is close or latency exceeds the live budget")
+		context.Constraints = append(context.Constraints, "do not reject quality challengers solely for being larger when latency remains acceptable")
+		context.RankingWeights["model_size"] = maxFloat(context.RankingWeights["model_size"], 0.08)
+		context.RankingWeights["latency"] = maxFloat(context.RankingWeights["latency"], 0.10)
 	}
 
 	context.MetricPreferences = uniqueStrings(context.MetricPreferences)
@@ -5336,7 +5909,7 @@ func holisticRunScore(targetMetric string, summary runs.TrainingRunSummary, eval
 	runtimeScore := maxFloat(0, minFloat(1, 1-summary.RuntimeSeconds/1800))
 
 	if objectiveContext.PrimaryObjective == "low_latency_live_service" {
-		return quality*0.62 + latencyScore*0.24 + costScore*0.08 + runtimeScore*0.06
+		return quality*0.76 + latencyScore*0.10 + costScore*0.08 + runtimeScore*0.06
 	}
 	if objectiveContext.PrimaryObjective == "budget_sensitive" {
 		return quality*0.68 + costScore*0.18 + latencyScore*0.08 + runtimeScore*0.06
@@ -5759,6 +6332,13 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 		return err
 	}
 
+	metadataSummary, err := s.activeAgentSafeDatasetMetadataSummary(dataset)
+	if err != nil {
+		return err
+	}
+	if len(metadataSummary) > 0 {
+		dataset.Profile = profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary)
+	}
 	recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{
 		Priority: agents.PriorityBalanced,
 	})
@@ -5878,6 +6458,12 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			config["report_only"] = true
 		}
 		addOptionalExperimentConfig(config, experiment)
+		if metadataImport, err := s.store.GetActiveDatasetMetadataImport(plan.DatasetID); err == nil {
+			config["metadata_import_id"] = metadataImport.ID
+			config["metadata_summary"] = metadataImport.AgentSafeSummary
+		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return executeExperimentPlanResponse{}, err
+		}
 		if suggestion, ok := automlSuggestions[index]; ok {
 			config["automl_study_id"] = suggestion.StudyID
 			config["automl_suggestion_id"] = suggestion.ID
@@ -6032,6 +6618,10 @@ func (s *Server) prepareAutoMLExperimentsForProject(projectID string, experiment
 		}
 	}
 	for index := range out {
+		if out[index].AutoML == nil && automationSettings.AutoMLEnabled && !strings.EqualFold(strings.TrimSpace(out[index].Template), jobs.TemplateLabelQualityAudit) {
+			out[index].AutoML = defaultBackendAutoMLForExperiment(out[index], automationSettings.AutoMLSampler)
+			warnings = append(warnings, fmt.Sprintf("AutoML auto-enabled for experiment %d; backend sampled concrete hyperparameters inside the LLM-selected strategy.", index))
+		}
 		if out[index].AutoML == nil || !out[index].AutoML.Enabled {
 			continue
 		}
@@ -6049,6 +6639,208 @@ func (s *Server) prepareAutoMLExperimentsForProject(projectID string, experiment
 		warnings = append(warnings, fmt.Sprintf("AutoML sampled %d hyperparameter(s) for experiment %d using %s.", len(prepared.AutoML.Suggestion.Values), index, prepared.AutoML.Sampler))
 	}
 	return out, warnings, nil
+}
+
+func defaultBackendAutoMLForExperiment(experiment plans.PlannedExperiment, defaultSampler string) *automl.ExperimentAutoML {
+	searchSpace := defaultBackendAutoMLSearchSpace(experiment)
+	return &automl.ExperimentAutoML{
+		Enabled:     true,
+		Sampler:     normalizeAutoMLSampler(defaultSampler),
+		SearchSpace: &searchSpace,
+		Intent: automl.ExperimentIntent{
+			Summary:           "Backend default AutoML samples concrete hyperparameters only; LLM-owned strategy fields are frozen.",
+			PlanningMode:      strings.TrimSpace(experiment.Strategy),
+			ExplorationIntent: "backend_default_hyperparameter_sampling",
+			Goals: []string{
+				"sample executable hyperparameters inside the validated experiment strategy",
+				"preserve LLM-selected model, preprocessing, augmentation policy, class balancing, and fine-tuning choices",
+			},
+			AllowedParameters:   autoMLSearchSpaceParameterNames(searchSpace),
+			StrategyDescription: strings.TrimSpace(experiment.Reason),
+		},
+	}
+}
+
+func defaultBackendAutoMLSearchSpace(experiment plans.PlannedExperiment) automl.HyperparameterSearchSpace {
+	params := []automl.HyperparameterParameterSpec{}
+
+	baseLR := experiment.LearningRate
+	if baseLR <= 0 {
+		baseLR = 3e-4
+	}
+	lrMin := maxFloat(1e-6, baseLR/5)
+	lrMax := minFloat(3e-3, baseLR*5)
+	if lrMax <= lrMin {
+		lrMin = 1e-5
+		lrMax = 3e-4
+	}
+	params = append(params, autoMLFloatSpec("learning_rate", lrMin, lrMax, automl.SearchScaleLog, "centered around the LLM-provided learning rate"))
+
+	wdMin := 0.0
+	wdMax := 0.08
+	if experiment.WeightDecay > 0 {
+		wdMin = maxFloat(0, experiment.WeightDecay/5)
+		wdMax = minFloat(0.2, maxFloat(experiment.WeightDecay*4, experiment.WeightDecay+0.02))
+	}
+	params = append(params, autoMLFloatSpec("weight_decay", wdMin, wdMax, automl.SearchScaleLinear, "regularization strength"))
+
+	params = append(params, autoMLIntChoicesSpec("batch_size", defaultAutoMLBatchSizeChoices(experiment.BatchSize), "worker-supported batch sizes near the LLM budget"))
+
+	epochBase := experiment.Epochs
+	if epochBase < 3 {
+		epochBase = 10
+	}
+	epochMin := maxInt(3, epochBase-4)
+	epochMax := minInt(40, epochBase+8)
+	if epochMax < epochMin {
+		epochMax = epochMin
+	}
+	params = append(params, autoMLIntRangeSpec("epochs", epochMin, epochMax, "bounded training budget around the LLM proposal"))
+	params = append(params, autoMLIntChoicesSpec("early_stopping_patience", defaultAutoMLPatienceChoices(epochMax), "bounded early-stopping patience"))
+
+	dropoutMin := 0.0
+	dropoutMax := 0.35
+	if experiment.Dropout > 0 {
+		dropoutMin = maxFloat(0, experiment.Dropout/3)
+		dropoutMax = minFloat(0.7, maxFloat(0.35, experiment.Dropout*2.5))
+	}
+	params = append(params, autoMLFloatSpec("dropout", dropoutMin, dropoutMax, automl.SearchScaleLinear, "head regularization"))
+	params = append(params, autoMLFloatSpec("label_smoothing", 0, 0.15, automl.SearchScaleLinear, "classification regularization"))
+	params = append(params, autoMLFloatSpec("gradient_clip_norm", 0, 3, automl.SearchScaleLinear, "gradient stability"))
+
+	if strings.EqualFold(strings.TrimSpace(experiment.Optimizer), "sgd") {
+		params = append(params, autoMLFloatSpec("optimizer_momentum", 0.7, 0.95, automl.SearchScaleLinear, "SGD momentum"))
+	}
+	if strings.EqualFold(strings.TrimSpace(experiment.Scheduler), "step") {
+		stepMax := minInt(10, maxInt(2, epochMax/2))
+		params = append(params, autoMLIntRangeSpec("scheduler_step_size", 1, stepMax, "step scheduler cadence"))
+		params = append(params, autoMLFloatSpec("scheduler_gamma", 0.2, 0.8, automl.SearchScaleLinear, "step scheduler decay"))
+	}
+
+	if experiment.AugmentationPolicyConfig != nil {
+		switch strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicyConfig.PolicyType)) {
+		case "randaugment":
+			params = append(params,
+				autoMLIntRangeSpec("augmentation_policy_config.magnitude", 4, 12, "numeric strength for the LLM-selected randaugment policy"),
+				autoMLIntRangeSpec("augmentation_policy_config.num_ops", 1, 3, "operation count for the LLM-selected randaugment policy"),
+				autoMLFloatSpec("augmentation_policy_config.probability", 0.5, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"),
+			)
+		case "trivialaugment", "trivialaugmentwide":
+			params = append(params,
+				autoMLIntRangeSpec("augmentation_policy_config.num_magnitude_bins", 8, 31, "magnitude bins for the LLM-selected augmentation policy"),
+				autoMLFloatSpec("augmentation_policy_config.probability", 0.5, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"),
+			)
+		case "autoaugment":
+			params = append(params, autoMLFloatSpec("augmentation_policy_config.probability", 0.5, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"))
+		case "mixup", "cutmix":
+			params = append(params,
+				autoMLFloatSpec("augmentation_policy_config.alpha", 0.05, 0.6, automl.SearchScaleLinear, "mixing strength for the LLM-selected mixed-sample policy"),
+				autoMLFloatSpec("augmentation_policy_config.probability", 0.3, 0.9, automl.SearchScaleLinear, "application probability for the LLM-selected mixed-sample policy"),
+			)
+		}
+	}
+
+	if effectiveNumberClassBalancing(experiment.ClassBalancing) {
+		params = append(params, autoMLFloatSpec("class_balancing_config.effective_number_beta", 0.95, 0.9999, automl.SearchScaleLinear, "effective-number loss beta"))
+	}
+	if strings.EqualFold(strings.TrimSpace(experiment.ClassBalancing), "focal_loss") {
+		params = append(params, autoMLFloatSpec("class_balancing_config.focal_loss_gamma", 1, 4, automl.SearchScaleLinear, "focal loss gamma"))
+	}
+
+	return automl.HyperparameterSearchSpace{Parameters: params}
+}
+
+func autoMLSearchSpaceParameterNames(space automl.HyperparameterSearchSpace) []string {
+	names := make([]string, 0, len(space.Parameters))
+	for _, spec := range space.Parameters {
+		names = append(names, spec.Name)
+	}
+	return names
+}
+
+func autoMLFloatSpec(name string, minValue float64, maxValue float64, scale automl.SearchScale, notes string) automl.HyperparameterParameterSpec {
+	return automl.HyperparameterParameterSpec{
+		Name:   name,
+		Type:   automl.ParameterFloat,
+		Min:    &minValue,
+		Max:    &maxValue,
+		Scale:  scale,
+		Source: automl.ProvenanceBackendDefault,
+		Notes:  notes,
+	}
+}
+
+func autoMLIntRangeSpec(name string, minValue int, maxValue int, notes string) automl.HyperparameterParameterSpec {
+	minFloatValue := float64(minValue)
+	maxFloatValue := float64(maxValue)
+	return automl.HyperparameterParameterSpec{
+		Name:   name,
+		Type:   automl.ParameterInteger,
+		Min:    &minFloatValue,
+		Max:    &maxFloatValue,
+		Source: automl.ProvenanceBackendDefault,
+		Notes:  notes,
+	}
+}
+
+func autoMLIntChoicesSpec(name string, choices []int, notes string) automl.HyperparameterParameterSpec {
+	return automl.HyperparameterParameterSpec{
+		Name:       name,
+		Type:       automl.ParameterInteger,
+		IntChoices: append([]int(nil), choices...),
+		Source:     automl.ProvenanceBackendDefault,
+		Notes:      notes,
+	}
+}
+
+func defaultAutoMLBatchSizeChoices(current int) []int {
+	supported := []int{4, 8, 16, 32, 64, 128}
+	if current <= 0 {
+		return []int{8, 16, 32}
+	}
+	lower := maxInt(4, current/2)
+	upper := maxInt(lower, current*2)
+	choices := []int{}
+	for _, choice := range supported {
+		if choice >= lower && choice <= upper {
+			choices = append(choices, choice)
+		}
+	}
+	if len(choices) > 0 {
+		return choices
+	}
+	nearest := supported[0]
+	bestDistance := absInt(current - nearest)
+	for _, choice := range supported[1:] {
+		if distance := absInt(current - choice); distance < bestDistance {
+			nearest = choice
+			bestDistance = distance
+		}
+	}
+	return []int{nearest}
+}
+
+func defaultAutoMLPatienceChoices(maxEpochs int) []int {
+	limit := minInt(8, maxInt(2, maxEpochs/2))
+	choices := []int{}
+	for value := 2; value <= limit; value++ {
+		choices = append(choices, value)
+	}
+	return choices
+}
+
+func minInt(left int, right int) int {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func prepareAutoMLExperiment(experiment plans.PlannedExperiment, index int, defaultSampler string) (plans.PlannedExperiment, error) {
@@ -7053,9 +7845,11 @@ func profileHasBBoxEvidence(profile map[string]any) bool {
 		return true
 	}
 	metadata := profileMap(profile, "metadata_summary")
-	if metadataBool(metadata, "bbox_available") || metadataBool(metadata, "annotations_available") ||
-		payloadNumber(metadata["bbox_annotations_count"]) > 0 ||
-		artifactCountsHaveBBoxEvidence(profileMap(metadata, "artifact_counts")) {
+	if metadataSummaryHasBBoxEvidence(metadata) {
+		return true
+	}
+	if metadataSummaryHasBBoxEvidence(profileMap(profile, "agent_safe_metadata_summary")) ||
+		metadataSummaryHasBBoxEvidence(profileMap(profile, "normalized_metadata_summary")) {
 		return true
 	}
 	visualTraits := profileMap(profile, "visual_trait_summary")
@@ -7073,6 +7867,31 @@ func profileHasBBoxEvidence(profile map[string]any) bool {
 		if containsAnyText(strings.ToLower(string(blob)), "bbox", "bounding_box", "annotation", "coco", "voc") {
 			return true
 		}
+	}
+	return false
+}
+
+func metadataSummaryHasBBoxEvidence(summary map[string]any) bool {
+	if len(summary) == 0 {
+		return false
+	}
+	if metadataBool(summary, "bbox_available") || metadataBool(summary, "annotations_available") ||
+		payloadNumber(summary["bbox_annotations_count"]) > 0 ||
+		payloadNumber(summary["bbox_annotation_count"]) > 0 ||
+		payloadNumber(summary["bbox_sample_count"]) > 0 ||
+		payloadNumber(summary["bbox_count"]) > 0 ||
+		payloadNumber(summary["bbox_coverage_ratio"]) > 0 ||
+		artifactCountsHaveBBoxEvidence(profileMap(summary, "artifact_counts")) {
+		return true
+	}
+	annotationCounts := profileMap(summary, "annotation_counts")
+	if payloadNumber(annotationCounts["bbox"]) > 0 || payloadNumber(annotationCounts["bounding_box"]) > 0 {
+		return true
+	}
+	capabilities := profileMap(summary, "capabilities")
+	if metadataBool(capabilities, "bbox") || metadataBool(capabilities, "bbox_annotations") ||
+		metadataBool(capabilities, "bbox_crop") || metadataBool(capabilities, "object_detection") {
+		return true
 	}
 	return false
 }
@@ -7687,6 +8506,31 @@ func visualExemplarFromProfileEntry(entry any) (datasets.VisualExemplar, bool) {
 	return exemplar, true
 }
 
+func championHeldoutDemoImageProfile(champion runs.ProjectChampion) map[string]any {
+	out := map[string]any{}
+	objective := payloadMap(champion.Evaluation, "objective_profile")
+	for _, key := range []string{"heldout_demo_images", "demo_images", "test_images"} {
+		if value, ok := objective[key]; ok {
+			out[key] = value
+		}
+		if value, ok := champion.DeploymentProfile[key]; ok {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func testOnlyVisualExemplars(exemplars []datasets.VisualExemplar) []datasets.VisualExemplar {
+	out := make([]datasets.VisualExemplar, 0, len(exemplars))
+	for _, exemplar := range exemplars {
+		split := strings.ToLower(strings.TrimSpace(exemplar.Split))
+		if split == "test" || split == "heldout" || split == "holdout" {
+			out = append(out, exemplar)
+		}
+	}
+	return out
+}
+
 func championDemoImageMetadata(profile map[string]any, imageURI string) (string, string, map[string]any, bool) {
 	imageURI = strings.TrimSpace(imageURI)
 	if imageURI == "" {
@@ -7750,7 +8594,30 @@ func normalizeChampionExportFormat(format string) string {
 }
 
 func championArtifactURI(deploymentProfile map[string]any) string {
-	return firstString(deploymentProfile, "artifact_uri", "model_artifact_uri", "export_artifact_uri", "checkpoint_uri")
+	if artifactURI := firstString(deploymentProfile, "artifact_uri", "onnx_artifact_uri", "model_artifact_uri", "export_artifact_uri", "checkpoint_uri"); artifactURI != "" {
+		return artifactURI
+	}
+	return championArtifactURIFromEvaluation(payloadMap(deploymentProfile, "model_profile"))
+}
+
+func championArtifactURIFromEvaluation(modelProfile map[string]any) string {
+	return firstString(modelProfile, "onnx_artifact_uri", "artifact_uri", "model_artifact_uri", "export_artifact_uri", "checkpoint_uri")
+}
+
+func artifactMatchesChampionExportFormat(artifactURI string, format string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(artifactURI))
+	switch format {
+	case "onnx":
+		return strings.HasSuffix(normalized, ".onnx")
+	case "torchscript":
+		return strings.HasSuffix(normalized, ".torchscript.pt") || strings.HasSuffix(normalized, ".torchscript")
+	case "pytorch":
+		return strings.HasSuffix(normalized, ".pt") || strings.HasSuffix(normalized, ".pth")
+	case "safetensors":
+		return strings.HasSuffix(normalized, ".safetensors")
+	default:
+		return false
+	}
 }
 
 func championExportMetadata(champion runs.ProjectChampion, format string, requestMetadata map[string]any) map[string]any {
@@ -8286,6 +9153,17 @@ func (s *Server) queueDatasetVisualAnalysis(dataset datasets.Dataset, trigger da
 		"high_detail_cap":        highDetailCap,
 		"profile_fingerprint":    datasetProfileFingerprint(dataset.Profile),
 		"evidence_only":          true,
+	}
+	metadataSummary, err := s.activeAgentSafeDatasetMetadataSummary(dataset)
+	if err != nil {
+		return jobs.ExperimentJob{}, execution.ExecutionEvent{}, err
+	}
+	if len(metadataSummary) > 0 {
+		config["agent_safe_metadata_summary"] = metadataSummary
+		config["metadata_summary"] = metadataSummary
+		if importID, _ := metadataSummary["import_id"].(string); strings.TrimSpace(importID) != "" {
+			config["metadata_import_id"] = strings.TrimSpace(importID)
+		}
 	}
 	job, err := s.ensureOpenJob(dataset.ProjectID, jobs.TemplateAnalyzeDatasetVisuals, config, func(job jobs.ExperimentJob) bool {
 		return jobConfigString(job.Config, "dataset_id") == dataset.ID &&
@@ -9274,6 +10152,24 @@ func envFlagValueFromString(input string) (bool, bool) {
 
 func envInt(name string, defaultValue int, minValue int, maxValue int) int {
 	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	if parsed < minValue {
+		return minValue
+	}
+	if maxValue >= minValue && parsed > maxValue {
+		return maxValue
+	}
+	return parsed
+}
+
+func queryInt(c *gin.Context, key string, defaultValue int, minValue int, maxValue int) int {
+	value := strings.TrimSpace(c.Query(key))
 	if value == "" {
 		return defaultValue
 	}

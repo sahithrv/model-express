@@ -339,6 +339,158 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertEqual(image.size, (8, 8))
             self.assertEqual(label, 0)
 
+    def test_image_folder_dataset_uses_common_top_level_image_root(self) -> None:
+        try:
+            from torchvision import datasets
+        except Exception as exc:  # pragma: no cover - depends on optional training deps
+            raise unittest.SkipTest(f"torchvision is unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            for class_name, color in (("cat", (255, 0, 0)), ("dog", (0, 0, 255))):
+                class_dir = dataset_dir / "images" / class_name
+                class_dir.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (12, 12), color).save(class_dir / "one.jpg")
+            (dataset_dir / "attributes").mkdir()
+            (dataset_dir / "parts").mkdir()
+
+            dataset = self.modal_app._image_folder_dataset(datasets, dataset_dir)
+
+            self.assertEqual(dataset.classes, ["cat", "dog"])
+            self.assertTrue(all("/images/" in Path(path).as_posix() for path, _label in dataset.samples))
+
+    def test_metadata_bundle_dataset_overrides_folder_labels_and_splits(self) -> None:
+        try:
+            import torch  # noqa: F401
+            import torchvision  # noqa: F401
+        except Exception as exc:  # pragma: no cover - depends on optional training deps
+            raise unittest.SkipTest(f"training dependencies are unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            folder_a = dataset_dir / "folder_a"
+            folder_b = dataset_dir / "folder_b"
+            folder_a.mkdir()
+            folder_b.mkdir()
+            image_specs = [
+                (folder_a / "a_train_1.jpg", (255, 0, 0)),
+                (folder_a / "a_train_2.jpg", (250, 0, 0)),
+                (folder_b / "b_train_1.jpg", (0, 255, 0)),
+                (folder_b / "b_val.jpg", (0, 250, 0)),
+                (folder_a / "a_test.jpg", (0, 0, 255)),
+                (folder_b / "b_test.jpg", (0, 0, 250)),
+            ]
+            for path, color in image_specs:
+                Image.new("RGB", (12, 12), color).save(path)
+
+            bundle = {
+                "classes": [
+                    {"class_key": "cat_key", "class_name": "cat", "class_index": 0},
+                    {"class_key": "dog_key", "class_name": "dog", "class_index": 1},
+                ],
+                "manifest_records": [
+                    {"sample_key": "s1", "relative_path": "folder_a/a_train_1.jpg", "label_key": "dog_key", "split": "train"},
+                    {"sample_key": "s2", "relative_path": "folder_a/a_train_2.jpg", "label_key": "dog_key", "split": "train"},
+                    {"sample_key": "s3", "relative_path": "folder_b/b_train_1.jpg", "label_key": "cat_key", "split": "train"},
+                    {"sample_key": "s4", "relative_path": "folder_b/b_val.jpg", "label_key": "cat_key", "split": "val"},
+                    {"sample_key": "s5", "relative_path": "folder_a/a_test.jpg", "label_key": "dog_key", "split": "test"},
+                    {"sample_key": "s6", "relative_path": "folder_b/b_test.jpg", "label_key": "cat_key", "split": "test"},
+                ],
+                "annotations": [
+                    {"sample_key": "s1", "annotation_type": "bbox", "bbox": {"xmin": 1, "ymin": 2, "xmax": 8, "ymax": 9}}
+                ],
+            }
+
+            train_loader, val_loader, test_loader, class_names, _class_weights, execution_metadata = self.modal_app._load_image_data(
+                dataset_dir,
+                batch_size=2,
+                image_size=32,
+                augmentation={},
+                class_balancing="none",
+                sampling_strategy="none",
+                preprocessing={"resize_strategy": "squash", "normalization": "none"},
+                metadata_bundle=bundle,
+            )
+            bbox_lookup = self.modal_app._bbox_lookup_from_metadata_bundle(bundle, dataset_dir)
+
+            self.assertEqual(class_names, ["cat", "dog"])
+            self.assertEqual(list(train_loader.dataset.indices), [0, 1, 2])
+            self.assertEqual(list(val_loader.dataset.indices), [3])
+            self.assertEqual(list(test_loader.dataset.indices), [4, 5])
+            self.assertEqual(execution_metadata["metadata_bundle"]["status"], "applied")
+            self.assertEqual(execution_metadata["metadata_bundle"]["split_strategy"], "metadata_official")
+            self.assertEqual(bbox_lookup["a_train_1.jpg"], (1, 2, 8, 9))
+
+    def test_metadata_bundle_resolves_paths_under_common_image_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            image_root = dataset_dir / "images"
+            (image_root / "red").mkdir(parents=True)
+            (image_root / "blue").mkdir(parents=True)
+            Image.new("RGB", (12, 12), (255, 0, 0)).save(image_root / "red" / "one.jpg")
+            Image.new("RGB", (12, 12), (0, 0, 255)).save(image_root / "blue" / "two.jpg")
+
+            bundle = {
+                "classes": [
+                    {"class_key": "red_key", "class_name": "red", "class_index": 0},
+                    {"class_key": "blue_key", "class_name": "blue", "class_index": 1},
+                ],
+                "manifest_records": [
+                    {"sample_key": "s1", "relative_path": "red/one.jpg", "label_key": "red_key", "split": "train"},
+                    {"sample_key": "s2", "relative_path": "blue/two.jpg", "label_key": "blue_key", "split": "test"},
+                ],
+                "annotations": [
+                    {"sample_key": "s1", "bbox": {"xmin": 1, "ymin": 2, "xmax": 9, "ymax": 10}},
+                ],
+            }
+
+            spec = self.modal_app._metadata_bundle_dataset_spec(dataset_dir, bundle)
+            bbox_lookup = self.modal_app._bbox_lookup_from_metadata_bundle(bundle, dataset_dir)
+
+            self.assertIsNotNone(spec)
+            self.assertEqual([Path(path).name for path, _target in spec["samples"]], ["one.jpg", "two.jpg"])
+            self.assertEqual(bbox_lookup["one.jpg"], (1, 2, 9, 10))
+
+    def test_train_test_metadata_split_derives_validation_from_train(self) -> None:
+        splits = ["train", "train", "train", "train", "train", "train", "test", "test"]
+        targets = [0, 0, 0, 1, 1, 1, 0, 1]
+
+        train_indices, val_indices, test_indices = self.modal_app._indices_from_metadata_splits(splits, targets)
+
+        self.assertEqual(train_indices, [0, 1, 2, 4, 5])
+        self.assertEqual(val_indices, [3])
+        self.assertEqual(test_indices, [6, 7])
+
+    def test_unusable_metadata_bundle_keeps_imagefolder_fallback(self) -> None:
+        try:
+            import torch  # noqa: F401
+            import torchvision  # noqa: F401
+        except Exception as exc:  # pragma: no cover - depends on optional training deps
+            raise unittest.SkipTest(f"training dependencies are unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            for class_name, color in (("cat", (255, 0, 0)), ("dog", (0, 0, 255))):
+                class_dir = dataset_dir / class_name
+                class_dir.mkdir()
+                for index in range(2):
+                    Image.new("RGB", (12, 12), color).save(class_dir / f"{index}.jpg")
+
+            _train_loader, _val_loader, _test_loader, class_names, _class_weights, execution_metadata = self.modal_app._load_image_data(
+                dataset_dir,
+                batch_size=2,
+                image_size=32,
+                augmentation={},
+                class_balancing="none",
+                sampling_strategy="none",
+                preprocessing={"resize_strategy": "squash", "normalization": "none"},
+                metadata_bundle={"manifest_records": [{"relative_path": "missing.jpg", "label": "cat", "split": "train"}]},
+            )
+
+            self.assertEqual(class_names, ["cat", "dog"])
+            self.assertEqual(execution_metadata["metadata_bundle"]["status"], "not_usable")
+            self.assertEqual(execution_metadata["metadata_bundle"]["split_strategy"], "deterministic_random")
+
     def test_label_quality_audit_is_report_only(self) -> None:
         audit = self.modal_app._label_quality_audit(
             {"mechanism": "label_noise_audit"},

@@ -259,21 +259,62 @@ def _existing_artifact_source_path(config: dict, requested_format: str) -> Path 
         "pytorch": ("checkpoint_path", "pytorch_path", "model_path"),
         "safetensors": ("safetensors_path", "safetensors_artifact_path"),
     }
-    keys = (*format_keys.get(requested_format, ()), "artifact_path", "local_artifact_path")
+    uri_keys = {
+        "onnx": ("onnx_artifact_uri", "onnx_uri"),
+        "torchscript": ("torchscript_artifact_uri", "torchscript_uri"),
+        "pytorch": ("checkpoint_uri", "pytorch_uri", "model_uri"),
+        "safetensors": ("safetensors_artifact_uri", "safetensors_uri"),
+    }
+    keys = (
+        *format_keys.get(requested_format, ()),
+        *uri_keys.get(requested_format, ()),
+        "artifact_path",
+        "local_artifact_path",
+        "artifact_uri",
+        "export_artifact_uri",
+    )
     for key in keys:
         value = _first_string(config, key)
         if not value:
             continue
+        if value.startswith("s3://"):
+            destination = _downloaded_artifact_path(value, requested_format)
+            try:
+                return download_s3_uri(value, destination)
+            except Exception:
+                continue
         path = _path_from_uri_or_local(value)
         if path is not None:
             return path
     return None
 
 
+def _downloaded_artifact_path(uri: str, requested_format: str) -> Path:
+    parsed = urlparse(uri)
+    filename = Path(parsed.path).name or _artifact_filename_for_format(requested_format)
+    return Path(os.getenv("WORKER_ARTIFACT_DOWNLOAD_ROOT", ".cache/artifacts")) / _safe_path_part(parsed.netloc) / _safe_path_part(filename)
+
+
+def _artifact_filename_for_format(requested_format: str) -> str:
+    if requested_format == "onnx":
+        return "model.onnx"
+    if requested_format == "torchscript":
+        return "model.torchscript.pt"
+    if requested_format == "safetensors":
+        return "model.safetensors"
+    return "model.pt"
+
+
 def _manifest_path(config: dict) -> Path | None:
     for key in ("manifest_path", "export_manifest_path", "local_manifest_path"):
         value = _first_string(config, key)
         if value:
+            if value.startswith("s3://"):
+                destination = _downloaded_artifact_path(value, "manifest")
+                try:
+                    return download_s3_uri(value, destination)
+                except Exception:
+                    continue
             path = _path_from_uri_or_local(value)
             if path is not None:
                 return path

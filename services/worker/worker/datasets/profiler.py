@@ -1,15 +1,62 @@
 from __future__ import annotations
 from pathlib import Path
 import statistics
-from PIL import Image
+from PIL import Image, ImageStat
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-NON_CLASS_DIR_NAMES = {"annotation", "annotations", "metadata", "meta", "splits"}
-SPLIT_FILE_NAMES = {"train.txt", "val.txt", "valid.txt", "validation.txt", "test.txt", "split.txt", "splits.txt"}
-LABELS_FILE_NAMES = {"labels.csv", "classes.csv", "annotations.csv"}
+NON_CLASS_DIR_NAMES = {
+    "annotation",
+    "annotations",
+    "attribute",
+    "attributes",
+    "bbox",
+    "bboxes",
+    "boxes",
+    "keypoint",
+    "keypoints",
+    "label",
+    "labels",
+    "landmark",
+    "landmarks",
+    "manifest",
+    "manifests",
+    "meta",
+    "metadata",
+    "part",
+    "parts",
+    "split",
+    "splits",
+}
+COMMON_IMAGE_ROOT_NAMES = {"images", "image", "imgs", "img", "jpegimages", "data"}
+SPLIT_FILE_NAMES = {
+    "train.txt",
+    "val.txt",
+    "valid.txt",
+    "validation.txt",
+    "test.txt",
+    "split.txt",
+    "splits.txt",
+    "train_test_split.txt",
+}
+LABELS_FILE_NAMES = {"labels.csv", "classes.csv", "annotations.csv", "image_class_labels.txt"}
 CLASS_HIERARCHY_NAMES = {"class_hierarchy.json", "class_hierarchy.csv", "hierarchy.json", "synsets.txt"}
+CUB_METADATA_FILE_NAMES = {"classes.txt", "images.txt", "parts.txt", "part_locs.txt"}
+CUB_BBOX_FILE_NAMES = {"bounding_boxes.txt"}
+METADATA_ARTIFACT_TYPES = {
+    "annotation_xml",
+    "annotation_json",
+    "labels_csv",
+    "labels_file",
+    "metadata_file",
+    "metadata_folder",
+    "bounding_boxes",
+    "class_hierarchy",
+}
+NORMALIZATION_THUMBNAIL_SIZE = 256
 
 def profile_image_folder(dataset_dir: Path) -> dict:
+    dataset_dir = Path(dataset_dir)
+    class_root = resolve_classification_root(dataset_dir)
     class_counts: dict[str, int] = {}
     corrupt_images: list[str] = []
 
@@ -17,14 +64,9 @@ def profile_image_folder(dataset_dir: Path) -> dict:
     heights: list[int] = []
     image_paths: list[Path] = []
 
-    for class_dir in sorted(dataset_dir.iterdir()):
-        if not class_dir.is_dir():
-            continue
-        if class_dir.name.lower() in NON_CLASS_DIR_NAMES:
-            continue
-
+    for class_dir in classification_class_dirs(class_root):
         class_name = class_dir.name
-        class_counts[class_name] = 0
+        image_count = 0
 
         for image_path in sorted(class_dir.rglob("*")):
             if not image_path.is_file():
@@ -40,10 +82,12 @@ def profile_image_folder(dataset_dir: Path) -> dict:
 
                 widths.append(width)
                 heights.append(height)
-                class_counts[class_name]+=1
+                image_count += 1
                 image_paths.append(image_path)
             except Exception:
                 corrupt_images.append(str(image_path))
+        if image_count > 0:
+            class_counts[class_name] = image_count
     
     total_images = sum(class_counts.values())
     non_empty_counts = [count for count in class_counts.values() if count > 0]
@@ -71,6 +115,14 @@ def profile_image_folder(dataset_dir: Path) -> dict:
     return {
         "schema_version": "dataset_profile_v1",
         "dataset_path": str(dataset_dir),
+        "image_folder_root": str(class_root),
+        "layout_summary": {
+            "image_folder_root": "dataset_root"
+            if class_root == dataset_dir
+            else _safe_relative_to(dataset_dir, class_root),
+            "class_folder_count": len(class_counts),
+            "single_wrapper_unwrapped": class_root != dataset_dir and _is_under_single_wrapper(dataset_dir, class_root),
+        },
         "task_type": "image_classification",
         "class_names": sorted(class_counts.keys()),
         "class_count": len(class_counts),
@@ -94,6 +146,121 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         "dataset_traits": traits,
         "artifacts": artifacts,
     }
+
+
+def resolve_classification_root(dataset_dir: Path) -> Path:
+    """Find the folder whose immediate children are image-class folders."""
+    root = Path(dataset_dir)
+    candidates: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        if not candidate.is_dir():
+            return
+        if all(existing.resolve() != resolved for existing in candidates):
+            candidates.append(candidate)
+
+    for image_root in _common_image_root_dirs(root):
+        add(image_root)
+
+    wrapper = _single_wrapper_dir(root)
+    if wrapper is not None:
+        for image_root in _common_image_root_dirs(wrapper):
+            add(image_root)
+        add(wrapper)
+
+    add(root)
+
+    scored: list[tuple[int, int, int, Path]] = []
+    for index, candidate in enumerate(candidates):
+        class_dirs = classification_class_dirs(candidate)
+        image_count = sum(_image_count_under(path) for path in class_dirs)
+        scored.append((len(class_dirs), image_count, -index, candidate))
+
+    multi_class = [item for item in scored if item[0] >= 2 and item[1] > 0]
+    if multi_class:
+        return max(multi_class)[3]
+    single_class = [item for item in scored if item[0] >= 1 and item[1] > 0]
+    if single_class:
+        return max(single_class)[3]
+    return root
+
+
+def classification_class_dirs(class_root: Path) -> list[Path]:
+    try:
+        children = sorted(Path(class_root).iterdir())
+    except OSError:
+        return []
+    return [
+        child
+        for child in children
+        if child.is_dir()
+        and child.name.lower() not in NON_CLASS_DIR_NAMES
+        and _contains_image_file(child)
+    ]
+
+
+def _common_image_root_dirs(root: Path) -> list[Path]:
+    try:
+        children = {child.name.lower(): child for child in root.iterdir() if child.is_dir()}
+    except OSError:
+        return []
+    return [
+        children[name]
+        for name in sorted(COMMON_IMAGE_ROOT_NAMES)
+        if name in children and _contains_image_file(children[name])
+    ]
+
+
+def _single_wrapper_dir(root: Path) -> Path | None:
+    try:
+        candidates = [
+            child
+            for child in root.iterdir()
+            if child.is_dir()
+            and child.name.lower() not in NON_CLASS_DIR_NAMES
+            and _contains_image_file(child)
+        ]
+    except OSError:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _contains_image_file(directory: Path) -> bool:
+    try:
+        return any(path.is_file() and path.suffix.lower() in IMAGE_EXT for path in directory.rglob("*"))
+    except OSError:
+        return False
+
+
+def _image_count_under(directory: Path) -> int:
+    try:
+        return sum(1 for path in directory.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXT)
+    except OSError:
+        return 0
+
+
+def _safe_relative_to(root: Path, child: Path) -> str:
+    try:
+        return child.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return child.name
+
+
+def _is_under_single_wrapper(root: Path, child: Path) -> bool:
+    wrapper = _single_wrapper_dir(root)
+    if wrapper is None:
+        return False
+    try:
+        child.resolve().relative_to(wrapper.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _dimension_stats(widths: list[int], heights: list[int]) -> dict:
@@ -125,56 +292,80 @@ def _numeric_stats(values: list[float]) -> dict:
 
 def detect_dataset_artifacts(dataset_dir: Path) -> list[dict]:
     """Return bounded, profile-safe artifact records detected in an image dataset."""
+    dataset_dir = Path(dataset_dir)
+    class_root = resolve_classification_root(dataset_dir)
     artifacts = [
         {
             "artifact_type": "image_root",
-            "path": str(dataset_dir),
+            "path": str(class_root),
             "format": "folder",
             "description": "Root folder containing image-classification data.",
         }
     ]
-    for child in sorted(dataset_dir.iterdir()):
-        if child.is_dir():
-            artifacts.append(
+    folder_artifacts: list[dict] = []
+    for class_dir in classification_class_dirs(class_root)[:50]:
+        folder_artifacts.append(
+            {
+                "artifact_type": "class_folder",
+                "path": str(class_dir),
+                "format": "folder",
+                "description": "Image class folder.",
+            }
+        )
+
+    for child in _bounded_dirs(dataset_dir, limit=200):
+        name = child.name.lower()
+        if name in NON_CLASS_DIR_NAMES:
+            folder_artifacts.append(
                 {
-                    "artifact_type": "class_folder",
+                    "artifact_type": "metadata_folder",
                     "path": str(child),
                     "format": "folder",
-                    "description": "Image class folder.",
+                    "description": "Detected metadata or annotation folder.",
                 }
             )
-            name = child.name.lower()
-            if name in {"metadata", "meta", "annotations"}:
-                artifacts.append(
-                    {
-                        "artifact_type": "metadata_folder",
-                        "path": str(child),
-                        "format": "folder",
-                        "description": "Detected metadata or annotation folder.",
-                    }
-                )
 
+    file_artifacts: list[dict] = []
     for path in sorted(dataset_dir.rglob("*")):
         if not path.is_file():
             continue
         name = path.name.lower()
         suffix = path.suffix.lower()
-        if suffix == ".xml":
+        if name in CUB_BBOX_FILE_NAMES:
+            file_artifacts.append({"artifact_type": "bounding_boxes", "path": str(path), "format": "cub_txt"})
+        elif suffix == ".xml":
             artifact_type = "bounding_boxes" if _looks_like_bbox_xml(path) else "annotation_xml"
-            artifacts.append({"artifact_type": artifact_type, "path": str(path), "format": "xml"})
+            file_artifacts.append({"artifact_type": artifact_type, "path": str(path), "format": "xml"})
         elif suffix == ".json" and "annotation" in name:
-            artifacts.append({"artifact_type": "annotation_json", "path": str(path), "format": "json"})
+            file_artifacts.append({"artifact_type": "annotation_json", "path": str(path), "format": "json"})
         elif name in LABELS_FILE_NAMES:
-            artifacts.append({"artifact_type": "labels_csv", "path": str(path), "format": "csv"})
+            artifact_type = "labels_csv" if suffix == ".csv" else "labels_file"
+            file_artifacts.append({"artifact_type": artifact_type, "path": str(path), "format": suffix.lstrip(".") or "txt"})
         elif name in SPLIT_FILE_NAMES:
-            artifacts.append(
+            file_artifacts.append(
                 {"artifact_type": "split_file", "path": str(path), "format": suffix.lstrip(".") or "txt"}
             )
         elif name in CLASS_HIERARCHY_NAMES:
-            artifacts.append(
+            file_artifacts.append(
                 {"artifact_type": "class_hierarchy", "path": str(path), "format": suffix.lstrip(".") or "txt"}
             )
-    return artifacts[:200]
+        elif name in CUB_METADATA_FILE_NAMES:
+            file_artifacts.append({"artifact_type": "metadata_file", "path": str(path), "format": suffix.lstrip(".") or "txt"})
+    return (artifacts + file_artifacts + folder_artifacts)[:200]
+
+
+def _bounded_dirs(root: Path, limit: int) -> list[Path]:
+    out: list[Path] = []
+    try:
+        iterator = root.rglob("*")
+        for path in iterator:
+            if path.is_dir():
+                out.append(path)
+                if len(out) >= limit:
+                    break
+    except OSError:
+        return out
+    return out
 
 
 def detect_split_files(dataset_dir: Path) -> list[dict]:
@@ -185,30 +376,36 @@ def detect_split_files(dataset_dir: Path) -> list[dict]:
     ]
 
 
-def compute_image_normalization_metadata(dataset_dir: Path, max_images: int = 500) -> dict:
+def compute_image_normalization_metadata(
+    dataset_dir: Path,
+    max_images: int = 500,
+    max_dimension: int = NORMALIZATION_THUMBNAIL_SIZE,
+) -> dict:
     """Compute channel mean/std metadata without mutating the dataset or job state."""
     pixel_count = 0
     channel_sums = [0.0, 0.0, 0.0]
     channel_squared_sums = [0.0, 0.0, 0.0]
     images_seen = 0
+    target_dimension = max(32, int(max_dimension))
 
     for image_path in _iter_image_files(dataset_dir):
         if images_seen >= max(1, max_images):
             break
         try:
             with Image.open(image_path) as image:
+                image.draft("RGB", (target_dimension, target_dimension))
                 rgb_image = image.convert("RGB")
-                pixels = list(rgb_image.getdata())
+                rgb_image.thumbnail((target_dimension, target_dimension), Image.Resampling.BILINEAR)
+                stat = ImageStat.Stat(rgb_image)
         except Exception:
             continue
 
         images_seen += 1
-        pixel_count += len(pixels)
-        for red, green, blue in pixels:
-            values = (red / 255.0, green / 255.0, blue / 255.0)
-            for index, value in enumerate(values):
-                channel_sums[index] += value
-                channel_squared_sums[index] += value * value
+        sample_pixels = max(1, rgb_image.width * rgb_image.height)
+        pixel_count += sample_pixels
+        for index in range(3):
+            channel_sums[index] += stat.sum[index] / 255.0
+            channel_squared_sums[index] += stat.sum2[index] / (255.0 * 255.0)
 
     if pixel_count == 0:
         return {
@@ -230,13 +427,15 @@ def compute_image_normalization_metadata(dataset_dir: Path, max_images: int = 50
         "status": "computed",
         "image_count": images_seen,
         "pixel_count": pixel_count,
+        "max_dimension": target_dimension,
         "mean": [round(value, 6) for value in mean],
         "std": [round(max(value, 1e-6), 6) for value in std],
     }
 
 
 def _iter_image_files(dataset_dir: Path):
-    for image_path in sorted(dataset_dir.rglob("*")):
+    image_root = resolve_classification_root(Path(dataset_dir))
+    for image_path in sorted(image_root.rglob("*")):
         if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXT:
             yield image_path
 
@@ -257,8 +456,7 @@ def _metadata_summary(artifacts: list[dict]) -> dict:
     return {
         "artifact_counts": counts,
         "metadata_available": any(
-            artifact.get("artifact_type")
-            in {"annotation_xml", "annotation_json", "labels_csv", "metadata_folder", "bounding_boxes", "class_hierarchy"}
+            artifact.get("artifact_type") in METADATA_ARTIFACT_TYPES
             for artifact in artifacts
         ),
         "bbox_available": any(artifact.get("artifact_type") == "bounding_boxes" for artifact in artifacts),
@@ -344,13 +542,17 @@ def _border_dominance(image) -> float:
 def _bbox_trait_summary(artifacts: list[dict]) -> dict:
     from worker.datasets.annotations import parse_annotation_json_bboxes, parse_pascal_voc_bboxes
 
+    bbox_count = 0
     area_ratios: list[float] = []
     for artifact in artifacts:
         if artifact.get("artifact_type") not in {"bounding_boxes", "annotation_json"}:
             continue
         path = Path(str(artifact.get("path") or ""))
         try:
-            if path.suffix.lower() == ".xml":
+            if path.name.lower() in CUB_BBOX_FILE_NAMES:
+                bbox_count += _count_cub_bbox_rows(path)
+                continue
+            elif path.suffix.lower() == ".xml":
                 payload = parse_pascal_voc_bboxes(path)
             elif path.suffix.lower() == ".json":
                 payload = parse_annotation_json_bboxes(path)
@@ -368,6 +570,8 @@ def _bbox_trait_summary(artifacts: list[dict]) -> dict:
                 area = max(0, int(bbox["xmax"]) - int(bbox["xmin"])) * max(0, int(bbox["ymax"]) - int(bbox["ymin"]))
             except (KeyError, TypeError, ValueError):
                 continue
+            if area > 0:
+                bbox_count += 1
             if image_area > 0 and area > 0:
                 area_ratios.append(max(0.0, min(1.0, area / image_area)))
     median_area = round(float(statistics.median(area_ratios)), 4) if area_ratios else 0.0
@@ -379,7 +583,27 @@ def _bbox_trait_summary(artifacts: list[dict]) -> dict:
         object_scale = "large"
     else:
         object_scale = "medium"
-    return {"bbox_count": len(area_ratios), "median_area_ratio": median_area, "object_scale": object_scale}
+    return {"bbox_count": bbox_count, "median_area_ratio": median_area, "object_scale": object_scale}
+
+
+def _count_cub_bbox_rows(path: Path) -> int:
+    count = 0
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return 0
+    for line in lines:
+        fields = line.strip().split()
+        if len(fields) < 5:
+            continue
+        try:
+            width = float(fields[3])
+            height = float(fields[4])
+        except ValueError:
+            continue
+        if width > 0 and height > 0:
+            count += 1
+    return count
 
 
 def _safe_stdev(values: list[float]) -> float:
@@ -455,7 +679,7 @@ def _dataset_traits(
     if any(artifact.get("artifact_type") == "bounding_boxes" for artifact in artifacts):
         traits.append("bbox_available")
     if any(
-        artifact.get("artifact_type") in {"annotation_xml", "annotation_json", "labels_csv", "metadata_folder", "class_hierarchy"}
+        artifact.get("artifact_type") in METADATA_ARTIFACT_TYPES
         for artifact in artifacts
     ):
         traits.append("metadata_available")

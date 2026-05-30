@@ -336,6 +336,101 @@ func TestExperimentPlannerPromptContextIncludesDatasetAndStrategyMemory(t *testi
 	}
 }
 
+func TestExperimentPlannerPromptContextUsesOnlySafeDatasetMetadataSummary(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.Dataset.Profile = map[string]any{
+		"metadata_summary": map[string]any{
+			"bbox_available": true,
+			"relative_path":  "train/rare/img_001.jpg",
+			"storage_uri":    "s3://secret-bucket/metadata.csv",
+			"raw_preview":    map[string]any{"row": "raw source content"},
+		},
+	}
+	input.DatasetInsights = DatasetPlanningInsights{
+		Summary: "Dataset has normalized metadata.",
+		MetadataSummary: map[string]any{
+			"bbox_available": true,
+			"relative_path":  "train/rare/img_001.jpg",
+			"storage_uri":    "s3://secret-bucket/metadata.csv",
+			"raw_preview":    "raw source content",
+			"source_rows":    []any{map[string]any{"filename": "private/path.jpg"}},
+		},
+		AgentSafeMetadataSummary: map[string]any{
+			"status":                "SUCCEEDED",
+			"source_formats":        []string{"pascal_voc"},
+			"bbox_annotation_count": 8,
+			"bbox_sample_count":     4,
+			"annotation_counts":     map[string]any{"bbox": 8},
+			"split_counts":          map[string]any{"train": 20, "val": 5},
+			"raw_preview":           "never show me",
+			"storage_uri":           "s3://secret-bucket/metadata.csv",
+			"warnings": []any{
+				map[string]any{
+					"code":      "missing_label",
+					"message":   "missing labels were summarized",
+					"source_id": "s3://secret-bucket/metadata.csv",
+				},
+				map[string]any{
+					"code":    "raw_path",
+					"message": "raw row at /tmp/private/labels.csv was skipped",
+				},
+			},
+		},
+	}
+
+	context := experimentPlannerPromptContext(input)
+	blob, err := json.Marshal(context)
+	if err != nil {
+		t.Fatalf("marshal compact prompt context: %v", err)
+	}
+	text := string(blob)
+	for _, forbidden := range []string{
+		"train/rare/img_001.jpg",
+		"s3://secret-bucket",
+		"metadata.csv",
+		"raw source content",
+		"private/path.jpg",
+		"never show me",
+		"/tmp/private",
+		"source_id",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("expected planner context to exclude raw metadata detail %q: %s", forbidden, text)
+		}
+	}
+	for _, expected := range []string{"agent_safe_metadata_summary", "bbox_annotation_count", "pascal_voc", "missing labels were summarized"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("expected safe metadata context to include %q: %s", expected, text)
+		}
+	}
+}
+
+func TestPlannerDatasetMetadataSummaryToolIsSafeOnly(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.DatasetInsights.AgentSafeMetadataSummary = map[string]any{
+		"source_formats":        []string{"pascal_voc"},
+		"bbox_annotation_count": 3,
+		"raw_preview":           "raw xml preview",
+		"relative_path":         "annotations/private.xml",
+	}
+
+	result := ExecuteExperimentPlannerInformationTool(input, PlannerToolDatasetMetadataSummary, nil, PlannerInformationToolOptions{})
+	if !result.Accepted {
+		t.Fatalf("expected dataset metadata summary tool to be accepted: %#v", result)
+	}
+	blob, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal tool result: %v", err)
+	}
+	text := string(blob)
+	if strings.Contains(text, "raw xml preview") || strings.Contains(text, "annotations/private.xml") {
+		t.Fatalf("expected dataset metadata tool to exclude raw details: %s", text)
+	}
+	if !strings.Contains(text, "bbox_annotation_count") || !strings.Contains(text, "raw_metadata") {
+		t.Fatalf("expected dataset metadata tool to include safe summary and exclusions: %s", text)
+	}
+}
+
 func TestPlannerContextCardsIncludeDecisionSignals(t *testing.T) {
 	input := testExperimentPlannerInput()
 	input.Dataset.Profile = map[string]any{"class_names": []any{"rare", "common"}}
@@ -717,6 +812,32 @@ func TestPlannerMechanismCoverageToolReturnsBackendGatedMethodProposals(t *testi
 	}
 }
 
+func TestPlannerBackendGatedMethodsUseAgentSafeMetadataBBoxEvidence(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.Dataset.Profile = map[string]any{}
+	input.DatasetInsights.AgentSafeMetadataSummary = map[string]any{
+		"source_formats":        []string{"pascal_voc"},
+		"bbox_annotation_count": 12,
+		"bbox_sample_count":     6,
+		"annotation_counts":     map[string]any{"bbox": 12},
+	}
+
+	snapshot := BuildPlannerContextSnapshot(input)
+	bbox, ok := findBackendGatedTestMethod(snapshot.BackendGatedMethods, "bbox_crop_ablation")
+	if !ok {
+		t.Fatalf("expected normalized metadata bbox evidence to surface gated bbox method, got %#v", snapshot.BackendGatedMethods)
+	}
+	if bbox.Source != "dataset_metadata" {
+		t.Fatalf("expected bbox source to cite dataset metadata, got %#v", bbox)
+	}
+	if containsTestSubstring(bbox.MissingRequirements, "bbox/annotation evidence") {
+		t.Fatalf("expected normalized bbox summary to satisfy backend evidence requirement, got %#v", bbox.MissingRequirements)
+	}
+	if !containsTestSubstring(bbox.Evidence, "normalized metadata safe summary") {
+		t.Fatalf("expected evidence to cite normalized safe summary, got %#v", bbox.Evidence)
+	}
+}
+
 func TestInformationValidationToolsUseStringifiedDraftSchemas(t *testing.T) {
 	plannerSpec, ok := findInformationToolSpec(ExperimentPlannerInformationToolSpecs(), PlannerToolValidateCandidateExperiments)
 	if !ok {
@@ -910,6 +1031,42 @@ func TestExperimentPlannerAcceptsClassImbalanceMode(t *testing.T) {
 
 	if err := validateExperimentPlanningRecommendation(recommendation, 5); err != nil {
 		t.Fatalf("expected class imbalance mode to validate: %v", err)
+	}
+}
+
+func TestExperimentPlannerClassImbalanceModeAllowsControlExperiment(t *testing.T) {
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	recommendation.Hypothesis = "Weighted loss should improve minority recall and macro-F1."
+	recommendation.SuccessCriteria = "Macro-F1 and minority recall improve without a large accuracy drop."
+	recommendation.ChangedVariables = []string{"class_balancing", "model_family"}
+	recommendation.ProposedExperiments[0].ClassBalancing = "weighted_loss"
+	recommendation.ProposedExperiments[0].Reason = "Test weighted loss for minority recall."
+	recommendation.ProposedExperiments[1].Reason = "Keep an unweighted architecture challenger as a comparison point."
+	recommendation.ProposalMechanisms[0].Mechanism = "class_imbalance"
+	recommendation.ProposalMechanisms[0].Intervention = "weighted_loss for minority recall"
+	recommendation.ProposalMechanisms[0].ExpectedEffect = "Improve minority recall and macro-F1."
+	recommendation.ProposalMechanisms[1].Mechanism = "architecture_challenge"
+	recommendation.ProposalMechanisms[1].Intervention = "Compare the LLM-selected stronger architecture without class balancing."
+	recommendation.ProposalMechanisms[1].ExpectedEffect = "Separate class-balancing gains from representation-capacity gains."
+
+	if err := validateExperimentPlanningRecommendation(recommendation, 5); err != nil {
+		t.Fatalf("expected class imbalance mode to allow non-imbalance controls: %v", err)
+	}
+}
+
+func TestExperimentPlannerClassImbalanceMechanismRequiresBalancing(t *testing.T) {
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	recommendation.Hypothesis = "Weighted loss should improve minority recall and macro-F1."
+	recommendation.SuccessCriteria = "Macro-F1 and minority recall improve without a large accuracy drop."
+	recommendation.ChangedVariables = []string{"class_balancing", "model_family"}
+	recommendation.ProposalMechanisms[0].Mechanism = "class_imbalance"
+	recommendation.ProposalMechanisms[0].Intervention = "Claims to test class imbalance but omits class balancing."
+	recommendation.ProposalMechanisms[0].ExpectedEffect = "Improve minority recall and macro-F1."
+	recommendation.ProposalMechanisms[1].Mechanism = "architecture_challenge"
+
+	err := validateExperimentPlanningRecommendation(recommendation, 5)
+	if err == nil || !strings.Contains(err.Error(), "must include a class balancing strategy") {
+		t.Fatalf("expected class imbalance mechanism validation error, got %v", err)
 	}
 }
 

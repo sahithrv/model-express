@@ -4,10 +4,8 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
-def download_s3_uri(storage_uri: str, destination: Path) -> Path:
-    bucket, key = parse_s3_uri(storage_uri)
-
-    s3client = boto3.client(
+def s3_client():
+    return boto3.client(
         "s3",
         endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
@@ -15,9 +13,17 @@ def download_s3_uri(storage_uri: str, destination: Path) -> Path:
         region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
+def download_s3_uri(storage_uri: str, destination: Path) -> Path:
+    bucket, key = parse_s3_uri(storage_uri)
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    s3client.download_file(bucket, key, str(destination))
+    s3_client().download_file(bucket, key, str(destination))
     return destination
+
+def upload_file_to_s3_uri(source: Path, storage_uri: str) -> str:
+    bucket, key = parse_s3_uri(storage_uri)
+    s3_client().upload_file(str(source), bucket, key)
+    return storage_uri
 
 def parse_s3_uri(storage_uri: str) -> tuple[str, str]:
     parsed = urlparse(storage_uri)

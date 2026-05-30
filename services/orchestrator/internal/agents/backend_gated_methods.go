@@ -124,12 +124,12 @@ func plannerBackendGatedMethods(input ExperimentPlannerInput) []PlannerBackendGa
 			},
 		})
 	}
-	if plannerProfileHasBBoxEvidence(input.Dataset.Profile) {
+	if plannerInputHasBBoxEvidence(input) {
 		add(PlannerBackendGatedMethod{
 			Mechanism: "bbox_crop_ablation",
-			Source:    "dataset_profile",
-			Summary:   "Backend profile contains bbox or annotation evidence, so bbox crop can be proposed with concrete preprocessing.",
-			Evidence:  []string{"dataset profile includes bbox/annotation evidence"},
+			Source:    "dataset_metadata",
+			Summary:   "Backend metadata or profile contains bbox annotation evidence, so bbox crop can be proposed with concrete preprocessing.",
+			Evidence:  plannerBBoxEvidence(input),
 			SupportedConfigHints: map[string]any{
 				"preprocessing_options": []plans.Preprocessing{
 					{ResizeStrategy: "bbox_crop_if_available", CropStrategy: "bbox_crop_ablation", BBoxMode: "crop_if_available", Normalization: "imagenet"},
@@ -293,7 +293,7 @@ func plannerBackendGatedMissingRequirements(input ExperimentPlannerInput, card P
 		if !plannerCardHasBBoxConfig(card) {
 			missing = append(missing, "concrete bbox crop preprocessing")
 		}
-		if !plannerProfileHasBBoxEvidence(input.Dataset.Profile) {
+		if !plannerInputHasBBoxEvidence(input) {
 			missing = append(missing, "backend-profiled bbox/annotation evidence")
 		}
 	case "resolution_crop":
@@ -588,9 +588,11 @@ func plannerProfileHasBBoxEvidence(profile map[string]any) bool {
 		return true
 	}
 	metadata := plannerMap(profile, "metadata_summary")
-	if plannerProfileBool(metadata, "bbox_available") || plannerProfileBool(metadata, "annotations_available") ||
-		plannerProfileFloat(metadata, "bbox_annotations_count") > 0 ||
-		plannerArtifactCountsHaveBBoxEvidence(plannerMap(metadata, "artifact_counts")) {
+	if plannerMetadataSummaryHasBBoxEvidence(metadata) {
+		return true
+	}
+	if plannerMetadataSummaryHasBBoxEvidence(plannerMap(profile, "agent_safe_metadata_summary")) ||
+		plannerMetadataSummaryHasBBoxEvidence(plannerMap(profile, "normalized_metadata_summary")) {
 		return true
 	}
 	visualTraits := plannerMap(profile, "visual_trait_summary")
@@ -607,6 +609,57 @@ func plannerProfileHasBBoxEvidence(profile map[string]any) bool {
 		if containsAnyText(strings.ToLower(string(blob)), "bbox", "bounding_box", "annotation", "coco", "voc") {
 			return true
 		}
+	}
+	return false
+}
+
+func plannerInputHasBBoxEvidence(input ExperimentPlannerInput) bool {
+	return plannerProfileHasBBoxEvidence(input.Dataset.Profile) ||
+		plannerMetadataSummaryHasBBoxEvidence(input.DatasetInsights.MetadataSummary) ||
+		plannerMetadataSummaryHasBBoxEvidence(input.DatasetInsights.AgentSafeMetadataSummary)
+}
+
+func plannerBBoxEvidence(input ExperimentPlannerInput) []string {
+	evidence := []string{}
+	if plannerMetadataSummaryHasBBoxEvidence(input.DatasetInsights.AgentSafeMetadataSummary) {
+		if count := plannerProfileFloat(input.DatasetInsights.AgentSafeMetadataSummary, "bbox_annotation_count"); count > 0 {
+			evidence = append(evidence, fmt.Sprintf("normalized metadata safe summary reports %.0f bbox annotation(s)", count))
+		} else if count := plannerProfileFloat(input.DatasetInsights.AgentSafeMetadataSummary, "bbox_sample_count"); count > 0 {
+			evidence = append(evidence, fmt.Sprintf("normalized metadata safe summary reports %.0f sample(s) with bbox annotations", count))
+		} else {
+			evidence = append(evidence, "normalized metadata safe summary includes bbox annotation evidence")
+		}
+	}
+	if plannerMetadataSummaryHasBBoxEvidence(input.DatasetInsights.MetadataSummary) {
+		evidence = append(evidence, "legacy metadata summary includes bbox/annotation evidence")
+	}
+	if plannerProfileHasBBoxEvidence(input.Dataset.Profile) {
+		evidence = append(evidence, "dataset profile includes bbox/annotation evidence")
+	}
+	return cappedStrings(evidence, 6)
+}
+
+func plannerMetadataSummaryHasBBoxEvidence(summary map[string]any) bool {
+	if len(summary) == 0 {
+		return false
+	}
+	if plannerProfileBool(summary, "bbox_available") || plannerProfileBool(summary, "annotations_available") ||
+		plannerProfileFloat(summary, "bbox_annotations_count") > 0 ||
+		plannerProfileFloat(summary, "bbox_annotation_count") > 0 ||
+		plannerProfileFloat(summary, "bbox_sample_count") > 0 ||
+		plannerProfileFloat(summary, "bbox_count") > 0 ||
+		plannerProfileFloat(summary, "bbox_coverage_ratio") > 0 ||
+		plannerArtifactCountsHaveBBoxEvidence(plannerMap(summary, "artifact_counts")) {
+		return true
+	}
+	annotationCounts := plannerMap(summary, "annotation_counts")
+	if plannerProfileFloat(annotationCounts, "bbox") > 0 || plannerProfileFloat(annotationCounts, "bounding_box") > 0 {
+		return true
+	}
+	capabilities := plannerMap(summary, "capabilities")
+	if plannerProfileBool(capabilities, "bbox") || plannerProfileBool(capabilities, "bbox_annotations") ||
+		plannerProfileBool(capabilities, "bbox_crop") || plannerProfileBool(capabilities, "object_detection") {
+		return true
 	}
 	return false
 }

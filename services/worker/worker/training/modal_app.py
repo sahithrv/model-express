@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
+import json
 import os
 import random
+import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 from worker.training.augmentation import (
     MIXED_SAMPLE_POLICY_TYPES,
@@ -27,6 +31,34 @@ except Exception:  # pragma: no cover - local helper tests can run without Modal
 APP_NAME = "model-express-training"
 DEFAULT_GPU = os.getenv("MODAL_GPU_TYPE", "T4")
 DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS = 300
+DEFAULT_METADATA_BUNDLE_PAGE_SIZE = 5000
+DEFAULT_METADATA_BUNDLE_MAX_RECORDS = 50_000
+METADATA_ENDPOINT_UNAVAILABLE_STATUS_CODES = {404, 405, 501}
+COMMON_IMAGE_ROOT_NAMES = ("images", "image", "imgs", "img", "JPEGImages", "jpegimages", "data")
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+ROOT_METADATA_DIR_NAMES = {
+    "annotation",
+    "annotations",
+    "attribute",
+    "attributes",
+    "bbox",
+    "bboxes",
+    "boxes",
+    "keypoint",
+    "keypoints",
+    "label",
+    "labels",
+    "landmark",
+    "landmarks",
+    "manifest",
+    "manifests",
+    "meta",
+    "metadata",
+    "part",
+    "parts",
+    "split",
+    "splits",
+}
 
 EFFECTIVE_NUMBER_CLASS_BALANCING = {
     "effective_number",
@@ -45,6 +77,7 @@ if modal is not None:
             "pillow",
             "requests",
             "scikit-learn",
+            "onnx",
             "torch",
             "torchvision",
         )
@@ -145,6 +178,7 @@ def train_image_classifier(payload: dict) -> dict:
     archive_path = dataset_archive_path(dataset_id)
     download_s3_uri(dataset["storage_uri"], archive_path)
     dataset_dir = extract_dataset_archive(archive_path, dataset_id)
+    metadata_bundle = _fetch_training_metadata_bundle(orchestrator_url, dataset_id, config)
 
     train_loader, val_loader, test_loader, class_names, class_weights, execution_metadata = _load_image_data(
         dataset_dir,
@@ -155,6 +189,7 @@ def train_image_classifier(payload: dict) -> dict:
         sampling_strategy,
         preprocessing,
         class_balancing_config,
+        metadata_bundle=metadata_bundle,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _build_model(model_name, len(class_names), pretrained, freeze_backbone, fine_tune_strategy, dropout).to(device)
@@ -246,7 +281,7 @@ def train_image_classifier(payload: dict) -> dict:
         criterion,
         device,
         class_names,
-        collect_examples=_label_quality_audit_requested(config),
+        collect_examples=True,
     )
     if test_eval_details.get("confusion_matrix"):
         final_eval_details = test_eval_details
@@ -259,6 +294,30 @@ def train_image_classifier(payload: dict) -> dict:
         crop_metrics={"accuracy": test_accuracy, "macro_f1": test_macro_f1, "loss": test_loss},
     )
     model_profile = _model_profile(model, model_name, image_size, device, val_loader)
+    demo_images = _demo_images_from_test_examples(test_eval_details, class_names)
+    export_bundle = _export_trained_champion_bundle(
+        model=model,
+        model_name=model_name,
+        class_names=class_names,
+        image_size=image_size,
+        preprocessing=preprocessing,
+        model_profile=model_profile,
+        training_config=config,
+        dataset=dataset,
+        job_id=job_id,
+    )
+    model_profile = {
+        **model_profile,
+        "class_labels": class_names,
+        "input_shape": [1, 3, image_size, image_size],
+        "preprocessing": preprocessing,
+        "export_status": export_bundle.get("status", ""),
+        "artifact_uri": export_bundle.get("artifact_uri", ""),
+        "onnx_artifact_uri": export_bundle.get("artifact_uri", "") if export_bundle.get("format") == "onnx" else "",
+        "export_manifest_uri": export_bundle.get("manifest_uri", ""),
+        "export_manifest": export_bundle.get("manifest", {}),
+        "export_validation_errors": export_bundle.get("validation_errors", []),
+    }
     _post_training_run_summary(
         orchestrator_url,
         job_id,
@@ -289,6 +348,7 @@ def train_image_classifier(payload: dict) -> dict:
                 "heldout_test_accuracy": round(test_accuracy, 6),
                 "heldout_test_macro_f1": round(test_macro_f1, 6),
                 "heldout_test_loss": round(test_loss, 6),
+                "heldout_demo_images": demo_images,
             },
             "per_class_metrics": final_eval_details.get("per_class_metrics", {}),
             "confusion_matrix": final_eval_details.get("confusion_matrix", []),
@@ -332,6 +392,7 @@ def train_image_classifier(payload: dict) -> dict:
                 },
             },
             "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
+            "export_bundle": export_bundle,
             "recommendation_summary": (
                 f"{model_name} finished with macro-F1 {best_macro_f1:.3f}, "
                 f"accuracy {best_accuracy:.3f}, and estimated latency "
@@ -362,6 +423,7 @@ def profile_image_dataset(payload: dict) -> dict:
     import tempfile
 
     from worker.datasets.cache import dataset_archive_path, extract_dataset_archive
+    from worker.datasets.metadata_discovery import build_metadata_import_payload
     from worker.datasets.profiler import profile_image_folder
     from worker.datasets.storage import download_s3_uri
 
@@ -373,7 +435,10 @@ def profile_image_dataset(payload: dict) -> dict:
         archive_path = dataset_archive_path(dataset_id, cache_root)
         download_s3_uri(dataset["storage_uri"], archive_path)
         dataset_dir = extract_dataset_archive(archive_path, dataset_id, cache_root)
-        return profile_image_folder(dataset_dir)
+        return {
+            "profile": profile_image_folder(dataset_dir),
+            "metadata_import": build_metadata_import_payload(dataset_dir),
+        }
 
 
 def _configure_storage_env(payload: dict) -> None:
@@ -381,6 +446,89 @@ def _configure_storage_env(payload: dict) -> None:
     os.environ["AWS_ACCESS_KEY_ID"] = payload["aws_access_key_id"]
     os.environ["AWS_SECRET_ACCESS_KEY"] = payload["aws_secret_access_key"]
     os.environ["AWS_DEFAULT_REGION"] = payload["aws_default_region"]
+
+
+class _MetadataBundleImageDataset:
+    def __init__(self, spec: dict, transform=None):
+        self.classes = list(spec["class_names"])
+        self.class_to_idx = {class_name: index for index, class_name in enumerate(self.classes)}
+        self.samples = list(spec["samples"])
+        self.targets = list(spec["targets"])
+        self.metadata_splits = list(spec["splits"])
+        self.metadata_records = list(spec["records"])
+        self.transform = transform
+        self.target_transform = None
+        self.loader = _load_rgb_image
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        image = self.loader(path)
+        if self.transform is not None:
+            image = self.transform(image)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        return image, target
+
+
+def _load_rgb_image(path: str):
+    from PIL import Image
+
+    with Image.open(path) as image:
+        return image.convert("RGB")
+
+
+def _fetch_training_metadata_bundle(orchestrator_url: str, dataset_id: str, config: dict) -> dict | None:
+    import requests
+
+    metadata_import_id = str(config.get("metadata_import_id") or "").strip()
+    limit = _bounded_int(
+        config.get("metadata_bundle_page_size") or config.get("metadata_bundle_limit"),
+        default=DEFAULT_METADATA_BUNDLE_PAGE_SIZE,
+        minimum=1,
+        maximum=10_000,
+    )
+    max_records = _bounded_int(
+        config.get("metadata_bundle_max_records"),
+        default=DEFAULT_METADATA_BUNDLE_MAX_RECORDS,
+        minimum=limit,
+        maximum=200_000,
+    )
+    offset = 0
+    merged_bundle: dict | None = None
+    while offset < max_records:
+        params: dict[str, object] = {
+            "purpose": "training",
+            "include": "bbox",
+            "limit": min(limit, max_records - offset),
+            "offset": offset,
+        }
+        if metadata_import_id:
+            params["metadata_import_id"] = metadata_import_id
+        try:
+            response = requests.get(
+                f"{orchestrator_url}/datasets/{dataset_id}/metadata/bundle",
+                params=params,
+                timeout=_orchestrator_report_timeout_seconds(),
+            )
+            if response.status_code in METADATA_ENDPOINT_UNAVAILABLE_STATUS_CODES or response.status_code == 204:
+                return merged_bundle
+            response.raise_for_status()
+            page_payload = response.json()
+        except Exception:
+            return merged_bundle
+
+        page_bundle = _coerce_metadata_bundle(page_payload)
+        if not page_bundle:
+            return merged_bundle
+        merged_bundle = _merge_metadata_bundle_pages(merged_bundle, page_bundle)
+        page_records = _metadata_manifest_records(page_bundle)
+        if not _metadata_bundle_has_more(page_payload, page_bundle, len(page_records), limit):
+            break
+        offset += max(len(page_records), limit)
+    return merged_bundle
 
 
 def _load_image_data(
@@ -392,6 +540,8 @@ def _load_image_data(
     sampling_strategy: str,
     preprocessing: dict,
     class_balancing_config: dict | None = None,
+    *,
+    metadata_bundle: dict | None = None,
 ):
     import torch
     from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
@@ -402,6 +552,7 @@ def _load_image_data(
         preprocessing = {**preprocessing, "normalization_metadata": normalization_metadata}
     train_transform = _image_transform(image_size, augmentation, preprocessing, training=True)
     val_transform = _image_transform(image_size, {}, preprocessing, training=False)
+    metadata_spec = _metadata_bundle_dataset_spec(dataset_dir, metadata_bundle)
     crop_strategy = str(preprocessing.get("crop_strategy", "")).lower()
     bbox_mode = str(preprocessing.get("bbox_mode", "")).lower()
     requested_bbox_crop = bbox_crop_requested(preprocessing)
@@ -415,11 +566,19 @@ def _load_image_data(
             "annotation_count": 0,
             "mode": bbox_mode or crop_strategy or "none",
             "compare_full_image": compare_bbox_crop,
-        }
+        },
+        "metadata_bundle": _metadata_bundle_execution_metadata(metadata_bundle, metadata_spec),
     }
     if requested_bbox_crop:
-        bbox_lookup = _load_bbox_lookup(dataset_dir)
+        bbox_source = "legacy_sidecar"
+        if metadata_spec is not None:
+            bbox_lookup = _bbox_lookup_from_metadata_bundle(metadata_bundle or {}, dataset_dir)
+            if bbox_lookup:
+                bbox_source = "metadata_bundle"
+        if not bbox_lookup:
+            bbox_lookup = _load_bbox_lookup(dataset_dir)
         execution_metadata["bbox_crop"]["annotation_count"] = len(bbox_lookup)
+        execution_metadata["bbox_crop"]["source"] = bbox_source if bbox_lookup else ""
         if not bbox_lookup:
             message = (
                 "BBox crop was requested, but no Pascal VOC XML or annotation JSON bounding boxes "
@@ -432,34 +591,52 @@ def _load_image_data(
             execution_metadata["bbox_crop"]["applied"] = True
             execution_metadata["bbox_crop"]["status"] = "applied"
 
-    uses_metadata_aware_dataset = _has_root_metadata_dirs(dataset_dir)
-    base_dataset = _image_folder_dataset(datasets, dataset_dir)
+    uses_metadata_aware_dataset = metadata_spec is not None or _has_root_metadata_dirs(dataset_dir)
+    base_dataset = (
+        _MetadataBundleImageDataset(metadata_spec)
+        if metadata_spec is not None
+        else _image_folder_dataset(datasets, dataset_dir)
+    )
     if len(base_dataset.classes) < 2:
         raise ValueError("Training requires at least two image classes.")
     if len(base_dataset) < 2:
         raise ValueError("Training requires at least two images.")
 
-    validation_size = max(1, int(len(base_dataset) * 0.2))
-    test_size = max(1, int(len(base_dataset) * 0.1)) if len(base_dataset) >= 6 else 0
-    training_size = len(base_dataset) - validation_size - test_size
-    if training_size < 1:
-        test_size = 0
-        validation_size = 1
-        training_size = len(base_dataset) - validation_size
+    metadata_split_indices = _indices_from_metadata_splits(
+        getattr(base_dataset, "metadata_splits", []),
+        getattr(base_dataset, "targets", []),
+    )
+    if metadata_split_indices is None:
+        validation_size = max(1, int(len(base_dataset) * 0.2))
+        test_size = max(1, int(len(base_dataset) * 0.1)) if len(base_dataset) >= 6 else 0
+        training_size = len(base_dataset) - validation_size - test_size
+        if training_size < 1:
+            test_size = 0
+            validation_size = 1
+            training_size = len(base_dataset) - validation_size
 
-    generator = torch.Generator().manual_seed(42)
-    shuffled_indices = torch.randperm(len(base_dataset), generator=generator).tolist()
-    train_indices = shuffled_indices[:training_size]
-    val_start = training_size
-    val_end = val_start + validation_size
-    val_indices = shuffled_indices[val_start:val_end]
-    test_indices = shuffled_indices[val_end : val_end + test_size]
-    if not test_indices:
-        test_indices = val_indices
+        generator = torch.Generator().manual_seed(42)
+        shuffled_indices = torch.randperm(len(base_dataset), generator=generator).tolist()
+        train_indices = shuffled_indices[:training_size]
+        val_start = training_size
+        val_end = val_start + validation_size
+        val_indices = shuffled_indices[val_start:val_end]
+        test_indices = shuffled_indices[val_end : val_end + test_size]
+        if not test_indices:
+            test_indices = val_indices
+        execution_metadata["metadata_bundle"]["split_strategy"] = "deterministic_random"
+    else:
+        train_indices, val_indices, test_indices = metadata_split_indices
+        execution_metadata["metadata_bundle"]["split_strategy"] = "metadata_official"
 
-    train_dataset = _image_folder_dataset(datasets, dataset_dir, transform=train_transform)
-    val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
-    full_image_val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
+    if metadata_spec is not None:
+        train_dataset = _MetadataBundleImageDataset(metadata_spec, transform=train_transform)
+        val_dataset = _MetadataBundleImageDataset(metadata_spec, transform=val_transform)
+        full_image_val_dataset = _MetadataBundleImageDataset(metadata_spec, transform=val_transform)
+    else:
+        train_dataset = _image_folder_dataset(datasets, dataset_dir, transform=train_transform)
+        val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
+        full_image_val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
     if bbox_lookup:
         train_dataset = _BBoxCropDataset(train_dataset, bbox_lookup, required=bbox_required)
         val_dataset = _BBoxCropDataset(val_dataset, bbox_lookup, required=bbox_required)
@@ -510,28 +687,509 @@ def _augmentation_from_policy(augmentation: dict, policy: str) -> dict:
 
 
 def _image_folder_dataset(datasets, dataset_dir: Path, transform=None):
-    metadata_names = {"annotation", "annotations", "metadata", "meta", "splits"}
-    if not _has_root_metadata_dirs(dataset_dir):
-        return datasets.ImageFolder(dataset_dir, transform=transform)
+    image_folder_root = _image_folder_root(dataset_dir)
+    if not _has_root_metadata_dirs(image_folder_root):
+        return datasets.ImageFolder(image_folder_root, transform=transform)
 
     class MetadataAwareImageFolder(datasets.ImageFolder):
         def find_classes(self, directory):
             classes = sorted(
                 entry.name
                 for entry in os.scandir(directory)
-                if entry.is_dir() and entry.name.lower() not in metadata_names
+                if entry.is_dir() and entry.name.lower() not in ROOT_METADATA_DIR_NAMES
             )
             if not classes:
                 raise FileNotFoundError(f"No class folders found in {directory}.")
             class_to_idx = {class_name: index for index, class_name in enumerate(classes)}
             return classes, class_to_idx
 
-    return MetadataAwareImageFolder(dataset_dir, transform=transform)
+    return MetadataAwareImageFolder(image_folder_root, transform=transform)
 
 
 def _has_root_metadata_dirs(dataset_dir: Path) -> bool:
-    metadata_names = {"annotation", "annotations", "metadata", "meta", "splits"}
-    return any(child.is_dir() and child.name.lower() in metadata_names for child in dataset_dir.iterdir())
+    return any(child.is_dir() and child.name.lower() in ROOT_METADATA_DIR_NAMES for child in dataset_dir.iterdir())
+
+
+def _image_folder_root(dataset_dir: Path) -> Path:
+    if _has_class_directories(dataset_dir):
+        return dataset_dir
+    for image_root in _metadata_image_root_prefixes(dataset_dir):
+        candidate = dataset_dir / image_root
+        if _has_class_directories(candidate):
+            return candidate
+    wrapper = _single_wrapper_dir(dataset_dir)
+    if wrapper is not None and _has_class_directories(wrapper):
+        return wrapper
+    return dataset_dir
+
+
+def _has_class_directories(directory: Path) -> bool:
+    try:
+        class_dirs = [
+            child
+            for child in directory.iterdir()
+            if child.is_dir() and child.name.lower() not in ROOT_METADATA_DIR_NAMES and _contains_image_file(child)
+        ]
+    except OSError:
+        return False
+    return len(class_dirs) >= 2
+
+
+def _contains_image_file(directory: Path) -> bool:
+    try:
+        return any(path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES for path in directory.rglob("*"))
+    except OSError:
+        return False
+
+
+def _single_wrapper_dir(dataset_dir: Path) -> Path | None:
+    try:
+        candidates = [
+            child
+            for child in dataset_dir.iterdir()
+            if child.is_dir()
+            and child.name.lower() not in ROOT_METADATA_DIR_NAMES
+            and _contains_image_file(child)
+        ]
+    except OSError:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _metadata_bundle_dataset_spec(dataset_dir: Path, metadata_bundle: dict | None) -> dict | None:
+    bundle = _coerce_metadata_bundle(metadata_bundle)
+    if not bundle:
+        return None
+    records = _metadata_manifest_records(bundle)
+    if not records:
+        return None
+    class_names, label_lookup = _metadata_class_mapping(bundle, records)
+    if len(class_names) < 2:
+        return None
+
+    samples: list[tuple[str, int]] = []
+    targets: list[int] = []
+    splits: list[str] = []
+    accepted_records: list[dict] = []
+    skipped_records = 0
+    for record in records:
+        if not isinstance(record, dict):
+            skipped_records += 1
+            continue
+        relative_path = _metadata_record_relative_path(record)
+        if not relative_path:
+            skipped_records += 1
+            continue
+        image_path = _resolve_dataset_relative_file(dataset_dir, relative_path)
+        if image_path is None:
+            skipped_records += 1
+            continue
+        target = _metadata_record_target(record, label_lookup)
+        if target is None:
+            skipped_records += 1
+            continue
+        samples.append((str(image_path), target))
+        targets.append(target)
+        splits.append(_normalize_metadata_split(record.get("split")))
+        accepted_records.append(record)
+
+    if len(samples) < 2 or len(set(targets)) < 2:
+        return None
+    return {
+        "class_names": class_names,
+        "samples": samples,
+        "targets": targets,
+        "splits": splits,
+        "records": accepted_records,
+        "record_count": len(records),
+        "accepted_record_count": len(samples),
+        "skipped_record_count": skipped_records,
+    }
+
+
+def _metadata_bundle_execution_metadata(metadata_bundle: dict | None, metadata_spec: dict | None) -> dict:
+    bundle = _coerce_metadata_bundle(metadata_bundle)
+    if not bundle:
+        return {
+            "status": "unavailable",
+            "applied": False,
+            "record_count": 0,
+            "accepted_record_count": 0,
+            "skipped_record_count": 0,
+        }
+    records = _metadata_manifest_records(bundle)
+    if metadata_spec is None:
+        return {
+            "status": "not_usable",
+            "applied": False,
+            "record_count": len(records),
+            "accepted_record_count": 0,
+            "skipped_record_count": len(records),
+        }
+    return {
+        "status": "applied",
+        "applied": True,
+        "record_count": int(metadata_spec.get("record_count") or len(records)),
+        "accepted_record_count": int(metadata_spec.get("accepted_record_count") or 0),
+        "skipped_record_count": int(metadata_spec.get("skipped_record_count") or 0),
+        "class_count": len(metadata_spec.get("class_names") or []),
+    }
+
+
+def _coerce_metadata_bundle(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    for key in ("bundle", "metadata_bundle", "data"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return payload
+
+
+def _metadata_manifest_records(bundle: dict) -> list:
+    for key in ("manifest_records", "records", "samples", "files"):
+        value = bundle.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _metadata_annotations(bundle: dict) -> list:
+    for key in ("annotations", "dataset_annotations", "bboxes"):
+        value = bundle.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _metadata_classes(bundle: dict) -> list:
+    value = bundle.get("classes")
+    return value if isinstance(value, list) else []
+
+
+def _merge_metadata_bundle_pages(merged: dict | None, page: dict) -> dict:
+    if merged is None:
+        return {key: list(value) if isinstance(value, list) else value for key, value in page.items()}
+    for key, value in page.items():
+        if isinstance(value, list):
+            merged.setdefault(key, [])
+            if isinstance(merged[key], list):
+                merged[key].extend(value)
+        elif key not in merged:
+            merged[key] = value
+    return merged
+
+
+def _metadata_bundle_has_more(page_payload: object, page_bundle: dict, record_count: int, limit: int) -> bool:
+    for source in (page_payload, page_bundle):
+        if not isinstance(source, dict):
+            continue
+        has_more = source.get("has_more")
+        if isinstance(has_more, bool):
+            return has_more
+        pagination = source.get("pagination")
+        if isinstance(pagination, dict):
+            has_more = pagination.get("has_more")
+            if isinstance(has_more, bool):
+                return has_more
+            if pagination.get("next_offset") is not None:
+                return True
+        if source.get("next_offset") is not None:
+            return True
+    return record_count >= limit and limit > 0
+
+
+def _metadata_class_mapping(bundle: dict, records: list) -> tuple[list[str], dict[str, int]]:
+    classes = []
+    for item in _metadata_classes(bundle):
+        if not isinstance(item, dict):
+            continue
+        name = _first_metadata_string(item, ("class_name", "name", "label_name", "class_key", "label_key"))
+        if not name:
+            continue
+        class_index = _optional_int(item.get("class_index"))
+        classes.append(
+            {
+                "name": name,
+                "index": class_index,
+                "keys": [
+                    _first_metadata_string(item, ("class_key",)),
+                    _first_metadata_string(item, ("label_key",)),
+                    _first_metadata_string(item, ("id",)),
+                    str(class_index) if class_index is not None else "",
+                ],
+            }
+        )
+    if not classes:
+        names = sorted(
+            {
+                label
+                for record in records
+                if isinstance(record, dict)
+                for label in [_first_metadata_string(record, ("label_name", "class_name", "label", "label_key", "class_key"))]
+                if label
+            }
+        )
+        classes = [{"name": name, "index": index, "keys": [name]} for index, name in enumerate(names)]
+
+    classes.sort(key=lambda item: (item["index"] is None, item["index"] if item["index"] is not None else item["name"], item["name"]))
+    class_names = [str(item["name"]) for item in classes]
+    lookup: dict[str, int] = {}
+    for index, item in enumerate(classes):
+        values = [item["name"], *item["keys"]]
+        for value in values:
+            normalized = _metadata_lookup_key(value)
+            if normalized:
+                lookup[normalized] = index
+    return class_names, lookup
+
+
+def _metadata_record_target(record: dict, label_lookup: dict[str, int]) -> int | None:
+    for key in ("label_key", "class_key", "label_name", "class_name", "label", "category_name", "category_id", "class_index"):
+        normalized = _metadata_lookup_key(record.get(key))
+        if normalized and normalized in label_lookup:
+            return label_lookup[normalized]
+    return None
+
+
+def _metadata_record_relative_path(record: dict) -> str:
+    return _first_metadata_string(
+        record,
+        ("relative_path", "media_path", "image_path", "file_path", "path"),
+    )
+
+
+def _resolve_dataset_relative_file(dataset_dir: Path, relative_path: str) -> Path | None:
+    from worker.datasets.metadata_discovery import is_safe_relative_path
+
+    if not is_safe_relative_path(relative_path):
+        return None
+    candidate_paths = [relative_path]
+    for image_root in _metadata_image_root_prefixes(dataset_dir):
+        candidate_paths.append(f"{image_root}/{relative_path}")
+    dataset_root = dataset_dir.resolve(strict=True)
+    for candidate_path in candidate_paths:
+        if not is_safe_relative_path(candidate_path):
+            continue
+        candidate = dataset_dir.joinpath(*candidate_path.split("/"))
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(dataset_root)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _metadata_image_root_prefixes(dataset_dir: Path) -> list[str]:
+    try:
+        actual_dirs = {child.name.lower(): child.name for child in dataset_dir.iterdir() if child.is_dir()}
+    except OSError:
+        return []
+    prefixes: list[str] = []
+    for prefix in COMMON_IMAGE_ROOT_NAMES:
+        actual = actual_dirs.get(prefix.lower())
+        if actual and actual not in prefixes:
+            prefixes.append(actual)
+    wrapper = _single_wrapper_dir(dataset_dir)
+    if wrapper is not None:
+        wrapper_prefix = wrapper.name
+        if wrapper_prefix not in prefixes:
+            prefixes.append(wrapper_prefix)
+        try:
+            wrapper_dirs = {child.name.lower(): child.name for child in wrapper.iterdir() if child.is_dir()}
+        except OSError:
+            wrapper_dirs = {}
+        for prefix in COMMON_IMAGE_ROOT_NAMES:
+            actual = wrapper_dirs.get(prefix.lower())
+            if not actual:
+                continue
+            nested_prefix = f"{wrapper_prefix}/{actual}"
+            if nested_prefix not in prefixes:
+                prefixes.append(nested_prefix)
+    return prefixes
+
+
+def _indices_from_metadata_splits(
+    splits: list[str],
+    targets: list[int] | None = None,
+) -> tuple[list[int], list[int], list[int]] | None:
+    if not splits:
+        return None
+    train_indices = [index for index, split in enumerate(splits) if split == "train"]
+    val_indices = [index for index, split in enumerate(splits) if split == "val"]
+    test_indices = [index for index, split in enumerate(splits) if split == "test"]
+    if not train_indices:
+        return None
+    if not val_indices and test_indices:
+        derived = _derive_validation_indices_from_train(train_indices, targets or [])
+        if derived is not None:
+            train_indices, val_indices = derived
+        else:
+            val_indices = list(test_indices)
+    if not val_indices:
+        return None
+    if not test_indices:
+        test_indices = list(val_indices)
+    return train_indices, val_indices, test_indices
+
+
+def _derive_validation_indices_from_train(
+    train_indices: list[int],
+    targets: list[int],
+) -> tuple[list[int], list[int]] | None:
+    if len(train_indices) < 2:
+        return None
+    val_size = min(max(1, int(len(train_indices) * 0.2)), len(train_indices) - 1)
+    shuffled = list(train_indices)
+    random.Random(42).shuffle(shuffled)
+    target_counts: dict[int, int] = {}
+    for index in train_indices:
+        if 0 <= index < len(targets):
+            target = int(targets[index])
+            target_counts[target] = target_counts.get(target, 0) + 1
+    if target_counts:
+        preferred = [
+            index
+            for index in shuffled
+            if 0 <= index < len(targets) and target_counts.get(int(targets[index]), 0) > 1
+        ]
+        candidates = preferred if len(preferred) >= val_size else shuffled
+    else:
+        candidates = shuffled
+    val_indices = sorted(candidates[:val_size])
+    val_set = set(val_indices)
+    remaining_train_indices = [index for index in train_indices if index not in val_set]
+    if not remaining_train_indices or not val_indices:
+        return None
+    return remaining_train_indices, val_indices
+
+
+def _normalize_metadata_split(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"training", "train"}:
+        return "train"
+    if normalized in {"val", "valid", "validation", "dev"}:
+        return "val"
+    if normalized in {"test", "testing", "holdout", "heldout"}:
+        return "test"
+    return ""
+
+
+def _bbox_lookup_from_metadata_bundle(metadata_bundle: dict, dataset_dir: Path) -> dict[str, tuple[int, int, int, int]]:
+    bundle = _coerce_metadata_bundle(metadata_bundle)
+    if not bundle:
+        return {}
+    sample_paths: dict[str, str] = {}
+    for record in _metadata_manifest_records(bundle):
+        if not isinstance(record, dict):
+            continue
+        relative_path = _metadata_record_relative_path(record)
+        if not relative_path:
+            continue
+        for key in (
+            _first_metadata_string(record, ("sample_key",)),
+            _first_metadata_string(record, ("id",)),
+            relative_path,
+            Path(relative_path).name,
+            Path(relative_path).stem,
+        ):
+            normalized = _metadata_lookup_key(key)
+            if normalized:
+                sample_paths[normalized] = relative_path
+
+    boxes_by_path: dict[str, list[tuple[int, int, int, int]]] = {}
+    for annotation in _metadata_annotations(bundle):
+        if not isinstance(annotation, dict):
+            continue
+        relative_path = _metadata_record_relative_path(annotation)
+        if not relative_path:
+            sample_key = _metadata_lookup_key(_first_metadata_string(annotation, ("sample_key", "record_key", "manifest_key")))
+            relative_path = sample_paths.get(sample_key, "")
+        if not relative_path:
+            continue
+        bbox = _metadata_bbox(annotation.get("bbox"))
+        if bbox is None:
+            continue
+        boxes_by_path.setdefault(relative_path, []).append(bbox)
+
+    lookup: dict[str, tuple[int, int, int, int]] = {}
+    for relative_path, boxes in boxes_by_path.items():
+        image_path = _resolve_dataset_relative_file(dataset_dir, relative_path)
+        if image_path is None:
+            continue
+        union = _union_bbox_tuples(boxes)
+        if union is None:
+            continue
+        for key in (
+            str(image_path.resolve()).lower(),
+            image_path.name.lower(),
+            image_path.stem.lower(),
+            relative_path.lower(),
+        ):
+            lookup[key] = union
+    return lookup
+
+
+def _metadata_bbox(value: object) -> tuple[int, int, int, int] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        if all(key in value for key in ("xmin", "ymin", "xmax", "ymax")):
+            xmin = int(value["xmin"])
+            ymin = int(value["ymin"])
+            xmax = int(value["xmax"])
+            ymax = int(value["ymax"])
+        elif all(key in value for key in ("x", "y", "width", "height")):
+            xmin = int(value["x"])
+            ymin = int(value["y"])
+            xmax = xmin + int(value["width"])
+            ymax = ymin + int(value["height"])
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if xmax <= xmin or ymax <= ymin:
+        return None
+    return xmin, ymin, xmax, ymax
+
+
+def _union_bbox_tuples(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int] | None:
+    if not boxes:
+        return None
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def _first_metadata_string(record: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = record.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _metadata_lookup_key(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _image_transform(image_size: int, augmentation: dict, preprocessing: dict, training: bool):
@@ -1130,6 +1788,89 @@ def _example_prediction_records(
     return records
 
 
+def _demo_images_from_test_examples(eval_details: dict, class_names: list[str], max_total: int = 12) -> list[dict]:
+    records = eval_details.get("example_predictions") if isinstance(eval_details, dict) else []
+    if not isinstance(records, list):
+        return []
+    wrong = [record for record in records if isinstance(record, dict) and record.get("correct") is False]
+    correct = [record for record in records if isinstance(record, dict) and record.get("correct") is True]
+    ranked = sorted(wrong, key=lambda record: -float(record.get("confidence") or 0.0)) + _class_balanced_records(correct, class_names)
+
+    demo_images: list[dict] = []
+    seen_paths: set[str] = set()
+    for record in ranked:
+        path = str(record.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        thumbnail_uri, width, height, size_bytes = _thumbnail_data_uri(path)
+        if not thumbnail_uri:
+            continue
+        true_label = str(record.get("true_class") or "")
+        predicted_label = str(record.get("predicted_class") or "")
+        demo_images.append(
+            {
+                "id": f"test:{Path(path).stem}",
+                "image_id": Path(path).name,
+                "uri": thumbnail_uri,
+                "image_uri": thumbnail_uri,
+                "thumbnail_uri": thumbnail_uri,
+                "class_name": true_label,
+                "label": true_label,
+                "true_label": true_label,
+                "split": "test",
+                "width": width,
+                "height": height,
+                "size_bytes": size_bytes,
+                "metadata": {
+                    "source": "heldout_test",
+                    "predicted_label_at_training": predicted_label,
+                    "confidence_at_training": round(float(record.get("confidence") or 0.0), 6),
+                    "correct_at_training": bool(record.get("correct")),
+                },
+            }
+        )
+        if len(demo_images) >= max_total:
+            break
+    return demo_images
+
+
+def _class_balanced_records(records: list[dict], class_names: list[str]) -> list[dict]:
+    by_class = {class_name: [] for class_name in class_names}
+    for record in records:
+        label = str(record.get("true_class") or "")
+        by_class.setdefault(label, []).append(record)
+    for class_records in by_class.values():
+        class_records.sort(key=lambda record: -float(record.get("confidence") or 0.0))
+
+    out: list[dict] = []
+    while any(by_class.values()):
+        for class_name in sorted(by_class):
+            if by_class[class_name]:
+                out.append(by_class[class_name].pop(0))
+    return out
+
+
+def _thumbnail_data_uri(path: str, image_size: int = 224, quality: int = 76) -> tuple[str, int, int, int]:
+    try:
+        from PIL import Image
+    except Exception:
+        return "", 0, 0, 0
+
+    try:
+        with Image.open(path) as image:
+            rgb = image.convert("RGB")
+            rgb.thumbnail((image_size, image_size), Image.Resampling.LANCZOS)
+            output_path = Path(tempfile.gettempdir()) / f"model_express_demo_{os.getpid()}_{Path(path).stem}.jpg"
+            rgb.save(output_path, format="JPEG", quality=quality, optimize=True)
+            payload = base64.b64encode(output_path.read_bytes()).decode("ascii")
+            size_bytes = output_path.stat().st_size
+            output_path.unlink(missing_ok=True)
+            return f"data:image/jpeg;base64,{payload}", rgb.width, rgb.height, size_bytes
+    except Exception:
+        return "", 0, 0, 0
+
+
 def _label_quality_audit_requested(config: dict) -> bool:
     mechanism = str(config.get("mechanism", "")).lower()
     audit_config = config.get("label_quality_audit") if isinstance(config.get("label_quality_audit"), dict) else {}
@@ -1250,6 +1991,125 @@ def _model_profile(model, model_name: str, image_size: int, device, loader) -> d
         "estimated_throughput_images_per_second": round(1000.0 / max(float(estimated_latency_ms), 1.0), 3),
         "image_size": image_size,
     }
+
+
+def _export_trained_champion_bundle(
+    *,
+    model,
+    model_name: str,
+    class_names: list[str],
+    image_size: int,
+    preprocessing: dict,
+    model_profile: dict,
+    training_config: dict,
+    dataset: dict,
+    job_id: str,
+) -> dict:
+    try:
+        from worker.exporting.artifacts import produce_champion_export_artifacts
+        from worker.datasets.storage import upload_file_to_s3_uri
+    except Exception as exc:
+        return _export_error("EXPORT_DEPENDENCY_UNAVAILABLE", str(exc))
+
+    export_dir = Path(os.getenv("WORKER_CHAMPION_EXPORT_ROOT", ".cache/champion_exports")) / _safe_path_part(job_id) / "training"
+    try:
+        manifest = produce_champion_export_artifacts(
+            export_dir=export_dir,
+            model_name=model_name,
+            class_names=class_names,
+            image_size=image_size,
+            model=model,
+            preprocessing=preprocessing,
+            model_profile=model_profile,
+            training_config=training_config,
+            formats=("onnx", "torchscript", "framework_native"),
+        )
+        remote_base = _artifact_remote_base_uri(dataset, job_id)
+        public_manifest, artifact_uris = _upload_manifest_artifacts(manifest, remote_base, upload_file_to_s3_uri)
+        onnx_artifact = next((item for item in artifact_uris if item["format"] == "onnx"), None)
+        primary_artifact = onnx_artifact or (artifact_uris[0] if artifact_uris else None)
+        validation_errors = _artifact_errors(public_manifest)
+        status = "READY" if onnx_artifact else "PENDING_ARTIFACT"
+        if not artifact_uris:
+            status = "FAILED" if validation_errors else "PENDING_ARTIFACT"
+        manifest_uri = f"{remote_base}/manifest.json"
+        manifest_path = export_dir / "manifest.remote.json"
+        manifest_path.write_text(json.dumps(public_manifest, indent=2, sort_keys=True), encoding="utf-8")
+        upload_file_to_s3_uri(manifest_path, manifest_uri)
+        return {
+            "status": status,
+            "format": primary_artifact["format"] if primary_artifact else "onnx",
+            "artifact_uri": primary_artifact["uri"] if primary_artifact else "",
+            "onnx_artifact_uri": onnx_artifact["uri"] if onnx_artifact else "",
+            "manifest_uri": manifest_uri,
+            "manifest": public_manifest,
+            "validation_errors": validation_errors,
+        }
+    except Exception as exc:
+        return _export_error("EXPORT_FAILED", str(exc))
+
+
+def _upload_manifest_artifacts(manifest: dict, remote_base: str, upload_file_to_s3_uri) -> tuple[dict, list[dict]]:
+    public_manifest = json.loads(json.dumps(manifest))
+    artifact_uris: list[dict] = []
+    artifacts = public_manifest.get("artifacts") if isinstance(public_manifest.get("artifacts"), list) else []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("status") != "created":
+            continue
+        path = Path(str(artifact.get("path") or ""))
+        if not path.exists() or not path.is_file():
+            artifact["status"] = "failed"
+            artifact["error_code"] = "ARTIFACT_NOT_FOUND"
+            artifact["error"] = f"Created artifact disappeared before upload: {path}"
+            continue
+        remote_uri = f"{remote_base}/{path.name}"
+        upload_file_to_s3_uri(path, remote_uri)
+        artifact["path"] = remote_uri
+        artifact["uri"] = remote_uri
+        artifact_uris.append({"format": str(artifact.get("format") or ""), "uri": remote_uri})
+    public_manifest.pop("manifest_path", None)
+    if isinstance(public_manifest.get("metadata"), dict):
+        onnx_artifact = next((item for item in artifact_uris if item["format"] == "onnx"), None)
+        public_manifest["metadata"]["artifact_uri"] = onnx_artifact["uri"] if onnx_artifact else ""
+    return public_manifest, artifact_uris
+
+
+def _artifact_remote_base_uri(dataset: dict, job_id: str) -> str:
+    bucket = os.getenv("MODEL_EXPRESS_ARTIFACT_BUCKET", "").strip()
+    dataset_uri = str(dataset.get("storage_uri") or "")
+    if not bucket:
+        parsed = urlparse(dataset_uri)
+        bucket = parsed.netloc if parsed.scheme == "s3" else "model-express"
+    prefix = os.getenv("MODEL_EXPRESS_ARTIFACT_PREFIX", "model-express/artifacts").strip("/")
+    return f"s3://{bucket}/{prefix}/{_safe_path_part(job_id)}"
+
+
+def _artifact_errors(manifest: dict) -> list[str]:
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), list) else []
+    errors = []
+    for artifact in artifacts:
+        if isinstance(artifact, dict) and artifact.get("status") != "created":
+            error_code = str(artifact.get("error_code") or artifact.get("status") or "EXPORT_UNAVAILABLE")
+            error = str(artifact.get("error") or "")
+            errors.append(f"{error_code}: {error}".strip())
+    return errors
+
+
+def _export_error(error_code: str, error: str) -> dict:
+    return {
+        "status": "FAILED",
+        "format": "onnx",
+        "artifact_uri": "",
+        "onnx_artifact_uri": "",
+        "manifest_uri": "",
+        "manifest": {},
+        "validation_errors": [f"{error_code}: {error}"],
+    }
+
+
+def _safe_path_part(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(value))
+    return safe or "artifact"
 
 
 def _holistic_scores(best_macro_f1: float, best_accuracy: float, estimated_cost_usd: float, runtime_seconds: float, model_profile: dict) -> dict:

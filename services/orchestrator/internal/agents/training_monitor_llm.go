@@ -247,8 +247,8 @@ Produce signals that the plan-level Experiment Planning Agent can use later.`),
 
 Do not include proposed_experiments. This is not the plan-level planner.
 Payload may include supporting evidence such as overfitting indicators, plateau signals, or promising settings.
-Use objective_context to judge whether the run fits the user's goal. For live/real-time goals,
-penalize slow or oversized models when quality is close.
+Use objective_context to judge whether the run fits the user's goal. For live/real-time goals, treat latency
+under roughly 25ms as acceptable and penalize slow or oversized models only when quality is close or latency exceeds that budget.
 
 Context:
 %s`, string(contextBlob)),

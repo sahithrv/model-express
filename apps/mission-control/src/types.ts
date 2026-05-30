@@ -20,6 +20,62 @@ export type Dataset = {
   profiled_at?: string;
 };
 
+export type DatasetMetadataIssue =
+  | string
+  | {
+      code?: string;
+      severity?: string;
+      message?: string;
+      reason?: string;
+      source_kind?: string;
+      source_format?: string;
+      declared_format?: string;
+      detected_format?: string;
+      count?: number;
+      [key: string]: unknown;
+    };
+
+export type DatasetMetadataSummary = {
+  status?: string;
+  import_id?: string;
+  source_kinds?: string[];
+  source_formats?: string[];
+  formats?: string[];
+  class_count?: number;
+  sample_count?: number;
+  split_counts?: Record<string, number>;
+  annotation_counts?: Record<string, number>;
+  bbox_coverage?: number | string | Record<string, unknown>;
+  bbox_count?: number;
+  bbox_counts?: Record<string, number> | Record<string, unknown>;
+  warnings?: DatasetMetadataIssue[];
+  errors?: DatasetMetadataIssue[];
+  official_split_available?: boolean;
+  unsupported_source_count?: number;
+  created_at?: string;
+  completed_at?: string;
+  [key: string]: unknown;
+};
+
+export type DatasetMetadataImport = {
+  id?: string;
+  import_id?: string;
+  dataset_id?: string;
+  project_id?: string;
+  status?: string;
+  import_version?: number;
+  source_kind?: string;
+  active?: boolean;
+  strict_mode?: boolean;
+  summary?: DatasetMetadataSummary;
+  agent_safe_summary?: DatasetMetadataSummary;
+  warnings?: DatasetMetadataIssue[];
+  errors?: DatasetMetadataIssue[];
+  created_at?: string;
+  completed_at?: string;
+  [key: string]: unknown;
+};
+
 export type VisualCoverageReport = {
   selection_strategy?: string;
   selection_basis?: string[];
@@ -357,6 +413,7 @@ export type ChampionDemoImage = {
   image_id?: string;
   uri?: string;
   image_uri?: string;
+  preview_uri?: string;
   thumbnail_uri?: string;
   class_name?: string;
   label?: string;
@@ -389,6 +446,7 @@ export type ChampionDemoPrediction = {
   completed_at?: string;
   created_at?: string;
   updated_at?: string;
+  image_metadata?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 };
 

@@ -7,10 +7,11 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from worker.datasets.profiler import IMAGE_EXT, NON_CLASS_DIR_NAMES
+from worker.datasets.profiler import IMAGE_EXT, classification_class_dirs, resolve_classification_root
 
 
 SELECTION_STRATEGY = "deterministic_risk_and_representative_sampling"
+ANALYSIS_THUMBNAIL_SIZE = 160
 
 
 @dataclass(frozen=True)
@@ -234,12 +235,8 @@ def _empty_manifest(dataset_id: str, dataset_name: str) -> dict:
 
 def _class_image_records(dataset_dir: Path) -> dict[str, list[_ImageRecord]]:
     records: dict[str, list[_ImageRecord]] = {}
-    class_dirs = [
-        path
-        for path in sorted(dataset_dir.iterdir())
-        if path.is_dir() and path.name.lower() not in NON_CLASS_DIR_NAMES
-    ]
-    for class_dir in class_dirs:
+    class_root = resolve_classification_root(dataset_dir)
+    for class_dir in classification_class_dirs(class_root):
         class_records = []
         for image_path in sorted(class_dir.rglob("*")):
             if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXT:
@@ -295,12 +292,15 @@ def _load_candidates(
     for record in records:
         try:
             with Image.open(record.path) as image:
+                width, height = image.size
+                image.draft("RGB", (ANALYSIS_THUMBNAIL_SIZE, ANALYSIS_THUMBNAIL_SIZE))
                 rgb = image.convert("RGB")
-                width, height = rgb.size
+                rgb.thumbnail((ANALYSIS_THUMBNAIL_SIZE, ANALYSIS_THUMBNAIL_SIZE), Image.Resampling.BILINEAR)
                 stat = ImageStat.Stat(rgb.resize((1, 1)))
                 brightness = float(sum(stat.mean) / 3.0)
-                contrast = float(sum(ImageStat.Stat(rgb.convert("L")).stddev) / 1.0)
-                edges = rgb.convert("L").filter(ImageFilter.FIND_EDGES)
+                grayscale = rgb.convert("L")
+                contrast = float(sum(ImageStat.Stat(grayscale).stddev) / 1.0)
+                edges = grayscale.filter(ImageFilter.FIND_EDGES)
                 blur_score = float(ImageStat.Stat(edges).mean[0])
         except Exception:
             skipped_corrupt += 1

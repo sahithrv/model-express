@@ -5,6 +5,7 @@ import time
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_REPORT_TIMEOUT_SECONDS = 300
 POLL_INTERVAL_SECONDS = 5
+ENDPOINT_UNAVAILABLE_STATUS_CODES = {404, 405, 501}
 
 class OrchestratorClient:
     def __init__(self, base_url: str, timeout: int | None = None):
@@ -24,6 +25,49 @@ class OrchestratorClient:
             json={"profile": profile},
             timeout=self.timeout,
         )
+        response.raise_for_status()
+        return response.json()
+
+    def import_dataset_metadata(self, dataset_id: str, payload: dict) -> dict:
+        response = requests.post(
+            f"{self.base_url}/datasets/{dataset_id}/metadata/imports",
+            json=payload,
+            timeout=report_timeout_seconds(),
+        )
+        if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
+            return {
+                "status": "unavailable",
+                "reason": "metadata_import_endpoint_unavailable",
+                "status_code": response.status_code,
+            }
+        response.raise_for_status()
+        return response.json()
+
+    def get_dataset_metadata_bundle(
+        self,
+        dataset_id: str,
+        *,
+        metadata_import_id: str | None = None,
+        purpose: str = "training",
+        include: str = "bbox",
+        limit: int = 5000,
+        offset: int = 0,
+    ) -> dict | None:
+        params: dict[str, str | int] = {
+            "purpose": purpose,
+            "include": include,
+            "limit": limit,
+            "offset": offset,
+        }
+        if metadata_import_id:
+            params["metadata_import_id"] = metadata_import_id
+        response = requests.get(
+            f"{self.base_url}/datasets/{dataset_id}/metadata/bundle",
+            params=params,
+            timeout=self.timeout,
+        )
+        if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES or response.status_code == 204:
+            return None
         response.raise_for_status()
         return response.json()
     
@@ -114,7 +158,7 @@ class OrchestratorClient:
             json=payload,
             timeout=report_timeout_seconds(),
         )
-        response.raise_for_status()
+        _raise_for_status_with_body(response)
         return response.json()
 
     def complete_job(self, job_id: str, mlflow_run_id: str = "") -> dict:
@@ -133,7 +177,7 @@ class OrchestratorClient:
             json={"error": error},
             timeout=report_timeout_seconds(),
         )
-        response.raise_for_status()
+        _raise_for_status_with_body(response)
         return response.json()
 
 
@@ -164,6 +208,17 @@ def request_timeout_seconds() -> int:
 
 def report_timeout_seconds() -> int:
     return _positive_int_env("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", DEFAULT_REPORT_TIMEOUT_SECONDS)
+
+
+def _raise_for_status_with_body(response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        body = str(getattr(response, "text", "") or "")
+        if body:
+            body = body[:2000]
+            raise requests.HTTPError(f"{exc}; response_body={body}", response=response) from exc
+        raise
 
 
 def _positive_int_env(name: str, default: int) -> int:

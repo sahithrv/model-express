@@ -15,6 +15,7 @@
     "concurrently": "latest",
     "electron": "latest",
     "lucide-react": "latest",
+    "onnxruntime-web": "^1.26.0",
     "react": "latest",
     "react-dom": "latest",
     "typescript": "latest",

@@ -41,6 +41,28 @@ interface Window {
       checksum_sha256: string;
       size_bytes: number;
     } | null>;
+    selectDemoImage(): Promise<{
+      path: string;
+      name: string;
+      uri: string;
+      image_uri: string;
+      image_id: string;
+      thumbnail_uri?: string;
+      split?: string;
+      size_bytes?: number;
+      metadata?: Record<string, unknown>;
+    } | null>;
+    loadModelArtifact(options: {
+      artifactUri: string;
+      endpoint?: string;
+      accessKeyId?: string;
+      secretAccessKey?: string;
+      region?: string;
+    }): Promise<{
+      artifact_uri: string;
+      size_bytes: number;
+      bytes: ArrayBuffer;
+    }>;
     ensureProjectWorker(options: {
       projectId: string;
       baseUrl: string;

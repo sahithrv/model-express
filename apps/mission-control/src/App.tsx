@@ -13,8 +13,11 @@ import {
   Eye,
   FolderOpen,
   HardDriveUpload,
+  ImageIcon,
+  Link2,
   ListRestart,
   MonitorDot,
+  Pause,
   Play,
   Plus,
   RefreshCcw,
@@ -25,8 +28,15 @@ import {
   StepForward,
   Timer,
   Trophy,
+  Upload,
   X,
 } from "lucide-react";
+import {
+  createChampionLocalRuntime,
+  predictChampionImage,
+  readyONNXExport,
+  type ChampionLocalRuntime,
+} from "./championLocalInference";
 import type {
   AgentDecision,
   AgentInvocation,
@@ -35,6 +45,8 @@ import type {
   ChampionDemoPrediction,
   ChampionExport,
   Dataset,
+  DatasetMetadataImport,
+  DatasetMetadataSummary,
   DatasetVisualAnalysis,
   EpochMetric,
   ExecutionEvent,
@@ -79,6 +91,7 @@ type ProjectDetail = {
   decisions: AgentDecision[];
   datasets: Dataset[];
   visualAnalysis: VisualAnalysisDetail;
+  datasetMetadata: DatasetMetadataDetail;
   jobs: Job[];
   plans: ExperimentPlan[];
   runSummaries: TrainingRunSummary[];
@@ -103,6 +116,13 @@ type VisualAnalysisDetail = {
   rerunPolicy?: VisualAnalysisRerunPolicy | null;
 };
 
+type DatasetMetadataDetail = {
+  summary: DatasetMetadataSummary | null;
+  imports: DatasetMetadataImport[];
+  status: "available" | "empty" | "unsupported" | "error";
+  message: string;
+};
+
 type VisualAnalysisListResponse = {
   visual_analyses?: DatasetVisualAnalysis[];
   dataset_visual_analyses?: DatasetVisualAnalysis[];
@@ -121,6 +141,39 @@ type AgentInvocationsResponse = {
   items?: AgentInvocation[];
 };
 
+type DatasetMetadataSummaryResponse =
+  | DatasetMetadataSummary
+  | {
+      summary?: DatasetMetadataSummary;
+      metadata_summary?: DatasetMetadataSummary;
+      dataset_metadata_summary?: DatasetMetadataSummary;
+      agent_safe_summary?: DatasetMetadataSummary;
+      import?: DatasetMetadataImport;
+      metadata_import?: DatasetMetadataImport;
+    };
+
+type DatasetMetadataImportsResponse =
+  | DatasetMetadataImport[]
+  | {
+      imports?: DatasetMetadataImport[];
+      metadata_imports?: DatasetMetadataImport[];
+      items?: DatasetMetadataImport[];
+      latest?: DatasetMetadataImport;
+      active?: DatasetMetadataImport;
+      import?: DatasetMetadataImport;
+      metadata_import?: DatasetMetadataImport;
+    };
+
+type OrchestratorHttpErrorResponse = {
+  __mission_control_http_error: true;
+  status: number;
+  statusText?: string;
+  message?: string;
+  path?: string;
+  url?: string;
+  payload?: unknown;
+};
+
 type TimelineItem = {
   label: string;
   detail: string;
@@ -132,6 +185,22 @@ type InsightItem = {
   label: string;
   value: string;
   tone?: "good" | "warn" | "bad";
+};
+
+type MetadataCountRow = {
+  label: string;
+  value: string;
+};
+
+type MetadataStatusDisplay = {
+  status: string;
+  detail: string;
+  facts: InsightItem[];
+  sources: string[];
+  splitRows: MetadataCountRow[];
+  annotationRows: MetadataCountRow[];
+  warnings: string[];
+  errors: string[];
 };
 
 type ReasoningSection = {
@@ -208,6 +277,8 @@ type ChampionExportDemo = {
   exports: ChampionExport[];
   projectId: string;
   modelCard: Record<string, unknown>;
+  deploymentProfile: Record<string, unknown>;
+  modelProfile: Record<string, unknown>;
   useCases: string[];
   limitations: string[];
   preprocessing: string[];
@@ -274,6 +345,12 @@ function emptyProjectDetail(message = "Select a dataset to load visual analysis 
       message,
       manualRunSupported: false,
     },
+    datasetMetadata: {
+      summary: null,
+      imports: [],
+      status: "empty",
+      message: "Dataset metadata imports have not been reported.",
+    },
     jobs: [],
     plans: [],
     runSummaries: [],
@@ -312,8 +389,18 @@ export function App() {
   const [demoPredictionError, setDemoPredictionError] = useState("");
   const [demoPredictionLoading, setDemoPredictionLoading] = useState(false);
   const [selectedDemoImageIndex, setSelectedDemoImageIndex] = useState(0);
+  const [customDemoImage, setCustomDemoImage] = useState<ChampionDemoImage | null>(null);
+  const [customDemoImageURI, setCustomDemoImageURI] = useState("");
+  const [customDemoTrueLabel, setCustomDemoTrueLabel] = useState("");
+  const [localInferenceStatus, setLocalInferenceStatus] = useState("not_ready");
+  const [localInferenceError, setLocalInferenceError] = useState("");
+  const [demoSlideshowEnabled, setDemoSlideshowEnabled] = useState(false);
+  const localRuntime = useRef<ChampionLocalRuntime | null>(null);
+  const demoImagesRef = useRef<ChampionDemoImage[]>([]);
+  const demoSlideshowInFlight = useRef(false);
   const supervisingRequirements = useRef<Set<string>>(new Set());
   const eventRefreshInFlight = useRef(false);
+  const liveRefreshInFlight = useRef(false);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -346,8 +433,8 @@ export function App() {
     [detail, selectedProject],
   );
   const datasetIntelligence = useMemo(
-    () => buildDatasetIntelligence(detail.datasets[0] ?? null, latestDecision),
-    [detail.datasets, latestDecision],
+    () => buildDatasetIntelligence(detail.datasets[0] ?? null, latestDecision, detail.datasetMetadata),
+    [detail.datasetMetadata, detail.datasets, latestDecision],
   );
   const championComparison = useMemo(
     () => buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.jobs, detail.champion),
@@ -362,12 +449,19 @@ export function App() {
 
   const request = useCallback(
     async <T,>(path: string, options: { method?: string; body?: unknown } = {}) => {
-      return window.missionControl.request<T>({
+      const response = await window.missionControl.request<T | OrchestratorHttpErrorResponse>({
         baseUrl,
         path,
         method: options.method,
         body: options.body,
       });
+      if (isOrchestratorHttpErrorResponse(response)) {
+        const statusText = response.statusText ? ` ${response.statusText}` : "";
+        const message = response.message || "request failed";
+        const requestPath = response.path ? ` (${response.path})` : "";
+        throw new Error(`${response.status}${statusText} ${message}${requestPath}`);
+      }
+      return response;
     },
     [baseUrl],
   );
@@ -459,6 +553,73 @@ export function App() {
     [request],
   );
 
+  const fetchLatestDatasetMetadata = useCallback(
+    async (dataset: Dataset | null): Promise<DatasetMetadataDetail> => {
+      if (!dataset) {
+        return {
+          summary: null,
+          imports: [],
+          status: "empty",
+          message: "Upload a dataset before metadata imports can run.",
+        };
+      }
+
+      const [summaryResult, importsResult] = await Promise.all([
+        request<DatasetMetadataSummaryResponse>(`/datasets/${dataset.id}/metadata/summary`)
+          .then((response) => ({ response }))
+          .catch((error: unknown) => ({ error })),
+        request<DatasetMetadataImportsResponse>(`/datasets/${dataset.id}/metadata/imports`)
+          .then((response) => ({ response }))
+          .catch((error: unknown) => ({ error })),
+      ]);
+
+      const imports =
+        "response" in importsResult ? datasetMetadataImportsFromResponse(importsResult.response) : [];
+      const summary =
+        "response" in summaryResult
+          ? datasetMetadataSummaryFromResponse(summaryResult.response, imports)
+          : datasetMetadataSummaryFromImports(imports);
+
+      if (summary) {
+        return {
+          summary,
+          imports,
+          status: "available",
+          message: "Dataset metadata summary loaded from the backend.",
+        };
+      }
+
+      const summaryError = "error" in summaryResult ? summaryResult.error : null;
+      const importsError = "error" in importsResult ? importsResult.error : null;
+      const errors = [summaryError, importsError].filter(Boolean);
+      if (errors.length > 0 && errors.every(isUnsupportedEndpointError)) {
+        return {
+          summary: null,
+          imports: [],
+          status: "unsupported",
+          message: "This backend does not expose dataset metadata endpoints yet.",
+        };
+      }
+      if (errors.length > 0 && !errors.every(isUnsupportedEndpointError)) {
+        const error = errors.find((item) => !isUnsupportedEndpointError(item)) ?? errors[0];
+        return {
+          summary: null,
+          imports,
+          status: "error",
+          message: `Metadata status lookup failed: ${errorMessage(error)}`,
+        };
+      }
+
+      return {
+        summary: null,
+        imports,
+        status: "empty",
+        message: "No metadata imports have been recorded for this dataset.",
+      };
+    },
+    [request],
+  );
+
   const refreshProjectDetail = useCallback(
     async (projectId: string) => {
       if (!projectId) {
@@ -499,7 +660,11 @@ export function App() {
         request<{ scorecards: StrategyScorecard[] }>(`/projects/${projectId}/strategy-scorecards?limit=6`),
       ]);
 
-      const visualAnalysis = await fetchLatestDatasetVisualAnalysis(datasets.datasets[0] ?? null);
+      const firstDataset = datasets.datasets[0] ?? null;
+      const [visualAnalysis, datasetMetadata] = await Promise.all([
+        fetchLatestDatasetVisualAnalysis(firstDataset),
+        fetchLatestDatasetMetadata(firstDataset),
+      ]);
 
       const championValue = champion.champion;
       const [championExports, championDemoImages, championDemoPredictions] = championValue
@@ -520,6 +685,7 @@ export function App() {
         decisions: decisions.decisions,
         datasets: datasets.datasets,
         visualAnalysis,
+        datasetMetadata,
         jobs: jobs.jobs,
         plans: plans.plans,
         runSummaries: runSummaries.summaries,
@@ -546,7 +712,7 @@ export function App() {
         return jobs.jobs[0].id;
       });
     },
-    [fetchLatestDatasetVisualAnalysis, request],
+    [fetchLatestDatasetMetadata, fetchLatestDatasetVisualAnalysis, request],
   );
 
   const refreshSelectedJobMetrics = useCallback(async () => {
@@ -585,6 +751,10 @@ export function App() {
   ]);
 
   const refreshLive = useCallback(async () => {
+    if (liveRefreshInFlight.current) {
+      return;
+    }
+    liveRefreshInFlight.current = true;
     try {
       await refreshHealth();
       await refreshProjects();
@@ -594,6 +764,8 @@ export function App() {
       await refreshSelectedJobMetrics();
     } catch {
       setHealth(null);
+    } finally {
+      liveRefreshInFlight.current = false;
     }
   }, [refreshHealth, refreshProjectDetail, refreshProjects, refreshSelectedJobMetrics, selectedProjectId]);
 
@@ -658,6 +830,13 @@ export function App() {
       setDemoPrediction(null);
       setDemoPredictionError("");
       setSelectedDemoImageIndex(0);
+      setCustomDemoImage(null);
+      setCustomDemoImageURI("");
+      setCustomDemoTrueLabel("");
+      setDemoSlideshowEnabled(false);
+      setLocalInferenceStatus("not_ready");
+      setLocalInferenceError("");
+      localRuntime.current = null;
       setJobPage(0);
       refreshProjectDetail(selectedProjectId).catch((error) =>
         setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
@@ -671,6 +850,46 @@ export function App() {
       return Math.min(current, championExportDemo.demoImages.length - 1);
     });
   }, [championExportDemo.demoImages.length]);
+
+  useEffect(() => {
+    demoImagesRef.current = championExportDemo.demoImages;
+  }, [championExportDemo.demoImages]);
+
+  useEffect(() => {
+    if (readyONNXExport(championExportDemo.exports)) {
+      setLocalInferenceStatus((status) => (status === "not_ready" ? "available" : status));
+    } else {
+      localRuntime.current = null;
+      setLocalInferenceStatus("not_ready");
+      setLocalInferenceError("");
+    }
+  }, [championExportDemo.exports]);
+
+  useEffect(() => {
+    if (!demoSlideshowEnabled) return;
+    const runNextSlide = () => {
+      if (demoSlideshowInFlight.current) return;
+      const images = demoImagesRef.current;
+      if (images.length === 0) return;
+      let imageToRun: ChampionDemoImage | null = null;
+      setSelectedDemoImageIndex((current) => {
+        const next = nextDemoImageIndex(current, images.length);
+        imageToRun = images[next] ?? null;
+        return next;
+      });
+      if (!imageToRun) return;
+      demoSlideshowInFlight.current = true;
+      runChampionDemoPrediction(imageToRun)
+        .catch((error) => setDemoPredictionError(error instanceof Error ? error.message : String(error)))
+        .finally(() => {
+          demoSlideshowInFlight.current = false;
+        });
+    };
+
+    runNextSlide();
+    const timer = window.setInterval(runNextSlide, 5200);
+    return () => window.clearInterval(timer);
+  }, [demoSlideshowEnabled, selectedProjectId]);
 
   useEffect(() => {
     refreshSelectedJobMetrics().catch((error) =>
@@ -977,10 +1196,80 @@ export function App() {
     }
   }
 
+  async function chooseChampionDemoImage() {
+    try {
+      const image = await window.missionControl.selectDemoImage();
+      if (!image) return;
+      setCustomDemoImage(image);
+      setCustomDemoImageURI(demoImageURI(image));
+      setCustomDemoTrueLabel(demoImageLabel(image));
+      setDemoPrediction(null);
+      setDemoPredictionError("");
+    } catch (error) {
+      setDemoPredictionError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function runCustomChampionDemoPrediction() {
+    const imageURI = customDemoImageURI.trim();
+    if (!imageURI) {
+      setDemoPredictionError("Choose an image or enter a worker-visible image URI.");
+      return;
+    }
+
+    const customImageMatchesPicker = customDemoImage ? imageURI === demoImageURI(customDemoImage) : false;
+    await runChampionDemoPrediction({
+      ...(customDemoImage ?? {}),
+      uri: imageURI,
+      image_uri: imageURI,
+      thumbnail_uri: customImageMatchesPicker ? customDemoImage?.thumbnail_uri : undefined,
+      split: customDemoImage?.split || "custom",
+      true_label: customDemoTrueLabel.trim() || customDemoImage?.true_label || customDemoImage?.label || customDemoImage?.class_name,
+      label: customDemoTrueLabel.trim() || customDemoImage?.label,
+      class_name: customDemoTrueLabel.trim() || customDemoImage?.class_name,
+    });
+  }
+
+  async function ensureChampionLocalRuntime() {
+    const exportRecord = readyONNXExport(championExportDemo.exports);
+    if (!exportRecord) {
+      throw new Error("No READY ONNX export is available for local UI inference.");
+    }
+    const artifactURI = exportRecord.artifact_uri || exportRecord.model_uri || exportRecord.download_url || "";
+    if (!artifactURI) {
+      throw new Error("The READY ONNX export does not expose an artifact URI.");
+    }
+    if (localRuntime.current?.artifactURI === artifactURI) {
+      return localRuntime.current;
+    }
+
+    setLocalInferenceStatus("loading");
+    setLocalInferenceError("");
+    const artifact = await window.missionControl.loadModelArtifact({ artifactUri: artifactURI });
+    const runtime = await createChampionLocalRuntime(artifact, {
+      exportRecord,
+      deploymentProfile: championExportDemo.deploymentProfile,
+      modelProfile: championExportDemo.modelProfile,
+    });
+    localRuntime.current = runtime;
+    setLocalInferenceStatus("ready");
+    return runtime;
+  }
+
+  async function runChampionLocalPrediction(image: ChampionDemoImage) {
+    const imageSource = demoImagePreviewURI(image) || demoImageURI(image);
+    if (!imageSource || imageSource.startsWith("s3://")) {
+      throw new Error("Local UI inference needs an image preview URI or a local uploaded image.");
+    }
+    const runtime = await ensureChampionLocalRuntime();
+    const prediction = await predictChampionImage(runtime, image, imageSource);
+    setDemoPrediction(attachDemoPredictionPreview(prediction, { ...image, thumbnail_uri: imageSource }));
+  }
+
   async function runChampionDemoPrediction(image: ChampionDemoImage) {
     if (!selectedProjectId || !detail.champion) return;
 
-    const imageURI = image.uri || image.image_uri || image.thumbnail_uri || "";
+    const imageURI = demoImageURI(image);
     if (!imageURI) {
       setDemoPrediction(null);
       setDemoPredictionError("Demo image has no URI to send to the backend.");
@@ -991,16 +1280,60 @@ export function App() {
     setDemoPredictionError("");
     setDemoPredictionLoading(true);
     try {
-      const prediction = await request<ChampionDemoPrediction>(`/projects/${selectedProjectId}/champion/demo-predictions`, {
-        method: "POST",
-        body: { image_uri: imageURI, top_k: 5 },
-      });
-      setDemoPrediction(normalizeDemoPredictionResponse(prediction));
+      if (readyONNXExport(championExportDemo.exports)) {
+        await runChampionLocalPrediction(image);
+        return;
+      }
+      const response = await request<ChampionDemoPrediction | { prediction?: ChampionDemoPrediction }>(
+        `/projects/${selectedProjectId}/champion/demo-predictions`,
+        {
+          method: "POST",
+          body: {
+            image_uri: imageURI,
+            image_id: image.image_id || image.id || "",
+            true_label: demoImageLabel(image),
+            image_metadata: demoPredictionRequestMetadata(image),
+            top_k: 5,
+          },
+        },
+      );
+      const normalized = attachDemoPredictionPreview(normalizeDemoPredictionResponse(response), image);
+      setDemoPrediction(normalized);
+      if (normalized.id && !isTerminalDemoPredictionStatus(normalized.status)) {
+        await pollChampionDemoPrediction(normalized.id, image);
+      } else {
+        await refreshProjectDetail(selectedProjectId).catch(() => undefined);
+      }
     } catch (error) {
+      if (readyONNXExport(championExportDemo.exports)) {
+        setLocalInferenceStatus("error");
+        setLocalInferenceError(error instanceof Error ? error.message : String(error));
+      }
       setDemoPredictionError(error instanceof Error ? error.message : String(error));
     } finally {
       setDemoPredictionLoading(false);
     }
+  }
+
+  async function pollChampionDemoPrediction(predictionId: string, image: ChampionDemoImage) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(attempt === 0 ? 700 : 1500);
+      if (!selectedProjectId) return;
+
+      const response = await request<{
+        predictions?: ChampionDemoPrediction[];
+        history?: ChampionDemoPrediction[];
+        demo_predictions?: ChampionDemoPrediction[];
+      }>(`/projects/${selectedProjectId}/champion/demo-predictions?limit=12`);
+      const predictions = response.predictions ?? response.history ?? response.demo_predictions ?? [];
+      const matched = predictions.find((item) => item.id === predictionId);
+      if (!matched) continue;
+
+      const normalized = attachDemoPredictionPreview(normalizeDemoPredictionResponse(matched), image);
+      setDemoPrediction(normalized);
+      if (isTerminalDemoPredictionStatus(normalized.status)) break;
+    }
+    await refreshProjectDetail(selectedProjectId).catch(() => undefined);
   }
 
   function updateSettingsDraft(update: AutomationSettingsUpdate) {
@@ -1175,6 +1508,79 @@ export function App() {
                     </div>
                   ))}
                 </div>
+                {datasetIntelligence.metadataStatus && (
+                  <div className="metadata-status-panel">
+                    <div className="metadata-status-head">
+                      <span>
+                        <strong>Metadata Import</strong>
+                        <small>{datasetIntelligence.metadataStatus.detail}</small>
+                      </span>
+                      <Badge value={datasetIntelligence.metadataStatus.status || "reported"} />
+                    </div>
+                    <div className="metadata-fact-grid">
+                      {datasetIntelligence.metadataStatus.facts.map((item) => (
+                        <div className={`insight-card ${item.tone ?? ""}`} key={item.label}>
+                          <small>{item.label}</small>
+                          <strong>{item.value}</strong>
+                        </div>
+                      ))}
+                    </div>
+                    {datasetIntelligence.metadataStatus.sources.length > 0 && (
+                      <div className="tag-list">
+                        {datasetIntelligence.metadataStatus.sources.map((source, index) => (
+                          <small key={`${source}-${index}`}>{source}</small>
+                        ))}
+                      </div>
+                    )}
+                    {(datasetIntelligence.metadataStatus.splitRows.length > 0 ||
+                      datasetIntelligence.metadataStatus.annotationRows.length > 0) && (
+                      <div className="metadata-count-grid">
+                        {datasetIntelligence.metadataStatus.splitRows.length > 0 && (
+                          <div className="metadata-count-block">
+                            <strong>Splits</strong>
+                            {datasetIntelligence.metadataStatus.splitRows.map((row) => (
+                              <span key={row.label}>
+                                <small>{row.label}</small>
+                                <b>{row.value}</b>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {datasetIntelligence.metadataStatus.annotationRows.length > 0 && (
+                          <div className="metadata-count-block">
+                            <strong>Annotations</strong>
+                            {datasetIntelligence.metadataStatus.annotationRows.map((row) => (
+                              <span key={row.label}>
+                                <small>{row.label}</small>
+                                <b>{row.value}</b>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {datasetIntelligence.metadataStatus.warnings.length > 0 && (
+                      <div className="warning-list">
+                        {datasetIntelligence.metadataStatus.warnings.map((warning, index) => (
+                          <span key={`${warning}-${index}`}>
+                            <AlertTriangle size={14} />
+                            {warning}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {datasetIntelligence.metadataStatus.errors.length > 0 && (
+                      <div className="metadata-error-list">
+                        {datasetIntelligence.metadataStatus.errors.map((error, index) => (
+                          <span key={`${error}-${index}`}>
+                            <AlertTriangle size={14} />
+                            {error}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="dataset-intelligence-grid">
                   <div className="class-distribution">
                     <strong>Class Distribution</strong>
@@ -1452,9 +1858,36 @@ export function App() {
               predictionError={demoPredictionError}
               predictionLoading={demoPredictionLoading}
               selectedImageIndex={selectedDemoImageIndex}
-              onSelectImage={setSelectedDemoImageIndex}
-              onNextImage={() => setSelectedDemoImageIndex((index) => nextDemoImageIndex(index, championExportDemo.demoImages.length))}
-              onRandomImage={() => setSelectedDemoImageIndex((index) => randomDemoImageIndex(index, championExportDemo.demoImages.length))}
+              customImage={customDemoImage}
+              customImageURI={customDemoImageURI}
+              customTrueLabel={customDemoTrueLabel}
+              localInferenceStatus={localInferenceStatus}
+              localInferenceError={localInferenceError}
+              slideshowEnabled={demoSlideshowEnabled}
+              onCustomImageURIChange={setCustomDemoImageURI}
+              onCustomTrueLabelChange={setCustomDemoTrueLabel}
+              onChooseCustomImage={chooseChampionDemoImage}
+              onRunCustomPrediction={runCustomChampionDemoPrediction}
+              onToggleSlideshow={() => setDemoSlideshowEnabled((enabled) => !enabled)}
+              onSelectImage={(index) => {
+                setSelectedDemoImageIndex(index);
+                setCustomDemoImage(null);
+                setCustomDemoImageURI("");
+                setCustomDemoTrueLabel("");
+                setDemoSlideshowEnabled(false);
+              }}
+              onNextImage={() => {
+                setCustomDemoImage(null);
+                setCustomDemoImageURI("");
+                setCustomDemoTrueLabel("");
+                setSelectedDemoImageIndex((index) => nextDemoImageIndex(index, championExportDemo.demoImages.length));
+              }}
+              onRandomImage={() => {
+                setCustomDemoImage(null);
+                setCustomDemoImageURI("");
+                setCustomDemoTrueLabel("");
+                setSelectedDemoImageIndex((index) => randomDemoImageIndex(index, championExportDemo.demoImages.length));
+              }}
               onRequestExport={() => requestChampionExport("onnx")}
               onRunPrediction={runChampionDemoPrediction}
             />
@@ -2512,6 +2945,17 @@ function ChampionExportDemoPanel({
   predictionError,
   predictionLoading,
   selectedImageIndex,
+  customImage,
+  customImageURI,
+  customTrueLabel,
+  localInferenceStatus,
+  localInferenceError,
+  slideshowEnabled,
+  onCustomImageURIChange,
+  onCustomTrueLabelChange,
+  onChooseCustomImage,
+  onRunCustomPrediction,
+  onToggleSlideshow,
   onSelectImage,
   onNextImage,
   onRandomImage,
@@ -2523,6 +2967,17 @@ function ChampionExportDemoPanel({
   predictionError: string;
   predictionLoading: boolean;
   selectedImageIndex: number;
+  customImage: ChampionDemoImage | null;
+  customImageURI: string;
+  customTrueLabel: string;
+  localInferenceStatus: string;
+  localInferenceError: string;
+  slideshowEnabled: boolean;
+  onCustomImageURIChange: (value: string) => void;
+  onCustomTrueLabelChange: (value: string) => void;
+  onChooseCustomImage: () => void;
+  onRunCustomPrediction: () => void;
+  onToggleSlideshow: () => void;
   onSelectImage: (index: number) => void;
   onNextImage: () => void;
   onRandomImage: () => void;
@@ -2534,7 +2989,21 @@ function ChampionExportDemoPanel({
   }
 
   const selectedImage = data.demoImages[selectedImageIndex] ?? data.demoImages[0] ?? null;
-  const predictionRows = prediction ? [prediction] : data.demoPredictions;
+  const customURI = customImageURI.trim();
+  const customImageMatchesPicker = customImage ? customURI === demoImageURI(customImage) : false;
+  const customPreviewImage = customImageURI.trim()
+    ? ({
+        ...(customImage ?? {}),
+        uri: customURI,
+        image_uri: customURI,
+        thumbnail_uri: customImageMatchesPicker ? customImage?.thumbnail_uri : undefined,
+        true_label: customTrueLabel.trim() || customImage?.true_label || customImage?.label || customImage?.class_name,
+        split: customImage?.split || "custom",
+      } satisfies ChampionDemoImage)
+    : null;
+  const activeImage = customPreviewImage ?? selectedImage;
+  const activePreviewURI = demoImagePreviewURI(activeImage);
+  const activeImageLabel = demoImageLabel(activeImage);
 
   return (
     <div className="export-demo-panel">
@@ -2616,10 +3085,111 @@ function ChampionExportDemoPanel({
         </div>
       </div>
 
+      <div className="champion-test-bench">
+        <div className="test-image-stage">
+          <div className="test-image-preview">
+            {activePreviewURI ? (
+              <img src={activePreviewURI} alt={activeImageLabel || "test image"} />
+            ) : (
+              <div className="test-image-placeholder">
+                <ImageIcon size={28} />
+                <span>No image</span>
+              </div>
+            )}
+          </div>
+          <div className="test-image-meta">
+            <span>
+              <Badge value={activeImage?.split || "TEST"} />
+              <strong>{activeImageLabel || activeImage?.image_id || "Select an image"}</strong>
+            </span>
+            <small>{demoImageDetail(activeImage) || "Held-out image or custom worker-visible URI"}</small>
+          </div>
+        </div>
+
+        <div className="test-controls">
+          <div className="demo-block-head">
+            <strong>Champion Test</strong>
+            <span>
+              <Badge value={localInferenceStatus === "ready" || localInferenceStatus === "available" ? "LOCAL_ONNX" : localInferenceStatus === "loading" ? "LOADING_ONNX" : "WORKER_FALLBACK"} />
+              <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={data.demoImages.length < 2 || predictionLoading}>
+                {slideshowEnabled ? <Pause size={15} /> : <Play size={15} />}
+                {slideshowEnabled ? "Pause" : "Slideshow"}
+              </button>
+              <button className="icon-command" type="button" onClick={onRandomImage} disabled={data.demoImages.length < 2} title="Random held-out image">
+                <Shuffle size={14} />
+              </button>
+              <button className="icon-command" type="button" onClick={onNextImage} disabled={data.demoImages.length < 2} title="Next held-out image">
+                <StepForward size={14} />
+              </button>
+              <button
+                className="command compact"
+                type="button"
+                onClick={() => selectedImage && onRunPrediction(selectedImage)}
+                disabled={!selectedImage || predictionLoading}
+              >
+                <Play size={15} />
+                Predict Held-out
+              </button>
+            </span>
+          </div>
+
+          <div className="custom-image-actions">
+            <button className="command compact" type="button" onClick={onChooseCustomImage}>
+              <Upload size={15} />
+              Choose Image
+            </button>
+            <button className="command primary compact" type="button" onClick={onRunCustomPrediction} disabled={!customImageURI.trim() || predictionLoading}>
+              <Play size={15} />
+              Predict Custom
+            </button>
+          </div>
+
+          <label className="field">
+            <span><Link2 size={12} /> Image URI</span>
+            <input
+              value={customImageURI}
+              onChange={(event) => onCustomImageURIChange(event.target.value)}
+              placeholder="file://, s3://, or worker-visible path"
+            />
+          </label>
+          <label className="field">
+            <span>True label</span>
+            <input
+              value={customTrueLabel}
+              onChange={(event) => onCustomTrueLabelChange(event.target.value)}
+              placeholder="optional"
+            />
+          </label>
+        </div>
+
+        <div className="test-result-panel">
+          <div className="demo-block-head">
+            <strong>Prediction Result</strong>
+            {predictionLoading && <Badge value="RUNNING" />}
+          </div>
+          {predictionError && (
+            <div className="warning-list">
+              <span>{predictionError}</span>
+            </div>
+          )}
+          {localInferenceError && (
+            <div className="warning-list">
+              <span>{localInferenceError}</span>
+            </div>
+          )}
+          {predictionLoading && <div className="empty compact">{readyONNXExport(data.exports) ? "Running local ONNX inference..." : "Waiting for inference..."}</div>}
+          {prediction ? (
+            <PredictionRow prediction={prediction} index={0} />
+          ) : (
+            <div className="empty compact">Run a held-out or custom image to see the champion prediction.</div>
+          )}
+        </div>
+      </div>
+
       <div className="demo-grid">
         <div className="demo-block">
           <div className="demo-block-head">
-            <strong>Demo Images</strong>
+            <strong>Held-out Images</strong>
             <span>
               <button className="icon-command" type="button" onClick={onRandomImage} disabled={data.demoImages.length < 2} title="Random demo image">
                 <Shuffle size={14} />
@@ -2647,14 +3217,14 @@ function ChampionExportDemoPanel({
                   type="button"
                   onClick={() => onSelectImage(index)}
                 >
-                  {image.thumbnail_uri || image.uri || image.image_uri ? (
-                    <img src={image.thumbnail_uri || image.uri || image.image_uri} alt={image.label || image.true_label || image.class_name || "demo image"} />
+                  {demoImagePreviewURI(image) ? (
+                    <img src={demoImagePreviewURI(image)} alt={demoImageLabel(image) || "demo image"} />
                   ) : (
                     <div className="demo-image-placeholder">image</div>
                   )}
                   <span>
-                    <strong>{image.true_label || image.label || image.class_name || image.image_id || "unlabeled"}</strong>
-                    <small>{[image.split, image.size_bytes ? formatBytes(image.size_bytes) : "", image.uri || image.image_uri].filter(Boolean).join(" - ") || "image metadata pending"}</small>
+                    <strong>{demoImageLabel(image) || image.image_id || "unlabeled"}</strong>
+                    <small>{demoImageDetail(image) || "image metadata pending"}</small>
                   </span>
                 </button>
               ))}
@@ -2665,16 +3235,10 @@ function ChampionExportDemoPanel({
         </div>
 
         <div className="demo-block">
-          <strong>{prediction ? "Latest Prediction" : "Prediction History"}</strong>
-          {predictionError && (
-            <div className="warning-list">
-              <span>{predictionError}</span>
-            </div>
-          )}
-          {predictionLoading && <div className="empty compact">Waiting for backend demo inference...</div>}
-          {predictionRows.length > 0 ? (
+          <strong>Prediction History</strong>
+          {data.demoPredictions.length > 0 ? (
             <div className="prediction-list">
-              {predictionRows.slice(0, 6).map((predictionRow, index) => (
+              {data.demoPredictions.slice(0, 6).map((predictionRow, index) => (
                 <PredictionRow
                   key={predictionRow.id || `${predictionRow.image_id}-${index}`}
                   prediction={predictionRow}
@@ -2696,7 +3260,11 @@ function PredictionRow({ prediction, index }: { prediction: ChampionDemoPredicti
   const displayLabel = prediction.predicted_label || predictionStatusMessage(status);
   const confidence = numericValue(prediction.confidence);
   const topK = Array.isArray(prediction.top_k) ? prediction.top_k : [];
-  const imageSrc = prediction.image_uri || recordString(recordObject(prediction.metadata), "thumbnail_uri");
+  const imageMetadata = { ...recordObject(prediction.image_metadata), ...recordObject(prediction.metadata) };
+  const imageSrc =
+    recordString(imageMetadata, "thumbnail_uri") ||
+    recordString(imageMetadata, "preview_uri") ||
+    prediction.image_uri;
   const timestamp =
     prediction.completed_at || prediction.updated_at || prediction.started_at || prediction.requested_at || prediction.created_at || "";
 
@@ -3069,7 +3637,11 @@ function buildExperimentTimeline(project: Project | null, detail: ProjectDetail)
   ];
 }
 
-function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: AgentDecision | null) {
+function buildDatasetIntelligence(
+  dataset: Dataset | null,
+  latestDecision: AgentDecision | null,
+  metadataDetail: DatasetMetadataDetail,
+) {
   const profile = dataset?.profile ?? {};
   const plannerInsights = recordObject(latestDecision?.payload.dataset_planning_insights);
   const classDistribution = recordObject(profile.images_per_class ?? profile.class_distribution);
@@ -3087,8 +3659,10 @@ function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: Agent
   const widthMax = recordNumber(profile, "width_max");
   const heightMin = recordNumber(profile, "height_min");
   const heightMax = recordNumber(profile, "height_max");
-  const metadataSummary = recordObject(profile.metadata_summary);
-  const metadataAvailable = profile.metadata_available === true || Object.keys(metadataSummary).length > 0;
+  const legacyMetadataSummary = recordObject(profile.metadata_summary);
+  const metadataStatus = buildMetadataStatusDisplay(metadataDetail);
+  const metadataAvailable =
+    Boolean(metadataStatus) || profile.metadata_available === true || Object.keys(legacyMetadataSummary).length > 0;
   const exemplarStatus = exemplarStatusFromProfile(profile);
   const recommendedMetrics = stringArrayPayload(plannerInsights.recommended_metrics);
   const recommendedPreprocessing = stringArrayPayload(plannerInsights.recommended_preprocessing);
@@ -3109,13 +3683,14 @@ function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: Agent
 
   const artifacts = [
     "image folders",
-    metadataAvailable ? "metadata detected" : "metadata not reported",
+    metadataAvailable ? (metadataStatus ? "backend metadata imported" : "metadata detected") : "metadata not reported",
     corruptCount > 0 ? `${corruptCount} corrupt image(s)` : "no corrupt images reported",
     exemplarStatus,
   ].filter(Boolean);
   const warnings = [
     ...(imbalanceRatio >= 1.5 ? [`Class imbalance ratio ${imbalanceRatio.toFixed(2)}; prefer macro-F1 and per-class checks.`] : []),
     ...(corruptCount > 0 ? [`${corruptCount} corrupt image(s) detected by profiler.`] : []),
+    ...(metadataDetail.status === "error" ? [metadataDetail.message] : []),
     ...(widthMin > 0 && heightMin > 0 && Math.max(widthMax, heightMax) > Math.min(widthMin, heightMin) * 2
       ? ["Image dimensions vary widely; resize plus crop is safer for comparison runs."]
       : []),
@@ -3128,6 +3703,7 @@ function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: Agent
     preprocessing,
     artifacts,
     warnings,
+    metadataStatus,
     insights: [
       { label: "Images", value: totalImages ? String(totalImages) : "-", tone: totalImages > 0 ? "good" : "warn" },
       { label: "Classes", value: classCount ? String(classCount) : "-", tone: classCount >= 2 ? "good" : "warn" },
@@ -3144,6 +3720,357 @@ function buildDatasetIntelligence(dataset: Dataset | null, latestDecision: Agent
       { label: "Profile", value: dataset?.profiled_at ? "ready" : "pending", tone: dataset?.profiled_at ? "good" : "warn" },
     ] satisfies InsightItem[],
   };
+}
+
+function datasetMetadataSummaryFromResponse(
+  value: DatasetMetadataSummaryResponse,
+  imports: DatasetMetadataImport[] = [],
+): DatasetMetadataSummary | null {
+  const record = recordObject(value);
+  const importRecords = [
+    ...imports,
+    ...[record.import, record.metadata_import].map(recordObject).filter(hasDatasetMetadataImportShape),
+  ];
+  const fallback = datasetMetadataSummaryFallback(record);
+  const candidates = [
+    recordObject(record.agent_safe_summary),
+    recordObject(record.metadata_summary),
+    recordObject(record.dataset_metadata_summary),
+    recordObject(record.summary),
+    hasDatasetMetadataSummaryShape(record) ? record : {},
+    datasetMetadataSummaryFromImports(importRecords),
+  ].filter((item): item is Record<string, unknown> => Boolean(item) && Object.keys(recordObject(item)).length > 0);
+
+  const summary = candidates.find(hasDatasetMetadataSummaryShape);
+  if (!summary) return null;
+  return { ...fallback, ...summary } as DatasetMetadataSummary;
+}
+
+function datasetMetadataSummaryFromImports(imports: DatasetMetadataImport[]): DatasetMetadataSummary | null {
+  const latestImport = [...imports].sort((left, right) => metadataImportSortScore(right) - metadataImportSortScore(left)).find(Boolean);
+  if (!latestImport) return null;
+  return datasetMetadataSummaryFromImport(latestImport);
+}
+
+function datasetMetadataSummaryFromImport(metadataImport: DatasetMetadataImport): DatasetMetadataSummary | null {
+  const importRecord = recordObject(metadataImport);
+  const agentSafeSummary = recordObject(metadataImport.agent_safe_summary);
+  const importSummary = recordObject(metadataImport.summary);
+  const summary = hasDatasetMetadataSummaryShape(agentSafeSummary) ? agentSafeSummary : importSummary;
+  const fallback = datasetMetadataSummaryFallback(importRecord);
+  const warnings = metadataImport.warnings ?? (summary.warnings as DatasetMetadataSummary["warnings"]);
+  const errors = metadataImport.errors ?? (summary.errors as DatasetMetadataSummary["errors"]);
+  if (hasDatasetMetadataSummaryShape(summary)) {
+    return { ...fallback, warnings, errors, ...summary } as DatasetMetadataSummary;
+  }
+  if (hasDatasetMetadataImportShape(importRecord)) {
+    return { ...fallback, warnings, errors } as DatasetMetadataSummary;
+  }
+  return null;
+}
+
+function datasetMetadataImportsFromResponse(value: DatasetMetadataImportsResponse): DatasetMetadataImport[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => recordObject(item) as DatasetMetadataImport).filter(hasDatasetMetadataImportShape);
+  }
+
+  const record = recordObject(value);
+  const imports = [
+    ...arrayDatasetMetadataImports(record.imports),
+    ...arrayDatasetMetadataImports(record.metadata_imports),
+    ...arrayDatasetMetadataImports(record.items),
+  ];
+
+  for (const key of ["latest", "active", "import", "metadata_import"]) {
+    const metadataImport = recordObject(record[key]);
+    if (hasDatasetMetadataImportShape(metadataImport)) imports.push(metadataImport as DatasetMetadataImport);
+  }
+
+  return uniqueBy(imports, (metadataImport, index) => metadataImport.import_id || metadataImport.id || String(index));
+}
+
+function arrayDatasetMetadataImports(value: unknown): DatasetMetadataImport[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => recordObject(item) as DatasetMetadataImport).filter(hasDatasetMetadataImportShape);
+}
+
+function hasDatasetMetadataImportShape(value: unknown): value is DatasetMetadataImport {
+  const record = recordObject(value);
+  return [
+    "id",
+    "import_id",
+    "status",
+    "active",
+    "summary",
+    "agent_safe_summary",
+    "warnings",
+    "errors",
+    "created_at",
+    "completed_at",
+  ].some((key) => key in record);
+}
+
+function hasDatasetMetadataSummaryShape(value: unknown): value is DatasetMetadataSummary {
+  const record = recordObject(value);
+  return [
+    "status",
+    "import_id",
+    "source_kinds",
+    "source_formats",
+    "formats",
+    "class_count",
+    "sample_count",
+    "split_counts",
+    "annotation_counts",
+    "bbox_coverage",
+    "bbox_count",
+    "bbox_counts",
+    "warnings",
+    "errors",
+    "official_split_available",
+    "unsupported_source_count",
+    "created_at",
+    "completed_at",
+  ].some((key) => key in record);
+}
+
+function datasetMetadataSummaryFallback(record: Record<string, unknown>): DatasetMetadataSummary {
+  const fallback: DatasetMetadataSummary = {};
+  const status = recordFirstString(record, ["status"]);
+  const importId = recordFirstString(record, ["import_id", "id"]);
+  const createdAt = recordFirstString(record, ["created_at"]);
+  const completedAt = recordFirstString(record, ["completed_at"]);
+  const unsupportedSourceCount = recordNumber(record, "unsupported_source_count");
+  if (status) fallback.status = status;
+  if (importId) fallback.import_id = importId;
+  if (createdAt) fallback.created_at = createdAt;
+  if (completedAt) fallback.completed_at = completedAt;
+  if (typeof record.official_split_available === "boolean") {
+    fallback.official_split_available = record.official_split_available;
+  }
+  if (unsupportedSourceCount > 0) fallback.unsupported_source_count = unsupportedSourceCount;
+  return fallback;
+}
+
+function metadataImportSortScore(metadataImport: DatasetMetadataImport) {
+  const timestamp = Date.parse(metadataImport.completed_at || metadataImport.created_at || "");
+  if (Number.isFinite(timestamp)) return timestamp;
+  if (metadataImport.active) return 1;
+  return 0;
+}
+
+function buildMetadataStatusDisplay(metadataDetail: DatasetMetadataDetail): MetadataStatusDisplay | null {
+  const summary = metadataDetail.summary;
+  if (metadataDetail.status !== "available" || !summary) return null;
+
+  const status = metadataSummaryStatus(summary, metadataDetail.imports);
+  const classCount = metadataNumber(summary, ["class_count", "classes", "num_classes"]);
+  const sampleCount = metadataNumber(summary, ["sample_count", "samples", "image_count", "total_images"]);
+  const unsupportedCount = metadataNumber(summary, ["unsupported_source_count", "unsupported_sources"]);
+  const errors = metadataIssueSummaries(summary.errors).slice(0, 5);
+  const warnings = uniqueStrings([
+    ...metadataIssueSummaries(summary.warnings),
+    ...(unsupportedCount > 0 ? [`${unsupportedCount} unsupported metadata source(s) skipped.`] : []),
+  ]).slice(0, 6);
+  const officialSplitAvailable = typeof summary.official_split_available === "boolean" ? summary.official_split_available : null;
+
+  return {
+    status,
+    detail: metadataDetailText(summary, metadataDetail.imports),
+    facts: [
+      { label: "Metadata Classes", value: metadataCountValue(classCount), tone: classCount > 0 ? "good" : "warn" },
+      { label: "Metadata Samples", value: metadataCountValue(sampleCount), tone: sampleCount > 0 ? "good" : "warn" },
+      {
+        label: "Official Split",
+        value: officialSplitAvailable === null ? "-" : officialSplitAvailable ? "yes" : "no",
+        tone: officialSplitAvailable ? "good" : officialSplitAvailable === false ? "warn" : undefined,
+      },
+      { label: "BBox Evidence", value: metadataBBoxValue(summary), tone: metadataBBoxTone(summary) },
+      { label: "Skipped Sources", value: String(unsupportedCount), tone: unsupportedCount > 0 ? "warn" : "good" },
+      { label: "Metadata Errors", value: String(errors.length), tone: errors.length > 0 ? "bad" : "good" },
+    ],
+    sources: metadataSourceTags(summary),
+    splitRows: metadataCountRows(summary.split_counts),
+    annotationRows: metadataCountRows(summary.annotation_counts),
+    warnings,
+    errors,
+  };
+}
+
+function metadataSummaryStatus(summary: DatasetMetadataSummary, imports: DatasetMetadataImport[]) {
+  const summaryStatus = recordFirstString(summary, ["status"]);
+  if (summaryStatus) return summaryStatus;
+  const importId = recordFirstString(summary, ["import_id"]);
+  const matchingImport = imports.find((metadataImport) => metadataImport.import_id === importId || metadataImport.id === importId);
+  return matchingImport?.status || imports.find((metadataImport) => metadataImport.active)?.status || "reported";
+}
+
+function metadataDetailText(summary: DatasetMetadataSummary, imports: DatasetMetadataImport[]) {
+  const importId = recordFirstString(summary, ["import_id"]);
+  const matchingImport = imports.find((metadataImport) => metadataImport.import_id === importId || metadataImport.id === importId);
+  const createdAt = recordFirstString(summary, ["created_at"]) || matchingImport?.created_at || "";
+  const completedAt = recordFirstString(summary, ["completed_at"]) || matchingImport?.completed_at || "";
+  const timestamp = completedAt || createdAt;
+  const timeLabel = timestamp ? `${completedAt ? "completed" : "created"} ${formatTimestamp(timestamp)}` : "";
+  return [importId ? `import ${importId}` : "agent-safe summary", timeLabel].filter(Boolean).join(" - ");
+}
+
+function metadataSourceTags(summary: DatasetMetadataSummary) {
+  const sourceKinds = metadataStringList(summary.source_kinds ?? summary.source_kind);
+  const sourceFormats = metadataStringList(summary.source_formats ?? summary.formats ?? summary.detected_formats);
+  return uniqueStrings([
+    ...sourceKinds.map((kind) => `kind: ${kind}`),
+    ...sourceFormats.map((format) => `format: ${format}`),
+  ]).slice(0, 8);
+}
+
+function metadataCountRows(value: unknown): MetadataCountRow[] {
+  return Object.entries(recordObject(value))
+    .map(([label, count]) => ({ label, value: metadataCountText(count) }))
+    .filter((row) => row.value !== "")
+    .slice(0, 8);
+}
+
+function metadataCountText(value: unknown) {
+  const numeric = metadataNumericValue(value);
+  if (numeric !== null) return String(numeric);
+  const record = recordObject(value);
+  const nested = metadataNumber(record, ["count", "sample_count", "annotation_count"]);
+  if (nested > 0) return String(nested);
+  if (typeof value === "string" && value.trim()) return value.trim();
+  return "";
+}
+
+function metadataStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map(metadataStringValue).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((item) => shortAuditText(item, 80))
+      .filter(Boolean);
+  }
+  const record = recordObject(value);
+  return Object.entries(record)
+    .map(([key, entry]) => {
+      const count = metadataNumericValue(entry);
+      return count !== null && count > 0 ? `${key} (${count})` : key;
+    })
+    .filter(Boolean);
+}
+
+function metadataStringValue(value: unknown) {
+  if (typeof value === "string") return shortAuditText(value, 80);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  const record = recordObject(value);
+  return shortAuditText(
+    recordFirstString(record, ["format", "source_format", "detected_format", "declared_format", "kind", "source_kind", "name"]),
+    80,
+  );
+}
+
+function metadataIssueSummaries(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map(metadataIssueSummary).filter(Boolean);
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) return [metadataIssueSummary(value)].filter(Boolean);
+  if (["message", "reason", "code", "error", "status"].some((key) => key in record)) {
+    return [metadataIssueSummary(record)].filter(Boolean);
+  }
+  return Object.entries(record)
+    .map(([key, entry]) => metadataIssueSummary({ code: key, value: entry }))
+    .filter(Boolean);
+}
+
+function metadataIssueSummary(value: unknown) {
+  if (typeof value === "string") return shortAuditText(value, 180);
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) return "";
+  const code = recordFirstString(record, ["code", "type", "severity", "status"]);
+  const message = recordFirstString(record, ["message", "reason", "summary", "detail", "error"]);
+  const kind = recordFirstString(record, ["source_kind", "kind"]);
+  const format = recordFirstString(record, ["source_format", "declared_format", "detected_format", "format"]);
+  const count = metadataNumericValue(record.count);
+  const valueText = metadataPrimitiveText(record.value);
+  return shortAuditText(
+    [code, message || valueText, kind ? `kind ${kind}` : "", format ? `format ${format}` : "", count ? `${count} item(s)` : ""]
+      .filter(Boolean)
+      .join(": "),
+    180,
+  );
+}
+
+function metadataPrimitiveText(value: unknown) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `${value.length} item(s)`;
+  return "";
+}
+
+function metadataNumber(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const numeric = metadataNumericValue(record[key]);
+    if (numeric !== null) return numeric;
+  }
+  return 0;
+}
+
+function metadataNumericValue(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function metadataCountValue(value: number) {
+  return Number.isFinite(value) && value > 0 ? String(value) : "-";
+}
+
+function metadataBBoxValue(summary: DatasetMetadataSummary) {
+  const coverage = metadataCoverageText(summary.bbox_coverage ?? summary.bounding_box_coverage ?? summary.bbox_coverage_ratio);
+  const bboxCounts = recordObject(summary.bbox_counts);
+  const bboxCount =
+    metadataNumber(summary, ["bbox_count", "bounding_box_count", "box_count"]) ||
+    metadataNumber(bboxCounts, ["bbox", "box", "boxes", "total", "count"]);
+  if (coverage && bboxCount > 0) return `${coverage} / ${bboxCount}`;
+  if (coverage) return coverage;
+  if (bboxCount > 0) return `${bboxCount}`;
+  return "-";
+}
+
+function metadataBBoxTone(summary: DatasetMetadataSummary): InsightItem["tone"] {
+  const value = metadataBBoxValue(summary);
+  if (value === "-") return "warn";
+  return "good";
+}
+
+function metadataCoverageText(value: unknown) {
+  const numeric = metadataNumericValue(value);
+  if (numeric !== null) {
+    if (numeric >= 0 && numeric <= 1) return formatPercent(numeric);
+    if (numeric <= 100) return `${Math.round(numeric)}%`;
+    return String(numeric);
+  }
+  if (typeof value === "string" && value.trim()) return shortAuditText(value, 40);
+
+  const record = recordObject(value);
+  const percent = metadataNumber(record, ["coverage_percent", "percent", "bbox_coverage_percent"]);
+  if (percent > 0) return `${Math.round(percent)}%`;
+  const ratio = metadataNumber(record, ["coverage_ratio", "sample_coverage_ratio", "bbox_coverage_ratio", "coverage"]);
+  if (ratio > 0) return ratio <= 1 ? formatPercent(ratio) : `${Math.round(ratio)}%`;
+  const covered = metadataNumber(record, ["annotated_sample_count", "covered_sample_count", "samples_with_bbox"]);
+  const total = metadataNumber(record, ["sample_count", "total_sample_count", "total_samples"]);
+  if (covered > 0 && total > 0) return formatPercent(covered / total);
+  return "";
+}
+
+function formatTimestamp(value: string) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  return new Date(timestamp).toLocaleString();
 }
 
 function visualAnalysesFromResponse(value: unknown): DatasetVisualAnalysis[] {
@@ -3767,6 +4694,8 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
       exports: [],
       projectId: "",
       modelCard: {},
+      deploymentProfile: {},
+      modelProfile: {},
       useCases: ["Select a champion first"],
       limitations: [],
       preprocessing: [],
@@ -3781,7 +4710,36 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
     ...recordObject(deployment.model_card),
     ...recordObject(evaluation.model_card),
   };
+  const modelProfile = {
+    ...recordObject(deployment.model_profile),
+    ...recordObject(evaluation.model_profile),
+  };
+  const deploymentONNXArtifact =
+    recordString(deployment, "onnx_artifact_uri") ||
+    recordString(deployment, "artifact_uri") ||
+    recordString(modelProfile, "onnx_artifact_uri") ||
+    recordString(modelProfile, "artifact_uri");
+  const deploymentExportManifest = recordObject(deployment.export_manifest);
+  const modelExportManifest = recordObject(modelProfile.export_manifest);
   const exports = [
+    ...(deploymentONNXArtifact
+      ? [
+          {
+            id: `${champion.id}-training-onnx`,
+            project_id: champion.project_id,
+            champion_id: champion.id,
+            job_id: champion.job_id,
+            status: "READY",
+            format: "onnx",
+            artifact_uri: deploymentONNXArtifact,
+            metadata: {
+              manifest: Object.keys(deploymentExportManifest).length > 0 ? deploymentExportManifest : modelExportManifest,
+              deployment_profile: deployment,
+              model_profile: modelProfile,
+            },
+          } satisfies ChampionExport,
+        ]
+      : []),
     ...detail.championExports,
     ...championExportsFromUnknown(champion.champion_exports),
     ...championExportsFromUnknown(deployment.champion_exports),
@@ -3794,6 +4752,9 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
     ...demoImagesFromUnknown(deployment.demo_images),
     ...demoImagesFromUnknown(deployment.heldout_images),
     ...demoImagesFromUnknown(deployment.test_images),
+    ...demoImagesFromUnknown(recordObject(evaluation.objective_profile).heldout_demo_images),
+    ...demoImagesFromUnknown(recordObject(evaluation.objective_profile).demo_images),
+    ...demoImagesFromUnknown(recordObject(evaluation.objective_profile).test_images),
   ];
   const demoPredictions = [
     ...detail.championDemoPredictions,
@@ -3801,10 +4762,6 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
     ...demoPredictionsFromUnknown(deployment.demo_predictions),
     ...demoPredictionsFromUnknown(deployment.predictions),
   ];
-  const modelProfile = {
-    ...recordObject(deployment.model_profile),
-    ...recordObject(evaluation.model_profile),
-  };
   const exportStatus =
     recordString(modelCard, "export_status") ||
     recordString(deployment, "export_status") ||
@@ -3843,6 +4800,8 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
     exports: uniqueBy(exports, (item, index) => item.id || item.artifact_uri || item.model_uri || item.download_url || String(index)),
     projectId: champion.project_id,
     modelCard,
+    deploymentProfile: deployment,
+    modelProfile,
     useCases,
     limitations,
     preprocessing: preprocessing.length > 0 ? preprocessing : ["Use the preprocessing from the winning experiment config."],
@@ -4496,6 +5455,11 @@ function isUnsupportedEndpointError(error: unknown) {
   );
 }
 
+function isOrchestratorHttpErrorResponse(value: unknown): value is OrchestratorHttpErrorResponse {
+  const record = recordObject(value);
+  return record.__mission_control_http_error === true && typeof record.status === "number";
+}
+
 function exemplarStatusFromProfile(profile: Record<string, unknown>) {
   const directStatus =
     recordString(profile, "visual_exemplar_status") ||
@@ -4545,6 +5509,64 @@ function normalizeDemoPredictionResponse(value: ChampionDemoPrediction | { predi
     return { ...prediction, status: "RUNTIME_UNAVAILABLE", runtime_unavailable: true };
   }
   return prediction;
+}
+
+function attachDemoPredictionPreview(prediction: ChampionDemoPrediction, image: ChampionDemoImage) {
+  const previewURI = demoImagePreviewURI(image);
+  if (!previewURI) return prediction;
+  const metadata = {
+    ...recordObject(prediction.image_metadata),
+    ...recordObject(prediction.metadata),
+    thumbnail_uri: previewURI,
+  };
+  return { ...prediction, metadata, image_metadata: { ...recordObject(prediction.image_metadata), preview_available: true } };
+}
+
+function demoImageURI(image?: ChampionDemoImage | null) {
+  return image?.uri || image?.image_uri || "";
+}
+
+function demoImagePreviewURI(image?: ChampionDemoImage | null) {
+  return image?.preview_uri || image?.thumbnail_uri || image?.uri || image?.image_uri || "";
+}
+
+function demoImageLabel(image?: ChampionDemoImage | null) {
+  return image?.true_label || image?.label || image?.class_name || "";
+}
+
+function demoImageDetail(image?: ChampionDemoImage | null) {
+  if (!image) return "";
+  const uri = demoImageURI(image);
+  return [
+    image.split,
+    image.size_bytes ? formatBytes(image.size_bytes) : "",
+    uri.startsWith("data:image") ? "inline test image" : uri,
+  ]
+    .filter(Boolean)
+    .join(" - ");
+}
+
+function demoPredictionRequestMetadata(image: ChampionDemoImage) {
+  const metadata: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(recordObject(image.metadata))) {
+    if (["path", "preview_uri", "thumbnail_uri", "uri", "image_uri"].includes(key.toLowerCase())) continue;
+    if (typeof value === "string" && isLikelyEncodedPayload(value)) continue;
+    metadata[key] = value;
+  }
+  if (image.split) metadata.split = image.split;
+  if (image.size_bytes) metadata.size_bytes = image.size_bytes;
+  if (image.width) metadata.width = image.width;
+  if (image.height) metadata.height = image.height;
+  if (image.image_id || image.id) metadata.image_id = image.image_id || image.id;
+  return metadata;
+}
+
+function isTerminalDemoPredictionStatus(value?: string) {
+  return ["SUCCEEDED", "FAILED", "RUNTIME_UNAVAILABLE"].includes(normalizedStatus(value || ""));
+}
+
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function nextDemoImageIndex(current: number, count: number) {

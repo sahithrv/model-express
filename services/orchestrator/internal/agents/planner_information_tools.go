@@ -13,6 +13,7 @@ import (
 
 const (
 	PlannerToolDatasetProfile               = "dataset_profile"
+	PlannerToolDatasetMetadataSummary       = "dataset_metadata_summary"
 	PlannerToolVisualSummary                = "visual_summary"
 	PlannerToolMemory                       = "memory"
 	PlannerToolScorecards                   = "scorecards"
@@ -68,6 +69,11 @@ func ExperimentPlannerInformationToolSpecs() []AgentInformationToolSpec {
 		{
 			Name:        PlannerToolDatasetProfile,
 			Description: "Return the active dataset and objective profile as compact backend-curated facts.",
+			Parameters:  emptyObjectSchema(),
+		},
+		{
+			Name:        PlannerToolDatasetMetadataSummary,
+			Description: "Return the active normalized dataset metadata safe summary only; no source rows, paths, storage URIs, raw previews, or sidecar contents.",
 			Parameters:  emptyObjectSchema(),
 		},
 		{
@@ -148,6 +154,21 @@ func ExecuteExperimentPlannerInformationTool(input ExperimentPlannerInput, name 
 			"label_quality":     snapshot.LabelQualityCard,
 			"prompt_budget":     snapshot.PromptBudget,
 			"raw_profile":       "excluded",
+		})
+	case PlannerToolDatasetMetadataSummary:
+		return acceptedPlannerTool(normalized, map[string]any{
+			"dataset_id":                  snapshot.DatasetCard.ID,
+			"metadata_summary":            snapshot.DatasetCard.MetadataSummary,
+			"agent_safe_metadata_summary": snapshot.DatasetCard.AgentSafeMetadataSummary,
+			"raw_metadata":                "excluded",
+			"excluded": []string{
+				"source rows",
+				"source relative paths",
+				"storage URIs",
+				"raw previews",
+				"sidecar contents",
+				"manifest records",
+			},
 		})
 	case PlannerToolVisualSummary:
 		return acceptedPlannerTool(normalized, map[string]any{

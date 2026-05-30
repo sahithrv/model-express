@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
+from worker.datasets.storage import download_s3_uri
 from worker.exporting.artifacts import load_export_manifest
 from worker.exporting.metadata import build_demo_prediction_payload
 
@@ -146,10 +148,24 @@ def _find_created_artifact(manifest: dict, format_name: str) -> dict | None:
 def _resolve_artifact_path(manifest_path: Path, path_value: object) -> Path | None:
     if not path_value:
         return None
-    path = Path(str(path_value))
+    value = str(path_value)
+    if value.startswith("s3://"):
+        parsed = urlparse(value)
+        filename = Path(parsed.path).name or "model.torchscript.pt"
+        destination = Path(".cache/artifacts") / _safe_path_part(parsed.netloc) / _safe_path_part(filename)
+        try:
+            return download_s3_uri(value, destination)
+        except Exception:
+            return None
+    path = Path(value)
     if path.is_absolute():
         return path
     return manifest_path.parent / path
+
+
+def _safe_path_part(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(value))
+    return safe or "artifact"
 
 
 def _pending_payload(error_code: str, error: str) -> dict:

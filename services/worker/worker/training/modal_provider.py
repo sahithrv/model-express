@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from urllib.parse import urlparse
 
+from worker.diagnostics import log_event
 from worker.orchestrator_client import OrchestratorClient
 
 
@@ -76,11 +77,15 @@ def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:
 
     print(f"Submitting Modal dataset profile job dataset={dataset_id}")
     with app.run():
-        profile = _remote_function(profile_image_dataset)(payload)
+        result = _remote_function(profile_image_dataset)(payload)
 
+    profile = result.get("profile") if isinstance(result, dict) and isinstance(result.get("profile"), dict) else result
     if not isinstance(profile, dict):
         raise RuntimeError("Modal dataset profiler returned an invalid profile payload.")
 
+    metadata_import = result.get("metadata_import") if isinstance(result, dict) else None
+    if isinstance(metadata_import, dict):
+        _send_dataset_metadata_import(client, dataset_id, metadata_import)
     client.update_dataset_profile(dataset_id, profile)
     client.complete_job(job["id"], mlflow_run_id="")
     print(f"Modal dataset profile finished for {dataset_id}")
@@ -106,4 +111,24 @@ def _require_remote_reachable_url(name: str, value: str) -> None:
         raise ValueError(
             f"{name} points at {value!r}, but Modal cannot reach your local localhost. "
             "Expose it with a tunnel and set the public URL before running Modal jobs."
+        )
+
+
+def _send_dataset_metadata_import(client: OrchestratorClient, dataset_id: str, payload: dict) -> None:
+    try:
+        result = client.import_dataset_metadata(dataset_id, payload)
+        if isinstance(result, dict) and result.get("status") == "unavailable":
+            log_event(
+                "warn",
+                "dataset_metadata_import_unavailable",
+                dataset_id=dataset_id,
+                reason=result.get("reason"),
+                status_code=result.get("status_code"),
+            )
+    except Exception as exc:
+        log_event(
+            "warn",
+            "dataset_metadata_import_failed_nonfatal",
+            dataset_id=dataset_id,
+            error=str(exc),
         )

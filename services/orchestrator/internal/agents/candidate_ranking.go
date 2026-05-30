@@ -431,12 +431,12 @@ func candidateDeploymentFitScore(objective ProjectObjectiveContext, experiment p
 		return 0, ""
 	}
 	if isFastLiveModel(experiment.Model) {
-		return 0.06, "candidate fits low-latency live objective"
+		return 0.02, "candidate has a compact live-serving profile"
 	}
-	if expectedGain < 0.035 {
-		return -0.22, "candidate is weakly aligned with the project objective"
+	if expectedGain < 0.015 {
+		return -0.04, "candidate should justify its live-budget tradeoff with a measurable quality gain"
 	}
-	return -0.08, "candidate must justify heavier deployment profile"
+	return -0.01, "candidate may be viable if latency stays within the live budget"
 }
 
 func candidateRedundancyPenalty(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (float64, string) {

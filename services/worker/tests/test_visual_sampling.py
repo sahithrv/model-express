@@ -97,6 +97,35 @@ class VisualSamplingTests(unittest.TestCase):
             self.assertLessEqual(manifest["classes_covered"], 5)
             self.assertIn("Sample is not class-complete.", manifest["limitations"])
 
+    def test_sample_pack_unwraps_single_wrapper_common_image_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "dataset"
+            images_root = dataset_dir / "CUB_200_2011" / "images"
+            _write_image(images_root / "001.Black_footed_Albatross" / "one.jpg", (80, 60), (240, 20, 20))
+            _write_image(images_root / "002.Laysan_Albatross" / "two.jpg", (82, 62), (20, 80, 220))
+
+            pack = generate_visual_sample_pack(
+                dataset_dir=dataset_dir,
+                dataset_id="cub",
+                dataset_name="CUB",
+                max_total_images=4,
+                max_high_detail_images=1,
+                max_image_bytes=30_000,
+                max_total_bytes=100_000,
+                image_size=48,
+                seed=11,
+            )
+
+            manifest = pack["sample_manifest"]
+            class_names = {sample["class_name"] for sample in manifest["samples"]}
+
+            self.assertEqual(pack["status"], "created")
+            self.assertEqual(manifest["images_available"], 2)
+            self.assertEqual(manifest["classes_total"], 2)
+            self.assertEqual(class_names, {"001.Black_footed_Albatross", "002.Laysan_Albatross"})
+            self.assertNotIn("CUB_200_2011", class_names)
+            self.assertNotIn("images", class_names)
+
 
 def _write_image(path: Path, size: tuple[int, int], color: tuple[int, int, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
