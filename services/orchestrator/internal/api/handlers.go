@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -103,13 +104,15 @@ type automaticExperimentReviewResult struct {
 }
 
 const (
-	llmExperimentPlannerDecisionSource  = "llm_experiment_planner"
-	minLLMDecisionConfidence            = 0.50
-	maxLLMPlannerExperiments            = 5
-	plannerMinimumMeaningfulImprovement = 0.005
-	plannerNoImprovementRoundsToSelect  = 2
-	plannerDefaultMaxFollowUpRounds     = 10
-	plannerBackendValidationRetryLimit  = 1
+	llmExperimentPlannerDecisionSource     = "llm_experiment_planner"
+	minLLMDecisionConfidence               = 0.50
+	maxLLMPlannerExperiments               = 5
+	plannerMinimumMeaningfulImprovement    = 0.005
+	plannerAutonomousMeaningfulImprovement = 0.010
+	plannerNoImprovementRoundsToSelect     = 2
+	plannerDefaultMaxFollowUpRounds        = 10
+	plannerAutonomousMaxFollowUpRounds     = 3
+	plannerBackendValidationRetryLimit     = 1
 
 	visualAnalysisDefaultCooldownMinutes      = 360
 	visualAnalysisDefaultMaxRunsPerProfile    = 3
@@ -257,7 +260,14 @@ type completeJobRequest struct {
 }
 
 type failJobRequest struct {
-	Error string `json:"error" binding:"required"`
+	Error     string `json:"error" binding:"required"`
+	Retryable bool   `json:"retryable"`
+}
+
+type pollJobRequest struct {
+	Provider                            string   `json:"provider"`
+	Templates                           []string `json:"templates"`
+	IncludeUnspecifiedProviderTemplates []string `json:"include_unspecified_provider_templates"`
 }
 
 type pollJobResponse struct {
@@ -1787,7 +1797,7 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
-	if terminalPlannerGuardsEnabled() {
+	if terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
 		if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(projectID); err != nil {
 			return plans.ExperimentPlan{}, false, err
 		} else if ok {
@@ -2313,7 +2323,7 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 
 	decision, ok := actionDecisionForPlan(agentDecisions, latestPlan.ID)
 	if !ok {
-		if terminalPlannerGuardsEnabled() {
+		if terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
 			if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(project.ID); err != nil {
 				return automaticExperimentReviewResult{}, err
 			} else if selected {
@@ -2422,12 +2432,15 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 		})
 		return err
 	}
-	targetCount := s.targetWorkerCountForPlan(plan, openJobCount)
-	activeWorkerCount := s.activeOrStartingWorkersForProject(plan.ProjectID)
-
 	provider := req.Provider
 	if provider == "" {
 		provider = "local"
+	}
+	targetCount := s.targetWorkerCountForPlan(plan, openJobCount)
+	activeWorkerCount := s.activeOrStartingWorkersForProject(plan.ProjectID, provider, req.GPUType)
+	requirementPolicy, err := s.workerRequirementPolicyForPlan(plan, provider, targetCount)
+	if err != nil {
+		return err
 	}
 
 	requirement, created, err := s.store.UpsertWorkerRequirement(
@@ -2437,6 +2450,7 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 		req.GPUType,
 		targetCount,
 		"auto_followup",
+		requirementPolicy,
 	)
 	if err != nil {
 		return err
@@ -2462,14 +2476,21 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 	}
 
 	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventJobsQueued, fmt.Sprintf("Queued %d automatic experiment job(s) for plan %s.", len(queuedJobs), plan.ID), map[string]any{
-		"job_ids":               experimentJobIDs(queuedJobs),
-		"open_job_count":        openJobCount,
-		"active_worker_count":   activeWorkerCount,
-		"worker_requirement_id": requirement.ID,
-		"target_count":          requirement.TargetCount,
-		"requirement_status":    requirementStatus,
-		"provider":              provider,
-		"gpu_type":              req.GPUType,
+		"job_ids":                           experimentJobIDs(queuedJobs),
+		"open_job_count":                    openJobCount,
+		"active_worker_count":               activeWorkerCount,
+		"worker_requirement_id":             requirement.ID,
+		"target_count":                      requirement.TargetCount,
+		"requirement_status":                requirementStatus,
+		"provider":                          provider,
+		"gpu_type":                          req.GPUType,
+		"dataset_id":                        requirement.DatasetID,
+		"dataset_checksum":                  requirement.DatasetChecksum,
+		"dataset_cache_key":                 requirement.DatasetCacheKey,
+		"materialization_status":            requirement.DatasetMaterializationStatus,
+		"cold_cache_policy":                 requirement.ColdCachePolicy,
+		"max_concurrent_jobs":               requirement.MaxConcurrentJobs,
+		"max_cold_dataset_materializations": requirement.MaxColdDatasetMaterializations,
 	}); err != nil {
 		return err
 	}
@@ -2485,12 +2506,19 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 		activeWorkerCount,
 	)
 	_, err = s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, eventType, message, map[string]any{
-		"worker_requirement_id": requirement.ID,
-		"target_count":          requirement.TargetCount,
-		"open_job_count":        openJobCount,
-		"active_worker_count":   activeWorkerCount,
-		"provider":              requirement.Provider,
-		"gpu_type":              requirement.GPUType,
+		"worker_requirement_id":             requirement.ID,
+		"target_count":                      requirement.TargetCount,
+		"open_job_count":                    openJobCount,
+		"active_worker_count":               activeWorkerCount,
+		"provider":                          requirement.Provider,
+		"gpu_type":                          requirement.GPUType,
+		"dataset_id":                        requirement.DatasetID,
+		"dataset_checksum":                  requirement.DatasetChecksum,
+		"dataset_cache_key":                 requirement.DatasetCacheKey,
+		"materialization_status":            requirement.DatasetMaterializationStatus,
+		"cold_cache_policy":                 requirement.ColdCachePolicy,
+		"max_concurrent_jobs":               requirement.MaxConcurrentJobs,
+		"max_cold_dataset_materializations": requirement.MaxColdDatasetMaterializations,
 	})
 	return err
 }
@@ -2534,7 +2562,7 @@ func (s *Server) targetWorkerCountForPlan(plan plans.ExperimentPlan, openJobCoun
 	return targetCount
 }
 
-func (s *Server) activeOrStartingWorkersForProject(projectID string) int {
+func (s *Server) activeOrStartingWorkersForProject(projectID string, provider string, gpuType string) int {
 	projectWorkers, err := s.store.ListProjectWorkers(projectID)
 	if err != nil {
 		return 0
@@ -2546,10 +2574,120 @@ func (s *Server) activeOrStartingWorkersForProject(projectID string) int {
 		}
 		switch strings.ToUpper(strings.TrimSpace(worker.Status)) {
 		case workers.StatusIdle, workers.StatusRunning:
+			if !workerMatchesProviderCapacity(worker, provider, gpuType) {
+				continue
+			}
 			count++
 		}
 	}
 	return count
+}
+
+func workerMatchesProviderCapacity(worker workers.Worker, provider string, gpuType string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		provider = "local"
+	}
+	workerGPU := strings.ToLower(strings.TrimSpace(worker.GPUType))
+	requiredGPU := strings.ToLower(strings.TrimSpace(gpuType))
+	if provider == "local" {
+		if requiredGPU == "" || requiredGPU == "local" {
+			return workerGPU == "" || workerGPU == "local"
+		}
+		return workerGPU == requiredGPU
+	}
+	if provider == "modal" {
+		if workerGPU == "modal" {
+			return true
+		}
+		if strings.HasPrefix(workerGPU, "modal:") {
+			modalGPU := strings.TrimPrefix(workerGPU, "modal:")
+			return requiredGPU == "" || modalGPU == requiredGPU
+		}
+		return false
+	}
+	if requiredGPU != "" {
+		return workerGPU == provider+":"+requiredGPU
+	}
+	return workerGPU == provider
+}
+
+func (s *Server) workerRequirementPolicyForPlan(plan plans.ExperimentPlan, provider string, targetCount int) (execution.WorkerRequirementPolicy, error) {
+	dataset, err := s.store.GetDataset(plan.DatasetID)
+	if err != nil {
+		return execution.WorkerRequirementPolicy{}, err
+	}
+	return datasetMaterializationPolicy(dataset, provider, targetCount), nil
+}
+
+func datasetMaterializationPolicy(dataset datasets.Dataset, provider string, maxConcurrentJobs int) execution.WorkerRequirementPolicy {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		provider = "local"
+	}
+	checksum := normalizedDatasetChecksum(dataset.ChecksumSHA256)
+	policy := execution.WorkerRequirementPolicy{
+		DatasetID:                    dataset.ID,
+		DatasetChecksum:              checksum,
+		DatasetCacheKey:              datasetCacheKey(dataset),
+		DatasetMaterializationStatus: execution.DatasetMaterializationUnknown,
+		MaxConcurrentJobs:            maxConcurrentJobs,
+	}
+	if provider == "modal" {
+		policy.ColdCachePolicy = execution.ColdCachePolicySingleMaterialization
+		policy.MaxColdDatasetMaterializations = 1
+		if checksum != "" {
+			policy.DatasetMaterializationStatus = execution.DatasetMaterializationCold
+		}
+	}
+	return policy
+}
+
+func datasetCacheKey(dataset datasets.Dataset) string {
+	checksum := normalizedDatasetChecksum(dataset.ChecksumSHA256)
+	if checksum != "" {
+		return "sha256-" + checksum
+	}
+	fingerprint := storageURIFingerprint(dataset.StorageURI)
+	if fingerprint == "" {
+		return ""
+	}
+	return "uri-" + fingerprint
+}
+
+func storageURIFingerprint(storageURI string) string {
+	normalized := normalizedStorageURI(storageURI)
+	if normalized == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(normalized))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func normalizedDatasetChecksum(checksumSHA256 string) string {
+	checksum := strings.ToLower(strings.TrimSpace(checksumSHA256))
+	if len(checksum) != 64 {
+		return ""
+	}
+	for _, ch := range checksum {
+		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') {
+			continue
+		}
+		return ""
+	}
+	return checksum
+}
+
+func normalizedStorageURI(storageURI string) string {
+	trimmed := strings.TrimSpace(storageURI)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err == nil && parsed.Scheme == "s3" {
+		return "s3://" + strings.ToLower(parsed.Host) + "/" + strings.TrimLeft(parsed.EscapedPath(), "/")
+	}
+	return trimmed
 }
 
 func mapFromStruct(value any) (map[string]any, error) {
@@ -2957,6 +3095,48 @@ func (s *Server) failJob(c *gin.Context) {
 		return
 	}
 
+	if req.Retryable {
+		job, requeued, err := s.store.RetryJob(c.Param("id"), req.Error)
+		if err != nil {
+			writeStoreError(c, err)
+			return
+		}
+		diagnostics.Event("warn", "job_retryable_failure", map[string]any{
+			"job_id":       job.ID,
+			"project_id":   job.ProjectID,
+			"worker_id":    job.WorkerID,
+			"template":     job.Template,
+			"attempt":      job.Attempt,
+			"max_attempts": job.MaxAttempts,
+			"requeued":     requeued,
+			"error":        req.Error,
+		})
+		s.recordRetryableJobFailureEvent(job, requeued, req.Error)
+		if job.Template == jobs.TemplateTrainExperiment {
+			status := jobs.StatusQueued
+			if !requeued {
+				status = jobs.StatusFailed
+			}
+			if _, err := s.store.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
+				Status: status,
+			}); err != nil {
+				writeStoreError(c, err)
+				return
+			}
+			if !requeued {
+				s.enqueueTrainingTerminalHooks(job)
+			}
+		}
+		if !requeued && job.Template == jobs.TemplateAnalyzeDatasetVisuals && jobConfigString(job.Config, "trigger_reason") == string(datasets.VisualTriggerInitialProfile) {
+			if err := s.createInitialPlanForDataset(jobConfigString(job.Config, "dataset_id")); err != nil {
+				writeStoreError(c, err)
+				return
+			}
+		}
+		c.JSON(http.StatusOK, job)
+		return
+	}
+
 	job, err := s.store.FailJob(c.Param("id"), req.Error)
 	if err != nil {
 		writeStoreError(c, err)
@@ -2988,6 +3168,31 @@ func (s *Server) failJob(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, job)
+}
+
+func (s *Server) recordRetryableJobFailureEvent(job jobs.ExperimentJob, requeued bool, message string) {
+	planID := jobConfigString(job.Config, "plan_id")
+	nextAttempt := job.Attempt + 1
+	if nextAttempt > job.MaxAttempts {
+		nextAttempt = job.MaxAttempts
+	}
+	eventType := execution.EventJobRetryQueued
+	eventMessage := fmt.Sprintf("Job %s reported a retryable failure and was requeued for attempt %d of %d.", job.ID, nextAttempt, job.MaxAttempts)
+	if !requeued {
+		eventType = execution.EventExecutionFailed
+		eventMessage = fmt.Sprintf("Job %s reported a retryable failure and exhausted %d attempts.", job.ID, job.MaxAttempts)
+	}
+	if _, err := s.store.CreateExecutionEvent(job.ProjectID, planID, eventType, eventMessage, map[string]any{
+		"job_id":       job.ID,
+		"worker_id":    job.WorkerID,
+		"template":     job.Template,
+		"attempt":      job.Attempt,
+		"max_attempts": job.MaxAttempts,
+		"requeued":     requeued,
+		"error":        message,
+	}); err != nil {
+		log.Printf("record retryable job failure event failed: %v", err)
+	}
 }
 
 func (s *Server) runAutomaticExperimentReviewAfterTrainingJob(job jobs.ExperimentJob) {
@@ -3457,7 +3662,8 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		}
 		return true, nil
 	}
-	if terminalPlannerGuardsEnabled() {
+	automationSettings := s.currentAutomationSettings()
+	if terminalPlannerGuardsEnabledForMode(automationSettings.AgentMode) {
 		if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(job.ProjectID); err != nil {
 			return false, err
 		} else if selected {
@@ -3467,7 +3673,6 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		}
 	}
 
-	automationSettings := s.currentAutomationSettings()
 	config := llm.ConfigFromEnv(automationSettings.LLMEnabled, automationSettings.LLMProvider, automationSettings.LLMModel)
 	client := llm.NewClient(config)
 	agent := agents.NewExperimentPlannerAgentWithRuntime(client, config.Model, config, agents.PlannerInformationToolOptions{
@@ -3618,6 +3823,8 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	if !planTrainingRunsComplete(plan, planSummaries) {
 		return agents.ExperimentPlannerInput{}, false, nil
 	}
+	automationSettings := s.currentAutomationSettings()
+	minimumMeaningfulImprovement := plannerMinimumMeaningfulImprovementFromEnv(automationSettings.AgentMode)
 	objectiveContext := projectObjectiveContext(project.Goal)
 	currentChampion, baselineChampion, sourcePlanDeltas, noImprovementRounds, stopSignals := experimentPlannerPerformanceContext(
 		plan.TargetMetric,
@@ -3646,20 +3853,21 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	}
 
 	partialInput := agents.ExperimentPlannerInput{
-		Project:                    project,
-		Dataset:                    dataset,
-		SourcePlan:                 plan,
-		PlanJobs:                   planJobs,
-		PlanSummaries:              planSummaries,
-		PlanEvaluations:            planEvaluations,
-		PlanMetrics:                planMetrics,
-		DatasetInsights:            datasetPlanningInsights(dataset, metadataSummary),
-		VisualExemplarContext:      visualContext,
-		ObjectiveContext:           objectiveContext,
-		CurrentChampion:            currentChampion,
-		SourcePlanBaselineChampion: baselineChampion,
-		SourcePlanDeltas:           sourcePlanDeltas,
-		NoImprovementRounds:        noImprovementRounds,
+		Project:                      project,
+		Dataset:                      dataset,
+		SourcePlan:                   plan,
+		PlanJobs:                     planJobs,
+		PlanSummaries:                planSummaries,
+		PlanEvaluations:              planEvaluations,
+		PlanMetrics:                  planMetrics,
+		DatasetInsights:              datasetPlanningInsights(dataset, metadataSummary),
+		VisualExemplarContext:        visualContext,
+		ObjectiveContext:             objectiveContext,
+		CurrentChampion:              currentChampion,
+		SourcePlanBaselineChampion:   baselineChampion,
+		SourcePlanDeltas:             sourcePlanDeltas,
+		NoImprovementRounds:          noImprovementRounds,
+		MinimumMeaningfulImprovement: minimumMeaningfulImprovement,
 	}
 	deterministicDiagnosis := agents.ComputePlannerDiagnosis(partialInput)
 
@@ -3678,7 +3886,7 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	}
 	strategyScorecards := plannerStrategyScorecards(scorecards, plan.DatasetID)
 
-	return agents.ExperimentPlannerInput{
+	input := agents.ExperimentPlannerInput{
 		Project:                      project,
 		Dataset:                      dataset,
 		SourcePlan:                   plan,
@@ -3696,7 +3904,7 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		SourcePlanDeltas:             sourcePlanDeltas,
 		NoImprovementRounds:          noImprovementRounds,
 		StopSignals:                  stopSignals,
-		MinimumMeaningfulImprovement: plannerMinimumMeaningfulImprovement,
+		MinimumMeaningfulImprovement: minimumMeaningfulImprovement,
 		SuccessfulStrategyMemory:     successfulStrategyMemory,
 		FailedStrategyMemory:         failedStrategyMemory,
 		RejectedStrategyMemory:       rejectedStrategyMemory,
@@ -3708,10 +3916,13 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		PriorEvaluations:             evaluations,
 		PriorMemory:                  priorMemory,
 		ExistingExperimentSignatures: experimentSignaturesForPlans(projectPlans),
+		AgentMode:                    automationSettings.AgentMode,
 		MaxExperiments:               maxLLMPlannerExperiments,
 		MaxFollowUpRounds:            s.maxAutoFollowUpRounds(),
 		FollowUpRound:                followUpRoundCount(projectPlans),
-	}, true, nil
+	}
+	input.ProjectTrajectory = agents.ComputeProjectTrajectoryDiagnosis(input)
+	return input, true, nil
 }
 
 func (s *Server) recordExperimentPlannerInvocation(
@@ -3972,7 +4183,7 @@ func applyExperimentPlannerStopCriteria(
 	if !ok {
 		return recommendation
 	}
-	if !terminalPlannerGuardsEnabled() {
+	if !terminalPlannerGuardsEnabledForMode(input.AgentMode) {
 		recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend stop advisory only; continuing is allowed because terminal planner guards are disabled: "+stopReason)
 		recommendation.Tags = append(recommendation.Tags, "backend_stop_advisory", guardTag)
 		return recommendation
@@ -4083,6 +4294,7 @@ func experimentPlannerDecisionPayload(
 		"objective_context":               input.ObjectiveContext,
 		"deterministic_diagnosis":         input.DeterministicDiagnosis,
 		"deterministic_diagnosis_used":    recommendation.DeterministicDiagnosisUsed,
+		"project_trajectory_card":         input.ProjectTrajectory,
 		"evidence_used":                   recommendation.EvidenceUsed,
 		"expected_failure_modes":          recommendation.ExpectedFailureModes,
 		"stop_condition":                  recommendation.StopCondition,
@@ -4347,7 +4559,7 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 }
 
 func (s *Server) plannerFollowUpStopReason(projectID string, sourcePlan plans.ExperimentPlan, projectPlans []plans.ExperimentPlan) (string, string, bool, error) {
-	if !terminalPlannerGuardsEnabled() {
+	if !terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
 		return "", "", false, nil
 	}
 	if stopReason, _, ok, err := s.projectChampionSelectedFollowUpStopReason(projectID); err != nil {
@@ -6183,7 +6395,17 @@ func (s *Server) heartbeatWorker(c *gin.Context) {
 }
 
 func (s *Server) pollJob(c *gin.Context) {
-	job, err := s.store.PollJob(c.Param("id"))
+	var req pollJobRequest
+	if c.Request.ContentLength > 0 {
+		if !bindJSON(c, &req) {
+			return
+		}
+	}
+	job, err := s.store.PollJob(c.Param("id"), store.JobPollFilter{
+		Provider:                            req.Provider,
+		Templates:                           req.Templates,
+		IncludeUnspecifiedProviderTemplates: req.IncludeUnspecifiedProviderTemplates,
+	})
 	if err == nil {
 		c.JSON(http.StatusOK, pollJobResponse{Job: job})
 		return
@@ -6398,6 +6620,11 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	if provider == "" {
 		provider = "local"
 	}
+	dataset, err := s.store.GetDataset(plan.DatasetID)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+	materializationPolicy := datasetMaterializationPolicy(dataset, provider, s.targetWorkerCountForPlan(plan, len(plan.Experiments)))
 
 	existingJobs, err := s.store.ListProjectJobs(plan.ProjectID)
 	if err != nil {
@@ -6448,6 +6675,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			"provider":            provider,
 			"gpu_type":            req.GPUType,
 		}
+		addDatasetMaterializationConfig(config, materializationPolicy)
 		if jobTemplate == jobs.TemplateTrainExperiment {
 			config["model"] = experiment.Model
 			config["epochs"] = experiment.Epochs
@@ -6493,7 +6721,7 @@ func (s *Server) validateFollowUpPlanCanExecute(plan plans.ExperimentPlan) error
 	if plan.SourceDecisionID == "" {
 		return nil
 	}
-	if terminalPlannerGuardsEnabled() {
+	if terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
 		if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(plan.ProjectID); err != nil {
 			return err
 		} else if ok {
@@ -7483,6 +7711,25 @@ func (s *Server) optimizerFeedbackSummariesForProject(projectID string, targetMe
 func configString(config map[string]any, key string) string {
 	value, _ := config[key].(string)
 	return value
+}
+
+func addDatasetMaterializationConfig(config map[string]any, policy execution.WorkerRequirementPolicy) {
+	if policy.DatasetID == "" && policy.DatasetCacheKey == "" {
+		return
+	}
+	if policy.DatasetChecksum != "" {
+		config["dataset_checksum_sha256"] = policy.DatasetChecksum
+	}
+	materialization := map[string]any{
+		"dataset_id":                policy.DatasetID,
+		"dataset_checksum_sha256":   policy.DatasetChecksum,
+		"dataset_cache_key":         policy.DatasetCacheKey,
+		"status":                    policy.DatasetMaterializationStatus,
+		"cold_cache_policy":         policy.ColdCachePolicy,
+		"max_concurrent_jobs":       policy.MaxConcurrentJobs,
+		"max_cold_materializations": policy.MaxColdDatasetMaterializations,
+	}
+	config["dataset_materialization"] = materialization
 }
 
 func configInt(config map[string]any, key string) (int, bool) {
@@ -9923,16 +10170,17 @@ func automationSettingsFromEnv() settings.AutomationSettings {
 	if defaultProvider == "" {
 		defaultProvider = "local"
 	}
+	agentMode := llm.NormalizeAgentMode(os.Getenv("MODEL_EXPRESS_AGENT_MODE"))
 
 	return settings.AutomationSettings{
 		AutoReviewExperiments:   envFlag("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", false),
 		AutoScheduleFollowUps:   envFlag("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", false),
 		AutoExecutePlans:        envFlag("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER") != ""),
-		MaxFollowUpRounds:       maxAutoFollowUpRoundsFromEnv(),
+		MaxFollowUpRounds:       maxAutoFollowUpRoundsFromEnvForMode(agentMode),
 		DefaultTrainingProvider: defaultProvider,
 		DefaultGPUType:          os.Getenv("MODEL_EXPRESS_DEFAULT_GPU_TYPE"),
 		LLMEnabled:              envFlag("MODEL_EXPRESS_LLM_ENABLED", false),
-		AgentMode:               llm.NormalizeAgentMode(os.Getenv("MODEL_EXPRESS_AGENT_MODE")),
+		AgentMode:               agentMode,
 		LLMProvider:             defaultLLMProviderFromEnv(),
 		LLMModel:                defaultLLMModelFromEnv(),
 		AutoMLEnabled:           envFlag("MODEL_EXPRESS_AUTOML_ENABLED", false),
@@ -10036,20 +10284,51 @@ func (s *Server) shouldAutoScheduleFollowUps() bool {
 }
 
 func maxAutoFollowUpRoundsFromEnv() int {
+	return maxAutoFollowUpRoundsFromEnvForMode(llm.NormalizeAgentMode(os.Getenv("MODEL_EXPRESS_AGENT_MODE")))
+}
+
+func maxAutoFollowUpRoundsFromEnvForMode(agentMode string) int {
 	value := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS"))
 	if value == "" {
+		if strings.EqualFold(agentMode, llm.AgentModeAutonomous) {
+			return plannerAutonomousMaxFollowUpRounds
+		}
 		return plannerDefaultMaxFollowUpRounds
 	}
 
 	rounds, err := strconv.Atoi(value)
 	if err != nil || rounds < 0 {
+		if strings.EqualFold(agentMode, llm.AgentModeAutonomous) {
+			return plannerAutonomousMaxFollowUpRounds
+		}
 		return plannerDefaultMaxFollowUpRounds
 	}
 
 	return rounds
 }
 
+func plannerMinimumMeaningfulImprovementFromEnv(agentMode string) float64 {
+	value := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PLANNER_MIN_MEANINGFUL_DELTA"))
+	if value != "" {
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	if strings.EqualFold(agentMode, llm.AgentModeAutonomous) {
+		return plannerAutonomousMeaningfulImprovement
+	}
+	return plannerMinimumMeaningfulImprovement
+}
+
 func terminalPlannerGuardsEnabled() bool {
+	return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", false)
+}
+
+func terminalPlannerGuardsEnabledForMode(agentMode string) bool {
+	if strings.EqualFold(agentMode, llm.AgentModeAutonomous) {
+		return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", true)
+	}
 	return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", false)
 }
 

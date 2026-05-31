@@ -30,6 +30,13 @@ except Exception:  # pragma: no cover - local helper tests can run without Modal
 
 APP_NAME = "model-express-training"
 DEFAULT_GPU = os.getenv("MODAL_GPU_TYPE", "T4")
+DATASET_MATERIALIZATION_ROOT = Path(
+    os.getenv("MODEL_EXPRESS_MODAL_DATASET_CACHE_ROOT", "/cache/model-express/datasets")
+)
+DATASET_VOLUME_NAME = os.getenv(
+    "MODEL_EXPRESS_MODAL_DATASET_CACHE_VOLUME",
+    "model-express-dataset-cache",
+)
 DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS = 300
 DEFAULT_METADATA_BUNDLE_PAGE_SIZE = 5000
 DEFAULT_METADATA_BUNDLE_MAX_RECORDS = 50_000
@@ -68,6 +75,12 @@ EFFECTIVE_NUMBER_CLASS_BALANCING = {
     "class_balanced_effective_number",
 }
 if modal is not None:
+    try:
+        dataset_volume = modal.Volume.from_name(DATASET_VOLUME_NAME, create_if_missing=True)
+        dataset_volume_mounts = {str(DATASET_MATERIALIZATION_ROOT): dataset_volume}
+    except Exception:  # pragma: no cover - depends on Modal runtime/account setup.
+        dataset_volume = None
+        dataset_volume_mounts = {}
     image = (
         modal.Image.debian_slim(python_version="3.11")
         .apt_install("libglib2.0-0", "libgl1")
@@ -86,6 +99,8 @@ if modal is not None:
     app = modal.App(APP_NAME)
 else:
     image = None
+    dataset_volume = None
+    dataset_volume_mounts = {}
 
     class _UnavailableModalApp:
         def function(self, *args, **kwargs):
@@ -126,14 +141,25 @@ class _BBoxCropDataset:
 
 
 
-@app.function(image=image, gpu=DEFAULT_GPU, timeout=60 * 60)
+@app.function(image=image, gpu=DEFAULT_GPU, timeout=60 * 60, volumes=dataset_volume_mounts)
 def train_image_classifier(payload: dict) -> dict:
-    import requests
+    try:
+        return _train_image_classifier_impl(payload)
+    except Exception as exc:
+        if _report_modal_training_retryable_failure(payload, exc):
+            return {
+                "status": "retryable_failure_reported",
+                "job_id": str((payload.get("job") or {}).get("id") or ""),
+                "error": _modal_training_error_message(exc),
+            }
+        raise
+
+
+def _train_image_classifier_impl(payload: dict) -> dict:
     import time
     import torch
 
-    from worker.datasets.cache import dataset_archive_path, extract_dataset_archive
-    from worker.datasets.storage import download_s3_uri
+    from worker.datasets.cache import ensure_dataset_materialized
 
     started_at = time.time()
     job = payload["job"]
@@ -175,9 +201,16 @@ def train_image_classifier(payload: dict) -> dict:
     gpu_type = str(config.get("gpu_type") or os.getenv("MODAL_GPU_TYPE", "T4"))
     modal_function_call_id, modal_input_id = _modal_identifiers()
 
-    archive_path = dataset_archive_path(dataset_id)
-    download_s3_uri(dataset["storage_uri"], archive_path)
-    dataset_dir = extract_dataset_archive(archive_path, dataset_id)
+    _reload_modal_dataset_volume()
+    materialized = ensure_dataset_materialized(
+        dataset_id=dataset_id,
+        storage_uri=dataset["storage_uri"],
+        checksum_sha256=_dataset_checksum(dataset, config),
+        cache_root=DATASET_MATERIALIZATION_ROOT,
+    )
+    _commit_modal_dataset_volume()
+    dataset_dir = materialized.dataset_dir
+    dataset_materialization = materialized.telemetry
     metadata_bundle = _fetch_training_metadata_bundle(orchestrator_url, dataset_id, config)
 
     train_loader, val_loader, test_loader, class_names, class_weights, execution_metadata = _load_image_data(
@@ -268,6 +301,7 @@ def train_image_classifier(payload: dict) -> dict:
                 "epochs_completed": epoch,
                 "modal_function_call_id": modal_function_call_id,
                 "modal_input_id": modal_input_id,
+                "dataset_materialization": dataset_materialization,
             },
         )
         if early_stopping_patience > 0 and epoch - best_epoch >= early_stopping_patience:
@@ -335,6 +369,7 @@ def train_image_classifier(payload: dict) -> dict:
             "epochs_completed": completed_epochs,
             "modal_function_call_id": modal_function_call_id,
             "modal_input_id": modal_input_id,
+            "dataset_materialization": dataset_materialization,
         },
     )
     _post_training_run_evaluation(
@@ -369,6 +404,7 @@ def train_image_classifier(payload: dict) -> dict:
                 "sampling_strategy": sampling_strategy,
                 "preprocessing": preprocessing,
                 "worker_execution_metadata": _public_execution_metadata(execution_metadata),
+                "dataset_materialization": dataset_materialization,
                 "bbox_crop_ablation": bbox_ablation,
                 "training_hyperparameters": {
                     "optimizer": optimizer_name,
@@ -415,30 +451,61 @@ def train_image_classifier(payload: dict) -> dict:
         "estimated_cost_usd": estimated_cost_usd,
         "runtime_seconds": runtime_seconds,
         "device": str(device),
+        "dataset_materialization": dataset_materialization,
     }
 
 
-@app.function(image=image, timeout=60 * 20)
-def profile_image_dataset(payload: dict) -> dict:
-    import tempfile
-
-    from worker.datasets.cache import dataset_archive_path, extract_dataset_archive
-    from worker.datasets.metadata_discovery import build_metadata_import_payload
-    from worker.datasets.profiler import profile_image_folder
-    from worker.datasets.storage import download_s3_uri
+@app.function(image=image, timeout=60 * 20, volumes=dataset_volume_mounts)
+def materialize_image_dataset(payload: dict) -> dict:
+    from worker.datasets.cache import ensure_dataset_materialized
 
     _configure_storage_env(payload)
 
     dataset = payload["dataset"]
     dataset_id = dataset["id"]
-    with tempfile.TemporaryDirectory(prefix=f"model-express-profile-{dataset_id}-") as cache_root:
-        archive_path = dataset_archive_path(dataset_id, cache_root)
-        download_s3_uri(dataset["storage_uri"], archive_path)
-        dataset_dir = extract_dataset_archive(archive_path, dataset_id, cache_root)
-        return {
-            "profile": profile_image_folder(dataset_dir),
-            "metadata_import": build_metadata_import_payload(dataset_dir),
-        }
+    job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    _reload_modal_dataset_volume()
+    materialized = ensure_dataset_materialized(
+        dataset_id=dataset_id,
+        storage_uri=dataset["storage_uri"],
+        checksum_sha256=_dataset_checksum(dataset, config),
+        cache_root=DATASET_MATERIALIZATION_ROOT,
+    )
+    _commit_modal_dataset_volume()
+    return {
+        "dataset_id": dataset_id,
+        "dataset_dir": str(materialized.dataset_dir),
+        "dataset_materialization": materialized.telemetry,
+    }
+
+
+@app.function(image=image, timeout=60 * 20, volumes=dataset_volume_mounts)
+def profile_image_dataset(payload: dict) -> dict:
+    from worker.datasets.cache import ensure_dataset_materialized
+    from worker.datasets.metadata_discovery import build_metadata_import_payload
+    from worker.datasets.profiler import profile_image_folder
+
+    _configure_storage_env(payload)
+
+    dataset = payload["dataset"]
+    dataset_id = dataset["id"]
+    job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    _reload_modal_dataset_volume()
+    materialized = ensure_dataset_materialized(
+        dataset_id=dataset_id,
+        storage_uri=dataset["storage_uri"],
+        checksum_sha256=_dataset_checksum(dataset, config),
+        cache_root=DATASET_MATERIALIZATION_ROOT,
+    )
+    _commit_modal_dataset_volume()
+    dataset_dir = materialized.dataset_dir
+    return {
+        "profile": profile_image_folder(dataset_dir),
+        "metadata_import": build_metadata_import_payload(dataset_dir),
+        "dataset_materialization": materialized.telemetry,
+    }
 
 
 def _configure_storage_env(payload: dict) -> None:
@@ -446,6 +513,46 @@ def _configure_storage_env(payload: dict) -> None:
     os.environ["AWS_ACCESS_KEY_ID"] = payload["aws_access_key_id"]
     os.environ["AWS_SECRET_ACCESS_KEY"] = payload["aws_secret_access_key"]
     os.environ["AWS_DEFAULT_REGION"] = payload["aws_default_region"]
+
+
+def _dataset_checksum(dataset: dict, config: dict | None = None) -> str:
+    for key in ("checksum_sha256", "sha256", "checksum"):
+        value = dataset.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    metadata = dataset.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("checksum_sha256", "sha256", "checksum"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(config, dict):
+        for key in ("dataset_checksum_sha256", "checksum_sha256", "sha256", "checksum"):
+            value = config.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        materialization = config.get("dataset_materialization")
+        if isinstance(materialization, dict):
+            for key in ("dataset_checksum_sha256", "checksum_sha256", "sha256", "checksum"):
+                value = materialization.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            cache_key = materialization.get("dataset_cache_key")
+            if isinstance(cache_key, str) and cache_key.startswith("sha256-"):
+                return cache_key.removeprefix("sha256-").strip()
+    return ""
+
+
+def _reload_modal_dataset_volume() -> None:
+    reload = getattr(dataset_volume, "reload", None)
+    if callable(reload):
+        reload()
+
+
+def _commit_modal_dataset_volume() -> None:
+    commit = getattr(dataset_volume, "commit", None)
+    if callable(commit):
+        commit()
 
 
 class _MetadataBundleImageDataset:
@@ -2157,6 +2264,29 @@ def _post_json(url: str, payload: dict) -> None:
 
     response = requests.post(url, json=payload, timeout=_orchestrator_report_timeout_seconds())
     response.raise_for_status()
+
+
+def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> bool:
+    job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+    job_id = str(job.get("id") or "")
+    orchestrator_url = str(payload.get("orchestrator_url") or "").rstrip("/")
+    if not job_id or not orchestrator_url:
+        return False
+    try:
+        _post_json(
+            f"{orchestrator_url}/jobs/{job_id}/fail",
+            {"error": _modal_training_error_message(exc), "retryable": True},
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _modal_training_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        message = exc.__class__.__name__
+    return f"Modal training container failed before completion: {message}"[:2000]
 
 
 def _orchestrator_report_timeout_seconds() -> int:

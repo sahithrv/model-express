@@ -7,6 +7,7 @@ import traceback
 from worker.diagnostics import log_event
 from worker.orchestrator_client import OrchestratorClient
 from worker.jobs import run_job
+from worker.training.modal_dispatcher import modal_dispatcher_enabled, run_modal_dispatcher
 
 POLL_INTERVAL_SECONDS = 5
 
@@ -14,8 +15,13 @@ POLL_INTERVAL_SECONDS = 5
 def main() -> None:
     oURL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
     client = OrchestratorClient(oURL)
+    project_id = os.getenv("PROJECT_ID")
 
-    worker = client.register_worker(os.getenv("PROJECT_ID"))
+    if modal_dispatcher_enabled():
+        run_modal_dispatcher(client, project_id or "")
+        return
+
+    worker = client.register_worker(project_id or "")
     worker_id = worker["id"]
     log_event(
         "info",

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from PIL import Image
 
@@ -37,6 +38,80 @@ class ModalTrainingHelperTests(unittest.TestCase):
                 self.modal_app._post_json("http://orchestrator.test/jobs/job_1/complete", {"mlflow_run_id": "run_1"})
 
         self.assertEqual(calls[0]["timeout"], 240)
+
+    def test_modal_training_failure_report_marks_retryable(self) -> None:
+        calls = []
+
+        def fake_post(url: str, payload: dict) -> None:
+            calls.append({"url": url, "payload": payload})
+
+        payload = {
+            "job": {"id": "job_1"},
+            "orchestrator_url": "https://orchestrator.test",
+        }
+        with patch.object(self.modal_app, "_post_json", fake_post):
+            reported = self.modal_app._report_modal_training_retryable_failure(
+                payload,
+                RuntimeError("container exited unexpectedly"),
+            )
+
+        self.assertTrue(reported)
+        self.assertEqual(calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
+        self.assertTrue(calls[0]["payload"]["retryable"])
+        self.assertIn("container exited unexpectedly", calls[0]["payload"]["error"])
+
+    def test_profile_image_dataset_uses_materialized_dataset_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "dataset"
+            (dataset_dir / "cat").mkdir(parents=True)
+            (dataset_dir / "cat" / "one.txt").write_text("meow", encoding="utf-8")
+            calls = []
+
+            def fake_materialize(**kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(
+                    dataset_dir=dataset_dir,
+                    telemetry={
+                        "dataset_materialization_cache_hit": True,
+                        "dataset_materialization_cache_miss": False,
+                        "dataset_materialization_bytes_downloaded": 0,
+                        "dataset_materialization_extract_seconds": 0.0,
+                        "dataset_materialization_wait_seconds": 0.0,
+                        "dataset_checksum": "d" * 64,
+                        "storage_uri_fingerprint": "fingerprint",
+                    },
+                )
+
+            payload = {
+                "job": {
+                    "id": "job_1",
+                    "config": {
+                        "dataset_materialization": {
+                            "dataset_checksum_sha256": "d" * 64,
+                            "dataset_cache_key": "sha256-" + ("d" * 64),
+                        }
+                    },
+                },
+                "dataset": {
+                    "id": "dataset_1",
+                    "storage_uri": "s3://bucket/dataset.zip",
+                },
+                "s3_endpoint_url": "https://s3.test",
+                "aws_access_key_id": "key",
+                "aws_secret_access_key": "secret",
+                "aws_default_region": "us-east-1",
+            }
+            with patch("worker.datasets.cache.ensure_dataset_materialized", fake_materialize):
+                with patch("worker.datasets.profiler.profile_image_folder", lambda path: {"profiled": str(path)}):
+                    with patch("worker.datasets.metadata_discovery.build_metadata_import_payload", lambda path: {"root": str(path)}):
+                        result = self.modal_app.profile_image_dataset(payload)
+
+            self.assertEqual(calls[0]["dataset_id"], "dataset_1")
+            self.assertEqual(calls[0]["storage_uri"], "s3://bucket/dataset.zip")
+            self.assertEqual(calls[0]["checksum_sha256"], "d" * 64)
+            self.assertEqual(calls[0]["cache_root"], self.modal_app.DATASET_MATERIALIZATION_ROOT)
+            self.assertEqual(result["profile"]["profiled"], str(dataset_dir))
+            self.assertTrue(result["dataset_materialization"]["dataset_materialization_cache_hit"])
 
     def test_transform_uses_dataset_normalization_metadata(self) -> None:
         try:

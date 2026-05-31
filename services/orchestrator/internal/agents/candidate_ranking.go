@@ -4,12 +4,91 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 
+	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/plans"
 )
+
+func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation ExperimentPlanningRecommendation) (ExperimentPlanningRecommendation, error) {
+	if strings.ToUpper(strings.TrimSpace(recommendation.DecisionType)) != decisions.TypeAddExperiments {
+		return recommendation, nil
+	}
+	if len(recommendation.CandidateHypotheses) == 0 {
+		return recommendation, fmt.Errorf("experiment planner ADD_EXPERIMENTS requires candidate_hypotheses for backend ranking")
+	}
+
+	rankings, selected, mechanisms := RankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, effectiveMaxPlannerExperiments(input))
+	recommendation.CandidateRankings = rankings
+	recommendation.ProposedExperiments = selected
+	recommendation.ProposalMechanisms = mechanisms
+	if len(selected) == 0 {
+		return recommendation, fmt.Errorf("experiment planner ADD_EXPERIMENTS has no backend-ranked candidate_hypotheses that survived validation")
+	}
+	if strings.TrimSpace(recommendation.PlanningMode) == "" {
+		for _, ranking := range rankings {
+			if ranking.Selected && strings.TrimSpace(ranking.PlanningMode) != "" {
+				recommendation.PlanningMode = ranking.PlanningMode
+				break
+			}
+		}
+	}
+	return recommendation, nil
+}
+
+func mechanismExhausted(input ExperimentPlannerInput, mechanism string) (bool, string) {
+	normalized := normalizeMechanism(mechanism)
+	if normalized == "" {
+		return false, ""
+	}
+	group := mechanismGroup(normalized)
+
+	if blockedByRejectedStrategyMemory(input, normalized, group) {
+		return true, fmt.Sprintf("mechanism %s is blocked by rejected strategy memory", normalized)
+	}
+	if blocked, reason := projectTrajectoryBlocksMechanism(input, normalized, group); blocked {
+		return true, reason
+	}
+	if normalized == "architecture_challenge" && repeatedArchitectureAttemptsExhausted(input) {
+		return true, "architecture_challenge exhausted after repeated architecture attempts without meaningful improvement"
+	}
+	return false, ""
+}
+
+func projectDecisionPressure(input ExperimentPlannerInput) string {
+	if pressure := strings.ToLower(strings.TrimSpace(projectTrajectoryDecisionPressure(input))); pressure != "" {
+		return pressure
+	}
+	switch {
+	case containsAnyText(strings.ToLower(strings.Join(input.StopSignals, " ")), "stop", "select", "final", "budget", "exhaust"):
+		return "critical"
+	case input.MaxFollowUpRounds > 0 && input.FollowUpRound >= input.MaxFollowUpRounds:
+		return "critical"
+	case input.NoImprovementRounds >= 2:
+		return "high"
+	case input.NoImprovementRounds == 1:
+		return "moderate"
+	default:
+		return "normal"
+	}
+}
+
+func effectiveMaxPlannerExperiments(input ExperimentPlannerInput) int {
+	maxExperiments := maxPlannerExperiments(input.MaxExperiments)
+	switch projectDecisionPressure(input) {
+	case "critical", "final", "select_champion", "stop_project":
+		return minInt(maxExperiments, 1)
+	case "high", "non_exhausted_mechanism_or_stop", "champion_confirmation_or_non_architecture_pivot":
+		return minInt(maxExperiments, 2)
+	case "moderate":
+		return minInt(maxExperiments, 3)
+	default:
+		return maxExperiments
+	}
+}
 
 func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []CandidateHypothesis, maxExperiments int) ([]CandidateRanking, []plans.PlannedExperiment, []PlannerProposalMechanism) {
 	if maxExperiments < 1 {
@@ -98,6 +177,12 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 		ranking.Rejected = true
 		ranking.Score = 0
 		ranking.Reasons = append(ranking.Reasons, err.Error())
+		return ranking
+	}
+	if exhausted, reason := mechanismExhausted(input, candidate.Mechanism); exhausted {
+		ranking.Rejected = true
+		ranking.Score = 0
+		ranking.Reasons = append(ranking.Reasons, reason)
 		return ranking
 	}
 	if existing[signature] {
@@ -261,6 +346,139 @@ func candidateMechanismScore(input ExperimentPlannerInput, candidate CandidateHy
 		reasons = append(reasons, "same mechanism only changes minor tuning knobs")
 	}
 	return score, reasons
+}
+
+func blockedByRejectedStrategyMemory(input ExperimentPlannerInput, mechanism string, group string) bool {
+	blocked := mechanismsFromRejectedOptions(input.RejectedStrategyMemory)
+	for blockedMechanism := range blocked {
+		if mechanismMatches(blockedMechanism, mechanism, group) {
+			return true
+		}
+	}
+	return false
+}
+
+func projectTrajectoryBlocksMechanism(input ExperimentPlannerInput, mechanism string, group string) (bool, string) {
+	trajectory, ok := projectTrajectoryValue(input)
+	if !ok {
+		return false, ""
+	}
+	for _, blocked := range stringsFromReflectField(trajectory, "BlockedMechanisms") {
+		if mechanismMatches(blocked, mechanism, group) {
+			return true, fmt.Sprintf("mechanism %s is blocked by project trajectory", mechanism)
+		}
+	}
+	outcomes := reflectField(trajectory, "MechanismOutcomes")
+	if !outcomes.IsValid() || (outcomes.Kind() != reflect.Slice && outcomes.Kind() != reflect.Array) {
+		return false, ""
+	}
+	failureCount := 0
+	for index := 0; index < outcomes.Len(); index++ {
+		outcome := reflectIndirect(outcomes.Index(index))
+		if !outcome.IsValid() {
+			continue
+		}
+		outcomeMechanism := reflectedMechanismOutcomeMechanism(outcome)
+		if !mechanismMatches(outcomeMechanism, mechanism, group) {
+			continue
+		}
+		if reflectedBoolField(outcome, "Exhausted") || reflectedBoolField(outcome, "Blocked") {
+			return true, fmt.Sprintf("mechanism %s is exhausted by project trajectory", mechanism)
+		}
+		status := strings.ToLower(strings.Join([]string{
+			reflectedStringField(outcome, "Outcome"),
+			reflectedStringField(outcome, "OutcomeStatus"),
+			reflectedStringField(outcome, "Status"),
+			reflectedStringField(outcome, "State"),
+		}, " "))
+		if containsAnyText(status, "exhausted", "blocked") {
+			return true, fmt.Sprintf("mechanism %s is exhausted by project trajectory", mechanism)
+		}
+		if containsAnyText(status, ExperimentPlanningOutcomeNoImprovement, ExperimentPlanningOutcomeFailed, "no improvement", "failed") {
+			failureCount += candidateMaxInt(1, reflectedIntField(outcome, "Attempts"), reflectedIntField(outcome, "AttemptCount"), reflectedIntField(outcome, "NoImprovementAttempts"), reflectedIntField(outcome, "FailedAttempts"))
+		}
+	}
+	if mechanism == "architecture_challenge" && failureCount >= 2 {
+		return true, "architecture_challenge exhausted by project trajectory after repeated no-improvement outcomes"
+	}
+	return false, ""
+}
+
+func projectTrajectoryDecisionPressure(input ExperimentPlannerInput) string {
+	trajectory, ok := projectTrajectoryValue(input)
+	if !ok {
+		return ""
+	}
+	return reflectedStringField(trajectory, "DecisionPressure")
+}
+
+func projectTrajectoryValue(input ExperimentPlannerInput) (reflect.Value, bool) {
+	inputValue := reflect.ValueOf(input)
+	if inputValue.Kind() == reflect.Pointer {
+		inputValue = reflectIndirect(inputValue)
+	}
+	if !inputValue.IsValid() || inputValue.Kind() != reflect.Struct {
+		return reflect.Value{}, false
+	}
+	return validReflectField(inputValue, "ProjectTrajectory")
+}
+
+func reflectedMechanismOutcomeMechanism(outcome reflect.Value) string {
+	for _, fieldName := range []string{"Mechanism", "MechanismName", "Name", "StrategyType"} {
+		if value := reflectedStringField(outcome, fieldName); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func mechanismMatches(candidate string, mechanism string, group string) bool {
+	normalized := normalizeMechanism(candidate)
+	if normalized == "" {
+		return false
+	}
+	return normalized == mechanism || mechanismGroup(normalized) == group
+}
+
+func repeatedArchitectureAttemptsExhausted(input ExperimentPlannerInput) bool {
+	failures := 0
+	for _, scorecard := range input.StrategyScorecards {
+		if !mechanismMatches(mechanismFromScorecard(scorecard), "architecture_challenge", "architecture_challenge") &&
+			!mechanismMatches(scorecard.StrategyType, "architecture_challenge", "architecture_challenge") {
+			continue
+		}
+		switch scorecard.Outcome {
+		case ExperimentPlanningOutcomeFailed, ExperimentPlanningOutcomeNoImprovement:
+			failures++
+		case ExperimentPlanningOutcomeMinorImprovement:
+			if input.MinimumMeaningfulImprovement > 0 && scorecard.ActualDelta < input.MinimumMeaningfulImprovement {
+				failures++
+			}
+		}
+	}
+	for _, memory := range input.FailedStrategyMemory {
+		text := strings.ToLower(strings.Join(append([]string{memory.OutcomeStatus, memory.Lesson, memory.BestModel}, memory.Tags...), " "))
+		if containsAnyText(text, "architecture_challenge", "architecture challenge", "model family", "model shopping") {
+			failures++
+		}
+	}
+	if failures >= 2 {
+		return true
+	}
+	architectureExperiments := 0
+	for _, experiment := range input.SourcePlan.Experiments {
+		if mechanismMatches(inferExperimentMechanismTaxonomy(experiment), "architecture_challenge", "architecture_challenge") {
+			architectureExperiments++
+		}
+	}
+	for _, plan := range input.PriorPlans {
+		for _, experiment := range plan.Experiments {
+			if mechanismMatches(inferExperimentMechanismTaxonomy(experiment), "architecture_challenge", "architecture_challenge") {
+				architectureExperiments++
+			}
+		}
+	}
+	return architectureExperiments >= 2 && input.NoImprovementRounds >= 2
 }
 
 func diagnosisMatchesMechanism(diagnosis PlannerDiagnosis, mechanism string, candidate CandidateHypothesis, experiment plans.PlannedExperiment) bool {
@@ -755,4 +973,119 @@ func clampCandidate(value float64, minValue float64, maxValue float64) float64 {
 
 func roundCandidateScore(value float64) float64 {
 	return math.Round(value*1000) / 1000
+}
+
+func validReflectField(value reflect.Value, fieldName string) (reflect.Value, bool) {
+	field := reflectField(value, fieldName)
+	if !field.IsValid() {
+		return reflect.Value{}, false
+	}
+	return field, true
+}
+
+func reflectField(value reflect.Value, fieldName string) reflect.Value {
+	value = reflectIndirect(value)
+	if !value.IsValid() {
+		return reflect.Value{}
+	}
+	switch value.Kind() {
+	case reflect.Struct:
+		field := value.FieldByName(fieldName)
+		if field.IsValid() {
+			return reflectIndirect(field)
+		}
+	case reflect.Map:
+		if value.Type().Key().Kind() != reflect.String {
+			return reflect.Value{}
+		}
+		for _, key := range value.MapKeys() {
+			if strings.EqualFold(key.String(), fieldName) || strings.EqualFold(strings.ReplaceAll(key.String(), "_", ""), strings.ReplaceAll(fieldName, "_", "")) {
+				return reflectIndirect(value.MapIndex(key))
+			}
+		}
+	}
+	return reflect.Value{}
+}
+
+func reflectIndirect(value reflect.Value) reflect.Value {
+	for value.IsValid() && (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) {
+		if value.IsNil() {
+			return reflect.Value{}
+		}
+		value = value.Elem()
+	}
+	return value
+}
+
+func stringsFromReflectField(value reflect.Value, fieldName string) []string {
+	field := reflectField(value, fieldName)
+	if !field.IsValid() {
+		return nil
+	}
+	switch field.Kind() {
+	case reflect.String:
+		if strings.TrimSpace(field.String()) == "" {
+			return nil
+		}
+		return []string{field.String()}
+	case reflect.Slice, reflect.Array:
+		values := []string{}
+		for index := 0; index < field.Len(); index++ {
+			item := reflectIndirect(field.Index(index))
+			if item.IsValid() && item.Kind() == reflect.String && strings.TrimSpace(item.String()) != "" {
+				values = append(values, item.String())
+			}
+		}
+		return values
+	default:
+		return nil
+	}
+}
+
+func reflectedStringField(value reflect.Value, fieldName string) string {
+	field := reflectField(value, fieldName)
+	if !field.IsValid() {
+		return ""
+	}
+	switch field.Kind() {
+	case reflect.String:
+		return strings.TrimSpace(field.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(field.Interface()))
+	}
+}
+
+func reflectedBoolField(value reflect.Value, fieldName string) bool {
+	field := reflectField(value, fieldName)
+	if !field.IsValid() || field.Kind() != reflect.Bool {
+		return false
+	}
+	return field.Bool()
+}
+
+func reflectedIntField(value reflect.Value, fieldName string) int {
+	field := reflectField(value, fieldName)
+	if !field.IsValid() {
+		return 0
+	}
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return int(field.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return int(field.Uint())
+	case reflect.Float32, reflect.Float64:
+		return int(field.Float())
+	default:
+		return 0
+	}
+}
+
+func candidateMaxInt(values ...int) int {
+	maxValue := 0
+	for _, value := range values {
+		if value > maxValue {
+			maxValue = value
+		}
+	}
+	return maxValue
 }

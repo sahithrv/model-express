@@ -1,0 +1,39 @@
+{
+  "name": "plateau_backbone_lottery",
+  "input_summary": {
+    "first_successful_macro_f1": 0.701,
+    "current_best_macro_f1": 0.743,
+    "completed_training_runs": 22,
+    "planner_rounds": 6,
+    "attempted_models": [
+      "efficientnet_b0",
+      "efficientnet_b1",
+      "efficientnet_b2",
+      "mobilenet_v3_large",
+      "resnet18",
+      "regnet_y_400mf"
+    ],
+    "dominant_mechanism": "architecture_challenge"
+  },
+  "expected": {
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "allowed_decisions": [
+      "ADD_EXPERIMENTS",
+      "SELECT_CHAMPION",
+      "STOP_PROJECT",
+      "WAIT"
+    ],
+    "allowed_add_experiment_mechanisms": [
+      "class_imbalance",
+      "minority_targeting",
+      "resolution_crop",
+      "augmentation_auto",
+      "augmentation_mixed_sample",
+      "label_noise_audit",
+      "hard_example_audit",
+      "deployment_latency",
+      "stop_select_champion"
+    ],
+    "max_selected_experiments": 2
+  }
+}

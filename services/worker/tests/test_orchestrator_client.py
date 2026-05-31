@@ -37,6 +37,28 @@ def test_complete_job_uses_longer_report_timeout(monkeypatch):
     ]
 
 
+def test_fail_job_can_report_retryable_failure(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, *, json: dict | None = None, timeout: int | None = None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setenv("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", "240")
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    client.fail_job("job_1", "modal container exited", retryable=True)
+
+    assert calls == [
+        {
+            "url": "http://orchestrator.test/jobs/job_1/fail",
+            "json": {"error": "modal container exited", "retryable": True},
+            "timeout": 240,
+        }
+    ]
+
+
 def test_poll_job_keeps_short_request_timeout(monkeypatch):
     calls = []
 
@@ -52,6 +74,47 @@ def test_poll_job_keeps_short_request_timeout(monkeypatch):
 
     assert calls[0]["url"] == "http://orchestrator.test/workers/worker_1/poll"
     assert calls[0]["timeout"] == 12
+    assert "json" not in calls[0] or calls[0]["json"] is None
+
+
+def test_poll_job_can_send_modal_filter(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, *, json: dict | None = None, timeout: int | None = None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    client.poll_job(
+        "worker_1",
+        provider="modal",
+        templates=["train_experiment", "profile_dataset"],
+        include_unspecified_provider_templates=["profile_dataset"],
+    )
+
+    assert calls[0]["url"] == "http://orchestrator.test/workers/worker_1/poll"
+    assert calls[0]["json"] == {
+        "provider": "modal",
+        "templates": ["train_experiment", "profile_dataset"],
+        "include_unspecified_provider_templates": ["profile_dataset"],
+    }
+
+
+def test_heartbeat_worker_posts_to_worker_heartbeat(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, *, json: dict | None = None, timeout: int | None = None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    client.heartbeat_worker("worker_1")
+
+    assert calls[0]["url"] == "http://orchestrator.test/workers/worker_1/heartbeat"
 
 
 def test_import_dataset_metadata_old_backend_fallback(monkeypatch):

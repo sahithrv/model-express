@@ -64,6 +64,7 @@ type ExperimentPlannerInput struct {
 	VisualExemplarContext        *PlannerVisualExemplarContext
 	ObjectiveContext             ProjectObjectiveContext
 	DeterministicDiagnosis       PlannerDiagnosis
+	ProjectTrajectory            PlannerProjectTrajectoryCard
 	ModelCatalog                 []SupportedModelSpec
 	CurrentChampion              *ExperimentChampion
 	SourcePlanBaselineChampion   *ExperimentChampion
@@ -83,6 +84,7 @@ type ExperimentPlannerInput struct {
 	PriorMemory                  []memory.AgentMemoryRecord
 	ExistingExperimentSignatures []string
 	ValidationFeedback           []PlannerValidationFeedback
+	AgentMode                    string
 	MaxExperiments               int
 	MaxFollowUpRounds            int
 	FollowUpRound                int
@@ -97,6 +99,7 @@ type PlannerContextSnapshot struct {
 	ChampionCard           PlannerChampionCard               `json:"champion_card"`
 	CompletedExperimentLog []PlannerExperimentLog            `json:"completed_experiment_ledger"`
 	FailureDiagnosis       PlannerFailureDiagnosis           `json:"failure_diagnosis"`
+	ProjectTrajectoryCard  PlannerProjectTrajectoryCard      `json:"project_trajectory_card"`
 	TrainingDynamicsCard   PlannerTrainingDynamicsCard       `json:"training_dynamics_card"`
 	PerClassErrorCard      PlannerPerClassErrorCard          `json:"per_class_error_card"`
 	DeploymentCard         PlannerDeploymentCard             `json:"deployment_card"`
@@ -560,6 +563,8 @@ type ExperimentPlanningRecommendation struct {
 	DeterministicDiagnosisUsed    []string                   `json:"deterministic_diagnosis_used"`
 	EvidenceUsed                  []string                   `json:"evidence_used"`
 	Hypothesis                    string                     `json:"hypothesis"`
+	PrimaryMechanism              string                     `json:"primary_mechanism,omitempty"`
+	GovernorCompliance            PlannerGovernorCompliance  `json:"governor_compliance,omitempty"`
 	ExpectedFailureModes          []string                   `json:"expected_failure_modes"`
 	DatasetPreprocessingRationale string                     `json:"dataset_preprocessing_rationale"`
 	ChangedVariables              []string                   `json:"changed_variables"`
@@ -579,6 +584,13 @@ type ExperimentPlanningRecommendation struct {
 	NoveltyNotes                  []string                   `json:"novelty_notes"`
 	RejectedOptions               []RejectedPlannerOption    `json:"rejected_options"`
 	Tags                          []string                   `json:"tags"`
+}
+
+type PlannerGovernorCompliance struct {
+	BlockedMechanismsSeen      []string `json:"blocked_mechanisms_seen"`
+	AvoidedBlockedMechanisms   bool     `json:"avoided_blocked_mechanisms"`
+	WhyAllowedToContinue       string   `json:"why_allowed_to_continue,omitempty"`
+	ExpectedValueJustification string   `json:"expected_value_justification,omitempty"`
 }
 
 type RejectedPlannerOption struct {
@@ -712,19 +724,12 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 	}
 
 	recommendation.AgentName = ExperimentPlannerAgentName
-	if len(recommendation.ProposedExperiments) == 0 && len(recommendation.CandidateHypotheses) > 0 {
-		rankings, selected, mechanisms := RankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, maxPlannerExperiments(input.MaxExperiments))
-		recommendation.CandidateRankings = rankings
-		recommendation.ProposedExperiments = selected
-		recommendation.ProposalMechanisms = mechanisms
-		if strings.TrimSpace(recommendation.PlanningMode) == "" && len(selected) > 0 {
-			for _, ranking := range rankings {
-				if ranking.Selected && strings.TrimSpace(ranking.PlanningMode) != "" {
-					recommendation.PlanningMode = ranking.PlanningMode
-					break
-				}
-			}
-		}
+	recommendation, err = FinalizePlannerRecommendation(input, recommendation)
+	if err != nil {
+		trace.ValidationStatus = memory.InvocationValidationInvalid
+		trace.ValidationError = err.Error()
+		trace.Recommendation = recommendation
+		return trace, err
 	}
 	if err := validateExperimentPlanningRecommendation(recommendation, maxPlannerExperiments(input.MaxExperiments)); err != nil {
 		trace.ValidationStatus = memory.InvocationValidationInvalid
@@ -849,6 +854,13 @@ Deterministic backend policy will validate and schedule accepted experiment prop
   "deterministic_diagnosis_used": ["overfitting_score=0.72", "minority_class_failure_score=0.64"],
   "evidence_used": ["specific metric, diagnosis, champion, dataset-profile, or memory fact used"],
   "hypothesis": "testable claim about why this batch can improve model quality or deployment fitness",
+  "primary_mechanism": "class_imbalance",
+  "governor_compliance": {
+    "blocked_mechanisms_seen": ["architecture_challenge"],
+    "avoided_blocked_mechanisms": true,
+    "why_allowed_to_continue": "The selected candidates use non-exhausted, diagnosis-supported mechanisms.",
+    "expected_value_justification": "Expected impact exceeds planner_context_snapshot.project_trajectory_card.minimum_useful_delta when that card is present."
+  },
   "expected_failure_modes": ["how this strategy could fail"],
   "dataset_preprocessing_rationale": "how the dataset profile or visual evidence changes resolution_strategy, preprocessing, augmentation_policy, augmentation_policy_config, sampling_strategy, class balancing, loss, or metrics",
   "changed_variables": ["model_family", "resolution_strategy", "preprocessing", "augmentation_policy", "augmentation_policy_config", "sampling_strategy", "class_balancing"],
@@ -986,11 +998,18 @@ Deterministic backend policy will validate and schedule accepted experiment prop
 }
 
 Rules:
-- If decision_type is ADD_EXPERIMENTS, propose 1-5 complete, novel experiments.
+- You must choose mechanisms before concrete models/configs.
+- For ADD_EXPERIMENTS, provide candidate_hypotheses. The backend will rank candidates and populate final proposed_experiments.
+- Do not rely on direct proposed_experiments to force scheduling; they are treated as draft only for ADD_EXPERIMENTS.
+- If planner_context_snapshot.project_trajectory_card marks a mechanism as exhausted, do not propose that mechanism.
+- If architecture_challenge is exhausted, do not propose another backbone/model-family-only experiment.
+- Plateau alone is not sufficient evidence for architecture_challenge after repeated architecture attempts.
+- When decision_pressure is champion_confirmation_or_non_architecture_pivot, choose one of: champion confirmation, label/data diagnosis, class imbalance intervention, preprocessing/resolution intervention, SELECT_CHAMPION, STOP_PROJECT, or WAIT.
+- If decision_type is ADD_EXPERIMENTS, propose candidate_hypotheses with complete, novel experiment_config objects.
 - Every candidate_hypothesis must include mechanism, intervention, evidence_used, and expected_effect.
 - Every proposed_experiment must have a matching proposal_mechanisms item with experiment_index, mechanism, intervention, evidence_used, and expected_effect.
-- Prefer returning 6-12 candidate_hypotheses. The backend will score/rank candidates and select 1-5 final proposed_experiments plus proposal_mechanisms if proposed_experiments is empty.
-- If you include both candidate_hypotheses and proposed_experiments, proposed_experiments must be the strongest 1-5 after your own ranking and proposal_mechanisms must explain each one.
+- Prefer returning 6-12 candidate_hypotheses. The backend will score/rank candidates and select 1-5 final proposed_experiments plus proposal_mechanisms.
+- If you include both candidate_hypotheses and proposed_experiments, proposed_experiments are draft-only and must not contradict the candidate set.
 - Mechanism values should come from this taxonomy: baseline_control, architecture_challenge, capacity_finetune, optimizer_scheduler, regularization, augmentation_basic, augmentation_auto, augmentation_mixed_sample, class_imbalance, minority_targeting, resolution_crop, bbox_crop_ablation, label_noise_audit, hard_example_audit, deployment_latency, distillation.
 - Model family is a parameter inside a mechanism, not a mechanism by itself. Do not use architecture_challenge unless deterministic diagnosis supports capacity, underfitting, plateau, or a clear champion challenge.
 - Treat distillation as a rejected/future option unless the context shows backend support. Label-quality audit mechanisms are supported only as report-only jobs with template label_quality_audit.
@@ -1054,6 +1073,7 @@ Rules:
 - Set why_can_beat_champion for ADD_EXPERIMENTS; set stop_reason for SELECT_CHAMPION or STOP_PROJECT.
 - Do not repeat mechanisms or signatures summarized in planner_context_snapshot.search_coverage or mechanism_coverage_card; backend validation checks the full project history even when only a capped signature sample is shown.
 - Candidate ranking will reject or heavily penalize missing mechanism fields, duplicate signatures, tiny-only changes, same-mechanism minor-only variants, architecture-only shopping, high-cost weak-justification experiments, failed strategies with similar traits, objective misalignment, and ideas not tied to planner_context_snapshot.failure_diagnosis.
+- Invalid shallow proposals: trying another backbone only because it exists in the model catalog; repeating EfficientNet/ResNet/MobileNet variants after architecture_challenge is exhausted; changing epochs, learning rate, or batch size without training-dynamics evidence; proposing high-cost work when expected_metric_impact is below planner_context_snapshot.project_trajectory_card.minimum_useful_delta.
 
 Context:
 %s`, string(contextBlob)),
@@ -1074,6 +1094,9 @@ func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningR
 	}
 	switch strings.ToUpper(strings.TrimSpace(recommendation.DecisionType)) {
 	case decisions.TypeAddExperiments:
+		if len(recommendation.CandidateHypotheses) == 0 {
+			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing candidate_hypotheses")
+		}
 		if len(recommendation.ProposedExperiments) == 0 {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing proposed_experiments")
 		}
@@ -1440,6 +1463,7 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		ChampionCard:           plannerChampionCard(input),
 		CompletedExperimentLog: plannerCompletedExperimentLedger(input),
 		FailureDiagnosis:       plannerFailureDiagnosis(input.DeterministicDiagnosis),
+		ProjectTrajectoryCard:  input.ProjectTrajectory,
 		TrainingDynamicsCard:   plannerTrainingDynamicsCard(input),
 		PerClassErrorCard:      plannerPerClassErrorCard(input),
 		DeploymentCard:         plannerDeploymentCard(input),
@@ -2034,6 +2058,10 @@ func plannerExperimentFromJob(job jobs.ExperimentJob) plans.PlannedExperiment {
 	experiment := plans.PlannedExperiment{
 		Template:                 plannerConfigString(config, "experiment_template"),
 		Model:                    plannerConfigString(config, "model"),
+		Mechanism:                plannerConfigString(config, "mechanism"),
+		Intervention:             plannerConfigString(config, "intervention"),
+		EvidenceUsed:             plannerConfigStringSlice(config, "evidence_used"),
+		ExpectedEffect:           plannerConfigString(config, "expected_effect"),
 		Epochs:                   plannerConfigIntDefault(config, "epochs"),
 		BatchSize:                plannerConfigIntDefault(config, "batch_size"),
 		LearningRate:             plannerConfigFloatDefault(config, "learning_rate"),
@@ -2063,6 +2091,9 @@ func plannerExperimentFromJob(job jobs.ExperimentJob) plans.PlannedExperiment {
 	}
 	if preprocessing := plannerConfigPreprocessing(config, "preprocessing"); preprocessing != nil {
 		experiment.Preprocessing = preprocessing
+	}
+	if strings.TrimSpace(experiment.Mechanism) == "" {
+		experiment.Mechanism = plannerExperimentMechanism(experiment, "")
 	}
 	return experiment
 }
@@ -3072,6 +3103,32 @@ func stringsFromAny(value any) []string {
 func plannerConfigString(config map[string]any, key string) string {
 	value, _ := config[key].(string)
 	return strings.TrimSpace(value)
+}
+
+func plannerConfigStringSlice(config map[string]any, key string) []string {
+	raw, ok := config[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch values := raw.(type) {
+	case []string:
+		return nonEmptyStrings(values)
+	case []any:
+		out := []string{}
+		for _, value := range values {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				out = append(out, strings.TrimSpace(text))
+			}
+		}
+		return out
+	case string:
+		if strings.TrimSpace(values) == "" {
+			return nil
+		}
+		return []string{strings.TrimSpace(values)}
+	default:
+		return nil
+	}
 }
 
 func plannerConfigIntDefault(config map[string]any, key string) int {

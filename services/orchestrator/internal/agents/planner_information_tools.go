@@ -283,12 +283,7 @@ func plannerValidateCandidateExperimentsTool(input ExperimentPlannerInput, toolN
 	if recommendation.DecisionType == "" {
 		recommendation.DecisionType = decisions.TypeAddExperiments
 	}
-	if len(recommendation.ProposedExperiments) == 0 && len(recommendation.CandidateHypotheses) > 0 {
-		rankings, selected, mechanisms := RankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, maxPlannerExperiments(input.MaxExperiments))
-		recommendation.CandidateRankings = rankings
-		recommendation.ProposedExperiments = selected
-		recommendation.ProposalMechanisms = mechanisms
-	}
+	recommendation, finalizeErr := FinalizePlannerRecommendation(input, recommendation)
 
 	result := PlannerCandidateDryRunResult{
 		ValidationStatus:        "valid",
@@ -298,8 +293,15 @@ func plannerValidateCandidateExperimentsTool(input ExperimentPlannerInput, toolN
 		WouldWriteRows:          false,
 		WouldScheduleJobs:       false,
 		Details: map[string]any{
-			"dry_run_only": true,
+			"dry_run_only":       true,
+			"candidate_rankings": recommendation.CandidateRankings,
 		},
+	}
+	if finalizeErr != nil {
+		result.Valid = false
+		result.ValidationStatus = "invalid"
+		result.ValidationError = finalizeErr.Error()
+		return acceptedPlannerTool(toolName, map[string]any{"dry_run_validation": result})
 	}
 	if err := validateExperimentPlanningRecommendation(recommendation, maxPlannerExperiments(input.MaxExperiments)); err != nil {
 		result.Valid = false

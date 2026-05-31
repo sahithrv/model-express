@@ -271,6 +271,26 @@ type MechanismCoverageRow = {
   detail: string;
 };
 
+type DecisionQualitySnapshot = {
+  decisionId: string;
+  decisionType: string;
+  createdAt: string;
+  source: string;
+  decisionPressure: string;
+  blockedMechanisms: string[];
+  completedTrainingRuns: number | null;
+  completedPlannerRounds: number | null;
+  gainPerCompletedRun: number | null;
+  recentBestDelta: number | null;
+  minimumUsefulDelta: number | null;
+  selectedCandidates: number;
+  totalCandidates: number;
+  rejectedCandidates: number;
+  topRejectionReason: string;
+  exhaustedOutcomes: MechanismCoverageRow[];
+  warnings: string[];
+};
+
 type ChampionExportDemo = {
   hasChampion: boolean;
   exportStatus: string;
@@ -794,7 +814,7 @@ export function App() {
           projectId: requirement.project_id,
           baseUrl,
           name: `auto-worker-${requirement.project_id}`,
-          gpuType: requirement.gpu_type || requirement.provider || "local",
+          gpuType: requirement.provider === "modal" ? "modal" : requirement.gpu_type || requirement.provider || "local",
           count: requirement.target_count,
         });
 
@@ -2019,6 +2039,10 @@ export function App() {
             </div>
           </Panel>
 
+					<Panel title="Decision Quality" icon={<BarChart3 size={17} />} wide tab="agents">
+            <DecisionQualityPanel decisions={detail.decisions} invocations={detail.agentInvocations} />
+          </Panel>
+
 					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide tab="operations">
             <div className="automation-grid">
               <div className="automation-block">
@@ -2584,6 +2608,114 @@ function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function DecisionQualityPanel({
+  decisions,
+  invocations,
+}: {
+  decisions: AgentDecision[];
+  invocations: AgentInvocation[];
+}) {
+  const snapshot = buildDecisionQualitySnapshot(decisions, invocations);
+
+  if (!snapshot) {
+    return <div className="empty">Decision quality metadata will appear after the Experiment Planner records trajectory data.</div>;
+  }
+
+  const facts = [
+    { label: "Decision Pressure", value: snapshot.decisionPressure || "-" },
+    {
+      label: "Blocked",
+      value: snapshot.blockedMechanisms.length > 0 ? snapshot.blockedMechanisms.join(", ") : "none",
+    },
+    { label: "Training Runs", value: formatDecisionQualityCount(snapshot.completedTrainingRuns) },
+    { label: "Planner Rounds", value: formatDecisionQualityCount(snapshot.completedPlannerRounds) },
+    { label: "Gain / Run", value: formatDecisionQualityMetric(snapshot.gainPerCompletedRun, true) },
+    { label: "Recent Delta", value: formatDecisionQualityMetric(snapshot.recentBestDelta, true) },
+    { label: "Useful Delta", value: formatDecisionQualityMetric(snapshot.minimumUsefulDelta, false) },
+    {
+      label: "Candidates",
+      value: snapshot.totalCandidates > 0 ? `${snapshot.selectedCandidates}/${snapshot.totalCandidates} selected` : "-",
+    },
+    { label: "Rejected", value: String(snapshot.rejectedCandidates) },
+    { label: "Top Rejection", value: snapshot.topRejectionReason || "none" },
+  ];
+
+  return (
+    <div className="decision-quality-panel">
+      <div className="decision-quality-head">
+        <span>
+          <strong>{snapshot.decisionType}</strong>
+          <small>
+            {[snapshot.createdAt ? new Date(snapshot.createdAt).toLocaleString() : "", snapshot.decisionId, snapshot.source]
+              .filter(Boolean)
+              .join(" - ")}
+          </small>
+        </span>
+        <Badge value={snapshot.decisionPressure || "normal"} />
+      </div>
+
+      <div className="decision-quality-facts">
+        {facts.map((item) => (
+          <span key={item.label}>
+            <small>{item.label}</small>
+            <strong title={item.value}>{item.value}</strong>
+          </span>
+        ))}
+      </div>
+
+      <div className="decision-quality-sections">
+        <div className="decision-quality-section">
+          <strong>Blocked Mechanisms</strong>
+          {snapshot.blockedMechanisms.length > 0 ? (
+            <div className="decision-quality-tags">
+              {snapshot.blockedMechanisms.map((mechanism) => (
+                <small key={mechanism}>{mechanism}</small>
+              ))}
+            </div>
+          ) : (
+            <div className="empty compact">No blocked mechanisms reported.</div>
+          )}
+        </div>
+
+        <div className="decision-quality-section">
+          <strong>Governor Outcomes</strong>
+          {snapshot.exhaustedOutcomes.length > 0 ? (
+            <div className="decision-quality-list">
+              {snapshot.exhaustedOutcomes.map((row) => (
+                <div className="decision-quality-row" key={`${row.status}-${row.mechanism}-${row.detail}`}>
+                  <span>
+                    <strong>{row.mechanism}</strong>
+                    <small>{row.detail}</small>
+                  </span>
+                  <Badge value={row.status} />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="empty compact">No exhausted governor outcomes reported.</div>
+          )}
+        </div>
+      </div>
+
+      {snapshot.warnings.length > 0 && (
+        <div className="decision-quality-section warning">
+          <strong>Trajectory Warnings</strong>
+          <div className="decision-quality-list">
+            {snapshot.warnings.slice(0, 4).map((warning) => (
+              <div className="decision-quality-row" key={warning}>
+                <span>
+                  <strong>{warning}</strong>
+                </span>
+                <Badge value="WARN" />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -4507,6 +4639,148 @@ function decisionRejections(decision: AgentDecision) {
   return items.slice(0, 8);
 }
 
+function buildDecisionQualitySnapshot(decisions: AgentDecision[], invocations: AgentInvocation[]): DecisionQualitySnapshot | null {
+  const decision = latestDecisionWithQualityContext(decisions);
+  const payload = decision?.payload ?? {};
+  const trajectory = firstNonEmptyRecord([
+    recordObject(payload.project_trajectory_card),
+    recordObject(payload.projectTrajectoryCard),
+    latestProjectTrajectoryFromInvocations(invocations),
+  ]);
+
+  const rankings = Array.isArray(payload.candidate_rankings) ? payload.candidate_rankings.map(recordObject) : [];
+  const candidateHypotheses = Array.isArray(payload.candidate_hypotheses) ? payload.candidate_hypotheses.length : 0;
+  const proposedExperiments = Array.isArray(payload.proposed_experiments) ? payload.proposed_experiments.length : 0;
+  const selectedCandidates = rankings.filter((ranking) => ranking.selected === true).length || proposedExperiments;
+  const rejectedCandidates = rankings.filter((ranking) => ranking.rejected === true).length;
+  const totalCandidates = rankings.length || candidateHypotheses || selectedCandidates + rejectedCandidates;
+  const topRejectionReason =
+    topCandidateRejectionReason(rankings) || (decision ? decisionRejections(decision)[0]?.text ?? "" : "");
+  const hasTrajectory = Object.keys(trajectory).length > 0;
+  const hasQualityPayload = hasTrajectory || rankings.length > 0 || candidateHypotheses > 0 || proposedExperiments > 0 || Boolean(topRejectionReason);
+  if (!decision && !hasTrajectory) return null;
+  if (!hasQualityPayload) return null;
+
+  return {
+    decisionId: decision?.id ?? "no decision",
+    decisionType: decision?.decision_type ?? "TRAJECTORY",
+    createdAt: decision?.created_at ?? latestInvocationTimestamp(invocations),
+    source: hasTrajectory ? "project trajectory" : "decision payload",
+    decisionPressure:
+      recordFirstString(trajectory, ["decision_pressure", "DecisionPressure"]) ||
+      recordFirstString(payload, ["decision_pressure", "project_decision_pressure"]) ||
+      "normal",
+    blockedMechanisms: uniqueStrings([
+      ...stringArrayPayload(trajectory.blocked_mechanisms),
+      ...stringArrayPayload(trajectory.BlockedMechanisms),
+    ]),
+    completedTrainingRuns: recordFirstNumber(trajectory, ["completed_training_runs", "CompletedTrainingRuns"]),
+    completedPlannerRounds: recordFirstNumber(trajectory, ["completed_planner_rounds", "CompletedPlannerRounds"]),
+    gainPerCompletedRun: recordFirstNumber(trajectory, ["gain_per_completed_run", "GainPerCompletedRun"]),
+    recentBestDelta: recordFirstNumber(trajectory, ["recent_best_delta", "RecentBestDelta"]),
+    minimumUsefulDelta: recordFirstNumber(trajectory, ["minimum_useful_delta", "MinimumUsefulDelta"]),
+    selectedCandidates,
+    totalCandidates,
+    rejectedCandidates,
+    topRejectionReason,
+    exhaustedOutcomes: decisionQualityMechanismOutcomes(trajectory),
+    warnings: uniqueStrings([...stringArrayPayload(trajectory.warnings), ...stringArrayPayload(trajectory.Warnings)]).slice(0, 6),
+  };
+}
+
+function latestDecisionWithQualityContext(decisions: AgentDecision[]) {
+  const sorted = [...decisions].sort((left, right) => timestampSortScore(right.created_at) - timestampSortScore(left.created_at));
+  return (
+    sorted.find((decision) => Object.keys(recordObject(decision.payload?.project_trajectory_card)).length > 0) ??
+    sorted.find((decision) => Array.isArray(decision.payload?.candidate_rankings)) ??
+    sorted[0] ??
+    null
+  );
+}
+
+function latestProjectTrajectoryFromInvocations(invocations: AgentInvocation[]) {
+  const sorted = [...invocations].sort((left, right) => timestampSortScore(right.created_at) - timestampSortScore(left.created_at));
+  for (const invocation of sorted) {
+    if (invocation.agent_name && invocation.agent_name !== "experiment_planner") continue;
+    const inputContext = recordObject(invocation.input_context);
+    const direct = recordObject(inputContext.project_trajectory_card ?? inputContext.projectTrajectoryCard);
+    if (Object.keys(direct).length > 0) return direct;
+
+    const snapshot = recordObject(inputContext.planner_context_snapshot ?? inputContext.plannerContextSnapshot);
+    const nested = recordObject(snapshot.project_trajectory_card ?? snapshot.projectTrajectoryCard);
+    if (Object.keys(nested).length > 0) return nested;
+  }
+  return {};
+}
+
+function latestInvocationTimestamp(invocations: AgentInvocation[]) {
+  const latest = [...invocations].sort((left, right) => timestampSortScore(right.created_at) - timestampSortScore(left.created_at))[0];
+  return latest?.created_at ?? "";
+}
+
+function firstNonEmptyRecord(records: Record<string, unknown>[]) {
+  return records.find((record) => Object.keys(record).length > 0) ?? {};
+}
+
+function topCandidateRejectionReason(rankings: Record<string, unknown>[]) {
+  for (const ranking of rankings) {
+    if (ranking.rejected !== true) continue;
+    const reasons = stringArrayPayload(ranking.reasons);
+    if (reasons.length > 0) return reasons[0];
+    const validationError = recordFirstString(ranking, ["backend_validation_error", "validation_error", "planner_validation_error"]);
+    if (validationError) return validationError;
+    const status = recordFirstString(ranking, ["backend_validation_status", "validation_status", "planner_validation_status"]);
+    if (status) return status;
+  }
+  return "";
+}
+
+function decisionQualityMechanismOutcomes(trajectory: Record<string, unknown>): MechanismCoverageRow[] {
+  const outcomesValue = trajectory.mechanism_outcomes ?? trajectory.MechanismOutcomes;
+  const outcomes = Array.isArray(outcomesValue) ? outcomesValue.map(recordObject) : [];
+  return outcomes
+    .map((record) => {
+      const mechanism = recordFirstString(record, ["mechanism", "Mechanism"]);
+      const status = recordFirstString(record, ["status", "Status"]);
+      return {
+        mechanism,
+        status: status ? status.toUpperCase() : "OUTCOME",
+        detail: decisionQualityOutcomeDetail(record),
+      };
+    })
+    .filter(
+      (row) =>
+        row.mechanism &&
+        ["BLOCKED", "EXHAUSTED"].includes(row.status.toUpperCase()),
+    )
+    .slice(0, 8);
+}
+
+function decisionQualityOutcomeDetail(record: Record<string, unknown>) {
+  const reason = recordFirstString(record, ["exhaustion_reason", "ExhaustionReason", "reason", "detail"]);
+  if (reason) return reason;
+  const attempts = recordFirstNumber(record, ["attempt_count", "AttemptCount"]);
+  const recentDelta = recordFirstNumber(record, ["recent_best_delta", "RecentBestDelta"]);
+  const parts = [
+    attempts !== null ? `${attempts} attempt(s)` : "",
+    recentDelta !== null ? `recent delta ${formatDecisionQualityMetric(recentDelta, true)}` : "",
+  ].filter(Boolean);
+  return parts.join(" - ") || "governor status";
+}
+
+function recordFirstNumber(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = numberPayload(record[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function timestampSortScore(value?: string) {
+  const timestamp = Date.parse(value || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
 function buildChampionComparison(
   summaries: TrainingRunSummary[],
   evaluations: TrainingRunEvaluation[],
@@ -5717,6 +5991,16 @@ function formatSeconds(value: number) {
 function formatMaybeMetric(value: number) {
   if (!value) return "-";
   return value.toFixed(3);
+}
+
+function formatDecisionQualityCount(value: number | null) {
+  return value === null || !Number.isFinite(value) ? "-" : String(value);
+}
+
+function formatDecisionQualityMetric(value: number | null, signed: boolean) {
+  if (value === null || !Number.isFinite(value)) return "-";
+  const sign = signed && value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(3)}`;
 }
 
 function formatPercent(value: number) {

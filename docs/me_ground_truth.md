@@ -12,6 +12,8 @@ LLMs propose structured JSON -> backend validates -> backend stores/schedules ->
 
 LLMs never directly create workers, mutate datasets, choose arbitrary filesystem paths, enqueue jobs, export models, or run inference. Every executable action must pass through deterministic Go backend validation.
 
+For Experiment Planner `ADD_EXPERIMENTS` decisions, the LLM proposes mechanism-level `candidate_hypotheses`. The backend finalizer is authoritative: direct LLM `proposed_experiments` are draft-only, and the backend ranks candidates before populating final `proposed_experiments` and `proposal_mechanisms`.
+
 ## Main Components
 
 - Mission Control (`apps/mission-control`): Electron/Vite/React operator UI for projects, datasets, plans, jobs, agents, workers, champions, export records, and demo surfaces.
@@ -104,6 +106,12 @@ Duplicate experiment signatures include preprocessing, augmentation policy/confi
 
 LLM-originated follow-up proposals must name a mechanism and evidence-backed intervention. Label-quality mechanisms can only schedule report-only `label_quality_audit` jobs; they cannot create training jobs or mutate labels. MixUp/CutMix require bounded mixed-sample augmentation config. Effective-number class balancing requires bounded `class_balancing_config.effective_number_beta`.
 
+The Experiment Planner now has a project trajectory governor. Planner input includes a `project_trajectory_card` with completed training runs, completed planner rounds, first successful score, current champion score, absolute champion gain, gain per completed run, recent best delta, minimum useful delta, no-improvement rounds, decision pressure, mechanism outcomes, blocked mechanisms, and warnings. The backend computes this card from prior plans, jobs, summaries, scorecards, rejected options, and champion context.
+
+Mechanism outcomes aggregate attempts, plan counts, best score, best delta versus prior champion, recent best delta, cost, runtime, status, and exhaustion reason. Repeated low-yield `architecture_challenge` attempts are marked exhausted, so plateau alone no longer justifies another backbone/model-family sweep. Exhausted or blocked mechanisms are rejected by backend candidate ranking. Plateau exits include champion confirmation, non-architecture pivots such as class imbalance or preprocessing/resolution work, label/hard-example audits, `SELECT_CHAMPION`, `STOP_PROJECT`, and `WAIT`.
+
+Autonomous mode is more conservative than propose mode. Unless overridden by environment variables, autonomous planner guards default on, the minimum meaningful target-metric delta defaults to `0.010`, and automatic follow-up rounds default to `3`. Propose/manual mode keeps the more flexible legacy defaults unless explicitly configured.
+
 When an LLM planner proposal passes JSON/schema parsing but fails backend validation, the backend records the rejected invocation outcome and performs one bounded correction retry with `planner_validation_feedback` in the prompt context. The retry can only succeed if the corrected JSON passes the same backend validation and scheduling gates.
 
 ## Training Flow
@@ -145,7 +153,11 @@ Experiment Planner reviews completed plans and can recommend:
 - `STOP_PROJECT`
 - `WAIT`
 
-Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional agent-safe normalized metadata summaries, optional visual evidence, objective context, deterministic diagnosis, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, validation feedback, and existing experiment signatures.
+Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional agent-safe normalized metadata summaries, optional visual evidence, objective context, deterministic diagnosis, project trajectory, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, validation feedback, and existing experiment signatures.
+
+For `ADD_EXPERIMENTS`, the Planner must return `candidate_hypotheses` with mechanism, intervention, evidence, expected effect, expected metric impact, tradeoffs, risk/cost/novelty, proposed changes, and a complete executable experiment config. `FinalizePlannerRecommendation` then applies deterministic backend ranking and governor checks. If no candidate survives, the planner output is rejected rather than scheduled.
+
+Planner decisions persist the `project_trajectory_card` alongside candidate rankings, so operator-facing audit views can explain why the backend selected, rejected, blocked, or stopped a recommendation.
 
 Live/real-time objective handling treats latency as a budget and tiebreaker rather than a primary search driver. Latency below roughly 25ms is considered acceptable for live use, so the Planner and Training Monitor should prioritize macro-F1, per-class recall, and meaningful quality gains unless latency exceeds the budget or quality is otherwise close.
 
@@ -206,6 +218,7 @@ Mission Control polls project detail endpoints and optionally consumes `GET /pro
 - automation settings and worker requirements
 - experiment timeline and execution events
 - agent decisions, rejections, candidate score components, and scorecards
+- read-only decision-quality visibility for project trajectory pressure, blocked mechanisms, completed runs, gain per run, recent best delta, selected/rejected candidate counts, and top rejection reasons
 - plans with typed preprocessing fields
 - run summaries/evaluations, metric charts, per-class metrics, confusion previews, and backend training diagnostics
 - selected champion and export/demo panel
@@ -232,6 +245,9 @@ Implemented/current-scale hardening:
 - Worker requirements and execution events for local worker supervision.
 - Additive indexes for common project/status/agent/memory/scorecard reads.
 - Follow-up rounds remain bounded by automation settings and max follow-up rounds.
+- Experiment Planner `ADD_EXPERIMENTS` cannot bypass backend candidate ranking.
+- Dry-run planner validation uses the same backend finalizer as scheduling, so repair prompts receive finalizer rejection reasons.
+- Deterministic replay evals under `services/orchestrator/internal/agents/evals` include the `plateau_backbone_lottery` fixture for the 20+ low-yield backbone/model-family failure mode.
 - AutoML is settings-gated, backend-validated, persisted with provenance, and linked to normal plan/job execution rather than owning scheduling.
 - Normalized dataset metadata imports are additive, active-import replacement is transactional in Postgres, and agent-safe summaries are separated from raw source previews.
 
@@ -254,5 +270,6 @@ Known reliability gaps:
 - Real model reconstruction/export from completed training runs when no worker-visible artifact exists.
 - Heavier Bayesian/TPE/GP AutoML dependencies and richer multi-trial acquisition policies beyond the current lightweight adaptive sampler.
 - Durable idempotency keys, async agent task queue, and a standalone lease-recovery loop.
+- Semantic/vector planner memory, multi-agent planner debate, tree search/MCTS over plans, planner fine-tuning, and prompt caching.
 
 Do not add Kafka, Redis, NATS, WebSockets, or a workflow engine until Postgres hardening, leases, idempotency, and SSE are no longer sufficient.

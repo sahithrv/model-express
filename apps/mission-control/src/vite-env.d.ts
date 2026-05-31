@@ -76,6 +76,8 @@ interface Window {
       started: boolean;
       started_count: number;
       running_count: number;
+      process_count?: number;
+      dispatcher?: boolean;
       status: string;
     }>;
   };

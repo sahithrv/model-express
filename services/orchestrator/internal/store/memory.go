@@ -505,7 +505,7 @@ func (s *MemoryStore) HeartbeatWorker(id string) (workers.Worker, error) {
 	return worker, nil
 }
 
-func (s *MemoryStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
+func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.ExperimentJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -538,9 +538,13 @@ func (s *MemoryStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 		if job.ProjectID != worker.ProjectID {
 			continue
 		}
+		if !filter.Matches(job) {
+			continue
+		}
 
 		job.WorkerID = workerID
 		job.Status = jobs.StatusAssigned
+		job.Error = ""
 		job.Attempt++
 		if job.MaxAttempts < 1 {
 			job.MaxAttempts = defaultJobMaxAttempts
@@ -1116,7 +1120,7 @@ func (s *MemoryStore) SaveAutomationSettings(automationSettings settings.Automat
 	return automationSettings, nil
 }
 
-func (s *MemoryStore) UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string) (execution.WorkerRequirement, bool, error) {
+func (s *MemoryStore) UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string, policy execution.WorkerRequirementPolicy) (execution.WorkerRequirement, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1135,6 +1139,7 @@ func (s *MemoryStore) UpsertWorkerRequirement(projectID string, planID string, p
 			requirement.GPUType = gpuType
 			requirement.TargetCount = targetCount
 			requirement.Source = source
+			applyWorkerRequirementPolicy(&requirement, policy)
 			if targetChanged || requirement.Status == execution.WorkerRequirementFailed || requirement.Status == execution.WorkerRequirementCancelled {
 				requirement.Status = execution.WorkerRequirementPending
 				requirement.LastError = ""
@@ -1157,8 +1162,19 @@ func (s *MemoryStore) UpsertWorkerRequirement(projectID string, planID string, p
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
+	applyWorkerRequirementPolicy(&requirement, policy)
 	s.workerRequirements[requirement.ID] = requirement
 	return requirement, true, nil
+}
+
+func applyWorkerRequirementPolicy(requirement *execution.WorkerRequirement, policy execution.WorkerRequirementPolicy) {
+	requirement.DatasetID = policy.DatasetID
+	requirement.DatasetChecksum = policy.DatasetChecksum
+	requirement.DatasetCacheKey = policy.DatasetCacheKey
+	requirement.DatasetMaterializationStatus = policy.DatasetMaterializationStatus
+	requirement.ColdCachePolicy = policy.ColdCachePolicy
+	requirement.MaxConcurrentJobs = policy.MaxConcurrentJobs
+	requirement.MaxColdDatasetMaterializations = policy.MaxColdDatasetMaterializations
 }
 
 func (s *MemoryStore) ListProjectWorkerRequirements(projectID string) ([]execution.WorkerRequirement, error) {
@@ -1735,6 +1751,52 @@ func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.Expe
 
 func (s *MemoryStore) CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error) {
 	return s.finishJob(jobID, jobs.StatusSucceeded, mlflowRunID, "")
+}
+
+func (s *MemoryStore) RetryJob(jobID string, message string) (jobs.ExperimentJob, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return jobs.ExperimentJob{}, false, ErrNotFound
+	}
+	if job.MaxAttempts < 1 {
+		job.MaxAttempts = defaultJobMaxAttempts
+	}
+
+	now := time.Now().UTC()
+	requeued := job.Attempt < job.MaxAttempts
+	if requeued {
+		job.Status = jobs.StatusQueued
+		job.Error = message
+		job.WorkerID = ""
+		job.StartedAt = nil
+		job.CompletedAt = nil
+		job.MLflowRunID = ""
+	} else {
+		job.Status = jobs.StatusFailed
+		job.Error = message
+		job.CompletedAt = &now
+	}
+	job.LeaseOwnerWorkerID = ""
+	job.LeaseExpiresAt = nil
+	job.LeaseLastHeartbeatAt = nil
+	s.jobs[jobID] = job
+
+	for workerID, worker := range s.workers {
+		if worker.CurrentJobID != jobID {
+			continue
+		}
+		worker.CurrentJobID = ""
+		if worker.Status != workers.StatusOffline {
+			worker.Status = workers.StatusIdle
+		}
+		worker.LastHeartbeat = now
+		s.workers[workerID] = worker
+	}
+
+	return job, requeued, nil
 }
 
 func (s *MemoryStore) FailJob(jobID string, message string) (jobs.ExperimentJob, error) {

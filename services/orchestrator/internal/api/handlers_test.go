@@ -27,6 +27,7 @@ import (
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/strategies"
+	"model-express/services/orchestrator/internal/workers"
 )
 
 func TestAutomationSettingsPersistAndReload(t *testing.T) {
@@ -845,7 +846,7 @@ func TestExpiredJobLeasesRequeueThenFailAtMaxAttempts(t *testing.T) {
 		t.Fatalf("create job: %v", err)
 	}
 	for attempt := 1; attempt <= 2; attempt++ {
-		assigned, err := memoryStore.PollJob(worker.ID)
+		assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{})
 		if err != nil {
 			t.Fatalf("poll attempt %d: %v", attempt, err)
 		}
@@ -860,7 +861,7 @@ func TestExpiredJobLeasesRequeueThenFailAtMaxAttempts(t *testing.T) {
 			t.Fatalf("expected queued recovery at attempt %d, got %#v", attempt, recovered)
 		}
 	}
-	assigned, err := memoryStore.PollJob(worker.ID)
+	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{})
 	if err != nil {
 		t.Fatalf("poll final attempt: %v", err)
 	}
@@ -873,6 +874,145 @@ func TestExpiredJobLeasesRequeueThenFailAtMaxAttempts(t *testing.T) {
 	}
 	if len(recovered) != 1 || recovered[0].Status != jobs.StatusFailed {
 		t.Fatalf("expected failed recovery at max attempts, got %#v", recovered)
+	}
+}
+
+func TestRetryableFailJobRequeuesUntilMaxAttempts(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{})
+		if err != nil {
+			t.Fatalf("poll attempt %d: %v", attempt, err)
+		}
+		if assigned.ID != job.ID || assigned.Attempt != attempt {
+			t.Fatalf("unexpected assigned job at attempt %d: %#v", attempt, assigned)
+		}
+		body := strings.NewReader(`{"error":"modal container exited before completion","retryable":true}`)
+		req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", body)
+		req.Header.Set("Content-Type", "application/json")
+		resp := httptest.NewRecorder()
+		router.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected retryable fail status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+		}
+		requeued, err := memoryStore.GetJob(job.ID)
+		if err != nil {
+			t.Fatalf("get requeued job: %v", err)
+		}
+		if requeued.Status != jobs.StatusQueued || requeued.Attempt != attempt {
+			t.Fatalf("expected queued retry at attempt %d, got %#v", attempt, requeued)
+		}
+		updatedWorker, err := memoryStore.GetWorker(worker.ID)
+		if err != nil {
+			t.Fatalf("get worker: %v", err)
+		}
+		if updatedWorker.CurrentJobID != "" || updatedWorker.Status != workers.StatusIdle {
+			t.Fatalf("expected worker released after retryable failure, got %#v", updatedWorker)
+		}
+	}
+
+	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{})
+	if err != nil {
+		t.Fatalf("poll final attempt: %v", err)
+	}
+	if assigned.ID != job.ID || assigned.Attempt != 3 {
+		t.Fatalf("unexpected final assignment: %#v", assigned)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", strings.NewReader(`{"error":"modal container exited before completion","retryable":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected final retryable fail status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	failed, err := memoryStore.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get failed job: %v", err)
+	}
+	if failed.Status != jobs.StatusFailed || failed.Attempt != 3 {
+		t.Fatalf("expected terminal failure after max attempts, got %#v", failed)
+	}
+}
+
+func TestPollJobFiltersModalProviderAndProfileFallback(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "modal dispatcher slot", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "local",
+	}); err != nil {
+		t.Fatalf("create local job: %v", err)
+	}
+	modalJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+	})
+	if err != nil {
+		t.Fatalf("create modal job: %v", err)
+	}
+
+	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{
+		Provider:  "modal",
+		Templates: []string{jobs.TemplateTrainExperiment},
+	})
+	if err != nil {
+		t.Fatalf("poll modal job: %v", err)
+	}
+	if assigned.ID != modalJob.ID {
+		t.Fatalf("expected modal job assignment, got %#v", assigned)
+	}
+	if _, err := memoryStore.CompleteJob(assigned.ID, ""); err != nil {
+		t.Fatalf("complete modal job: %v", err)
+	}
+
+	profileJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateProfileDataset, map[string]any{
+		"dataset_id": dataset.ID,
+	})
+	if err != nil {
+		t.Fatalf("create profile job: %v", err)
+	}
+	assigned, err = memoryStore.PollJob(worker.ID, store.JobPollFilter{
+		Provider:                            "modal",
+		Templates:                           []string{jobs.TemplateProfileDataset},
+		IncludeUnspecifiedProviderTemplates: []string{jobs.TemplateProfileDataset},
+	})
+	if err != nil {
+		t.Fatalf("poll profile fallback job: %v", err)
+	}
+	if assigned.ID != profileJob.ID {
+		t.Fatalf("expected profile fallback assignment, got %#v", assigned)
 	}
 }
 
@@ -1061,7 +1201,8 @@ func TestAutomaticExecutionWorkerRequirementScalesToQueuedJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", "", 0)
+	checksum := strings.Repeat("a", 64)
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", checksum, 0)
 	if err != nil {
 		t.Fatalf("create dataset: %v", err)
 	}
@@ -1096,13 +1237,84 @@ func TestAutomaticExecutionWorkerRequirementScalesToQueuedJobs(t *testing.T) {
 	if requirements[0].Status != execution.WorkerRequirementPending {
 		t.Fatalf("expected pending requirement, got %s", requirements[0].Status)
 	}
+	if requirements[0].DatasetID != dataset.ID || requirements[0].DatasetChecksum != checksum {
+		t.Fatalf("expected dataset materialization identity on requirement, got %#v", requirements[0])
+	}
+	expectedCacheKey := "sha256-" + checksum
+	if requirements[0].DatasetCacheKey != expectedCacheKey {
+		t.Fatalf("expected checksum cache key, got %q", requirements[0].DatasetCacheKey)
+	}
+	if requirements[0].ColdCachePolicy != execution.ColdCachePolicySingleMaterialization || requirements[0].MaxColdDatasetMaterializations != 1 {
+		t.Fatalf("expected modal cold cache policy on requirement, got %#v", requirements[0])
+	}
+	materialization, ok := executionResult.Jobs[0].Config["dataset_materialization"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected dataset materialization config, got %#v", executionResult.Jobs[0].Config)
+	}
+	if materialization["dataset_cache_key"] != expectedCacheKey || materialization["cold_cache_policy"] != execution.ColdCachePolicySingleMaterialization {
+		t.Fatalf("unexpected dataset materialization config: %#v", materialization)
+	}
+}
+
+func TestModalWorkerRequirementIgnoresLocalWorkerCapacity(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", "abc123", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	if _, err := memoryStore.RegisterWorker(project.ID, "local worker", "local"); err != nil {
+		t.Fatalf("register local worker: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 1, 10, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	executionResult, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if err := server.recordAutomaticExecutionQueued(plan, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"}, executionResult.Jobs); err != nil {
+		t.Fatalf("record automatic execution queued: %v", err)
+	}
+
+	requirements, err := server.store.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list requirements: %v", err)
+	}
+	if len(requirements) != 1 {
+		t.Fatalf("expected one worker requirement, got %d", len(requirements))
+	}
+	if requirements[0].Status != execution.WorkerRequirementPending {
+		t.Fatalf("expected modal requirement to stay pending with only local workers active, got %s", requirements[0].Status)
+	}
+	if _, err := memoryStore.RegisterWorker(project.ID, "modal worker", "modal"); err != nil {
+		t.Fatalf("register modal worker: %v", err)
+	}
+	if err := server.recordAutomaticExecutionQueued(plan, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"}, executionResult.Jobs); err != nil {
+		t.Fatalf("record automatic execution queued after modal worker: %v", err)
+	}
+	requirements, err = server.store.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list requirements after modal worker: %v", err)
+	}
+	if requirements[0].Status != execution.WorkerRequirementActive {
+		t.Fatalf("expected modal requirement to become active with modal worker, got %s", requirements[0].Status)
+	}
 }
 
 func TestWorkerRequirementResetsPendingWhenTargetChanges(t *testing.T) {
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 6),
 	})
-	requirement, _, err := server.store.UpsertWorkerRequirement(projectID, plan.ID, "modal", "T4", 1, "test")
+	requirement, _, err := server.store.UpsertWorkerRequirement(projectID, plan.ID, "modal", "T4", 1, "test", execution.WorkerRequirementPolicy{})
 	if err != nil {
 		t.Fatalf("upsert worker requirement: %v", err)
 	}
@@ -1110,7 +1322,7 @@ func TestWorkerRequirementResetsPendingWhenTargetChanges(t *testing.T) {
 	if _, err := server.store.UpdateWorkerRequirement(requirement.ID, execution.WorkerRequirementUpdate{Status: &active}); err != nil {
 		t.Fatalf("mark worker requirement active: %v", err)
 	}
-	updated, _, err := server.store.UpsertWorkerRequirement(projectID, plan.ID, "modal", "T4", 2, "test")
+	updated, _, err := server.store.UpsertWorkerRequirement(projectID, plan.ID, "modal", "T4", 2, "test", execution.WorkerRequirementPolicy{})
 	if err != nil {
 		t.Fatalf("upsert changed worker requirement: %v", err)
 	}
@@ -1809,6 +2021,30 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 			"success_criteria": "Improve macro-F1 over the prior best run.",
 			"stop_condition": "Select champion if the repeat does not improve.",
 			"deployment_tradeoff": "Same deployment profile but more training cost.",
+			"candidate_hypotheses": [{
+				"hypothesis": "More epochs may improve the previous best MobileNet model.",
+				"planning_mode": "exploit",
+				"mechanism": "capacity_finetune",
+				"intervention": "Extend the prior MobileNet training budget without changing preprocessing.",
+				"proposed_changes": {"scheduler": "none", "epochs": 6},
+				"expected_effect": "Determine whether the prior best model was simply undertrained.",
+				"expected_metric_impact": 0.01,
+				"expected_tradeoffs": ["more runtime"],
+				"risk": "medium",
+				"cost_level": "low",
+				"novelty_score": 0.25,
+				"evidence_used": ["previous MobileNet was best"],
+				"similar_success_memory_ids": [],
+				"similar_failure_memory_ids": [],
+				"experiment_config": {
+					"template": "mobilenet_transfer",
+					"model": "mobilenet_v3_small",
+					"epochs": 12,
+					"batch_size": 16,
+					"learning_rate": 0.0003,
+					"reason": "Repeat MobileNet with more epochs."
+				}
+			}],
 			"proposed_experiments": [{
 				"template": "mobilenet_transfer",
 				"model": "mobilenet_v3_small",
@@ -1847,6 +2083,35 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 			"success_criteria": "Improve macro-F1 by at least 0.01 without excessive latency.",
 			"stop_condition": "Select champion if this mechanism does not improve.",
 			"deployment_tradeoff": "More runtime for a stronger quality challenger.",
+			"candidate_hypotheses": [{
+				"hypothesis": "EfficientNet with moderate augmentation and weighted loss can improve macro-F1 more than a shallow epoch repeat.",
+				"planning_mode": "preprocessing_ablation",
+				"mechanism": "class_imbalance",
+				"intervention": "Use weighted loss and weighted sampling with a stronger EfficientNet challenger.",
+				"proposed_changes": {"model_family": "efficientnet", "resolution_strategy": "high_resolution_ablation", "augmentation_policy": "moderate", "class_balancing": "weighted_loss"},
+				"expected_effect": "Improve macro-F1 by addressing class imbalance instead of repeating training budget.",
+				"expected_metric_impact": 0.02,
+				"expected_tradeoffs": ["higher runtime"],
+				"risk": "medium",
+				"cost_level": "medium",
+				"novelty_score": 0.8,
+				"evidence_used": ["backend rejected the minor-only repeat", "prior run plateaued"],
+				"similar_success_memory_ids": [],
+				"similar_failure_memory_ids": [],
+				"experiment_config": {
+					"template": "efficientnet_transfer",
+					"model": "efficientnet_b0",
+					"epochs": 10,
+					"batch_size": 16,
+					"learning_rate": 0.0003,
+					"reason": "Corrected proposal changes family, augmentation, and balancing.",
+					"image_size": 256,
+					"resolution_strategy": "high_resolution_ablation",
+					"augmentation_policy": "moderate",
+					"class_balancing": "weighted_loss",
+					"sampling_strategy": "weighted_random_sampler"
+				}
+			}],
 			"proposed_experiments": [{
 				"template": "efficientnet_transfer",
 				"model": "efficientnet_b0",
@@ -3327,6 +3592,44 @@ func TestNearCeilingChampionBlocksPlannerFollowUpScheduling(t *testing.T) {
 		"success_criteria": "Improve accuracy by at least 0.005.",
 		"stop_condition": "Select champion if no challenger improves.",
 		"deployment_tradeoff": "More training cost for a tiny possible gain.",
+		"candidate_hypotheses": [
+			{
+				"hypothesis": "A higher-resolution EfficientNet challenger could capture remaining fine-grained errors.",
+				"planning_mode": "champion_challenge",
+				"mechanism": "resolution_crop",
+				"intervention": "Challenge the near-ceiling champion with higher resolution and full fine-tuning.",
+				"proposed_changes": {"model_family": "efficientnet", "resolution_strategy": "high_resolution_ablation", "fine_tune_strategy": "full"},
+				"expected_effect": "Capture any remaining fine-grained or scale-dependent errors.",
+				"expected_metric_impact": 0.005,
+				"expected_tradeoffs": ["more training cost"],
+				"risk": "high",
+				"cost_level": "medium",
+				"novelty_score": 0.55,
+				"evidence_used": ["champion is near-perfect", "dataset has variable dimensions"],
+				"similar_success_memory_ids": [],
+				"similar_failure_memory_ids": [],
+				"experiment_config": {
+					"template": "efficientnet_transfer",
+					"model": "efficientnet_b1",
+					"epochs": 12,
+					"batch_size": 16,
+					"learning_rate": 0.0002,
+					"reason": "Challenge the champion with a balanced EfficientNet.",
+					"image_size": 240,
+					"resolution_strategy": "high_resolution_ablation",
+					"optimizer": "adamw",
+					"scheduler": "cosine",
+					"weight_decay": 0.01,
+					"augmentation_policy": "moderate",
+					"class_balancing": "weighted_loss",
+					"sampling_strategy": "none",
+					"strategy": "champion challenge",
+					"pretrained": true,
+					"freeze_backbone": false,
+					"fine_tune_strategy": "full"
+				}
+			}
+		],
 		"proposed_experiments": [
 			{
 				"template": "efficientnet_transfer",

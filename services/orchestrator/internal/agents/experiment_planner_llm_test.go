@@ -31,6 +31,50 @@ func TestExperimentPlannerAgentValidatesAddExperiments(t *testing.T) {
 			"success_criteria": "Beat the current champion macro-F1 by at least 0.01 while staying within reasonable runtime.",
 			"stop_condition": "Select the current champion if this ablation does not improve macro-F1 or minority recall.",
 			"deployment_tradeoff": "EfficientNet-B1 may cost more than MobileNet, so it must show clear quality improvement to be worth live use.",
+			"candidate_hypotheses": [
+				{
+					"hypothesis": "Weighted loss with higher resolution should improve macro-F1 on the imbalanced dataset.",
+					"planning_mode": "preprocessing_ablation",
+					"mechanism": "class_imbalance",
+					"intervention": "weighted_loss and weighted_random_sampler with moderate augmentation",
+					"proposed_changes": {"model_family": "efficientnet", "image_size": 256, "augmentation": "moderate", "class_balancing": "weighted_loss"},
+					"expected_effect": "Improve macro-F1 and minority recall while keeping inference changes bounded.",
+					"expected_metric_impact": 0.02,
+					"expected_tradeoffs": ["higher runtime"],
+					"risk": "medium",
+					"cost_level": "medium",
+					"novelty_score": 0.72,
+					"evidence_used": ["dataset imbalance ratio is high", "validation/train loss gap is visible"],
+					"similar_success_memory_ids": [],
+					"similar_failure_memory_ids": [],
+					"experiment_config": {
+						"template": "efficientnet_transfer",
+						"model": "efficientnet_b1",
+						"epochs": 12,
+						"batch_size": 16,
+						"learning_rate": 0.0002,
+						"reason": "Try a larger EfficientNet with stronger augmentation.",
+						"image_size": 256,
+						"resolution_strategy": "high_resolution_ablation",
+						"preprocessing": {
+							"resize_strategy": "preserve_aspect_pad",
+							"normalization": "imagenet",
+							"crop_strategy": "center_crop",
+							"bbox_mode": "ignore",
+							"use_dataset_normalization": false
+						},
+						"optimizer": "adamw",
+						"scheduler": "cosine",
+						"weight_decay": 0.01,
+						"augmentation": {"horizontal_flip": true, "color_jitter": true},
+						"augmentation_policy": "moderate",
+						"class_balancing": "weighted_loss",
+						"sampling_strategy": "weighted_random_sampler",
+						"early_stopping_patience": 3,
+						"strategy": "promising family exploitation"
+					}
+				}
+			],
 			"proposed_experiments": [
 				{
 					"template": "efficientnet_transfer",
@@ -123,6 +167,8 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 	for _, expected := range []string{
 		"resolution_strategy",
 		"proposal_mechanisms",
+		"primary_mechanism",
+		"governor_compliance",
 		"mechanism",
 		"intervention",
 		"expected_effect",
@@ -146,6 +192,13 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"raw images",
 		"Backend validation remains the gate",
 		"planner_validation_feedback",
+		"You must choose mechanisms before concrete models/configs",
+		"For ADD_EXPERIMENTS, provide candidate_hypotheses",
+		"direct proposed_experiments",
+		"project_trajectory_card",
+		"architecture_challenge is exhausted",
+		"champion_confirmation_or_non_architecture_pivot",
+		"Invalid shallow proposals",
 		"choose arbitrary files",
 		"mutate datasets",
 		"run export or inference",
@@ -156,6 +209,35 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("expected prompt to contain %q", expected)
 		}
+	}
+}
+
+func TestExperimentPlannerGovernorComplianceShapeAccepted(t *testing.T) {
+	var recommendation ExperimentPlanningRecommendation
+	if err := json.Unmarshal([]byte(`{
+		"summary": "Use a governor-aware pivot.",
+		"decision_type": "WAIT",
+		"rationale": "No scheduling action is required for this shape test.",
+		"confidence": 0.7,
+		"primary_mechanism": "class_imbalance",
+		"governor_compliance": {
+			"blocked_mechanisms_seen": ["architecture_challenge"],
+			"avoided_blocked_mechanisms": true,
+			"why_allowed_to_continue": "The draft avoids exhausted architecture work.",
+			"expected_value_justification": "The expected delta clears the project useful-delta floor."
+		}
+	}`), &recommendation); err != nil {
+		t.Fatalf("unmarshal recommendation: %v", err)
+	}
+
+	if recommendation.PrimaryMechanism != "class_imbalance" {
+		t.Fatalf("expected primary mechanism to decode, got %q", recommendation.PrimaryMechanism)
+	}
+	if !recommendation.GovernorCompliance.AvoidedBlockedMechanisms {
+		t.Fatalf("expected governor compliance flag to decode")
+	}
+	if !containsTestString(recommendation.GovernorCompliance.BlockedMechanismsSeen, "architecture_challenge") {
+		t.Fatalf("expected blocked mechanisms to decode, got %#v", recommendation.GovernorCompliance.BlockedMechanismsSeen)
 	}
 }
 
@@ -176,8 +258,8 @@ func TestExperimentPlannerAgentRejectsAddWithoutExperiments(t *testing.T) {
 	}, "test-model")
 
 	_, err := agent.Plan(context.Background(), testExperimentPlannerInput())
-	if err == nil || !strings.Contains(err.Error(), "missing proposed_experiments") {
-		t.Fatalf("expected missing proposed_experiments error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "requires candidate_hypotheses") {
+		t.Fatalf("expected missing candidate_hypotheses error, got %v", err)
 	}
 }
 
@@ -198,6 +280,33 @@ func TestExperimentPlannerAgentRejectsAddWithoutHypothesis(t *testing.T) {
 			"success_criteria": "Improve macro-F1.",
 			"stop_condition": "Stop if it plateaus.",
 			"deployment_tradeoff": "Similar latency.",
+			"candidate_hypotheses": [
+				{
+					"hypothesis": "Weighted loss should improve minority recall.",
+					"planning_mode": "class_imbalance_ablation",
+					"mechanism": "class_imbalance",
+					"intervention": "Use weighted_loss on the compact model.",
+					"proposed_changes": {"class_balancing": "weighted_loss"},
+					"expected_effect": "Improve minority recall and macro-F1.",
+					"expected_metric_impact": 0.02,
+					"expected_tradeoffs": ["possible precision drop"],
+					"risk": "medium",
+					"cost_level": "low",
+					"novelty_score": 0.6,
+					"evidence_used": ["prior champion family is promising"],
+					"similar_success_memory_ids": [],
+					"similar_failure_memory_ids": [],
+					"experiment_config": {
+						"template": "mobilenet_transfer",
+						"model": "mobilenet_v3_small",
+						"epochs": 12,
+						"batch_size": 16,
+						"learning_rate": 0.0003,
+						"reason": "Weighted-loss candidate.",
+						"class_balancing": "weighted_loss"
+					}
+				}
+			],
 			"proposed_experiments": [
 				{
 					"template": "mobilenet_transfer",
@@ -241,6 +350,33 @@ func TestExperimentPlannerAgentRejectsMinorOnlyTweaks(t *testing.T) {
 			"success_criteria": "Improve macro-F1.",
 			"stop_condition": "Stop if no improvement.",
 			"deployment_tradeoff": "Similar latency.",
+			"candidate_hypotheses": [
+				{
+					"hypothesis": "Weighted loss should improve minority recall.",
+					"planning_mode": "class_imbalance_ablation",
+					"mechanism": "class_imbalance",
+					"intervention": "Use weighted_loss rather than another architecture sweep.",
+					"proposed_changes": {"class_balancing": "weighted_loss"},
+					"expected_effect": "Improve minority recall and macro-F1.",
+					"expected_metric_impact": 0.02,
+					"expected_tradeoffs": ["possible precision drop"],
+					"risk": "medium",
+					"cost_level": "low",
+					"novelty_score": 0.6,
+					"evidence_used": ["prior champion family is strong"],
+					"similar_success_memory_ids": [],
+					"similar_failure_memory_ids": [],
+					"experiment_config": {
+						"template": "mobilenet_transfer",
+						"model": "mobilenet_v3_small",
+						"epochs": 12,
+						"batch_size": 16,
+						"learning_rate": 0.0003,
+						"reason": "Weighted-loss candidate.",
+						"class_balancing": "weighted_loss"
+					}
+				}
+			],
 			"proposed_experiments": [
 				{
 					"template": "mobilenet_transfer",
@@ -853,7 +989,28 @@ func TestInformationValidationToolsUseStringifiedDraftSchemas(t *testing.T) {
 }
 
 func TestPlannerValidateCandidateExperimentsAcceptsRecommendationJSON(t *testing.T) {
-	recommendation := validExperimentPlannerRecommendationForMode("explore")
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	recommendation.ChangedVariables = []string{"class_balancing", "sampling_strategy"}
+	recommendation.ProposedExperiments[0].ClassBalancing = "weighted_loss"
+	recommendation.ProposedExperiments[0].SamplingStrategy = "weighted_random_sampler"
+	recommendation.ProposedExperiments[0].Reason = "Test weighted loss and sampling for minority recall."
+	recommendation.CandidateHypotheses = []CandidateHypothesis{
+		{
+			Hypothesis:           "Weighted loss and sampling should improve minority recall.",
+			PlanningMode:         "class_imbalance_ablation",
+			Mechanism:            "class_imbalance",
+			Intervention:         "Use weighted_loss plus weighted_random_sampler.",
+			ProposedChanges:      map[string]any{"class_balancing": "weighted_loss", "sampling_strategy": "weighted_random_sampler"},
+			ExpectedEffect:       "Improve minority recall and macro-F1.",
+			ExpectedMetricImpact: 0.025,
+			ExpectedTradeoffs:    []string{"may reduce majority precision"},
+			Risk:                 "medium",
+			CostLevel:            "low",
+			NoveltyScore:         0.75,
+			EvidenceUsed:         []string{"minority_class_failure_score is high"},
+			ExperimentConfig:     recommendation.ProposedExperiments[0],
+		},
+	}
 	blob, err := json.Marshal(recommendation)
 	if err != nil {
 		t.Fatalf("marshal recommendation: %v", err)
@@ -886,6 +1043,32 @@ func TestPlannerValidateCandidateExperimentsAcceptsRecommendationJSON(t *testing
 	validation, ok := result.Payload["dry_run_validation"].(PlannerCandidateDryRunResult)
 	if !ok || !validation.Valid || validation.WouldScheduleJobs {
 		t.Fatalf("expected valid dry-run-only result, got %#v", result.Payload["dry_run_validation"])
+	}
+}
+
+func TestPlannerValidateCandidateExperimentsReportsFinalizerRejection(t *testing.T) {
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	recommendation.CandidateHypotheses = nil
+	blob, err := json.Marshal(recommendation)
+	if err != nil {
+		t.Fatalf("marshal recommendation: %v", err)
+	}
+
+	result := ExecuteExperimentPlannerInformationTool(
+		testExperimentPlannerInput(),
+		PlannerToolValidateCandidateExperiments,
+		map[string]any{"recommendation_json": string(blob)},
+		PlannerInformationToolOptions{},
+	)
+	if !result.Accepted {
+		t.Fatalf("expected dry-run validation payload, got %#v", result)
+	}
+	validation, ok := result.Payload["dry_run_validation"].(PlannerCandidateDryRunResult)
+	if !ok || validation.Valid || validation.WouldScheduleJobs || validation.WouldWriteRows {
+		t.Fatalf("expected invalid dry-run-only result, got %#v", result.Payload["dry_run_validation"])
+	}
+	if !strings.Contains(validation.ValidationError, "requires candidate_hypotheses") {
+		t.Fatalf("expected finalizer rejection text, got %q", validation.ValidationError)
 	}
 }
 
@@ -928,7 +1111,7 @@ func TestTrainingMonitorValidateRecommendationDraftAcceptsRecommendationJSON(t *
 
 func TestComputePlannerDiagnosisFlagsEvidenceDrivenFailures(t *testing.T) {
 	input := testExperimentPlannerInput()
-	input.SourcePlan.TargetMetric = "macro_f1"
+	input.SourcePlan = plans.ExperimentPlan{TargetMetric: "macro_f1"}
 	input.DatasetInsights = DatasetPlanningInsights{ImbalanceRatio: 3.4}
 	input.CurrentChampion = &ExperimentChampion{JobID: "champion_1", Score: 0.70}
 	input.NoImprovementRounds = 2
@@ -983,6 +1166,111 @@ func TestComputePlannerDiagnosisFlagsEvidenceDrivenFailures(t *testing.T) {
 	}
 	if !containsTestString(diagnosis.RecommendedFailureModes, "minority_class_failure") {
 		t.Fatalf("expected minority class failure mode, got %#v", diagnosis.RecommendedFailureModes)
+	}
+}
+
+func TestComputeProjectTrajectoryDiagnosisExhaustsLowYieldArchitectureSweep(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.SourcePlan = plans.ExperimentPlan{TargetMetric: "macro_f1"}
+	input.MinimumMeaningfulImprovement = 0
+	input.CurrentChampion = &ExperimentChampion{JobID: "job_20", TargetMetric: "macro_f1", Score: 0.642}
+	input.PriorPlans = []plans.ExperimentPlan{
+		{
+			ID:           "plan_arch",
+			TargetMetric: "macro_f1",
+			Experiments:  []plans.PlannedExperiment{{Model: "resnet18", Mechanism: "architecture_challenge"}},
+		},
+	}
+	input.PriorJobs = nil
+	input.PriorSummaries = nil
+	input.PlanJobs = nil
+	input.PlanSummaries = nil
+	scores := []float64{0.600, 0.620, 0.635, 0.640, 0.641, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642, 0.642}
+	for index, score := range scores {
+		jobID := fmt.Sprintf("job_%02d", index+1)
+		input.PriorJobs = append(input.PriorJobs, jobs.ExperimentJob{
+			ID: jobID,
+			Config: map[string]any{
+				"plan_id":          "plan_arch",
+				"experiment_index": 0,
+				"model":            "resnet18",
+				"mechanism":        "architecture_challenge",
+			},
+		})
+		input.PriorSummaries = append(input.PriorSummaries, runs.TrainingRunSummary{
+			JobID:       jobID,
+			PlanID:      "plan_arch",
+			Model:       "resnet18",
+			Status:      jobs.StatusSucceeded,
+			BestMacroF1: score,
+		})
+	}
+
+	trajectory := ComputeProjectTrajectoryDiagnosis(input)
+	if trajectory.CompletedTrainingRuns != 20 {
+		t.Fatalf("expected all prior runs to count, got %#v", trajectory)
+	}
+	if trajectory.MinimumUsefulDelta != 0.010 {
+		t.Fatalf("expected minimum useful delta floor, got %.3f", trajectory.MinimumUsefulDelta)
+	}
+	if trajectory.AbsoluteChampionGain != 0.042 || trajectory.GainPerCompletedRun != 0.002 {
+		t.Fatalf("expected low-yield trajectory gain, got gain=%.3f per_run=%.3f", trajectory.AbsoluteChampionGain, trajectory.GainPerCompletedRun)
+	}
+	if trajectory.DecisionPressure != "champion_confirmation_or_non_architecture_pivot" {
+		t.Fatalf("expected low-yield decision pressure, got %q", trajectory.DecisionPressure)
+	}
+	outcome, ok := findTrajectoryTestOutcome(trajectory.MechanismOutcomes, "architecture_challenge")
+	if !ok {
+		t.Fatalf("expected architecture outcome, got %#v", trajectory.MechanismOutcomes)
+	}
+	if outcome.AttemptCount != 20 || outcome.Status != "exhausted" {
+		t.Fatalf("expected exhausted architecture outcome, got %#v", outcome)
+	}
+	if !containsTestString(trajectory.BlockedMechanisms, "architecture_challenge") {
+		t.Fatalf("expected architecture to be blocked, got %#v", trajectory.BlockedMechanisms)
+	}
+}
+
+func TestComputeProjectTrajectoryDiagnosisPrefersStoredMechanismMetadata(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.SourcePlan = plans.ExperimentPlan{TargetMetric: "macro_f1"}
+	input.PriorPlans = []plans.ExperimentPlan{
+		{
+			ID:           "plan_imbalance",
+			TargetMetric: "macro_f1",
+			Experiments:  []plans.PlannedExperiment{{Model: "efficientnet_b2"}},
+		},
+	}
+	input.PriorJobs = []jobs.ExperimentJob{
+		{
+			ID: "job_imbalance",
+			Config: map[string]any{
+				"plan_id":          "plan_imbalance",
+				"experiment_index": 0,
+				"model":            "efficientnet_b2",
+				"mechanism":        "class_imbalance",
+			},
+		},
+	}
+	input.PriorSummaries = []runs.TrainingRunSummary{
+		{
+			JobID:       "job_imbalance",
+			PlanID:      "plan_imbalance",
+			Model:       "efficientnet_b2",
+			Status:      jobs.StatusSucceeded,
+			BestMacroF1: 0.71,
+		},
+	}
+	input.PlanJobs = nil
+	input.PlanSummaries = nil
+
+	trajectory := ComputeProjectTrajectoryDiagnosis(input)
+	outcome, ok := findTrajectoryTestOutcome(trajectory.MechanismOutcomes, "class_imbalance")
+	if !ok || outcome.AttemptCount != 1 {
+		t.Fatalf("expected stored class_imbalance mechanism to win over local model inference, got %#v", trajectory.MechanismOutcomes)
+	}
+	if architecture, ok := findTrajectoryTestOutcome(trajectory.MechanismOutcomes, "architecture_challenge"); ok && architecture.AttemptCount != 0 {
+		t.Fatalf("did not expect architecture attempts when stored mechanism exists, got %#v", trajectory.MechanismOutcomes)
 	}
 }
 
@@ -1410,6 +1698,52 @@ func validExperimentPlannerRecommendationForMode(mode string) ExperimentPlanning
 		SuccessCriteria:               "Improve macro-F1 by at least 0.01.",
 		StopCondition:                 "Select champion if no candidate improves.",
 		DeploymentTradeoff:            "Slightly higher cost must be justified by quality.",
+		CandidateHypotheses: []CandidateHypothesis{
+			{
+				Hypothesis:           "EfficientNet-B0 can challenge the current family with a stronger pretrained backbone.",
+				PlanningMode:         mode,
+				Mechanism:            "architecture_challenge",
+				Intervention:         "Test EfficientNet-B0 as a controlled challenger.",
+				ProposedChanges:      map[string]any{"model_family": "efficientnet", "augmentation": "moderate"},
+				ExpectedEffect:       "Improve macro-F1 through a stronger pretrained family.",
+				ExpectedMetricImpact: 0.02,
+				ExpectedTradeoffs:    []string{"higher runtime"},
+				Risk:                 "medium",
+				CostLevel:            "medium",
+				NoveltyScore:         0.7,
+				EvidenceUsed:         []string{"plan metric plateaued"},
+				ExperimentConfig: plans.PlannedExperiment{
+					Template:     "efficientnet_transfer",
+					Model:        "efficientnet_b0",
+					Epochs:       10,
+					BatchSize:    16,
+					LearningRate: 0.0003,
+					Reason:       "Test a stronger family.",
+				},
+			},
+			{
+				Hypothesis:           "A compact control keeps the comparison grounded.",
+				PlanningMode:         mode,
+				Mechanism:            "baseline_control",
+				Intervention:         "Keep MobileNet as a compact control.",
+				ProposedChanges:      map[string]any{"control": "compact_mobilenet"},
+				ExpectedEffect:       "Provide a low-latency comparison point for the challenger.",
+				ExpectedMetricImpact: 0.012,
+				ExpectedTradeoffs:    []string{"lower upside"},
+				Risk:                 "low",
+				CostLevel:            "low",
+				NoveltyScore:         0.4,
+				EvidenceUsed:         []string{"plan metric plateaued"},
+				ExperimentConfig: plans.PlannedExperiment{
+					Template:     "mobilenet_transfer",
+					Model:        "mobilenet_v3_small",
+					Epochs:       10,
+					BatchSize:    16,
+					LearningRate: 0.0003,
+					Reason:       "Keep a compact control.",
+				},
+			},
+		},
 		ProposedExperiments: []plans.PlannedExperiment{
 			{
 				Template:     "efficientnet_transfer",
@@ -1470,6 +1804,15 @@ func containsTestSubstring(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func findTrajectoryTestOutcome(values []PlannerMechanismOutcome, mechanism string) (PlannerMechanismOutcome, bool) {
+	for _, value := range values {
+		if value.Mechanism == mechanism {
+			return value, true
+		}
+	}
+	return PlannerMechanismOutcome{}, false
 }
 
 func findBackendGatedTestMethod(values []PlannerBackendGatedMethod, mechanism string) (PlannerBackendGatedMethod, bool) {

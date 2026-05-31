@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"model-express/services/orchestrator/internal/automl"
@@ -23,6 +24,36 @@ var (
 	ErrNoJob          = errors.New("no job available")
 	ErrInvalidRequest = errors.New("invalid request")
 )
+
+type JobPollFilter struct {
+	Provider                            string
+	Templates                           []string
+	IncludeUnspecifiedProviderTemplates []string
+}
+
+func (filter JobPollFilter) Matches(job jobs.ExperimentJob) bool {
+	templates := normalizedSet(filter.Templates)
+	if len(templates) > 0 {
+		if _, ok := templates[strings.ToLower(strings.TrimSpace(job.Template))]; !ok {
+			return false
+		}
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(filter.Provider))
+	if provider == "" {
+		return true
+	}
+	jobProvider := strings.ToLower(strings.TrimSpace(configString(job.Config, "provider")))
+	if jobProvider == provider {
+		return true
+	}
+	if jobProvider != "" {
+		return false
+	}
+	includeUnspecified := normalizedSet(filter.IncludeUnspecifiedProviderTemplates)
+	_, ok := includeUnspecified[strings.ToLower(strings.TrimSpace(job.Template))]
+	return ok
+}
 
 type Store interface {
 	CreateProject(name string, goal string) (projects.Project, error)
@@ -48,7 +79,7 @@ type Store interface {
 	ListProjectWorkers(projectID string) ([]workers.Worker, error)
 	GetWorker(workerID string) (workers.Worker, error)
 	HeartbeatWorker(id string) (workers.Worker, error)
-	PollJob(workerID string) (*jobs.ExperimentJob, error)
+	PollJob(workerID string, filter JobPollFilter) (*jobs.ExperimentJob, error)
 
 	CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error)
 	GetJob(id string) (jobs.ExperimentJob, error)
@@ -57,6 +88,7 @@ type Store interface {
 	ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error)
 	ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
 	CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error)
+	RetryJob(jobID string, message string) (jobs.ExperimentJob, bool, error)
 	FailJob(jobID string, message string) (jobs.ExperimentJob, error)
 
 	UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error)
@@ -80,7 +112,7 @@ type Store interface {
 	GetAutomationSettings() (settings.AutomationSettings, error)
 	SaveAutomationSettings(automationSettings settings.AutomationSettings) (settings.AutomationSettings, error)
 
-	UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string) (execution.WorkerRequirement, bool, error)
+	UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string, policy execution.WorkerRequirementPolicy) (execution.WorkerRequirement, bool, error)
 	ListProjectWorkerRequirements(projectID string) ([]execution.WorkerRequirement, error)
 	UpdateWorkerRequirement(id string, update execution.WorkerRequirementUpdate) (execution.WorkerRequirement, error)
 	CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error)
@@ -107,4 +139,21 @@ type Store interface {
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)
 	ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error)
+}
+
+func normalizedSet(values []string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			continue
+		}
+		out[normalized] = struct{}{}
+	}
+	return out
+}
+
+func configString(config map[string]any, key string) string {
+	value, _ := config[key].(string)
+	return value
 }

@@ -2678,6 +2678,149 @@ button {
   color: #eef3f0;
 }
 
+.decision-quality-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.decision-quality-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  padding: 12px;
+  background: #070c0b;
+}
+
+.decision-quality-head span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.decision-quality-head strong {
+  overflow: hidden;
+  color: #fbfffc;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-quality-head small {
+  overflow: hidden;
+  color: #77837d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-quality-facts {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.decision-quality-facts span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid #17221e;
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: #101715;
+}
+
+.decision-quality-facts small,
+.decision-quality-section > strong {
+  color: #77837d;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.decision-quality-facts strong {
+  overflow: hidden;
+  color: #eef3f0;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-quality-sections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.decision-quality-section {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #17221e;
+  border-radius: 8px;
+  padding: 11px;
+  background: #070c0b;
+}
+
+.decision-quality-section.warning {
+  border-color: rgba(255, 202, 87, 0.24);
+  background: rgba(255, 202, 87, 0.05);
+}
+
+.decision-quality-list {
+  display: grid;
+  gap: 7px;
+}
+
+.decision-quality-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #223029;
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: #101715;
+}
+
+.decision-quality-row span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.decision-quality-row strong {
+  overflow: hidden;
+  color: #dce7e2;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-quality-row small {
+  overflow: hidden;
+  color: #77837d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-quality-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.decision-quality-tags small {
+  border: 1px solid rgba(255, 104, 117, 0.2);
+  border-radius: 999px;
+  padding: 5px 8px;
+  color: #ff9ca5;
+  background: rgba(255, 104, 117, 0.07);
+  font-size: 11px;
+  font-weight: 800;
+}
+
 .decision-history {
   display: grid;
   gap: 7px;
@@ -3182,6 +3325,7 @@ button {
   .plan-overview,
   .run-overview,
   .decision-payload,
+  .decision-quality-facts,
   .reasoning-grid,
   .message-section-list,
   .agent-audit-facts {
@@ -3193,6 +3337,7 @@ button {
   .visual-analysis-grid,
   .visual-card-grid,
   .automation-grid,
+  .decision-quality-sections,
   .evaluation-details,
   .export-demo-grid,
   .champion-test-bench,
@@ -3272,6 +3417,8 @@ button {
   .plan-overview,
   .run-overview,
   .decision-payload,
+  .decision-quality-facts,
+  .decision-quality-sections,
   .reasoning-grid,
   .message-section-list,
   .agent-audit-facts {
@@ -3316,6 +3463,7 @@ button {
 
   .visual-analysis-head,
   .metadata-status-head,
+  .decision-quality-head,
   .visual-card-head {
     align-items: stretch;
     flex-direction: column;

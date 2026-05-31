@@ -11,6 +11,15 @@ const (
 )
 
 const (
+	DatasetMaterializationUnknown       = "UNKNOWN"
+	DatasetMaterializationCold          = "COLD"
+	DatasetMaterializationMaterializing = "MATERIALIZING"
+	DatasetMaterializationWarm          = "WARM"
+
+	ColdCachePolicySingleMaterialization = "single_materialization_per_checksum"
+)
+
+const (
 	EventJobsQueued                  = "JOBS_QUEUED"
 	EventWorkersRequired             = "WORKERS_REQUIRED"
 	EventWorkerScalingUpdated        = "WORKER_SCALING_UPDATED"
@@ -19,6 +28,7 @@ const (
 	EventChampionSelected            = "CHAMPION_SELECTED"
 	EventChampionExportRequested     = "CHAMPION_EXPORT_REQUESTED"
 	EventChampionDemoPrediction      = "CHAMPION_DEMO_PREDICTION"
+	EventJobRetryQueued              = "JOB_RETRY_QUEUED"
 	EventDatasetVisualAnalysisQueued = "DATASET_VISUAL_ANALYSIS_QUEUED"
 	EventDatasetVisualAnalysisResult = "DATASET_VISUAL_ANALYSIS_RESULT"
 	EventExperimentationReopened     = "EXPERIMENTATION_REOPENED"
@@ -29,22 +39,39 @@ const (
 )
 
 type WorkerRequirement struct {
-	ID          string    `json:"id"`
-	ProjectID   string    `json:"project_id"`
-	PlanID      string    `json:"plan_id"`
-	Provider    string    `json:"provider"`
-	GPUType     string    `json:"gpu_type"`
-	TargetCount int       `json:"target_count"`
-	Status      string    `json:"status"`
-	Source      string    `json:"source"`
-	LastError   string    `json:"last_error,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                             string    `json:"id"`
+	ProjectID                      string    `json:"project_id"`
+	PlanID                         string    `json:"plan_id"`
+	Provider                       string    `json:"provider"`
+	GPUType                        string    `json:"gpu_type"`
+	TargetCount                    int       `json:"target_count"`
+	Status                         string    `json:"status"`
+	Source                         string    `json:"source"`
+	DatasetID                      string    `json:"dataset_id,omitempty"`
+	DatasetChecksum                string    `json:"dataset_checksum,omitempty"`
+	DatasetCacheKey                string    `json:"dataset_cache_key,omitempty"`
+	DatasetMaterializationStatus   string    `json:"dataset_materialization_status,omitempty"`
+	ColdCachePolicy                string    `json:"cold_cache_policy,omitempty"`
+	MaxConcurrentJobs              int       `json:"max_concurrent_jobs,omitempty"`
+	MaxColdDatasetMaterializations int       `json:"max_cold_dataset_materializations,omitempty"`
+	LastError                      string    `json:"last_error,omitempty"`
+	CreatedAt                      time.Time `json:"created_at"`
+	UpdatedAt                      time.Time `json:"updated_at"`
 }
 
 type WorkerRequirementUpdate struct {
 	Status    *string `json:"status"`
 	LastError *string `json:"last_error"`
+}
+
+type WorkerRequirementPolicy struct {
+	DatasetID                      string
+	DatasetChecksum                string
+	DatasetCacheKey                string
+	DatasetMaterializationStatus   string
+	ColdCachePolicy                string
+	MaxConcurrentJobs              int
+	MaxColdDatasetMaterializations int
 }
 
 type ExecutionEvent struct {

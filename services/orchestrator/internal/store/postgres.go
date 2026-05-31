@@ -881,7 +881,7 @@ func (s *PostgresStore) HeartbeatWorker(id string) (workers.Worker, error) {
 	return scanWorker(s.db.QueryRowContext(context.Background(), query, id))
 }
 
-func (s *PostgresStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
+func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.ExperimentJob, error) {
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -960,15 +960,40 @@ func (s *PostgresStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 		return nil, ErrNoJob
 	}
 
-	job, err := scanJob(tx.QueryRowContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
 		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
 		FROM experiment_jobs
 		WHERE status = $1 AND project_id = $2
 		ORDER BY created_at
-		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, jobs.StatusQueued, worker.ProjectID))
-	if errors.Is(err, ErrNotFound) {
+	`, jobs.StatusQueued, worker.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+
+	var job jobs.ExperimentJob
+	foundJob := false
+	for rows.Next() {
+		candidate, scanErr := scanJob(rows)
+		if scanErr != nil {
+			rows.Close()
+			return nil, scanErr
+		}
+		if !filter.Matches(candidate) {
+			continue
+		}
+		job = candidate
+		foundJob = true
+		break
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if !foundJob {
 		if _, updateErr := tx.ExecContext(ctx, `
 			UPDATE workers
 			SET last_heartbeat = now()
@@ -983,14 +1008,12 @@ func (s *PostgresStore) PollJob(workerID string) (*jobs.ExperimentJob, error) {
 
 		return nil, ErrNoJob
 	}
-	if err != nil {
-		return nil, err
-	}
 
 	assignedJob, err := scanJob(tx.QueryRowContext(ctx, `
 		UPDATE experiment_jobs
 		SET worker_id = $1,
 			status = $2,
+			error = '',
 			started_at = now(),
 			attempt = attempt + 1,
 			lease_owner_worker_id = $1,
@@ -1890,7 +1913,7 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 	))
 }
 
-func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string) (execution.WorkerRequirement, bool, error) {
+func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string, provider string, gpuType string, targetCount int, source string, policy execution.WorkerRequirementPolicy) (execution.WorkerRequirement, bool, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return execution.WorkerRequirement{}, false, err
 	}
@@ -1899,7 +1922,7 @@ func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string,
 	}
 
 	existing, err := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), `
-		SELECT id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+		SELECT `+workerRequirementSelectColumns()+`
 		FROM worker_requirements
 		WHERE project_id = $1 AND plan_id = $2
 	`, projectID, planID))
@@ -1910,23 +1933,40 @@ func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string,
 			status = execution.WorkerRequirementPending
 			lastError = ""
 		}
-		const updateQuery = `
+		updateQuery := `
 			UPDATE worker_requirements
-			SET provider = $1, gpu_type = $2, target_count = $3, source = $4, status = $5, last_error = $6, updated_at = now()
-			WHERE id = $7
-			RETURNING id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+			SET provider = $1,
+				gpu_type = $2,
+				target_count = $3,
+				source = $4,
+				status = $5,
+				last_error = $6,
+				dataset_id = $7,
+				dataset_checksum = $8,
+				dataset_cache_key = $9,
+				dataset_materialization_status = $10,
+				cold_cache_policy = $11,
+				max_concurrent_jobs = $12,
+				max_cold_dataset_materializations = $13,
+				updated_at = now()
+			WHERE id = $14
+			RETURNING ` + workerRequirementSelectColumns() + `
 		`
-		requirement, updateErr := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), updateQuery, provider, gpuType, targetCount, source, status, lastError, existing.ID))
+		requirement, updateErr := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), updateQuery, provider, gpuType, targetCount, source, status, lastError, policy.DatasetID, policy.DatasetChecksum, policy.DatasetCacheKey, policy.DatasetMaterializationStatus, policy.ColdCachePolicy, policy.MaxConcurrentJobs, policy.MaxColdDatasetMaterializations, existing.ID))
 		return requirement, false, updateErr
 	}
 	if !errors.Is(err, ErrNotFound) {
 		return execution.WorkerRequirement{}, false, err
 	}
 
-	const insertQuery = `
-		INSERT INTO worker_requirements (project_id, plan_id, provider, gpu_type, target_count, status, source)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+	insertQuery := `
+		INSERT INTO worker_requirements (
+			project_id, plan_id, provider, gpu_type, target_count, status, source,
+			dataset_id, dataset_checksum, dataset_cache_key, dataset_materialization_status,
+			cold_cache_policy, max_concurrent_jobs, max_cold_dataset_materializations
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		RETURNING ` + workerRequirementSelectColumns() + `
 	`
 	requirement, err := scanWorkerRequirement(s.db.QueryRowContext(
 		context.Background(),
@@ -1938,6 +1978,13 @@ func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string,
 		targetCount,
 		execution.WorkerRequirementPending,
 		source,
+		policy.DatasetID,
+		policy.DatasetChecksum,
+		policy.DatasetCacheKey,
+		policy.DatasetMaterializationStatus,
+		policy.ColdCachePolicy,
+		policy.MaxConcurrentJobs,
+		policy.MaxColdDatasetMaterializations,
 	))
 	return requirement, true, err
 }
@@ -1947,8 +1994,8 @@ func (s *PostgresStore) ListProjectWorkerRequirements(projectID string) ([]execu
 		return nil, err
 	}
 
-	const query = `
-		SELECT id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+	query := `
+		SELECT ` + workerRequirementSelectColumns() + `
 		FROM worker_requirements
 		WHERE project_id = $1
 		ORDER BY updated_at DESC
@@ -1972,7 +2019,7 @@ func (s *PostgresStore) ListProjectWorkerRequirements(projectID string) ([]execu
 
 func (s *PostgresStore) UpdateWorkerRequirement(id string, update execution.WorkerRequirementUpdate) (execution.WorkerRequirement, error) {
 	requirement, err := scanWorkerRequirement(s.db.QueryRowContext(context.Background(), `
-		SELECT id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+		SELECT `+workerRequirementSelectColumns()+`
 		FROM worker_requirements
 		WHERE id = $1
 	`, id))
@@ -1986,11 +2033,11 @@ func (s *PostgresStore) UpdateWorkerRequirement(id string, update execution.Work
 		requirement.LastError = *update.LastError
 	}
 
-	const query = `
+	query := `
 		UPDATE worker_requirements
 		SET status = $1, last_error = $2, updated_at = now()
 		WHERE id = $3
-		RETURNING id, project_id, plan_id, provider, gpu_type, target_count, status, source, last_error, created_at, updated_at
+		RETURNING ` + workerRequirementSelectColumns() + `
 	`
 	return scanWorkerRequirement(s.db.QueryRowContext(context.Background(), query, requirement.Status, requirement.LastError, id))
 }
@@ -2776,6 +2823,72 @@ func (s *PostgresStore) ListProjectExperimentPlans(projectID string) ([]plans.Ex
 
 func (s *PostgresStore) CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error) {
 	return s.finishJob(jobID, jobs.StatusSucceeded, mlflowRunID, "")
+}
+
+func (s *PostgresStore) RetryJob(jobID string, message string) (jobs.ExperimentJob, bool, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
+	defer tx.Rollback()
+
+	job, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id")+" FOR UPDATE", jobID))
+	if err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
+	if job.MaxAttempts < 1 {
+		job.MaxAttempts = defaultJobMaxAttempts
+	}
+
+	requeued := job.Attempt < job.MaxAttempts
+	if requeued {
+		job, err = scanJob(tx.QueryRowContext(ctx, `
+			UPDATE experiment_jobs
+			SET status = $1,
+				error = $2,
+				worker_id = '',
+				mlflow_run_id = '',
+				started_at = NULL,
+				completed_at = NULL,
+				lease_owner_worker_id = '',
+				lease_expires_at = NULL,
+				lease_last_heartbeat_at = NULL
+			WHERE id = $3
+			RETURNING `+jobSelectColumns()+`
+		`, jobs.StatusQueued, message, jobID))
+	} else {
+		job, err = scanJob(tx.QueryRowContext(ctx, `
+			UPDATE experiment_jobs
+			SET status = $1,
+				error = $2,
+				completed_at = now(),
+				lease_owner_worker_id = '',
+				lease_expires_at = NULL,
+				lease_last_heartbeat_at = NULL
+			WHERE id = $3
+			RETURNING `+jobSelectColumns()+`
+		`, jobs.StatusFailed, message, jobID))
+	}
+	if err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE workers
+		SET status = CASE WHEN status = $3 THEN status ELSE $1 END,
+			current_job_id = '',
+			last_heartbeat = now()
+		WHERE current_job_id = $2
+	`, workers.StatusIdle, jobID, workers.StatusOffline); err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
+
+	return job, requeued, nil
 }
 
 func (s *PostgresStore) FailJob(jobID string, message string) (jobs.ExperimentJob, error) {
@@ -3766,6 +3879,10 @@ func scanAgentDecision(row rowScanner) (decisions.AgentDecision, error) {
 	return decision, nil
 }
 
+func workerRequirementSelectColumns() string {
+	return "id, project_id, plan_id, provider, gpu_type, target_count, status, source, dataset_id, dataset_checksum, dataset_cache_key, dataset_materialization_status, cold_cache_policy, max_concurrent_jobs, max_cold_dataset_materializations, last_error, created_at, updated_at"
+}
+
 func scanWorkerRequirement(row rowScanner) (execution.WorkerRequirement, error) {
 	var requirement execution.WorkerRequirement
 	if err := row.Scan(
@@ -3777,6 +3894,13 @@ func scanWorkerRequirement(row rowScanner) (execution.WorkerRequirement, error) 
 		&requirement.TargetCount,
 		&requirement.Status,
 		&requirement.Source,
+		&requirement.DatasetID,
+		&requirement.DatasetChecksum,
+		&requirement.DatasetCacheKey,
+		&requirement.DatasetMaterializationStatus,
+		&requirement.ColdCachePolicy,
+		&requirement.MaxConcurrentJobs,
+		&requirement.MaxColdDatasetMaterializations,
 		&requirement.LastError,
 		&requirement.CreatedAt,
 		&requirement.UpdatedAt,

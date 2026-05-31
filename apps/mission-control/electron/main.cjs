@@ -306,12 +306,18 @@ function ensureProjectWorker(options) {
   const logDir = resolveLogDir(repoRoot);
   fs.mkdirSync(logDir, { recursive: true });
   const targetCount = normalizeWorkerCount(options.count);
+  const useModalDispatcher = shouldUseModalDispatcher(options);
+  const processCount = useModalDispatcher ? 1 : targetCount;
   const repoEnv = loadRepoEnv(repoRoot);
   const pids = [];
   let startedCount = 0;
 
-  for (let slot = 1; slot <= targetCount; slot += 1) {
-    const key = projectWorkerKey(projectId, slot);
+  for (let slot = 1; slot <= processCount; slot += 1) {
+    const key = projectWorkerKey(
+      projectId,
+      slot,
+      useModalDispatcher ? "modal-dispatcher" : options.gpuType ?? "local",
+    );
     const existing = projectWorkers.get(key);
     if (isWorkerRunning(existing)) {
       pids.push(existing.pid);
@@ -332,6 +338,10 @@ function ensureProjectWorker(options) {
       MODEL_EXPRESS_LOG_DIR: process.env.MODEL_EXPRESS_LOG_DIR ?? repoEnv.MODEL_EXPRESS_LOG_DIR ?? logDir,
       PYTHONUNBUFFERED: "1",
     };
+    if (useModalDispatcher) {
+      childEnv.MODEL_EXPRESS_MODAL_DISPATCHER = "true";
+      childEnv.MODEL_EXPRESS_MODAL_DISPATCHER_SLOTS = String(targetCount);
+    }
 
     const child = startProjectWorker({
       projectId,
@@ -351,7 +361,9 @@ function ensureProjectWorker(options) {
     pids,
     started: startedCount > 0,
     started_count: startedCount,
-    running_count: pids.length,
+    running_count: useModalDispatcher ? targetCount : pids.length,
+    process_count: pids.length,
+    dispatcher: useModalDispatcher,
     status: startedCount > 0 ? "started" : "already_running",
   };
 }
@@ -424,12 +436,21 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
   return child;
 }
 
-function projectWorkerKey(projectId, slot) {
-  return `${projectId}:${slot}`;
+function projectWorkerKey(projectId, slot, kind = "local") {
+  return `${projectId}:${String(kind).trim().toLowerCase() || "local"}:${slot}`;
 }
 
 function isWorkerRunning(worker) {
   return worker && worker.exitCode === null && !worker.killed;
+}
+
+function shouldUseModalDispatcher(options) {
+  const gpuType = String(options?.gpuType ?? "").trim().toLowerCase();
+  if (gpuType !== "modal") {
+    return false;
+  }
+  const disabled = String(process.env.MODEL_EXPRESS_DISABLE_MODAL_DISPATCHER ?? "").trim().toLowerCase();
+  return !["1", "true", "yes", "on"].includes(disabled);
 }
 
 function normalizeWorkerCount(count) {

@@ -44,9 +44,27 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
         f"{job['id']} model={config.get('model')} gpu={config.get('gpu_type') or os.getenv('MODAL_GPU_TYPE', 'T4')}"
     )
 
-    with app.run():
-        result = _remote_function(train_image_classifier)(payload)
+    try:
+        with app.run():
+            result = _remote_function(train_image_classifier)(payload)
+    except Exception as exc:
+        message = _modal_training_error_message(exc)
+        client.fail_job(job["id"], message, retryable=True)
+        log_event(
+            "warn",
+            "modal_training_retry_queued",
+            job_id=job["id"],
+            project_id=job.get("project_id", ""),
+            error=message,
+        )
+        print(f"Modal training reported retryable failure for {job['id']}: {message}")
+        return
 
+    if isinstance(result, dict) and result.get("status") == "retryable_failure_reported":
+        print(f"Modal training reported retryable failure for {job['id']}: {result.get('error', '')}")
+        return
+
+    _log_dataset_materialization(job.get("id", ""), job.get("project_id", ""), result)
     print(f"Modal training finished for {job['id']}: {result}")
 
 
@@ -68,6 +86,7 @@ def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:
     _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
 
     payload = {
+        "job": job,
         "dataset": dataset,
         "s3_endpoint_url": s3_endpoint_url,
         "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
@@ -86,9 +105,43 @@ def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:
     metadata_import = result.get("metadata_import") if isinstance(result, dict) else None
     if isinstance(metadata_import, dict):
         _send_dataset_metadata_import(client, dataset_id, metadata_import)
+    _log_dataset_materialization(job.get("id", ""), job.get("project_id", ""), result)
     client.update_dataset_profile(dataset_id, profile)
     client.complete_job(job["id"], mlflow_run_id="")
     print(f"Modal dataset profile finished for {dataset_id}")
+
+
+def run_modal_dataset_materialization(client: OrchestratorClient, job: dict) -> dict:
+    config = job["config"]
+    dataset_id = str(config["dataset_id"])
+
+    try:
+        from worker.training.modal_app import app, materialize_image_dataset
+    except ModuleNotFoundError as exc:
+        if exc.name == "modal":
+            raise RuntimeError(
+                "Modal is not installed. Install worker dependencies, then run `modal setup`."
+            ) from exc
+        raise
+
+    dataset = client.get_dataset(dataset_id)
+    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
+    _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+
+    payload = {
+        "job": job,
+        "dataset": dataset,
+        "s3_endpoint_url": s3_endpoint_url,
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
+        "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    }
+
+    print(f"Pre-warming Modal dataset materialization dataset={dataset_id}")
+    with app.run():
+        result = _remote_function(materialize_image_dataset)(payload)
+    _log_dataset_materialization(job.get("id", ""), job.get("project_id", ""), result)
+    return result
 
 
 def _remote_function(function):
@@ -112,6 +165,34 @@ def _require_remote_reachable_url(name: str, value: str) -> None:
             f"{name} points at {value!r}, but Modal cannot reach your local localhost. "
             "Expose it with a tunnel and set the public URL before running Modal jobs."
         )
+
+
+def _modal_training_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        message = exc.__class__.__name__
+    return f"Modal training invocation failed before completion: {message}"[:2000]
+
+
+def _log_dataset_materialization(job_id: str, project_id: str, result: object) -> None:
+    telemetry = result.get("dataset_materialization") if isinstance(result, dict) else None
+    if not isinstance(telemetry, dict):
+        return
+    log_event(
+        "info",
+        "modal_dataset_materialization",
+        job_id=job_id,
+        project_id=project_id,
+        status=telemetry.get("dataset_materialization_status"),
+        cache_hit=telemetry.get("dataset_materialization_cache_hit"),
+        cache_miss=telemetry.get("dataset_materialization_cache_miss"),
+        bytes_downloaded=telemetry.get("dataset_materialization_bytes_downloaded"),
+        extract_seconds=telemetry.get("dataset_materialization_extract_seconds"),
+        wait_seconds=telemetry.get("dataset_materialization_wait_seconds"),
+        dataset_checksum=telemetry.get("dataset_checksum"),
+        storage_uri_fingerprint=telemetry.get("storage_uri_fingerprint"),
+        dataset_cache_key=telemetry.get("dataset_materialization_cache_key"),
+    )
 
 
 def _send_dataset_metadata_import(client: OrchestratorClient, dataset_id: str, payload: dict) -> None:

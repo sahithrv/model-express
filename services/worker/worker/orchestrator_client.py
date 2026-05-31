@@ -71,13 +71,19 @@ class OrchestratorClient:
         response.raise_for_status()
         return response.json()
     
-    def register_worker(self, project_id: str) -> dict:
+    def register_worker(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        gpu_type: str | None = None,
+    ) -> dict:
         response = requests.post(
             f"{self.base_url}/workers/register",
             json={
                 "project_id": project_id,
-                "name": os.getenv("WORKER_NAME", "local-worker-1"),
-                "gpu_type": os.getenv("GPU_TYPE", "local"),
+                "name": name or os.getenv("WORKER_NAME", "local-worker-1"),
+                "gpu_type": gpu_type or os.getenv("GPU_TYPE", "local"),
             },
             timeout=request_timeout_seconds(),
         )
@@ -85,10 +91,36 @@ class OrchestratorClient:
         return response.json()
 
 
-    def poll_job(self, worker_id: str) -> dict | None:
+    def heartbeat_worker(self, worker_id: str) -> dict:
+        response = requests.post(
+            f"{self.base_url}/workers/{worker_id}/heartbeat",
+            timeout=request_timeout_seconds(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+    def poll_job(
+        self,
+        worker_id: str,
+        *,
+        provider: str | None = None,
+        templates: list[str] | None = None,
+        include_unspecified_provider_templates: list[str] | None = None,
+    ) -> dict | None:
+        payload = {}
+        if provider:
+            payload["provider"] = provider
+        if templates:
+            payload["templates"] = templates
+        if include_unspecified_provider_templates:
+            payload["include_unspecified_provider_templates"] = include_unspecified_provider_templates
+        kwargs = {"timeout": request_timeout_seconds()}
+        if payload:
+            kwargs["json"] = payload
         response = requests.post(
             f"{self.base_url}/workers/{worker_id}/poll",
-            timeout=request_timeout_seconds(),
+            **kwargs,
         )
         response.raise_for_status()
         return response.json()["job"]
@@ -171,10 +203,13 @@ class OrchestratorClient:
         return response.json()
 
 
-    def fail_job(self, job_id: str, error: str) -> dict:
+    def fail_job(self, job_id: str, error: str, retryable: bool = False) -> dict:
+        payload = {"error": error}
+        if retryable:
+            payload["retryable"] = True
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/fail",
-            json={"error": error},
+            json=payload,
             timeout=report_timeout_seconds(),
         )
         _raise_for_status_with_body(response)

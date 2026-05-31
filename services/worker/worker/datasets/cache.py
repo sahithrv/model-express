@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import tempfile
+import time
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+from urllib.parse import urlparse
 
 
 CACHE_ROOT = Path(".cache/datasets")
 SCRATCH_ROOT = Path(tempfile.gettempdir()) / "model-express-worker-datasets"
+MATERIALIZED_ROOT = Path(
+    os.getenv("MODEL_EXPRESS_DATASET_MATERIALIZED_ROOT", "/cache/model-express/datasets")
+)
+LOCK_POLL_SECONDS = 0.25
+LOCK_TIMEOUT_SECONDS = 60 * 60
+LOCK_STALE_SECONDS = 60 * 60
 
 
 def dataset_cache_root(cache_root: Path | str | None = None) -> Path:
@@ -61,6 +73,111 @@ def extract_dataset_archive(
     return extract_dir
 
 
+@dataclass(frozen=True)
+class DatasetMaterializationResult:
+    dataset_dir: Path
+    telemetry: dict
+
+
+def ensure_dataset_materialized(
+    *,
+    dataset_id: str,
+    storage_uri: str,
+    checksum_sha256: str | None = None,
+    cache_root: Path | str | None = None,
+    download_fn: Callable[[str, Path], Path] | None = None,
+) -> DatasetMaterializationResult:
+    root = Path(cache_root) if cache_root is not None else MATERIALIZED_ROOT
+    key = dataset_materialization_cache_key(checksum_sha256, storage_uri)
+    storage_fingerprint = storage_uri_fingerprint(storage_uri)
+    cache_dir = root / key
+    archive_path = cache_dir / "archive.zip"
+    extracted_dir = cache_dir / "extracted"
+    complete_marker = cache_dir / ".complete"
+    manifest_path = cache_dir / "manifest.json"
+    if download_fn is None:
+        from worker.datasets.storage import download_s3_uri
+
+        downloader = download_s3_uri
+    else:
+        downloader = download_fn
+    telemetry = _materialization_telemetry(
+        cache_hit=False,
+        cache_key=key,
+        checksum_sha256=checksum_sha256,
+        storage_fingerprint=storage_fingerprint,
+    )
+
+    if _dataset_materialization_complete(extracted_dir, complete_marker):
+        telemetry["dataset_materialization_cache_hit"] = True
+        telemetry["dataset_materialization_status"] = "hit"
+        return DatasetMaterializationResult(extracted_dir, telemetry)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    wait_started = time.perf_counter()
+    lock_dir = _acquire_materialization_lock(cache_dir)
+    telemetry["dataset_materialization_wait_seconds"] = round(time.perf_counter() - wait_started, 6)
+    try:
+        if _dataset_materialization_complete(extracted_dir, complete_marker):
+            telemetry["dataset_materialization_cache_hit"] = True
+            telemetry["dataset_materialization_status"] = "hit_after_wait"
+            return DatasetMaterializationResult(extracted_dir, telemetry)
+
+        telemetry["dataset_materialization_cache_miss"] = True
+        telemetry["dataset_materialization_status"] = "materializing"
+        _reset_incomplete_materialization(extracted_dir, complete_marker, archive_path)
+        downloaded_path = downloader(storage_uri, archive_path)
+        downloaded_path = Path(downloaded_path) if downloaded_path is not None else archive_path
+        telemetry["dataset_materialization_bytes_downloaded"] = _path_size(downloaded_path)
+
+        staging_dir = cache_dir / f"extracting-{os.getpid()}-{time.time_ns()}"
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True)
+        extract_started = time.perf_counter()
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(staging_dir)
+        telemetry["dataset_materialization_extract_seconds"] = round(
+            time.perf_counter() - extract_started,
+            6,
+        )
+
+        if extracted_dir.exists():
+            shutil.rmtree(extracted_dir)
+        staging_dir.replace(extracted_dir)
+        manifest = {
+            "dataset_id": dataset_id,
+            "dataset_checksum": _normalized_checksum(checksum_sha256),
+            "storage_uri": storage_uri,
+            "storage_uri_fingerprint": storage_fingerprint,
+            "cache_key": key,
+            "bytes_downloaded": telemetry["dataset_materialization_bytes_downloaded"],
+            "completed_at_unix": time.time(),
+        }
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        complete_marker.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        telemetry["dataset_materialization_status"] = "materialized"
+        return DatasetMaterializationResult(extracted_dir, telemetry)
+    finally:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
+def dataset_materialization_cache_key(checksum_sha256: str | None, storage_uri: str) -> str:
+    checksum = _normalized_checksum(checksum_sha256)
+    if checksum:
+        return f"sha256-{checksum[:64]}"
+    return f"uri-{storage_uri_fingerprint(storage_uri)}"
+
+
+def storage_uri_fingerprint(storage_uri: str) -> str:
+    normalized = _normalized_storage_uri(storage_uri)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _dataset_materialization_complete(extracted_dir: Path, complete_marker: Path) -> bool:
+    return complete_marker.exists() and extracted_dir.is_dir()
+
+
 def cleanup_dataset_cache(dataset_id: str, cache_root: Path | str | None = None) -> None:
     shutil.rmtree(dataset_cache_dir(dataset_id, cache_root), ignore_errors=True)
 
@@ -76,7 +193,10 @@ def job_dataset_cache_root(job_id: str | None = None, cache_root: Path | str | N
     return base_root / "_jobs" / safe_job_id
 
 
-def cleanup_job_dataset_cache(job_id: str | None = None, cache_root: Path | str | None = None) -> None:
+def cleanup_job_dataset_cache(
+    job_id: str | None = None,
+    cache_root: Path | str | None = None,
+) -> None:
     root = job_dataset_cache_root(job_id, cache_root)
     if should_persist_dataset_cache() and cache_root is None:
         return
@@ -86,6 +206,106 @@ def cleanup_job_dataset_cache(job_id: str | None = None, cache_root: Path | str 
 def should_persist_dataset_cache() -> bool:
     value = os.getenv("MODEL_EXPRESS_PERSIST_DATASET_CACHE", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _acquire_materialization_lock(cache_dir: Path) -> Path:
+    lock_dir = cache_dir / ".materializing.lock"
+    started_at = time.monotonic()
+    while True:
+        try:
+            lock_dir.mkdir()
+            return lock_dir
+        except FileExistsError:
+            if _materialization_lock_is_stale(lock_dir):
+                shutil.rmtree(lock_dir, ignore_errors=True)
+                continue
+            if time.monotonic() - started_at > _materialization_lock_timeout_seconds():
+                raise TimeoutError(
+                    f"Timed out waiting for dataset materialization lock: {lock_dir}"
+                )
+            time.sleep(LOCK_POLL_SECONDS)
+
+
+def _materialization_telemetry(
+    *,
+    cache_hit: bool,
+    cache_key: str,
+    checksum_sha256: str | None,
+    storage_fingerprint: str,
+) -> dict:
+    checksum = _normalized_checksum(checksum_sha256)
+    return {
+        "dataset_materialization_cache_hit": cache_hit,
+        "dataset_materialization_cache_miss": False,
+        "dataset_materialization_bytes_downloaded": 0,
+        "dataset_materialization_extract_seconds": 0.0,
+        "dataset_materialization_wait_seconds": 0.0,
+        "dataset_materialization_status": "checking",
+        "dataset_checksum": checksum,
+        "storage_uri_fingerprint": storage_fingerprint,
+        "dataset_materialization_cache_key": cache_key,
+    }
+
+
+def _reset_incomplete_materialization(
+    extracted_dir: Path,
+    complete_marker: Path,
+    archive_path: Path,
+) -> None:
+    complete_marker.unlink(missing_ok=True)
+    if extracted_dir.exists():
+        shutil.rmtree(extracted_dir)
+    archive_path.unlink(missing_ok=True)
+
+
+def _path_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _normalized_checksum(checksum_sha256: str | None) -> str:
+    value = str(checksum_sha256 or "").strip().lower()
+    if len(value) == 64 and all(ch in "0123456789abcdef" for ch in value):
+        return value
+    return ""
+
+
+def _normalized_storage_uri(storage_uri: str) -> str:
+    parsed = urlparse(str(storage_uri).strip())
+    if parsed.scheme == "s3":
+        return f"s3://{parsed.netloc.lower()}/{parsed.path.lstrip('/')}"
+    return str(storage_uri).strip()
+
+
+def _materialization_lock_timeout_seconds() -> float:
+    value = os.getenv("MODEL_EXPRESS_DATASET_MATERIALIZATION_LOCK_TIMEOUT_SECONDS", "").strip()
+    if not value:
+        return float(LOCK_TIMEOUT_SECONDS)
+    try:
+        parsed = float(value)
+    except ValueError:
+        return float(LOCK_TIMEOUT_SECONDS)
+    return parsed if parsed > 0 else float(LOCK_TIMEOUT_SECONDS)
+
+
+def _materialization_lock_stale_seconds() -> float:
+    value = os.getenv("MODEL_EXPRESS_DATASET_MATERIALIZATION_LOCK_STALE_SECONDS", "").strip()
+    if not value:
+        return float(LOCK_STALE_SECONDS)
+    try:
+        parsed = float(value)
+    except ValueError:
+        return float(LOCK_STALE_SECONDS)
+    return parsed if parsed > 0 else float(LOCK_STALE_SECONDS)
+
+
+def _materialization_lock_is_stale(lock_dir: Path) -> bool:
+    try:
+        return time.time() - lock_dir.stat().st_mtime > _materialization_lock_stale_seconds()
+    except OSError:
+        return False
 
 
 def _safe_dataset_id(dataset_id: str) -> str:
