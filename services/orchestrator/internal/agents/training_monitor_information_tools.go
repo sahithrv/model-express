@@ -35,7 +35,7 @@ func TrainingMonitorInformationToolSpecs() []AgentInformationToolSpec {
 		},
 		{
 			Name:        TrainingMonitorToolMemoryRecords,
-			Description: "Return capped prior memory summaries scoped to this project/dataset/job context.",
+			Description: "Return capped prior memory summaries and advisory retrieved run memory when supplied for this project/dataset/job context.",
 			Parameters:  emptyObjectSchema(),
 		},
 		{
@@ -85,9 +85,13 @@ func ExecuteTrainingMonitorInformationTool(input TrainingMonitorInput, name stri
 			"evaluation": compactTrainingMonitorEvaluation(input),
 		})
 	case TrainingMonitorToolMemoryRecords:
-		return acceptedMonitorTool(normalized, map[string]any{
+		payload := map[string]any{
 			"memory_records": compactMemoryRecords(input.MemoryRecords),
-		})
+		}
+		if retrievedRunMemory := compactRetrievedRunMemory(input.RetrievedRunMemory); len(retrievedRunMemory) > 0 {
+			payload["retrieved_run_memory"] = retrievedRunMemory
+		}
+		return acceptedMonitorTool(normalized, payload)
 	case TrainingMonitorToolPlanConfig:
 		return acceptedMonitorTool(normalized, map[string]any{
 			"plan": compactTrainingMonitorPlan(input.Plan),

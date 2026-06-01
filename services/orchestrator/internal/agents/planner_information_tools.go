@@ -83,7 +83,7 @@ func ExperimentPlannerInformationToolSpecs() []AgentInformationToolSpec {
 		},
 		{
 			Name:        PlannerToolMemory,
-			Description: "Return capped planning memory summaries for the active project and dataset.",
+			Description: "Return capped planning memory summaries and supplied retrieved compact memory cards for the active project and dataset.",
 			Parameters:  emptyObjectSchema(),
 		},
 		{
@@ -175,11 +175,15 @@ func ExecuteExperimentPlannerInformationTool(input ExperimentPlannerInput, name 
 			"visual_evidence": snapshot.VisualEvidence,
 		})
 	case PlannerToolMemory:
-		return acceptedPlannerTool(normalized, map[string]any{
+		payload := map[string]any{
 			"successful_strategy_memory": capPlannerStrategyMemory(input.SuccessfulStrategyMemory, plannerToolMaxMemoryRecords),
 			"failed_strategy_memory":     capPlannerStrategyMemory(input.FailedStrategyMemory, plannerToolMaxMemoryRecords),
 			"rejected_strategy_memory":   capRejectedPlannerOptions(input.RejectedStrategyMemory, plannerToolMaxMemoryRecords),
-		})
+		}
+		if snapshot.RetrievedMemory != nil {
+			payload["retrieved_memory"] = snapshot.RetrievedMemory
+		}
+		return acceptedPlannerTool(normalized, payload)
 	case PlannerToolScorecards:
 		return acceptedPlannerTool(normalized, map[string]any{
 			"scorecards": capPlannerStrategyScorecards(input.StrategyScorecards, plannerToolMaxScorecards),

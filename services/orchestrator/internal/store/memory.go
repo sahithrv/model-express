@@ -2,9 +2,12 @@ package store
 
 import (
 	"fmt"
+	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
@@ -48,6 +51,7 @@ type MemoryStore struct {
 	executionEvents      map[string]execution.ExecutionEvent
 	agentMemoryRecords   map[string]memory.AgentMemoryRecord
 	agentInvocations     map[string]memory.AgentInvocation
+	memoryEmbeddings     map[string]memory.MemoryEmbeddingRecord
 	strategyScorecards   map[string]strategies.StrategyScorecard
 	optimizerStudies     map[string]automl.OptimizerStudy
 	optimizerSuggestions map[string]automl.OptimizerSuggestion
@@ -75,6 +79,7 @@ func NewMemoryStore() *MemoryStore {
 		executionEvents:      make(map[string]execution.ExecutionEvent),
 		agentMemoryRecords:   make(map[string]memory.AgentMemoryRecord),
 		agentInvocations:     make(map[string]memory.AgentInvocation),
+		memoryEmbeddings:     make(map[string]memory.MemoryEmbeddingRecord),
 		strategyScorecards:   make(map[string]strategies.StrategyScorecard),
 		optimizerStudies:     make(map[string]automl.OptimizerStudy),
 		optimizerSuggestions: make(map[string]automl.OptimizerSuggestion),
@@ -1392,6 +1397,162 @@ func (s *MemoryStore) ListProjectAgentInvocations(projectID string, filter memor
 	return out, nil
 }
 
+func (s *MemoryStore) UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord) (memory.MemoryEmbeddingRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[record.ProjectID]; !ok {
+		return memory.MemoryEmbeddingRecord{}, ErrNotFound
+	}
+
+	now := time.Now().UTC()
+	normalized, err := normalizeMemoryEmbeddingRecord(record, now)
+	if err != nil {
+		return memory.MemoryEmbeddingRecord{}, err
+	}
+	for id, existing := range s.memoryEmbeddings {
+		if memoryEmbeddingSourceModelKey(existing) != memoryEmbeddingSourceModelKey(normalized) {
+			continue
+		}
+		normalized.ID = existing.ID
+		normalized.CreatedAt = existing.CreatedAt
+		normalized.UpdatedAt = now
+		s.memoryEmbeddings[id] = normalized
+		return normalized, nil
+	}
+
+	if normalized.ID == "" {
+		normalized.ID = s.newID("memory_embedding")
+	}
+	normalized.CreatedAt = now
+	normalized.UpdatedAt = now
+	s.memoryEmbeddings[normalized.ID] = normalized
+	return normalized, nil
+}
+
+func (s *MemoryStore) SearchMemoryEmbeddings(query memory.MemoryRetrievalQuery) ([]memory.MemoryRetrievalResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.TrimSpace(query.ProjectID) == "" {
+		return nil, fmt.Errorf("%w: project_id is required", ErrInvalidRequest)
+	}
+	if _, ok := s.projects[query.ProjectID]; !ok {
+		return nil, ErrNotFound
+	}
+	limit := memoryRetrievalLimit(query.Limit)
+	candidates := []memoryRetrievalCandidate{}
+	for _, record := range s.memoryEmbeddings {
+		if !memoryEmbeddingMatchesQuery(record, query) {
+			continue
+		}
+		semantic, structured, score, reason := scoreMemoryEmbedding(record, query)
+		candidates = append(candidates, memoryRetrievalCandidate{
+			result: memory.MemoryRetrievalResult{
+				SourceTable:     record.SourceTable,
+				SourceID:        record.SourceID,
+				ProjectID:       record.ProjectID,
+				DatasetID:       record.DatasetID,
+				Kind:            record.Kind,
+				Score:           score,
+				SemanticScore:   semantic,
+				StructuredScore: structured,
+				RetrievalReason: reason,
+				SummaryCard:     copyAnyMap(record.SummaryCard),
+				Metadata:        copyAnyMap(record.Metadata),
+			},
+			updatedAt: record.UpdatedAt,
+		})
+	}
+	sortMemoryRetrievalCandidates(candidates)
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]memory.MemoryRetrievalResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, candidate.result)
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) ListUnembeddedMemorySources(projectID string, limit int) ([]memory.EmbeddableMemoryCard, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	limit = unembeddedMemorySourceLimit(limit)
+	embedded := map[string]bool{}
+	for _, record := range s.memoryEmbeddings {
+		if record.ProjectID == projectID {
+			embedded[memoryEmbeddingSourceKey(record.SourceTable, record.SourceID)] = true
+		}
+	}
+
+	candidates := []embeddableMemorySourceCandidate{}
+	for _, record := range s.agentMemoryRecords {
+		if record.ProjectID != projectID || embedded[memoryEmbeddingSourceKey(memory.SourceAgentMemoryRecord, record.ID)] {
+			continue
+		}
+		card, ok := memory.BuildAgentMemoryCard(record)
+		if !ok || !memoryCardShouldBeIndexed(card) {
+			continue
+		}
+		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: record.CreatedAt})
+	}
+	for _, scorecard := range s.strategyScorecards {
+		if scorecard.ProjectID != projectID || embedded[memoryEmbeddingSourceKey(memory.SourceStrategyScorecard, scorecard.ID)] {
+			continue
+		}
+		card, ok := memory.BuildStrategyScorecardCard(scorecard)
+		if !ok || !memoryCardShouldBeIndexed(card) {
+			continue
+		}
+		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: scorecard.CreatedAt})
+	}
+	for _, dataset := range s.datasets {
+		if dataset.ProjectID != projectID || embedded[memoryEmbeddingSourceKey(memory.SourceDatasetProfile, dataset.ID)] {
+			continue
+		}
+		card, ok := memory.BuildDatasetProfileCard(dataset)
+		if !ok || !memoryCardShouldBeIndexed(card) {
+			continue
+		}
+		createdAt := dataset.CreatedAt
+		if dataset.ProfiledAt != nil {
+			createdAt = *dataset.ProfiledAt
+		}
+		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: createdAt})
+	}
+	for _, analysis := range s.visualAnalyses {
+		if analysis.ProjectID != projectID {
+			continue
+		}
+		if !embedded[memoryEmbeddingSourceKey(memory.SourceDatasetVisualAnalysis, analysis.ID)] {
+			card, ok := memory.BuildDatasetVisualAnalysisCard(analysis)
+			if ok && memoryCardShouldBeIndexed(card) {
+				candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: analysis.CreatedAt})
+			}
+		}
+		for _, card := range memory.BuildDatasetPreprocessingHypothesisCards(analysis) {
+			if embedded[memoryEmbeddingSourceKey(card.SourceTable, card.SourceID)] || !memoryCardShouldBeIndexed(card) {
+				continue
+			}
+			candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: analysis.CreatedAt})
+		}
+	}
+	sortEmbeddableMemorySourceCandidates(candidates)
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]memory.EmbeddableMemoryCard, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, candidate.card)
+	}
+	return out, nil
+}
+
 func (s *MemoryStore) CreateStrategyScorecard(scorecard strategies.StrategyScorecardCreate) (strategies.StrategyScorecard, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2164,4 +2325,448 @@ func agentInvocationMatchesFilter(invocation memory.AgentInvocation, filter memo
 		return false
 	}
 	return true
+}
+
+const (
+	defaultMemoryRetrievalLimit        = 10
+	maxMemoryRetrievalLimit            = 100
+	defaultUnembeddedMemorySourceLimit = 100
+	maxUnembeddedMemorySourceLimit     = 500
+)
+
+type memoryRetrievalCandidate struct {
+	result    memory.MemoryRetrievalResult
+	updatedAt time.Time
+}
+
+type embeddableMemorySourceCandidate struct {
+	card      memory.EmbeddableMemoryCard
+	createdAt time.Time
+}
+
+func normalizeMemoryEmbeddingRecord(record memory.MemoryEmbeddingRecord, now time.Time) (memory.MemoryEmbeddingRecord, error) {
+	record.ID = strings.TrimSpace(record.ID)
+	record.SourceTable = strings.TrimSpace(record.SourceTable)
+	record.SourceID = strings.TrimSpace(record.SourceID)
+	record.ProjectID = strings.TrimSpace(record.ProjectID)
+	record.DatasetID = strings.TrimSpace(record.DatasetID)
+	record.PlanID = strings.TrimSpace(record.PlanID)
+	record.JobID = strings.TrimSpace(record.JobID)
+	record.InvocationID = strings.TrimSpace(record.InvocationID)
+	record.Kind = strings.TrimSpace(record.Kind)
+	record.Scope = strings.TrimSpace(record.Scope)
+	record.EmbeddingModel = strings.TrimSpace(record.EmbeddingModel)
+	record.EmbeddingText = strings.TrimSpace(record.EmbeddingText)
+	if record.SourceTable == "" {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: source_table is required", ErrInvalidRequest)
+	}
+	if record.SourceID == "" {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: source_id is required", ErrInvalidRequest)
+	}
+	if record.ProjectID == "" {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: project_id is required", ErrInvalidRequest)
+	}
+	if record.Kind == "" {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: kind is required", ErrInvalidRequest)
+	}
+	if record.Scope == "" {
+		record.Scope = memory.ScopeProject
+	}
+	if record.EmbeddingModel == "" {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: embedding_model is required", ErrInvalidRequest)
+	}
+	if len(record.Embedding) == 0 {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: embedding is required", ErrInvalidRequest)
+	}
+	if record.EmbeddingDimensions <= 0 {
+		record.EmbeddingDimensions = len(record.Embedding)
+	}
+	if record.EmbeddingDimensions != len(record.Embedding) {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: embedding_dimensions must match embedding length", ErrInvalidRequest)
+	}
+	if record.EmbeddingText == "" {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: embedding_text is required", ErrInvalidRequest)
+	}
+	record.Embedding = append([]float32(nil), record.Embedding...)
+	record.SummaryCard = copyAnyMap(record.SummaryCard)
+	if record.SummaryCard == nil {
+		record.SummaryCard = map[string]any{}
+	}
+	record.Metadata = copyAnyMap(record.Metadata)
+	if record.Metadata == nil {
+		record.Metadata = map[string]any{}
+	}
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = now
+	}
+	record.UpdatedAt = now
+	return record, nil
+}
+
+func memoryRetrievalLimit(limit int) int {
+	if limit <= 0 {
+		return defaultMemoryRetrievalLimit
+	}
+	if limit > maxMemoryRetrievalLimit {
+		return maxMemoryRetrievalLimit
+	}
+	return limit
+}
+
+func unembeddedMemorySourceLimit(limit int) int {
+	if limit <= 0 {
+		return defaultUnembeddedMemorySourceLimit
+	}
+	if limit > maxUnembeddedMemorySourceLimit {
+		return maxUnembeddedMemorySourceLimit
+	}
+	return limit
+}
+
+func memorySearchCandidateLimit(limit int) int {
+	candidateLimit := memoryRetrievalLimit(limit) * 50
+	if candidateLimit < 100 {
+		return 100
+	}
+	if candidateLimit > 1000 {
+		return 1000
+	}
+	return candidateLimit
+}
+
+func memoryEmbeddingMatchesQuery(record memory.MemoryEmbeddingRecord, query memory.MemoryRetrievalQuery) bool {
+	if strings.TrimSpace(query.ProjectID) == "" {
+		return false
+	}
+	if !query.CrossProjectOK && record.ProjectID != query.ProjectID {
+		return false
+	}
+	if query.DatasetID != "" && !query.CrossProjectOK && record.DatasetID != query.DatasetID {
+		return false
+	}
+	if len(query.Kinds) > 0 {
+		if _, ok := normalizedSet(query.Kinds)[strings.ToLower(strings.TrimSpace(record.Kind))]; !ok {
+			return false
+		}
+	}
+	if strings.TrimSpace(query.EmbeddingModel) != "" && record.EmbeddingModel != strings.TrimSpace(query.EmbeddingModel) {
+		return false
+	}
+	if query.EmbeddingDimensions > 0 && record.EmbeddingDimensions != query.EmbeddingDimensions {
+		return false
+	}
+	if len(query.Embedding) > 0 && len(record.Embedding) != len(query.Embedding) {
+		return false
+	}
+	if !metadataBoolDefault(record.Metadata, "accepted_for_vector_memory", true) {
+		return false
+	}
+	return true
+}
+
+func scoreMemoryEmbedding(record memory.MemoryEmbeddingRecord, query memory.MemoryRetrievalQuery) (float64, float64, float64, string) {
+	searchText := memoryEmbeddingSearchText(record)
+	semantic := lexicalSimilarity(query.Text, searchText)
+	semanticReason := "lexical match"
+	if len(query.Embedding) > 0 {
+		semantic = cosineSimilarity(query.Embedding, record.Embedding)
+		semanticReason = "vector match"
+	}
+	structured, reasons := structuredMemoryScore(record, query, searchText)
+	quality := clampUnit(record.QualityScore)
+	outcome := clampUnit(record.OutcomeScore)
+
+	score := 0.62*semantic + 0.28*structured + 0.05*quality + 0.10*outcome
+	if strings.TrimSpace(query.Text) == "" {
+		score = 0.75*structured + 0.05*quality + 0.10*outcome
+	}
+	if score < 0 {
+		score = 0
+	}
+	if semantic > 0 {
+		reasons = append(reasons, semanticReason)
+	}
+	if outcome > 0 {
+		reasons = append(reasons, "positive outcome")
+	} else if outcome < 0 {
+		reasons = append(reasons, "negative outcome")
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "eligible memory")
+	}
+	return roundScore(semantic), roundScore(structured), roundScore(score), strings.Join(reasons, "; ")
+}
+
+func cosineSimilarity(left []float32, right []float32) float64 {
+	if len(left) == 0 || len(left) != len(right) {
+		return 0
+	}
+	dot := 0.0
+	leftNorm := 0.0
+	rightNorm := 0.0
+	for index := range left {
+		l := float64(left[index])
+		r := float64(right[index])
+		dot += l * r
+		leftNorm += l * l
+		rightNorm += r * r
+	}
+	if leftNorm == 0 || rightNorm == 0 {
+		return 0
+	}
+	score := dot / (math.Sqrt(leftNorm) * math.Sqrt(rightNorm))
+	if math.IsNaN(score) || math.IsInf(score, 0) || score <= 0 {
+		return 0
+	}
+	if score > 1 {
+		return 1
+	}
+	return score
+}
+
+func structuredMemoryScore(record memory.MemoryEmbeddingRecord, query memory.MemoryRetrievalQuery, searchText string) (float64, []string) {
+	score := 0.0
+	total := 0.0
+	reasons := []string{}
+
+	if query.DatasetID != "" {
+		total += 1
+		if record.DatasetID == query.DatasetID {
+			score += 1
+			reasons = append(reasons, "same dataset")
+		}
+	}
+	if len(query.Mechanisms) > 0 {
+		total += 1
+		mechanismText := strings.Join([]string{
+			stringFromAny(record.Metadata["mechanism"]),
+			stringFromAny(record.Metadata["intervention"]),
+			stringFromAny(record.SummaryCard["mechanism"]),
+			stringFromAny(record.SummaryCard["intervention"]),
+			searchText,
+		}, " ")
+		if anyNeedleMatchesText(query.Mechanisms, mechanismText) {
+			score += 1
+			reasons = append(reasons, "matching mechanism")
+		}
+	}
+	if len(query.DatasetTraits) > 0 {
+		total += 1
+		traitsText := strings.Join([]string{
+			stringFromAny(record.Metadata["dataset_traits"]),
+			stringFromAny(record.SummaryCard["dataset_traits"]),
+			searchText,
+		}, " ")
+		if anyNeedleMatchesText(query.DatasetTraits, traitsText) {
+			score += 1
+			reasons = append(reasons, "matching dataset traits")
+		}
+	}
+	if strings.TrimSpace(query.Objective) != "" {
+		total += 1
+		objectiveText := strings.Join([]string{
+			stringFromAny(record.Metadata["objective"]),
+			stringFromAny(record.Metadata["objective_profile"]),
+			stringFromAny(record.SummaryCard["objective"]),
+			searchText,
+		}, " ")
+		if lexicalSimilarity(query.Objective, objectiveText) > 0 {
+			score += 1
+			reasons = append(reasons, "matching objective")
+		}
+	}
+	if total == 0 {
+		return 0, reasons
+	}
+	return score / total, reasons
+}
+
+func lexicalSimilarity(queryText string, documentText string) float64 {
+	queryTokens := tokenSet(queryText)
+	if len(queryTokens) == 0 {
+		return 0
+	}
+	documentTokens := tokenSet(documentText)
+	if len(documentTokens) == 0 {
+		return 0
+	}
+	matches := 0
+	for token := range queryTokens {
+		if documentTokens[token] {
+			matches++
+		}
+	}
+	return float64(matches) / float64(len(queryTokens))
+}
+
+func tokenSet(text string) map[string]bool {
+	out := map[string]bool{}
+	for _, token := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		token = strings.TrimSpace(token)
+		if len(token) < 2 {
+			continue
+		}
+		out[token] = true
+	}
+	return out
+}
+
+func memoryEmbeddingSearchText(record memory.MemoryEmbeddingRecord) string {
+	return strings.Join([]string{
+		record.EmbeddingText,
+		stringFromAny(record.SummaryCard),
+		stringFromAny(record.Metadata),
+	}, "\n")
+}
+
+func anyNeedleMatchesText(needles []string, text string) bool {
+	normalizedText := strings.ToLower(text)
+	for _, needle := range needles {
+		needle = strings.ToLower(strings.TrimSpace(needle))
+		if needle == "" {
+			continue
+		}
+		if strings.Contains(normalizedText, needle) || lexicalSimilarity(needle, normalizedText) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func metadataBoolDefault(values map[string]any, key string, fallback bool) bool {
+	value, ok := values[key]
+	if !ok {
+		return fallback
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "yes", "1":
+			return true
+		case "false", "no", "0":
+			return false
+		default:
+			return fallback
+		}
+	default:
+		return fallback
+	}
+}
+
+func stringFromAny(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []string:
+		return strings.Join(typed, " ")
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text := stringFromAny(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, " ")
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			text := stringFromAny(typed[key])
+			if text == "" {
+				continue
+			}
+			parts = append(parts, key+" "+text)
+		}
+		return strings.Join(parts, " ")
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func sortMemoryRetrievalCandidates(candidates []memoryRetrievalCandidate) {
+	sort.Slice(candidates, func(i, j int) bool {
+		left := candidates[i]
+		right := candidates[j]
+		if left.result.Score != right.result.Score {
+			return left.result.Score > right.result.Score
+		}
+		if left.result.SemanticScore != right.result.SemanticScore {
+			return left.result.SemanticScore > right.result.SemanticScore
+		}
+		if left.result.StructuredScore != right.result.StructuredScore {
+			return left.result.StructuredScore > right.result.StructuredScore
+		}
+		if !left.updatedAt.Equal(right.updatedAt) {
+			return left.updatedAt.After(right.updatedAt)
+		}
+		if left.result.SourceTable != right.result.SourceTable {
+			return left.result.SourceTable < right.result.SourceTable
+		}
+		return left.result.SourceID < right.result.SourceID
+	})
+}
+
+func sortEmbeddableMemorySourceCandidates(candidates []embeddableMemorySourceCandidate) {
+	sort.Slice(candidates, func(i, j int) bool {
+		left := candidates[i]
+		right := candidates[j]
+		if !left.createdAt.Equal(right.createdAt) {
+			return left.createdAt.After(right.createdAt)
+		}
+		if left.card.SourceTable != right.card.SourceTable {
+			return left.card.SourceTable < right.card.SourceTable
+		}
+		return left.card.SourceID < right.card.SourceID
+	})
+}
+
+func memoryCardShouldBeIndexed(card memory.EmbeddableMemoryCard) bool {
+	if strings.TrimSpace(card.Text) == "" {
+		return false
+	}
+	return metadataBoolDefault(card.Metadata, "accepted_for_vector_memory", true)
+}
+
+func memoryEmbeddingSourceKey(sourceTable string, sourceID string) string {
+	return strings.TrimSpace(sourceTable) + "\x00" + strings.TrimSpace(sourceID)
+}
+
+func memoryEmbeddingSourceModelKey(record memory.MemoryEmbeddingRecord) string {
+	return memoryEmbeddingSourceKey(record.SourceTable, record.SourceID) + "\x00" + strings.TrimSpace(record.EmbeddingModel)
+}
+
+func copyAnyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func clampUnit(value float64) float64 {
+	if value > 1 {
+		return 1
+	}
+	if value < -1 {
+		return -1
+	}
+	return value
+}
+
+func roundScore(value float64) float64 {
+	if value == 0 {
+		return 0
+	}
+	return float64(int(value*10000+0.5)) / 10000
 }

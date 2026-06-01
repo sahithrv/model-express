@@ -37,14 +37,15 @@ type TrainingMonitorAgent struct {
 }
 
 type TrainingMonitorInput struct {
-	Plan              plans.ExperimentPlan
-	Job               jobs.ExperimentJob
-	Summary           runs.TrainingRunSummary
-	Evaluation        *runs.TrainingRunEvaluation
-	Metrics           []jobs.EpochMetric
-	ObjectiveContext  ProjectObjectiveContext
-	MemoryRecords     []memory.AgentMemoryRecord
-	OptimizerFeedback *automl.OptimizerFeedbackSummary
+	Plan               plans.ExperimentPlan
+	Job                jobs.ExperimentJob
+	Summary            runs.TrainingRunSummary
+	Evaluation         *runs.TrainingRunEvaluation
+	Metrics            []jobs.EpochMetric
+	ObjectiveContext   ProjectObjectiveContext
+	MemoryRecords      []memory.AgentMemoryRecord
+	RetrievedRunMemory []memory.MemoryRetrievalResult
+	OptimizerFeedback  *automl.OptimizerFeedbackSummary
 }
 
 type TrainingEvaluationRecommendation struct {
@@ -221,6 +222,7 @@ After any information requests, return only final valid JSON.
 Consider validation quality, macro-F1, accuracy, per-class metrics, confusion matrix,
 train/validation gap, metric stability, plateauing, cost, runtime, inference latency,
 model size, compact optimizer feedback if present, and whether the run should inform future experiments.
+Retrieved run memory, if present, is advisory prior-run context only; it is not scheduling authority.
 This agent evaluates one run only. Do not propose new experiments or plan a follow-up batch.
 Produce signals that the plan-level Experiment Planning Agent can use later.`),
 			},
@@ -316,6 +318,9 @@ func trainingMonitorPromptContext(input TrainingMonitorInput) map[string]any {
 	}
 	if input.OptimizerFeedback != nil {
 		context["optimizer_feedback_summary"] = input.OptimizerFeedback
+	}
+	if retrievedRunMemory := compactRetrievedRunMemory(input.RetrievedRunMemory); len(retrievedRunMemory) > 0 {
+		context["retrieved_run_memory"] = retrievedRunMemory
 	}
 	attachTrainingMonitorPromptBudget(context)
 	return context
@@ -1018,6 +1023,12 @@ func attachTrainingMonitorPromptBudget(context map[string]any) {
 		"max_confusion_pairs": trainingMonitorMaxConfusionPairs,
 		"max_memory_records":  trainingMonitorMaxMemoryRecords,
 	}
+	if retrievedRunMemory, ok := context["retrieved_run_memory"].([]map[string]any); ok {
+		budget["retrieved_run_memory_count"] = len(retrievedRunMemory)
+		if encoded, err := json.Marshal(retrievedRunMemory); err == nil {
+			budget["retrieved_run_memory_approx_bytes"] = len(encoded)
+		}
+	}
 	context["prompt_budget"] = budget
 	encoded, err := json.Marshal(context)
 	if err == nil {
@@ -1041,6 +1052,103 @@ func compactEpochMetrics(metrics []jobs.EpochMetric) []map[string]any {
 		})
 	}
 	return out
+}
+
+func compactRetrievedRunMemory(records []memory.MemoryRetrievalResult) []map[string]any {
+	limit := minInt(len(records), trainingMonitorMaxMemoryRecords)
+	out := make([]map[string]any, 0, limit)
+	for _, record := range records {
+		card := compactRetrievedRunMemoryRecord(record)
+		if len(card) == 0 {
+			continue
+		}
+		out = append(out, card)
+		if len(out) >= trainingMonitorMaxMemoryRecords {
+			break
+		}
+	}
+	return out
+}
+
+func compactRetrievedRunMemoryRecord(record memory.MemoryRetrievalResult) map[string]any {
+	sourceTable := firstTrainingMonitorMemoryText(record.SummaryCard, record.Metadata, "source_table")
+	if sourceTable == "" {
+		sourceTable = safeTrainingMonitorMemoryText(record.SourceTable)
+	}
+	sourceID := firstTrainingMonitorMemoryText(record.SummaryCard, record.Metadata, "source_id", "memory_id", "job_id")
+	if sourceID == "" {
+		sourceID = safeTrainingMonitorMemoryText(record.SourceID)
+	}
+	kind := firstTrainingMonitorMemoryText(record.SummaryCard, record.Metadata, "kind", "memory_kind")
+	if kind == "" {
+		kind = safeTrainingMonitorMemoryText(record.Kind)
+	}
+
+	out := map[string]any{
+		"source_table": sourceTable,
+		"source_id":    sourceID,
+		"kind":         kind,
+	}
+	if record.Score != 0 {
+		out["score"] = roundMonitorFloat(record.Score)
+	}
+	if reason := safeTrainingMonitorMemoryText(record.RetrievalReason); reason != "" {
+		out["retrieval_reason"] = reason
+	}
+
+	addTrainingMonitorMemoryText(out, "model", record, "model", "best_model", "winner_model")
+	addTrainingMonitorMemoryText(out, "model_family", record, "model_family", "family")
+	addTrainingMonitorMemoryText(out, "dynamics", record, "dynamics", "training_dynamics", "training_dynamics_summary", "diagnostic_summary")
+	addTrainingMonitorMemoryText(out, "outcome", record, "outcome", "outcome_status", "status")
+	addTrainingMonitorMemoryText(out, "mechanism", record, "mechanism", "primary_mechanism", "mechanism_group")
+	addTrainingMonitorMemoryText(out, "summary", record, "summary", "recommendation_summary", "quality_summary")
+	addTrainingMonitorMemoryText(out, "lesson", record, "lesson")
+
+	return compactNonZeroMap(out)
+}
+
+func addTrainingMonitorMemoryText(out map[string]any, outputKey string, record memory.MemoryRetrievalResult, keys ...string) {
+	if text := firstTrainingMonitorMemoryText(record.SummaryCard, record.Metadata, keys...); text != "" {
+		out[outputKey] = text
+	}
+}
+
+func firstTrainingMonitorMemoryText(primary map[string]any, fallback map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if text := safeTrainingMonitorMemoryText(primary[key]); text != "" {
+			return text
+		}
+		if text := safeTrainingMonitorMemoryText(fallback[key]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func safeTrainingMonitorMemoryText(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || unsafeTrainingMonitorMemoryText(text) {
+		return ""
+	}
+	const maxLength = 320
+	if len(text) > maxLength {
+		text = strings.TrimSpace(text[:maxLength]) + "..."
+	}
+	return text
+}
+
+func unsafeTrainingMonitorMemoryText(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "://") ||
+		strings.Contains(lower, "embedding_text") ||
+		strings.Contains(lower, "raw payload") ||
+		strings.Contains(lower, "raw_payload") ||
+		strings.Contains(lower, "full_run_evaluation") ||
+		strings.Contains(lower, "epoch_history")
 }
 
 func compactMemoryRecords(records []memory.AgentMemoryRecord) []map[string]any {

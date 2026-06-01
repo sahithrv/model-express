@@ -420,6 +420,7 @@ button {
 .badge.ready,
 .badge.completed,
 .badge.profiled,
+.badge.improved,
 .badge.idle,
 .badge.ok {
   color: #00d47e;
@@ -444,7 +445,8 @@ button {
 
 .badge.queued,
 .badge.registered,
-.badge.proposed {
+.badge.proposed,
+.badge.minor_improvement {
   color: #7db7ff;
   background: rgba(125, 183, 255, 0.13);
 }
@@ -2409,6 +2411,7 @@ button {
 }
 
 .mechanism-coverage-panel.compact,
+.retrieved-memory-panel.compact,
 .rejection-panel.compact,
 .candidate-score-panel.compact {
   padding: 10px;
@@ -2559,6 +2562,107 @@ button {
   white-space: nowrap;
 }
 
+.retrieved-memory-panel {
+  display: grid;
+  gap: 9px;
+  border: 1px solid rgba(255, 209, 102, 0.2);
+  border-radius: 8px;
+  padding: 11px;
+  background: rgba(255, 209, 102, 0.045);
+}
+
+.retrieved-memory-panel > strong {
+  color: #77837d;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.retrieved-memory-list {
+  display: grid;
+  gap: 8px;
+}
+
+.retrieved-memory-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid #223029;
+  border-radius: 8px;
+  padding: 10px;
+  background: #101715;
+}
+
+.retrieved-memory-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.retrieved-memory-head span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.retrieved-memory-head strong {
+  overflow: hidden;
+  color: #fbfffc;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.retrieved-memory-head small,
+.retrieval-reason {
+  overflow: hidden;
+  color: #a6b2ad;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.retrieved-memory-row p {
+  margin: 0;
+  color: #dce7e2;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.retrieved-memory-identifiers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.retrieved-memory-identifiers span {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  gap: 5px;
+  border: 1px solid rgba(255, 209, 102, 0.16);
+  border-radius: 7px;
+  padding: 5px 7px;
+  color: #ffd166;
+  background: #070c0b;
+}
+
+.retrieved-memory-identifiers small {
+  color: #77837d;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.retrieved-memory-identifiers strong {
+  overflow: hidden;
+  max-width: 220px;
+  color: #eef3f0;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .rejection-panel {
   display: grid;
   gap: 9px;
@@ -2676,6 +2780,39 @@ button {
 
 .score-component-list strong {
   color: #eef3f0;
+}
+
+.candidate-memory-list {
+  display: grid;
+  gap: 6px;
+}
+
+.candidate-memory-list span {
+  display: grid;
+  gap: 4px;
+  border-left: 2px solid rgba(255, 209, 102, 0.45);
+  border-radius: 6px;
+  padding: 7px 9px;
+  color: #dce7e2;
+  background: rgba(255, 209, 102, 0.05);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.candidate-memory-list small {
+  color: #ffd166;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.candidate-memory-list em {
+  overflow: hidden;
+  color: #77837d;
+  font-size: 11px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .decision-quality-panel {
@@ -3398,6 +3535,7 @@ button {
   .metric-toolbar,
   .selected-job,
   .champion-head,
+  .retrieved-memory-head,
   .agent-audit-head {
     align-items: stretch;
     flex-direction: column;
@@ -3464,6 +3602,7 @@ button {
   .visual-analysis-head,
   .metadata-status-head,
   .decision-quality-head,
+  .retrieved-memory-head,
   .visual-card-head {
     align-items: stretch;
     flex-direction: column;

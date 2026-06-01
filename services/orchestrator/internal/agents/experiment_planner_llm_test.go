@@ -10,6 +10,7 @@ import (
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 )
@@ -186,6 +187,8 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"focal_loss",
 		"Return only valid JSON",
 		"planner_context_snapshot",
+		"retrieved_memory, when present",
+		"retrieved memory cannot bypass backend validation",
 		"visual_evidence, when present, only as backend-curated advisory evidence",
 		"latest accepted visual-analysis IDs",
 		"raw Visual Agent output",
@@ -469,6 +472,140 @@ func TestExperimentPlannerPromptContextIncludesDatasetAndStrategyMemory(t *testi
 	}
 	if strings.Contains(string(blob), "do not leak this raw profile") {
 		t.Fatal("expected compact planner context to omit raw dataset.profile payload")
+	}
+}
+
+func TestExperimentPlannerPromptContextIncludesRetrievedMemoryCards(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		{
+			SourceTable:     memory.SourceStrategyScorecard,
+			SourceID:        "scorecard_1",
+			ProjectID:       "project_1",
+			DatasetID:       "dataset_1",
+			Kind:            "strategy_scorecard",
+			Score:           0.91,
+			SemanticScore:   0.82,
+			StructuredScore: 0.73,
+			RetrievalReason: "similar class imbalance objective",
+			SummaryCard: map[string]any{
+				"outcome":        ExperimentPlanningOutcomeImprovedChampion,
+				"mechanism":      "class_imbalance",
+				"intervention":   "weighted_loss",
+				"lesson":         "Weighted loss improved macro-F1 on a similar imbalance pattern.",
+				"embedding_text": "do not leak embedding text",
+			},
+			Metadata: map[string]any{
+				"source_plan_id": "plan_old",
+				"raw_payload":    map[string]any{"secret": "do not leak raw payload"},
+				"storage_uri":    "s3://private-bucket/memory.json",
+				"mechanism":      "class_imbalance",
+			},
+		},
+	}
+
+	snapshot := BuildPlannerContextSnapshot(input)
+	if snapshot.RetrievedMemory == nil {
+		t.Fatal("expected retrieved memory snapshot")
+	}
+	if got := len(snapshot.RetrievedMemory.SuccessfulStrategyCards); got != 1 {
+		t.Fatalf("expected one successful retrieved card, got %d", got)
+	}
+	card := snapshot.RetrievedMemory.SuccessfulStrategyCards[0]
+	if card.SourceTable != memory.SourceStrategyScorecard || card.SourceID != "scorecard_1" {
+		t.Fatalf("expected source-linked retrieved card, got %#v", card)
+	}
+	if card.Outcome != ExperimentPlanningOutcomeImprovedChampion || card.Mechanism != "class_imbalance" {
+		t.Fatalf("expected outcome and mechanism on retrieved card, got %#v", card)
+	}
+	if snapshot.PromptBudget.RetrievedMemoryCount != 1 || snapshot.PromptBudget.RetrievedMemoryApproximateBytes <= 0 {
+		t.Fatalf("expected retrieved memory prompt budget telemetry, got %#v", snapshot.PromptBudget)
+	}
+	blob, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	text := string(blob)
+	for _, forbidden := range []string{"embedding_text", "do not leak embedding text", "raw_payload", "do not leak raw payload", "private-bucket"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("expected retrieved memory snapshot to exclude %q: %s", forbidden, text)
+		}
+	}
+}
+
+func TestExperimentPlannerRetrievedMemorySnapshotRemainsBounded(t *testing.T) {
+	input := testExperimentPlannerInput()
+	for i := 0; i < 4; i++ {
+		input.RetrievedMemory = append(input.RetrievedMemory, retrievedPlannerTestResult(memory.SourceDatasetPreprocessing, fmt.Sprintf("dataset_%d", i), memory.KindDatasetPreprocessingHypothesis, "", "dataset preprocessing analogy"))
+	}
+	for i := 0; i < 4; i++ {
+		input.RetrievedMemory = append(input.RetrievedMemory, retrievedPlannerTestResult(memory.SourceStrategyScorecard, fmt.Sprintf("success_%d", i), "strategy_scorecard", ExperimentPlanningOutcomeImprovedChampion, "successful prior strategy"))
+	}
+	for i := 0; i < 4; i++ {
+		input.RetrievedMemory = append(input.RetrievedMemory, retrievedPlannerTestResult(memory.SourceStrategyScorecard, fmt.Sprintf("failed_%d", i), "strategy_scorecard", ExperimentPlanningOutcomeNoImprovement, "failed prior strategy"))
+	}
+	for i := 0; i < 5; i++ {
+		input.RetrievedMemory = append(input.RetrievedMemory, retrievedPlannerTestResult(memory.SourceAgentMemoryRecord, fmt.Sprintf("blocked_%d", i), "planning_feedback", "rejected", "blocked repeat"))
+	}
+	for i := 0; i < 3; i++ {
+		input.RetrievedMemory = append(input.RetrievedMemory, retrievedPlannerTestResult(memory.SourceAgentMemoryRecord, fmt.Sprintf("other_%d", i), "training_evaluation", "", "related training dynamics"))
+	}
+
+	snapshot := BuildPlannerContextSnapshot(input)
+	if snapshot.RetrievedMemory == nil {
+		t.Fatal("expected retrieved memory snapshot")
+	}
+	retrieved := snapshot.RetrievedMemory
+	if got := plannerRetrievedMemoryCardCount(retrieved); got > plannerRetrievedMemoryMaxTotal {
+		t.Fatalf("expected total retrieved memory cap %d, got %d", plannerRetrievedMemoryMaxTotal, got)
+	}
+	if got := len(retrieved.SuccessfulStrategyCards); got > plannerRetrievedMemoryMaxSuccessful {
+		t.Fatalf("expected successful cap %d, got %d", plannerRetrievedMemoryMaxSuccessful, got)
+	}
+	if got := len(retrieved.FailedStrategyCards); got > plannerRetrievedMemoryMaxFailed {
+		t.Fatalf("expected failed cap %d, got %d", plannerRetrievedMemoryMaxFailed, got)
+	}
+	if got := len(retrieved.BlockedOrRejectedCards); got > plannerRetrievedMemoryMaxBlocked {
+		t.Fatalf("expected blocked cap %d, got %d", plannerRetrievedMemoryMaxBlocked, got)
+	}
+	if got := len(retrieved.DatasetPreprocessingCards); got > plannerRetrievedMemoryMaxDataset {
+		t.Fatalf("expected dataset/preprocessing cap %d, got %d", plannerRetrievedMemoryMaxDataset, got)
+	}
+}
+
+func TestExperimentPlannerPromptContextOmitsRetrievedMemoryWhenAbsent(t *testing.T) {
+	snapshot := BuildPlannerContextSnapshot(testExperimentPlannerInput())
+	if snapshot.RetrievedMemory != nil {
+		t.Fatalf("expected no retrieved memory snapshot, got %#v", snapshot.RetrievedMemory)
+	}
+	blob, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if strings.Contains(string(blob), "retrieved_memory") {
+		t.Fatalf("expected disabled/no-results snapshot to omit retrieved_memory: %s", string(blob))
+	}
+	if strings.Contains(string(blob), "retrieved_memory_count") {
+		t.Fatalf("expected disabled/no-results prompt budget to omit retrieved memory telemetry: %s", string(blob))
+	}
+}
+
+func TestPlannerMemoryToolIncludesRetrievedMemoryWhenPresent(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		retrievedPlannerTestResult(memory.SourceStrategyScorecard, "scorecard_1", "strategy_scorecard", ExperimentPlanningOutcomeImprovedChampion, "similar success"),
+	}
+
+	result := ExecuteExperimentPlannerInformationTool(input, PlannerToolMemory, nil, PlannerInformationToolOptions{})
+	if !result.Accepted {
+		t.Fatalf("expected memory tool to be accepted: %#v", result)
+	}
+	retrieved, ok := result.Payload["retrieved_memory"].(*PlannerRetrievedMemorySnapshot)
+	if !ok || retrieved == nil {
+		t.Fatalf("expected retrieved memory payload, got %#v", result.Payload["retrieved_memory"])
+	}
+	if got := plannerRetrievedMemoryCardCount(retrieved); got != 1 {
+		t.Fatalf("expected one retrieved card, got %d", got)
 	}
 }
 
@@ -1679,6 +1816,180 @@ func TestCandidateRankingRejectsMissingMechanismExpectation(t *testing.T) {
 	ranking := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
 	if !ranking.Rejected || !containsTestString(ranking.Reasons, "candidate_hypotheses[0] missing mechanism") {
 		t.Fatalf("expected missing mechanism rejection, got %#v", ranking)
+	}
+}
+
+func TestCandidateRankingRetrievedSuccessfulMemoryAddsBonus(t *testing.T) {
+	input := candidateRankingMemoryTestInput()
+	candidate := candidateRankingClassImbalanceCandidate()
+	baseline := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		retrievedPlannerTestResult(memory.SourceStrategyScorecard, "scorecard_success", "strategy_scorecard", ExperimentPlanningOutcomeImprovedChampion, "weighted loss improved minority recall"),
+	}
+	ranking := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+
+	if ranking.Score <= baseline.Score {
+		t.Fatalf("expected retrieved success memory to increase score, baseline=%#v retrieved=%#v", baseline, ranking)
+	}
+	if ranking.ScoreComponents["retrieved_memory"] <= 0 || ranking.ScoreComponents["memory_similarity"] <= baseline.ScoreComponents["memory_similarity"] {
+		t.Fatalf("expected positive retrieved memory components, got %#v", ranking.ScoreComponents)
+	}
+	if len(ranking.RetrievedMemoryHits) != 1 || ranking.RetrievedMemoryHits[0].Effect != "bonus" {
+		t.Fatalf("expected bonus retrieved memory hit, got %#v", ranking.RetrievedMemoryHits)
+	}
+	if !containsTestString(ranking.Reasons, "similar retrieved successful strategy") {
+		t.Fatalf("expected retrieved success reason, got %#v", ranking.Reasons)
+	}
+}
+
+func TestCandidateRankingRetrievedFailedMemoryAppliesPenalty(t *testing.T) {
+	input := candidateRankingMemoryTestInput()
+	candidate := candidateRankingClassImbalanceCandidate()
+	baseline := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		retrievedPlannerTestResult(memory.SourceStrategyScorecard, "scorecard_failed", "strategy_scorecard", ExperimentPlanningOutcomeNoImprovement, "weighted loss did not improve macro-F1"),
+	}
+	ranking := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+
+	if ranking.Score >= baseline.Score {
+		t.Fatalf("expected retrieved failed memory to lower score, baseline=%#v retrieved=%#v", baseline, ranking)
+	}
+	if ranking.ScoreComponents["retrieved_memory"] >= 0 {
+		t.Fatalf("expected negative retrieved memory component, got %#v", ranking.ScoreComponents)
+	}
+	if len(ranking.RetrievedMemoryHits) != 1 || ranking.RetrievedMemoryHits[0].Effect != "penalty" {
+		t.Fatalf("expected penalty retrieved memory hit, got %#v", ranking.RetrievedMemoryHits)
+	}
+	if !containsTestString(ranking.Reasons, "similar retrieved failed mechanism") {
+		t.Fatalf("expected retrieved failure reason, got %#v", ranking.Reasons)
+	}
+}
+
+func TestCandidateRankingRetrievedRejectedOptionBlocksCandidate(t *testing.T) {
+	input := candidateRankingMemoryTestInput()
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		retrievedPlannerTestResult(memory.SourceAgentMemoryRecord, "memory_rejected", memory.KindPlanningFeedback, "rejected", "rejected weighted loss repeat"),
+	}
+
+	ranking := scorePlannerCandidate(input, candidateRankingClassImbalanceCandidate(), 0, map[string]bool{}, map[string]bool{})
+
+	if !ranking.Rejected || ranking.Score != 0 {
+		t.Fatalf("expected rejected retrieved memory to block candidate, got %#v", ranking)
+	}
+	if ranking.ScoreComponents["retrieved_memory"] >= 0 {
+		t.Fatalf("expected negative retrieved memory component, got %#v", ranking.ScoreComponents)
+	}
+	if len(ranking.RetrievedMemoryHits) != 1 || ranking.RetrievedMemoryHits[0].Effect != "blocked" {
+		t.Fatalf("expected blocked retrieved memory hit, got %#v", ranking.RetrievedMemoryHits)
+	}
+	if !containsTestString(ranking.Reasons, "blocked by retrieved rejected option") {
+		t.Fatalf("expected retrieved rejected option reason, got %#v", ranking.Reasons)
+	}
+}
+
+func TestCandidateRankingUnrelatedRetrievedMemoryDoesNotOverrideStructuredMismatch(t *testing.T) {
+	input := candidateRankingMemoryTestInput()
+	candidate := candidateRankingClassImbalanceCandidate()
+	baseline := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{{
+		SourceTable:     memory.SourceStrategyScorecard,
+		SourceID:        "scorecard_unrelated",
+		ProjectID:       "project_1",
+		DatasetID:       "dataset_1",
+		Kind:            "strategy_scorecard",
+		Score:           0.99,
+		SemanticScore:   0.99,
+		StructuredScore: 0.1,
+		RetrievalReason: "semantically mentions class balancing but structured mechanism is different",
+		SummaryCard: map[string]any{
+			"outcome":      ExperimentPlanningOutcomeImprovedChampion,
+			"mechanism":    "architecture_challenge",
+			"intervention": "resnet architecture swap",
+			"lesson":       "Class balancing words appear here, but this memory is about architecture shopping.",
+			"summary":      "weighted_loss minority recall class imbalance text should not be enough",
+		},
+		Metadata: map[string]any{
+			"outcome":   ExperimentPlanningOutcomeImprovedChampion,
+			"mechanism": "architecture_challenge",
+			"models":    []string{"resnet18"},
+		},
+	}}
+
+	ranking := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+
+	if ranking.ScoreComponents["retrieved_memory"] != 0 || len(ranking.RetrievedMemoryHits) != 0 {
+		t.Fatalf("expected unrelated retrieved memory to be ignored, got %#v hits=%#v", ranking.ScoreComponents, ranking.RetrievedMemoryHits)
+	}
+	if ranking.Score != baseline.Score {
+		t.Fatalf("expected unrelated memory not to change score, baseline=%#v retrieved=%#v", baseline, ranking)
+	}
+}
+
+func candidateRankingMemoryTestInput() ExperimentPlannerInput {
+	input := testExperimentPlannerInput()
+	input.DeterministicDiagnosis = PlannerDiagnosis{
+		ClassImbalanceScore:       0.72,
+		MinorityClassFailureScore: 0.78,
+		RecommendedFailureModes:   []string{"class_imbalance", "minority_class_failure"},
+	}
+	return input
+}
+
+func candidateRankingClassImbalanceCandidate() CandidateHypothesis {
+	return CandidateHypothesis{
+		Hypothesis:           "Weighted loss should improve minority recall.",
+		PlanningMode:         "class_imbalance_ablation",
+		Mechanism:            "class_imbalance",
+		Intervention:         "Use weighted_loss for minority recall.",
+		ProposedChanges:      map[string]any{"class_balancing": "weighted_loss"},
+		ExpectedEffect:       "Improve minority recall and macro-F1 by reweighting rare classes.",
+		ExpectedMetricImpact: 0.02,
+		ExpectedTradeoffs:    []string{"may reduce majority precision"},
+		Risk:                 "medium",
+		CostLevel:            "low",
+		NoveltyScore:         0.55,
+		EvidenceUsed:         []string{"minority_class_failure_score is high"},
+		ExperimentConfig: plans.PlannedExperiment{
+			Template:       "mobilenet_transfer",
+			Model:          "mobilenet_v3_small",
+			Epochs:         12,
+			BatchSize:      16,
+			LearningRate:   0.0003,
+			Reason:         "Test weighted loss for minority recall.",
+			ClassBalancing: "weighted_loss",
+			Mechanism:      "class_imbalance",
+		},
+	}
+}
+
+func retrievedPlannerTestResult(sourceTable string, sourceID string, kind string, outcome string, reason string) memory.MemoryRetrievalResult {
+	summary := strings.TrimSpace(reason)
+	if summary == "" {
+		summary = "related compact memory"
+	}
+	return memory.MemoryRetrievalResult{
+		SourceTable:     sourceTable,
+		SourceID:        sourceID,
+		ProjectID:       "project_1",
+		DatasetID:       "dataset_1",
+		Kind:            kind,
+		Score:           0.8,
+		SemanticScore:   0.7,
+		StructuredScore: 0.6,
+		RetrievalReason: reason,
+		SummaryCard: map[string]any{
+			"outcome":      outcome,
+			"mechanism":    "class_imbalance",
+			"intervention": "weighted_loss",
+			"lesson":       summary,
+			"summary":      summary,
+		},
+		Metadata: map[string]any{
+			"outcome":   outcome,
+			"mechanism": "class_imbalance",
+		},
 	}
 }
 

@@ -278,6 +278,128 @@ func TestTrainingMonitorPromptContextUsesCompactRunEvaluationCards(t *testing.T)
 	}
 }
 
+func TestTrainingMonitorPromptContextIncludesRetrievedRunMemory(t *testing.T) {
+	input := testTrainingMonitorInput()
+	input.RetrievedRunMemory = []memory.MemoryRetrievalResult{
+		{
+			SourceTable:     memory.SourceAgentMemoryRecord,
+			SourceID:        "memory_run_1",
+			Kind:            memory.KindTrainingEvaluation,
+			Score:           0.82,
+			RetrievalReason: "same model family and plateau dynamics",
+			SummaryCard: map[string]any{
+				"summary":             "Prior EfficientNet run plateaued with a similar train/validation gap.",
+				"model":               "efficientnet_b0",
+				"training_dynamics":   "Validation macro-F1 flattened after epoch 7.",
+				"lesson":              "More epochs did not improve macro-F1.",
+				"full_run_evaluation": "SENTINEL_FULL_EVALUATION",
+				"epoch_history":       "SENTINEL_RAW_EPOCHS",
+			},
+			Metadata: map[string]any{
+				"model_family":   "efficientnet",
+				"mechanism":      "regularization",
+				"outcome":        "no_improvement",
+				"embedding_text": "SENTINEL_EMBEDDING_TEXT",
+				"raw_payload":    "SENTINEL_RAW_PAYLOAD",
+				"image_uri":      "s3://bucket/raw-image.jpg",
+			},
+		},
+	}
+
+	context := trainingMonitorPromptContext(input)
+	retrieved, ok := context["retrieved_run_memory"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected retrieved run memory in context, got %#v", context["retrieved_run_memory"])
+	}
+	if len(retrieved) != 1 {
+		t.Fatalf("expected one retrieved memory card, got %d", len(retrieved))
+	}
+	card := retrieved[0]
+	if card["source_table"] != memory.SourceAgentMemoryRecord || card["source_id"] != "memory_run_1" {
+		t.Fatalf("unexpected source fields: %#v", card)
+	}
+	if card["model_family"] != "efficientnet" || card["dynamics"] == "" || card["lesson"] == "" {
+		t.Fatalf("expected compact run-dynamics fields, got %#v", card)
+	}
+
+	encoded, err := json.Marshal(context)
+	if err != nil {
+		t.Fatalf("marshal context: %v", err)
+	}
+	contextJSON := string(encoded)
+	for _, forbidden := range []string{
+		"SENTINEL_FULL_EVALUATION",
+		"SENTINEL_RAW_EPOCHS",
+		"SENTINEL_EMBEDDING_TEXT",
+		"SENTINEL_RAW_PAYLOAD",
+		"s3://bucket/raw-image.jpg",
+		"embedding_text",
+		"raw_payload",
+		"full_run_evaluation",
+		"epoch_history",
+	} {
+		if strings.Contains(contextJSON, forbidden) {
+			t.Fatalf("retrieved run memory leaked forbidden field/value %q in %s", forbidden, contextJSON)
+		}
+	}
+
+	budget := requirePromptMap(t, context, "prompt_budget")
+	if budget["retrieved_run_memory_count"] != 1 {
+		t.Fatalf("expected retrieved memory count telemetry, got %#v", budget)
+	}
+	if budget["retrieved_run_memory_approx_bytes"] == nil {
+		t.Fatalf("expected retrieved memory byte telemetry, got %#v", budget)
+	}
+}
+
+func TestTrainingMonitorPromptContextOmitsEmptyRetrievedRunMemory(t *testing.T) {
+	context := trainingMonitorPromptContext(testTrainingMonitorInput())
+	if _, ok := context["retrieved_run_memory"]; ok {
+		t.Fatalf("expected empty retrieval to omit retrieved_run_memory, got %#v", context["retrieved_run_memory"])
+	}
+	budget := requirePromptMap(t, context, "prompt_budget")
+	if _, ok := budget["retrieved_run_memory_count"]; ok {
+		t.Fatalf("expected empty retrieval to preserve prior prompt budget shape, got %#v", budget)
+	}
+}
+
+func TestTrainingMonitorMemoryToolIncludesRetrievedRunMemory(t *testing.T) {
+	input := testTrainingMonitorInput()
+	input.MemoryRecords = []memory.AgentMemoryRecord{
+		{AgentName: "training_monitor", Kind: memory.KindTrainingEvaluation, Summary: "Recent same-dataset memory."},
+	}
+	input.RetrievedRunMemory = []memory.MemoryRetrievalResult{
+		{
+			SourceTable:     memory.SourceAgentMemoryRecord,
+			SourceID:        "memory_run_2",
+			Kind:            memory.KindTrainingEvaluation,
+			Score:           0.77,
+			RetrievalReason: "same validation-loss gap",
+			SummaryCard: map[string]any{
+				"summary":           "Prior MobileNet run overfit in the same pattern.",
+				"model":             "mobilenet_v3_small",
+				"training_dynamics": "Validation loss rose while train loss fell.",
+			},
+			Metadata: map[string]any{
+				"model_family": "mobilenet",
+				"outcome":      "failed",
+			},
+		},
+	}
+
+	result := ExecuteTrainingMonitorInformationTool(input, TrainingMonitorToolMemoryRecords, nil, TrainingMonitorInformationToolOptions{})
+	if !result.Accepted {
+		t.Fatalf("expected accepted memory tool result, got %#v", result)
+	}
+	retrieved, ok := result.Payload["retrieved_run_memory"].([]map[string]any)
+	if !ok || len(retrieved) != 1 {
+		t.Fatalf("expected compact retrieved memory in tool payload, got %#v", result.Payload)
+	}
+	if retrieved[0]["model_family"] != "mobilenet" || retrieved[0]["retrieval_reason"] == "" {
+		t.Fatalf("unexpected retrieved memory tool card: %#v", retrieved[0])
+	}
+}
+
 type fakeJSONGenerator struct {
 	response string
 }

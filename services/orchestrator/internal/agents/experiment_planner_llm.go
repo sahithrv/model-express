@@ -34,6 +34,11 @@ const (
 	plannerSnapshotMaxStrategyLessons   = 10
 	plannerSnapshotMaxBlockedRepeats    = 8
 	plannerSnapshotMaxRunDeltas         = 8
+	plannerRetrievedMemoryMaxTotal      = 10
+	plannerRetrievedMemoryMaxSuccessful = 3
+	plannerRetrievedMemoryMaxFailed     = 3
+	plannerRetrievedMemoryMaxBlocked    = 4
+	plannerRetrievedMemoryMaxDataset    = 2
 	plannerVisualMaxObservedTraits      = 8
 	plannerVisualMaxClassesToWatch      = 6
 	plannerVisualMaxHypotheses          = 6
@@ -75,6 +80,7 @@ type ExperimentPlannerInput struct {
 	SuccessfulStrategyMemory     []PlannerStrategyMemory
 	FailedStrategyMemory         []PlannerStrategyMemory
 	RejectedStrategyMemory       []RejectedPlannerOption
+	RetrievedMemory              []memory.MemoryRetrievalResult
 	StrategyScorecards           []PlannerStrategyScorecard
 	OptimizerFeedback            []automl.OptimizerFeedbackSummary
 	PriorPlans                   []plans.ExperimentPlan
@@ -108,6 +114,7 @@ type PlannerContextSnapshot struct {
 	LabelQualityCard       PlannerLabelQualityCard           `json:"label_quality_card"`
 	SearchCoverage         PlannerSearchCoverage             `json:"search_coverage"`
 	StrategyLessons        []PlannerStrategyLesson           `json:"strategy_lessons"`
+	RetrievedMemory        *PlannerRetrievedMemorySnapshot   `json:"retrieved_memory,omitempty"`
 	OptimizerFeedback      []automl.OptimizerFeedbackSummary `json:"optimizer_feedback_summary,omitempty"`
 	BlockedRepeats         []RejectedPlannerOption           `json:"blocked_repeats"`
 	VisualEvidence         map[string]any                    `json:"visual_evidence"`
@@ -369,6 +376,44 @@ type PlannerStrategyLesson struct {
 	RuntimeSecs       float64  `json:"runtime_seconds,omitempty"`
 }
 
+type PlannerRetrievedMemorySnapshot struct {
+	SuccessfulStrategyCards   []PlannerRetrievedMemoryCard `json:"successful_strategy_cards"`
+	FailedStrategyCards       []PlannerRetrievedMemoryCard `json:"failed_strategy_cards"`
+	BlockedOrRejectedCards    []PlannerRetrievedMemoryCard `json:"blocked_or_rejected_cards"`
+	DatasetPreprocessingCards []PlannerRetrievedMemoryCard `json:"dataset_preprocessing_cards"`
+	OtherCards                []PlannerRetrievedMemoryCard `json:"other_cards"`
+	Caps                      PlannerRetrievedMemoryCaps   `json:"caps"`
+	RetrievalEnabled          bool                         `json:"retrieval_enabled"`
+	ApproximateBytes          int                          `json:"approximate_bytes"`
+}
+
+type PlannerRetrievedMemoryCaps struct {
+	MaxTotal                int `json:"max_total"`
+	MaxSuccessfulStrategies int `json:"max_successful_strategy_cards"`
+	MaxFailedStrategies     int `json:"max_failed_strategy_cards"`
+	MaxBlockedOrRejected    int `json:"max_blocked_or_rejected_cards"`
+	MaxDatasetPreprocessing int `json:"max_dataset_preprocessing_cards"`
+}
+
+type PlannerRetrievedMemoryCard struct {
+	SourceTable     string         `json:"source_table"`
+	SourceID        string         `json:"source_id"`
+	ProjectID       string         `json:"project_id"`
+	DatasetID       string         `json:"dataset_id"`
+	Kind            string         `json:"kind"`
+	Score           float64        `json:"score"`
+	SemanticScore   float64        `json:"semantic_score"`
+	StructuredScore float64        `json:"structured_score"`
+	RetrievalReason string         `json:"retrieval_reason"`
+	Outcome         string         `json:"outcome,omitempty"`
+	Mechanism       string         `json:"mechanism,omitempty"`
+	Intervention    string         `json:"intervention,omitempty"`
+	Lesson          string         `json:"lesson,omitempty"`
+	Summary         string         `json:"summary,omitempty"`
+	SummaryCard     map[string]any `json:"summary_card,omitempty"`
+	Metadata        map[string]any `json:"metadata,omitempty"`
+}
+
 type PlannerStopContinueCard struct {
 	NoImprovementRounds int      `json:"no_improvement_rounds"`
 	StopSignals         []string `json:"stop_signals"`
@@ -376,11 +421,14 @@ type PlannerStopContinueCard struct {
 }
 
 type PlannerPromptBudget struct {
-	RawSectionsExcluded []string `json:"raw_sections_excluded"`
-	MaxLedgerEntries    int      `json:"max_ledger_entries"`
-	MaxMechanisms       int      `json:"max_mechanisms"`
-	MaxStrategyLessons  int      `json:"max_strategy_lessons"`
-	MaxBlockedRepeats   int      `json:"max_blocked_repeats"`
+	RawSectionsExcluded             []string `json:"raw_sections_excluded"`
+	MaxLedgerEntries                int      `json:"max_ledger_entries"`
+	MaxMechanisms                   int      `json:"max_mechanisms"`
+	MaxStrategyLessons              int      `json:"max_strategy_lessons"`
+	MaxBlockedRepeats               int      `json:"max_blocked_repeats"`
+	MaxRetrievedMemoryCards         int      `json:"max_retrieved_memory_cards,omitempty"`
+	RetrievedMemoryCount            int      `json:"retrieved_memory_count,omitempty"`
+	RetrievedMemoryApproximateBytes int      `json:"retrieved_memory_approximate_bytes,omitempty"`
 }
 
 type DatasetPlanningInsights struct {
@@ -627,18 +675,35 @@ type CandidateHypothesis struct {
 }
 
 type CandidateRanking struct {
-	CandidateIndex      int                `json:"candidate_index"`
-	Hypothesis          string             `json:"hypothesis"`
-	PlanningMode        string             `json:"planning_mode"`
-	Mechanism           string             `json:"mechanism,omitempty"`
-	Intervention        string             `json:"intervention,omitempty"`
-	ExpectedEffect      string             `json:"expected_effect,omitempty"`
-	Score               float64            `json:"score"`
-	ScoreComponents     map[string]float64 `json:"score_components"`
-	Selected            bool               `json:"selected"`
-	Rejected            bool               `json:"rejected"`
-	Reasons             []string           `json:"reasons"`
-	ExperimentSignature string             `json:"experiment_signature"`
+	CandidateIndex      int                           `json:"candidate_index"`
+	Hypothesis          string                        `json:"hypothesis"`
+	PlanningMode        string                        `json:"planning_mode"`
+	Mechanism           string                        `json:"mechanism,omitempty"`
+	Intervention        string                        `json:"intervention,omitempty"`
+	ExpectedEffect      string                        `json:"expected_effect,omitempty"`
+	Score               float64                       `json:"score"`
+	ScoreComponents     map[string]float64            `json:"score_components"`
+	RetrievedMemoryHits []CandidateRetrievedMemoryHit `json:"retrieved_memory_hits,omitempty"`
+	Selected            bool                          `json:"selected"`
+	Rejected            bool                          `json:"rejected"`
+	Reasons             []string                      `json:"reasons"`
+	ExperimentSignature string                        `json:"experiment_signature"`
+}
+
+type CandidateRetrievedMemoryHit struct {
+	SourceTable     string   `json:"source_table"`
+	SourceID        string   `json:"source_id"`
+	Kind            string   `json:"kind"`
+	Outcome         string   `json:"outcome,omitempty"`
+	Mechanism       string   `json:"mechanism,omitempty"`
+	Intervention    string   `json:"intervention,omitempty"`
+	Lesson          string   `json:"lesson,omitempty"`
+	Summary         string   `json:"summary,omitempty"`
+	RetrievalReason string   `json:"retrieval_reason,omitempty"`
+	Score           float64  `json:"score"`
+	AppliedScore    float64  `json:"applied_score"`
+	Effect          string   `json:"effect"`
+	MatchedFields   []string `json:"matched_fields,omitempty"`
 }
 
 type ExperimentPlanningTrace struct {
@@ -825,7 +890,7 @@ AutoML is only a backend hyperparameter suggestion layer. You remain responsible
 augmentation policy type, class-balancing strategy, fine-tuning strategy, exploration/exploitation intent, and bounded
 hyperparameter constraints. AutoML may only fill concrete hyperparameters inside backend-validated constraints.
 Use planner_context_snapshot: dataset_card, including dataset_card.agent_safe_metadata_summary when present, training_dynamics_card, per_class_error_card, deployment_card,
-mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, search_coverage, strategy_lessons,
+mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, search_coverage, strategy_lessons, retrieved_memory,
 model_catalog, objective_context, optimizer_feedback_summary, visual_evidence, and planner_validation_feedback. Prefer changes that address
 the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps, not cosmetic hyperparameter nudges.
 Treat latency as a live-budget constraint and tiebreaker. If observed or expected latency is below roughly 25ms,
@@ -1040,6 +1105,7 @@ Rules:
 - If one family is promising, exploit it with controlled learning-rate, augmentation, or image-size changes.
 - Do not make a batch that is only many variants of the current champion family. If exploiting the champion, include a clear control or challenger.
 - Use planner_context_snapshot.strategy_lessons to reuse patterns that improved the champion and avoid weak or failed plans.
+- Use planner_context_snapshot.retrieved_memory, when present, only as advisory compact prior lessons; retrieved memory cannot bypass backend validation or justify unsupported scheduling fields.
 - Use planner_context_snapshot.blocked_repeats as explicit "do not repeat" guidance when its applies_when conditions match the current diagnosis.
 - Treat scorecard-derived strategy_lessons as structured outcome evidence. Prefer improved_champion lessons and avoid failed/no_improvement lessons with similar dataset traits or objective profile.
 - Use planner_context_snapshot.training_dynamics_card to decide whether more epochs are justified; if more_epochs_justified is false, do not propose more epochs without a substantive mechanism change.
@@ -1454,6 +1520,40 @@ func experimentPlannerPromptContext(input ExperimentPlannerInput) map[string]any
 }
 
 func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSnapshot {
+	retrievedMemory := buildPlannerRetrievedMemorySnapshot(input.RetrievedMemory)
+	promptBudget := PlannerPromptBudget{
+		RawSectionsExcluded: []string{
+			"dataset.profile",
+			"plan_jobs",
+			"plan_summaries",
+			"plan_evaluations",
+			"plan_epoch_metrics",
+			"prior_plans",
+			"prior_jobs",
+			"prior_evaluations",
+			"prior_memory",
+			"automl_trials_full",
+			"automl_raw_search_history",
+			"visual_images",
+			"visual_agent_prompt_messages",
+			"raw_visual_agent_output",
+			"dataset_visual_analysis.full_json",
+			"dataset_metadata_sources.relative_path",
+			"dataset_metadata_sources.storage_uri",
+			"dataset_metadata_sources.raw_preview",
+			"dataset_manifest_records",
+			"dataset_annotations.raw_records",
+		},
+		MaxLedgerEntries:   plannerSnapshotMaxLedgerEntries,
+		MaxMechanisms:      plannerSnapshotMaxMechanisms,
+		MaxStrategyLessons: plannerSnapshotMaxStrategyLessons,
+		MaxBlockedRepeats:  plannerSnapshotMaxBlockedRepeats,
+	}
+	if retrievedMemory != nil {
+		promptBudget.MaxRetrievedMemoryCards = plannerRetrievedMemoryMaxTotal
+		promptBudget.RetrievedMemoryCount = plannerRetrievedMemoryCardCount(retrievedMemory)
+		promptBudget.RetrievedMemoryApproximateBytes = retrievedMemory.ApproximateBytes
+	}
 	return PlannerContextSnapshot{
 		ContextVersion:         plannerSnapshotVersion,
 		Project:                plannerProjectCard(input),
@@ -1472,40 +1572,14 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		LabelQualityCard:       plannerLabelQualityCard(input),
 		SearchCoverage:         plannerSearchCoverage(input),
 		StrategyLessons:        plannerStrategyLessons(input),
+		RetrievedMemory:        retrievedMemory,
 		OptimizerFeedback:      capOptimizerFeedback(input.OptimizerFeedback, 5),
 		BlockedRepeats:         capRejectedPlannerOptions(input.RejectedStrategyMemory, plannerSnapshotMaxBlockedRepeats),
 		VisualEvidence:         visualExemplarPromptContext(input.VisualExemplarContext),
 		ModelCatalog:           input.ModelCatalog,
 		ValidationFeedback:     input.ValidationFeedback,
 		StopOrContinuePressure: plannerStopContinueCard(input),
-		PromptBudget: PlannerPromptBudget{
-			RawSectionsExcluded: []string{
-				"dataset.profile",
-				"plan_jobs",
-				"plan_summaries",
-				"plan_evaluations",
-				"plan_epoch_metrics",
-				"prior_plans",
-				"prior_jobs",
-				"prior_evaluations",
-				"prior_memory",
-				"automl_trials_full",
-				"automl_raw_search_history",
-				"visual_images",
-				"visual_agent_prompt_messages",
-				"raw_visual_agent_output",
-				"dataset_visual_analysis.full_json",
-				"dataset_metadata_sources.relative_path",
-				"dataset_metadata_sources.storage_uri",
-				"dataset_metadata_sources.raw_preview",
-				"dataset_manifest_records",
-				"dataset_annotations.raw_records",
-			},
-			MaxLedgerEntries:   plannerSnapshotMaxLedgerEntries,
-			MaxMechanisms:      plannerSnapshotMaxMechanisms,
-			MaxStrategyLessons: plannerSnapshotMaxStrategyLessons,
-			MaxBlockedRepeats:  plannerSnapshotMaxBlockedRepeats,
-		},
+		PromptBudget:           promptBudget,
 	}
 }
 
@@ -1984,6 +2058,496 @@ func plannerStrategyLessons(input ExperimentPlannerInput) []PlannerStrategyLesso
 		out = out[:plannerSnapshotMaxStrategyLessons]
 	}
 	return out
+}
+
+func buildPlannerRetrievedMemorySnapshot(results []memory.MemoryRetrievalResult) *PlannerRetrievedMemorySnapshot {
+	if len(results) == 0 {
+		return nil
+	}
+	snapshot := &PlannerRetrievedMemorySnapshot{
+		SuccessfulStrategyCards:   []PlannerRetrievedMemoryCard{},
+		FailedStrategyCards:       []PlannerRetrievedMemoryCard{},
+		BlockedOrRejectedCards:    []PlannerRetrievedMemoryCard{},
+		DatasetPreprocessingCards: []PlannerRetrievedMemoryCard{},
+		OtherCards:                []PlannerRetrievedMemoryCard{},
+		Caps: PlannerRetrievedMemoryCaps{
+			MaxTotal:                plannerRetrievedMemoryMaxTotal,
+			MaxSuccessfulStrategies: plannerRetrievedMemoryMaxSuccessful,
+			MaxFailedStrategies:     plannerRetrievedMemoryMaxFailed,
+			MaxBlockedOrRejected:    plannerRetrievedMemoryMaxBlocked,
+			MaxDatasetPreprocessing: plannerRetrievedMemoryMaxDataset,
+		},
+		RetrievalEnabled: true,
+	}
+
+	seen := map[string]bool{}
+	total := 0
+	for _, result := range results {
+		if total >= plannerRetrievedMemoryMaxTotal {
+			break
+		}
+		card := plannerRetrievedMemoryCard(result)
+		key := plannerRetrievedMemoryDedupeKey(card)
+		if key != "" && seen[key] {
+			continue
+		}
+
+		added := false
+		switch plannerRetrievedMemoryBucket(card) {
+		case "successful_strategy":
+			if len(snapshot.SuccessfulStrategyCards) < plannerRetrievedMemoryMaxSuccessful {
+				snapshot.SuccessfulStrategyCards = append(snapshot.SuccessfulStrategyCards, card)
+				added = true
+			}
+		case "failed_strategy":
+			if len(snapshot.FailedStrategyCards) < plannerRetrievedMemoryMaxFailed {
+				snapshot.FailedStrategyCards = append(snapshot.FailedStrategyCards, card)
+				added = true
+			}
+		case "blocked_or_rejected":
+			if len(snapshot.BlockedOrRejectedCards) < plannerRetrievedMemoryMaxBlocked {
+				snapshot.BlockedOrRejectedCards = append(snapshot.BlockedOrRejectedCards, card)
+				added = true
+			}
+		case "dataset_preprocessing":
+			if len(snapshot.DatasetPreprocessingCards) < plannerRetrievedMemoryMaxDataset {
+				snapshot.DatasetPreprocessingCards = append(snapshot.DatasetPreprocessingCards, card)
+				added = true
+			}
+		default:
+			snapshot.OtherCards = append(snapshot.OtherCards, card)
+			added = true
+		}
+		if added {
+			total++
+			if key != "" {
+				seen[key] = true
+			}
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	snapshot.ApproximateBytes = approximateJSONBytes(snapshot)
+	snapshot.ApproximateBytes = approximateJSONBytes(snapshot)
+	return snapshot
+}
+
+func plannerRetrievedMemoryCard(result memory.MemoryRetrievalResult) PlannerRetrievedMemoryCard {
+	summaryCard := compactPlannerRetrievedMemoryMap(result.SummaryCard, 12)
+	metadata := compactPlannerRetrievedMemoryMap(result.Metadata, 12)
+	records := []map[string]any{summaryCard, metadata}
+
+	sourceTable := strings.TrimSpace(result.SourceTable)
+	if sourceTable == "" {
+		sourceTable = firstPlannerRetrievedMemoryString(records, "source_table", "source")
+	}
+	sourceID := strings.TrimSpace(result.SourceID)
+	if sourceID == "" {
+		sourceID = firstPlannerRetrievedMemoryString(records, "source_id", "memory_id", "scorecard_id", "id")
+	}
+	projectID := strings.TrimSpace(result.ProjectID)
+	if projectID == "" {
+		projectID = firstPlannerRetrievedMemoryString(records, "project_id")
+	}
+	datasetID := strings.TrimSpace(result.DatasetID)
+	if datasetID == "" {
+		datasetID = firstPlannerRetrievedMemoryString(records, "dataset_id")
+	}
+	kind := strings.TrimSpace(result.Kind)
+	if kind == "" {
+		kind = firstPlannerRetrievedMemoryString(records, "kind", "memory_kind", "card_kind", "type")
+	}
+	lesson := firstPlannerRetrievedMemoryString(records, "lesson", "compact_lesson")
+	summary := firstPlannerRetrievedMemoryString(records, "summary", "compact_summary", "recommendation_summary", "preprocessing_hypothesis", "training_dynamics", "dynamics")
+	if strings.EqualFold(summary, lesson) {
+		summary = ""
+	}
+
+	return PlannerRetrievedMemoryCard{
+		SourceTable:     sourceTable,
+		SourceID:        sourceID,
+		ProjectID:       projectID,
+		DatasetID:       datasetID,
+		Kind:            kind,
+		Score:           roundDiagnosis(result.Score),
+		SemanticScore:   roundDiagnosis(result.SemanticScore),
+		StructuredScore: roundDiagnosis(result.StructuredScore),
+		RetrievalReason: compactPlannerRetrievedMemoryText(result.RetrievalReason, 220),
+		Outcome:         firstPlannerRetrievedMemoryString(records, "outcome", "outcome_status", "decision_type", "status"),
+		Mechanism:       normalizeMechanism(firstPlannerRetrievedMemoryString(records, "mechanism", "mechanism_group", "strategy_type", "selected_mechanism")),
+		Intervention:    firstPlannerRetrievedMemoryString(records, "intervention", "action", "proposed_change"),
+		Lesson:          lesson,
+		Summary:         summary,
+		SummaryCard:     summaryCard,
+		Metadata:        metadata,
+	}
+}
+
+func plannerRetrievedMemoryBucket(card PlannerRetrievedMemoryCard) string {
+	text := strings.ToLower(strings.Join([]string{
+		card.SourceTable,
+		card.Kind,
+		card.Outcome,
+		card.Mechanism,
+		card.Intervention,
+		card.RetrievalReason,
+		card.Lesson,
+		card.Summary,
+	}, " "))
+	if containsAnyText(text, "blocked", "rejected", "invalid proposal", "validation rejected") {
+		return "blocked_or_rejected"
+	}
+	outcome := strings.ToLower(strings.TrimSpace(card.Outcome))
+	if containsAnyText(outcome, ExperimentPlanningOutcomeImprovedChampion, ExperimentPlanningOutcomeMinorImprovement, "success", "succeeded", "accepted") {
+		return "successful_strategy"
+	}
+	if containsAnyText(outcome, ExperimentPlanningOutcomeNoImprovement, ExperimentPlanningOutcomeFailed, "failure", "error", "invalidated", "pruned") {
+		return "failed_strategy"
+	}
+	if containsAnyText(text, "dataset_preprocessing", "dataset_profile", "dataset_visual", "preprocessing", "visual_analysis", "bbox_crop", "resolution_crop") {
+		return "dataset_preprocessing"
+	}
+	return "other"
+}
+
+func plannerRetrievedMemoryDedupeKey(card PlannerRetrievedMemoryCard) string {
+	parts := []string{
+		strings.TrimSpace(card.SourceTable),
+		strings.TrimSpace(card.SourceID),
+		strings.TrimSpace(card.Kind),
+	}
+	if strings.Join(parts, "") == "" {
+		parts = []string{card.Kind, card.Mechanism, card.Lesson, card.Summary}
+	}
+	return strings.ToLower(strings.Join(parts, "\x00"))
+}
+
+func plannerRetrievedMemoryCardCount(snapshot *PlannerRetrievedMemorySnapshot) int {
+	if snapshot == nil {
+		return 0
+	}
+	return len(snapshot.SuccessfulStrategyCards) +
+		len(snapshot.FailedStrategyCards) +
+		len(snapshot.BlockedOrRejectedCards) +
+		len(snapshot.DatasetPreprocessingCards) +
+		len(snapshot.OtherCards)
+}
+
+func firstPlannerRetrievedMemoryString(records []map[string]any, keys ...string) string {
+	for _, key := range keys {
+		for _, record := range records {
+			if len(record) == 0 {
+				continue
+			}
+			if value := compactPlannerRetrievedMemoryText(stringFromAny(record[key]), 220); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func compactPlannerRetrievedMemoryMap(values map[string]any, limit int) map[string]any {
+	if len(values) == 0 || limit <= 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if plannerRetrievedMemoryAllowedKey(key) && !plannerUnsafeRetrievedMemoryKey(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	out := map[string]any{}
+	for _, key := range keys {
+		if len(out) >= limit {
+			break
+		}
+		value, ok := compactPlannerRetrievedMemoryValue(key, values[key])
+		if !ok {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func compactPlannerRetrievedMemoryValue(key string, value any) (any, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return nil, false
+	case string:
+		text := compactPlannerRetrievedMemoryText(typed, 260)
+		return text, text != ""
+	case bool:
+		return typed, true
+	case int:
+		return typed, true
+	case int64:
+		return typed, true
+	case float64:
+		return roundDiagnosis(typed), true
+	case float32:
+		return roundDiagnosis(float64(typed)), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return nil, false
+		}
+		return roundDiagnosis(parsed), true
+	case []string:
+		values := []string{}
+		for _, item := range typed {
+			text := compactPlannerRetrievedMemoryText(item, 180)
+			if text == "" {
+				continue
+			}
+			values = append(values, text)
+			if len(values) >= 8 {
+				break
+			}
+		}
+		return values, len(values) > 0
+	case []any:
+		values := []any{}
+		for _, item := range typed {
+			value, ok := compactPlannerRetrievedMemoryListItem(key, item)
+			if !ok {
+				continue
+			}
+			values = append(values, value)
+			if len(values) >= 8 {
+				break
+			}
+		}
+		return values, len(values) > 0
+	case map[string]any:
+		if plannerRetrievedMemoryAllowsLeafMap(key) {
+			return compactPlannerRetrievedMemoryLeafMap(typed, 8)
+		}
+		compacted := compactPlannerRetrievedMemoryMap(typed, 8)
+		return compacted, len(compacted) > 0
+	case map[string]string:
+		return compactPlannerRetrievedMemoryLeafMap(anyStringMap(typed), 8)
+	case map[string]int:
+		return compactPlannerRetrievedMemoryLeafMap(anyIntMap(typed), 8)
+	case map[string]bool:
+		return compactPlannerRetrievedMemoryLeafMap(anyBoolMap(typed), 8)
+	default:
+		return nil, false
+	}
+}
+
+func compactPlannerRetrievedMemoryListItem(parentKey string, value any) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		compacted := compactPlannerRetrievedMemoryMap(typed, 6)
+		return compacted, len(compacted) > 0
+	default:
+		return compactPlannerRetrievedMemoryValue(parentKey, typed)
+	}
+}
+
+func compactPlannerRetrievedMemoryLeafMap(values map[string]any, limit int) (map[string]any, bool) {
+	if len(values) == 0 || limit <= 0 {
+		return nil, false
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if !plannerUnsafeRetrievedMemoryKey(key) && !plannerUnsafeMetadataText(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	out := map[string]any{}
+	for _, key := range keys {
+		if len(out) >= limit {
+			break
+		}
+		switch value := values[key].(type) {
+		case string:
+			text := compactPlannerRetrievedMemoryText(value, 140)
+			if text != "" {
+				out[key] = text
+			}
+		case bool:
+			out[key] = value
+		case int:
+			out[key] = value
+		case int64:
+			out[key] = value
+		case float64:
+			out[key] = roundDiagnosis(value)
+		case float32:
+			out[key] = roundDiagnosis(float64(value))
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func compactPlannerRetrievedMemoryText(value string, limit int) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || plannerUnsafeMetadataText(trimmed) {
+		return ""
+	}
+	if limit > 0 && len(trimmed) > limit {
+		return strings.TrimSpace(trimmed[:limit])
+	}
+	return trimmed
+}
+
+func plannerRetrievedMemoryAllowedKey(key string) bool {
+	switch plannerRetrievedMemoryKey(key) {
+	case "id",
+		"source",
+		"source_table",
+		"source_id",
+		"memory_id",
+		"scorecard_id",
+		"project_id",
+		"dataset_id",
+		"plan_id",
+		"job_id",
+		"invocation_id",
+		"decision_id",
+		"source_decision_id",
+		"source_plan_id",
+		"followup_plan_id",
+		"follow_up_plan_id",
+		"kind",
+		"memory_kind",
+		"card_kind",
+		"type",
+		"scope",
+		"agent_name",
+		"strategy_type",
+		"planning_mode",
+		"outcome",
+		"outcome_status",
+		"decision_type",
+		"status",
+		"mechanism",
+		"mechanism_group",
+		"selected_mechanism",
+		"intervention",
+		"action",
+		"proposed_change",
+		"lesson",
+		"summary",
+		"compact_lesson",
+		"compact_summary",
+		"recommendation_summary",
+		"dynamics",
+		"training_dynamics",
+		"preprocessing_hypothesis",
+		"retrieval_reason",
+		"reason_for_retrieval",
+		"match_reason",
+		"expected_effect",
+		"evidence",
+		"evidence_used",
+		"diagnosis_triggers",
+		"expected_failure_modes",
+		"changed_variables",
+		"models",
+		"proposed_models",
+		"best_model",
+		"tags",
+		"rejections",
+		"expected_delta",
+		"actual_delta",
+		"expected_delta_vs_champion",
+		"actual_delta_vs_champion",
+		"cost_usd",
+		"total_cost_usd",
+		"runtime_seconds",
+		"total_runtime_seconds",
+		"rank_score",
+		"quality_score",
+		"outcome_score",
+		"dataset_traits",
+		"objective_profile",
+		"task_type",
+		"class_count",
+		"total_images",
+		"image_count",
+		"imbalance_ratio",
+		"metadata_capabilities",
+		"capabilities",
+		"observed_traits",
+		"classes_to_watch",
+		"bbox_available",
+		"official_split_available",
+		"sample_count",
+		"source_formats",
+		"preprocessing_hypotheses",
+		"suggested_preprocessing",
+		"suggested_image_sizes",
+		"suggested_augmentation_policy",
+		"support_status":
+		return true
+	default:
+		return false
+	}
+}
+
+func plannerRetrievedMemoryAllowsLeafMap(key string) bool {
+	switch plannerRetrievedMemoryKey(key) {
+	case "dataset_traits", "objective_profile", "capabilities", "suggested_preprocessing":
+		return true
+	default:
+		return false
+	}
+}
+
+func plannerUnsafeRetrievedMemoryKey(key string) bool {
+	normalized := plannerRetrievedMemoryKey(key)
+	if normalized == "source" || normalized == "source_table" || normalized == "source_id" ||
+		normalized == "source_decision_id" || normalized == "source_plan_id" || normalized == "source_formats" {
+		return false
+	}
+	return containsAnyText(
+		normalized,
+		"embedding",
+		"raw",
+		"payload",
+		"prompt",
+		"path",
+		"uri",
+		"url",
+		"preview",
+		"content",
+		"sidecar",
+		"storage",
+		"checksum",
+		"filename",
+		"file_name",
+		"manifest_record",
+		"source_row",
+		"image_bytes",
+	)
+}
+
+func plannerRetrievedMemoryKey(key string) string {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, " ", "_")
+	return normalized
+}
+
+func approximateJSONBytes(value any) int {
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return 0
+	}
+	return len(blob)
 }
 
 func plannerStopContinueCard(input ExperimentPlannerInput) PlannerStopContinueCard {
@@ -2925,6 +3489,14 @@ func anyIntMap(values map[string]int) map[string]any {
 }
 
 func anyBoolMap(values map[string]bool) map[string]any {
+	out := map[string]any{}
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func anyStringMap(values map[string]string) map[string]any {
 	out := map[string]any{}
 	for key, value := range values {
 		out[key] = value

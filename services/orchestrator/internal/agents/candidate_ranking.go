@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 )
 
@@ -254,10 +255,18 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	ranking.Reasons = append(ranking.Reasons, alignmentReasons...)
 	ranking.ScoreComponents["diagnosis_alignment"] = roundCandidateScore(alignmentBonus)
 
-	memoryBonus, memoryReasons := candidateMemoryScore(input, candidate, experiment)
+	memoryBonus, memoryReasons, memoryHits, blockedByRetrievedMemory := candidateMemoryScore(input, candidate, experiment)
 	ranking.Score += memoryBonus
 	ranking.Reasons = append(ranking.Reasons, memoryReasons...)
+	ranking.RetrievedMemoryHits = memoryHits
 	ranking.ScoreComponents["memory_similarity"] = roundCandidateScore(memoryBonus)
+	ranking.ScoreComponents["retrieved_memory"] = roundCandidateScore(retrievedMemoryComponent(memoryHits))
+	if blockedByRetrievedMemory {
+		ranking.Rejected = true
+		ranking.Score = 0
+		ranking.Reasons = append(ranking.Reasons, "blocked by retrieved rejected option")
+		return ranking
+	}
 
 	if ranking.Score < 0.20 {
 		ranking.Rejected = true
@@ -568,9 +577,11 @@ func mechanismReflectedInExperimentConfig(mechanism string, experiment plans.Pla
 	}
 }
 
-func candidateMemoryScore(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (float64, []string) {
+func candidateMemoryScore(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (float64, []string, []CandidateRetrievedMemoryHit, bool) {
 	bonus := 0.0
 	reasons := []string{}
+	hits := []CandidateRetrievedMemoryHit{}
+	blocked := false
 	model := strings.ToLower(strings.TrimSpace(experiment.Model))
 	for _, memory := range input.SuccessfulStrategyMemory {
 		if stringSliceContainsFold(candidate.SimilarSuccessMemoryIDs, memory.MemoryID) || stringSliceContainsFold(memory.ProposedModels, model) {
@@ -600,7 +611,263 @@ func candidateMemoryScore(input ExperimentPlannerInput, candidate CandidateHypot
 		}
 		break
 	}
-	return bonus, reasons
+	retrievedScore, retrievedReasons, retrievedHits, retrievedBlocked := candidateRetrievedMemoryScore(input.RetrievedMemory, candidate, experiment)
+	bonus += retrievedScore
+	reasons = append(reasons, retrievedReasons...)
+	hits = append(hits, retrievedHits...)
+	blocked = retrievedBlocked
+	return bonus, reasons, hits, blocked
+}
+
+func retrievedMemoryComponent(hits []CandidateRetrievedMemoryHit) float64 {
+	score := 0.0
+	for _, hit := range hits {
+		score += hit.AppliedScore
+	}
+	return clampCandidate(score, -0.35, 0.18)
+}
+
+func candidateRetrievedMemoryScore(results []memory.MemoryRetrievalResult, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (float64, []string, []CandidateRetrievedMemoryHit, bool) {
+	if len(results) == 0 {
+		return 0, nil, nil, false
+	}
+	score := 0.0
+	reasons := []string{}
+	hits := []CandidateRetrievedMemoryHit{}
+	blocked := false
+	seen := map[string]bool{}
+	for _, result := range results {
+		card := plannerRetrievedMemoryCard(result)
+		key := plannerRetrievedMemoryDedupeKey(card)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		matchStrength, matchedFields := candidateRetrievedMemoryMatch(card, candidate, experiment)
+		if matchStrength < 0.45 {
+			continue
+		}
+		appliedScore, effect, reason, shouldBlock := candidateRetrievedMemoryEffect(card, matchStrength)
+		if appliedScore == 0 || effect == "" {
+			continue
+		}
+		score += appliedScore
+		reasons = append(reasons, reason)
+		if len(hits) < 4 {
+			hits = append(hits, CandidateRetrievedMemoryHit{
+				SourceTable:     card.SourceTable,
+				SourceID:        card.SourceID,
+				Kind:            card.Kind,
+				Outcome:         card.Outcome,
+				Mechanism:       card.Mechanism,
+				Intervention:    card.Intervention,
+				Lesson:          card.Lesson,
+				Summary:         card.Summary,
+				RetrievalReason: card.RetrievalReason,
+				Score:           roundCandidateScore(card.Score),
+				AppliedScore:    roundCandidateScore(appliedScore),
+				Effect:          effect,
+				MatchedFields:   matchedFields,
+			})
+		}
+		if shouldBlock {
+			blocked = true
+		}
+	}
+	return clampCandidate(score, -0.35, 0.18), uniqueCandidateReasons(reasons), hits, blocked
+}
+
+func candidateRetrievedMemoryEffect(card PlannerRetrievedMemoryCard, matchStrength float64) (float64, string, string, bool) {
+	confidence := clampCandidate(card.Score, 0, 1)
+	if confidence == 0 {
+		confidence = 0.6
+	}
+	weight := 0.65 + 0.35*confidence
+	bucket := plannerRetrievedMemoryBucket(card)
+	switch bucket {
+	case "blocked_or_rejected":
+		score := -clampCandidate(0.18+0.18*matchStrength*weight, 0.18, 0.35)
+		return score, "blocked", "blocked by retrieved rejected option", matchStrength >= 0.72
+	case "successful_strategy":
+		score := clampCandidate(0.05+0.08*matchStrength*weight, 0.05, 0.14)
+		return score, "bonus", "similar retrieved successful strategy", false
+	case "failed_strategy":
+		score := -clampCandidate(0.07+0.09*matchStrength*weight, 0.07, 0.18)
+		return score, "penalty", "similar retrieved failed mechanism", false
+	case "dataset_preprocessing":
+		score := clampCandidate(0.03+0.05*matchStrength*weight, 0.03, 0.08)
+		return score, "bonus", "retrieved dataset preprocessing analogy", false
+	default:
+		outcome := strings.ToLower(strings.TrimSpace(card.Outcome))
+		switch {
+		case containsAnyText(outcome, ExperimentPlanningOutcomeImprovedChampion, ExperimentPlanningOutcomeMinorImprovement, "success", "accepted"):
+			return clampCandidate(0.03+0.04*matchStrength*weight, 0.03, 0.08), "bonus", "similar retrieved positive memory", false
+		case containsAnyText(outcome, ExperimentPlanningOutcomeNoImprovement, ExperimentPlanningOutcomeFailed, "failed", "failure", "invalidated", "rejected"):
+			return -clampCandidate(0.04+0.05*matchStrength*weight, 0.04, 0.10), "penalty", "similar retrieved negative memory", false
+		default:
+			return 0, "", "", false
+		}
+	}
+}
+
+func candidateRetrievedMemoryMatch(card PlannerRetrievedMemoryCard, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (float64, []string) {
+	mechanism := normalizeMechanism(candidate.Mechanism)
+	group := mechanismGroup(mechanism)
+	score := 0.0
+	fields := []string{}
+	cardMechanism := normalizeMechanism(card.Mechanism)
+	if mechanism != "" && cardMechanism != "" && mechanismMatches(cardMechanism, mechanism, group) {
+		score += 0.55
+		fields = append(fields, "mechanism")
+	}
+	if planningMode := candidateMemoryCardValue(card, "planning_mode"); planningMode != "" && strings.EqualFold(planningMode, candidate.PlanningMode) {
+		score += 0.20
+		fields = append(fields, "planning_mode")
+	}
+	if candidateMemoryInterventionMatches(card.Intervention, candidate, experiment) {
+		score += 0.20
+		fields = append(fields, "intervention")
+	}
+	if candidateMemoryModelMatches(card, experiment) {
+		score += 0.18
+		fields = append(fields, "model_family")
+	}
+	if candidateMemoryPreprocessingMatches(card, candidate, experiment) {
+		score += 0.18
+		fields = append(fields, "preprocessing")
+	}
+	if score == 0 {
+		return 0, nil
+	}
+	return clampCandidate(score, 0, 1), fields
+}
+
+func candidateMemoryInterventionMatches(cardIntervention string, candidate CandidateHypothesis, experiment plans.PlannedExperiment) bool {
+	cardIntervention = strings.ToLower(strings.TrimSpace(cardIntervention))
+	if cardIntervention == "" {
+		return false
+	}
+	candidateText := strings.ToLower(strings.Join([]string{
+		candidate.Intervention,
+		candidate.ExpectedEffect,
+		experiment.ClassBalancing,
+		experiment.SamplingStrategy,
+		experiment.ResolutionStrategy,
+		experiment.AugmentationPolicy,
+		experiment.Optimizer,
+		experiment.Scheduler,
+		plannerPreprocessingText(experiment),
+		compactJSON(experiment.ClassBalancingConfig),
+		compactJSON(experiment.AugmentationPolicyConfig),
+	}, " "))
+	for _, token := range candidateMemorySignificantTokens(cardIntervention) {
+		if strings.Contains(candidateText, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func candidateMemoryModelMatches(card PlannerRetrievedMemoryCard, experiment plans.PlannedExperiment) bool {
+	model := strings.ToLower(strings.TrimSpace(experiment.Model))
+	family := inferExperimentFamily(experiment.Model)
+	if model == "" && family == "" {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{
+		candidateMemoryCardValue(card, "model"),
+		candidateMemoryCardValue(card, "models"),
+		candidateMemoryCardValue(card, "best_model"),
+		candidateMemoryCardValue(card, "model_family"),
+	}, " "))
+	if text == "" {
+		return false
+	}
+	return (model != "" && strings.Contains(text, model)) || (family != "" && strings.Contains(text, family))
+}
+
+func candidateMemoryPreprocessingMatches(card PlannerRetrievedMemoryCard, candidate CandidateHypothesis, experiment plans.PlannedExperiment) bool {
+	sourceText := strings.ToLower(strings.Join([]string{card.SourceTable, card.Kind, card.Mechanism}, " "))
+	if !containsAnyText(sourceText, memory.SourceDatasetPreprocessing, memory.SourceDatasetVisualAnalysis, memory.KindDatasetPreprocessingHypothesis, "dataset_profile", "preprocessing", "visual") {
+		return false
+	}
+	candidateText := candidateMechanismEvidenceText(candidate, experiment)
+	return containsAnyText(candidateText, "preprocess", "crop", "bbox", "resolution", "image_size", "small object", "aspect")
+}
+
+func candidateMemoryCardValue(card PlannerRetrievedMemoryCard, keys ...string) string {
+	records := []map[string]any{card.Metadata, card.SummaryCard}
+	values := []string{}
+	for _, record := range records {
+		for _, key := range keys {
+			if value, ok := record[key]; ok {
+				if text := candidateMemoryValueText(value); text != "" {
+					values = append(values, text)
+				}
+			}
+		}
+	}
+	return strings.Join(values, " ")
+}
+
+func candidateMemoryValueText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []string:
+		return strings.Join(typed, " ")
+	case []any:
+		values := []string{}
+		for _, item := range typed {
+			if text := candidateMemoryValueText(item); text != "" {
+				values = append(values, text)
+			}
+		}
+		return strings.Join(values, " ")
+	case map[string]any:
+		values := []string{}
+		for key, item := range typed {
+			if text := candidateMemoryValueText(item); text != "" {
+				values = append(values, key+" "+text)
+			}
+		}
+		return strings.Join(values, " ")
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func candidateMemorySignificantTokens(text string) []string {
+	stop := map[string]bool{
+		"and": true, "the": true, "for": true, "with": true, "without": true, "from": true, "this": true,
+		"that": true, "into": true, "plus": true, "only": true, "use": true, "used": true, "test": true,
+		"strategy": true, "mechanism": true, "experiment": true, "candidate": true,
+	}
+	tokens := []string{}
+	for _, token := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '_'
+	}) {
+		token = strings.TrimSpace(token)
+		if len(token) < 4 || stop[token] {
+			continue
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens
+}
+
+func uniqueCandidateReasons(values []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func scorecardSimilarToCandidate(scorecard PlannerStrategyScorecard, candidate CandidateHypothesis, experiment plans.PlannedExperiment) bool {

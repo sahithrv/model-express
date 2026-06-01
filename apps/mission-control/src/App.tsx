@@ -56,6 +56,7 @@ import type {
   PlannedExperiment,
   Project,
   ProjectChampion,
+  RetrievedMemoryCard,
   StrategyScorecard,
   TrainingRunEvaluation,
   TrainingRunSummary,
@@ -234,7 +235,22 @@ type CandidateScoreRow = {
   validationStatus: string;
   totalScore: number | null;
   reasons: string[];
+  memoryReasons: string[];
+  memoryHits: RetrievedMemoryDisplay[];
   components: Array<{ label: string; value: number | string }>;
+};
+
+type RetrievedMemoryDisplay = {
+  source: string;
+  sourceId: string;
+  kind: string;
+  outcome: string;
+  mechanism: string;
+  intervention: string;
+  summary: string;
+  retrievalReason: string;
+  score: number | null;
+  identifiers: Array<{ label: string; value: string }>;
 };
 
 type AgentInvocationAuditRow = {
@@ -260,6 +276,7 @@ type DecisionChatTurn = {
   opening: string;
   highlights: Array<{ label: string; value: string }>;
   sections: ReasoningSection[];
+  retrievedMemory: RetrievedMemoryDisplay[];
   rejections: Array<{ kind: string; text: string }>;
   mechanismCoverage: MechanismCoverageRow[];
   candidateScores: CandidateScoreRow[];
@@ -2543,6 +2560,8 @@ function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                 </div>
               )}
 
+              {turn.retrievedMemory.length > 0 && <RetrievedMemoryPanel memories={turn.retrievedMemory} />}
+
               {turn.rejections.length > 0 && (
                 <div className="rejection-panel compact">
                   <strong>Backend Gate And Rejections</strong>
@@ -2599,6 +2618,23 @@ function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                             </span>
                           ))}
                         </div>
+                        {(candidate.memoryReasons.length > 0 || candidate.memoryHits.length > 0) && (
+                          <div className="candidate-memory-list">
+                            {candidate.memoryReasons.slice(0, 3).map((reason) => (
+                              <span key={`${turn.decision.id}-${candidate.label}-memory-reason-${reason}`}>
+                                <small>Retrieved Memory</small>
+                                {reason}
+                              </span>
+                            ))}
+                            {candidate.memoryHits.slice(0, 2).map((memory, index) => (
+                              <span key={`${turn.decision.id}-${candidate.label}-memory-${memory.sourceId}-${index}`}>
+                                <small>{memory.kind || memory.source || "Memory"}</small>
+                                {memory.summary || memory.retrievalReason || memory.sourceId}
+                                <em>{memory.outcome || memory.sourceId}</em>
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -2608,6 +2644,51 @@ function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function RetrievedMemoryPanel({ memories }: { memories: RetrievedMemoryDisplay[] }) {
+  if (memories.length === 0) return null;
+
+  return (
+    <div className="retrieved-memory-panel compact">
+      <strong>Retrieved Memory</strong>
+      <div className="retrieved-memory-list">
+        {memories.slice(0, 5).map((memory, index) => (
+          <div className="retrieved-memory-row" key={`${memory.source}-${memory.sourceId}-${index}`}>
+            <div className="retrieved-memory-head">
+              <span>
+                <strong>{memory.source || "Memory"}</strong>
+                <small>
+                  {[memory.kind, memory.mechanism, memory.intervention].filter(Boolean).join(" - ") ||
+                    "retrieved decision context"}
+                </small>
+              </span>
+              <Badge value={memory.outcome || memory.kind || "memory"} />
+            </div>
+            {memory.summary && <p>{memory.summary}</p>}
+            {(memory.retrievalReason || memory.score !== null) && (
+              <small className="retrieval-reason">
+                {[memory.retrievalReason, memory.score !== null ? `score ${memory.score.toFixed(3)}` : ""]
+                  .filter(Boolean)
+                  .join(" - ")}
+              </small>
+            )}
+            {memory.identifiers.length > 0 && (
+              <div className="retrieved-memory-identifiers">
+                {memory.identifiers.slice(0, 5).map((identifier) => (
+                  <span key={`${memory.sourceId}-${identifier.label}-${identifier.value}`}>
+                    <Link2 size={12} />
+                    <small>{identifier.label}</small>
+                    <strong>{identifier.value}</strong>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -4523,6 +4604,7 @@ function buildDecisionChatTurns(decisions: AgentDecision[]): DecisionChatTurn[] 
       opening: decisionChatOpening(decision),
       highlights: decisionHighlights(decision),
       sections: decisionReasoningSections(decision).filter((section) => section.title !== "Summary"),
+      retrievedMemory: decisionRetrievedMemoryRows(decision),
       rejections: decisionRejections(decision),
       mechanismCoverage: mechanismCoverageRows(decision.payload),
       candidateScores: candidateScoreRows(decision),
@@ -4930,6 +5012,8 @@ function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[] {
     .map((item, index) => {
       const record = recordObject(item);
       const components = recordObject(record.score_components);
+      const memoryHits = candidateRetrievedMemoryRows(record, components);
+      const memoryReasons = candidateMemoryReasons(record, components, memoryHits);
       return {
         label:
           recordString(record, "hypothesis") ||
@@ -4943,10 +5027,9 @@ function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[] {
         validationStatus: recordFirstString(record, ["backend_validation_status", "validation_status"]),
         totalScore: numberPayload(record.score) ?? numberPayload(record.total_score),
         reasons: stringArrayPayload(record.reasons),
-        components: Object.entries(components)
-          .map(([label, value]) => ({ label, value: typeof value === "number" ? value : String(value) }))
-          .filter((component) => component.value !== "")
-          .slice(0, 6),
+        memoryReasons,
+        memoryHits,
+        components: candidateScoreComponentRows(components),
       };
     })
     .filter(
@@ -4954,9 +5037,308 @@ function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[] {
         row.totalScore !== null ||
         row.components.length > 0 ||
         row.reasons.length > 0 ||
+        row.memoryReasons.length > 0 ||
+        row.memoryHits.length > 0 ||
         Boolean(row.mechanism || row.intervention || row.expectedEffect || row.validationStatus),
     )
     .slice(0, 6);
+}
+
+function decisionRetrievedMemoryRows(decision: AgentDecision): RetrievedMemoryDisplay[] {
+  const payload = decision.payload ?? {};
+  const snapshot = recordObject(payload.planner_context_snapshot ?? payload.plannerContextSnapshot);
+  const monitorSnapshot = recordObject(payload.training_monitor_context_snapshot ?? payload.trainingMonitorContextSnapshot);
+  const rows = [
+    ...memoryCardsFromUnknown(payload.retrieved_memory),
+    ...memoryCardsFromUnknown(payload.retrievedMemory),
+    ...memoryCardsFromUnknown(payload.retrieved_run_memory),
+    ...memoryCardsFromUnknown(payload.retrievedRunMemory),
+    ...memoryCardsFromUnknown(snapshot.retrieved_memory ?? snapshot.retrievedMemory),
+    ...memoryCardsFromUnknown(monitorSnapshot.retrieved_run_memory ?? monitorSnapshot.retrievedRunMemory),
+  ];
+  return uniqueBy(rows, memoryDisplayKey).slice(0, 8);
+}
+
+function candidateRetrievedMemoryRows(
+  record: Record<string, unknown>,
+  components: Record<string, unknown>,
+): RetrievedMemoryDisplay[] {
+  const rows = [
+    ...memoryCardsFromUnknown(record.retrieved_memory),
+    ...memoryCardsFromUnknown(record.retrievedMemory),
+    ...memoryCardsFromUnknown(record.retrieved_memory_hits),
+    ...memoryCardsFromUnknown(record.retrievedMemoryHits),
+    ...memoryCardsFromUnknown(record.memory_hits),
+    ...memoryCardsFromUnknown(record.memoryHits),
+    ...memoryCardsFromUnknown(record.memory_retrieval_hits),
+    ...memoryCardsFromUnknown(record.memory_cards),
+    ...memoryCardsFromUnknown(record.retrieved_cards),
+    ...memoryCardsFromUnknown(components.retrieved_memory),
+    ...memoryCardsFromUnknown(components.retrieved_memory_hits),
+    ...memoryCardsFromUnknown(components.memory_hits),
+  ];
+  return uniqueBy(rows, memoryDisplayKey).slice(0, 4);
+}
+
+function candidateMemoryReasons(
+  record: Record<string, unknown>,
+  components: Record<string, unknown>,
+  memoryHits: RetrievedMemoryDisplay[],
+) {
+  const explicitReasons = [
+    ...memoryReasonStrings(record.retrieved_memory_reasons),
+    ...memoryReasonStrings(record.retrievedMemoryReasons),
+    ...memoryReasonStrings(record.memory_reasons),
+    ...memoryReasonStrings(record.memoryReasons),
+    ...memoryReasonStrings(record.retrieval_reasons),
+    ...memoryReasonStrings(record.retrievalReasons),
+  ];
+  const rankingReasons = stringArrayPayload(record.reasons).filter(isMemoryReasonText).map((reason) => safeMemoryText(reason));
+  const hitReasons = memoryHits.map((memory) => memory.retrievalReason).filter(Boolean);
+  return uniqueStrings([
+    ...explicitReasons,
+    ...rankingReasons,
+    ...memoryScoreComponentSummaries(components),
+    ...hitReasons,
+  ]).slice(0, 6);
+}
+
+function candidateScoreComponentRows(components: Record<string, unknown>): Array<{ label: string; value: number | string }> {
+  const rows: Array<{ label: string; value: number | string }> = [];
+  for (const [label, value] of Object.entries(components)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      if (isMemoryComponentLabel(label) && value === 0) continue;
+      rows.push({ label, value });
+      continue;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const text = safeMemoryText(value, 80);
+      if (text) rows.push({ label, value: text });
+    }
+  }
+  return rows
+    .sort((left, right) => Number(isMemoryComponentLabel(right.label)) - Number(isMemoryComponentLabel(left.label)))
+    .slice(0, 6);
+}
+
+function memoryCardsFromUnknown(value: unknown): RetrievedMemoryDisplay[] {
+  return memoryCardsFromUnknownDepth(value, 0);
+}
+
+function memoryCardsFromUnknownDepth(value: unknown, depth: number): RetrievedMemoryDisplay[] {
+  if (depth > 3 || value === undefined || value === null) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => memoryCardsFromUnknownDepth(item, depth + 1));
+  }
+
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) return [];
+  if (isMemoryCardLike(record)) {
+    const row = memoryDisplayFromRecord(record as RetrievedMemoryCard);
+    return row ? [row] : [];
+  }
+
+  return Object.entries(record)
+    .filter(([key, entry]) => isMemoryContainerKey(key, entry))
+    .flatMap(([, entry]) => memoryCardsFromUnknownDepth(entry, depth + 1));
+}
+
+function memoryDisplayFromRecord(record: RetrievedMemoryCard): RetrievedMemoryDisplay | null {
+  const summaryCard = recordObject(record.summary_card ?? record.summaryCard);
+  const metadata = recordObject(record.metadata);
+  const records = [record as Record<string, unknown>, summaryCard, metadata];
+  const sourceTable = firstMemoryString(records, ["source_table", "sourceTable", "source", "source_kind"], 80);
+  const source = humanizeMemorySource(sourceTable);
+  const sourceId = firstMemoryString(records, ["source_id", "sourceID", "memory_id", "scorecard_id", "id"], 120);
+  const kind = firstMemoryString(records, ["kind", "memory_kind", "card_kind", "type"], 80);
+  const outcome = memoryOutcome(records, kind);
+  const mechanism = firstMemoryString(records, ["mechanism", "strategy_type", "strategy", "selected_mechanism"], 120);
+  const intervention = firstMemoryString(records, ["intervention", "action", "proposed_change"], 180);
+  const summary =
+    firstMemoryString(records, ["lesson", "compact_lesson", "summary", "compact_summary"], 260) ||
+    firstMemoryString(records, ["recommendation_summary", "dynamics", "training_dynamics", "preprocessing_hypothesis"], 220);
+  const retrievalReason =
+    firstMemoryString(records, ["retrieval_reason", "reason_for_retrieval", "match_reason", "memory_reason"], 220) ||
+    firstMemoryString([record as Record<string, unknown>], ["reason"], 180);
+  const score =
+    numberPayload(record.score) ??
+    numberPayload(record.retrieval_score) ??
+    numberPayload(record.semantic_score) ??
+    numberPayload(record.structured_score);
+  const identifiers = memoryIdentifierRows(records);
+
+  if (!sourceId && !kind && !mechanism && !summary && !retrievalReason) return null;
+
+  return {
+    source,
+    sourceId,
+    kind,
+    outcome,
+    mechanism,
+    intervention,
+    summary,
+    retrievalReason,
+    score,
+    identifiers,
+  };
+}
+
+function isMemoryCardLike(record: Record<string, unknown>) {
+  return [
+    "source_id",
+    "sourceID",
+    "source_table",
+    "summary_card",
+    "summaryCard",
+    "retrieval_reason",
+    "reason_for_retrieval",
+    "kind",
+    "memory_kind",
+    "lesson",
+    "compact_lesson",
+    "compact_summary",
+    "outcome",
+    "mechanism",
+    "intervention",
+  ].some((key) => key in record);
+}
+
+function isMemoryContainerKey(key: string, entry: unknown) {
+  if (!entry || key.toLowerCase().includes("embedding") || key.toLowerCase().includes("payload")) return false;
+  if (Array.isArray(entry)) return true;
+  const normalized = key.toLowerCase();
+  return (
+    normalized.includes("retrieved_memory") ||
+    normalized.includes("retrievedrunmemory") ||
+    normalized.includes("retrieved_run_memory") ||
+    normalized.includes("memory_hits") ||
+    normalized.includes("memory_cards") ||
+    normalized.includes("successful_strategy_cards") ||
+    normalized.includes("failed_strategy_cards") ||
+    normalized.includes("blocked_or_rejected_cards") ||
+    normalized.includes("dataset_preprocessing_cards") ||
+    normalized.includes("run_dynamics_cards")
+  );
+}
+
+function firstMemoryString(records: Record<string, unknown>[], keys: string[], maxLength: number) {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === "string") {
+        const text = safeMemoryText(value, maxLength);
+        if (text) return text;
+      }
+      if ((typeof value === "number" && Number.isFinite(value)) || typeof value === "boolean") {
+        return String(value);
+      }
+    }
+  }
+  return "";
+}
+
+function memoryIdentifierRows(records: Record<string, unknown>[]) {
+  const labels: Array<{ key: string; label: string }> = [
+    { key: "source_id", label: "Source ID" },
+    { key: "memory_id", label: "Memory ID" },
+    { key: "scorecard_id", label: "Scorecard" },
+    { key: "decision_id", label: "Decision" },
+    { key: "source_decision_id", label: "Decision" },
+    { key: "plan_id", label: "Plan" },
+    { key: "source_plan_id", label: "Source Plan" },
+    { key: "followup_plan_id", label: "Follow-up Plan" },
+    { key: "follow_up_plan_id", label: "Follow-up Plan" },
+    { key: "job_id", label: "Job" },
+    { key: "invocation_id", label: "Invocation" },
+    { key: "dataset_id", label: "Dataset" },
+  ];
+  const rows: Array<{ label: string; value: string }> = [];
+  for (const item of labels) {
+    const value = firstMemoryString(records, [item.key], 120);
+    if (value) rows.push({ label: item.label, value });
+  }
+  return uniqueBy(rows, (row) => `${row.label}-${row.value}`).slice(0, 6);
+}
+
+function memoryOutcome(records: Record<string, unknown>[], kind: string) {
+  const explicit = firstMemoryString(records, ["outcome", "outcome_status", "result"], 80);
+  if (explicit) return explicit;
+  const text = kind.toLowerCase();
+  if (text.includes("rejected") || text.includes("blocked")) return "rejected";
+  if (text.includes("failed") || text.includes("failure")) return "failed";
+  if (text.includes("no_improvement") || text.includes("no improvement")) return "no_improvement";
+  if (text.includes("minor")) return "minor_improvement";
+  if (text.includes("success") || text.includes("improved")) return "improved";
+  return kind ? "memory" : "retrieved";
+}
+
+function humanizeMemorySource(value: string) {
+  const normalized = value.toLowerCase();
+  if (!normalized) return "Memory";
+  const labels: Record<string, string> = {
+    agent_memory_records: "Agent Memory",
+    strategy_scorecards: "Strategy Scorecard",
+    dataset_profiles: "Dataset Profile",
+    dataset_visual_analyses: "Visual Analysis",
+    dataset_preprocessing: "Preprocessing Memory",
+    training_run_evaluations: "Run Evaluation",
+    training_run_summaries: "Run Summary",
+  };
+  return labels[normalized] || value.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function memoryReasonStrings(value: unknown): string[] {
+  if (typeof value === "string") {
+    const text = safeMemoryText(value);
+    return text ? [text] : [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => memoryReasonStrings(item));
+  }
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) return [];
+  return [
+    firstMemoryString([record], ["retrieval_reason", "reason_for_retrieval", "match_reason", "memory_reason", "reason"], 220),
+    firstMemoryString([record], ["summary", "lesson"], 220),
+  ].filter(Boolean);
+}
+
+function memoryScoreComponentSummaries(components: Record<string, unknown>) {
+  return Object.entries(components)
+    .filter(([label]) => isMemoryComponentLabel(label))
+    .flatMap(([label, value]) => {
+      if (typeof value === "number" && Number.isFinite(value) && value !== 0) {
+        const sign = value > 0 ? "+" : "";
+        return [`${humanizeAuditKey(label)} ${sign}${value.toFixed(3)}`];
+      }
+      if (typeof value === "string") {
+        const text = safeMemoryText(value);
+        return text ? [`${humanizeAuditKey(label)}: ${text}`] : [];
+      }
+      return memoryReasonStrings(value);
+    });
+}
+
+function isMemoryComponentLabel(label: string) {
+  const normalized = label.toLowerCase();
+  return normalized.includes("retrieved_memory") || normalized.includes("memory_similarity") || normalized.includes("memory_score");
+}
+
+function isMemoryReasonText(value: string) {
+  const normalized = value.toLowerCase();
+  return normalized.includes("retrieved") || normalized.includes("memory") || normalized.includes("scorecard");
+}
+
+function memoryDisplayKey(memory: RetrievedMemoryDisplay) {
+  return `${memory.source}-${memory.sourceId}-${memory.kind}-${memory.summary}`;
+}
+
+function safeMemoryText(value: string, maxLength = 220) {
+  const text = shortAuditText(value, maxLength);
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) return "";
+  return trimmed;
 }
 
 function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {

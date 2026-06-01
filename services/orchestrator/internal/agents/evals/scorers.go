@@ -11,15 +11,20 @@ import (
 )
 
 type PlannerReplayScores struct {
-	SchemaValid                     bool `json:"schema_valid"`
-	BackendValidationPassed         bool `json:"backend_validation_passed"`
-	CandidateRankingApplied         bool `json:"candidate_ranking_applied"`
-	AvoidedBlockedMechanisms        bool `json:"avoided_blocked_mechanisms"`
-	AvoidedDuplicateSignatures      bool `json:"avoided_duplicate_signatures"`
-	AvoidedArchitectureAfterPlateau bool `json:"avoided_architecture_after_plateau"`
-	ExpectedValueAboveFloor         bool `json:"expected_value_above_floor"`
-	EvidencePresent                 bool `json:"evidence_present"`
-	SelectedExperimentCountOK       bool `json:"selected_experiment_count_ok"`
+	SchemaValid                     bool           `json:"schema_valid"`
+	BackendValidationPassed         bool           `json:"backend_validation_passed"`
+	CandidateRankingApplied         bool           `json:"candidate_ranking_applied"`
+	AvoidedBlockedMechanisms        bool           `json:"avoided_blocked_mechanisms"`
+	AvoidedDuplicateSignatures      bool           `json:"avoided_duplicate_signatures"`
+	AvoidedArchitectureAfterPlateau bool           `json:"avoided_architecture_after_plateau"`
+	ExpectedValueAboveFloor         bool           `json:"expected_value_above_floor"`
+	EvidencePresent                 bool           `json:"evidence_present"`
+	SelectedExperimentCountOK       bool           `json:"selected_experiment_count_ok"`
+	RetrievedCardCount              int            `json:"retrieved_card_count,omitempty"`
+	RetrievalPromptBytes            int            `json:"retrieval_prompt_bytes,omitempty"`
+	SelectedCandidateMemoryScore    float64        `json:"selected_candidate_memory_score,omitempty"`
+	RejectedCandidateMemoryPenalty  float64        `json:"rejected_candidate_memory_penalty,omitempty"`
+	RetrievalHitSourceMix           map[string]int `json:"retrieval_hit_source_mix,omitempty"`
 }
 
 func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendation agents.ExperimentPlanningRecommendation, expected PlannerReplayExpected) PlannerReplayScores {
@@ -62,6 +67,7 @@ func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendat
 	evidencePresent := replayEvidencePresent(decision, finalized)
 	countOK := decision != decisions.TypeAddExperiments || len(finalized.ProposedExperiments) <= maxExperiments
 	addHasSelection := decision != decisions.TypeAddExperiments || len(finalized.ProposedExperiments) > 0
+	retrievalMetrics := replayRetrievalMetrics(input, finalized)
 
 	backendPassed := schemaValid &&
 		decisionAllowed &&
@@ -85,7 +91,55 @@ func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendat
 		ExpectedValueAboveFloor:         expectedValueOK,
 		EvidencePresent:                 evidencePresent,
 		SelectedExperimentCountOK:       countOK,
+		RetrievedCardCount:              retrievalMetrics.RetrievedCardCount,
+		RetrievalPromptBytes:            retrievalMetrics.RetrievalPromptBytes,
+		SelectedCandidateMemoryScore:    retrievalMetrics.SelectedCandidateMemoryScore,
+		RejectedCandidateMemoryPenalty:  retrievalMetrics.RejectedCandidateMemoryPenalty,
+		RetrievalHitSourceMix:           retrievalMetrics.RetrievalHitSourceMix,
 	}
+}
+
+type plannerReplayRetrievalMetrics struct {
+	RetrievedCardCount             int
+	RetrievalPromptBytes           int
+	SelectedCandidateMemoryScore   float64
+	RejectedCandidateMemoryPenalty float64
+	RetrievalHitSourceMix          map[string]int
+}
+
+func replayRetrievalMetrics(input agents.ExperimentPlannerInput, recommendation agents.ExperimentPlanningRecommendation) plannerReplayRetrievalMetrics {
+	metrics := plannerReplayRetrievalMetrics{
+		RetrievedCardCount: len(input.RetrievedMemory),
+	}
+	if len(input.RetrievedMemory) > 0 {
+		metrics.RetrievalPromptBytes = replayApproximateJSONBytes(input.RetrievedMemory)
+	}
+
+	sourceMix := map[string]int{}
+	for _, ranking := range recommendation.CandidateRankings {
+		retrievedScore := ranking.ScoreComponents["retrieved_memory"]
+		if ranking.Selected {
+			metrics.SelectedCandidateMemoryScore += retrievedScore
+		}
+		if ranking.Rejected && retrievedScore < 0 {
+			metrics.RejectedCandidateMemoryPenalty += retrievedScore
+		}
+		for _, hit := range ranking.RetrievedMemoryHits {
+			source := strings.TrimSpace(hit.SourceTable)
+			if source == "" {
+				source = strings.TrimSpace(hit.Kind)
+			}
+			if source != "" {
+				sourceMix[source]++
+			}
+		}
+	}
+	if len(sourceMix) > 0 {
+		metrics.RetrievalHitSourceMix = sourceMix
+	}
+	metrics.SelectedCandidateMemoryScore = replayRoundScore(metrics.SelectedCandidateMemoryScore)
+	metrics.RejectedCandidateMemoryPenalty = replayRoundScore(metrics.RejectedCandidateMemoryPenalty)
+	return metrics
 }
 
 func replaySchemaValid(recommendation agents.ExperimentPlanningRecommendation) bool {
@@ -299,4 +353,16 @@ func nonEmptyReplayStrings(values []string) []string {
 		}
 	}
 	return out
+}
+
+func replayApproximateJSONBytes(value any) int {
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return 0
+	}
+	return len(blob)
+}
+
+func replayRoundScore(value float64) float64 {
+	return math.Round(value*1000) / 1000
 }

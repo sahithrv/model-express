@@ -25,6 +25,7 @@ import (
 	datasetmetadata "model-express/services/orchestrator/internal/datasets/metadata"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/diagnostics"
+	"model-express/services/orchestrator/internal/embeddings"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
@@ -122,6 +123,9 @@ const (
 
 	datasetMetadataMaxSourceBytes      = 2_000_000
 	datasetMetadataMaxTotalSourceBytes = 10_000_000
+
+	memoryRetrievalDefaultMaxCards = 10
+	memoryRetrievalDefaultMinScore = 0.55
 )
 
 var (
@@ -413,6 +417,7 @@ func (s *Server) updateDatasetProfile(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	s.indexMemoryCard(context.Background(), memory.NewDatasetProfileMemoryCard(dataset))
 
 	visualQueued, err := s.maybeQueueInitialDatasetVisualAnalysis(dataset.ID)
 	if err != nil {
@@ -734,6 +739,7 @@ func (s *Server) mergeDatasetVisualExemplars(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	s.indexMemoryCard(context.Background(), memory.NewDatasetProfileMemoryCard(updated))
 
 	c.JSON(http.StatusOK, gin.H{
 		"dataset":          updated,
@@ -938,6 +944,12 @@ func (s *Server) reportDatasetVisualAnalysisResult(c *gin.Context) {
 	if err != nil {
 		writeStoreError(c, err)
 		return
+	}
+	if stored.ValidationStatus == datasets.VisualValidationStatusAccepted {
+		s.indexMemoryCard(context.Background(), memory.NewDatasetVisualAnalysisMemoryCard(stored))
+		for _, card := range memory.BuildDatasetPreprocessingHypothesisCards(stored) {
+			s.indexMemoryCard(context.Background(), card)
+		}
 	}
 
 	if _, eventErr := s.store.CreateExecutionEvent(dataset.ProjectID, "", execution.EventDatasetVisualAnalysisResult, "Dataset visual analysis result recorded.", map[string]any{
@@ -2800,6 +2812,20 @@ func (s *Server) listProjectAgentMemoryRecords(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"records": records})
 }
 
+func (s *Server) backfillProjectMemoryEmbeddings(c *gin.Context) {
+	projectID := c.Param("id")
+	if _, err := s.store.GetProject(projectID); err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	result, err := memory.NewIndexer(s.store, nil, embeddings.ConfigFromEnv()).BackfillProject(c.Request.Context(), projectID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 func (s *Server) listProjectAgentInvocations(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "25"))
 	invocations, err := s.store.ListProjectAgentInvocations(c.Param("id"), memory.AgentInvocationFilter{
@@ -3373,6 +3399,7 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	if err != nil {
 		return err
 	}
+	s.indexMemoryCard(context.Background(), memory.NewAgentMemoryCard(record))
 
 	if _, err := s.store.CreateExecutionEvent(job.ProjectID, plan.ID, execution.EventAgentOutcomeRecorded, fmt.Sprintf("Experiment Planner outcome recorded for follow-up plan %s.", plan.ID), map[string]any{
 		"invocation_id":      updatedInvocation.ID,
@@ -3382,7 +3409,7 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	}); err != nil {
 		log.Printf("record experiment planner outcome event failed: %v", err)
 	}
-	if _, err := s.store.UpdateStrategyScorecardOutcomeByFollowUpPlan(plan.ID, strategies.StrategyScorecardOutcomeUpdate{
+	if updatedScorecard, err := s.store.UpdateStrategyScorecardOutcomeByFollowUpPlan(plan.ID, strategies.StrategyScorecardOutcomeUpdate{
 		ActualDelta:     outcome.ActualDeltaVsChampion,
 		ConfidenceAfter: plannerOutcomeConfidence(outcome),
 		CostUSD:         outcome.TotalCostUSD,
@@ -3390,7 +3417,9 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 		Outcome:         outcome.OutcomeStatus,
 		Lesson:          outcome.Lesson,
 		Tags:            tags,
-	}); err != nil && !errors.Is(err, store.ErrNotFound) {
+	}); err == nil {
+		s.indexMemoryCard(context.Background(), memory.NewStrategyScorecardMemoryCard(updatedScorecard))
+	} else if !errors.Is(err, store.ErrNotFound) {
 		log.Printf("update strategy scorecard failed for follow-up plan %s: %v", plan.ID, err)
 	}
 	return nil
@@ -3455,15 +3484,17 @@ func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
 	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 	defer cancel()
 
+	retrievedRunMemory := s.retrieveTrainingMonitorMemory(ctx, plan, job, summary, projectObjectiveContext(goalText))
 	trace, err := agent.EvaluateWithTrace(ctx, agents.TrainingMonitorInput{
-		Plan:              plan,
-		Job:               job,
-		Summary:           summary,
-		Evaluation:        evaluation,
-		Metrics:           metrics,
-		ObjectiveContext:  projectObjectiveContext(goalText),
-		MemoryRecords:     priorMemory,
-		OptimizerFeedback: s.optimizerFeedbackSummary(jobConfigString(job.Config, "automl_study_id"), trainingMonitorTargetMetricFromJob(job, summary)),
+		Plan:               plan,
+		Job:                job,
+		Summary:            summary,
+		Evaluation:         evaluation,
+		Metrics:            metrics,
+		ObjectiveContext:   projectObjectiveContext(goalText),
+		MemoryRecords:      priorMemory,
+		RetrievedRunMemory: retrievedRunMemory,
+		OptimizerFeedback:  s.optimizerFeedbackSummary(jobConfigString(job.Config, "automl_study_id"), trainingMonitorTargetMetricFromJob(job, summary)),
 	})
 	acceptedForMemory := err == nil
 	invocation, invocationErr := s.recordTrainingMonitorInvocation(job, summary, config, trace, acceptedForMemory)
@@ -3516,6 +3547,7 @@ func (s *Server) runTrainingMonitorAfterTrainingJob(job jobs.ExperimentJob) {
 		log.Printf("training monitor memory write failed for job %s: %v", job.ID, err)
 		return
 	}
+	s.indexMemoryCard(context.Background(), memory.NewAgentMemoryCard(record))
 
 	if _, err := s.store.CreateExecutionEvent(job.ProjectID, summary.PlanID, execution.EventAgentRecommendationRecorded, fmt.Sprintf("Training Monitor recorded an evaluation for job %s.", job.ID), map[string]any{
 		"job_id":           job.ID,
@@ -3743,6 +3775,7 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		return false, err
 	}
 	payload["memory_record_id"] = record.ID
+	s.indexMemoryCard(context.Background(), memory.NewAgentMemoryCard(record))
 
 	decisionType := strings.ToUpper(strings.TrimSpace(recommendation.DecisionType))
 	if decisionType == decisions.TypeWait {
@@ -3922,6 +3955,7 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		FollowUpRound:                followUpRoundCount(projectPlans),
 	}
 	input.ProjectTrajectory = agents.ComputeProjectTrajectoryDiagnosis(input)
+	input.RetrievedMemory = s.retrievePlannerMemory(context.Background(), input)
 	return input, true, nil
 }
 
@@ -5239,6 +5273,242 @@ func projectObjectiveContext(goal string) agents.ProjectObjectiveContext {
 	context.DeploymentPriorities = uniqueStrings(context.DeploymentPriorities)
 	context.Constraints = uniqueStrings(context.Constraints)
 	return context
+}
+
+func (s *Server) retrievePlannerMemory(ctx context.Context, input agents.ExperimentPlannerInput) []memory.MemoryRetrievalResult {
+	if !memoryRetrievalEnabled() {
+		return nil
+	}
+	query := memory.MemoryRetrievalQuery{
+		ProjectID:      input.Project.ID,
+		DatasetID:      input.Dataset.ID,
+		AgentName:      agents.ExperimentPlannerAgentName,
+		Purpose:        "experiment_planner",
+		Text:           plannerMemoryRetrievalText(input),
+		Kinds:          plannerMemoryRetrievalKinds(),
+		Mechanisms:     plannerMemoryRetrievalMechanisms(input),
+		DatasetTraits:  uniqueStrings(append(input.DatasetInsights.DatasetTraits, datasetProfileTraits(input.Dataset.Profile)...)),
+		Objective:      strings.Join([]string{input.ObjectiveContext.PrimaryObjective, input.ObjectiveContext.GoalText, input.SourcePlan.TargetMetric}, " "),
+		Limit:          memoryRetrievalMaxCards(),
+		CrossProjectOK: memoryRetrievalCrossProjectOK(),
+	}
+	results := s.searchRetrievedMemory(ctx, query)
+	s.logMemoryRetrieval("planner", input.Project.ID, input.Dataset.ID, results)
+	if memoryRetrievalLogOnly() {
+		return nil
+	}
+	return results
+}
+
+func (s *Server) retrieveTrainingMonitorMemory(ctx context.Context, plan plans.ExperimentPlan, job jobs.ExperimentJob, summary runs.TrainingRunSummary, objective agents.ProjectObjectiveContext) []memory.MemoryRetrievalResult {
+	if !memoryRetrievalEnabled() {
+		return nil
+	}
+	mechanism := strings.TrimSpace(jobConfigString(job.Config, "mechanism"))
+	if mechanism == "" {
+		mechanism = strings.TrimSpace(jobConfigString(job.Config, "intervention"))
+	}
+	query := memory.MemoryRetrievalQuery{
+		ProjectID:      job.ProjectID,
+		DatasetID:      summary.DatasetID,
+		AgentName:      agents.TrainingMonitorAgentName,
+		Purpose:        "training_monitor",
+		Text:           trainingMonitorMemoryRetrievalText(plan, job, summary, objective),
+		Kinds:          []string{memory.KindTrainingEvaluation, memory.KindPlanningOutcome, "strategy_scorecard"},
+		Mechanisms:     uniqueStrings([]string{mechanism}),
+		Objective:      strings.Join([]string{objective.PrimaryObjective, objective.GoalText, plan.TargetMetric}, " "),
+		Limit:          minInt(memoryRetrievalMaxCards(), trainingMonitorMemoryRetrievalMaxCards()),
+		CrossProjectOK: memoryRetrievalCrossProjectOK(),
+	}
+	results := s.searchRetrievedMemory(ctx, query)
+	s.logMemoryRetrieval("training_monitor", job.ProjectID, summary.DatasetID, results)
+	if memoryRetrievalLogOnly() {
+		return nil
+	}
+	return results
+}
+
+func (s *Server) searchRetrievedMemory(ctx context.Context, query memory.MemoryRetrievalQuery) []memory.MemoryRetrievalResult {
+	query.Text = strings.TrimSpace(query.Text)
+	if query.ProjectID == "" || query.Text == "" {
+		return nil
+	}
+	if query.Limit <= 0 {
+		query.Limit = memoryRetrievalMaxCards()
+	}
+	query = s.withMemoryQueryEmbedding(ctx, query)
+	results, err := s.store.SearchMemoryEmbeddings(query)
+	if err != nil {
+		log.Printf("memory retrieval failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, err)
+		return nil
+	}
+	return filterMemoryRetrievalResults(results, memoryRetrievalMinScore(), query.Limit)
+}
+
+func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.MemoryRetrievalQuery) memory.MemoryRetrievalQuery {
+	config := embeddings.ConfigFromEnv()
+	if !config.EmbeddingsEnabled || config.ReadyForIndexing() != nil {
+		return query
+	}
+	result, err := embeddings.NewClient(config).Embed(ctx, embeddings.EmbedRequest{
+		Model:      config.Model,
+		Text:       query.Text,
+		Dimensions: config.Dimensions,
+	})
+	if err != nil {
+		log.Printf("memory retrieval embedding failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, err)
+		return query
+	}
+	query.EmbeddingModel = result.Model
+	query.EmbeddingDimensions = result.Dimensions
+	query.Embedding = result.Vector
+	return query
+}
+
+func (s *Server) logMemoryRetrieval(purpose string, projectID string, datasetID string, results []memory.MemoryRetrievalResult) {
+	if len(results) == 0 {
+		return
+	}
+	diagnostics.Event("info", "memory_retrieval", map[string]any{
+		"purpose":          purpose,
+		"project_id":       projectID,
+		"dataset_id":       datasetID,
+		"retrieved_count":  len(results),
+		"log_only":         memoryRetrievalLogOnly(),
+		"cross_project_ok": memoryRetrievalCrossProjectOK(),
+	})
+}
+
+func (s *Server) indexMemoryCard(ctx context.Context, card memory.EmbeddableMemoryCard) {
+	if !embeddings.ConfigFromEnv().EmbeddingsEnabled {
+		return
+	}
+	result, err := memory.NewIndexer(s.store, nil, embeddings.ConfigFromEnv()).IndexCards(ctx, []memory.EmbeddableMemoryCard{card})
+	if err != nil {
+		log.Printf("memory card indexing failed for %s/%s: %v", card.SourceTable, card.SourceID, err)
+		return
+	}
+	if result.Disabled && result.NoopReason != "" {
+		log.Printf("memory card indexing skipped for %s/%s: %s", card.SourceTable, card.SourceID, result.NoopReason)
+	}
+}
+
+func plannerMemoryRetrievalText(input agents.ExperimentPlannerInput) string {
+	return strings.Join(uniqueStrings([]string{
+		input.Project.Goal,
+		input.Dataset.Name,
+		input.DatasetInsights.Summary,
+		input.DatasetInsights.TaskType,
+		strings.Join(input.DatasetInsights.DatasetTraits, " "),
+		input.SourcePlan.TargetMetric,
+		input.ObjectiveContext.PrimaryObjective,
+		input.ObjectiveContext.GoalText,
+		strings.Join(input.DeterministicDiagnosis.RecommendedFailureModes, " "),
+		strings.Join(input.DeterministicDiagnosis.Evidence, " "),
+		plannerChampionMemoryText(input.CurrentChampion),
+	}), "\n")
+}
+
+func trainingMonitorMemoryRetrievalText(plan plans.ExperimentPlan, job jobs.ExperimentJob, summary runs.TrainingRunSummary, objective agents.ProjectObjectiveContext) string {
+	return strings.Join(uniqueStrings([]string{
+		summary.Model,
+		memoryModelFamily(summary.Model),
+		summary.Status,
+		job.Template,
+		jobConfigString(job.Config, "mechanism"),
+		jobConfigString(job.Config, "intervention"),
+		plan.TargetMetric,
+		objective.PrimaryObjective,
+		objective.GoalText,
+		fmt.Sprintf("best_macro_f1 %.4f best_accuracy %.4f final_train_loss %.4f final_val_loss %.4f epochs %d", summary.BestMacroF1, summary.BestAccuracy, summary.FinalTrainLoss, summary.FinalValLoss, summary.EpochsCompleted),
+	}), "\n")
+}
+
+func plannerMemoryRetrievalKinds() []string {
+	return []string{
+		"strategy_scorecard",
+		memory.KindPlanningOutcome,
+		memory.KindPlanningFeedback,
+		memory.KindTrainingEvaluation,
+		memory.KindDatasetProfile,
+		memory.KindDatasetVisualAnalysis,
+		memory.KindDatasetPreprocessingHypothesis,
+	}
+}
+
+func plannerMemoryRetrievalMechanisms(input agents.ExperimentPlannerInput) []string {
+	values := append([]string{}, input.DeterministicDiagnosis.RecommendedFailureModes...)
+	for _, scorecard := range input.StrategyScorecards {
+		values = append(values, scorecard.Mechanism)
+	}
+	return uniqueStrings(values)
+}
+
+func plannerChampionMemoryText(champion *agents.ExperimentChampion) string {
+	if champion == nil {
+		return ""
+	}
+	return strings.Join(uniqueStrings([]string{champion.Model, champion.TargetMetric, fmt.Sprintf("score %.4f", champion.Score)}), " ")
+}
+
+func filterMemoryRetrievalResults(results []memory.MemoryRetrievalResult, minScore float64, limit int) []memory.MemoryRetrievalResult {
+	out := []memory.MemoryRetrievalResult{}
+	for _, result := range results {
+		if result.Score < minScore {
+			continue
+		}
+		out = append(out, result)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func memoryRetrievalEnabled() bool {
+	return envFlag("MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED", false)
+}
+
+func memoryRetrievalCrossProjectOK() bool {
+	return envFlag("MODEL_EXPRESS_MEMORY_CROSS_PROJECT_ENABLED", false)
+}
+
+func memoryRetrievalLogOnly() bool {
+	return envFlag("MODEL_EXPRESS_MEMORY_RETRIEVAL_LOG_ONLY", true)
+}
+
+func memoryRetrievalMaxCards() int {
+	return envInt("MODEL_EXPRESS_MEMORY_RETRIEVAL_MAX_CARDS", memoryRetrievalDefaultMaxCards, 1, 50)
+}
+
+func trainingMonitorMemoryRetrievalMaxCards() int {
+	return minInt(memoryRetrievalMaxCards(), 8)
+}
+
+func memoryRetrievalMinScore() float64 {
+	return envFloat("MODEL_EXPRESS_MEMORY_RETRIEVAL_MIN_SCORE", memoryRetrievalDefaultMinScore, 0, 1)
+}
+
+func memoryModelFamily(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(normalized, "mobilenet"):
+		return "mobilenet"
+	case strings.Contains(normalized, "efficientnet"):
+		return "efficientnet"
+	case strings.Contains(normalized, "resnet"):
+		return "resnet"
+	case strings.Contains(normalized, "regnet"):
+		return "regnet"
+	case strings.Contains(normalized, "convnext"):
+		return "convnext"
+	case strings.Contains(normalized, "swin"):
+		return "swin"
+	case strings.Contains(normalized, "vit"):
+		return "vit"
+	default:
+		return normalized
+	}
 }
 
 func containsAny(value string, needles ...string) bool {

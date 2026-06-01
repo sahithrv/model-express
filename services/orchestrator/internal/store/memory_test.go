@@ -1,10 +1,14 @@
 package store
 
 import (
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 
 	"model-express/services/orchestrator/internal/datasets"
+	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/strategies"
 )
 
@@ -134,6 +138,369 @@ func TestMemoryStoreDatasetVisualAnalysisCRUD(t *testing.T) {
 	}
 	if len(analyses) != 3 || analyses[0].ID != latest.ID || analyses[2].ID != first.ID {
 		t.Fatalf("unexpected visual analysis ordering: %#v", analyses)
+	}
+}
+
+func TestMemoryStoreMemoryEmbeddingUpsertAndSearch(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("memory project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	otherProject, err := store.CreateProject("other project", "maximize accuracy")
+	if err != nil {
+		t.Fatalf("CreateProject() other error = %v", err)
+	}
+
+	first, err := store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		SourceTable:         memory.SourceAgentMemoryRecord,
+		SourceID:            "memory_1",
+		ProjectID:           project.ID,
+		DatasetID:           "dataset_1",
+		Kind:                memory.KindPlanningOutcome,
+		Scope:               memory.ScopeDataset,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0.1, 0.2, 0.3},
+		EmbeddingText:       "class balancing improved minority class recall",
+		SummaryCard:         map[string]any{"lesson": "class balancing helped"},
+		Metadata:            map[string]any{"mechanism": "class_balancing", "outcome": strategies.OutcomeImprovedChampion, "accepted_for_vector_memory": true},
+		QualityScore:        0.8,
+		OutcomeScore:        1,
+	})
+	if err != nil {
+		t.Fatalf("UpsertMemoryEmbedding() first error = %v", err)
+	}
+	if first.ID == "" {
+		t.Fatalf("UpsertMemoryEmbedding() did not assign ID")
+	}
+
+	second, err := store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		SourceTable:         memory.SourceAgentMemoryRecord,
+		SourceID:            "memory_2",
+		ProjectID:           project.ID,
+		Kind:                memory.KindTrainingEvaluation,
+		Scope:               memory.ScopeProject,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0.4, 0.5, 0.6},
+		EmbeddingText:       "training dynamics plateaued after early epochs",
+		Metadata:            map[string]any{"agent_name": "training_monitor", "accepted_for_vector_memory": true},
+	})
+	if err != nil {
+		t.Fatalf("UpsertMemoryEmbedding() second error = %v", err)
+	}
+	_, err = store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		SourceTable:         memory.SourceAgentMemoryRecord,
+		SourceID:            "memory_other",
+		ProjectID:           otherProject.ID,
+		Kind:                memory.KindPlanningOutcome,
+		Scope:               memory.ScopeProject,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0.7, 0.8, 0.9},
+		EmbeddingText:       "class balancing from another project",
+	})
+	if err != nil {
+		t.Fatalf("UpsertMemoryEmbedding() other project error = %v", err)
+	}
+
+	updated, err := store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		ID:                  "ignored_new_id",
+		SourceTable:         memory.SourceAgentMemoryRecord,
+		SourceID:            first.SourceID,
+		ProjectID:           project.ID,
+		DatasetID:           "dataset_1",
+		Kind:                memory.KindPlanningOutcome,
+		Scope:               memory.ScopeDataset,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0.9, 0.2, 0.1},
+		EmbeddingText:       "class balancing and weighted sampling improved minority recall",
+		Metadata:            map[string]any{"mechanism": "class_balancing", "accepted_for_vector_memory": true},
+	})
+	if err != nil {
+		t.Fatalf("UpsertMemoryEmbedding() update error = %v", err)
+	}
+	if updated.ID != first.ID {
+		t.Fatalf("upsert should preserve ID for same source/model, got %q want %q", updated.ID, first.ID)
+	}
+	if second.ID == updated.ID {
+		t.Fatalf("distinct source should keep distinct ID")
+	}
+	_, err = store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		SourceTable:         memory.SourceAgentMemoryRecord,
+		SourceID:            "memory_3",
+		ProjectID:           project.ID,
+		DatasetID:           "dataset_1",
+		Kind:                memory.KindPlanningOutcome,
+		Scope:               memory.ScopeDataset,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0, 1, 0},
+		EmbeddingText:       "minority class balancing was attempted with low confidence",
+		Metadata:            map[string]any{"mechanism": "class_balancing", "accepted_for_vector_memory": true},
+	})
+	if err != nil {
+		t.Fatalf("UpsertMemoryEmbedding() competing vector error = %v", err)
+	}
+
+	results, err := store.SearchMemoryEmbeddings(memory.MemoryRetrievalQuery{
+		ProjectID:           project.ID,
+		DatasetID:           "dataset_1",
+		Text:                "minority class balancing",
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0.9, 0.2, 0.1},
+		Kinds:               []string{memory.KindPlanningOutcome},
+		Mechanisms:          []string{"class_balancing"},
+		Limit:               5,
+	})
+	if err != nil {
+		t.Fatalf("SearchMemoryEmbeddings() error = %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("SearchMemoryEmbeddings() returned %d results, want 2: %#v", len(results), results)
+	}
+	if results[0].SourceID != first.SourceID {
+		t.Fatalf("SearchMemoryEmbeddings() SourceID = %q, want %q", results[0].SourceID, first.SourceID)
+	}
+	if results[0].Score <= 0 || results[0].SemanticScore <= 0 || results[0].StructuredScore <= 0 {
+		t.Fatalf("expected positive retrieval scores, got %#v", results[0])
+	}
+	if !strings.Contains(results[0].RetrievalReason, "vector match") {
+		t.Fatalf("expected vector retrieval reason, got %q", results[0].RetrievalReason)
+	}
+
+	crossAgentResults, err := store.SearchMemoryEmbeddings(memory.MemoryRetrievalQuery{
+		ProjectID: project.ID,
+		AgentName: "experiment_planner",
+		Text:      "training dynamics plateau",
+		Kinds:     []string{memory.KindTrainingEvaluation},
+		Limit:     5,
+	})
+	if err != nil {
+		t.Fatalf("SearchMemoryEmbeddings() cross-agent error = %v", err)
+	}
+	if len(crossAgentResults) == 0 || crossAgentResults[0].SourceID != second.SourceID {
+		t.Fatalf("agent_name should describe requester, not filter source agent: %#v", crossAgentResults)
+	}
+}
+
+func TestMemoryStoreListUnembeddedMemorySources(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("source project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+
+	record, err := store.CreateAgentMemoryRecord(memory.AgentMemoryRecord{
+		ProjectID: project.ID,
+		DatasetID: "dataset_1",
+		AgentName: "experiment_planner",
+		Kind:      memory.KindPlanningOutcome,
+		Summary:   "Class balancing produced a useful follow-up.",
+		Payload: map[string]any{
+			"lesson":         "Class balancing helped minority classes.",
+			"mechanism":      "class_balancing",
+			"outcome_status": strategies.OutcomeImprovedChampion,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAgentMemoryRecord() error = %v", err)
+	}
+	scorecard, err := store.CreateStrategyScorecard(strategies.StrategyScorecardCreate{
+		ProjectID:    project.ID,
+		DatasetID:    "dataset_1",
+		Mechanism:    "resolution_crop",
+		Intervention: "increase image size with random resized crops",
+		Outcome:      strategies.OutcomeMinorImprovement,
+		Lesson:       "Resolution crop helped small objects.",
+	})
+	if err != nil {
+		t.Fatalf("CreateStrategyScorecard() error = %v", err)
+	}
+
+	sources, err := store.ListUnembeddedMemorySources(project.ID, 10)
+	if err != nil {
+		t.Fatalf("ListUnembeddedMemorySources() error = %v", err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("ListUnembeddedMemorySources() returned %d sources, want 2: %#v", len(sources), sources)
+	}
+
+	_, err = store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		SourceTable:         memory.SourceAgentMemoryRecord,
+		SourceID:            record.ID,
+		ProjectID:           project.ID,
+		DatasetID:           "dataset_1",
+		Kind:                memory.KindPlanningOutcome,
+		Scope:               memory.ScopeDataset,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0.1, 0.2, 0.3},
+		EmbeddingText:       "Class balancing helped minority classes.",
+	})
+	if err != nil {
+		t.Fatalf("UpsertMemoryEmbedding() error = %v", err)
+	}
+
+	sources, err = store.ListUnembeddedMemorySources(project.ID, 10)
+	if err != nil {
+		t.Fatalf("ListUnembeddedMemorySources() after embedding error = %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("ListUnembeddedMemorySources() returned %d sources, want 1: %#v", len(sources), sources)
+	}
+	if sources[0].SourceTable != memory.SourceStrategyScorecard || sources[0].SourceID != scorecard.ID {
+		t.Fatalf("remaining source = %s/%s, want scorecard %s", sources[0].SourceTable, sources[0].SourceID, scorecard.ID)
+	}
+}
+
+func TestMemoryStoreListUnembeddedMemorySourcesIncludesDatasetAndVisualCards(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("dataset source project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	dataset, err := store.CreateDataset(project.ID, "small object birds", "s3://bucket/not-indexed", "", 0)
+	if err != nil {
+		t.Fatalf("CreateDataset() error = %v", err)
+	}
+	dataset, err = store.UpdateDatasetProfile(dataset.ID, map[string]any{
+		"task_type":    "image_classification",
+		"class_count":  4,
+		"total_images": 120,
+		"metadata_summary": map[string]any{
+			"bbox_available": true,
+		},
+		"dataset_traits": []any{"small_objects", "fine_grained"},
+	})
+	if err != nil {
+		t.Fatalf("UpdateDatasetProfile() error = %v", err)
+	}
+	analysis, err := store.CreateDatasetVisualAnalysis(datasets.DatasetVisualAnalysis{
+		ProjectID:     project.ID,
+		DatasetID:     dataset.ID,
+		Confidence:    "high",
+		TriggerReason: datasets.VisualTriggerInitialProfile,
+		CoverageReport: datasets.VisualCoverageReport{
+			ImagesAnalyzed:     24,
+			ClassesTotal:       4,
+			ClassesCovered:     4,
+			ClassCoverageRatio: 1,
+		},
+		VisualTraits: []datasets.VisualTrait{{
+			Trait:      "object_scale",
+			Level:      "small",
+			Confidence: "high",
+			Evidence:   []string{"objects are small"},
+		}},
+		PreprocessingHypotheses: []datasets.PreprocessingHypothesis{{
+			ID:        "bbox_crop",
+			Mechanism: "bbox_crop_ablation",
+			Summary:   "Bounding-box crop may reduce background noise.",
+			Evidence:  []string{"objects are small"},
+			SuggestedPreprocessing: &plans.Preprocessing{
+				CropStrategy: "bbox_crop",
+				BBoxMode:     "use_if_available",
+			},
+			ExpectedEffect: "Improve object focus.",
+			Confidence:     "high",
+			SupportStatus:  "supported",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateDatasetVisualAnalysis() error = %v", err)
+	}
+
+	sources, err := store.ListUnembeddedMemorySources(project.ID, 10)
+	if err != nil {
+		t.Fatalf("ListUnembeddedMemorySources() error = %v", err)
+	}
+	found := map[string]memory.EmbeddableMemoryCard{}
+	for _, source := range sources {
+		found[memoryEmbeddingSourceKey(source.SourceTable, source.SourceID)] = source
+	}
+	for _, want := range []struct {
+		sourceTable string
+		sourceID    string
+	}{
+		{memory.SourceDatasetProfile, dataset.ID},
+		{memory.SourceDatasetVisualAnalysis, analysis.ID},
+		{memory.SourceDatasetPreprocessing, analysis.ID + "#bbox_crop"},
+	} {
+		if _, ok := found[memoryEmbeddingSourceKey(want.sourceTable, want.sourceID)]; !ok {
+			t.Fatalf("missing source %s/%s from %#v", want.sourceTable, want.sourceID, sources)
+		}
+	}
+
+	_, err = store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		SourceTable:         memory.SourceDatasetProfile,
+		SourceID:            dataset.ID,
+		ProjectID:           project.ID,
+		DatasetID:           dataset.ID,
+		Kind:                memory.KindDatasetProfile,
+		Scope:               memory.ScopeDataset,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{0.1, 0.2, 0.3},
+		EmbeddingText:       found[memoryEmbeddingSourceKey(memory.SourceDatasetProfile, dataset.ID)].Text,
+	})
+	if err != nil {
+		t.Fatalf("UpsertMemoryEmbedding() dataset error = %v", err)
+	}
+	sources, err = store.ListUnembeddedMemorySources(project.ID, 10)
+	if err != nil {
+		t.Fatalf("ListUnembeddedMemorySources() after dataset embedding error = %v", err)
+	}
+	for _, source := range sources {
+		if source.SourceTable == memory.SourceDatasetProfile && source.SourceID == dataset.ID {
+			t.Fatalf("embedded dataset profile source was returned: %#v", sources)
+		}
+	}
+}
+
+func TestPostgresVectorLiteralSafety(t *testing.T) {
+	literal, err := postgresVectorLiteral([]float32{0.25, -1, 3.5})
+	if err != nil {
+		t.Fatalf("postgresVectorLiteral() error = %v", err)
+	}
+	if literal != "[0.25,-1,3.5]" {
+		t.Fatalf("postgresVectorLiteral() = %q", literal)
+	}
+	parsed, err := parsePostgresVectorLiteral(literal)
+	if err != nil {
+		t.Fatalf("parsePostgresVectorLiteral() error = %v", err)
+	}
+	if !reflect.DeepEqual(parsed, []float32{0.25, -1, 3.5}) {
+		t.Fatalf("parsePostgresVectorLiteral() = %#v", parsed)
+	}
+	if _, err := postgresVectorLiteral([]float32{float32(math.NaN())}); err == nil {
+		t.Fatalf("postgresVectorLiteral() should reject NaN")
+	}
+	if _, err := parsePostgresVectorLiteral("[1,NaN]"); err == nil {
+		t.Fatalf("parsePostgresVectorLiteral() should reject NaN")
+	}
+}
+
+func TestVectorMemoryMigrationIsIdempotent(t *testing.T) {
+	sqlBytes, err := migrationFiles.ReadFile("migrations/005_vector_memory.sql")
+	if err != nil {
+		t.Fatalf("read vector memory migration: %v", err)
+	}
+	sqlText := string(sqlBytes)
+	for _, snippet := range []string{
+		"CREATE EXTENSION IF NOT EXISTS vector",
+		"CREATE SEQUENCE IF NOT EXISTS agent_memory_embedding_id_seq",
+		"CREATE TABLE IF NOT EXISTS agent_memory_embeddings",
+		"ALTER TABLE agent_memory_embeddings ADD COLUMN IF NOT EXISTS plan_id",
+		"CREATE INDEX IF NOT EXISTS idx_agent_memory_embeddings_project_kind_updated",
+		"UNIQUE (source_table, source_id, embedding_model)",
+	} {
+		if !strings.Contains(sqlText, snippet) {
+			t.Fatalf("migration missing idempotent snippet %q", snippet)
+		}
 	}
 }
 

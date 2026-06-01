@@ -69,6 +69,45 @@ func TestAutomationSettingsPersistAndReload(t *testing.T) {
 	}
 }
 
+func TestMemoryEmbeddingBackfillEndpointDisabledByDefault(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "false")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("memory demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := memoryStore.CreateAgentMemoryRecord(memory.AgentMemoryRecord{
+		ProjectID: project.ID,
+		AgentName: agents.ExperimentPlannerAgentName,
+		Kind:      memory.KindPlanningOutcome,
+		Summary:   "weighted loss improved the champion",
+		Payload: map[string]any{
+			"outcome":      "improved_champion",
+			"mechanism":    "class_imbalance",
+			"intervention": "weighted_loss",
+		},
+	}); err != nil {
+		t.Fatalf("create memory record: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/memory-embeddings/backfill", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var result memory.MemoryIndexResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode backfill response: %v", err)
+	}
+	if !result.Disabled || result.NoopReason == "" {
+		t.Fatalf("expected disabled no-op backfill response, got %#v", result)
+	}
+}
+
 func TestReportMetricRejectsNonPositiveEpoch(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")

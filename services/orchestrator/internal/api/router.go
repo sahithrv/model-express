@@ -50,6 +50,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/projects/:id/schedule-follow-up-experiments", server.scheduleFollowUpExperiments)
 	router.GET("/projects/:id/agent-decisions", server.listProjectAgentDecisions)
 	router.GET("/projects/:id/agent-memory", server.listProjectAgentMemoryRecords)
+	router.POST("/projects/:id/memory-embeddings/backfill", server.backfillProjectMemoryEmbeddings)
 	router.GET("/projects/:id/agent-invocations", server.listProjectAgentInvocations)
 	router.GET("/projects/:id/strategy-scorecards", server.listProjectStrategyScorecards)
 	router.GET("/projects/:id/worker-requirements", server.listProjectWorkerRequirements)

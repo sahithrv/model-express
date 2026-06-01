@@ -150,6 +150,20 @@ Strategy scorecards are now a structured outcome layer separate from raw memory.
 
 This lets future planner calls distinguish "valid JSON" from "actually improved the champion."
 
+### Vector Retrieval Memory
+
+The wrapper now has semantic retrieval for compact decision cards:
+
+- `agent_memory_embeddings` stores embeddings for safe cards, not raw prompts, raw LLM outputs, full invocation context, full epoch arrays, manifests, image URIs, or unbounded JSON.
+- The Planner can receive capped `retrieved_memory` cards in `planner_context_snapshot`.
+- The Training Monitor can receive capped `retrieved_run_memory` for analogous prior run dynamics.
+- Candidate ranking records `score_components["retrieved_memory"]` and `retrieved_memory_hits` when a retrieved card structurally matches a candidate.
+- Replay evals track retrieved card count, retrieval prompt bytes, source mix, selected-candidate memory score, and rejected-memory penalties.
+
+Retrieval is guarded by rollout flags: `MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED=false` by default, `MODEL_EXPRESS_MEMORY_RETRIEVAL_LOG_ONLY=true` by default, and `MODEL_EXPRESS_MEMORY_CROSS_PROJECT_ENABLED=false` by default. Retrieved memories are advisory context only; backend validation and candidate finalization still own what can be scheduled.
+
+Existing project memories can be indexed with `POST /projects/:id/memory-embeddings/backfill`. The endpoint returns a disabled no-op response unless memory embeddings are explicitly configured.
+
 ## Prompt Upgrades
 
 The planner prompt now requires:
@@ -256,7 +270,6 @@ Frontend display of these fields should be a later UI PR unless the owning front
 
 ## Follow-Up Work
 
-- Add semantic retrieval for strategy memory across similar datasets.
 - Add richer dataset profile fields through PR 1, then expose them to planner context.
 - Add holdout/test-split awareness to reduce validation-set overfitting.
 - Add candidate-level expected latency/model-size estimates from the model catalog.

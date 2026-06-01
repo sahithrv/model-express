@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -2255,6 +2257,356 @@ func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter mem
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord) (memory.MemoryEmbeddingRecord, error) {
+	normalized, err := normalizeMemoryEmbeddingRecord(record, time.Now().UTC())
+	if err != nil {
+		return memory.MemoryEmbeddingRecord{}, err
+	}
+	if err := s.requireProject(normalized.ProjectID); err != nil {
+		return memory.MemoryEmbeddingRecord{}, err
+	}
+	vectorText, err := postgresVectorLiteral(normalized.Embedding)
+	if err != nil {
+		return memory.MemoryEmbeddingRecord{}, err
+	}
+	summaryJSON, err := json.Marshal(emptyMapIfNil(normalized.SummaryCard))
+	if err != nil {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("marshal memory embedding summary_card: %w", err)
+	}
+	metadataJSON, err := json.Marshal(emptyMapIfNil(normalized.Metadata))
+	if err != nil {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("marshal memory embedding metadata: %w", err)
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO agent_memory_embeddings (
+			id, source_table, source_id, project_id, dataset_id, plan_id, job_id, invocation_id,
+			kind, scope, embedding_model, embedding_dimensions, embedding, embedding_text,
+			summary_card, metadata, quality_score, outcome_score
+		)
+		VALUES (
+			COALESCE(NULLIF($1, ''), 'memory_embedding_' || nextval('agent_memory_embedding_id_seq')),
+			$2, $3, $4, $5, $6, $7, $8,
+			$9, $10, $11, $12, $13::vector, $14,
+			$15, $16, $17, $18
+		)
+		ON CONFLICT (source_table, source_id, embedding_model) DO UPDATE SET
+			project_id = EXCLUDED.project_id,
+			dataset_id = EXCLUDED.dataset_id,
+			plan_id = EXCLUDED.plan_id,
+			job_id = EXCLUDED.job_id,
+			invocation_id = EXCLUDED.invocation_id,
+			kind = EXCLUDED.kind,
+			scope = EXCLUDED.scope,
+			embedding_dimensions = EXCLUDED.embedding_dimensions,
+			embedding = EXCLUDED.embedding,
+			embedding_text = EXCLUDED.embedding_text,
+			summary_card = EXCLUDED.summary_card,
+			metadata = EXCLUDED.metadata,
+			quality_score = EXCLUDED.quality_score,
+			outcome_score = EXCLUDED.outcome_score,
+			updated_at = now()
+		RETURNING %s
+	`, memoryEmbeddingSelectColumns())
+	return scanMemoryEmbeddingRecord(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		normalized.ID,
+		normalized.SourceTable,
+		normalized.SourceID,
+		normalized.ProjectID,
+		normalized.DatasetID,
+		normalized.PlanID,
+		normalized.JobID,
+		normalized.InvocationID,
+		normalized.Kind,
+		normalized.Scope,
+		normalized.EmbeddingModel,
+		normalized.EmbeddingDimensions,
+		vectorText,
+		normalized.EmbeddingText,
+		summaryJSON,
+		metadataJSON,
+		normalized.QualityScore,
+		normalized.OutcomeScore,
+	))
+}
+
+func (s *PostgresStore) SearchMemoryEmbeddings(query memory.MemoryRetrievalQuery) ([]memory.MemoryRetrievalResult, error) {
+	if strings.TrimSpace(query.ProjectID) == "" {
+		return nil, fmt.Errorf("%w: project_id is required", ErrInvalidRequest)
+	}
+	if err := s.requireProject(query.ProjectID); err != nil {
+		return nil, err
+	}
+	limit := memoryRetrievalLimit(query.Limit)
+	candidateLimit := memorySearchCandidateLimit(limit)
+	embeddingModel := strings.TrimSpace(query.EmbeddingModel)
+	embeddingDimensions := query.EmbeddingDimensions
+	if embeddingDimensions <= 0 && len(query.Embedding) > 0 {
+		embeddingDimensions = len(query.Embedding)
+	}
+	orderBy := "updated_at DESC"
+	args := []any{
+		query.CrossProjectOK,
+		query.ProjectID,
+		query.DatasetID,
+		candidateLimit,
+		embeddingModel,
+		embeddingDimensions,
+	}
+	if len(query.Embedding) > 0 {
+		vectorText, err := postgresVectorLiteral(query.Embedding)
+		if err != nil {
+			return nil, fmt.Errorf("format memory retrieval query vector: %w", err)
+		}
+		orderBy = "embedding <=> $7::vector ASC, updated_at DESC"
+		args = append(args, vectorText)
+	}
+	querySQL := fmt.Sprintf(`
+		SELECT %s
+		FROM agent_memory_embeddings
+		WHERE ($1 OR project_id = $2)
+			AND ($3 = '' OR $1 OR dataset_id = $3)
+			AND ($5 = '' OR embedding_model = $5)
+			AND ($6 = 0 OR embedding_dimensions = $6)
+		ORDER BY %s
+		LIMIT $4
+	`, memoryEmbeddingSelectColumns(), orderBy)
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		querySQL,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	candidates := []memoryRetrievalCandidate{}
+	for rows.Next() {
+		record, err := scanMemoryEmbeddingRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		if !memoryEmbeddingMatchesQuery(record, query) {
+			continue
+		}
+		semantic, structured, score, reason := scoreMemoryEmbedding(record, query)
+		candidates = append(candidates, memoryRetrievalCandidate{
+			result: memory.MemoryRetrievalResult{
+				SourceTable:     record.SourceTable,
+				SourceID:        record.SourceID,
+				ProjectID:       record.ProjectID,
+				DatasetID:       record.DatasetID,
+				Kind:            record.Kind,
+				Score:           score,
+				SemanticScore:   semantic,
+				StructuredScore: structured,
+				RetrievalReason: reason,
+				SummaryCard:     copyAnyMap(record.SummaryCard),
+				Metadata:        copyAnyMap(record.Metadata),
+			},
+			updatedAt: record.UpdatedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortMemoryRetrievalCandidates(candidates)
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]memory.MemoryRetrievalResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, candidate.result)
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) ListUnembeddedMemorySources(projectID string, limit int) ([]memory.EmbeddableMemoryCard, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	limit = unembeddedMemorySourceLimit(limit)
+	candidates := []embeddableMemorySourceCandidate{}
+	embedded, err := s.listEmbeddedMemorySourceKeys(projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	const memoryQuery = `
+		SELECT id, invocation_id, project_id, dataset_id, plan_id, job_id, agent_name, kind, summary, payload, tags, created_at
+		FROM agent_memory_records records
+		WHERE records.project_id = $1
+			AND NOT EXISTS (
+				SELECT 1
+				FROM agent_memory_embeddings embeddings
+				WHERE embeddings.project_id = records.project_id
+					AND embeddings.source_table = $2
+					AND embeddings.source_id = records.id
+			)
+		ORDER BY records.created_at DESC
+		LIMIT $3
+	`
+	memoryRows, err := s.db.QueryContext(context.Background(), memoryQuery, projectID, memory.SourceAgentMemoryRecord, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer memoryRows.Close()
+	for memoryRows.Next() {
+		record, err := scanAgentMemoryRecord(memoryRows)
+		if err != nil {
+			return nil, err
+		}
+		card, ok := memory.BuildAgentMemoryCard(record)
+		if !ok || !memoryCardShouldBeIndexed(card) {
+			continue
+		}
+		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: record.CreatedAt})
+	}
+	if err := memoryRows.Err(); err != nil {
+		return nil, err
+	}
+
+	scorecardQuery := fmt.Sprintf(`
+		SELECT %s
+		FROM strategy_scorecards scorecards
+		WHERE scorecards.project_id = $1
+			AND NOT EXISTS (
+				SELECT 1
+				FROM agent_memory_embeddings embeddings
+				WHERE embeddings.project_id = scorecards.project_id
+					AND embeddings.source_table = $2
+					AND embeddings.source_id = scorecards.id
+			)
+		ORDER BY scorecards.created_at DESC
+		LIMIT $3
+	`, strategyScorecardSelectColumns())
+	scorecardRows, err := s.db.QueryContext(context.Background(), scorecardQuery, projectID, memory.SourceStrategyScorecard, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer scorecardRows.Close()
+	for scorecardRows.Next() {
+		scorecard, err := scanStrategyScorecard(scorecardRows)
+		if err != nil {
+			return nil, err
+		}
+		card, ok := memory.BuildStrategyScorecardCard(scorecard)
+		if !ok || !memoryCardShouldBeIndexed(card) {
+			continue
+		}
+		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: scorecard.CreatedAt})
+	}
+	if err := scorecardRows.Err(); err != nil {
+		return nil, err
+	}
+
+	const datasetQuery = `
+		SELECT id, project_id, name, storage_uri, checksum_sha256, size_bytes, profile, status, created_at, profiled_at
+		FROM datasets
+		WHERE project_id = $1
+			AND status = $2
+		ORDER BY profiled_at DESC NULLS LAST, created_at DESC
+		LIMIT $3
+	`
+	datasetRows, err := s.db.QueryContext(context.Background(), datasetQuery, projectID, datasets.StatusProfiled, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer datasetRows.Close()
+	for datasetRows.Next() {
+		dataset, err := scanDataset(datasetRows)
+		if err != nil {
+			return nil, err
+		}
+		if embedded[memoryEmbeddingSourceKey(memory.SourceDatasetProfile, dataset.ID)] {
+			continue
+		}
+		card, ok := memory.BuildDatasetProfileCard(dataset)
+		if !ok || !memoryCardShouldBeIndexed(card) {
+			continue
+		}
+		createdAt := dataset.CreatedAt
+		if dataset.ProfiledAt != nil {
+			createdAt = *dataset.ProfiledAt
+		}
+		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: createdAt})
+	}
+	if err := datasetRows.Err(); err != nil {
+		return nil, err
+	}
+
+	visualAnalysisQuery := fmt.Sprintf(`
+		SELECT %s
+		FROM dataset_visual_analyses
+		WHERE project_id = $1
+			AND validation_status = $2
+		ORDER BY created_at DESC
+		LIMIT $3
+	`, datasetVisualAnalysisSelectColumns())
+	visualRows, err := s.db.QueryContext(context.Background(), visualAnalysisQuery, projectID, datasets.VisualValidationStatusAccepted, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer visualRows.Close()
+	for visualRows.Next() {
+		analysis, err := scanDatasetVisualAnalysis(visualRows)
+		if err != nil {
+			return nil, err
+		}
+		if !embedded[memoryEmbeddingSourceKey(memory.SourceDatasetVisualAnalysis, analysis.ID)] {
+			card, ok := memory.BuildDatasetVisualAnalysisCard(analysis)
+			if ok && memoryCardShouldBeIndexed(card) {
+				candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: analysis.CreatedAt})
+			}
+		}
+		for _, card := range memory.BuildDatasetPreprocessingHypothesisCards(analysis) {
+			if embedded[memoryEmbeddingSourceKey(card.SourceTable, card.SourceID)] || !memoryCardShouldBeIndexed(card) {
+				continue
+			}
+			candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: analysis.CreatedAt})
+		}
+	}
+	if err := visualRows.Err(); err != nil {
+		return nil, err
+	}
+
+	sortEmbeddableMemorySourceCandidates(candidates)
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]memory.EmbeddableMemoryCard, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, candidate.card)
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) listEmbeddedMemorySourceKeys(projectID string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(context.Background(), `
+		SELECT source_table, source_id
+		FROM agent_memory_embeddings
+		WHERE project_id = $1
+	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var sourceTable string
+		var sourceID string
+		if err := rows.Scan(&sourceTable, &sourceID); err != nil {
+			return nil, normalizeSQLError(err)
+		}
+		out[memoryEmbeddingSourceKey(sourceTable, sourceID)] = true
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) CreateStrategyScorecard(scorecard strategies.StrategyScorecardCreate) (strategies.StrategyScorecard, error) {
 	if err := s.requireProject(scorecard.ProjectID); err != nil {
 		return strategies.StrategyScorecard{}, err
@@ -3933,6 +4285,55 @@ func scanExecutionEvent(row rowScanner) (execution.ExecutionEvent, error) {
 	return event, nil
 }
 
+func scanMemoryEmbeddingRecord(row rowScanner) (memory.MemoryEmbeddingRecord, error) {
+	var record memory.MemoryEmbeddingRecord
+	var embeddingText string
+	var summaryJSON []byte
+	var metadataJSON []byte
+	if err := row.Scan(
+		&record.ID,
+		&record.SourceTable,
+		&record.SourceID,
+		&record.ProjectID,
+		&record.DatasetID,
+		&record.PlanID,
+		&record.JobID,
+		&record.InvocationID,
+		&record.Kind,
+		&record.Scope,
+		&record.EmbeddingModel,
+		&record.EmbeddingDimensions,
+		&embeddingText,
+		&record.EmbeddingText,
+		&summaryJSON,
+		&metadataJSON,
+		&record.QualityScore,
+		&record.OutcomeScore,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	); err != nil {
+		return memory.MemoryEmbeddingRecord{}, normalizeSQLError(err)
+	}
+	embedding, err := parsePostgresVectorLiteral(embeddingText)
+	if err != nil {
+		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("parse memory embedding vector: %w", err)
+	}
+	record.Embedding = embedding
+	record.SummaryCard = map[string]any{}
+	if len(summaryJSON) > 0 {
+		if err := json.Unmarshal(summaryJSON, &record.SummaryCard); err != nil {
+			return memory.MemoryEmbeddingRecord{}, fmt.Errorf("unmarshal memory embedding summary_card: %w", err)
+		}
+	}
+	record.Metadata = map[string]any{}
+	if len(metadataJSON) > 0 {
+		if err := json.Unmarshal(metadataJSON, &record.Metadata); err != nil {
+			return memory.MemoryEmbeddingRecord{}, fmt.Errorf("unmarshal memory embedding metadata: %w", err)
+		}
+	}
+	return record, nil
+}
+
 func scanAgentMemoryRecord(row rowScanner) (memory.AgentMemoryRecord, error) {
 	var record memory.AgentMemoryRecord
 	var payloadJSON []byte
@@ -4319,6 +4720,10 @@ func datasetMetadataImportSelectColumns() string {
 	return "id, dataset_id, project_id, status, import_version, dataset_checksum_sha256, parser_registry_version, source_kind, active, strict_mode, summary, agent_safe_summary, warnings, errors, created_at, completed_at"
 }
 
+func memoryEmbeddingSelectColumns() string {
+	return "id, source_table, source_id, project_id, dataset_id, plan_id, job_id, invocation_id, kind, scope, embedding_model, embedding_dimensions, embedding::text, embedding_text, summary_card, metadata, quality_score, outcome_score, created_at, updated_at"
+}
+
 func strategyScorecardSelectColumns() string {
 	return "id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id, strategy_type, planning_mode, mechanism, intervention, diagnosis_triggers, evidence_used, expected_effect, dataset_traits, objective_profile, proposed_changes, expected_delta, actual_delta, confidence_before, confidence_after, cost_usd, runtime_seconds, outcome, lesson, tags, created_at"
 }
@@ -4402,4 +4807,49 @@ func applyPostgresTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, upd
 func postgresConfigString(config map[string]any, key string) string {
 	value, _ := config[key].(string)
 	return value
+}
+
+func postgresVectorLiteral(values []float32) (string, error) {
+	if len(values) == 0 {
+		return "", fmt.Errorf("%w: embedding is required", ErrInvalidRequest)
+	}
+	var builder strings.Builder
+	builder.WriteByte('[')
+	for index, value := range values {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return "", fmt.Errorf("%w: embedding contains non-finite value", ErrInvalidRequest)
+		}
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(strconv.FormatFloat(float64(value), 'g', -1, 32))
+	}
+	builder.WriteByte(']')
+	return builder.String(), nil
+}
+
+func parsePostgresVectorLiteral(value string) ([]float32, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, fmt.Errorf("%w: vector text is empty", ErrInvalidRequest)
+	}
+	value = strings.TrimPrefix(value, "[")
+	value = strings.TrimSuffix(value, "]")
+	if strings.TrimSpace(value) == "" {
+		return nil, fmt.Errorf("%w: vector text is empty", ErrInvalidRequest)
+	}
+	parts := strings.Split(value, ",")
+	out := make([]float32, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		number, err := strconv.ParseFloat(part, 32)
+		if err != nil {
+			return nil, err
+		}
+		if math.IsNaN(number) || math.IsInf(number, 0) {
+			return nil, fmt.Errorf("%w: vector contains non-finite value", ErrInvalidRequest)
+		}
+		out = append(out, float32(number))
+	}
+	return out, nil
 }

@@ -140,7 +140,7 @@ Worker utility modules also include:
 - TorchScript demo inference helper that returns a ranked payload when a valid worker-owned artifact exists, or a deterministic pending/error payload when dependencies/artifacts are missing
 - champion job handlers for `export_champion`, `champion_demo_prediction`, and `generate_visual_exemplars`
 
-Arbitrary split-file parsing in workers remains deferred, but backend-normalized official splits from supported imports can now drive Modal training. Model routing, prompt caching, vector retrieval, and cross-project mechanism retrieval are also intentionally deferred.
+Arbitrary split-file parsing in workers remains deferred, but backend-normalized official splits from supported imports can now drive Modal training. Model routing and prompt caching are still intentionally deferred. Vector retrieval is implemented as compact decision memory behind rollout flags; cross-project retrieval remains disabled by default.
 
 ## Agent Flow
 
@@ -153,7 +153,7 @@ Experiment Planner reviews completed plans and can recommend:
 - `STOP_PROJECT`
 - `WAIT`
 
-Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional agent-safe normalized metadata summaries, optional visual evidence, objective context, deterministic diagnosis, project trajectory, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, validation feedback, and existing experiment signatures.
+Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional agent-safe normalized metadata summaries, optional visual evidence, objective context, deterministic diagnosis, project trajectory, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, retrieved memory cards when enabled, validation feedback, and existing experiment signatures.
 
 For `ADD_EXPERIMENTS`, the Planner must return `candidate_hypotheses` with mechanism, intervention, evidence, expected effect, expected metric impact, tradeoffs, risk/cost/novelty, proposed changes, and a complete executable experiment config. `FinalizePlannerRecommendation` then applies deterministic backend ranking and governor checks. If no candidate survives, the planner output is rejected rather than scheduled.
 
@@ -162,6 +162,8 @@ Planner decisions persist the `project_trajectory_card` alongside candidate rank
 Live/real-time objective handling treats latency as a budget and tiebreaker rather than a primary search driver. Latency below roughly 25ms is considered acceptable for live use, so the Planner and Training Monitor should prioritize macro-F1, per-class recall, and meaningful quality gains unless latency exceeds the budget or quality is otherwise close.
 
 Training Monitor input is also compacted into run-evaluation cards. The backend still stores full run summaries, evaluations, epoch metrics, plans, and job configs, but the LLM receives capped cards and prompt-budget telemetry.
+
+Vector retrieval indexes compact memory cards only: strategy scorecards, distilled planning/training memories, dataset profile fingerprints, accepted visual-analysis cards, and preprocessing hypotheses. New eligible writes trigger indexing when embeddings are configured, and existing project memories can be indexed through `POST /projects/:id/memory-embeddings/backfill`. It does not vectorize raw prompts, raw LLM outputs, full invocation contexts, full epoch arrays, full manifests, image URIs, or unbounded JSON payloads. Retrieval can inform planner/monitor context and deterministic ranking, but backend validation remains the execution gate.
 
 When AutoML trials exist, the Planner and Training Monitor receive compact `optimizer_feedback_summary` cards: trial counts, best score/job, best hyperparameters, train/validation gap, trend, failed-trial count/patterns, and bounded narrowing advice. Raw trial dumps are not included in default LLM context.
 
@@ -250,6 +252,7 @@ Implemented/current-scale hardening:
 - Deterministic replay evals under `services/orchestrator/internal/agents/evals` include the `plateau_backbone_lottery` fixture for the 20+ low-yield backbone/model-family failure mode.
 - AutoML is settings-gated, backend-validated, persisted with provenance, and linked to normal plan/job execution rather than owning scheduling.
 - Normalized dataset metadata imports are additive, active-import replacement is transactional in Postgres, and agent-safe summaries are separated from raw source previews.
+- Vector retrieval uses a separate `agent_memory_embeddings` table, pgvector in Postgres, in-memory lexical/vector fallback for tests, prompt-budget caps, log-only rollout mode by default, and deterministic replay eval telemetry.
 
 Known reliability gaps:
 
@@ -270,6 +273,6 @@ Known reliability gaps:
 - Real model reconstruction/export from completed training runs when no worker-visible artifact exists.
 - Heavier Bayesian/TPE/GP AutoML dependencies and richer multi-trial acquisition policies beyond the current lightweight adaptive sampler.
 - Durable idempotency keys, async agent task queue, and a standalone lease-recovery loop.
-- Semantic/vector planner memory, multi-agent planner debate, tree search/MCTS over plans, planner fine-tuning, and prompt caching.
+- Multi-agent planner debate, tree search/MCTS over plans, planner fine-tuning, and prompt caching.
 
 Do not add Kafka, Redis, NATS, WebSockets, or a workflow engine until Postgres hardening, leases, idempotency, and SSE are no longer sufficient.

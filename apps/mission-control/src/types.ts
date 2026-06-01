@@ -450,13 +450,99 @@ export type ChampionDemoPrediction = {
   metadata?: Record<string, unknown>;
 };
 
+export type RetrievedMemoryCard = {
+  source_table?: string;
+  source_id?: string;
+  project_id?: string;
+  dataset_id?: string;
+  plan_id?: string;
+  job_id?: string;
+  invocation_id?: string;
+  decision_id?: string;
+  source_decision_id?: string;
+  source_plan_id?: string;
+  followup_plan_id?: string;
+  kind?: string;
+  scope?: string;
+  outcome?: string;
+  outcome_status?: string;
+  mechanism?: string;
+  intervention?: string;
+  lesson?: string;
+  summary?: string;
+  compact_lesson?: string;
+  compact_summary?: string;
+  retrieval_reason?: string;
+  reason_for_retrieval?: string;
+  match_reason?: string;
+  score?: number;
+  semantic_score?: number;
+  structured_score?: number;
+  summary_card?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export type RetrievedMemoryPayload = {
+  retrieval_enabled?: boolean;
+  successful_strategy_cards?: RetrievedMemoryCard[];
+  failed_strategy_cards?: RetrievedMemoryCard[];
+  blocked_or_rejected_cards?: RetrievedMemoryCard[];
+  dataset_preprocessing_cards?: RetrievedMemoryCard[];
+  run_dynamics_cards?: RetrievedMemoryCard[];
+  cards?: RetrievedMemoryCard[];
+  items?: RetrievedMemoryCard[];
+  results?: RetrievedMemoryCard[];
+  hits?: RetrievedMemoryCard[];
+  caps?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export type CandidateRanking = {
+  candidate_index?: number;
+  hypothesis?: string;
+  planning_mode?: string;
+  mechanism?: string;
+  intervention?: string;
+  expected_effect?: string;
+  score?: number;
+  total_score?: number;
+  score_components?: Record<string, unknown>;
+  selected?: boolean;
+  rejected?: boolean;
+  reasons?: string[];
+  memory_reasons?: string[];
+  retrieved_memory_reasons?: string[];
+  retrieval_reasons?: string[];
+  retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
+  retrieved_memory_hits?: RetrievedMemoryCard[];
+  memory_retrieval_hits?: RetrievedMemoryCard[];
+  memory_hits?: RetrievedMemoryCard[];
+  memory_cards?: RetrievedMemoryCard[];
+  retrieved_cards?: RetrievedMemoryCard[];
+  experiment_signature?: string;
+  [key: string]: unknown;
+};
+
 export type AgentDecision = {
   id: string;
   project_id: string;
   plan_id?: string;
   decision_type: string;
   rationale: string;
-  payload: Record<string, unknown>;
+  payload: Record<string, unknown> & {
+    retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
+    retrieved_run_memory?: RetrievedMemoryCard[];
+    candidate_rankings?: CandidateRanking[];
+    planner_context_snapshot?: {
+      retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
+      [key: string]: unknown;
+    };
+    training_monitor_context_snapshot?: {
+      retrieved_run_memory?: RetrievedMemoryCard[];
+      [key: string]: unknown;
+    };
+  };
   created_at: string;
 };
 
@@ -542,7 +628,18 @@ export type AgentInvocation = {
   provider?: string;
   model?: string;
   input_messages?: Array<Record<string, string>>;
-  input_context?: Record<string, unknown>;
+  input_context?: Record<string, unknown> & {
+    retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
+    retrieved_run_memory?: RetrievedMemoryCard[];
+    planner_context_snapshot?: {
+      retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
+      [key: string]: unknown;
+    };
+    training_monitor_context_snapshot?: {
+      retrieved_run_memory?: RetrievedMemoryCard[];
+      [key: string]: unknown;
+    };
+  };
   raw_output?: string;
   parsed_output?: Record<string, unknown>;
   validation_status?: string;
