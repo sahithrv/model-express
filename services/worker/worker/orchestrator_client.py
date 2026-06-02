@@ -100,6 +100,17 @@ class OrchestratorClient:
         return response.json()
 
 
+    def list_project_worker_requirements(self, project_id: str) -> list[dict]:
+        response = requests.get(
+            f"{self.base_url}/projects/{project_id}/worker-requirements",
+            timeout=request_timeout_seconds(),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        requirements = payload.get("requirements") if isinstance(payload, dict) else None
+        return requirements if isinstance(requirements, list) else []
+
+
     def poll_job(
         self,
         worker_id: str,

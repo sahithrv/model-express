@@ -1,10 +1,60 @@
 from __future__ import annotations
 
 import os
+import sys
+import threading
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 from worker.diagnostics import log_event
 from worker.orchestrator_client import OrchestratorClient
+
+
+class ModalRetryableFailureReported(RuntimeError):
+    pass
+
+
+_MODAL_APP_SESSION_LOCK = threading.RLock()
+_MODAL_APP_SESSION_DEPTH = 0
+
+
+@contextmanager
+def modal_app_session():
+    """Keep the Modal app hydrated while dispatcher threads submit remote calls."""
+    global _MODAL_APP_SESSION_DEPTH
+
+    with _MODAL_APP_SESSION_LOCK:
+        if _MODAL_APP_SESSION_DEPTH > 0:
+            _MODAL_APP_SESSION_DEPTH += 1
+            nested = True
+        else:
+            nested = False
+
+    if nested:
+        try:
+            yield
+        finally:
+            with _MODAL_APP_SESSION_LOCK:
+                _MODAL_APP_SESSION_DEPTH -= 1
+        return
+
+    try:
+        from worker.training.modal_app import app
+    except ModuleNotFoundError as exc:
+        if exc.name == "modal":
+            raise RuntimeError(
+                "Modal is not installed. Install worker dependencies, then run `modal setup`."
+            ) from exc
+        raise
+
+    with _modal_app_run(app):
+        with _MODAL_APP_SESSION_LOCK:
+            _MODAL_APP_SESSION_DEPTH = 1
+        try:
+            yield
+        finally:
+            with _MODAL_APP_SESSION_LOCK:
+                _MODAL_APP_SESSION_DEPTH = 0
 
 
 def run_modal_training(client: OrchestratorClient, job: dict) -> None:
@@ -45,7 +95,7 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     )
 
     try:
-        with app.run():
+        with _modal_invocation_context(app):
             result = _remote_function(train_image_classifier)(payload)
     except Exception as exc:
         message = _modal_training_error_message(exc)
@@ -95,8 +145,21 @@ def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:
     }
 
     print(f"Submitting Modal dataset profile job dataset={dataset_id}")
-    with app.run():
-        result = _remote_function(profile_image_dataset)(payload)
+    try:
+        with _modal_invocation_context(app):
+            result = _remote_function(profile_image_dataset)(payload)
+    except Exception as exc:
+        message = _modal_dataset_profile_error_message(exc)
+        client.fail_job(job["id"], message, retryable=True)
+        log_event(
+            "warn",
+            "modal_dataset_profile_retry_queued",
+            job_id=job["id"],
+            project_id=job.get("project_id", ""),
+            error=message,
+        )
+        print(f"Modal dataset profile reported retryable failure for {job['id']}: {message}")
+        return
 
     profile = result.get("profile") if isinstance(result, dict) and isinstance(result.get("profile"), dict) else result
     if not isinstance(profile, dict):
@@ -138,8 +201,21 @@ def run_modal_dataset_materialization(client: OrchestratorClient, job: dict) -> 
     }
 
     print(f"Pre-warming Modal dataset materialization dataset={dataset_id}")
-    with app.run():
-        result = _remote_function(materialize_image_dataset)(payload)
+    try:
+        with _modal_invocation_context(app):
+            result = _remote_function(materialize_image_dataset)(payload)
+    except Exception as exc:
+        message = _modal_dataset_materialization_error_message(exc)
+        client.fail_job(job["id"], message, retryable=True)
+        log_event(
+            "warn",
+            "modal_dataset_materialization_retry_queued",
+            job_id=job["id"],
+            project_id=job.get("project_id", ""),
+            error=message,
+        )
+        print(f"Modal dataset materialization reported retryable failure for {job['id']}: {message}")
+        raise ModalRetryableFailureReported(message) from exc
     _log_dataset_materialization(job.get("id", ""), job.get("project_id", ""), result)
     return result
 
@@ -152,6 +228,69 @@ def _remote_function(function):
             "Install worker dependencies, then run `modal setup`."
         )
     return remote
+
+
+@contextmanager
+def _modal_invocation_context(app):
+    if _modal_app_session_active():
+        yield
+        return
+    with _modal_app_run(app):
+        yield
+
+
+@contextmanager
+def _modal_app_run(app):
+    run = getattr(app, "run", None)
+    if run is None:
+        raise RuntimeError(
+            "Modal is not installed or the Modal app was not initialized. "
+            "Install worker dependencies, then run `modal setup`."
+        )
+    with _modal_output_context():
+        with run():
+            yield
+
+
+@contextmanager
+def _modal_output_context():
+    _make_output_streams_unicode_safe()
+
+    try:
+        import modal
+    except Exception:
+        yield
+        return
+
+    enable_output = getattr(modal, "enable_output", None)
+    if not callable(enable_output):
+        yield
+        return
+
+    with enable_output():
+        yield
+
+
+def _make_output_streams_unicode_safe() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        errors = getattr(stream, "errors", None)
+        if encoding in {"utf-8", "utf8", "utf-8-sig"} or errors == "replace":
+            continue
+
+        try:
+            reconfigure(errors="replace")
+        except (OSError, TypeError, ValueError):
+            continue
+
+
+def _modal_app_session_active() -> bool:
+    with _MODAL_APP_SESSION_LOCK:
+        return _MODAL_APP_SESSION_DEPTH > 0
 
 
 def _require_remote_reachable_url(name: str, value: str) -> None:
@@ -172,6 +311,20 @@ def _modal_training_error_message(exc: Exception) -> str:
     if not message:
         message = exc.__class__.__name__
     return f"Modal training invocation failed before completion: {message}"[:2000]
+
+
+def _modal_dataset_profile_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        message = exc.__class__.__name__
+    return f"Modal dataset profile invocation failed before completion: {message}"[:2000]
+
+
+def _modal_dataset_materialization_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        message = exc.__class__.__name__
+    return f"Modal dataset materialization invocation failed before completion: {message}"[:2000]
 
 
 def _log_dataset_materialization(job_id: str, project_id: str, result: object) -> None:

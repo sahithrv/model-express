@@ -22,6 +22,11 @@ class ExportMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["class_labels"], ["cat", "dog"])
         self.assertEqual(metadata["class_count"], 2)
         self.assertEqual(metadata["artifact_uri"], "s3://bucket/model.pt")
+        contract = metadata["inference_contract"]
+        self.assertEqual(contract["schema_version"], "model_express_inference_contract_v1")
+        self.assertEqual(contract["input"]["model_tensor_shape"], [1, 3, 224, 224])
+        self.assertIn("preprocessing", contract)
+        self.assertIn("postprocessing", contract)
 
     def test_demo_prediction_payload_is_ranked_and_bounded(self) -> None:
         payload = build_demo_prediction_payload(

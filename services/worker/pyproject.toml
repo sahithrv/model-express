@@ -8,6 +8,8 @@ dependencies = [
   "mlflow",
   "modal",
   "numpy",
+  "onnx",
+  "onnxscript",
   "pillow",
   "pydantic",
   "requests",

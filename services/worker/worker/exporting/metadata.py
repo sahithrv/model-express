@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from typing import Iterable
 
+from worker.exporting.preprocessing import build_inference_contract
+
 
 def build_champion_export_metadata(
     *,
@@ -19,6 +21,10 @@ def build_champion_export_metadata(
     profile = model_profile if isinstance(model_profile, dict) else {}
     config = training_config if isinstance(training_config, dict) else {}
     preprocessing_config = preprocessing if isinstance(preprocessing, dict) else {}
+    inference_contract = build_inference_contract(
+        image_size=int(image_size),
+        preprocessing=preprocessing_config,
+    )
     return {
         "schema_version": "champion_export_metadata_v1",
         "model": str(model_name),
@@ -28,11 +34,13 @@ def build_champion_export_metadata(
         "class_labels": labels,
         "class_count": len(labels),
         "preprocessing": preprocessing_config,
+        "inference_contract": inference_contract,
         "training_config": config,
         "model_profile": profile,
         "limitations": [
             "Export metadata is worker-generated and must be accepted by backend validation before use.",
             "Live demo inference should use held-out or test images when available.",
+            "Production runtimes must apply the inference_contract preprocessing exactly before model inference.",
         ],
     }
 

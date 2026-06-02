@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from worker.champion_jobs import (
+    _build_torchvision_model,
+    _demo_image_path,
     _validated_exemplar_payload,
     run_champion_demo_prediction_job,
     run_export_champion_job,
@@ -72,6 +74,94 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(client.completed, ["job_export"])
             self.assertEqual(client.failed, [])
 
+    def test_onnx_export_does_not_relabel_checkpoint_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.pt"
+            source.write_bytes(b"checkpoint bytes")
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "onnx",
+                    "champion_job_id": "train_1",
+                    "artifact_uri": str(source),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 64,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(root / "exports")}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "PENDING_ARTIFACT")
+            self.assertEqual(result["format"], "onnx")
+            self.assertEqual(result["artifact_uri"], "")
+            self.assertIn("MODEL_UNAVAILABLE", result["error"])
+            self.assertFalse((root / "exports" / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
+            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.failed, [])
+
+    def test_onnx_export_converts_framework_checkpoint_when_available(self) -> None:
+        try:
+            import onnxscript  # noqa: F401
+            import torch
+        except Exception as exc:  # pragma: no cover - depends on optional local deps
+            raise unittest.SkipTest(f"ONNX export dependencies are unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model = _build_torchvision_model(
+                model_name="mobilenet_v3_small",
+                class_count=2,
+                pretrained=False,
+                freeze_backbone=True,
+                fine_tune_strategy="head_only",
+                dropout=0.0,
+            )
+            checkpoint = root / "source.pt"
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "metadata": {
+                        "model": "mobilenet_v3_small",
+                        "class_labels": ["cat", "dog"],
+                        "training_config": {
+                            "freeze_backbone": True,
+                            "fine_tune_strategy": "head_only",
+                            "dropout": 0.0,
+                        },
+                    },
+                },
+                checkpoint,
+            )
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "onnx",
+                    "champion_job_id": "train_1",
+                    "source_artifact_uri": str(checkpoint),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 32,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(root / "exports")}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "READY")
+            self.assertEqual(result["format"], "onnx")
+            self.assertTrue((root / "exports" / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
+            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.failed, [])
+
     def test_export_without_artifact_reports_pending_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client = FakeClient()
@@ -106,6 +196,21 @@ class ChampionJobTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "MANIFEST_NOT_CONFIGURED")
         self.assertEqual(client.completed, ["job_predict"])
         self.assertEqual(client.failed, [])
+
+    def test_demo_image_path_materializes_inline_data_uri(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_uri = (
+                "data:image/png;base64,"
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+            )
+
+            with patch.dict("os.environ", {"WORKER_DEMO_IMAGE_ROOT": str(Path(temp_dir) / "demo_images")}):
+                path, error = _demo_image_path({"image_uri": image_uri}, "job_inline")
+
+            self.assertEqual(error, "")
+            self.assertIsNotNone(path)
+            self.assertTrue(path.exists())
+            self.assertEqual(path.suffix, ".png")
 
     def test_dispatch_rejects_unknown_templates_instead_of_faking_success(self) -> None:
         client = FakeClient()

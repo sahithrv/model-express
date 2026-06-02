@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +40,99 @@ class ModalTrainingHelperTests(unittest.TestCase):
 
         self.assertEqual(calls[0]["timeout"], 240)
 
+    def test_modal_dataset_timeouts_are_configurable(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_EXPRESS_MODAL_MATERIALIZATION_TIMEOUT_SECONDS": "1800",
+                "MODEL_EXPRESS_MODAL_PROFILE_TIMEOUT_SECONDS": "7200",
+            },
+        ):
+            self.assertEqual(self.modal_app._modal_dataset_materialization_timeout_seconds(), 1800)
+            self.assertEqual(self.modal_app._modal_dataset_profile_timeout_seconds(), 7200)
+
+    def test_modal_training_warm_pool_knobs_are_configurable(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_EXPRESS_MODAL_TRAIN_MIN_CONTAINERS": "2",
+                "MODEL_EXPRESS_MODAL_TRAIN_BUFFER_CONTAINERS": "1",
+                "MODEL_EXPRESS_MODAL_TRAIN_SCALEDOWN_WINDOW_SECONDS": "900",
+            },
+        ):
+            self.assertEqual(self.modal_app._modal_training_min_containers(), 2)
+            self.assertEqual(self.modal_app._modal_training_buffer_containers(), 1)
+            self.assertEqual(self.modal_app._modal_training_scaledown_window_seconds(), 900)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_EXPRESS_MODAL_TRAIN_MIN_CONTAINERS": "0",
+                "MODEL_EXPRESS_MODAL_TRAIN_BUFFER_CONTAINERS": "0",
+                "MODEL_EXPRESS_MODAL_TRAIN_SCALEDOWN_WINDOW_SECONDS": "0",
+            },
+        ):
+            self.assertIsNone(self.modal_app._modal_training_min_containers())
+            self.assertIsNone(self.modal_app._modal_training_buffer_containers())
+            self.assertIsNone(self.modal_app._modal_training_scaledown_window_seconds())
+
+    def test_modal_storage_env_sets_torch_home_default(self) -> None:
+        payload = {
+            "s3_endpoint_url": "https://s3.test",
+            "aws_access_key_id": "key",
+            "aws_secret_access_key": "secret",
+            "aws_default_region": "us-east-1",
+        }
+        with patch.dict("os.environ", {}, clear=True):
+            self.modal_app._configure_storage_env(payload)
+
+            self.assertEqual(os.environ["TORCH_HOME"], str(self.modal_app.TORCH_CACHE_ROOT))
+
+    def test_modal_torch_cache_sync_commit_is_opt_in(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(self.modal_app._modal_sync_torch_cache_commit_enabled())
+
+        with patch.dict("os.environ", {"MODEL_EXPRESS_MODAL_SYNC_TORCH_CACHE_COMMIT": "true"}):
+            self.assertTrue(self.modal_app._modal_sync_torch_cache_commit_enabled())
+
+    def test_modal_dataloader_workers_are_configurable(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(self.modal_app._modal_dataloader_workers(True), 4)
+            self.assertEqual(self.modal_app._modal_dataloader_workers(False), 2)
+
+        with patch.dict("os.environ", {"MODEL_EXPRESS_MODAL_DATALOADER_WORKERS": "0"}):
+            self.assertEqual(self.modal_app._modal_dataloader_workers(True), 0)
+
+        with patch.dict("os.environ", {"MODEL_EXPRESS_MODAL_DATALOADER_WORKERS": "99"}):
+            self.assertEqual(self.modal_app._modal_dataloader_workers(True), 16)
+
+    def test_modal_training_dataset_cache_root_is_local_by_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                self.modal_app._modal_training_dataset_cache_root(),
+                Path("/tmp/model-express/training-datasets"),
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                "os.environ",
+                {"MODEL_EXPRESS_MODAL_TRAINING_DATASET_CACHE_ROOT": temp_dir},
+            ):
+                self.assertEqual(self.modal_app._modal_training_dataset_cache_root(), Path(temp_dir))
+
+    def test_modal_remote_paths_are_posix_for_image_builds(self) -> None:
+        self.assertEqual(str(self.modal_app.TORCH_CACHE_ROOT), "/cache/model-express/torch")
+        self.assertEqual(str(self.modal_app.DATASET_MATERIALIZATION_ROOT), "/cache/model-express/datasets")
+        self.assertNotIn("\\", str(self.modal_app.TORCH_CACHE_ROOT))
+        self.assertNotIn("\\", str(self.modal_app.DATASET_MATERIALIZATION_ROOT))
+
+        self.assertEqual(
+            str(self.modal_app._modal_remote_path_env("UNSET_MODAL_PATH", "\\cache\\custom")),
+            "/cache/custom",
+        )
+        with self.assertRaisesRegex(ValueError, "absolute POSIX path"):
+            self.modal_app._modal_remote_path_env("UNSET_MODAL_PATH", "cache/custom")
+
     def test_modal_training_failure_report_marks_retryable(self) -> None:
         calls = []
 
@@ -60,7 +154,53 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertTrue(calls[0]["payload"]["retryable"])
         self.assertIn("container exited unexpectedly", calls[0]["payload"]["error"])
 
-    def test_profile_image_dataset_uses_materialized_dataset_helper(self) -> None:
+    def test_upload_manifest_artifacts_uploads_onnx_external_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model = root / "model.onnx"
+            sidecar = root / "model.onnx.data"
+            model.write_bytes(b"onnx bytes")
+            sidecar.write_bytes(b"external tensor bytes")
+            uploads = []
+
+            def fake_upload(source: Path, destination: str) -> None:
+                uploads.append((Path(source).name, destination))
+
+            manifest = {
+                "metadata": {},
+                "artifacts": [
+                    {
+                        "format": "onnx",
+                        "status": "created",
+                        "path": str(model),
+                        "external_data": [
+                            {
+                                "path": "model.onnx.data",
+                                "artifact_path": str(sidecar),
+                                "bytes": sidecar.stat().st_size,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+            public_manifest, artifact_uris = self.modal_app._upload_manifest_artifacts(
+                manifest,
+                "s3://bucket/exports/job_1",
+                fake_upload,
+            )
+
+            self.assertEqual(
+                uploads,
+                [
+                    ("model.onnx", "s3://bucket/exports/job_1/model.onnx"),
+                    ("model.onnx.data", "s3://bucket/exports/job_1/model.onnx.data"),
+                ],
+            )
+            self.assertEqual(artifact_uris, [{"format": "onnx", "uri": "s3://bucket/exports/job_1/model.onnx"}])
+            self.assertEqual(public_manifest["artifacts"][0]["external_data"][0]["uri"], "s3://bucket/exports/job_1/model.onnx.data")
+
+    def test_profile_image_dataset_uses_ephemeral_materialized_dataset_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_dir = Path(temp_dir) / "dataset"
             (dataset_dir / "cat").mkdir(parents=True)
@@ -109,7 +249,8 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertEqual(calls[0]["dataset_id"], "dataset_1")
             self.assertEqual(calls[0]["storage_uri"], "s3://bucket/dataset.zip")
             self.assertEqual(calls[0]["checksum_sha256"], "d" * 64)
-            self.assertEqual(calls[0]["cache_root"], self.modal_app.DATASET_MATERIALIZATION_ROOT)
+            self.assertNotEqual(Path(calls[0]["cache_root"]), self.modal_app.DATASET_MATERIALIZATION_ROOT)
+            self.assertIn("model-express-profile-dataset_1-", str(calls[0]["cache_root"]))
             self.assertEqual(result["profile"]["profiled"], str(dataset_dir))
             self.assertTrue(result["dataset_materialization"]["dataset_materialization_cache_hit"])
 
@@ -363,6 +504,58 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertIsInstance(head[0], nn.Dropout)
         self.assertEqual(head[0].p, 0.25)
 
+    def test_early_stopping_waits_until_after_half_epochs_for_non_egregious_runs(self) -> None:
+        should_stop = self.modal_app._should_stop_training_early
+
+        self.assertFalse(
+            should_stop(
+                epoch=8,
+                epochs=30,
+                best_epoch=4,
+                early_stopping_patience=4,
+                best_accuracy=0.52,
+                best_macro_f1=0.41,
+                target_metric="macro_f1",
+            )
+        )
+        self.assertTrue(
+            should_stop(
+                epoch=16,
+                epochs=30,
+                best_epoch=10,
+                early_stopping_patience=4,
+                best_accuracy=0.52,
+                best_macro_f1=0.41,
+                target_metric="macro_f1",
+            )
+        )
+
+    def test_early_stopping_allows_egregious_target_metric_after_warmup(self) -> None:
+        should_stop = self.modal_app._should_stop_training_early
+
+        self.assertTrue(
+            should_stop(
+                epoch=8,
+                epochs=30,
+                best_epoch=4,
+                early_stopping_patience=4,
+                best_accuracy=0.65,
+                best_macro_f1=0.15,
+                target_metric="macro_f1",
+            )
+        )
+        self.assertFalse(
+            should_stop(
+                epoch=8,
+                epochs=30,
+                best_epoch=4,
+                early_stopping_patience=4,
+                best_accuracy=0.65,
+                best_macro_f1=0.15,
+                target_metric="accuracy",
+            )
+        )
+
     def test_effective_number_class_weights_are_normalized(self) -> None:
         try:
             import torch
@@ -434,6 +627,39 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertEqual(dataset.classes, ["cat", "dog"])
             self.assertTrue(all("/images/" in Path(path).as_posix() for path, _label in dataset.samples))
 
+    def test_load_image_data_scans_imagefolder_once_for_fallback(self) -> None:
+        try:
+            import torch  # noqa: F401
+            import torchvision  # noqa: F401
+        except Exception as exc:  # pragma: no cover - depends on optional training deps
+            raise unittest.SkipTest(f"training dependencies are unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            for class_name, color in (("cat", (255, 0, 0)), ("dog", (0, 0, 255))):
+                class_dir = dataset_dir / class_name
+                class_dir.mkdir()
+                for index in range(2):
+                    Image.new("RGB", (12, 12), color).save(class_dir / f"{index}.jpg")
+
+            with patch.object(
+                self.modal_app,
+                "_image_folder_dataset",
+                wraps=self.modal_app._image_folder_dataset,
+            ) as image_folder_dataset:
+                self.modal_app._load_image_data(
+                    dataset_dir,
+                    batch_size=2,
+                    image_size=32,
+                    augmentation={},
+                    class_balancing="none",
+                    sampling_strategy="none",
+                    preprocessing={"resize_strategy": "squash", "normalization": "none"},
+                    metadata_bundle={"manifest_records": [{"relative_path": "missing.jpg", "label": "cat"}]},
+                )
+
+            self.assertEqual(image_folder_dataset.call_count, 1)
+
     def test_metadata_bundle_dataset_overrides_folder_labels_and_splits(self) -> None:
         try:
             import torch  # noqa: F401
@@ -495,6 +721,35 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertEqual(execution_metadata["metadata_bundle"]["status"], "applied")
             self.assertEqual(execution_metadata["metadata_bundle"]["split_strategy"], "metadata_official")
             self.assertEqual(bbox_lookup["a_train_1.jpg"], (1, 2, 8, 9))
+
+    def test_metadata_bundle_page_merge_deduplicates_repeated_classes(self) -> None:
+        first_page = {
+            "classes": [
+                {"class_key": "cat_key", "class_name": "cat", "class_index": 0},
+                {"class_key": "dog_key", "class_name": "dog", "class_index": 1},
+            ],
+            "manifest_records": [
+                {"relative_path": "cat/one.jpg", "label_key": "cat_key", "split": "train"},
+            ],
+        }
+        second_page = {
+            "classes": [
+                {"class_key": "cat_key", "class_name": "cat", "class_index": 0},
+                {"class_key": "dog_key", "class_name": "dog", "class_index": 1},
+            ],
+            "manifest_records": [
+                {"relative_path": "dog/two.jpg", "label_key": "dog_key", "split": "test"},
+            ],
+        }
+
+        merged = self.modal_app._merge_metadata_bundle_pages(None, first_page)
+        merged = self.modal_app._merge_metadata_bundle_pages(merged, second_page)
+        class_names, label_lookup = self.modal_app._metadata_class_mapping(merged, merged["manifest_records"])
+
+        self.assertEqual(len(merged["classes"]), 2)
+        self.assertEqual(class_names, ["cat", "dog"])
+        self.assertEqual(label_lookup["cat_key"], 0)
+        self.assertEqual(label_lookup["dog_key"], 1)
 
     def test_metadata_bundle_resolves_paths_under_common_image_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

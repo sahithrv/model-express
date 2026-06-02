@@ -117,6 +117,38 @@ def test_heartbeat_worker_posts_to_worker_heartbeat(monkeypatch):
     assert calls[0]["url"] == "http://orchestrator.test/workers/worker_1/heartbeat"
 
 
+def test_list_project_worker_requirements_gets_project_requirements(monkeypatch):
+    calls = []
+
+    class RequirementsResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"requirements": [{"id": "worker_requirement_1", "target_count": 4}]}
+
+    def fake_get(url: str, *, params: dict | None = None, timeout: int | None = None):
+        calls.append({"url": url, "params": params, "timeout": timeout})
+        return RequirementsResponse()
+
+    monkeypatch.setenv("MODEL_EXPRESS_WORKER_REQUEST_TIMEOUT_SECONDS", "12")
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    result = client.list_project_worker_requirements("project_1")
+
+    assert result == [{"id": "worker_requirement_1", "target_count": 4}]
+    assert calls == [
+        {
+            "url": "http://orchestrator.test/projects/project_1/worker-requirements",
+            "params": None,
+            "timeout": 12,
+        }
+    ]
+
+
 def test_import_dataset_metadata_old_backend_fallback(monkeypatch):
     calls = []
 

@@ -5,7 +5,7 @@ import json
 import os
 import random
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 from worker.training.augmentation import (
@@ -28,16 +28,41 @@ except Exception:  # pragma: no cover - local helper tests can run without Modal
     modal = None
 
 
+def _modal_remote_path_env(name: str, default: str) -> PurePosixPath:
+    value = os.getenv(name, default).strip() or default
+    path = PurePosixPath(value.replace("\\", "/"))
+    if not path.is_absolute():
+        raise ValueError(f"{name} must be an absolute POSIX path for Modal, got {value!r}.")
+    if str(path) in {"/", "/root", "/tmp"}:
+        raise ValueError(f"{name} cannot be mounted at {path}.")
+    return path
+
+
 APP_NAME = "model-express-training"
 DEFAULT_GPU = os.getenv("MODAL_GPU_TYPE", "T4")
-DATASET_MATERIALIZATION_ROOT = Path(
-    os.getenv("MODEL_EXPRESS_MODAL_DATASET_CACHE_ROOT", "/cache/model-express/datasets")
+DATASET_MATERIALIZATION_ROOT = _modal_remote_path_env(
+    "MODEL_EXPRESS_MODAL_DATASET_CACHE_ROOT",
+    "/cache/model-express/datasets",
 )
 DATASET_VOLUME_NAME = os.getenv(
     "MODEL_EXPRESS_MODAL_DATASET_CACHE_VOLUME",
     "model-express-dataset-cache",
 )
+TORCH_CACHE_ROOT = _modal_remote_path_env(
+    "MODEL_EXPRESS_MODAL_TORCH_CACHE_ROOT",
+    "/cache/model-express/torch",
+)
+TORCH_CACHE_VOLUME_NAME = os.getenv(
+    "MODEL_EXPRESS_MODAL_TORCH_CACHE_VOLUME",
+    "model-express-torch-cache",
+)
 DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS = 300
+DEFAULT_MODAL_DATASET_MATERIALIZATION_TIMEOUT_SECONDS = 60 * 60
+DEFAULT_MODAL_DATASET_PROFILE_TIMEOUT_SECONDS = 60 * 60
+DEFAULT_MODAL_TRAINING_SCALEDOWN_WINDOW_SECONDS = 10 * 60
+DEFAULT_MODAL_METADATA_DATALOADER_WORKERS = 4
+DEFAULT_MODAL_IMAGEFOLDER_DATALOADER_WORKERS = 2
+DEFAULT_MODAL_TRAINING_DATASET_CACHE_ROOT = "/tmp/model-express/training-datasets"
 DEFAULT_METADATA_BUNDLE_PAGE_SIZE = 5000
 DEFAULT_METADATA_BUNDLE_MAX_RECORDS = 50_000
 METADATA_ENDPOINT_UNAVAILABLE_STATUS_CODES = {404, 405, 501}
@@ -81,6 +106,13 @@ if modal is not None:
     except Exception:  # pragma: no cover - depends on Modal runtime/account setup.
         dataset_volume = None
         dataset_volume_mounts = {}
+    try:
+        torch_cache_volume = modal.Volume.from_name(TORCH_CACHE_VOLUME_NAME, create_if_missing=True)
+        torch_cache_volume_mounts = {str(TORCH_CACHE_ROOT): torch_cache_volume}
+    except Exception:  # pragma: no cover - depends on Modal runtime/account setup.
+        torch_cache_volume = None
+        torch_cache_volume_mounts = {}
+    training_volume_mounts = dict(torch_cache_volume_mounts)
     image = (
         modal.Image.debian_slim(python_version="3.11")
         .apt_install("libglib2.0-0", "libgl1")
@@ -91,9 +123,11 @@ if modal is not None:
             "requests",
             "scikit-learn",
             "onnx",
+            "onnxscript",
             "torch",
             "torchvision",
         )
+        .env({"TORCH_HOME": str(TORCH_CACHE_ROOT)})
         .add_local_python_source("worker")
     )
     app = modal.App(APP_NAME)
@@ -101,6 +135,9 @@ else:
     image = None
     dataset_volume = None
     dataset_volume_mounts = {}
+    torch_cache_volume = None
+    torch_cache_volume_mounts = {}
+    training_volume_mounts = {}
 
     class _UnavailableModalApp:
         def function(self, *args, **kwargs):
@@ -110,6 +147,57 @@ else:
             return decorator
 
     app = _UnavailableModalApp()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _modal_dataset_materialization_timeout_seconds() -> int:
+    return _positive_int_env(
+        "MODEL_EXPRESS_MODAL_MATERIALIZATION_TIMEOUT_SECONDS",
+        DEFAULT_MODAL_DATASET_MATERIALIZATION_TIMEOUT_SECONDS,
+    )
+
+
+def _modal_dataset_profile_timeout_seconds() -> int:
+    return _positive_int_env(
+        "MODEL_EXPRESS_MODAL_PROFILE_TIMEOUT_SECONDS",
+        DEFAULT_MODAL_DATASET_PROFILE_TIMEOUT_SECONDS,
+    )
+
+
+def _optional_positive_int_env(name: str, default: int = 0) -> int | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default if default > 0 else None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default if default > 0 else None
+    return parsed if parsed > 0 else None
+
+
+def _modal_training_min_containers() -> int | None:
+    return _optional_positive_int_env("MODEL_EXPRESS_MODAL_TRAIN_MIN_CONTAINERS")
+
+
+def _modal_training_buffer_containers() -> int | None:
+    return _optional_positive_int_env("MODEL_EXPRESS_MODAL_TRAIN_BUFFER_CONTAINERS")
+
+
+def _modal_training_scaledown_window_seconds() -> int | None:
+    return _optional_positive_int_env(
+        "MODEL_EXPRESS_MODAL_TRAIN_SCALEDOWN_WINDOW_SECONDS",
+        DEFAULT_MODAL_TRAINING_SCALEDOWN_WINDOW_SECONDS,
+    )
 
 
 class _BBoxCropDataset:
@@ -140,8 +228,73 @@ class _BBoxCropDataset:
         return image, target
 
 
+class _TransformedImageFolderView:
+    def __init__(self, base_dataset, transform=None):
+        self.base_dataset = base_dataset
+        self.transform = transform
+        self.target_transform = getattr(base_dataset, "target_transform", None)
+        self.classes = getattr(base_dataset, "classes", [])
+        self.class_to_idx = getattr(base_dataset, "class_to_idx", {})
+        self.samples = getattr(base_dataset, "samples", [])
+        self.imgs = self.samples
+        self.targets = getattr(base_dataset, "targets", [])
+        self.loader = getattr(base_dataset, "loader", None)
 
-@app.function(image=image, gpu=DEFAULT_GPU, timeout=60 * 60, volumes=dataset_volume_mounts)
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        if callable(self.loader):
+            image = self.loader(path)
+        else:
+            image, target = self.base_dataset[index]
+        if self.transform is not None:
+            image = self.transform(image)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        return image, target
+
+
+class _DatasetRelativePathResolver:
+    def __init__(self, dataset_dir: Path):
+        from worker.datasets.metadata_discovery import is_safe_relative_path
+
+        self.dataset_dir = dataset_dir
+        self.dataset_root = dataset_dir.resolve(strict=True)
+        self.image_root_prefixes = _metadata_image_root_prefixes(dataset_dir)
+        self.is_safe_relative_path = is_safe_relative_path
+
+    def resolve(self, relative_path: str) -> Path | None:
+        if not self.is_safe_relative_path(relative_path):
+            return None
+        candidate_paths = [relative_path]
+        for image_root in self.image_root_prefixes:
+            candidate_paths.append(f"{image_root}/{relative_path}")
+        for candidate_path in candidate_paths:
+            if not self.is_safe_relative_path(candidate_path):
+                continue
+            candidate = self.dataset_dir.joinpath(*candidate_path.split("/"))
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(self.dataset_root)
+            except (OSError, ValueError):
+                continue
+            if resolved.is_file():
+                return resolved
+        return None
+
+
+
+@app.function(
+    image=image,
+    gpu=DEFAULT_GPU,
+    timeout=60 * 60,
+    volumes=training_volume_mounts,
+    min_containers=_modal_training_min_containers(),
+    buffer_containers=_modal_training_buffer_containers(),
+    scaledown_window=_modal_training_scaledown_window_seconds(),
+)
 def train_image_classifier(payload: dict) -> dict:
     try:
         return _train_image_classifier_impl(payload)
@@ -201,18 +354,48 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     gpu_type = str(config.get("gpu_type") or os.getenv("MODAL_GPU_TYPE", "T4"))
     modal_function_call_id, modal_input_id = _modal_identifiers()
 
-    _reload_modal_dataset_volume()
+    _modal_training_phase(job_id, "storage_configured", started_at)
+    _modal_training_phase(job_id, "torch_cache_reload_start", started_at)
+    _reload_modal_torch_cache_volume()
+    _modal_training_phase(job_id, "torch_cache_reload_done", started_at)
+    dataset_cache_root = _modal_training_dataset_cache_root()
+    _modal_training_phase(
+        job_id,
+        "dataset_local_materialization_start",
+        started_at,
+        dataset_id=dataset_id,
+        cache_root=dataset_cache_root,
+    )
     materialized = ensure_dataset_materialized(
         dataset_id=dataset_id,
         storage_uri=dataset["storage_uri"],
         checksum_sha256=_dataset_checksum(dataset, config),
-        cache_root=DATASET_MATERIALIZATION_ROOT,
+        cache_root=dataset_cache_root,
     )
-    _commit_modal_dataset_volume()
+    _modal_training_phase(
+        job_id,
+        "dataset_local_materialization_done",
+        started_at,
+        status=materialized.telemetry.get("dataset_materialization_status"),
+        cache_hit=materialized.telemetry.get("dataset_materialization_cache_hit"),
+        bytes_downloaded=materialized.telemetry.get("dataset_materialization_bytes_downloaded"),
+    )
     dataset_dir = materialized.dataset_dir
-    dataset_materialization = materialized.telemetry
+    dataset_materialization = {
+        **materialized.telemetry,
+        "dataset_training_cache": "local",
+        "dataset_training_cache_root": str(dataset_cache_root),
+    }
+    _modal_training_phase(job_id, "metadata_fetch_start", started_at)
     metadata_bundle = _fetch_training_metadata_bundle(orchestrator_url, dataset_id, config)
+    _modal_training_phase(
+        job_id,
+        "metadata_fetch_done",
+        started_at,
+        records=len(_metadata_manifest_records(metadata_bundle)),
+    )
 
+    _modal_training_phase(job_id, "data_load_start", started_at)
     train_loader, val_loader, test_loader, class_names, class_weights, execution_metadata = _load_image_data(
         dataset_dir,
         batch_size,
@@ -224,13 +407,34 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         class_balancing_config,
         metadata_bundle=metadata_bundle,
     )
+    _modal_training_phase(
+        job_id,
+        "data_load_done",
+        started_at,
+        classes=len(class_names),
+        train_examples=len(train_loader.dataset),
+        val_examples=len(val_loader.dataset),
+        test_examples=len(test_loader.dataset),
+        metadata_status=execution_metadata.get("metadata_bundle", {}).get("status"),
+        split_strategy=execution_metadata.get("metadata_bundle", {}).get("split_strategy"),
+        loader_workers=execution_metadata.get("dataloader", {}).get("workers"),
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _modal_training_phase(job_id, "model_build_start", started_at, model=model_name, pretrained=pretrained, device=str(device))
     model = _build_model(model_name, len(class_names), pretrained, freeze_backbone, fine_tune_strategy, dropout).to(device)
+    _modal_training_phase(job_id, "model_build_done", started_at, model=model_name, device=str(device))
+    if pretrained and _modal_sync_torch_cache_commit_enabled():
+        _modal_training_phase(job_id, "torch_cache_commit_start", started_at)
+        _commit_modal_torch_cache_volume()
+        _modal_training_phase(job_id, "torch_cache_commit_done", started_at)
+    elif pretrained:
+        _modal_training_phase(job_id, "torch_cache_commit_deferred", started_at)
 
     criterion = _build_criterion(class_weights, class_balancing, device, label_smoothing, class_balancing_config)
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = _build_optimizer(optimizer_name, trainable_parameters, learning_rate, weight_decay, optimizer_momentum)
     scheduler = _build_scheduler(scheduler_name, optimizer, epochs, scheduler_step_size, scheduler_gamma)
+    _modal_training_phase(job_id, "optimizer_ready", started_at, trainable_parameters=len(trainable_parameters))
 
     best_macro_f1 = 0.0
     best_accuracy = 0.0
@@ -239,6 +443,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     final_eval_details = {"confusion_matrix": [], "per_class_metrics": {}}
 
     for epoch in range(1, epochs + 1):
+        _modal_training_phase(job_id, "epoch_train_start", started_at, epoch=epoch, epochs=epochs)
         train_loss = _train_one_epoch(
             model,
             train_loader,
@@ -248,8 +453,26 @@ def _train_image_classifier_impl(payload: dict) -> dict:
             augmentation,
             len(class_names),
             gradient_clip_norm,
+            on_first_batch=lambda batch_size, current_epoch=epoch: _modal_training_phase(
+                job_id,
+                "epoch_train_first_batch",
+                started_at,
+                epoch=current_epoch,
+                batch_size=batch_size,
+            ),
         )
+        _modal_training_phase(job_id, "epoch_train_done", started_at, epoch=epoch, train_loss=round(train_loss, 6))
+        _modal_training_phase(job_id, "epoch_eval_start", started_at, epoch=epoch)
         val_loss, accuracy, macro_f1, final_eval_details = _evaluate(model, val_loader, criterion, device, class_names)
+        _modal_training_phase(
+            job_id,
+            "epoch_eval_done",
+            started_at,
+            epoch=epoch,
+            val_loss=round(val_loss, 6),
+            accuracy=round(accuracy, 6),
+            macro_f1=round(macro_f1, 6),
+        )
         improved = macro_f1 > best_macro_f1
         if improved:
             best_epoch = epoch
@@ -304,7 +527,15 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "dataset_materialization": dataset_materialization,
             },
         )
-        if early_stopping_patience > 0 and epoch - best_epoch >= early_stopping_patience:
+        if _should_stop_training_early(
+            epoch=epoch,
+            epochs=epochs,
+            best_epoch=best_epoch,
+            early_stopping_patience=early_stopping_patience,
+            best_accuracy=best_accuracy,
+            best_macro_f1=best_macro_f1,
+            target_metric=str(config.get("target_metric", "macro_f1")),
+        ):
             break
 
     runtime_seconds = time.time() - started_at
@@ -340,14 +571,25 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         dataset=dataset,
         job_id=job_id,
     )
+    model_latency_ms = float(model_profile.get("estimated_latency_ms") or 0)
+    preprocessing_latency_ms = float(export_bundle.get("preprocessing_latency_ms") or 0)
+    pipeline_latency_ms = model_latency_ms + preprocessing_latency_ms if model_latency_ms or preprocessing_latency_ms else 0.0
     model_profile = {
         **model_profile,
+        "estimated_model_latency_ms": round(model_latency_ms, 3),
+        "estimated_preprocessing_latency_ms": round(preprocessing_latency_ms, 3),
+        "estimated_pipeline_latency_ms": round(pipeline_latency_ms, 3),
+        "estimated_latency_ms": round(pipeline_latency_ms or model_latency_ms, 3),
+        "estimated_throughput_images_per_second": round(
+            1000.0 / max(pipeline_latency_ms or model_latency_ms, 1.0),
+            3,
+        ),
         "class_labels": class_names,
         "input_shape": [1, 3, image_size, image_size],
         "preprocessing": preprocessing,
         "export_status": export_bundle.get("status", ""),
         "artifact_uri": export_bundle.get("artifact_uri", ""),
-        "onnx_artifact_uri": export_bundle.get("artifact_uri", "") if export_bundle.get("format") == "onnx" else "",
+        "onnx_artifact_uri": export_bundle.get("onnx_artifact_uri", ""),
         "export_manifest_uri": export_bundle.get("manifest_uri", ""),
         "export_manifest": export_bundle.get("manifest", {}),
         "export_validation_errors": export_bundle.get("validation_errors", []),
@@ -455,7 +697,11 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     }
 
 
-@app.function(image=image, timeout=60 * 20, volumes=dataset_volume_mounts)
+@app.function(
+    image=image,
+    timeout=_modal_dataset_materialization_timeout_seconds(),
+    volumes=dataset_volume_mounts,
+)
 def materialize_image_dataset(payload: dict) -> dict:
     from worker.datasets.cache import ensure_dataset_materialized
 
@@ -480,7 +726,10 @@ def materialize_image_dataset(payload: dict) -> dict:
     }
 
 
-@app.function(image=image, timeout=60 * 20, volumes=dataset_volume_mounts)
+@app.function(
+    image=image,
+    timeout=_modal_dataset_profile_timeout_seconds(),
+)
 def profile_image_dataset(payload: dict) -> dict:
     from worker.datasets.cache import ensure_dataset_materialized
     from worker.datasets.metadata_discovery import build_metadata_import_payload
@@ -492,20 +741,19 @@ def profile_image_dataset(payload: dict) -> dict:
     dataset_id = dataset["id"]
     job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
     config = job.get("config") if isinstance(job.get("config"), dict) else {}
-    _reload_modal_dataset_volume()
-    materialized = ensure_dataset_materialized(
-        dataset_id=dataset_id,
-        storage_uri=dataset["storage_uri"],
-        checksum_sha256=_dataset_checksum(dataset, config),
-        cache_root=DATASET_MATERIALIZATION_ROOT,
-    )
-    _commit_modal_dataset_volume()
-    dataset_dir = materialized.dataset_dir
-    return {
-        "profile": profile_image_folder(dataset_dir),
-        "metadata_import": build_metadata_import_payload(dataset_dir),
-        "dataset_materialization": materialized.telemetry,
-    }
+    with tempfile.TemporaryDirectory(prefix=f"model-express-profile-{dataset_id}-") as cache_root:
+        materialized = ensure_dataset_materialized(
+            dataset_id=dataset_id,
+            storage_uri=dataset["storage_uri"],
+            checksum_sha256=_dataset_checksum(dataset, config),
+            cache_root=cache_root,
+        )
+        dataset_dir = materialized.dataset_dir
+        return {
+            "profile": profile_image_folder(dataset_dir),
+            "metadata_import": build_metadata_import_payload(dataset_dir),
+            "dataset_materialization": materialized.telemetry,
+        }
 
 
 def _configure_storage_env(payload: dict) -> None:
@@ -513,6 +761,7 @@ def _configure_storage_env(payload: dict) -> None:
     os.environ["AWS_ACCESS_KEY_ID"] = payload["aws_access_key_id"]
     os.environ["AWS_SECRET_ACCESS_KEY"] = payload["aws_secret_access_key"]
     os.environ["AWS_DEFAULT_REGION"] = payload["aws_default_region"]
+    os.environ.setdefault("TORCH_HOME", str(TORCH_CACHE_ROOT))
 
 
 def _dataset_checksum(dataset: dict, config: dict | None = None) -> str:
@@ -553,6 +802,49 @@ def _commit_modal_dataset_volume() -> None:
     commit = getattr(dataset_volume, "commit", None)
     if callable(commit):
         commit()
+
+
+def _reload_modal_torch_cache_volume() -> None:
+    reload = getattr(torch_cache_volume, "reload", None)
+    if callable(reload):
+        reload()
+
+
+def _commit_modal_torch_cache_volume() -> None:
+    commit = getattr(torch_cache_volume, "commit", None)
+    if callable(commit):
+        commit()
+
+
+def _modal_sync_torch_cache_commit_enabled() -> bool:
+    return _bool(os.getenv("MODEL_EXPRESS_MODAL_SYNC_TORCH_CACHE_COMMIT"), default=False)
+
+
+def _modal_training_dataset_cache_root() -> Path:
+    return Path(
+        os.getenv(
+            "MODEL_EXPRESS_MODAL_TRAINING_DATASET_CACHE_ROOT",
+            DEFAULT_MODAL_TRAINING_DATASET_CACHE_ROOT,
+        )
+    )
+
+
+def _modal_training_phase(job_id: str, phase: str, started_at: float, **fields: object) -> None:
+    import time
+
+    elapsed = max(0.0, time.time() - started_at)
+    field_text = " ".join(
+        f"{key}={_modal_training_phase_value(value)}"
+        for key, value in fields.items()
+        if value is not None
+    )
+    suffix = f" {field_text}" if field_text else ""
+    print(f"Modal training {job_id} phase={phase} elapsed={elapsed:.2f}s{suffix}", flush=True)
+
+
+def _modal_training_phase_value(value: object) -> str:
+    text = str(value)
+    return text.replace("\n", " ").replace("\r", " ")[:120]
 
 
 class _MetadataBundleImageDataset:
@@ -659,7 +951,9 @@ def _load_image_data(
         preprocessing = {**preprocessing, "normalization_metadata": normalization_metadata}
     train_transform = _image_transform(image_size, augmentation, preprocessing, training=True)
     val_transform = _image_transform(image_size, {}, preprocessing, training=False)
-    metadata_spec = _metadata_bundle_dataset_spec(dataset_dir, metadata_bundle)
+    metadata_bundle_payload = _coerce_metadata_bundle(metadata_bundle)
+    path_resolver = _DatasetRelativePathResolver(dataset_dir) if metadata_bundle_payload else None
+    metadata_spec = _metadata_bundle_dataset_spec(dataset_dir, metadata_bundle, path_resolver=path_resolver)
     crop_strategy = str(preprocessing.get("crop_strategy", "")).lower()
     bbox_mode = str(preprocessing.get("bbox_mode", "")).lower()
     requested_bbox_crop = bbox_crop_requested(preprocessing)
@@ -679,7 +973,11 @@ def _load_image_data(
     if requested_bbox_crop:
         bbox_source = "legacy_sidecar"
         if metadata_spec is not None:
-            bbox_lookup = _bbox_lookup_from_metadata_bundle(metadata_bundle or {}, dataset_dir)
+            bbox_lookup = _bbox_lookup_from_metadata_bundle(
+                metadata_bundle or {},
+                dataset_dir,
+                path_resolver=path_resolver,
+            )
             if bbox_lookup:
                 bbox_source = "metadata_bundle"
         if not bbox_lookup:
@@ -741,9 +1039,9 @@ def _load_image_data(
         val_dataset = _MetadataBundleImageDataset(metadata_spec, transform=val_transform)
         full_image_val_dataset = _MetadataBundleImageDataset(metadata_spec, transform=val_transform)
     else:
-        train_dataset = _image_folder_dataset(datasets, dataset_dir, transform=train_transform)
-        val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
-        full_image_val_dataset = _image_folder_dataset(datasets, dataset_dir, transform=val_transform)
+        train_dataset = _TransformedImageFolderView(base_dataset, transform=train_transform)
+        val_dataset = _TransformedImageFolderView(base_dataset, transform=val_transform)
+        full_image_val_dataset = _TransformedImageFolderView(base_dataset, transform=val_transform)
     if bbox_lookup:
         train_dataset = _BBoxCropDataset(train_dataset, bbox_lookup, required=bbox_required)
         val_dataset = _BBoxCropDataset(val_dataset, bbox_lookup, required=bbox_required)
@@ -762,22 +1060,34 @@ def _load_image_data(
         weights = [float(1.0 / counts[int(base_dataset.targets[index])]) for index in train_indices]
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
-    loader_workers = 0 if uses_metadata_aware_dataset else 2
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=sampler is None, sampler=sampler, num_workers=loader_workers)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=loader_workers)
-    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=loader_workers)
+    loader_workers = _modal_dataloader_workers(uses_metadata_aware_dataset)
+    loader_kwargs = _dataloader_kwargs(loader_workers)
+    execution_metadata["dataloader"] = {
+        "workers": loader_workers,
+        "pin_memory": bool(loader_kwargs.get("pin_memory")),
+        "prefetch_factor": loader_kwargs.get("prefetch_factor"),
+    }
+    train_loader = DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, **loader_kwargs)
     if bbox_lookup and compare_bbox_crop:
         execution_metadata["_full_image_val_loader"] = DataLoader(
             full_image_val_data,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=loader_workers,
+            **loader_kwargs,
         )
         execution_metadata["_full_image_test_loader"] = DataLoader(
             full_image_test_data,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=loader_workers,
+            **loader_kwargs,
         )
     class_weights = _class_weights(
         base_dataset.targets,
@@ -791,6 +1101,42 @@ def _load_image_data(
 
 def _augmentation_from_policy(augmentation: dict, policy: str) -> dict:
     return normalize_augmentation_config(augmentation, policy)
+
+
+def _modal_dataloader_workers(uses_metadata_aware_dataset: bool) -> int:
+    default = (
+        DEFAULT_MODAL_METADATA_DATALOADER_WORKERS
+        if uses_metadata_aware_dataset
+        else DEFAULT_MODAL_IMAGEFOLDER_DATALOADER_WORKERS
+    )
+    return _bounded_non_negative_int_env("MODEL_EXPRESS_MODAL_DATALOADER_WORKERS", default, maximum=16)
+
+
+def _dataloader_kwargs(loader_workers: int) -> dict:
+    kwargs = {
+        "num_workers": loader_workers,
+        "pin_memory": _bool(os.getenv("MODEL_EXPRESS_MODAL_DATALOADER_PIN_MEMORY"), default=True),
+    }
+    if loader_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = _bounded_int(
+            os.getenv("MODEL_EXPRESS_MODAL_DATALOADER_PREFETCH_FACTOR"),
+            default=2,
+            minimum=1,
+            maximum=8,
+        )
+    return kwargs
+
+
+def _bounded_non_negative_int_env(name: str, default: int, maximum: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(0, min(maximum, parsed))
 
 
 def _image_folder_dataset(datasets, dataset_dir: Path, transform=None):
@@ -865,7 +1211,12 @@ def _single_wrapper_dir(dataset_dir: Path) -> Path | None:
     return None
 
 
-def _metadata_bundle_dataset_spec(dataset_dir: Path, metadata_bundle: dict | None) -> dict | None:
+def _metadata_bundle_dataset_spec(
+    dataset_dir: Path,
+    metadata_bundle: dict | None,
+    *,
+    path_resolver: _DatasetRelativePathResolver | None = None,
+) -> dict | None:
     bundle = _coerce_metadata_bundle(metadata_bundle)
     if not bundle:
         return None
@@ -881,6 +1232,7 @@ def _metadata_bundle_dataset_spec(dataset_dir: Path, metadata_bundle: dict | Non
     splits: list[str] = []
     accepted_records: list[dict] = []
     skipped_records = 0
+    resolver = path_resolver or _DatasetRelativePathResolver(dataset_dir)
     for record in records:
         if not isinstance(record, dict):
             skipped_records += 1
@@ -889,7 +1241,7 @@ def _metadata_bundle_dataset_spec(dataset_dir: Path, metadata_bundle: dict | Non
         if not relative_path:
             skipped_records += 1
             continue
-        image_path = _resolve_dataset_relative_file(dataset_dir, relative_path)
+        image_path = resolver.resolve(relative_path)
         if image_path is None:
             skipped_records += 1
             continue
@@ -983,6 +1335,21 @@ def _merge_metadata_bundle_pages(merged: dict | None, page: dict) -> dict:
         if isinstance(value, list):
             merged.setdefault(key, [])
             if isinstance(merged[key], list):
+                if key == "classes":
+                    seen = {
+                        identity
+                        for item in merged[key]
+                        for identity in [_metadata_class_identity(item)]
+                        if identity
+                    }
+                    for item in value:
+                        identity = _metadata_class_identity(item)
+                        if identity and identity in seen:
+                            continue
+                        merged[key].append(item)
+                        if identity:
+                            seen.add(identity)
+                    continue
                 merged[key].extend(value)
         elif key not in merged:
             merged[key] = value
@@ -1010,6 +1377,7 @@ def _metadata_bundle_has_more(page_payload: object, page_bundle: dict, record_co
 
 def _metadata_class_mapping(bundle: dict, records: list) -> tuple[list[str], dict[str, int]]:
     classes = []
+    seen_classes = set()
     for item in _metadata_classes(bundle):
         if not isinstance(item, dict):
             continue
@@ -1017,6 +1385,11 @@ def _metadata_class_mapping(bundle: dict, records: list) -> tuple[list[str], dic
         if not name:
             continue
         class_index = _optional_int(item.get("class_index"))
+        identity = _metadata_class_identity(item, name=name, class_index=class_index)
+        if identity and identity in seen_classes:
+            continue
+        if identity:
+            seen_classes.add(identity)
         classes.append(
             {
                 "name": name,
@@ -1053,6 +1426,25 @@ def _metadata_class_mapping(bundle: dict, records: list) -> tuple[list[str], dic
     return class_names, lookup
 
 
+def _metadata_class_identity(item: object, *, name: str | None = None, class_index: int | None = None) -> str:
+    if not isinstance(item, dict):
+        return ""
+    if class_index is None:
+        class_index = _optional_int(item.get("class_index"))
+    if class_index is not None:
+        return f"index:{class_index}"
+    for key in ("class_key", "label_key", "id"):
+        normalized = _metadata_lookup_key(item.get(key))
+        if normalized:
+            return f"key:{normalized}"
+    normalized_name = _metadata_lookup_key(
+        name or _first_metadata_string(item, ("class_name", "name", "label_name", "class_key", "label_key"))
+    )
+    if normalized_name:
+        return f"name:{normalized_name}"
+    return ""
+
+
 def _metadata_record_target(record: dict, label_lookup: dict[str, int]) -> int | None:
     for key in ("label_key", "class_key", "label_name", "class_name", "label", "category_name", "category_id", "class_index"):
         normalized = _metadata_lookup_key(record.get(key))
@@ -1069,26 +1461,7 @@ def _metadata_record_relative_path(record: dict) -> str:
 
 
 def _resolve_dataset_relative_file(dataset_dir: Path, relative_path: str) -> Path | None:
-    from worker.datasets.metadata_discovery import is_safe_relative_path
-
-    if not is_safe_relative_path(relative_path):
-        return None
-    candidate_paths = [relative_path]
-    for image_root in _metadata_image_root_prefixes(dataset_dir):
-        candidate_paths.append(f"{image_root}/{relative_path}")
-    dataset_root = dataset_dir.resolve(strict=True)
-    for candidate_path in candidate_paths:
-        if not is_safe_relative_path(candidate_path):
-            continue
-        candidate = dataset_dir.joinpath(*candidate_path.split("/"))
-        try:
-            resolved = candidate.resolve(strict=True)
-            resolved.relative_to(dataset_root)
-        except (OSError, ValueError):
-            continue
-        if resolved.is_file():
-            return resolved
-    return None
+    return _DatasetRelativePathResolver(dataset_dir).resolve(relative_path)
 
 
 def _metadata_image_root_prefixes(dataset_dir: Path) -> list[str]:
@@ -1186,7 +1559,12 @@ def _normalize_metadata_split(value: object) -> str:
     return ""
 
 
-def _bbox_lookup_from_metadata_bundle(metadata_bundle: dict, dataset_dir: Path) -> dict[str, tuple[int, int, int, int]]:
+def _bbox_lookup_from_metadata_bundle(
+    metadata_bundle: dict,
+    dataset_dir: Path,
+    *,
+    path_resolver: _DatasetRelativePathResolver | None = None,
+) -> dict[str, tuple[int, int, int, int]]:
     bundle = _coerce_metadata_bundle(metadata_bundle)
     if not bundle:
         return {}
@@ -1224,8 +1602,9 @@ def _bbox_lookup_from_metadata_bundle(metadata_bundle: dict, dataset_dir: Path) 
         boxes_by_path.setdefault(relative_path, []).append(bbox)
 
     lookup: dict[str, tuple[int, int, int, int]] = {}
+    resolver = path_resolver or _DatasetRelativePathResolver(dataset_dir)
     for relative_path, boxes in boxes_by_path.items():
-        image_path = _resolve_dataset_relative_file(dataset_dir, relative_path)
+        image_path = resolver.resolve(relative_path)
         if image_path is None:
             continue
         union = _union_bbox_tuples(boxes)
@@ -1758,6 +2137,19 @@ def _build_scheduler(scheduler_name: str, optimizer, epochs: int, step_size: int
     return None
 
 
+def _batch_size(labels) -> int:
+    size = getattr(labels, "size", None)
+    if callable(size):
+        try:
+            return int(size(0))
+        except Exception:
+            pass
+    try:
+        return len(labels)
+    except Exception:
+        return 0
+
+
 def _train_one_epoch(
     model,
     loader,
@@ -1767,6 +2159,7 @@ def _train_one_epoch(
     augmentation: dict | None = None,
     class_count: int = 0,
     gradient_clip_norm: float = 0.0,
+    on_first_batch=None,
 ) -> float:
     import torch
 
@@ -1776,7 +2169,9 @@ def _train_one_epoch(
     augmentation = augmentation or {}
     gradient_clip_norm = _bounded_float(gradient_clip_norm, default=0.0, minimum=0.0, maximum=10.0)
 
-    for inputs, labels in loader:
+    for batch_index, (inputs, labels) in enumerate(loader, start=1):
+        if batch_index == 1 and callable(on_first_batch):
+            on_first_batch(_batch_size(labels))
         inputs = inputs.to(device)
         labels = labels.to(device)
         inputs, loss_labels = _apply_mixed_sample_augmentation(inputs, labels, augmentation, max(1, class_count), device)
@@ -2133,6 +2528,7 @@ def _export_trained_champion_bundle(
         )
         remote_base = _artifact_remote_base_uri(dataset, job_id)
         public_manifest, artifact_uris = _upload_manifest_artifacts(manifest, remote_base, upload_file_to_s3_uri)
+        preprocessing_latency_ms = _manifest_preprocessing_latency_ms(public_manifest)
         onnx_artifact = next((item for item in artifact_uris if item["format"] == "onnx"), None)
         primary_artifact = onnx_artifact or (artifact_uris[0] if artifact_uris else None)
         validation_errors = _artifact_errors(public_manifest)
@@ -2150,6 +2546,7 @@ def _export_trained_champion_bundle(
             "onnx_artifact_uri": onnx_artifact["uri"] if onnx_artifact else "",
             "manifest_uri": manifest_uri,
             "manifest": public_manifest,
+            "preprocessing_latency_ms": preprocessing_latency_ms,
             "validation_errors": validation_errors,
         }
     except Exception as exc:
@@ -2171,6 +2568,13 @@ def _upload_manifest_artifacts(manifest: dict, remote_base: str, upload_file_to_
             continue
         remote_uri = f"{remote_base}/{path.name}"
         upload_file_to_s3_uri(path, remote_uri)
+        if str(artifact.get("format") or "") == "onnx":
+            artifact["external_data"] = _upload_onnx_external_data_files(
+                artifact,
+                remote_base,
+                path.parent,
+                upload_file_to_s3_uri,
+            )
         artifact["path"] = remote_uri
         artifact["uri"] = remote_uri
         artifact_uris.append({"format": str(artifact.get("format") or ""), "uri": remote_uri})
@@ -2179,6 +2583,57 @@ def _upload_manifest_artifacts(manifest: dict, remote_base: str, upload_file_to_
         onnx_artifact = next((item for item in artifact_uris if item["format"] == "onnx"), None)
         public_manifest["metadata"]["artifact_uri"] = onnx_artifact["uri"] if onnx_artifact else ""
     return public_manifest, artifact_uris
+
+
+def _manifest_preprocessing_latency_ms(manifest: dict) -> float:
+    try:
+        from worker.exporting.preprocessing import preprocessing_latency_p95_ms
+    except Exception:
+        return 0.0
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    profile = metadata.get("preprocessing_latency_profile") if isinstance(metadata, dict) else {}
+    return round(preprocessing_latency_p95_ms(profile), 3)
+
+
+def _upload_onnx_external_data_files(
+    artifact: dict,
+    remote_base: str,
+    artifact_dir: Path,
+    upload_file_to_s3_uri,
+) -> list[dict]:
+    external_data = artifact.get("external_data") if isinstance(artifact.get("external_data"), list) else []
+    uploaded: list[dict] = []
+    for item in external_data:
+        if not isinstance(item, dict):
+            continue
+        relative_path = _safe_manifest_relative_path(str(item.get("path") or ""))
+        local_path = Path(str(item.get("artifact_path") or ""))
+        if not local_path.is_absolute():
+            local_path = artifact_dir / (relative_path or local_path)
+        if not relative_path:
+            relative_path = _safe_manifest_relative_path(local_path.name)
+        if not local_path.exists() or not local_path.is_file() or not relative_path:
+            continue
+        remote_uri = f"{remote_base}/{relative_path}"
+        upload_file_to_s3_uri(local_path, remote_uri)
+        uploaded.append(
+            {
+                "path": relative_path,
+                "uri": remote_uri,
+                "artifact_path": remote_uri,
+                "bytes": local_path.stat().st_size,
+            }
+        )
+    return uploaded
+
+
+def _safe_manifest_relative_path(value: str) -> str:
+    parts = []
+    for part in str(value).replace("\\", "/").split("/"):
+        if part in {"", ".", ".."}:
+            continue
+        parts.append(part)
+    return "/".join(parts)
 
 
 def _artifact_remote_base_uri(dataset: dict, job_id: str) -> str:
@@ -2220,7 +2675,7 @@ def _safe_path_part(value: str) -> str:
 
 
 def _holistic_scores(best_macro_f1: float, best_accuracy: float, estimated_cost_usd: float, runtime_seconds: float, model_profile: dict) -> dict:
-    latency_ms = float(model_profile.get("estimated_latency_ms") or 0)
+    latency_ms = float(model_profile.get("estimated_pipeline_latency_ms") or model_profile.get("estimated_latency_ms") or 0)
     quality_score = (best_macro_f1 * 0.65) + (best_accuracy * 0.35)
     latency_score = max(0.0, min(1.0, 1.0 - latency_ms / 160.0))
     cost_score = max(0.0, min(1.0, 1.0 - estimated_cost_usd / 10.0))
@@ -2290,14 +2745,10 @@ def _modal_training_error_message(exc: Exception) -> str:
 
 
 def _orchestrator_report_timeout_seconds() -> int:
-    value = os.getenv("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", "").strip()
-    if not value:
-        return DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS
-    try:
-        parsed = int(value)
-    except ValueError:
-        return DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS
-    return parsed if parsed > 0 else DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS
+    return _positive_int_env(
+        "MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS",
+        DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS,
+    )
 
 
 def _post_training_run_summary(orchestrator_url: str, job_id: str, payload: dict) -> None:
@@ -2333,6 +2784,48 @@ def _modal_identifiers() -> tuple[str, str]:
         return modal.current_function_call_id() or "", modal.current_input_id() or ""
     except Exception:
         return "", ""
+
+
+def _should_stop_training_early(
+    *,
+    epoch: int,
+    epochs: int,
+    best_epoch: int,
+    early_stopping_patience: int,
+    best_accuracy: float,
+    best_macro_f1: float,
+    target_metric: str,
+) -> bool:
+    if early_stopping_patience <= 0 or epoch <= 0 or epochs <= 0:
+        return False
+    if epoch - max(best_epoch, 0) < early_stopping_patience:
+        return False
+
+    if epoch >= _early_stopping_min_epoch_for_plateau(epochs):
+        return True
+
+    return epoch >= _early_stopping_min_epoch_for_egregious_metrics(epochs) and _target_metric_is_egregiously_low(
+        best_accuracy=best_accuracy,
+        best_macro_f1=best_macro_f1,
+        target_metric=target_metric,
+    )
+
+
+def _early_stopping_min_epoch_for_plateau(epochs: int) -> int:
+    return max(1, epochs // 2 + 1)
+
+
+def _early_stopping_min_epoch_for_egregious_metrics(epochs: int) -> int:
+    quarter_epoch = max(1, (epochs + 3) // 4)
+    return min(_early_stopping_min_epoch_for_plateau(epochs), max(3, quarter_epoch))
+
+
+def _target_metric_is_egregiously_low(*, best_accuracy: float, best_macro_f1: float, target_metric: str) -> bool:
+    threshold = 0.2
+    normalized = str(target_metric or "macro_f1").strip().lower()
+    if normalized == "accuracy":
+        return best_accuracy < threshold
+    return best_macro_f1 < threshold
 
 
 def _positive_int(value: object, default: int) -> int:

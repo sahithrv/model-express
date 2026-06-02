@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from worker.exporting.artifacts import load_export_manifest, produce_champion_export_artifacts
+from worker.exporting.artifacts import (
+    load_export_manifest,
+    produce_champion_export_artifacts,
+    produce_existing_champion_export_manifest,
+)
 
 
 class ExportArtifactTests(unittest.TestCase):
@@ -55,6 +59,33 @@ class ExportArtifactTests(unittest.TestCase):
             payload = torch.load(artifact["path"], map_location="cpu", weights_only=False)
             self.assertIn("state_dict", payload)
             self.assertEqual(payload["metadata"]["input_shape"], [1, 3, 8, 8])
+
+    def test_existing_onnx_copy_preserves_external_data_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source = source_dir / "model.onnx"
+            sidecar = source_dir / "model.onnx.data"
+            source.write_bytes(b"onnx bytes")
+            sidecar.write_bytes(b"external tensor bytes")
+
+            manifest = produce_existing_champion_export_manifest(
+                export_dir=root / "export",
+                source_artifact_path=source,
+                artifact_format="onnx",
+                model_name="tiny",
+                class_names=["cat", "dog"],
+                image_size=8,
+            )
+
+            artifact = manifest["artifacts"][0]
+            copied_sidecar = root / "export" / "model.onnx.data"
+            self.assertEqual(artifact["status"], "created")
+            self.assertTrue((root / "export" / "model.onnx").exists())
+            self.assertTrue(copied_sidecar.exists())
+            self.assertEqual(artifact["external_data"][0]["path"], "model.onnx.data")
+            self.assertEqual(Path(artifact["external_data"][0]["artifact_path"]), copied_sidecar)
 
 
 if __name__ == "__main__":

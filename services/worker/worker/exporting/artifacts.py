@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from worker.exporting.metadata import build_champion_export_metadata
+from worker.exporting.preprocessing import benchmark_preprocessing_latency
 
 
 def produce_champion_export_artifacts(
@@ -34,6 +35,7 @@ def produce_champion_export_artifacts(
         training_config=training_config,
     )
     metadata["input_shape"] = input_shape
+    metadata["preprocessing_latency_profile"] = benchmark_preprocessing_latency(metadata)
 
     artifacts: list[dict] = []
     if "framework_native" in requested_formats or "checkpoint" in requested_formats:
@@ -107,6 +109,7 @@ def produce_existing_champion_export_manifest(
             model_profile=model_profile,
             training_config=training_config,
         )
+        metadata["preprocessing_latency_profile"] = benchmark_preprocessing_latency(metadata)
         manifest = {
             "schema_version": "champion_export_manifest_v1",
             "metadata": metadata,
@@ -134,13 +137,20 @@ def produce_existing_champion_export_manifest(
         training_config=training_config,
     )
     metadata["input_shape"] = input_shape
+    metadata["preprocessing_latency_profile"] = benchmark_preprocessing_latency(metadata)
 
     artifact_name = _artifact_filename(artifact_format, source_path)
     destination = export_dir / artifact_name
     if source_path.resolve() != destination.resolve():
         shutil.copy2(source_path, destination)
+    if _manifest_artifact_format(artifact_format) == "onnx":
+        _copy_onnx_external_data(source_path, export_dir)
 
-    artifact = _created_artifact(_manifest_artifact_format(artifact_format), destination)
+    manifest_format = _manifest_artifact_format(artifact_format)
+    if manifest_format == "onnx":
+        artifact = _created_onnx_artifact(destination)
+    else:
+        artifact = _created_artifact(manifest_format, destination)
     manifest = {
         "schema_version": "champion_export_manifest_v1",
         "metadata": metadata,
@@ -213,6 +223,10 @@ def _write_onnx(export_dir: Path, model, input_shape: list[int]) -> dict:
         import torch
     except Exception as exc:
         return _skipped_artifact("onnx", "TORCH_UNAVAILABLE", str(exc))
+    try:
+        import onnxscript  # noqa: F401
+    except Exception as exc:
+        return _skipped_artifact("onnx", "ONNXSCRIPT_UNAVAILABLE", str(exc))
 
     path = export_dir / "model.onnx"
     try:
@@ -231,7 +245,7 @@ def _write_onnx(export_dir: Path, model, input_shape: list[int]) -> dict:
         if "onnx" in str(exc).lower() and "install" in str(exc).lower():
             return _skipped_artifact("onnx", "ONNX_UNAVAILABLE", str(exc))
         return _failed_artifact("onnx", path, exc)
-    return _created_artifact("onnx", path)
+    return _created_onnx_artifact(path)
 
 
 def _created_artifact(format_name: str, path: Path) -> dict:
@@ -241,6 +255,93 @@ def _created_artifact(format_name: str, path: Path) -> dict:
         "path": str(path),
         "bytes": path.stat().st_size if path.exists() else 0,
     }
+
+
+def _created_onnx_artifact(path: Path) -> dict:
+    artifact = _created_artifact("onnx", path)
+    external_data = _onnx_external_data_records(path)
+    if external_data:
+        artifact["external_data"] = external_data
+    return artifact
+
+
+def _copy_onnx_external_data(source_model_path: Path, export_dir: Path) -> None:
+    for record in _onnx_external_data_records(source_model_path):
+        source_path = Path(str(record.get("artifact_path") or ""))
+        destination = _safe_external_data_path(export_dir, str(record.get("path") or ""))
+        if destination is None or not source_path.exists() or not source_path.is_file():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source_path.resolve() != destination.resolve():
+            shutil.copy2(source_path, destination)
+
+
+def _onnx_external_data_records(model_path: Path) -> list[dict]:
+    records: list[dict] = []
+    seen: set[str] = set()
+    locations = _onnx_external_data_locations(model_path)
+    if not locations:
+        fallback = model_path.with_name(f"{model_path.name}.data")
+        if fallback.exists() and fallback.is_file():
+            locations = [fallback.name]
+
+    for location in locations:
+        if location in seen:
+            continue
+        seen.add(location)
+        data_path = _safe_external_data_path(model_path.parent, location)
+        if data_path is None or not data_path.exists() or not data_path.is_file():
+            continue
+        records.append(
+            {
+                "path": location,
+                "artifact_path": str(data_path),
+                "bytes": data_path.stat().st_size,
+            }
+        )
+    return records
+
+
+def _onnx_external_data_locations(model_path: Path) -> list[str]:
+    try:
+        import onnx
+    except Exception:
+        return []
+    try:
+        model = onnx.load(str(model_path), load_external_data=False)
+    except Exception:
+        return []
+
+    locations: list[str] = []
+    for tensor in getattr(model.graph, "initializer", []):
+        location = _tensor_external_data_location(tensor)
+        if location and location not in locations:
+            locations.append(location)
+    return locations
+
+
+def _tensor_external_data_location(tensor) -> str:
+    for entry in getattr(tensor, "external_data", []):
+        if getattr(entry, "key", "") == "location":
+            value = str(getattr(entry, "value", "")).strip()
+            if value:
+                return value
+    return ""
+
+
+def _safe_external_data_path(base_dir: Path, relative_path: str) -> Path | None:
+    if not relative_path:
+        return None
+    candidate = Path(relative_path)
+    if candidate.is_absolute():
+        return None
+    base = base_dir.resolve()
+    resolved = (base / candidate).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        return None
+    return resolved
 
 
 def _skipped_artifact(format_name: str, error_code: str, error: str) -> dict:

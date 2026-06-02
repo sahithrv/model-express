@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import base64
 import json
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -73,12 +74,31 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
             sample_input_shape=config.get("sample_input_shape"),
         )
     elif requested_format in HELPER_EXPORT_FORMATS:
+        model, checkpoint_metadata, checkpoint_errors = _load_model_from_convertible_checkpoint(
+            config,
+            requested_format,
+            class_names,
+            model_name,
+        )
+        validation_errors.extend(checkpoint_errors)
+        if checkpoint_metadata:
+            if not class_names:
+                class_names = _metadata_class_names(checkpoint_metadata)
+            if not config.get("image_size"):
+                image_size = _metadata_image_size(checkpoint_metadata, image_size)
+            if not model_profile and isinstance(checkpoint_metadata.get("model_profile"), dict):
+                model_profile = checkpoint_metadata["model_profile"]
+            if not isinstance(config.get("training_config"), dict) and isinstance(
+                checkpoint_metadata.get("training_config"), dict
+            ):
+                training_config = checkpoint_metadata["training_config"]
+            model_name = _first_string(checkpoint_metadata, "model", "model_name") or model_name
         manifest = produce_champion_export_artifacts(
             export_dir=export_dir,
             model_name=model_name,
             class_names=class_names,
             image_size=image_size,
-            model=None,
+            model=model,
             preprocessing=preprocessing,
             model_profile=model_profile,
             training_config=training_config,
@@ -120,16 +140,17 @@ def run_champion_demo_prediction_job(client: OrchestratorClient, job: dict) -> N
     config = _config(job)
     job_id = str(job["id"])
     manifest_path = _manifest_path(config)
+    manifest_payload = _manifest_payload(config) if manifest_path is None else None
     image_path, image_error = _demo_image_path(config, job_id)
     image_uri = _first_string(config, "image_uri", "image_path", "local_image_path") or ""
     true_label = _first_string(config, "true_label", "label", "class_name")
     image_metadata = config.get("image_metadata") if isinstance(config.get("image_metadata"), dict) else {}
 
-    if manifest_path is None:
+    if manifest_path is None and manifest_payload is None:
         payload = {
             "status": "RUNTIME_UNAVAILABLE",
             "error_code": "MANIFEST_NOT_CONFIGURED",
-            "error": "No worker-owned export manifest path was supplied or found.",
+            "error": "No worker-owned export manifest path or manifest metadata was supplied or found.",
         }
     elif image_path is None:
         payload = {
@@ -140,18 +161,28 @@ def run_champion_demo_prediction_job(client: OrchestratorClient, job: dict) -> N
     else:
         inference = run_demo_inference_from_manifest(
             manifest_path=manifest_path,
+            manifest=manifest_payload,
             image_path=image_path,
             top_k=_positive_int(config.get("top_k"), 5),
             true_label=true_label,
         )
         payload = _prediction_result_from_inference(inference)
 
+    result_image_metadata = dict(image_metadata)
+    latency_breakdown = payload.get("latency_breakdown_ms")
+    if isinstance(latency_breakdown, dict):
+        result_image_metadata["latency_breakdown_ms"] = latency_breakdown
+        result_image_metadata["latency_measurement"] = {
+            "latency_ms_semantics": "streaming_total_excludes_one_time_model_load",
+            "runtime": payload.get("runtime", ""),
+        }
+
     payload.update(
         {
             "image_uri": image_uri,
             "image_id": _first_string(config, "image_id") or payload.get("image_id", ""),
             "true_label": true_label or payload.get("true_label", ""),
-            "image_metadata": image_metadata,
+            "image_metadata": result_image_metadata,
             "manifest_path": str(manifest_path) if manifest_path is not None else "",
         }
     )
@@ -252,6 +283,114 @@ def _class_names(config: dict, dataset_profile: dict) -> list[str]:
     return []
 
 
+def _load_model_from_convertible_checkpoint(
+    config: dict,
+    requested_format: str,
+    class_names: list[str],
+    fallback_model_name: str,
+):
+    if requested_format not in {"onnx", "torchscript"}:
+        return None, {}, []
+    checkpoint_path = _existing_convertible_checkpoint_path(config)
+    if checkpoint_path is None:
+        return None, {}, []
+
+    try:
+        import torch
+    except Exception as exc:
+        return None, {}, [f"TORCH_UNAVAILABLE: {exc}"]
+
+    try:
+        try:
+            payload = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(str(checkpoint_path), map_location="cpu")
+    except Exception as exc:
+        return None, {}, [f"CHECKPOINT_LOAD_FAILED: {exc}"]
+
+    metadata: dict = {}
+    state_dict = None
+    if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
+        state_dict = payload["state_dict"]
+        if isinstance(payload.get("metadata"), dict):
+            metadata = payload["metadata"]
+    elif isinstance(payload, dict):
+        state_dict = payload
+    if not isinstance(state_dict, dict):
+        return None, metadata, ["CHECKPOINT_LOAD_FAILED: checkpoint does not contain a state_dict"]
+
+    labels = class_names or _metadata_class_names(metadata)
+    class_count = max(1, len(labels))
+    training_config = metadata.get("training_config") if isinstance(metadata.get("training_config"), dict) else config
+    model_name = (
+        _first_string(config, "model", "model_name", "champion_model")
+        or _first_string(metadata, "model", "model_name")
+        or fallback_model_name
+    )
+
+    try:
+        model = _build_torchvision_model(
+            model_name=model_name,
+            class_count=class_count,
+            pretrained=False,
+            freeze_backbone=_bool_value(training_config.get("freeze_backbone"), True),
+            fine_tune_strategy=str(training_config.get("fine_tune_strategy") or "head_only"),
+            dropout=_float_value(training_config.get("dropout"), 0.0),
+        )
+        model.load_state_dict(_normalized_state_dict(state_dict), strict=False)
+        model.eval()
+    except Exception as exc:
+        return None, metadata, [f"CHECKPOINT_MODEL_LOAD_FAILED: {exc}"]
+
+    return model, metadata, []
+
+
+def _existing_convertible_checkpoint_path(config: dict) -> Path | None:
+    for key in (
+        "checkpoint_path",
+        "pytorch_path",
+        "model_path",
+        "checkpoint_uri",
+        "pytorch_uri",
+        "model_uri",
+        "source_artifact_uri",
+        "source_artifact_path",
+        "artifact_path",
+        "local_artifact_path",
+        "artifact_uri",
+        "export_artifact_uri",
+    ):
+        path = _artifact_source_path_for_key(config, key, "pytorch")
+        if path is not None:
+            return path
+    return None
+
+
+def _metadata_class_names(metadata: dict) -> list[str]:
+    for key in ("class_names", "class_labels", "classes"):
+        values = metadata.get(key)
+        if isinstance(values, list):
+            return [str(item) for item in values]
+    return []
+
+
+def _metadata_image_size(metadata: dict, default: int) -> int:
+    input_shape = metadata.get("input_shape")
+    if isinstance(input_shape, list) and len(input_shape) >= 4:
+        return _positive_int(input_shape[-1], default)
+    return _positive_int(metadata.get("image_size"), default)
+
+
+def _normalized_state_dict(state_dict: dict) -> dict:
+    out = {}
+    for key, value in state_dict.items():
+        normalized = str(key)
+        if normalized.startswith("module."):
+            normalized = normalized[len("module.") :]
+        out[normalized] = value
+    return out
+
+
 def _existing_artifact_source_path(config: dict, requested_format: str) -> Path | None:
     format_keys = {
         "onnx": ("onnx_path", "onnx_artifact_path"),
@@ -265,28 +404,49 @@ def _existing_artifact_source_path(config: dict, requested_format: str) -> Path 
         "pytorch": ("checkpoint_uri", "pytorch_uri", "model_uri"),
         "safetensors": ("safetensors_artifact_uri", "safetensors_uri"),
     }
-    keys = (
-        *format_keys.get(requested_format, ()),
-        *uri_keys.get(requested_format, ()),
-        "artifact_path",
-        "local_artifact_path",
-        "artifact_uri",
-        "export_artifact_uri",
-    )
-    for key in keys:
-        value = _first_string(config, key)
-        if not value:
-            continue
-        if value.startswith("s3://"):
-            destination = _downloaded_artifact_path(value, requested_format)
-            try:
-                return download_s3_uri(value, destination)
-            except Exception:
-                continue
-        path = _path_from_uri_or_local(value)
+    keys = (*format_keys.get(requested_format, ()), *uri_keys.get(requested_format, ()))
+    generic_keys = ("artifact_path", "local_artifact_path", "artifact_uri", "export_artifact_uri")
+    for key in (*keys, *generic_keys):
+        path = _artifact_source_path_for_key(config, key, requested_format)
         if path is not None:
             return path
     return None
+
+
+def _artifact_source_path_for_key(
+    config: dict,
+    key: str,
+    requested_format: str,
+) -> Path | None:
+    value = _first_string(config, key)
+    if not value:
+        return None
+    if not _artifact_value_matches_format(value, requested_format):
+        return None
+    if value.startswith("s3://"):
+        destination = _downloaded_artifact_path(value, requested_format)
+        try:
+            return download_s3_uri(value, destination)
+        except Exception:
+            return None
+    path = _path_from_uri_or_local(value)
+    if path is not None:
+        return path
+    return None
+
+
+def _artifact_value_matches_format(value: str, requested_format: str) -> bool:
+    parsed = urlparse(value)
+    path_value = unquote(parsed.path if parsed.scheme else value).lower()
+    if requested_format == "onnx":
+        return path_value.endswith(".onnx")
+    if requested_format == "torchscript":
+        return path_value.endswith(".torchscript.pt") or path_value.endswith(".torchscript")
+    if requested_format == "pytorch":
+        return path_value.endswith(".pt") or path_value.endswith(".pth")
+    if requested_format == "safetensors":
+        return path_value.endswith(".safetensors")
+    return False
 
 
 def _downloaded_artifact_path(uri: str, requested_format: str) -> Path:
@@ -306,7 +466,7 @@ def _artifact_filename_for_format(requested_format: str) -> str:
 
 
 def _manifest_path(config: dict) -> Path | None:
-    for key in ("manifest_path", "export_manifest_path", "local_manifest_path"):
+    for key in ("manifest_path", "export_manifest_path", "local_manifest_path", "manifest_uri", "export_manifest_uri"):
         value = _first_string(config, key)
         if value:
             if value.startswith("s3://"):
@@ -326,10 +486,221 @@ def _manifest_path(config: dict) -> Path | None:
     return matches[0] if matches else None
 
 
+def _manifest_payload(config: dict) -> dict | None:
+    for record in _manifest_metadata_records(config):
+        manifest = record.get("manifest")
+        if isinstance(manifest, dict) and manifest:
+            return manifest
+        manifest = record.get("export_manifest")
+        if isinstance(manifest, dict) and manifest:
+            return manifest
+    return _fallback_manifest_payload(config)
+
+
+def _manifest_metadata_records(config: dict) -> list[dict]:
+    records: list[dict] = []
+    for key in ("export_metadata", "metadata"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            records.append(value)
+            for nested_key in ("deployment_profile", "model_profile"):
+                nested = value.get(nested_key)
+                if isinstance(nested, dict):
+                    records.append(nested)
+    return records
+
+
+def _fallback_manifest_payload(config: dict) -> dict | None:
+    artifact_uri = _first_string(
+        config,
+        "export_artifact_uri",
+        "artifact_uri",
+        "checkpoint_uri",
+        "model_uri",
+        "onnx_artifact_uri",
+        "torchscript_artifact_uri",
+    )
+    if not artifact_uri:
+        return None
+    artifact_format = _manifest_artifact_format_for_uri(artifact_uri)
+    if not artifact_format:
+        return None
+    metadata = _fallback_manifest_metadata(config)
+    return {
+        "schema_version": "champion_export_manifest_v1",
+        "status": "created",
+        "metadata": metadata,
+        "artifacts": [
+            {
+                "format": artifact_format,
+                "status": "created",
+                "path": artifact_uri,
+                "uri": artifact_uri,
+            }
+        ],
+    }
+
+
+def _fallback_manifest_metadata(config: dict) -> dict:
+    for record in _manifest_metadata_records(config):
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict) and metadata:
+            return metadata
+        model_profile = record.get("model_profile")
+        if isinstance(model_profile, dict) and model_profile:
+            return model_profile
+    export_metadata = config.get("export_metadata") if isinstance(config.get("export_metadata"), dict) else {}
+    return {
+        "model": _first_string(config, "model", "model_name", "champion_model")
+        or _first_string(export_metadata, "model", "model_name")
+        or "mobilenet_v3_small",
+        "class_labels": _class_names(config, export_metadata),
+        "input_shape": config.get("sample_input_shape") or [1, 3, _positive_int(config.get("image_size"), 224), _positive_int(config.get("image_size"), 224)],
+        "preprocessing": config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {},
+        "training_config": config.get("training_config") if isinstance(config.get("training_config"), dict) else config,
+    }
+
+
+def _manifest_artifact_format_for_uri(uri: str) -> str:
+    normalized = unquote(urlparse(uri).path if urlparse(uri).scheme else uri).lower()
+    if normalized.endswith(".onnx"):
+        return "onnx"
+    if normalized.endswith(".torchscript.pt") or normalized.endswith(".torchscript"):
+        return "torchscript"
+    if normalized.endswith(".pt") or normalized.endswith(".pth"):
+        return "framework_native_checkpoint"
+    if normalized.endswith(".safetensors"):
+        return "safetensors"
+    return ""
+
+
+def _build_torchvision_model(
+    *,
+    model_name: str,
+    class_count: int,
+    pretrained: bool,
+    freeze_backbone: bool,
+    fine_tune_strategy: str,
+    dropout: float,
+):
+    from torch import nn
+    from torchvision import models
+
+    normalized = model_name.lower()
+    dropout = max(0.0, min(0.7, dropout))
+
+    if "efficientnet_b2" in normalized:
+        model = _torchvision_model(models.efficientnet_b2, models.EfficientNet_B2_Weights.DEFAULT if pretrained else None)
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    if "efficientnet_b1" in normalized:
+        model = _torchvision_model(models.efficientnet_b1, models.EfficientNet_B1_Weights.DEFAULT if pretrained else None)
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    if "efficientnet" in normalized:
+        model = _torchvision_model(models.efficientnet_b0, models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    if "resnet34" in normalized:
+        model = _torchvision_model(models.resnet34, models.ResNet34_Weights.DEFAULT if pretrained else None)
+        in_features = model.fc.in_features
+        _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
+        model.fc = _classification_head(nn, in_features, class_count, dropout)
+        return model
+    if "resnet" in normalized:
+        model = _torchvision_model(models.resnet18, models.ResNet18_Weights.DEFAULT if pretrained else None)
+        in_features = model.fc.in_features
+        _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
+        model.fc = _classification_head(nn, in_features, class_count, dropout)
+        return model
+    if "regnet_y_400mf" in normalized:
+        model = _torchvision_model(models.regnet_y_400mf, models.RegNet_Y_400MF_Weights.DEFAULT if pretrained else None)
+        in_features = model.fc.in_features
+        _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
+        model.fc = _classification_head(nn, in_features, class_count, dropout)
+        return model
+    if "convnext_tiny" in normalized:
+        model = _torchvision_model(models.convnext_tiny, models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None)
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    if "swin_t" in normalized:
+        model = _torchvision_model(models.swin_t, models.Swin_T_Weights.DEFAULT if pretrained else None)
+        in_features = model.head.in_features
+        _apply_transfer_strategy(model, "head", freeze_backbone, fine_tune_strategy)
+        model.head = _classification_head(nn, in_features, class_count, dropout)
+        return model
+    if "vit_b_16" in normalized:
+        model = _torchvision_model(models.vit_b_16, models.ViT_B_16_Weights.DEFAULT if pretrained else None)
+        in_features = model.heads.head.in_features
+        _apply_transfer_strategy(model, "heads", freeze_backbone, fine_tune_strategy)
+        model.heads.head = _classification_head(nn, in_features, class_count, dropout)
+        return model
+    if "mobilenet_v3_large" in normalized:
+        model = _torchvision_model(models.mobilenet_v3_large, models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None)
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+
+    model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
+    in_features = model.classifier[-1].in_features
+    _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+    _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+    return model
+
+
+def _torchvision_model(factory, weights):
+    try:
+        return factory(weights=weights)
+    except Exception:
+        return factory(weights=None)
+
+
+def _classification_head(nn, in_features: int, class_count: int, dropout: float = 0.0):
+    head = nn.Linear(in_features, class_count)
+    if dropout <= 0:
+        return head
+    return nn.Sequential(nn.Dropout(p=dropout), head)
+
+
+def _replace_classifier_head(nn, classifier, in_features: int, class_count: int, dropout: float = 0.0) -> None:
+    if len(classifier) >= 2 and isinstance(classifier[-2], nn.Dropout):
+        classifier[-2].p = dropout
+        classifier[-1] = nn.Linear(in_features, class_count)
+        return
+    classifier[-1] = _classification_head(nn, in_features, class_count, dropout)
+
+
+def _apply_transfer_strategy(model, head_name: str, freeze_backbone: bool, fine_tune_strategy: str) -> None:
+    if not freeze_backbone or fine_tune_strategy == "full":
+        return
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    if fine_tune_strategy == "last_block":
+        children = list(model.children())
+        if len(children) > 1:
+            for parameter in children[-2].parameters():
+                parameter.requires_grad = True
+    head = getattr(model, head_name, None)
+    if head is not None:
+        for parameter in head.parameters():
+            parameter.requires_grad = True
+
+
 def _demo_image_path(config: dict, job_id: str) -> tuple[Path | None, str]:
     value = _first_string(config, "local_image_path", "image_path", "image_uri")
     if not value:
         return None, "image_uri or local_image_path is required"
+    if value.startswith("data:image/"):
+        return _inline_demo_image_path(value, job_id)
     if value.startswith("s3://"):
         destination = Path(os.getenv("WORKER_DEMO_IMAGE_ROOT", ".cache/demo_images")) / _safe_path_part(job_id) / Path(urlparse(value).path).name
         try:
@@ -342,6 +713,29 @@ def _demo_image_path(config: dict, job_id: str) -> tuple[Path | None, str]:
     if not path.exists() or not path.is_file():
         return None, f"demo image not found: {path}"
     return path, ""
+
+
+def _inline_demo_image_path(value: str, job_id: str) -> tuple[Path | None, str]:
+    try:
+        header, encoded = value.split(",", 1)
+    except ValueError:
+        return None, "inline image data URI is missing a payload"
+    if ";base64" not in header.lower():
+        return None, "inline image data URI must be base64 encoded"
+    suffix = ".jpg"
+    media_type = header.split(";", 1)[0].lower()
+    if media_type.endswith("/png"):
+        suffix = ".png"
+    elif media_type.endswith("/webp"):
+        suffix = ".webp"
+    destination = Path(os.getenv("WORKER_DEMO_IMAGE_ROOT", ".cache/demo_images")) / _safe_path_part(job_id) / f"inline{suffix}"
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+    except Exception as exc:
+        return None, f"inline image decode failed: {exc}"
+    return destination, ""
 
 
 def _path_from_uri_or_local(value: str) -> Path | None:
@@ -550,6 +944,26 @@ def _positive_int(value: object, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _float_value(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_value(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _safe_path_part(value: str) -> str:
