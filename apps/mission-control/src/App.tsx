@@ -4,7 +4,6 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
-  Box,
   BrainCircuit,
   CheckCircle2,
   ClipboardList,
@@ -26,7 +25,10 @@ import {
   SlidersHorizontal,
   SquareTerminal,
   StepForward,
+  MessageSquare,
   Timer,
+  ThumbsDown,
+  ThumbsUp,
   Trophy,
   Upload,
   X,
@@ -38,12 +40,15 @@ import {
   type ChampionLocalRuntime,
 } from "./championLocalInference";
 import type {
+  AgentActivityEvent,
   AgentDecision,
   AgentInvocation,
   AgentMemoryRecord,
   ChampionDemoImage,
   ChampionDemoPrediction,
+  ChampionDetection,
   ChampionExport,
+  ChampionFeedback,
   Dataset,
   DatasetMetadataImport,
   DatasetMetadataSummary,
@@ -54,6 +59,8 @@ import type {
   Health,
   Job,
   PlannedExperiment,
+  MemoryEmbeddingUsageEvent,
+  MissionControlTelemetryResponse,
   Project,
   ProjectChampion,
   RetrievedMemoryCard,
@@ -68,6 +75,7 @@ import type {
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
 const jobsPerPage = 10;
+const liveRefreshIntervalMs = 10_000;
 
 type MetricKey = "macro_f1" | "accuracy" | "train_loss" | "val_loss";
 type ProjectTabKey = "overview" | "data" | "experiments" | "agents" | "operations" | "export";
@@ -91,6 +99,7 @@ const projectTabs: Array<{ key: ProjectTabKey; label: string }> = [
 type ProjectDetail = {
   decisions: AgentDecision[];
   datasets: Dataset[];
+  telemetry: MissionControlTelemetryResponse | null;
   visualAnalysis: VisualAnalysisDetail;
   datasetMetadata: DatasetMetadataDetail;
   jobs: Job[];
@@ -101,12 +110,105 @@ type ProjectDetail = {
   championExports: ChampionExport[];
   championDemoImages: ChampionDemoImage[];
   championDemoPredictions: ChampionDemoPrediction[];
+  championFeedback: ChampionFeedback[];
   workers: Worker[];
   workerRequirements: WorkerRequirement[];
   executionEvents: ExecutionEvent[];
   agentInvocations: AgentInvocation[];
   agentMemory: AgentMemoryRecord[];
   strategyScorecards: StrategyScorecard[];
+};
+
+type MissionDigestState =
+  | "empty"
+  | "dataset_needed"
+  | "profiling"
+  | "plan_ready"
+  | "training"
+  | "review_needed"
+  | "follow_up_ready"
+  | "champion_selected"
+  | "blocked";
+
+type MissionTone = "ok" | "warning" | "bad" | "info";
+
+type MissionHealthItem = {
+  id: string;
+  label: string;
+  value: string;
+  tone: MissionTone;
+  targetTab?: ProjectTabKey;
+  targetId?: string;
+};
+
+type MissionActionKey =
+  | "new_project"
+  | "refresh"
+  | "execute_plan"
+  | "review_experiments"
+  | "schedule_follow_up"
+  | "open_export";
+
+type MissionNextAction = {
+  id: string;
+  label: string;
+  reason: string;
+  priority: "primary" | "secondary";
+  disabled?: boolean;
+  actionKey?: MissionActionKey;
+  targetTab?: ProjectTabKey;
+  targetId?: string;
+};
+
+type MissionLiveActivity = {
+  status: "idle" | "active" | "waiting" | "blocked" | "failed" | "succeeded";
+  label: string;
+  detail: string;
+  streamState: ActivityStreamState;
+  steps: Array<{
+    id: string;
+    label: string;
+    status: "active" | "waiting" | "succeeded" | "failed" | "blocked";
+    timestamp?: string;
+    targetTab?: ProjectTabKey;
+    targetId?: string;
+  }>;
+};
+
+type MissionSignal = {
+  id: string;
+  label: string;
+  detail: string;
+  tone: MissionTone;
+  timestamp?: string;
+  targetTab?: ProjectTabKey;
+  targetId?: string;
+};
+
+type MissionChampionSummary = {
+  model: string;
+  primaryMetricLabel: string;
+  primaryMetricValue: string;
+  accuracy: string;
+  cost: string;
+  runtime: string;
+  latency: string;
+  modelSize: string;
+  objectiveFit: string;
+};
+
+type MissionDigest = {
+  state: MissionDigestState;
+  stateLabel: string;
+  healthLabel: string;
+  headline: string;
+  detail: string;
+  facts: Array<{ label: string; value: string; tone?: MissionTone }>;
+  health: MissionHealthItem[];
+  nextActions: MissionNextAction[];
+  liveActivity: MissionLiveActivity;
+  recentSignals: MissionSignal[];
+  champion?: MissionChampionSummary;
 };
 
 type VisualAnalysisDetail = {
@@ -122,6 +224,110 @@ type DatasetMetadataDetail = {
   imports: DatasetMetadataImport[];
   status: "available" | "empty" | "unsupported" | "error";
   message: string;
+};
+
+type TelemetryWindowKey = "today" | "7d" | "lifetime";
+
+type TelemetryWindowSummary = {
+  key: TelemetryWindowKey;
+  label: string;
+  calls: number;
+  exactCalls: number;
+  approxCalls: number;
+  validCalls: number;
+  invalidCalls: number;
+  exactInputTokens: number;
+  exactOutputTokens: number;
+  approxInputTokens: number;
+  approxOutputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  estimatedCostUsd: number;
+};
+
+type TelemetryCountSummary = {
+  label: string;
+  count: number;
+  exactCalls: number;
+  approxCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  approxInputTokens: number;
+  approxOutputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  estimatedCostUsd: number;
+};
+
+type TelemetrySectionSummary = {
+  name: string;
+  calls: number;
+  bytes: number;
+  approxTokens: number;
+  exampleSource?: string;
+};
+
+type TelemetryEmbeddingBreakdownRow = {
+  label: string;
+  count: number;
+  providerCalls: number;
+  inputBytes: number;
+  estimatedCostUsd: number;
+  retrievedCount: number;
+  injected: number;
+  logOnly: number;
+  cached: number;
+  skipped: number;
+};
+
+type TelemetryInvocationSummary = {
+  id: string;
+  createdAt: string;
+  agentName: string;
+  model: string;
+  validationStatus: string;
+  usageKind: "exact" | "approximate";
+  inputTokens: number;
+  outputTokens: number;
+  approxInputTokens: number;
+  approxOutputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  estimatedCostUsd: number;
+  promptBytes: number;
+  sections: TelemetrySectionSummary[];
+  largestSection: string;
+};
+
+type TelemetryEmbeddingPurposeSummary = {
+  purpose: string;
+  retrievalPurpose: string;
+  count: number;
+  providerCalls: number;
+  inputBytes: number;
+  estimatedCostUsd: number;
+  retrievedCount: number;
+  injected: number;
+  logOnly: number;
+  cached: number;
+  skipped: number;
+  bySourceTable: TelemetryEmbeddingBreakdownRow[];
+  byModel: TelemetryEmbeddingBreakdownRow[];
+};
+
+type TelemetrySummary = {
+  invocations: AgentInvocation[];
+  usageEvents: MemoryEmbeddingUsageEvent[];
+  windows: TelemetryWindowSummary[];
+  callsByAgent: TelemetryCountSummary[];
+  callsByModel: TelemetryCountSummary[];
+  topInvocations: TelemetryInvocationSummary[];
+  promptSections: TelemetrySectionSummary[];
+  embedding: {
+    sourceIndex: TelemetryEmbeddingPurposeSummary;
+    retrievalQuery: TelemetryEmbeddingPurposeSummary;
+    totalUsageEvents: number;
+  };
 };
 
 type VisualAnalysisListResponse = {
@@ -140,6 +346,27 @@ type AgentInvocationsResponse = {
   invocations?: AgentInvocation[];
   agent_invocations?: AgentInvocation[];
   items?: AgentInvocation[];
+};
+
+type ProjectDetailRefreshOptions = {
+  includeSlowData?: boolean;
+  forceSlowData?: boolean;
+};
+
+type ActivityStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "fallback";
+
+type RequestOptions = {
+  method?: string;
+  body?: unknown;
+  bypassCache?: boolean;
+  cacheTtlMs?: number;
+};
+
+type CachedGetRequest = {
+  expiresAt: number;
+  hasValue: boolean;
+  promise?: Promise<unknown>;
+  value?: unknown;
 };
 
 type DatasetMetadataSummaryResponse =
@@ -253,6 +480,16 @@ type RetrievedMemoryDisplay = {
   identifiers: Array<{ label: string; value: string }>;
 };
 
+type MemoryRetrievalProbeSnapshot = {
+  id: string;
+  purpose: string;
+  logOnly: boolean;
+  crossProjectOK: boolean;
+  retrievedCount: number;
+  createdAt: string;
+  cards: RetrievedMemoryDisplay[];
+};
+
 type AgentInvocationAuditRow = {
   id: string;
   agentName: string;
@@ -321,6 +558,14 @@ type ChampionExportDemo = {
   preprocessing: string[];
   demoImages: ChampionDemoImage[];
   demoPredictions: ChampionDemoPrediction[];
+  feedback: ChampionFeedback[];
+};
+
+type ChampionFeedbackRating = ChampionFeedback["rating"];
+
+type ChampionFeedbackDraft = {
+  rating: ChampionFeedbackRating;
+  message: string;
 };
 
 type Notice = {
@@ -376,6 +621,7 @@ function emptyProjectDetail(message = "Select a dataset to load visual analysis 
   return {
     decisions: [],
     datasets: [],
+    telemetry: null,
     visualAnalysis: {
       analysis: null,
       status: "empty",
@@ -396,6 +642,7 @@ function emptyProjectDetail(message = "Select a dataset to load visual analysis 
     championExports: [],
     championDemoImages: [],
     championDemoPredictions: [],
+    championFeedback: [],
     workers: [],
     workerRequirements: [],
     executionEvents: [],
@@ -403,6 +650,61 @@ function emptyProjectDetail(message = "Select a dataset to load visual analysis 
     agentMemory: [],
     strategyScorecards: [],
   };
+}
+
+const slowProjectRefreshEventTypes = new Set([
+  "AGENT_RECOMMENDATION_RECORDED",
+  "AGENT_OUTCOME_RECORDED",
+  "AGENT_FAILED",
+  "CHAMPION_SELECTED",
+  "DATASET_VISUAL_ANALYSIS_RESULT",
+  "MEMORY_RETRIEVAL_LOGGED",
+]);
+
+const slowActivityRefreshTypes = new Set([
+  "agent.failed",
+  "agent.outcome_recorded",
+  "champion.selected",
+  "planner.blocked",
+  "planner.decision_recorded",
+  "planner.stopped",
+  "planner.validation_failed",
+  "planner.validation_rejected",
+  "memory.retrieval_logged",
+]);
+
+const expensiveGetCacheTtlMs = 15_000;
+
+function cachedGetRequestTtlMs(path: string): number {
+  const normalizedPath = path.split("?")[0] ?? path;
+  if (/^\/projects\/[^/]+\/execution-events$/.test(normalizedPath)) {
+    return expensiveGetCacheTtlMs;
+  }
+  if (/^\/projects\/[^/]+\/(agent-invocations|agent-decisions|agent-memory|strategy-scorecards|training-run-evaluations)$/.test(normalizedPath)) {
+    return expensiveGetCacheTtlMs;
+  }
+  if (/^\/projects\/[^/]+\/telemetry-summary$/.test(normalizedPath)) {
+    return expensiveGetCacheTtlMs;
+  }
+  if (/^\/datasets\/[^/]+\/(visual-analyses|visual-analyses\/latest|metadata\/summary|metadata\/imports)$/.test(normalizedPath)) {
+    return expensiveGetCacheTtlMs;
+  }
+  if (/^\/projects\/[^/]+\/champion\/(exports|demo-images|demo-predictions|feedback)$/.test(normalizedPath)) {
+    return expensiveGetCacheTtlMs;
+  }
+  return 0;
+}
+
+function eventNeedsSlowProjectRefresh(event: MessageEvent | Event): boolean {
+  if (!(event instanceof MessageEvent) || !event.data) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(String(event.data)) as { event_type?: string; type?: string };
+    return slowProjectRefreshEventTypes.has(String(parsed.event_type ?? "")) || slowActivityRefreshTypes.has(String(parsed.type ?? ""));
+  } catch {
+    return false;
+  }
 }
 
 export function App() {
@@ -432,12 +734,22 @@ export function App() {
   const [localInferenceStatus, setLocalInferenceStatus] = useState("not_ready");
   const [localInferenceError, setLocalInferenceError] = useState("");
   const [demoSlideshowEnabled, setDemoSlideshowEnabled] = useState(false);
+  const [demoSlideshowIntervalMs, setDemoSlideshowIntervalMs] = useState(5200);
+  const [detectionConfidenceThreshold, setDetectionConfidenceThreshold] = useState(0.25);
+  const [detectionIouThreshold, setDetectionIouThreshold] = useState(0.7);
+  const [championFeedbackDraft, setChampionFeedbackDraft] = useState<ChampionFeedbackDraft | null>(null);
+  const [championFeedbackSubmitting, setChampionFeedbackSubmitting] = useState(false);
+  const [activityEvents, setActivityEvents] = useState<AgentActivityEvent[]>([]);
+  const [activityStreamState, setActivityStreamState] = useState<ActivityStreamState>("idle");
   const localRuntime = useRef<ChampionLocalRuntime | null>(null);
   const demoImagesRef = useRef<ChampionDemoImage[]>([]);
   const demoSlideshowInFlight = useRef(false);
   const supervisingRequirements = useRef<Set<string>>(new Set());
+  const activeRequirementEnsureAt = useRef<Map<string, number>>(new Map());
   const eventRefreshInFlight = useRef(false);
   const liveRefreshInFlight = useRef(false);
+  const cachedGetRequests = useRef<Map<string, CachedGetRequest>>(new Map());
+  const workerRequirementsRef = useRef<WorkerRequirement[]>([]);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -469,6 +781,27 @@ export function App() {
     () => buildExperimentTimeline(selectedProject, detail),
     [detail, selectedProject],
   );
+  const visibleActivityEvents = useMemo(
+    () => (activityEvents.length > 0 ? activityEvents : buildFallbackActivityEvents(selectedProjectId, detail)),
+    [activityEvents, detail, selectedProjectId],
+  );
+  const missionDigest = useMemo(
+    () =>
+      buildMissionDigest({
+        health,
+        selectedProject,
+        detail,
+        automationSettings,
+        activityStreamState,
+        visibleActivityEvents,
+        loading,
+      }),
+    [activityStreamState, automationSettings, detail, health, loading, selectedProject, visibleActivityEvents],
+  );
+  const memoryRetrievalProbe = useMemo(
+    () => buildMemoryRetrievalProbeSnapshots(detail.executionEvents),
+    [detail.executionEvents],
+  );
   const datasetIntelligence = useMemo(
     () => buildDatasetIntelligence(detail.datasets[0] ?? null, latestDecision, detail.datasetMetadata),
     [detail.datasetMetadata, detail.datasets, latestDecision],
@@ -478,6 +811,7 @@ export function App() {
     [detail.champion, detail.jobs, detail.runEvaluations, detail.runSummaries],
   );
   const championExportDemo = useMemo(() => buildChampionExportDemo(detail), [detail]);
+  const championDetectionDefaults = useMemo(() => detectionDefaultsFromChampionExportDemo(championExportDemo), [championExportDemo]);
   const reviewState = automationReviewState(automationSettings);
 
   const firstDatasetId = detail.datasets[0]?.id ?? "";
@@ -485,20 +819,69 @@ export function App() {
   const visibleJobs = detail.jobs.slice(jobPage * jobsPerPage, jobPage * jobsPerPage + jobsPerPage);
 
   const request = useCallback(
-    async <T,>(path: string, options: { method?: string; body?: unknown } = {}) => {
-      const response = await window.missionControl.request<T | OrchestratorHttpErrorResponse>({
-        baseUrl,
-        path,
-        method: options.method,
-        body: options.body,
-      });
-      if (isOrchestratorHttpErrorResponse(response)) {
-        const statusText = response.statusText ? ` ${response.statusText}` : "";
-        const message = response.message || "request failed";
-        const requestPath = response.path ? ` (${response.path})` : "";
-        throw new Error(`${response.status}${statusText} ${message}${requestPath}`);
+    async <T,>(path: string, options: RequestOptions = {}) => {
+      const method = (options.method ?? "GET").toUpperCase();
+      const runRequest = async () => {
+        const response = await window.missionControl.request<T | OrchestratorHttpErrorResponse>({
+          baseUrl,
+          path,
+          method: options.method,
+          body: options.body,
+        });
+        if (isOrchestratorHttpErrorResponse(response)) {
+          const statusText = response.statusText ? ` ${response.statusText}` : "";
+          const message = response.message || "request failed";
+          const requestPath = response.path ? ` (${response.path})` : "";
+          throw new Error(`${response.status}${statusText} ${message}${requestPath}`);
+        }
+        return response;
+      };
+
+      if (method !== "GET") {
+        const response = await runRequest();
+        cachedGetRequests.current.clear();
+        return response;
       }
-      return response;
+
+      const cacheTtlMs = options.bypassCache ? 0 : options.cacheTtlMs ?? cachedGetRequestTtlMs(path);
+      const cacheKey = `${baseUrl} ${path}`;
+      const now = Date.now();
+      const cached = cachedGetRequests.current.get(cacheKey);
+      if (cached?.promise) {
+        return cached.promise as Promise<T>;
+      }
+      if (!options.bypassCache && cached?.hasValue && cached.expiresAt > now) {
+        return cached.value as T;
+      }
+
+      const promise = runRequest();
+      cachedGetRequests.current.set(cacheKey, {
+        expiresAt: now + cacheTtlMs,
+        hasValue: false,
+        promise,
+      });
+      try {
+        const response = await promise;
+        if (cacheTtlMs > 0) {
+          cachedGetRequests.current.set(cacheKey, {
+            expiresAt: Date.now() + cacheTtlMs,
+            hasValue: true,
+            value: response,
+          });
+        } else {
+          const current = cachedGetRequests.current.get(cacheKey);
+          if (current?.promise === promise) {
+            cachedGetRequests.current.delete(cacheKey);
+          }
+        }
+        return response;
+      } catch (error) {
+        const current = cachedGetRequests.current.get(cacheKey);
+        if (current?.promise === promise) {
+          cachedGetRequests.current.delete(cacheKey);
+        }
+        throw error;
+      }
     },
     [baseUrl],
   );
@@ -523,7 +906,7 @@ export function App() {
   }, [request]);
 
   const fetchLatestDatasetVisualAnalysis = useCallback(
-    async (dataset: Dataset | null): Promise<VisualAnalysisDetail> => {
+    async (dataset: Dataset | null, options: Pick<RequestOptions, "bypassCache"> = {}): Promise<VisualAnalysisDetail> => {
       if (!dataset) {
         return {
           analysis: null,
@@ -537,7 +920,7 @@ export function App() {
       const profileFallback = visualAnalysisFromProfile(dataset.profile);
 
       try {
-        const response = await request<VisualAnalysisListResponse>(`/datasets/${dataset.id}/visual-analyses`);
+        const response = await request<VisualAnalysisListResponse>(`/datasets/${dataset.id}/visual-analyses`, options);
         const latest = latestVisualAnalysis(visualAnalysesFromResponse(response)) ?? profileFallback;
         return {
           analysis: latest,
@@ -552,6 +935,7 @@ export function App() {
         try {
           const response = await request<VisualAnalysisListResponse | DatasetVisualAnalysis>(
             `/datasets/${dataset.id}/visual-analyses/latest`,
+            options,
           );
           const latest = latestVisualAnalysis(visualAnalysesFromResponse(response)) ?? profileFallback;
           return {
@@ -591,7 +975,7 @@ export function App() {
   );
 
   const fetchLatestDatasetMetadata = useCallback(
-    async (dataset: Dataset | null): Promise<DatasetMetadataDetail> => {
+    async (dataset: Dataset | null, options: Pick<RequestOptions, "bypassCache"> = {}): Promise<DatasetMetadataDetail> => {
       if (!dataset) {
         return {
           summary: null,
@@ -602,10 +986,10 @@ export function App() {
       }
 
       const [summaryResult, importsResult] = await Promise.all([
-        request<DatasetMetadataSummaryResponse>(`/datasets/${dataset.id}/metadata/summary`)
+        request<DatasetMetadataSummaryResponse>(`/datasets/${dataset.id}/metadata/summary`, options)
           .then((response) => ({ response }))
           .catch((error: unknown) => ({ error })),
-        request<DatasetMetadataImportsResponse>(`/datasets/${dataset.id}/metadata/imports`)
+        request<DatasetMetadataImportsResponse>(`/datasets/${dataset.id}/metadata/imports`, options)
           .then((response) => ({ response }))
           .catch((error: unknown) => ({ error })),
       ]);
@@ -658,89 +1042,124 @@ export function App() {
   );
 
   const refreshProjectDetail = useCallback(
-    async (projectId: string) => {
+    async (projectId: string, options: ProjectDetailRefreshOptions = {}) => {
       if (!projectId) {
         setDetail(emptyProjectDetail());
         return;
       }
+      const includeSlowData = options.includeSlowData ?? true;
+      const slowRequestOptions: Pick<RequestOptions, "bypassCache"> = {
+        bypassCache: options.forceSlowData ?? false,
+      };
 
       const [
         datasets,
         jobs,
         plans,
         runSummaries,
-        runEvaluations,
         champion,
-        decisions,
         workers,
         workerRequirements,
         executionEvents,
-        agentInvocations,
-        agentMemory,
-        strategyScorecards,
-      ] =
-        await Promise.all([
+      ] = await Promise.all([
         request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
         request<{ jobs: Job[] }>(`/projects/${projectId}/jobs`),
         request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
         request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries`),
-        request<{ evaluations: TrainingRunEvaluation[] }>(`/projects/${projectId}/training-run-evaluations`),
         request<{ champion: ProjectChampion | null }>(`/projects/${projectId}/champion`),
-        request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`),
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
         request<{ requirements: WorkerRequirement[] }>(`/projects/${projectId}/worker-requirements`),
         request<{ events: ExecutionEvent[] }>(`/projects/${projectId}/execution-events?limit=8`),
-        request<AgentInvocationsResponse>(`/projects/${projectId}/agent-invocations?limit=8`).catch(
-          (): AgentInvocationsResponse => ({ invocations: [] }),
-        ),
-        request<{ records: AgentMemoryRecord[] }>(`/projects/${projectId}/agent-memory?limit=6`),
-        request<{ scorecards: StrategyScorecard[] }>(`/projects/${projectId}/strategy-scorecards?limit=6`),
       ]);
 
       const firstDataset = datasets.datasets[0] ?? null;
-      const [visualAnalysis, datasetMetadata] = await Promise.all([
-        fetchLatestDatasetVisualAnalysis(firstDataset),
-        fetchLatestDatasetMetadata(firstDataset),
-      ]);
+      const slowData = includeSlowData
+        ? await Promise.all([
+            request<{ evaluations: TrainingRunEvaluation[] }>(`/projects/${projectId}/training-run-evaluations`, slowRequestOptions),
+            request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`, slowRequestOptions),
+            request<AgentInvocationsResponse>(`/projects/${projectId}/agent-invocations?limit=8`, slowRequestOptions).catch(
+              (): AgentInvocationsResponse => ({ invocations: [] }),
+            ),
+            request<MissionControlTelemetryResponse>(`/projects/${projectId}/telemetry-summary?limit=1000`, slowRequestOptions).catch(
+              (): MissionControlTelemetryResponse => ({}),
+            ),
+            request<{ records: AgentMemoryRecord[] }>(`/projects/${projectId}/agent-memory?limit=6`, slowRequestOptions),
+            request<{ scorecards: StrategyScorecard[] }>(`/projects/${projectId}/strategy-scorecards?limit=6`, slowRequestOptions),
+            fetchLatestDatasetVisualAnalysis(firstDataset, slowRequestOptions),
+            fetchLatestDatasetMetadata(firstDataset, slowRequestOptions),
+          ])
+        : null;
+      const runEvaluations = slowData?.[0];
+      const decisions = slowData?.[1];
+      const agentInvocations = slowData?.[2];
+      const telemetry = slowData?.[3];
+      const agentMemory = slowData?.[4];
+      const strategyScorecards = slowData?.[5];
+      const visualAnalysis = slowData?.[6];
+      const datasetMetadata = slowData?.[7];
 
       const championValue = champion.champion;
-      const [championExports, championDemoImages, championDemoPredictions] = championValue
+      const championSlowData = includeSlowData && championValue
         ? await Promise.all([
-            request<{ exports: ChampionExport[] }>(`/projects/${projectId}/champion/exports`).catch(() => ({ exports: [] })),
+            request<{ exports: ChampionExport[] }>(`/projects/${projectId}/champion/exports`, slowRequestOptions).catch(() => ({ exports: [] })),
             request<{ images: ChampionDemoImage[] }>(
-              `/projects/${projectId}/champion/demo-images?max_total_images=12&max_per_class=2`,
+              `/projects/${projectId}/champion/demo-images?max_total_images=32&max_per_class=4`,
+              slowRequestOptions,
             ).catch(() => ({ images: [] })),
             request<{ predictions?: ChampionDemoPrediction[]; history?: ChampionDemoPrediction[]; demo_predictions?: ChampionDemoPrediction[] }>(
               `/projects/${projectId}/champion/demo-predictions?limit=8`,
+              slowRequestOptions,
             ).catch((): { predictions?: ChampionDemoPrediction[]; history?: ChampionDemoPrediction[]; demo_predictions?: ChampionDemoPrediction[] } => ({
               predictions: [],
             })),
+            request<{ feedback?: ChampionFeedback[]; items?: ChampionFeedback[] }>(
+              `/projects/${projectId}/champion/feedback`,
+              slowRequestOptions,
+            ).catch((): { feedback?: ChampionFeedback[]; items?: ChampionFeedback[] } => ({ feedback: [] })),
           ])
-        : [{ exports: [] }, { images: [] }, { predictions: [] }];
+        : null;
+      const championExports = championSlowData?.[0];
+      const championDemoImages = championSlowData?.[1];
+      const championDemoPredictions = championSlowData?.[2];
+      const championFeedback = championSlowData?.[3];
 
-      setDetail({
-        decisions: decisions.decisions,
-        datasets: datasets.datasets,
-        visualAnalysis,
-        datasetMetadata,
-        jobs: jobs.jobs,
-        plans: plans.plans,
-        runSummaries: runSummaries.summaries,
-        runEvaluations: runEvaluations.evaluations,
-        champion: championValue,
-        championExports: championExports.exports,
-        championDemoImages: championDemoImages.images,
-        championDemoPredictions:
-          championDemoPredictions.predictions ??
-          championDemoPredictions.history ??
-          championDemoPredictions.demo_predictions ??
-          [],
-        workers: workers.workers,
-        workerRequirements: workerRequirements.requirements,
-        executionEvents: executionEvents.events,
-        agentInvocations: agentInvocationsFromResponse(agentInvocations),
-        agentMemory: agentMemory.records,
-        strategyScorecards: strategyScorecards.scorecards,
+      setDetail((previous) => {
+        const previousChampionMatches =
+          championValue && previous.champion && previous.champion.job_id === championValue.job_id;
+        return {
+          decisions: decisions?.decisions ?? previous.decisions,
+          datasets: datasets.datasets,
+          visualAnalysis: visualAnalysis ?? previous.visualAnalysis,
+          datasetMetadata: datasetMetadata ?? previous.datasetMetadata,
+          jobs: jobs.jobs,
+          plans: plans.plans,
+          runSummaries: runSummaries.summaries,
+          runEvaluations: runEvaluations?.evaluations ?? previous.runEvaluations,
+          champion: championValue,
+          championExports: championValue
+            ? championExports?.exports ?? (previousChampionMatches ? previous.championExports : [])
+            : [],
+          championDemoImages: championValue
+            ? championDemoImages?.images ?? (previousChampionMatches ? previous.championDemoImages : [])
+            : [],
+          championDemoPredictions:
+            championValue
+              ? championDemoPredictions?.predictions ??
+                championDemoPredictions?.history ??
+                championDemoPredictions?.demo_predictions ??
+                (previousChampionMatches ? previous.championDemoPredictions : [])
+              : [],
+          championFeedback: championValue
+            ? championFeedback?.feedback ?? championFeedback?.items ?? (previousChampionMatches ? previous.championFeedback : [])
+            : [],
+          workers: workers.workers,
+          workerRequirements: workerRequirements.requirements,
+          executionEvents: executionEvents.events,
+          agentInvocations: agentInvocations ? agentInvocationsFromResponse(agentInvocations) : previous.agentInvocations,
+          telemetry: telemetry ?? previous.telemetry,
+          agentMemory: agentMemory?.records ?? previous.agentMemory,
+          strategyScorecards: strategyScorecards?.scorecards ?? previous.strategyScorecards,
+        };
       });
 
       setSelectedJobId((currentJobId) => {
@@ -770,7 +1189,7 @@ export function App() {
       await refreshAutomationSettings();
       await refreshProjects();
       if (selectedProjectId) {
-        await refreshProjectDetail(selectedProjectId);
+        await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
       }
       await refreshSelectedJobMetrics();
     } catch (error) {
@@ -787,16 +1206,17 @@ export function App() {
     selectedProjectId,
   ]);
 
-  const refreshLive = useCallback(async () => {
+  const refreshLive = useCallback(async (options: ProjectDetailRefreshOptions = { includeSlowData: false }) => {
     if (liveRefreshInFlight.current) {
       return;
     }
+    const includeSlowData = options.includeSlowData ?? false;
     liveRefreshInFlight.current = true;
     try {
       await refreshHealth();
       await refreshProjects();
       if (selectedProjectId) {
-        await refreshProjectDetail(selectedProjectId);
+        await refreshProjectDetail(selectedProjectId, { includeSlowData, forceSlowData: includeSlowData });
       }
       await refreshSelectedJobMetrics();
     } catch {
@@ -809,23 +1229,29 @@ export function App() {
   const superviseWorkerRequirements = useCallback(async () => {
     if (!selectedProjectId) return;
 
-    const response = await request<{ requirements: WorkerRequirement[] }>(
-      `/projects/${selectedProjectId}/worker-requirements`,
+    const actionable = workerRequirementsRef.current.filter((requirement) =>
+      requirement.status === "PENDING" || requirement.status === "STARTING" || requirement.status === "ACTIVE",
     );
-    const pending = response.requirements.filter((requirement) =>
-      requirement.status === "PENDING" || requirement.status === "STARTING",
-    );
+    const now = Date.now();
 
-    for (const requirement of pending) {
+    for (const requirement of actionable) {
       if (supervisingRequirements.current.has(requirement.id)) {
         continue;
       }
+      const alreadyActive = requirement.status === "ACTIVE";
+      const lastEnsureAt = activeRequirementEnsureAt.current.get(requirement.id) ?? 0;
+      if (alreadyActive && now - lastEnsureAt < 30_000) {
+        continue;
+      }
+      activeRequirementEnsureAt.current.set(requirement.id, now);
       supervisingRequirements.current.add(requirement.id);
       try {
-        await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
-          method: "PATCH",
-          body: { status: "STARTING", last_error: "" },
-        });
+        if (!alreadyActive) {
+          await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
+            method: "PATCH",
+            body: { status: "STARTING", last_error: "" },
+          });
+        }
 
         await window.missionControl.ensureProjectWorker({
           projectId: requirement.project_id,
@@ -835,10 +1261,12 @@ export function App() {
           count: requirement.target_count,
         });
 
-        await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
-          method: "PATCH",
-          body: { status: "ACTIVE", last_error: "" },
-        });
+        if (!alreadyActive) {
+          await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
+            method: "PATCH",
+            body: { status: "ACTIVE", last_error: "" },
+          });
+        }
       } catch (error) {
         await request<WorkerRequirement>(`/worker-requirements/${requirement.id}`, {
           method: "PATCH",
@@ -849,7 +1277,7 @@ export function App() {
         }).catch(() => undefined);
       } finally {
         supervisingRequirements.current.delete(requirement.id);
-        refreshProjectDetail(selectedProjectId).catch(() => undefined);
+        refreshProjectDetail(selectedProjectId, { includeSlowData: false }).catch(() => undefined);
       }
     }
   }, [baseUrl, refreshProjectDetail, request, selectedProjectId]);
@@ -857,6 +1285,10 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("orchestratorUrl", baseUrl);
   }, [baseUrl]);
+
+  useEffect(() => {
+    workerRequirementsRef.current = detail.workerRequirements;
+  }, [detail.workerRequirements]);
 
   useEffect(() => {
     refreshAll();
@@ -871,11 +1303,17 @@ export function App() {
       setCustomDemoImageURI("");
       setCustomDemoTrueLabel("");
       setDemoSlideshowEnabled(false);
+      setDemoSlideshowIntervalMs(5200);
+      setDetectionConfidenceThreshold(0.25);
+      setDetectionIouThreshold(0.7);
       setLocalInferenceStatus("not_ready");
       setLocalInferenceError("");
+      setActivityEvents([]);
+      setActivityStreamState("connecting");
       localRuntime.current = null;
+      activeRequirementEnsureAt.current.clear();
       setJobPage(0);
-      refreshProjectDetail(selectedProjectId).catch((error) =>
+      refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch((error) =>
         setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
       );
     }
@@ -903,6 +1341,16 @@ export function App() {
   }, [championExportDemo.exports]);
 
   useEffect(() => {
+    if (!championDetectionDefaults.isDetection) return;
+    setDetectionConfidenceThreshold(championDetectionDefaults.confidenceThreshold);
+    setDetectionIouThreshold(championDetectionDefaults.iouThreshold);
+  }, [
+    championDetectionDefaults.confidenceThreshold,
+    championDetectionDefaults.iouThreshold,
+    championDetectionDefaults.isDetection,
+  ]);
+
+  useEffect(() => {
     if (!demoSlideshowEnabled) return;
     const runNextSlide = () => {
       if (demoSlideshowInFlight.current) return;
@@ -924,9 +1372,9 @@ export function App() {
     };
 
     runNextSlide();
-    const timer = window.setInterval(runNextSlide, 5200);
+    const timer = window.setInterval(runNextSlide, demoSlideshowIntervalMs);
     return () => window.clearInterval(timer);
-  }, [demoSlideshowEnabled, selectedProjectId]);
+  }, [demoSlideshowEnabled, demoSlideshowIntervalMs, selectedProjectId]);
 
   useEffect(() => {
     refreshSelectedJobMetrics().catch((error) =>
@@ -937,35 +1385,60 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       refreshLive();
-    }, 2500);
+    }, liveRefreshIntervalMs);
 
     return () => window.clearInterval(timer);
   }, [refreshLive]);
 
   useEffect(() => {
-    if (!selectedProjectId || typeof EventSource === "undefined") return;
+    if (!selectedProjectId) {
+      setActivityStreamState("idle");
+      return;
+    }
+    if (typeof EventSource === "undefined") {
+      setActivityStreamState("fallback");
+      return;
+    }
 
     let closed = false;
-    const streamUrl = new URL(`/projects/${selectedProjectId}/events/stream`, baseUrl);
+    setActivityStreamState("connecting");
+    const streamUrl = new URL(`/projects/${selectedProjectId}/activity-stream`, baseUrl);
+    streamUrl.searchParams.set("limit", "12");
+    streamUrl.searchParams.set("interval_ms", "2000");
     const events = new EventSource(streamUrl.toString());
-    const triggerRefresh = () => {
+    const triggerRefresh = (event: MessageEvent | Event) => {
       if (closed || eventRefreshInFlight.current) return;
+      const includeSlowData = eventNeedsSlowProjectRefresh(event);
       eventRefreshInFlight.current = true;
       window.setTimeout(() => {
-        refreshLive()
+        refreshLive({ includeSlowData })
           .catch(() => undefined)
           .finally(() => {
             eventRefreshInFlight.current = false;
           });
-      }, 150);
+        }, 150);
     };
 
-    events.onmessage = triggerRefresh;
-    events.addEventListener("execution_event", triggerRefresh);
-    events.addEventListener("project_event", triggerRefresh);
+    const handleActivityEvent = (event: MessageEvent) => {
+      const activity = activityEventFromMessage(event);
+      if (activity) {
+        setActivityEvents((current) => mergeActivityEvents(current, activity));
+      }
+      triggerRefresh(event);
+    };
+
+    events.onopen = () => {
+      if (!closed) setActivityStreamState("connected");
+    };
+    events.onmessage = (event) => {
+      handleActivityEvent(event);
+    };
+    events.addEventListener("activity_event", handleActivityEvent);
+    events.addEventListener("stream_error", () => {
+      if (!closed) setActivityStreamState("fallback");
+    });
     events.onerror = () => {
-      closed = true;
-      events.close();
+      if (!closed) setActivityStreamState("reconnecting");
     };
 
     return () => {
@@ -1037,7 +1510,7 @@ export function App() {
       setNewProjectFolder(null);
       setNewProjectOpen(false);
       await refreshProjects();
-      await refreshProjectDetail(project.id);
+      await refreshProjectDetail(project.id, { includeSlowData: true, forceSlowData: true });
       setNotice({ kind: "info", text: `Created ${project.name} with dataset ${metadata.name}. ${workerMessage}` });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
@@ -1061,7 +1534,7 @@ export function App() {
     });
 
     setSelectedJobId(job.id);
-    await refreshProjectDetail(selectedProjectId);
+    await refreshProjectDetail(selectedProjectId, { includeSlowData: false });
   }
 
   async function requestVisualAnalysisRerun() {
@@ -1089,7 +1562,7 @@ export function App() {
       } catch (error) {
         workerMessage = `Queued, but worker did not start: ${errorMessage(error)}`;
       }
-      await refreshProjectDetail(selectedProjectId);
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: false });
       const responseStatus =
         recordString(response, "status") ||
         recordString(recordObject(response.job), "status") ||
@@ -1135,7 +1608,7 @@ export function App() {
         body: { provider: "modal", gpu_type: "T4" },
       });
 
-      await refreshProjectDetail(selectedProjectId);
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: false });
       setNotice({
         kind: "info",
         text: `Plan execution ensured ${response.jobs.length} experiment jobs across ${workerPool.running_count} workers.`,
@@ -1158,7 +1631,7 @@ export function App() {
         body: {},
       });
 
-      await refreshProjectDetail(selectedProjectId);
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
       setNotice({ kind: "info", text: `Reviewer decision: ${decision.decision_type}` });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
@@ -1182,7 +1655,7 @@ export function App() {
       );
 
       if (!response.follow_up_plan) {
-        await refreshProjectDetail(selectedProjectId);
+        await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
         setNotice({ kind: "info", text: `No follow-up scheduled. Reviewer decision: ${response.decision.decision_type}` });
         return;
       }
@@ -1202,7 +1675,7 @@ export function App() {
         body: { provider: "modal", gpu_type: "T4" },
       });
 
-      await refreshProjectDetail(selectedProjectId);
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
       setNotice({
         kind: "info",
         text: `Scheduled ${execution.jobs.length} follow-up jobs from ${plan.id} across ${workerPool.running_count} workers.`,
@@ -1224,7 +1697,7 @@ export function App() {
         method: "POST",
         body: { format },
       });
-      await refreshProjectDetail(selectedProjectId);
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
       setNotice({ kind: "info", text: `Champion export recorded as ${exportRecord.status || "PENDING"}.` });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
@@ -1282,7 +1755,10 @@ export function App() {
 
     setLocalInferenceStatus("loading");
     setLocalInferenceError("");
-    const artifact = await window.missionControl.loadModelArtifact({ artifactUri: artifactURI });
+    const artifact = await window.missionControl.loadModelArtifact({
+      artifactUri: artifactURI,
+      externalData: championExportExternalData(exportRecord),
+    });
     const runtime = await createChampionLocalRuntime(artifact, {
       exportRecord,
       deploymentProfile: championExportDemo.deploymentProfile,
@@ -1299,7 +1775,11 @@ export function App() {
       throw new Error("Local UI inference needs an image preview URI or a local uploaded image.");
     }
     const runtime = await ensureChampionLocalRuntime();
-    const prediction = await predictChampionImage(runtime, image, imageSource);
+    const prediction = await predictChampionImage(runtime, image, imageSource, {
+      confidenceThreshold: detectionConfidenceThreshold,
+      iouThreshold: detectionIouThreshold,
+      maxDetections: 100,
+    });
     setDemoPrediction(attachDemoPredictionPreview(prediction, { ...image, thumbnail_uri: imageSource }));
   }
 
@@ -1331,6 +1811,9 @@ export function App() {
             true_label: demoImageLabel(image),
             image_metadata: demoPredictionRequestMetadata(image),
             top_k: 5,
+            confidence_threshold: detectionConfidenceThreshold,
+            iou_threshold: detectionIouThreshold,
+            max_detections: 100,
           },
         },
       );
@@ -1339,7 +1822,7 @@ export function App() {
       if (normalized.id && !isTerminalDemoPredictionStatus(normalized.status)) {
         await pollChampionDemoPrediction(normalized.id, image);
       } else {
-        await refreshProjectDetail(selectedProjectId).catch(() => undefined);
+        await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
       }
     } catch (error) {
       if (readyONNXExport(championExportDemo.exports)) {
@@ -1370,7 +1853,59 @@ export function App() {
       setDemoPrediction(normalized);
       if (isTerminalDemoPredictionStatus(normalized.status)) break;
     }
-    await refreshProjectDetail(selectedProjectId).catch(() => undefined);
+    await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
+  }
+
+  function openChampionFeedback(rating: ChampionFeedbackRating) {
+    if (!detail.champion) return;
+    setChampionFeedbackDraft({ rating, message: "" });
+  }
+
+  async function submitChampionFeedback() {
+    if (!selectedProjectId || !detail.champion || !championFeedbackDraft) return;
+    const selectedHeldoutImage = championExportDemo.demoImages[selectedDemoImageIndex] ?? null;
+    const activeImage = customDemoImage ?? selectedHeldoutImage;
+    const imageURI = demoPrediction?.image_uri || (activeImage ? demoImageURI(activeImage) : customDemoImageURI.trim());
+    const imageID = demoPrediction?.image_id || activeImage?.image_id || activeImage?.id || "";
+
+    setChampionFeedbackSubmitting(true);
+    setNotice(null);
+    try {
+      const response = await request<{ feedback?: ChampionFeedback } | ChampionFeedback>(`/projects/${selectedProjectId}/champion/feedback`, {
+        method: "POST",
+        body: {
+          prediction_id: demoPrediction?.id || "",
+          image_uri: imageURI,
+          image_id: imageID,
+          rating: championFeedbackDraft.rating,
+          message: championFeedbackDraft.message.trim(),
+          prediction_snapshot: demoPrediction ? recordObject(demoPrediction) : {},
+          metrics_snapshot: championFeedbackMetricsSnapshot(detail),
+          metadata: {
+            ui_source: "mission_control_champion_test_bench",
+            local_inference_status: localInferenceStatus,
+            local_inference_error: localInferenceError,
+            export_status: championExportDemo.exportStatus,
+            selected_image_index: selectedDemoImageIndex,
+            custom_image: Boolean(customDemoImageURI.trim()),
+          },
+        },
+      });
+      const created = normalizeChampionFeedbackResponse(response);
+      if (created) {
+        setDetail((previous) => ({
+          ...previous,
+          championFeedback: [created, ...previous.championFeedback.filter((item) => item.id !== created.id)],
+        }));
+      }
+      setChampionFeedbackDraft(null);
+      setNotice({ kind: "info", text: "Champion feedback recorded." });
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setChampionFeedbackSubmitting(false);
+    }
   }
 
   function updateSettingsDraft(update: AutomationSettingsUpdate) {
@@ -1406,6 +1941,45 @@ export function App() {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
       setLoading(false);
+    }
+  }
+
+  function openProjectTab(tab: ProjectTabKey, targetId?: string) {
+    setActiveProjectTab(tab);
+    if (!targetId) return;
+    window.requestAnimationFrame(() => {
+      document.getElementById(targetId)?.scrollIntoView({ block: "start" });
+    });
+  }
+
+  async function handleMissionAction(action: MissionNextAction) {
+    if (action.disabled) return;
+    if (action.actionKey === "new_project") {
+      setNewProjectOpen(true);
+      return;
+    }
+    if (action.actionKey === "refresh") {
+      await refreshAll();
+      return;
+    }
+    if (action.actionKey === "execute_plan") {
+      if (latestPlan) await executePlan(latestPlan.id);
+      return;
+    }
+    if (action.actionKey === "review_experiments") {
+      await reviewExperiments();
+      return;
+    }
+    if (action.actionKey === "schedule_follow_up") {
+      await scheduleFollowUpExperiments();
+      return;
+    }
+    if (action.actionKey === "open_export") {
+      openProjectTab(action.targetTab ?? "export", action.targetId ?? "export-demo");
+      return;
+    }
+    if (action.targetTab) {
+      openProjectTab(action.targetTab, action.targetId);
     }
   }
 
@@ -1505,35 +2079,11 @@ export function App() {
 					))}
 				</nav>
 
-				<section className="summary-grid" id="overview" data-project-tab="overview">
-          <MetricCard icon={<Box size={18} />} label="Datasets" value={detail.datasets.length} />
-          <MetricCard icon={<Activity size={18} />} label="Jobs" value={detail.jobs.length} />
-          <MetricCard icon={<ClipboardList size={18} />} label="Plans" value={detail.plans.length} />
-          <MetricCard icon={<MonitorDot size={18} />} label="Workers" value={detail.workers.length} />
-          <MetricCard
-            icon={<ListRestart size={18} />}
-            label="Queued"
-            value={detail.jobs.filter((job) => job.status === "QUEUED").length}
-          />
+				<section className="mission-overview-shell" id="overview" data-project-tab="overview">
+          <MissionOverview digest={missionDigest} onAction={handleMissionAction} onOpenTab={openProjectTab} />
         </section>
 
 				<section className="content-grid mission-grid">
-					<Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide tab="overview">
-            <div className="timeline">
-              {timelineItems.map((item) => (
-                <div className={`timeline-item ${item.status}`} key={item.label}>
-                  <span className="timeline-dot" />
-                  <div>
-                    <strong>{item.label}</strong>
-                    <small>{item.detail}</small>
-                    {item.timestamp && <small>{new Date(item.timestamp).toLocaleString()}</small>}
-                  </div>
-                  <Badge value={item.status} />
-                </div>
-              ))}
-            </div>
-          </Panel>
-
 					<Panel title="Dataset Intelligence" icon={<BarChart3 size={17} />} wide id="data" tab="data">
             {datasetIntelligence.dataset ? (
               <div className="dataset-intelligence">
@@ -1684,6 +2234,22 @@ export function App() {
         </section>
 
         <section className="content-grid">
+					<Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide id="experiment-timeline" tab="operations">
+            <div className="timeline">
+              {timelineItems.map((item) => (
+                <div className={`timeline-item ${item.status}`} key={item.label}>
+                  <span className="timeline-dot" />
+                  <div>
+                    <strong>{item.label}</strong>
+                    <small>{item.detail}</small>
+                    {item.timestamp && <small>{new Date(item.timestamp).toLocaleString()}</small>}
+                  </div>
+                  <Badge value={item.status} />
+                </div>
+              ))}
+            </div>
+          </Panel>
+
 					<Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide id="operations" tab="operations">
             <div className="settings-panel">
               <div className="settings-grid">
@@ -1833,7 +2399,7 @@ export function App() {
           </Panel>
 
           {detail.champion && (
-						<Panel title="Selected Champion" icon={<Trophy size={17} />} wide tab="overview">
+						<Panel title="Champion Details" icon={<Trophy size={17} />} wide id="champion-detail" tab="export">
               <div className="champion-panel">
                 <div className="champion-head">
                   <span>
@@ -1901,6 +2467,9 @@ export function App() {
               localInferenceStatus={localInferenceStatus}
               localInferenceError={localInferenceError}
               slideshowEnabled={demoSlideshowEnabled}
+              slideshowIntervalMs={demoSlideshowIntervalMs}
+              detectionConfidenceThreshold={detectionConfidenceThreshold}
+              detectionIouThreshold={detectionIouThreshold}
               onCustomImageURIChange={setCustomDemoImageURI}
               onCustomTrueLabelChange={setCustomDemoTrueLabel}
               onChooseCustomImage={chooseChampionDemoImage}
@@ -1927,6 +2496,10 @@ export function App() {
               }}
               onRequestExport={() => requestChampionExport("onnx")}
               onRunPrediction={runChampionDemoPrediction}
+              onOpenFeedback={openChampionFeedback}
+              onSlideshowIntervalChange={setDemoSlideshowIntervalMs}
+              onDetectionConfidenceThresholdChange={setDetectionConfidenceThreshold}
+              onDetectionIouThresholdChange={setDetectionIouThreshold}
             />
           </Panel>
 
@@ -1985,7 +2558,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Champion Comparison" icon={<Trophy size={17} />} wide tab="experiments">
+					<Panel title="Champion Comparison" icon={<Trophy size={17} />} wide id="champion-comparison" tab="experiments">
             {championComparison.length > 0 ? (
               <div className="comparison-table">
                 <div className="comparison-row comparison-head">
@@ -2027,7 +2600,11 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agents" tab="agents">
+					<Panel title="Live Agent Activity" icon={<Activity size={17} />} wide id="agent-activity" tab="agents">
+            <AgentActivityPanel events={visibleActivityEvents} streamState={activityStreamState} detail={detail} />
+          </Panel>
+
+					<Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agent-decisions" tab="agents">
             <div className="decision-panel">
               <div className="decision-actions">
                 <div>
@@ -2060,7 +2637,11 @@ export function App() {
             <DecisionQualityPanel decisions={detail.decisions} invocations={detail.agentInvocations} />
           </Panel>
 
-					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide tab="operations">
+					<Panel title="Mission Control Telemetry" icon={<Activity size={17} />} wide tab="agents">
+            <MissionControlTelemetryPanel telemetry={detail.telemetry} fallbackInvocations={detail.agentInvocations} />
+          </Panel>
+
+					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide id="automation-timeline" tab="operations">
             <div className="automation-grid">
               <div className="automation-block">
                 <strong>Worker Requirements</strong>
@@ -2108,7 +2689,11 @@ export function App() {
             <AgentInvocationAuditPanel invocations={detail.agentInvocations} decisions={detail.decisions} />
           </Panel>
 
-					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide tab="agents">
+					<Panel title="Memory Retrieval Probe" icon={<BrainCircuit size={17} />} wide id="memory-retrieval-probe" tab="agents">
+            <MemoryRetrievalProbePanel snapshots={memoryRetrievalProbe} />
+          </Panel>
+
+					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide id="agent-memory" tab="agents">
             {detail.agentMemory.length > 0 ? (
               <div className="memory-list">
                 {detail.agentMemory.map((record) => (
@@ -2261,7 +2846,7 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Manual Job Queue" icon={<Play size={17} />} wide tab="operations">
+					<Panel title="Manual Job Queue" icon={<Play size={17} />} wide id="manual-job-queue" tab="operations">
             <form
               className="job-create-grid"
               onSubmit={(event) => {
@@ -2288,7 +2873,7 @@ export function App() {
             </form>
           </Panel>
 
-					<Panel title="Workers" icon={<MonitorDot size={17} />} wide tab="operations">
+					<Panel title="Workers" icon={<MonitorDot size={17} />} wide id="workers" tab="operations">
             <div className="table">
               <div className="table-row table-head">
                 <span>Name</span>
@@ -2332,7 +2917,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide tab="experiments">
+					<Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide id="recent-jobs" tab="experiments">
             <div className="job-panel-head">
               <span>
                 Showing {visibleJobs.length} of {detail.jobs.length}
@@ -2378,7 +2963,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Run Metrics" icon={<Activity size={17} />} wide tab="experiments">
+					<Panel title="Run Metrics" icon={<Activity size={17} />} wide id="run-metrics" tab="experiments">
             {selectedJob ? (
               <div className="metric-area">
                 <div className="selected-job">
@@ -2462,6 +3047,42 @@ export function App() {
           </section>
         </div>
       )}
+      {championFeedbackDraft && (
+        <div className="modal-backdrop">
+          <section className="modal">
+            <header>
+              <div>
+                <div className="eyebrow">Champion Feedback</div>
+                <h3>{feedbackRatingLabel(championFeedbackDraft.rating)} Output</h3>
+              </div>
+              <button className="icon-command" onClick={() => setChampionFeedbackDraft(null)} disabled={championFeedbackSubmitting}>
+                <X size={16} />
+              </button>
+            </header>
+            <form
+              className="stack"
+              onSubmit={(event) => {
+                event.preventDefault();
+                submitChampionFeedback();
+              }}
+            >
+              <label className="field">
+                <span>Optional note</span>
+                <textarea
+                  value={championFeedbackDraft.message}
+                  onChange={(event) => setChampionFeedbackDraft((current) => current ? { ...current, message: event.target.value } : current)}
+                  placeholder="What did the champion get right or wrong?"
+                  rows={4}
+                />
+              </label>
+              <button className="command primary" disabled={championFeedbackSubmitting}>
+                <MessageSquare size={16} />
+                {championFeedbackSubmitting ? "Recording..." : "Record Feedback"}
+              </button>
+            </form>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -2489,6 +3110,326 @@ function Panel({
       </header>
       {children}
     </section>
+  );
+}
+
+function MissionOverview({
+  digest,
+  onAction,
+  onOpenTab,
+}: {
+  digest: MissionDigest;
+  onAction: (action: MissionNextAction) => void;
+  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+}) {
+  return (
+    <div className={`mission-overview mission-state-${digest.state}`}>
+      <MissionStatusPanel digest={digest} />
+      <MissionHealthStrip items={digest.health} onOpenTab={onOpenTab} />
+      <MissionNextActions actions={digest.nextActions} onAction={onAction} />
+      <LiveAgentActivity activity={digest.liveActivity} onOpenTab={onOpenTab} />
+      <MissionSignals signals={digest.recentSignals} onOpenTab={onOpenTab} />
+      {digest.champion && <ChampionOutcomeSummary champion={digest.champion} onOpenTab={onOpenTab} />}
+    </div>
+  );
+}
+
+function MissionStatusPanel({ digest }: { digest: MissionDigest }) {
+  return (
+    <section className="mission-status-panel">
+      <div className="mission-status-head">
+        <div>
+          <div className="eyebrow">What is happening</div>
+          <h3>{digest.headline}</h3>
+          <p>{digest.detail}</p>
+        </div>
+        <div className="mission-status-badges">
+          <Badge value={digest.stateLabel} />
+          <Badge value={digest.healthLabel} />
+        </div>
+      </div>
+      <div className="mission-facts">
+        {digest.facts.map((fact) => (
+          <span className={fact.tone ?? "info"} key={`${fact.label}-${fact.value}`}>
+            <small>{fact.label}</small>
+            <strong>{fact.value}</strong>
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MissionHealthStrip({
+  items,
+  onOpenTab,
+}: {
+  items: MissionHealthItem[];
+  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+}) {
+  return (
+    <section className="mission-health-strip" aria-label="Mission health">
+      {items.map((item) => (
+        <button
+          className={`mission-health-chip ${item.tone}`}
+          key={item.id}
+          type="button"
+          onClick={() => item.targetTab && onOpenTab(item.targetTab, item.targetId)}
+        >
+          <small>{item.label}</small>
+          <strong>{item.value}</strong>
+        </button>
+      ))}
+    </section>
+  );
+}
+
+function MissionNextActions({
+  actions,
+  onAction,
+}: {
+  actions: MissionNextAction[];
+  onAction: (action: MissionNextAction) => void;
+}) {
+  const primary = actions.find((action) => action.priority === "primary") ?? actions[0];
+  const secondary = actions.filter((action) => action.id !== primary?.id).slice(0, 3);
+
+  return (
+    <section className="mission-next-actions">
+      <div>
+        <div className="eyebrow">What should I do next</div>
+        {primary ? (
+          <button
+            className="mission-primary-action"
+            type="button"
+            onClick={() => onAction(primary)}
+            disabled={primary.disabled}
+          >
+            <span>
+              <strong>{primary.label}</strong>
+              <small>{primary.reason}</small>
+            </span>
+            <StepForward size={17} />
+          </button>
+        ) : (
+          <div className="empty compact">No operator action is needed right now.</div>
+        )}
+      </div>
+      {secondary.length > 0 && (
+        <div className="mission-secondary-actions">
+          {secondary.map((action) => (
+            <button
+              className="mission-secondary-action"
+              type="button"
+              key={action.id}
+              onClick={() => onAction(action)}
+              disabled={action.disabled}
+            >
+              <span>
+                <strong>{action.label}</strong>
+                <small>{action.reason}</small>
+              </span>
+              <Link2 size={14} />
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function LiveAgentActivity({
+  activity,
+  onOpenTab,
+}: {
+  activity: MissionLiveActivity;
+  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+}) {
+  const moving = ["active", "waiting"].includes(activity.status) || ["connecting", "reconnecting", "fallback"].includes(activity.streamState);
+
+  return (
+    <section className={`live-agent-activity ${activity.status}`}>
+      <div className="live-agent-current">
+        <span className={moving ? "live-agent-pulse active" : "live-agent-pulse"} />
+        <div>
+          <div className="eyebrow">Live LLM activity</div>
+          <strong>{activity.label}</strong>
+          <small>{activity.detail}</small>
+        </div>
+        <Badge value={activityStreamBadge(activity.streamState)} />
+      </div>
+      {activity.steps.length > 0 && (
+        <div className="live-agent-steps">
+          {activity.steps.map((step) => (
+            <button
+              className={`live-agent-step ${step.status}`}
+              key={step.id}
+              type="button"
+              onClick={() => onOpenTab(step.targetTab ?? "agents", step.targetId ?? "agent-activity")}
+            >
+              <span>{step.label}</span>
+              <small>{step.timestamp ? formatRelativeTime(step.timestamp) : step.status}</small>
+            </button>
+          ))}
+        </div>
+      )}
+      <button className="mission-link-button" type="button" onClick={() => onOpenTab("agents", "agent-activity")}>
+        Open full activity
+      </button>
+    </section>
+  );
+}
+
+function MissionSignals({
+  signals,
+  onOpenTab,
+}: {
+  signals: MissionSignal[];
+  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+}) {
+  return (
+    <section className="mission-signals">
+      <div className="mission-section-head">
+        <div>
+          <div className="eyebrow">Recent signals</div>
+          <strong>Important changes</strong>
+        </div>
+      </div>
+      <div className="mission-signal-list">
+        {signals.length > 0 ? (
+          signals.map((signal) => (
+            <button
+              className={`mission-signal ${signal.tone}`}
+              key={signal.id}
+              type="button"
+              onClick={() => signal.targetTab && onOpenTab(signal.targetTab, signal.targetId)}
+            >
+              <span>
+                <strong>{signal.label}</strong>
+                <small>{signal.detail}</small>
+              </span>
+              <small>{signal.timestamp ? formatRelativeTime(signal.timestamp) : ""}</small>
+            </button>
+          ))
+        ) : (
+          <div className="empty compact">No state-changing events have been recorded yet.</div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ChampionOutcomeSummary({
+  champion,
+  onOpenTab,
+}: {
+  champion: MissionChampionSummary;
+  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+}) {
+  const extraFacts = [
+    { label: "Accuracy", value: champion.accuracy },
+    { label: "Latency", value: champion.latency },
+    { label: "Cost", value: champion.cost },
+    { label: "Size", value: champion.modelSize },
+    { label: "Fit", value: champion.objectiveFit },
+  ].filter((fact) => fact.value && fact.value !== "-");
+
+  return (
+    <section className="champion-outcome-summary">
+      <div className="mission-section-head">
+        <div>
+          <div className="eyebrow">Outcome summary</div>
+          <strong>{champion.model}</strong>
+        </div>
+        <Badge value="SELECTED" />
+      </div>
+      <div className="champion-outcome-primary">
+        <small>{champion.primaryMetricLabel}</small>
+        <strong>{champion.primaryMetricValue}</strong>
+      </div>
+      {extraFacts.length > 0 && (
+        <div className="champion-outcome-facts">
+          {extraFacts.slice(0, 4).map((fact) => (
+            <span key={`${fact.label}-${fact.value}`}>
+              <small>{fact.label}</small>
+              <strong>{fact.value}</strong>
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="champion-outcome-actions">
+        <button className="command compact" type="button" onClick={() => onOpenTab("export", "export-demo")}>
+          Open Export
+        </button>
+        <button className="command compact" type="button" onClick={() => onOpenTab("experiments", "champion-comparison")}>
+          Compare Runs
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function AgentActivityPanel({
+  events,
+  streamState,
+  detail,
+}: {
+  events: AgentActivityEvent[];
+  streamState: ActivityStreamState;
+  detail: ProjectDetail;
+}) {
+  const current = agentActivityCurrentState(events, detail, streamState);
+  const visibleEvents = events.slice(0, 12);
+
+  return (
+    <div className="agent-activity-panel">
+      <div className={`activity-current ${current.status}`}>
+        <span className={`activity-marker ${current.severity}`}>{activitySeverityIcon(current.severity)}</span>
+        <div>
+          <strong>{current.title}</strong>
+          <small>{current.detail}</small>
+        </div>
+        <Badge value={activityStreamBadge(streamState)} />
+      </div>
+
+      {visibleEvents.length > 0 ? (
+        <div className="activity-list">
+          {visibleEvents.map((event) => {
+            const rows = activityMetadataRows(event.metadata);
+            return (
+              <div className={`activity-row ${event.severity} ${event.status}`} key={event.id}>
+                <span className={`activity-marker ${event.severity}`}>{activitySeverityIcon(event.severity)}</span>
+                <div className="activity-body">
+                  <div className="activity-row-head">
+                    <span>
+                      <strong>{event.title}</strong>
+                      <small>{activityEventSubtitle(event)}</small>
+                    </span>
+                    <Badge value={event.status} />
+                  </div>
+                  {event.message && <p>{activitySafeDisplayText(event.message, 220)}</p>}
+                  {rows.length > 0 && (
+                    <details className="activity-details">
+                      <summary>Details</summary>
+                      <div className="activity-metadata">
+                        {rows.map((row) => (
+                          <span key={`${event.id}-${row.label}`}>
+                            <small>{row.label}</small>
+                            <strong title={row.value}>{row.value}</strong>
+                          </span>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="empty compact">Agent activity will appear when planning, validation, worker, or job events are recorded.</div>
+      )}
+    </div>
   );
 }
 
@@ -2693,6 +3634,86 @@ function RetrievedMemoryPanel({ memories }: { memories: RetrievedMemoryDisplay[]
   );
 }
 
+function MemoryRetrievalProbePanel({ snapshots }: { snapshots: MemoryRetrievalProbeSnapshot[] }) {
+  if (snapshots.length === 0) {
+    return <div className="empty">No memory retrieval diagnostics logged yet.</div>;
+  }
+
+  const latest = snapshots[0];
+
+  return (
+    <div className="memory-probe-panel">
+      <div className="memory-probe-summary">
+        <span>
+          <strong>{latest.retrievedCount} candidate memory card(s)</strong>
+          <small>
+            {humanizeMemoryPurpose(latest.purpose)} - {formatRelativeTime(latest.createdAt)}
+          </small>
+        </span>
+        <div className="memory-probe-badges">
+          <Badge value={latest.logOnly ? "log only" : "prompt enabled"} />
+          {latest.crossProjectOK && <Badge value="cross project" />}
+        </div>
+      </div>
+
+      <div className="memory-probe-runs">
+        {snapshots.slice(0, 4).map((snapshot, index) => (
+          <details className="memory-probe-run" key={snapshot.id} open={index === 0}>
+            <summary>
+              <span>
+                <strong>{humanizeMemoryPurpose(snapshot.purpose)}</strong>
+                <small>
+                  {snapshot.retrievedCount} retrieved - {formatRelativeTime(snapshot.createdAt)}
+                </small>
+              </span>
+              <Badge value={snapshot.logOnly ? "log only" : "prompt enabled"} />
+            </summary>
+            {snapshot.cards.length > 0 ? (
+              <div className="retrieved-memory-list">
+                {snapshot.cards.slice(0, 8).map((memory, memoryIndex) => (
+                  <div className="retrieved-memory-row" key={`${snapshot.id}-${memory.source}-${memory.sourceId}-${memoryIndex}`}>
+                    <div className="retrieved-memory-head">
+                      <span>
+                        <strong>{memory.source || "Memory"}</strong>
+                        <small>
+                          {[memory.kind, memory.mechanism, memory.intervention].filter(Boolean).join(" - ") ||
+                            "retrieved diagnostic context"}
+                        </small>
+                      </span>
+                      <Badge value={memory.outcome || memory.kind || "memory"} />
+                    </div>
+                    {memory.summary && <p>{memory.summary}</p>}
+                    {(memory.retrievalReason || memory.score !== null) && (
+                      <small className="retrieval-reason">
+                        {[memory.retrievalReason, memory.score !== null ? `score ${memory.score.toFixed(3)}` : ""]
+                          .filter(Boolean)
+                          .join(" - ")}
+                      </small>
+                    )}
+                    {memory.identifiers.length > 0 && (
+                      <div className="retrieved-memory-identifiers">
+                        {memory.identifiers.slice(0, 4).map((identifier) => (
+                          <span key={`${snapshot.id}-${memory.sourceId}-${identifier.label}-${identifier.value}`}>
+                            <Link2 size={12} />
+                            <small>{identifier.label}</small>
+                            <strong>{identifier.value}</strong>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty compact">Retrieval ran but found no candidate cards above the active threshold.</div>
+            )}
+          </details>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function DecisionQualityPanel({
   decisions,
   invocations,
@@ -2879,6 +3900,298 @@ function AgentInvocationAuditPanel({
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+function MissionControlTelemetryPanel({
+  telemetry,
+  fallbackInvocations,
+}: {
+  telemetry: MissionControlTelemetryResponse | null;
+  fallbackInvocations: AgentInvocation[];
+}) {
+  const summary = useMemo(
+    () => buildMissionControlTelemetrySummary(telemetry, fallbackInvocations),
+    [fallbackInvocations, telemetry],
+  );
+
+  if (!summary) {
+    return <div className="empty">LLM token, prompt, and embedding telemetry will appear after agent calls are recorded.</div>;
+  }
+
+  return (
+    <div className="telemetry-panel">
+      <div className="insight-grid telemetry-window-grid">
+        {summary.windows.map((window) => (
+          <div className={`insight-card telemetry-window ${window.key}`} key={window.key}>
+            <small>{window.label}</small>
+            <strong>{formatCurrency(window.estimatedCostUsd)}</strong>
+            <span>{window.calls} calls</span>
+            <span>
+              {formatTelemetryTokenPair(window.exactInputTokens, window.approxInputTokens)} in
+              {window.exactOutputTokens > 0 || window.approxOutputTokens > 0
+                ? ` / ${formatTelemetryTokenPair(window.exactOutputTokens, window.approxOutputTokens)} out`
+                : ""}
+            </span>
+            <span>
+              {window.cachedInputTokens > 0 ? `${formatCompactNumber(window.cachedInputTokens)} cached` : "no cached tokens"}
+              {" - "}
+              {window.reasoningTokens > 0 ? `${formatCompactNumber(window.reasoningTokens)} reasoning` : "no reasoning tokens"}
+            </span>
+            <span>
+              {window.validCalls} valid / {window.invalidCalls} invalid
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <div className="telemetry-grid">
+        <section className="telemetry-block">
+          <strong>Calls by Agent</strong>
+          <div className="telemetry-list">
+            {summary.callsByAgent.length > 0 ? (
+              summary.callsByAgent.map((row) => (
+                <div className="telemetry-row" key={row.label}>
+                  <span>
+                    <strong>{row.label}</strong>
+                    <small>
+                      {row.count} calls - {formatTelemetryTokenPair(row.inputTokens, row.approxInputTokens)} in
+                    </small>
+                  </span>
+                  <div className="telemetry-row-facts">
+                    <span>{formatCurrency(row.estimatedCostUsd)}</span>
+                    <span>{row.exactCalls} exact</span>
+                    <span>{row.approxCalls} approx</span>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="empty compact">Agent calls will appear after telemetry data is available.</div>
+            )}
+          </div>
+        </section>
+
+        <section className="telemetry-block">
+          <strong>Calls by Model</strong>
+          <div className="telemetry-list">
+            {summary.callsByModel.length > 0 ? (
+              summary.callsByModel.map((row) => (
+                <div className="telemetry-row" key={row.label}>
+                  <span>
+                    <strong>{row.label}</strong>
+                    <small>
+                      {row.count} calls - {formatTelemetryTokenPair(row.inputTokens, row.approxInputTokens)} in
+                    </small>
+                  </span>
+                  <div className="telemetry-row-facts">
+                    <span>{formatCurrency(row.estimatedCostUsd)}</span>
+                    <span>{row.cachedInputTokens > 0 ? `${formatCompactNumber(row.cachedInputTokens)} cached` : "no cache"}</span>
+                    <span>{row.reasoningTokens > 0 ? `${formatCompactNumber(row.reasoningTokens)} reasoning` : "no reasoning"}</span>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="empty compact">Model split will appear after telemetry data is available.</div>
+            )}
+          </div>
+        </section>
+      </div>
+
+      <div className="telemetry-grid">
+        <section className="telemetry-block">
+          <strong>Top Token-Heavy Invocations</strong>
+          <div className="telemetry-list">
+            {summary.topInvocations.length > 0 ? (
+              summary.topInvocations.map((row) => (
+                <div className="telemetry-invocation" key={row.id}>
+                  <div className="telemetry-invocation-head">
+                    <span>
+                      <strong>{row.agentName}</strong>
+                      <small>
+                        {row.model || "unknown model"} - {new Date(row.createdAt).toLocaleString()}
+                      </small>
+                    </span>
+                    <Badge value={row.usageKind === "exact" ? "EXACT" : "APPROX"} />
+                  </div>
+                  <div className="telemetry-invocation-facts">
+                    <span>
+                      <small>Prompt</small>
+                      <strong>{formatTelemetryTokenPair(row.inputTokens, row.approxInputTokens)}</strong>
+                    </span>
+                    <span>
+                      <small>Output</small>
+                      <strong>{formatTelemetryTokenPair(row.outputTokens, row.approxOutputTokens)}</strong>
+                    </span>
+                    <span>
+                      <small>Cached</small>
+                      <strong>{formatCompactNumber(row.cachedInputTokens)}</strong>
+                    </span>
+                    <span>
+                      <small>Reasoning</small>
+                      <strong>{formatCompactNumber(row.reasoningTokens)}</strong>
+                    </span>
+                    <span>
+                      <small>Cost</small>
+                      <strong>{formatCurrency(row.estimatedCostUsd)}</strong>
+                    </span>
+                    <span>
+                      <small>Prompt Size</small>
+                      <strong>{formatBytes(row.promptBytes)}</strong>
+                    </span>
+                  </div>
+                  <div className="telemetry-section-summary">
+                    <small>{row.largestSection || "No section breakdown available"}</small>
+                    {row.sections.length > 0 && (
+                      <div className="tag-list">
+                        {row.sections.slice(0, 3).map((section) => (
+                          <small key={`${row.id}-${section.name}`}>
+                            {section.name}: {formatCompactNumber(section.approxTokens)}t
+                          </small>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="empty compact">Top invocations will appear once telemetry rows are loaded.</div>
+            )}
+          </div>
+        </section>
+
+        <section className="telemetry-block">
+          <strong>Largest Prompt Sections</strong>
+          <div className="telemetry-list">
+            {summary.promptSections.length > 0 ? (
+              summary.promptSections.map((row) => (
+                <div className="telemetry-row" key={row.name}>
+                  <span>
+                    <strong>{row.name}</strong>
+                    <small>
+                      {row.calls} calls - {formatBytes(row.bytes)}
+                    </small>
+                  </span>
+                  <div className="telemetry-row-facts">
+                    <span>{formatCompactNumber(row.approxTokens)} tokens</span>
+                    {row.exampleSource && <span title={row.exampleSource}>{row.exampleSource}</span>}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="empty compact">Prompt section estimates are unavailable for these invocations.</div>
+            )}
+          </div>
+        </section>
+      </div>
+
+      <div className="telemetry-grid">
+        <section className="telemetry-block">
+          <strong>Embedding Source Index</strong>
+          <div className="telemetry-list">
+            {summary.embedding.sourceIndex.count > 0 ? (
+              <>
+                <div className="telemetry-row">
+                  <span>
+                    <strong>Total</strong>
+                    <small>
+                      {summary.embedding.sourceIndex.count} events - {formatCompactNumber(summary.embedding.sourceIndex.providerCalls)} provider call(s)
+                    </small>
+                  </span>
+                  <div className="telemetry-row-facts">
+                    <span>{formatBytes(summary.embedding.sourceIndex.inputBytes)}</span>
+                    <span>{formatCurrency(summary.embedding.sourceIndex.estimatedCostUsd)}</span>
+                    <span>{summary.embedding.sourceIndex.injected} injected</span>
+                    <span>{summary.embedding.sourceIndex.skipped} skipped</span>
+                  </div>
+                </div>
+                {summary.embedding.sourceIndex.bySourceTable.slice(0, 6).map((row) => (
+                  <div className="telemetry-row" key={row.label}>
+                    <span>
+                      <strong>{row.label}</strong>
+                      <small>{row.count} indexed source(s)</small>
+                    </span>
+                    <div className="telemetry-row-facts">
+                      <span>{formatCompactNumber(row.providerCalls)} provider calls</span>
+                      <span>{formatBytes(row.inputBytes)}</span>
+                      <span>{formatCurrency(row.estimatedCostUsd)}</span>
+                    </div>
+                  </div>
+                ))}
+                {summary.embedding.sourceIndex.byModel.length > 0 && (
+                  <div className="tag-list">
+                    {summary.embedding.sourceIndex.byModel.slice(0, 4).map((row) => (
+                      <small key={`${row.label}-model`}>
+                        {row.label}: {row.count}
+                      </small>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="empty compact">No source-index embedding usage events yet.</div>
+            )}
+          </div>
+        </section>
+
+        <section className="telemetry-block">
+          <strong>Retrieval Query Usefulness</strong>
+          <div className="telemetry-list">
+            {summary.embedding.retrievalQuery.count > 0 ? (
+              <>
+                <div className="telemetry-row">
+                  <span>
+                    <strong>Total</strong>
+                    <small>
+                      {summary.embedding.retrievalQuery.count} checks - {formatCompactNumber(summary.embedding.retrievalQuery.providerCalls)} provider call(s)
+                    </small>
+                  </span>
+                  <div className="telemetry-row-facts">
+                    <span>{formatBytes(summary.embedding.retrievalQuery.inputBytes)}</span>
+                    <span>{formatCurrency(summary.embedding.retrievalQuery.estimatedCostUsd)}</span>
+                    <span>{summary.embedding.retrievalQuery.retrievedCount} retrieved</span>
+                    <span>{summary.embedding.retrievalQuery.injected} injected</span>
+                    <span>{summary.embedding.retrievalQuery.logOnly} log-only</span>
+                    <span>{summary.embedding.retrievalQuery.cached} cached</span>
+                    <span>{summary.embedding.retrievalQuery.skipped} skipped</span>
+                  </div>
+                </div>
+                {summary.embedding.retrievalQuery.retrievalPurpose && (
+                  <div className="telemetry-note">
+                    <small>{summary.embedding.retrievalQuery.retrievalPurpose}</small>
+                  </div>
+                )}
+                {summary.embedding.retrievalQuery.bySourceTable.length > 0 && (
+                  <div className="telemetry-mini-list">
+                    {summary.embedding.retrievalQuery.bySourceTable.slice(0, 6).map((row) => (
+                      <div className="telemetry-mini-row" key={row.label}>
+                        <strong>{row.label}</strong>
+                        <small>
+                          {row.count} checks - {row.retrievedCount} retrieved - {row.injected} injected
+                        </small>
+                        <span>
+                          {formatCurrency(row.estimatedCostUsd)} - {formatBytes(row.inputBytes)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {summary.embedding.retrievalQuery.byModel.length > 0 && (
+                  <div className="tag-list">
+                    {summary.embedding.retrievalQuery.byModel.slice(0, 4).map((row) => (
+                      <small key={`${row.label}-retrieval-model`}>
+                        {row.label}: {row.count}
+                      </small>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="empty compact">No retrieval-query embedding telemetry has been recorded yet.</div>
+            )}
+          </div>
+        </section>
+      </div>
     </div>
   );
 }
@@ -3164,6 +4477,9 @@ function ChampionExportDemoPanel({
   localInferenceStatus,
   localInferenceError,
   slideshowEnabled,
+  slideshowIntervalMs,
+  detectionConfidenceThreshold,
+  detectionIouThreshold,
   onCustomImageURIChange,
   onCustomTrueLabelChange,
   onChooseCustomImage,
@@ -3174,6 +4490,10 @@ function ChampionExportDemoPanel({
   onRandomImage,
   onRequestExport,
   onRunPrediction,
+  onOpenFeedback,
+  onSlideshowIntervalChange,
+  onDetectionConfidenceThresholdChange,
+  onDetectionIouThresholdChange,
 }: {
   data: ChampionExportDemo;
   prediction: ChampionDemoPrediction | null;
@@ -3186,6 +4506,9 @@ function ChampionExportDemoPanel({
   localInferenceStatus: string;
   localInferenceError: string;
   slideshowEnabled: boolean;
+  slideshowIntervalMs: number;
+  detectionConfidenceThreshold: number;
+  detectionIouThreshold: number;
   onCustomImageURIChange: (value: string) => void;
   onCustomTrueLabelChange: (value: string) => void;
   onChooseCustomImage: () => void;
@@ -3196,6 +4519,10 @@ function ChampionExportDemoPanel({
   onRandomImage: () => void;
   onRequestExport: () => void;
   onRunPrediction: (image: ChampionDemoImage) => void;
+  onOpenFeedback: (rating: ChampionFeedbackRating) => void;
+  onSlideshowIntervalChange: (value: number) => void;
+  onDetectionConfidenceThresholdChange: (value: number) => void;
+  onDetectionIouThresholdChange: (value: number) => void;
 }) {
   if (!data.hasChampion) {
     return <div className="empty">Champion export and demo details will appear after the backend selects a champion.</div>;
@@ -3217,6 +4544,10 @@ function ChampionExportDemoPanel({
   const activeImage = customPreviewImage ?? selectedImage;
   const activePreviewURI = demoImagePreviewURI(activeImage);
   const activeImageLabel = demoImageLabel(activeImage);
+  const detectorDemo = championExportDemoIsDetection(data) || detectionBoxesFromPrediction(prediction).length > 0;
+  const activeDetections = detectionBoxesFromPrediction(prediction);
+  const activeFps = prediction?.latency_ms && prediction.latency_ms > 0 ? 1000 / prediction.latency_ms : 0;
+  const postprocessLatency = predictionPostprocessLatency(prediction);
 
   return (
     <div className="export-demo-panel">
@@ -3302,7 +4633,10 @@ function ChampionExportDemoPanel({
         <div className="test-image-stage">
           <div className="test-image-preview">
             {activePreviewURI ? (
-              <img src={activePreviewURI} alt={activeImageLabel || "test image"} />
+              <div className="test-image-frame">
+                <img src={activePreviewURI} alt={activeImageLabel || "test image"} />
+                {activeDetections.length > 0 && <DetectionOverlay detections={activeDetections} />}
+              </div>
             ) : (
               <div className="test-image-placeholder">
                 <ImageIcon size={28} />
@@ -3373,6 +4707,46 @@ function ChampionExportDemoPanel({
               placeholder="optional"
             />
           </label>
+          <label className="field compact-range">
+            <span><Timer size={12} /> Speed</span>
+            <input
+              type="range"
+              min={1200}
+              max={10000}
+              step={400}
+              value={slideshowIntervalMs}
+              onChange={(event) => onSlideshowIntervalChange(Number(event.target.value))}
+            />
+            <small>{(slideshowIntervalMs / 1000).toFixed(1)}s</small>
+          </label>
+          {detectorDemo && (
+            <div className="detector-controls">
+              <label className="field compact-range">
+                <span>Confidence</span>
+                <input
+                  type="range"
+                  min={0.01}
+                  max={0.95}
+                  step={0.01}
+                  value={detectionConfidenceThreshold}
+                  onChange={(event) => onDetectionConfidenceThresholdChange(Number(event.target.value))}
+                />
+                <small>{formatTopKScore(detectionConfidenceThreshold)}</small>
+              </label>
+              <label className="field compact-range">
+                <span>IoU</span>
+                <input
+                  type="range"
+                  min={0.1}
+                  max={0.95}
+                  step={0.01}
+                  value={detectionIouThreshold}
+                  onChange={(event) => onDetectionIouThresholdChange(Number(event.target.value))}
+                />
+                <small>{formatTopKScore(detectionIouThreshold)}</small>
+              </label>
+            </div>
+          )}
         </div>
 
         <div className="test-result-panel">
@@ -3392,7 +4766,39 @@ function ChampionExportDemoPanel({
           )}
           {predictionLoading && <div className="empty compact">{readyONNXExport(data.exports) ? "Running local ONNX inference..." : "Waiting for inference..."}</div>}
           {prediction ? (
-            <PredictionRow prediction={prediction} index={0} />
+            <>
+              <PredictionRow prediction={prediction} index={0} />
+              {detectorDemo && (
+                <div className="detector-live-stats">
+                  <span>
+                    <small>Detections</small>
+                    <strong>{activeDetections.length}</strong>
+                  </span>
+                  <span>
+                    <small>FPS</small>
+                    <strong>{activeFps ? activeFps.toFixed(1) : "-"}</strong>
+                  </span>
+                  <span>
+                    <small>Postprocess</small>
+                    <strong>{postprocessLatency ? formatLatency(postprocessLatency) : "-"}</strong>
+                  </span>
+                </div>
+              )}
+              <div className="feedback-actions" aria-label="Champion feedback">
+                <button className="command compact" type="button" onClick={() => onOpenFeedback("good")} disabled={predictionLoading} title="Mark champion output good">
+                  <ThumbsUp size={15} />
+                  Good
+                </button>
+                <button className="command compact" type="button" onClick={() => onOpenFeedback("mediocre")} disabled={predictionLoading} title="Mark champion output mediocre">
+                  <MessageSquare size={15} />
+                  Mediocre
+                </button>
+                <button className="command compact" type="button" onClick={() => onOpenFeedback("bad")} disabled={predictionLoading} title="Mark champion output bad">
+                  <ThumbsDown size={15} />
+                  Bad
+                </button>
+              </div>
+            </>
           ) : (
             <div className="empty compact">Run a held-out or custom image to see the champion prediction.</div>
           )}
@@ -3462,8 +4868,57 @@ function ChampionExportDemoPanel({
           ) : (
             <div className="empty compact">Prediction history will appear if the backend exposes durable demo predictions.</div>
           )}
+          {data.feedback.length > 0 && (
+            <>
+              <strong>Feedback</strong>
+              <div className="feedback-history">
+                {data.feedback.slice(0, 4).map((item) => (
+                  <div className={`feedback-row feedback-${item.rating}`} key={item.id}>
+                    <Badge value={feedbackRatingLabel(item.rating)} />
+                    <span>
+                      <strong>{item.message || "No note added"}</strong>
+                      <small>{[item.image_id || item.prediction_id || item.job_id || "", item.created_at || ""].filter(Boolean).join(" - ")}</small>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function DetectionOverlay({ detections }: { detections: ChampionDetection[] }) {
+  const boxes = detections
+    .map((detection) => ({ detection, box: normalizedDetectionBox(detection) }))
+    .filter((item): item is { detection: ChampionDetection; box: { x: number; y: number; width: number; height: number } } => Boolean(item.box))
+    .slice(0, 60);
+  if (boxes.length === 0) return null;
+  return (
+    <div className="detection-overlay" aria-hidden="true">
+      {boxes.map(({ detection, box }, index) => {
+        const label = detection.label || detection.class_name || `class_${detection.class_id ?? index}`;
+        const confidence = Number(detection.confidence ?? detection.score ?? 0);
+        const labelBelow = box.y < 0.08;
+        return (
+          <div
+            className={`detection-box${labelBelow ? " label-below" : ""}`}
+            key={`${label}-${index}-${box.x}-${box.y}`}
+            style={{
+              left: `${box.x * 100}%`,
+              top: `${box.y * 100}%`,
+              width: `${box.width * 100}%`,
+              height: `${box.height * 100}%`,
+            }}
+          >
+            <span>
+              {label} {formatTopKScore(confidence)}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -3473,6 +4928,7 @@ function PredictionRow({ prediction, index }: { prediction: ChampionDemoPredicti
   const displayLabel = prediction.predicted_label || predictionStatusMessage(status);
   const confidence = numericValue(prediction.confidence);
   const topK = Array.isArray(prediction.top_k) ? prediction.top_k : [];
+  const detections = detectionBoxesFromPrediction(prediction);
   const imageMetadata = { ...recordObject(prediction.image_metadata), ...recordObject(prediction.metadata) };
   const imageSrc =
     recordString(imageMetadata, "thumbnail_uri") ||
@@ -3525,6 +4981,16 @@ function PredictionRow({ prediction, index }: { prediction: ChampionDemoPredicti
           {topK.slice(0, 5).map((item, topIndex) => (
             <small key={`${prediction.id || index}-${topIndex}`}>
               {item.label || item.class_name || "class"} {formatTopKScore(item.confidence ?? item.probability ?? item.score)}
+            </small>
+          ))}
+        </div>
+      )}
+      {detections.length > 0 && (
+        <div className="detection-chip-list">
+          {detections.slice(0, 6).map((detection, detectionIndex) => (
+            <small key={`${prediction.id || index}-det-${detectionIndex}`}>
+              {detection.label || detection.class_name || `class_${detection.class_id ?? detectionIndex}`}{" "}
+              {formatTopKScore(detection.confidence ?? detection.score)}
             </small>
           ))}
         </div>
@@ -3757,6 +5223,1469 @@ function summarizeTrainingRuns(summaries: TrainingRunSummary[]) {
     bestMacroF1: best?.best_macro_f1 ?? 0,
     activeRuns: summaries.filter((summary) => ["RUNNING", "ASSIGNED", "QUEUED"].includes(summary.status)).length,
   };
+}
+
+function buildMissionDigest({
+  health,
+  selectedProject,
+  detail,
+  automationSettings,
+  activityStreamState,
+  visibleActivityEvents,
+  loading,
+}: {
+  health: Health | null;
+  selectedProject: Project | null;
+  detail: ProjectDetail;
+  automationSettings: AutomationSettings;
+  activityStreamState: ActivityStreamState;
+  visibleActivityEvents: AgentActivityEvent[];
+  loading: boolean;
+}): MissionDigest {
+  const dataset = detail.datasets[0] ?? null;
+  const datasetProfiled = missionDatasetProfiled(dataset);
+  const latestPlan = detail.plans[0] ?? null;
+  const latestDecision = detail.decisions[0] ?? null;
+  const latestDecisionHasFollowUpPlan = latestDecision
+    ? detail.plans.some((plan) => plan.source_decision_id === latestDecision.id)
+    : false;
+  const counts = jobStatusCounts(detail.jobs);
+  const queuedJobs = counts.QUEUED;
+  const activeJobs = counts.ASSIGNED + counts.RUNNING;
+  const terminalJobs = counts.SUCCEEDED + counts.FAILED;
+  const runTotals = summarizeTrainingRuns(detail.runSummaries);
+  const workerSummary = missionWorkerSummary(detail.workers, detail.workerRequirements);
+  const latestTerminalTimestamp = Math.max(
+    ...detail.jobs
+      .filter((job) => ["SUCCEEDED", "FAILED"].includes(normalizedStatus(job.status)))
+      .map((job) => timestampSortScore(job.completed_at || job.started_at || job.created_at)),
+    0,
+  );
+  const latestDecisionTimestamp = timestampSortScore(latestDecision?.created_at);
+  const latestDecisionStale = terminalJobs > 0 && (!latestDecision || latestDecisionTimestamp < latestTerminalTimestamp);
+  const validationStatus = latestDecision
+    ? recordFirstString(latestDecision.payload ?? {}, ["backend_validation_status", "validation_status", "planner_validation_status"]).toLowerCase()
+    : "";
+  const blockingDecision =
+    latestDecision &&
+    decisionRejections(latestDecision).length > 0 &&
+    validationStatus &&
+    !["accepted", "approved", "valid"].includes(validationStatus);
+  const activeFailedEvent = visibleActivityEvents.find((event) => ["failed", "blocked"].includes(activityStatus(event.status)));
+  const failedWithoutProgress = counts.FAILED > 0 && counts.SUCCEEDED === 0 && activeJobs === 0 && queuedJobs === 0;
+  const orchestratorUnhealthy = Boolean(health && health.status !== "ok");
+  const hardBlocked = orchestratorUnhealthy || Boolean(activeFailedEvent) || Boolean(blockingDecision) || workerSummary.failed || failedWithoutProgress;
+
+  let state: MissionDigestState = "plan_ready";
+  if (hardBlocked) {
+    state = "blocked";
+  } else if (!selectedProject) {
+    state = "empty";
+  } else if (!dataset) {
+    state = "dataset_needed";
+  } else if (!datasetProfiled) {
+    state = "profiling";
+  } else if (queuedJobs > 0 || activeJobs > 0) {
+    state = "training";
+  } else if (latestDecision?.decision_type === "ADD_EXPERIMENTS" && !latestDecisionHasFollowUpPlan) {
+    state = "follow_up_ready";
+  } else if (detail.champion) {
+    state = "champion_selected";
+  } else if (latestDecisionStale || (terminalJobs > 0 && !latestDecision)) {
+    state = "review_needed";
+  } else if (latestPlan) {
+    state = "plan_ready";
+  } else {
+    state = datasetProfiled ? "plan_ready" : "profiling";
+  }
+
+  const facts = missionFacts({
+    state,
+    dataset,
+    datasetProfiled,
+    latestPlan,
+    latestDecision,
+    runTotals,
+    queuedJobs,
+    activeJobs,
+    terminalJobs,
+    workerSummary,
+    automationSettings,
+  });
+  const liveActivity = buildMissionLiveActivity({ detail, streamState: activityStreamState, visibleActivityEvents });
+  const stateCopy = missionStateCopy({
+    state,
+    dataset,
+    latestPlan,
+    latestDecision,
+    runTotals,
+    queuedJobs,
+    activeJobs,
+    terminalJobs,
+    workerSummary,
+    orchestratorUnhealthy,
+    activeFailedEvent,
+    blockingDecision: Boolean(blockingDecision),
+  });
+
+  return {
+    state,
+    stateLabel: missionStateLabel(state),
+    healthLabel: hardBlocked ? "Needs attention" : missionHealthLabel(health),
+    headline: stateCopy.headline,
+    detail: stateCopy.detail,
+    facts,
+    health: buildMissionHealth({
+      health,
+      dataset,
+      datasetProfiled,
+      counts,
+      workerSummary,
+      liveActivity,
+      detail,
+      latestPlan,
+      latestDecision,
+    }),
+    nextActions: buildMissionNextActions({
+      state,
+      loading,
+      latestPlan,
+      latestDecision,
+      latestDecisionHasFollowUpPlan,
+      selectedProject,
+      dataset,
+      queuedJobs,
+      activeJobs,
+      workerSummary,
+      orchestratorUnhealthy,
+      blockingDecision: Boolean(blockingDecision),
+    }),
+    liveActivity,
+    recentSignals: buildMissionSignals({
+      state,
+      health,
+      dataset,
+      datasetProfiled,
+      latestPlan,
+      latestDecision,
+      counts,
+      detail,
+      visibleActivityEvents,
+      activeFailedEvent,
+      blockingDecision: Boolean(blockingDecision),
+    }),
+    champion: detail.champion ? buildMissionChampionSummary(detail) : undefined,
+  };
+}
+
+function buildMissionLiveActivity({
+  detail,
+  streamState,
+  visibleActivityEvents,
+}: {
+  detail: ProjectDetail;
+  streamState: ActivityStreamState;
+  visibleActivityEvents: AgentActivityEvent[];
+}): MissionLiveActivity {
+  const counts = jobStatusCounts(detail.jobs);
+  const eventSteps = visibleActivityEvents.slice(0, 5).map(missionLiveStepFromEvent);
+  const fallbackSteps: MissionLiveActivity["steps"] = [];
+  if (eventSteps.length === 0 && detail.agentMemory[0]) {
+    fallbackSteps.push({
+      id: `memory-${detail.agentMemory[0].id}`,
+      label: "Retrieving memories",
+      status: "succeeded",
+      timestamp: detail.agentMemory[0].created_at,
+      targetTab: "agents",
+      targetId: "memory-retrieval-probe",
+    });
+  }
+  if (eventSteps.length === 0 && detail.decisions[0]) {
+    fallbackSteps.push({
+      id: `decision-${detail.decisions[0].id}`,
+      label: "Writing decision",
+      status: "succeeded",
+      timestamp: detail.decisions[0].created_at,
+      targetTab: "agents",
+      targetId: "agent-decisions",
+    });
+  }
+  const steps = uniqueBy([...eventSteps, ...fallbackSteps], (step) => step.label).slice(0, 5);
+  const activeStep = steps.find((step) => ["active", "waiting", "blocked", "failed"].includes(step.status));
+  const latestStep = activeStep ?? steps[0] ?? null;
+  const runningJobs = counts.ASSIGNED + counts.RUNNING;
+
+  if (runningJobs > 0) {
+    return {
+      status: "active",
+      label: "Waiting for training results",
+      detail: `${runningJobs} training job${runningJobs === 1 ? "" : "s"} active; workers are expected to report metrics.`,
+      streamState,
+      steps: missionEnsureLiveStep(steps, {
+        id: "jobs-running-live",
+        label: "Waiting for training results",
+        status: "active",
+        targetTab: "experiments",
+        targetId: "runs",
+      }),
+    };
+  }
+  if (counts.QUEUED > 0) {
+    return {
+      status: "waiting",
+      label: "Scheduling workers",
+      detail: `${counts.QUEUED} queued job${counts.QUEUED === 1 ? "" : "s"} waiting for worker capacity.`,
+      streamState,
+      steps: missionEnsureLiveStep(steps, {
+        id: "jobs-queued-live",
+        label: "Scheduling workers",
+        status: "waiting",
+        targetTab: "operations",
+        targetId: "workers",
+      }),
+    };
+  }
+  if (latestStep) {
+    return {
+      status: latestStep.status,
+      label: latestStep.label,
+      detail: missionLiveActivityDetail(latestStep.label, latestStep.status),
+      streamState,
+      steps,
+    };
+  }
+  if (streamState === "connecting" || streamState === "connected") {
+    return {
+      status: streamState === "connecting" ? "waiting" : "idle",
+      label: streamState === "connecting" ? "Connecting" : "Listening",
+      detail: streamState === "connecting" ? "Opening the live activity stream." : "No agentic work is active right now.",
+      streamState,
+      steps: [],
+    };
+  }
+  if (streamState === "reconnecting" || streamState === "fallback") {
+    return {
+      status: "waiting",
+      label: streamState === "reconnecting" ? "Reconnecting" : "Polling",
+      detail: "Mission Control is still refreshing project state while the stream is unavailable.",
+      streamState,
+      steps: [],
+    };
+  }
+  return {
+    status: "idle",
+    label: "Idle",
+    detail: "No planner, memory, validation, worker, or training activity is active.",
+    streamState,
+    steps: [],
+  };
+}
+
+function missionDatasetProfiled(dataset: Dataset | null) {
+  if (!dataset) return false;
+  if (dataset.profiled_at) return true;
+  if (normalizedStatus(dataset.status) === "PROFILED") return true;
+  const profile = recordObject(dataset.profile);
+  return recordNumber(profile, "total_images") > 0 && recordNumber(profile, "class_count") > 0;
+}
+
+function missionWorkerSummary(workers: Worker[], requirements: WorkerRequirement[]) {
+  const activeWorkers = workers.filter((worker) => worker.current_job_id || ["ACTIVE", "RUNNING", "BUSY"].includes(normalizedStatus(worker.status))).length;
+  const availableWorkers = workers.filter((worker) => {
+    const status = normalizedStatus(worker.status);
+    return !["FAILED", "OFFLINE", "ERROR", "STOPPED", "CANCELLED"].includes(status);
+  }).length;
+  const failedWorkers = workers.filter((worker) => ["FAILED", "OFFLINE", "ERROR", "STOPPED", "CANCELLED"].includes(normalizedStatus(worker.status))).length;
+  const failedRequirements = requirements.filter((requirement) =>
+    ["FAILED", "ERROR", "BLOCKED", "CANCELLED"].includes(normalizedStatus(requirement.status)),
+  ).length;
+  const pendingRequirements = requirements.filter((requirement) =>
+    ["PENDING", "REQUESTED", "WORKERS_REQUIRED", "STARTING", "WORKERS_STARTING"].includes(normalizedStatus(requirement.status)),
+  ).length;
+  return {
+    totalWorkers: workers.length,
+    activeWorkers,
+    availableWorkers,
+    failedWorkers,
+    pendingRequirements,
+    failedRequirements,
+    failed: failedWorkers > 0 || failedRequirements > 0,
+  };
+}
+
+function missionFacts({
+  state,
+  dataset,
+  datasetProfiled,
+  latestPlan,
+  latestDecision,
+  runTotals,
+  queuedJobs,
+  activeJobs,
+  terminalJobs,
+  workerSummary,
+  automationSettings,
+}: {
+  state: MissionDigestState;
+  dataset: Dataset | null;
+  datasetProfiled: boolean;
+  latestPlan: ExperimentPlan | null;
+  latestDecision: AgentDecision | null;
+  runTotals: ReturnType<typeof summarizeTrainingRuns>;
+  queuedJobs: number;
+  activeJobs: number;
+  terminalJobs: number;
+  workerSummary: ReturnType<typeof missionWorkerSummary>;
+  automationSettings: AutomationSettings;
+}): MissionDigest["facts"] {
+  const profile = recordObject(dataset?.profile);
+  const totalImages = recordNumber(profile, "total_images");
+  const classCount = recordNumber(profile, "class_count");
+  const facts: MissionDigest["facts"] = [];
+  if (dataset) {
+    facts.push({
+      label: "Dataset",
+      value: datasetProfiled
+        ? [totalImages ? `${totalImages} images` : "", classCount ? `${classCount} classes` : ""].filter(Boolean).join(" / ") || "Profile ready"
+        : "Profiling pending",
+      tone: datasetProfiled ? "ok" : "warning",
+    });
+  } else {
+    facts.push({ label: "Dataset", value: state === "empty" ? "No project selected" : "Upload needed", tone: "warning" });
+  }
+  if (latestPlan) {
+    facts.push({
+      label: "Plan",
+      value: `${latestPlan.experiments.length} experiment${latestPlan.experiments.length === 1 ? "" : "s"} / ${latestPlan.target_metric}`,
+      tone: "info",
+    });
+  } else {
+    facts.push({ label: "Plan", value: datasetProfiled ? "Waiting for proposal" : "Needs profile", tone: datasetProfiled ? "warning" : "info" });
+  }
+  if (activeJobs > 0 || queuedJobs > 0 || terminalJobs > 0) {
+    facts.push({
+      label: "Runs",
+      value: activeJobs > 0
+        ? `${activeJobs} active, ${queuedJobs} queued`
+        : queuedJobs > 0
+          ? `${queuedJobs} queued`
+          : `${terminalJobs} completed`,
+      tone: activeJobs > 0 ? "ok" : queuedJobs > 0 ? "warning" : "info",
+    });
+  } else {
+    facts.push({ label: "Runs", value: "Not launched", tone: latestPlan ? "warning" : "info" });
+  }
+  if (runTotals.bestMacroF1 > 0) {
+    facts.push({ label: "Best macro-F1", value: formatMaybeMetric(runTotals.bestMacroF1), tone: "ok" });
+  } else if (workerSummary.availableWorkers > 0 || workerSummary.pendingRequirements > 0) {
+    facts.push({
+      label: "Workers",
+      value: workerSummary.activeWorkers > 0
+        ? `${workerSummary.activeWorkers} active`
+        : workerSummary.pendingRequirements > 0
+          ? "Starting"
+          : `${workerSummary.availableWorkers} available`,
+      tone: workerSummary.failed ? "bad" : "info",
+    });
+  } else {
+    facts.push({
+      label: "Automation",
+      value: automationSettings.auto_execute_plans ? "Auto execute on" : "Manual execute",
+      tone: automationSettings.auto_execute_plans ? "ok" : "info",
+    });
+  }
+  if (latestDecision && facts.length < 4) {
+    facts.push({ label: "Decision", value: missionDecisionLabel(latestDecision), tone: decisionRejections(latestDecision).length > 0 ? "warning" : "info" });
+  }
+  return facts.slice(0, 4);
+}
+
+function missionStateCopy({
+  state,
+  dataset,
+  latestPlan,
+  latestDecision,
+  runTotals,
+  queuedJobs,
+  activeJobs,
+  terminalJobs,
+  workerSummary,
+  orchestratorUnhealthy,
+  activeFailedEvent,
+  blockingDecision,
+}: {
+  state: MissionDigestState;
+  dataset: Dataset | null;
+  latestPlan: ExperimentPlan | null;
+  latestDecision: AgentDecision | null;
+  runTotals: ReturnType<typeof summarizeTrainingRuns>;
+  queuedJobs: number;
+  activeJobs: number;
+  terminalJobs: number;
+  workerSummary: ReturnType<typeof missionWorkerSummary>;
+  orchestratorUnhealthy: boolean;
+  activeFailedEvent?: AgentActivityEvent;
+  blockingDecision: boolean;
+}) {
+  if (state === "blocked") {
+    if (orchestratorUnhealthy) {
+      return {
+        headline: "Mission Control cannot reach the orchestrator.",
+        detail: "Refresh the connection or verify the orchestrator URL before scheduling more work.",
+      };
+    }
+    if (workerSummary.failed) {
+      return {
+        headline: "Worker supervision needs attention.",
+        detail: "A worker or requirement reported a failure. Open Operations for the exact worker state.",
+      };
+    }
+    if (blockingDecision || activeFailedEvent) {
+      return {
+        headline: "Agentic work is blocked.",
+        detail: "A planner, validation, or execution failure needs review in the agent and operations drill-downs.",
+      };
+    }
+    return {
+      headline: "Training did not make usable progress.",
+      detail: "The latest runs failed before a successful result was reported. Review the run and worker details.",
+    };
+  }
+  if (state === "empty") {
+    return {
+      headline: "No project is selected.",
+      detail: "Create or choose a project with an image-folder dataset to start profiling and planning.",
+    };
+  }
+  if (state === "dataset_needed") {
+    return {
+      headline: "This project needs a dataset.",
+      detail: "Mission Control cannot profile, plan, or train until a dataset is attached.",
+    };
+  }
+  if (state === "profiling") {
+    return {
+      headline: "Dataset profiling is in progress.",
+      detail: "The dataset is waiting for class counts and image statistics before experiments are planned.",
+    };
+  }
+  if (state === "training") {
+    return {
+      headline: activeJobs > 0 ? "Experiments are training." : "Experiments are queued.",
+      detail: activeJobs > 0
+        ? `${activeJobs} training job${activeJobs === 1 ? "" : "s"} running${runTotals.bestMacroF1 > 0 ? `; best macro-F1 is ${formatMaybeMetric(runTotals.bestMacroF1)}.` : "."}`
+        : `${queuedJobs} queued job${queuedJobs === 1 ? "" : "s"} waiting for worker capacity.`,
+    };
+  }
+  if (state === "follow_up_ready") {
+    return {
+      headline: "The planner proposed follow-up experiments.",
+      detail: "Backend validation has a stored decision ready for scheduling through the existing follow-up action.",
+    };
+  }
+  if (state === "champion_selected") {
+    return {
+      headline: "A champion has been selected.",
+      detail: `The best reported macro-F1 is ${formatMaybeMetric(runTotals.bestMacroF1)}. Export, demo, or compare it against completed runs.`,
+    };
+  }
+  if (state === "review_needed") {
+    return {
+      headline: "Completed runs need review.",
+      detail: `${terminalJobs} terminal run${terminalJobs === 1 ? "" : "s"} are ready for the experiment reviewer to compare.`,
+    };
+  }
+  if (latestPlan) {
+    return {
+      headline: "An experiment plan is ready.",
+      detail: `${latestPlan.experiments.length} experiment${latestPlan.experiments.length === 1 ? "" : "s"} target ${latestPlan.target_metric}; launch them or inspect the plan first.`,
+    };
+  }
+  return {
+    headline: latestDecision ? "Mission Control is waiting for the next plan." : "The profiled dataset is ready for planning.",
+    detail: "Open Experiments to inspect planning state and start the next backend-backed action.",
+  };
+}
+
+function buildMissionHealth({
+  health,
+  dataset,
+  datasetProfiled,
+  counts,
+  workerSummary,
+  liveActivity,
+  detail,
+  latestPlan,
+  latestDecision,
+}: {
+  health: Health | null;
+  dataset: Dataset | null;
+  datasetProfiled: boolean;
+  counts: ReturnType<typeof jobStatusCounts>;
+  workerSummary: ReturnType<typeof missionWorkerSummary>;
+  liveActivity: MissionLiveActivity;
+  detail: ProjectDetail;
+  latestPlan: ExperimentPlan | null;
+  latestDecision: AgentDecision | null;
+}): MissionHealthItem[] {
+  const runActive = counts.ASSIGNED + counts.RUNNING;
+  const items: MissionHealthItem[] = [
+    {
+      id: "orchestrator",
+      label: "Orchestrator",
+      value: health?.status === "ok" ? "Online" : health ? "Offline" : "Checking",
+      tone: health?.status === "ok" ? "ok" : health ? "bad" : "warning",
+      targetTab: "operations",
+      targetId: "operations",
+    },
+    {
+      id: "dataset",
+      label: "Dataset",
+      value: dataset ? (datasetProfiled ? "Profiled" : "Profiling") : "Needed",
+      tone: dataset ? (datasetProfiled ? "ok" : "warning") : "warning",
+      targetTab: "data",
+      targetId: "data",
+    },
+  ];
+  const candidates: MissionHealthItem[] = [];
+  if (latestPlan || detail.jobs.length > 0 || detail.champion) {
+    candidates.push({
+      id: "runs",
+      label: "Runs",
+      value: counts.FAILED > 0 && counts.SUCCEEDED === 0 && runActive === 0 && counts.QUEUED === 0
+        ? "Failed"
+        : runActive > 0
+          ? `${runActive} active`
+          : counts.QUEUED > 0
+            ? `${counts.QUEUED} queued`
+            : counts.SUCCEEDED > 0
+              ? `${counts.SUCCEEDED} done`
+              : "Not launched",
+      tone: counts.FAILED > 0 && counts.SUCCEEDED === 0 ? "bad" : runActive > 0 ? "ok" : counts.QUEUED > 0 ? "warning" : "info",
+      targetTab: "experiments",
+      targetId: "runs",
+    });
+  }
+  if (detail.workers.length > 0 || detail.workerRequirements.length > 0 || counts.QUEUED > 0 || runActive > 0) {
+    candidates.push({
+      id: "workers",
+      label: "Workers",
+      value: workerSummary.failed
+        ? "Needs review"
+        : counts.QUEUED > 0 && workerSummary.availableWorkers === 0
+          ? "No active workers"
+          : workerSummary.activeWorkers > 0
+            ? `${workerSummary.activeWorkers} active`
+            : workerSummary.pendingRequirements > 0
+              ? "Starting"
+              : workerSummary.availableWorkers > 0
+                ? `${workerSummary.availableWorkers} available`
+                : "Idle",
+      tone: workerSummary.failed || (counts.QUEUED > 0 && workerSummary.availableWorkers === 0) ? "warning" : workerSummary.activeWorkers > 0 ? "ok" : "info",
+      targetTab: "operations",
+      targetId: "workers",
+    });
+  }
+  if (
+    liveActivity.steps.length > 0 ||
+    detail.agentInvocations.length > 0 ||
+    detail.decisions.length > 0 ||
+    detail.agentMemory.length > 0 ||
+    latestDecision
+  ) {
+    candidates.push({
+      id: "agents",
+      label: "Agents",
+      value: liveActivity.status === "failed" || liveActivity.status === "blocked"
+        ? "Needs review"
+        : liveActivity.status === "active"
+          ? "Active"
+          : liveActivity.status === "waiting"
+            ? "Waiting"
+            : "Idle",
+      tone: liveActivity.status === "failed" || liveActivity.status === "blocked" ? "bad" : liveActivity.status === "waiting" ? "warning" : liveActivity.status === "active" ? "ok" : "info",
+      targetTab: "agents",
+      targetId: "agent-activity",
+    });
+  }
+  return [...items, ...candidates.sort((left, right) => missionToneRank(left.tone) - missionToneRank(right.tone)).slice(0, 2)];
+}
+
+function buildMissionNextActions({
+  state,
+  loading,
+  latestPlan,
+  latestDecision,
+  latestDecisionHasFollowUpPlan,
+  selectedProject,
+  dataset,
+  queuedJobs,
+  activeJobs,
+  workerSummary,
+  orchestratorUnhealthy,
+  blockingDecision,
+}: {
+  state: MissionDigestState;
+  loading: boolean;
+  latestPlan: ExperimentPlan | null;
+  latestDecision: AgentDecision | null;
+  latestDecisionHasFollowUpPlan: boolean;
+  selectedProject: Project | null;
+  dataset: Dataset | null;
+  queuedJobs: number;
+  activeJobs: number;
+  workerSummary: ReturnType<typeof missionWorkerSummary>;
+  orchestratorUnhealthy: boolean;
+  blockingDecision: boolean;
+}): MissionNextAction[] {
+  const action = (
+    id: string,
+    label: string,
+    reason: string,
+    priority: MissionNextAction["priority"],
+    options: Partial<MissionNextAction> = {},
+  ): MissionNextAction => ({ id, label, reason, priority, ...options });
+
+  if (state === "blocked") {
+    const primary = orchestratorUnhealthy
+      ? action("refresh-orchestrator", "Refresh connection", "Mission Control needs a healthy orchestrator before work can continue.", "primary", {
+          actionKey: "refresh",
+          disabled: loading,
+        })
+      : workerSummary.failed || (queuedJobs > 0 && workerSummary.availableWorkers === 0)
+        ? action("open-workers", "Open Workers", "Worker state explains why queued work is not moving.", "primary", {
+            targetTab: "operations",
+            targetId: "workers",
+          })
+        : action("open-agent-review", "Open Agents", blockingDecision ? "Backend validation detail is in the agent audit trail." : "The failure detail is in the live activity and decision views.", "primary", {
+            targetTab: "agents",
+            targetId: "agent-activity",
+          });
+    return [
+      primary,
+      action("open-operations", "Open Operations", "Inspect workers, automation settings, and execution events.", "secondary", {
+        targetTab: "operations",
+        targetId: "automation-timeline",
+      }),
+      action("open-runs", "Open Runs", "Check the latest job and run summaries.", "secondary", {
+        targetTab: "experiments",
+        targetId: "runs",
+      }),
+    ];
+  }
+  if (state === "empty" || state === "dataset_needed") {
+    return [
+      action("new-project", state === "empty" ? "New Project" : "Create project with dataset", "Dataset upload is part of the project setup flow.", "primary", {
+        actionKey: "new_project",
+        disabled: loading,
+      }),
+      action("refresh-projects", "Refresh", "Reload projects and orchestrator state.", "secondary", {
+        actionKey: "refresh",
+        disabled: loading,
+      }),
+    ];
+  }
+  if (state === "profiling") {
+    return [
+      action("open-data", "Open Data", "Dataset profile, metadata, and visual analysis live there.", "primary", {
+        targetTab: "data",
+        targetId: "data",
+      }),
+      action("open-operations", "Open Operations", "Check profiling workers and execution events if profiling stalls.", "secondary", {
+        targetTab: "operations",
+        targetId: "workers",
+      }),
+    ];
+  }
+  if (state === "plan_ready") {
+    return [
+      latestPlan
+        ? action("execute-plan", "Execute Plan", "The latest plan has not launched training jobs yet.", "primary", {
+            actionKey: "execute_plan",
+            disabled: loading || !selectedProject || !dataset,
+          })
+        : action("open-experiments", "Open Experiments", "Inspect planning state and create or review the next plan.", "primary", {
+            targetTab: "experiments",
+            targetId: "plans",
+          }),
+      action("inspect-plan", "Inspect Plan", "Review experiment templates, metrics, and warnings before launch.", "secondary", {
+        targetTab: "experiments",
+        targetId: "plans",
+      }),
+      action("open-agents", "Open Agents", "Review planner decisions and backend gates.", "secondary", {
+        targetTab: "agents",
+        targetId: "agent-decisions",
+      }),
+    ];
+  }
+  if (state === "training") {
+    const queuedWithoutWorkers = queuedJobs > 0 && activeJobs === 0 && workerSummary.availableWorkers === 0;
+    return [
+      queuedWithoutWorkers
+        ? action("open-workers", "Open Workers", "Queued runs need worker capacity before training can start.", "primary", {
+            targetTab: "operations",
+            targetId: "workers",
+          })
+        : action("open-runs", "Open Runs", "Training summaries and metrics show current progress.", "primary", {
+            targetTab: "experiments",
+            targetId: "runs",
+          }),
+      action("open-activity", "Open Activity", "Follow planner, worker, and validation events in detail.", "secondary", {
+        targetTab: "agents",
+        targetId: "agent-activity",
+      }),
+      action("open-operations", "Open Operations", "Inspect worker requirements and execution events.", "secondary", {
+        targetTab: "operations",
+        targetId: "automation-timeline",
+      }),
+    ];
+  }
+  if (state === "review_needed") {
+    return [
+      action("review-experiments", "Review Experiments", "Completed runs need the reviewer to choose stop, champion, or follow-up.", "primary", {
+        actionKey: "review_experiments",
+        disabled: loading || !selectedProject,
+      }),
+      action("open-runs", "Open Runs", "Compare completed training summaries before review.", "secondary", {
+        targetTab: "experiments",
+        targetId: "runs",
+      }),
+    ];
+  }
+  if (state === "follow_up_ready") {
+    return [
+      action("schedule-follow-up", "Schedule Follow-up", "The latest decision proposed additional backend-validated experiments.", "primary", {
+        actionKey: "schedule_follow_up",
+        disabled: loading || !latestDecision || latestDecisionHasFollowUpPlan,
+      }),
+      action("open-agents", "Open Agents", "Read the decision summary and backend gate outcome.", "secondary", {
+        targetTab: "agents",
+        targetId: "agent-decisions",
+      }),
+      action("open-plan", "Open Experiments", "Inspect current and follow-up plans.", "secondary", {
+        targetTab: "experiments",
+        targetId: "plans",
+      }),
+    ];
+  }
+  return [
+    action("open-export", "Open Export", "Use, demo, export, or validate the selected champion.", "primary", {
+      actionKey: "open_export",
+      targetTab: "export",
+      targetId: "export-demo",
+    }),
+    action("compare-runs", "Compare Runs", "See why this champion beat other completed runs.", "secondary", {
+      targetTab: "experiments",
+      targetId: "champion-comparison",
+    }),
+    action("open-agents", "Open Agents", "Review the decision trail behind the champion.", "secondary", {
+      targetTab: "agents",
+      targetId: "agent-decisions",
+    }),
+  ];
+}
+
+function buildMissionSignals({
+  state,
+  health,
+  dataset,
+  datasetProfiled,
+  latestPlan,
+  latestDecision,
+  counts,
+  detail,
+  visibleActivityEvents,
+  activeFailedEvent,
+  blockingDecision,
+}: {
+  state: MissionDigestState;
+  health: Health | null;
+  dataset: Dataset | null;
+  datasetProfiled: boolean;
+  latestPlan: ExperimentPlan | null;
+  latestDecision: AgentDecision | null;
+  counts: ReturnType<typeof jobStatusCounts>;
+  detail: ProjectDetail;
+  visibleActivityEvents: AgentActivityEvent[];
+  activeFailedEvent?: AgentActivityEvent;
+  blockingDecision: boolean;
+}): MissionSignal[] {
+  const signals: MissionSignal[] = [];
+  const push = (signal: MissionSignal) => signals.push(signal);
+  if (health && health.status !== "ok") {
+    push({
+      id: "orchestrator-unhealthy",
+      label: "Orchestrator offline",
+      detail: "Refresh or check the configured orchestrator URL.",
+      tone: "bad",
+      targetTab: "operations",
+      targetId: "operations",
+    });
+  }
+  if (activeFailedEvent) {
+    push({
+      id: `activity-${activeFailedEvent.id}`,
+      label: missionActivityLabelForEvent(activeFailedEvent),
+      detail: "Open the full activity trail for failure context.",
+      tone: "bad",
+      timestamp: activeFailedEvent.created_at,
+      targetTab: "agents",
+      targetId: "agent-activity",
+    });
+  }
+  if (blockingDecision && latestDecision) {
+    push({
+      id: `decision-blocked-${latestDecision.id}`,
+      label: "Validation blocked",
+      detail: "Backend gate details are available in Agents.",
+      tone: "bad",
+      timestamp: latestDecision.created_at,
+      targetTab: "agents",
+      targetId: "agent-decisions",
+    });
+  }
+  for (const event of visibleActivityEvents.slice(0, 4)) {
+    const status = activityStatus(event.status);
+    if (!["active", "waiting", "succeeded", "failed", "blocked"].includes(status)) continue;
+    const target = missionActivityTargetForEvent(event);
+    push({
+      id: `event-${event.id}`,
+      label: missionActivityLabelForEvent(event),
+      detail: missionSignalDetailForEvent(event),
+      tone: status === "failed" || status === "blocked" ? "bad" : status === "waiting" ? "warning" : status === "succeeded" ? "ok" : "info",
+      timestamp: event.created_at,
+      ...target,
+    });
+  }
+  if (counts.ASSIGNED + counts.RUNNING > 0 || counts.QUEUED > 0) {
+    push({
+      id: "jobs-active",
+      label: counts.ASSIGNED + counts.RUNNING > 0 ? "Training active" : "Jobs queued",
+      detail: counts.ASSIGNED + counts.RUNNING > 0
+        ? `${counts.ASSIGNED + counts.RUNNING} active, ${counts.QUEUED} queued.`
+        : `${counts.QUEUED} queued job${counts.QUEUED === 1 ? "" : "s"} waiting for workers.`,
+      tone: counts.ASSIGNED + counts.RUNNING > 0 ? "ok" : "warning",
+      targetTab: "experiments",
+      targetId: "runs",
+    });
+  }
+  if (detail.champion) {
+    push({
+      id: "champion-selected",
+      label: "Champion selected",
+      detail: "Export and demo actions are ready.",
+      tone: "ok",
+      timestamp: detail.champion.created_at,
+      targetTab: "export",
+      targetId: "export-demo",
+    });
+  } else if (latestDecision) {
+    push({
+      id: `decision-${latestDecision.id}`,
+      label: missionDecisionLabel(latestDecision),
+      detail: decisionRejections(latestDecision).length > 0 ? "Backend gate warnings are visible in Agents." : "Latest project decision is recorded.",
+      tone: decisionRejections(latestDecision).length > 0 ? "warning" : "info",
+      timestamp: latestDecision.created_at,
+      targetTab: "agents",
+      targetId: "agent-decisions",
+    });
+  } else if (latestPlan) {
+    push({
+      id: `plan-${latestPlan.id}`,
+      label: "Plan ready",
+      detail: `${latestPlan.experiments.length} experiment${latestPlan.experiments.length === 1 ? "" : "s"} proposed.`,
+      tone: "info",
+      timestamp: latestPlan.created_at,
+      targetTab: "experiments",
+      targetId: "plans",
+    });
+  } else if (dataset) {
+    push({
+      id: `dataset-${dataset.id}`,
+      label: datasetProfiled ? "Dataset profiled" : "Dataset profiling",
+      detail: datasetProfiled ? "Class counts and image statistics are available." : "Waiting on profile results before planning.",
+      tone: datasetProfiled ? "ok" : "warning",
+      timestamp: dataset.profiled_at || dataset.created_at,
+      targetTab: "data",
+      targetId: "data",
+    });
+  }
+  if (signals.length === 0 && state === "empty") {
+    push({
+      id: "empty",
+      label: "Ready for setup",
+      detail: "Create a project with a dataset folder.",
+      tone: "info",
+    });
+  }
+  return uniqueBy(signals, (signal) => signal.label).slice(0, 5);
+}
+
+function buildMissionChampionSummary(detail: ProjectDetail): MissionChampionSummary | undefined {
+  const champion = detail.champion;
+  if (!champion) return undefined;
+  const summary = detail.runSummaries.find((item) => item.job_id === champion.job_id) ?? null;
+  const evaluation = detail.runEvaluations.find((item) => item.job_id === champion.job_id) ?? null;
+  const modelProfile = championModelProfile(champion);
+  const holisticScores = evaluation?.holistic_scores ?? {};
+  const objectiveFit = recordNumber(holisticScores, "overall_score") || recordNumber(holisticScores, "objective_fit");
+  const macroF1 = recordNumber(champion.metrics, "best_macro_f1") || summary?.best_macro_f1 || 0;
+  const accuracy = recordNumber(champion.metrics, "best_accuracy") || summary?.best_accuracy || 0;
+  const cost = recordNumber(champion.metrics, "estimated_cost_usd") || summary?.estimated_cost_usd || 0;
+  const runtime = recordNumber(champion.metrics, "runtime_seconds") || summary?.runtime_seconds || 0;
+  return {
+    model: recordString(champion.metrics, "model") || summary?.model || "Selected champion",
+    primaryMetricLabel: "Macro-F1",
+    primaryMetricValue: formatMaybeMetric(macroF1),
+    accuracy: formatMaybeMetric(accuracy),
+    cost: formatCurrency(cost),
+    runtime: formatSeconds(runtime),
+    latency: formatLatency(modelProfile.estimated_latency_ms),
+    modelSize: formatModelSize(modelProfile),
+    objectiveFit: formatMaybeMetric(objectiveFit),
+  };
+}
+
+function missionLiveStepFromEvent(event: AgentActivityEvent): MissionLiveActivity["steps"][number] {
+  return {
+    id: `event-${event.id}`,
+    label: missionActivityLabelForEvent(event),
+    status: missionLiveStatus(event.status),
+    timestamp: event.created_at,
+    ...missionActivityTargetForEvent(event),
+  };
+}
+
+function missionLiveStatus(value: string): MissionLiveActivity["steps"][number]["status"] {
+  const status = activityStatus(value);
+  if (["active", "waiting", "succeeded", "failed", "blocked"].includes(status)) {
+    return status as MissionLiveActivity["steps"][number]["status"];
+  }
+  return "active";
+}
+
+function missionActivityLabelForEvent(event: AgentActivityEvent) {
+  const status = activityStatus(event.status);
+  const text = `${event.type} ${event.title} ${event.message}`.toLowerCase();
+  if (text.includes("memory") || text.includes("retrieval")) return "Retrieving memories";
+  if (text.includes("dataset") || text.includes("profile")) return "Reading dataset profile";
+  if (text.includes("candidate") || text.includes("ranking") || text.includes("rank")) return "Ranking candidates";
+  if (text.includes("validation") || text.includes("gate") || text.includes("rejected") || text.includes("blocked")) {
+    return status === "blocked" || status === "failed" ? "Validation blocked" : "Validating plan";
+  }
+  if (text.includes("worker")) {
+    if (text.includes("starting") || text.includes("active")) return "Starting workers";
+    return "Waiting for workers";
+  }
+  if (text.includes("queued") || text.includes("schedule") || text.includes("follow-up") || text.includes("followup")) return "Scheduling workers";
+  if (text.includes("job") || text.includes("training") || text.includes("run")) return "Waiting for training results";
+  if (text.includes("champion")) return "Selecting champion";
+  if (text.includes("decision") || text.includes("outcome") || text.includes("recorded") || text.includes("recommendation")) return "Writing decision";
+  if (text.includes("planner") || text.includes("reviewer") || text.includes("agent")) return "Thinking";
+  return "Thinking";
+}
+
+function missionActivityTargetForEvent(event: AgentActivityEvent): Pick<MissionSignal, "targetTab" | "targetId"> {
+  const text = `${event.type} ${event.title}`.toLowerCase();
+  if (text.includes("memory")) return { targetTab: "agents", targetId: "memory-retrieval-probe" };
+  if (text.includes("worker")) return { targetTab: "operations", targetId: "workers" };
+  if (text.includes("job") || text.includes("training") || text.includes("run")) return { targetTab: "experiments", targetId: "runs" };
+  if (text.includes("champion")) return { targetTab: "export", targetId: "export-demo" };
+  if (text.includes("plan.queued")) return { targetTab: "operations", targetId: "automation-timeline" };
+  if (text.includes("validation") || text.includes("decision") || text.includes("planner") || text.includes("agent")) {
+    return { targetTab: "agents", targetId: "agent-decisions" };
+  }
+  return { targetTab: "agents", targetId: "agent-activity" };
+}
+
+function missionLiveActivityDetail(label: string, status: MissionLiveActivity["status"]) {
+  if (label === "Retrieving memories") return "The agent is checking compact prior run and strategy memory.";
+  if (label === "Reading dataset profile") return "The planner is using class counts and dataset statistics.";
+  if (label === "Ranking candidates") return "The planner is comparing candidate experiments.";
+  if (label === "Validating plan") return "Backend gates are checking the proposed plan.";
+  if (label === "Validation blocked") return "A backend gate stopped unsafe or invalid work.";
+  if (label === "Scheduling workers") return "Mission Control is handing validated work to workers.";
+  if (label === "Waiting for workers") return "Queued work is waiting for worker capacity.";
+  if (label === "Waiting for training results") return "Training jobs are expected to report metrics.";
+  if (label === "Writing decision") return "The agent is recording a compact project decision.";
+  if (label === "Selecting champion") return "Completed runs are being promoted into a champion outcome.";
+  if (status === "failed") return "The latest agentic step failed; open Agents for the audit trail.";
+  if (status === "blocked") return "The latest agentic step is blocked by a visible gate.";
+  if (status === "waiting") return "Mission Control is waiting for the next backend or worker update.";
+  if (status === "succeeded") return "The latest agentic step completed.";
+  return "The agentic system is working through the next high-level step.";
+}
+
+function missionEnsureLiveStep(
+  steps: MissionLiveActivity["steps"],
+  step: MissionLiveActivity["steps"][number],
+) {
+  if (steps.some((item) => item.label === step.label)) return steps;
+  return [step, ...steps].slice(0, 5);
+}
+
+function missionSignalDetailForEvent(event: AgentActivityEvent) {
+  const label = missionActivityLabelForEvent(event);
+  if (label === "Validation blocked") return "Open Agents for backend gate detail.";
+  if (label === "Retrieving memories") return "Memory lookup completed without exposing raw payloads.";
+  if (label === "Scheduling workers" || label === "Waiting for workers") return "Worker state is available in Operations.";
+  if (label === "Waiting for training results") return "Run progress is available in Experiments.";
+  if (label === "Writing decision") return "Decision summary is available in Agents.";
+  if (label === "Selecting champion") return "Champion details are available in Export.";
+  return "Open the drill-down for the full audit trail.";
+}
+
+function missionDecisionLabel(decision: AgentDecision) {
+  const value = decision.decision_type.toLowerCase().replace(/_/g, " ");
+  return value.replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function missionStateLabel(state: MissionDigestState) {
+  switch (state) {
+    case "empty":
+      return "No Project";
+    case "dataset_needed":
+      return "Dataset Needed";
+    case "profiling":
+      return "Profiling";
+    case "plan_ready":
+      return "Plan Ready";
+    case "training":
+      return "Training";
+    case "review_needed":
+      return "Review Needed";
+    case "follow_up_ready":
+      return "Follow-up Ready";
+    case "champion_selected":
+      return "Champion Selected";
+    case "blocked":
+      return "Blocked";
+  }
+}
+
+function missionHealthLabel(health: Health | null) {
+  if (!health) return "Checking";
+  return health.status === "ok" ? "Healthy" : "Unhealthy";
+}
+
+function missionToneRank(tone: MissionTone) {
+  if (tone === "bad") return 0;
+  if (tone === "warning") return 1;
+  if (tone === "info") return 2;
+  return 3;
+}
+
+const activityStorageUriPattern = /\b(?:s3|gs|file|minio|https?):\/\/[^\s,;"')\]}]+/gi;
+const activityWindowsPathPattern = /\b[A-Z]:\\[^\s,;"')\]}]+/gi;
+const activityUnixPathPattern = /(^|\s)\/(?:Users|home|tmp|var|mnt|data|datasets|artifacts|workspace|app|srv)[^\s,;"')\]}]+/gi;
+const activityBase64Pattern = /\b[A-Za-z0-9+/]{80,}={0,2}\b/g;
+const activitySecretPattern = /\b(?:sk|pk|rk|xox[baprs]?)-[A-Za-z0-9_-]{16,}\b/gi;
+
+function activityEventFromMessage(event: MessageEvent): AgentActivityEvent | null {
+  try {
+    const parsed = recordObject(JSON.parse(String(event.data)));
+    const id = recordString(parsed, "id");
+    const projectId = recordString(parsed, "project_id");
+    const type = recordString(parsed, "type");
+    const createdAt = recordString(parsed, "created_at");
+    if (!id || !projectId || !type || !createdAt) return null;
+    return {
+      id,
+      project_id: projectId,
+      plan_id: recordString(parsed, "plan_id") || undefined,
+      job_id: recordString(parsed, "job_id") || undefined,
+      type,
+      severity: activitySeverity(recordString(parsed, "severity")),
+      title: activitySafeDisplayText(recordString(parsed, "title"), 96) || "Activity",
+      message: activitySafeDisplayText(recordString(parsed, "message"), 240),
+      status: activityStatus(recordString(parsed, "status")),
+      created_at: createdAt,
+      metadata: activityMetadataObject(parsed.metadata),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function mergeActivityEvents(current: AgentActivityEvent[], event: AgentActivityEvent) {
+  const byId = new Map<string, AgentActivityEvent>();
+  for (const item of current) byId.set(item.id, item);
+  byId.set(event.id, event);
+  return Array.from(byId.values())
+    .sort((left, right) => activityTimestamp(right) - activityTimestamp(left))
+    .slice(0, 12);
+}
+
+function buildFallbackActivityEvents(projectId: string, detail: ProjectDetail): AgentActivityEvent[] {
+  if (!projectId) return [];
+  const events: AgentActivityEvent[] = [
+    ...detail.executionEvents.map(fallbackActivityFromExecutionEvent),
+    ...detail.agentInvocations.flatMap((invocation) => fallbackActivityFromInvocation(invocation, detail.jobs)),
+    ...fallbackActivityFromJobs(projectId, detail.jobs),
+  ];
+  return events
+    .filter((event) => event.project_id === projectId)
+    .sort((left, right) => activityTimestamp(right) - activityTimestamp(left))
+    .slice(0, 12);
+}
+
+function fallbackActivityFromExecutionEvent(event: ExecutionEvent): AgentActivityEvent {
+  const payload = recordObject(event.payload);
+  const jobId = recordString(payload, "job_id") || recordString(payload, "champion_job_id");
+  const base: AgentActivityEvent = {
+    id: `fallback_execution_${event.id}`,
+    project_id: event.project_id,
+    plan_id: event.plan_id,
+    job_id: jobId || undefined,
+    type: "system.event",
+    severity: "info",
+    title: "System event",
+    message: activitySafeDisplayText(event.message, 220),
+    status: "active",
+    created_at: event.created_at,
+    metadata: fallbackActivityMetadata(payload),
+  };
+
+  switch (event.event_type) {
+    case "AGENT_STARTED":
+      return { ...base, type: "planner.started", title: "Planner started", message: "Reading completed runs, memories, evaluations, and project context." };
+    case "AGENT_RECOMMENDATION_RECORDED":
+      return { ...base, type: "planner.decision_recorded", severity: "success", title: "Valid decision recorded", status: "succeeded" };
+    case "AGENT_OUTCOME_RECORDED": {
+      const validationStatus = recordString(payload, "backend_validation_status").toLowerCase();
+      if (validationStatus === "blocked") {
+        return {
+          ...base,
+          type: "planner.blocked",
+          severity: "warning",
+          title: "Planner blocked",
+          status: "blocked",
+          message: activitySafeDisplayText(recordString(payload, "backend_validation_error") || recordString(payload, "reason") || event.message, 220),
+        };
+      }
+      if (validationStatus === "failed") {
+        return { ...base, type: "planner.validation_failed", severity: "error", title: "Planner validation failed", status: "failed" };
+      }
+      return { ...base, type: "agent.outcome_recorded", severity: "success", title: "Agent outcome recorded", status: "succeeded" };
+    }
+    case "AGENT_FAILED":
+      return { ...base, type: "agent.failed", severity: "error", title: "Agent failed", status: "failed" };
+    case "JOBS_QUEUED": {
+      const openCount = recordNumber(payload, "open_job_count");
+      return {
+        ...base,
+        type: "plan.queued",
+        severity: openCount > 0 ? "success" : "info",
+        title: openCount > 0 ? "Plan queued" : "Plan checked",
+        status: openCount > 0 ? "active" : "waiting",
+      };
+    }
+    case "WORKERS_REQUIRED":
+    case "WORKER_SCALING_UPDATED":
+      return { ...base, type: "workers.required", title: "Waiting for workers", status: "waiting" };
+    case "WORKERS_STARTING":
+      return { ...base, type: "workers.starting", title: "Workers starting", status: "active" };
+    case "WORKERS_ACTIVE":
+      return { ...base, type: "workers.active", severity: "success", title: "Workers active", status: "active" };
+    case "JOB_RETRY_QUEUED": {
+      const requeued = recordBoolean(payload, "requeued");
+      return {
+        ...base,
+        type: requeued ? "job.retrying" : "job.failed",
+        severity: requeued ? "warning" : "error",
+        title: requeued ? "Retrying job" : "Job attempts exhausted",
+        status: requeued ? "active" : "failed",
+      };
+    }
+    case "EXECUTION_FAILED":
+      return { ...base, type: "system.failed", severity: "error", title: "Execution failed", status: "failed" };
+    case "MEMORY_RETRIEVAL_LOGGED": {
+      const retrievedCount = recordNumber(payload, "retrieved_count");
+      const purpose = recordString(payload, "purpose");
+      return {
+        ...base,
+        type: "memory.retrieval_logged",
+        title: "Memory retrieval checked",
+        message: `Retrieved ${retrievedCount} candidate memory card(s)${memoryPurposeSuffix(purpose)}.`,
+        status: "succeeded",
+      };
+    }
+    case "CHAMPION_SELECTED":
+      return { ...base, type: "champion.selected", severity: "success", title: "Selected champion", status: "succeeded" };
+    default:
+      return base;
+  }
+}
+
+function fallbackActivityFromInvocation(invocation: AgentInvocation, jobs: Job[]): AgentActivityEvent[] {
+  const downstream = recordObject(invocation.downstream_outcome);
+  const validationStatus = (invocation.validation_status || "").toLowerCase();
+  const outcomeStatus = recordString(downstream, "backend_validation_status").toLowerCase();
+  if (validationStatus !== "invalid" && validationStatus !== "failed" && outcomeStatus !== "rejected") return [];
+  const willRetry = recordBoolean(downstream, "will_retry");
+  const activeWork = jobs.some((job) => ["QUEUED", "ASSIGNED", "RUNNING"].includes(normalizedStatus(job.status))) || willRetry;
+  const reason = recordString(downstream, "backend_validation_error") || invocation.validation_error || "backend validation rejected the draft";
+  const planner = invocation.agent_name === "experiment_planner";
+  const status = willRetry ? "active" : activeWork ? "waiting" : validationStatus === "failed" ? "failed" : "blocked";
+  const severity = status === "failed" ? "error" : "warning";
+  const title = `${planner ? "Planner" : "Agent"} draft rejected${willRetry ? "; retrying" : ""}`;
+  const message = willRetry
+    ? `Draft rejected: ${activitySafeDisplayText(reason, 180)}; retrying with validation feedback.`
+    : `Draft rejected: ${activitySafeDisplayText(reason, 180)}.`;
+  return [{
+    id: `fallback_invocation_${invocation.id}_${status}`,
+    project_id: invocation.project_id,
+    plan_id: invocation.plan_id,
+    job_id: invocation.job_id,
+    type: planner ? "planner.validation_rejected" : "agent.validation_rejected",
+    severity,
+    title,
+    message,
+    status,
+    created_at: invocation.created_at,
+    metadata: {
+      agent_name: invocation.agent_name,
+      validation_status: outcomeStatus || validationStatus,
+      will_retry: willRetry,
+      validation_error: activitySafeDisplayText(reason, 180),
+    },
+  }];
+}
+
+function fallbackActivityFromJobs(projectId: string, jobs: Job[]): AgentActivityEvent[] {
+  if (jobs.length === 0) return [];
+  const counts = jobStatusCounts(jobs);
+  const activeCount = counts.ASSIGNED + counts.RUNNING;
+  const latestJob = [...jobs].sort((left, right) => jobActivityTimestamp(right) - jobActivityTimestamp(left))[0];
+  const title = activeCount > 0 ? "Jobs running" : counts.QUEUED > 0 ? "Jobs queued" : counts.FAILED > 0 && counts.SUCCEEDED === 0 ? "Jobs failed" : "Jobs completed";
+  const status = activeCount > 0 ? "active" : counts.QUEUED > 0 ? "waiting" : counts.FAILED > 0 && counts.SUCCEEDED === 0 ? "failed" : "succeeded";
+  const severity = status === "failed" ? "error" : status === "succeeded" ? "success" : "info";
+  return [{
+    id: `fallback_jobs_${jobs.length}_${counts.QUEUED}_${counts.ASSIGNED}_${counts.RUNNING}_${counts.SUCCEEDED}_${counts.FAILED}_${latestJob?.id ?? "none"}_${latestJob?.status ?? "none"}`,
+    project_id: projectId,
+    job_id: latestJob?.id,
+    type: "jobs.status_counts",
+    severity,
+    title,
+    message: activeCount > 0
+      ? `${activeCount} job(s) running, ${counts.QUEUED} queued.`
+      : counts.QUEUED > 0
+        ? `${counts.QUEUED} job(s) queued; waiting for workers.`
+        : `${counts.SUCCEEDED} succeeded, ${counts.FAILED} failed.`,
+    status,
+    created_at: latestJob?.completed_at || latestJob?.started_at || latestJob?.created_at || new Date().toISOString(),
+    metadata: {
+      job_count: jobs.length,
+      queued_count: counts.QUEUED,
+      assigned_count: counts.ASSIGNED,
+      running_count: counts.RUNNING,
+      completed_count: counts.SUCCEEDED,
+      failed_count: counts.FAILED,
+    },
+  }];
+}
+
+function agentActivityCurrentState(events: AgentActivityEvent[], detail: ProjectDetail, streamState: ActivityStreamState) {
+  const retryEvent = events.find((event) => event.type === "planner.validation_rejected" && event.status === "active");
+  if (retryEvent) {
+    return { title: "Planner is retrying validation", detail: retryEvent.message, status: "active", severity: "warning" };
+  }
+  const activeJobs = detail.jobs.filter((job) => ["ASSIGNED", "RUNNING"].includes(normalizedStatus(job.status))).length;
+  if (activeJobs > 0) {
+    return { title: `${activeJobs} job${activeJobs === 1 ? "" : "s"} running`, detail: "Training workers are reporting active job work.", status: "active", severity: "info" };
+  }
+  const queuedJobs = detail.jobs.filter((job) => normalizedStatus(job.status) === "QUEUED").length;
+  if (queuedJobs > 0) {
+    return { title: `${queuedJobs} job${queuedJobs === 1 ? "" : "s"} queued`, detail: "Waiting for workers to pick up queued jobs.", status: "waiting", severity: "info" };
+  }
+  const activeEvent = events.find((event) => event.status === "active" || event.status === "waiting");
+  if (activeEvent) {
+    return { title: activeEvent.title, detail: activeEvent.message || activityEventSubtitle(activeEvent), status: activeEvent.status, severity: activeEvent.severity };
+  }
+  if (streamState === "reconnecting") {
+    return { title: "Activity stream reconnecting", detail: "Mission Control is using fallback refresh while the SSE stream reconnects.", status: "waiting", severity: "warning" };
+  }
+  if (streamState === "fallback") {
+    return { title: "Activity refresh fallback", detail: "SSE is unavailable; Mission Control is using periodic project refresh.", status: "waiting", severity: "info" };
+  }
+  const latest = events[0];
+  if (latest) {
+    return { title: latest.title, detail: latest.message || activityEventSubtitle(latest), status: latest.status, severity: latest.severity };
+  }
+  return { title: "Waiting for activity", detail: "No planner, worker, or job activity has been recorded yet.", status: "waiting", severity: "info" };
+}
+
+function activitySeverityIcon(severity: string) {
+  const normalized = severity.toLowerCase();
+  if (normalized === "success") return <CheckCircle2 size={15} />;
+  if (normalized === "warning") return <AlertTriangle size={15} />;
+  if (normalized === "error") return <X size={15} />;
+  return <Activity size={15} />;
+}
+
+function activityStreamBadge(streamState: ActivityStreamState) {
+  if (streamState === "connected") return "LIVE";
+  if (streamState === "reconnecting") return "RECONNECTING";
+  if (streamState === "fallback") return "POLLING";
+  if (streamState === "connecting") return "CONNECTING";
+  return "IDLE";
+}
+
+function activityEventSubtitle(event: AgentActivityEvent) {
+  return [
+    event.type,
+    event.plan_id ? `plan ${event.plan_id}` : "",
+    event.job_id ? `job ${event.job_id}` : "",
+    formatRelativeTime(event.created_at),
+  ].filter(Boolean).join(" - ");
+}
+
+function activityMetadataRows(metadata: Record<string, unknown> | undefined) {
+  const record = activityMetadataObject(metadata);
+  return Object.entries(record)
+    .map(([key, value]) => ({ label: humanizeAuditKey(key), value: activityMetadataDisplayValue(value) }))
+    .filter((row) => row.value !== "")
+    .slice(0, 10);
+}
+
+function activityMetadataObject(value: unknown): Record<string, unknown> {
+  const record = recordObject(value);
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(record)) {
+    const display = activityMetadataDisplayValue(entry);
+    if (display) out[key] = display;
+  }
+  return out;
+}
+
+function activityMetadataDisplayValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return value ? "yes" : "no";
+  if (typeof value === "string") return activitySafeDisplayText(value, 110);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => activitySafeDisplayText(String(item), 72))
+      .filter(Boolean)
+      .slice(0, 6)
+      .join(", ");
+  }
+  return "";
+}
+
+function fallbackActivityMetadata(payload: Record<string, unknown>) {
+  const allowed = [
+    "agent_name",
+    "decision_id",
+    "source_decision_id",
+    "decision_type",
+    "job_id",
+    "job_ids",
+    "worker_requirement_id",
+    "open_job_count",
+    "active_worker_count",
+    "target_count",
+    "provider",
+    "gpu_type",
+    "requirement_status",
+    "template",
+    "attempt",
+    "max_attempts",
+    "requeued",
+    "backend_validation_status",
+    "backend_stop_guard",
+    "reason",
+    "model",
+    "selection_source",
+    "materialization_status",
+    "max_concurrent_jobs",
+    "max_cold_dataset_materializations",
+    "retry_attempt",
+    "will_retry",
+    "completed_run_count",
+    "memory_count",
+    "evaluation_count",
+    "purpose",
+    "retrieved_count",
+    "log_only",
+    "cross_project_ok",
+  ];
+  const out: Record<string, unknown> = {};
+  for (const key of allowed) {
+    const display = activityMetadataDisplayValue(payload[key]);
+    if (display) out[key] = display;
+  }
+  const validationError = recordString(payload, "backend_validation_error");
+  if (validationError) out.validation_error = activitySafeDisplayText(validationError, 180);
+  const errorSummary = recordString(payload, "error") || recordString(payload, "last_error");
+  if (errorSummary) out.error_summary = activitySafeDisplayText(errorSummary, 180);
+  return out;
+}
+
+function activitySafeDisplayText(value: string, maxLength = 160) {
+  let text = String(value ?? "").trim();
+  if (!text) return "";
+  text = text
+    .replace(activitySecretPattern, "[redacted_secret]")
+    .replace(activityBase64Pattern, "[redacted_blob]")
+    .replace(activityStorageUriPattern, "[redacted_uri]")
+    .replace(activityWindowsPathPattern, "[redacted_path]")
+    .replace(activityUnixPathPattern, "$1[redacted_path]")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trim()}...`;
+}
+
+function activitySeverity(value: string): AgentActivityEvent["severity"] {
+  const normalized = value.toLowerCase();
+  if (["info", "warning", "error", "success"].includes(normalized)) return normalized;
+  return "info";
+}
+
+function activityStatus(value: string): AgentActivityEvent["status"] {
+  const normalized = value.toLowerCase();
+  if (["active", "waiting", "succeeded", "failed", "blocked"].includes(normalized)) return normalized;
+  return "active";
+}
+
+function activityTimestamp(event: AgentActivityEvent) {
+  const timestamp = Date.parse(event.created_at || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function jobActivityTimestamp(job: Job) {
+  const timestamp = Date.parse(job.completed_at || job.started_at || job.created_at || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function jobStatusCounts(jobs: Job[]) {
+  return jobs.reduce(
+    (counts, job) => {
+      const status = normalizedStatus(job.status);
+      if (status in counts) counts[status as keyof typeof counts] += 1;
+      return counts;
+    },
+    { QUEUED: 0, ASSIGNED: 0, RUNNING: 0, SUCCEEDED: 0, FAILED: 0 },
+  );
+}
+
+function recordBoolean(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") return ["true", "yes", "1"].includes(value.toLowerCase());
+  return false;
+}
+
+function formatRelativeTime(value: string) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  const elapsedSeconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s ago`;
+  const elapsedMinutes = Math.round(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) return `${elapsedMinutes}m ago`;
+  const elapsedHours = Math.round(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours}h ago`;
+  return new Date(timestamp).toLocaleString();
 }
 
 function buildExperimentTimeline(project: Project | null, detail: ProjectDetail): TimelineItem[] {
@@ -4406,6 +7335,512 @@ function buildAgentInvocationAuditRows(invocations: AgentInvocation[], decisions
   });
 }
 
+function buildMissionControlTelemetrySummary(
+  telemetry: MissionControlTelemetryResponse | null,
+  fallbackInvocations: AgentInvocation[],
+): TelemetrySummary | null {
+  const invocations =
+    telemetry?.agent_invocations ??
+    telemetry?.invocations ??
+    fallbackInvocations ??
+    [];
+  const usageEvents =
+    telemetry?.memory_embedding_usage_events ??
+    telemetry?.embedding_usage_events ??
+    telemetry?.usage_events ??
+    [];
+  if (invocations.length === 0 && usageEvents.length === 0) {
+    return null;
+  }
+
+  const windows = telemetryWindowsFromInvocations(invocations);
+  const callsByAgent = telemetryCountSummaryFromInvocations(invocations, (invocation) => invocation.agent_name || "agent");
+  const callsByModel = telemetryCountSummaryFromInvocations(invocations, (invocation) => invocation.model || "unknown model");
+  const topInvocations = telemetryInvocationSummaries(invocations).slice(0, 6);
+  const promptSections = telemetryPromptSectionSummaries(invocations).slice(0, 8);
+  const embedding = telemetryEmbeddingSummaryFromUsageEvents(usageEvents);
+
+  return {
+    invocations,
+    usageEvents,
+    windows,
+    callsByAgent,
+    callsByModel,
+    topInvocations,
+    promptSections,
+    embedding,
+  };
+}
+
+function telemetryWindowsFromInvocations(invocations: AgentInvocation[]): TelemetryWindowSummary[] {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const sevenDayStart = new Date(todayStart);
+  sevenDayStart.setDate(todayStart.getDate() - 6);
+  const windows: Array<{ key: TelemetryWindowKey; label: string; since: Date }> = [
+    { key: "today", label: "Today", since: todayStart },
+    { key: "7d", label: "7-day", since: sevenDayStart },
+    { key: "lifetime", label: "Lifetime", since: new Date(0) },
+  ];
+
+  return windows.map((window) => {
+    const rows = invocations.filter((invocation) => telemetryInvocationTimestamp(invocation) >= window.since.getTime());
+    return telemetryWindowSummary(window.key, window.label, rows);
+  });
+}
+
+function telemetryWindowSummary(key: TelemetryWindowKey, label: string, invocations: AgentInvocation[]): TelemetryWindowSummary {
+  const rows = invocations.map((invocation) => telemetryInvocationUsage(invocation));
+  return {
+    key,
+    label,
+    calls: invocations.length,
+    exactCalls: rows.filter((row) => row.usageKind === "exact").length,
+    approxCalls: rows.filter((row) => row.usageKind !== "exact").length,
+    validCalls: invocations.filter((invocation) => normalizedStatus(invocation.validation_status || "").toLowerCase() === "valid").length,
+    invalidCalls: invocations.filter((invocation) => normalizedStatus(invocation.validation_status || "").toLowerCase() !== "valid").length,
+    exactInputTokens: sumTelemetry(rows.map((row) => row.inputTokens)),
+    exactOutputTokens: sumTelemetry(rows.map((row) => row.outputTokens)),
+    approxInputTokens: sumTelemetry(rows.map((row) => row.approxInputTokens)),
+    approxOutputTokens: sumTelemetry(rows.map((row) => row.approxOutputTokens)),
+    cachedInputTokens: sumTelemetry(rows.map((row) => row.cachedInputTokens)),
+    reasoningTokens: sumTelemetry(rows.map((row) => row.reasoningTokens)),
+    estimatedCostUsd: sumTelemetry(rows.map((row) => row.estimatedCostUsd)),
+  };
+}
+
+function telemetryCountSummaryFromInvocations(
+  invocations: AgentInvocation[],
+  labelForInvocation: (invocation: AgentInvocation) => string,
+): TelemetryCountSummary[] {
+  const grouped = new Map<string, TelemetryCountSummary>();
+  for (const invocation of invocations) {
+    const label = labelForInvocation(invocation) || "unknown";
+    const usage = telemetryInvocationUsage(invocation);
+    const current = grouped.get(label) ?? {
+      label,
+      count: 0,
+      exactCalls: 0,
+      approxCalls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      approxInputTokens: 0,
+      approxOutputTokens: 0,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      estimatedCostUsd: 0,
+    };
+    current.count += 1;
+    if (usage.usageKind === "exact") {
+      current.exactCalls += 1;
+      current.inputTokens += usage.inputTokens;
+      current.outputTokens += usage.outputTokens;
+    } else {
+      current.approxCalls += 1;
+      current.approxInputTokens += usage.approxInputTokens;
+      current.approxOutputTokens += usage.approxOutputTokens;
+    }
+    current.cachedInputTokens += usage.cachedInputTokens;
+    current.reasoningTokens += usage.reasoningTokens;
+    current.estimatedCostUsd += usage.estimatedCostUsd;
+    grouped.set(label, current);
+  }
+  return Array.from(grouped.values()).sort((left, right) => right.count - left.count || right.estimatedCostUsd - left.estimatedCostUsd);
+}
+
+function telemetryInvocationSummaries(invocations: AgentInvocation[]): TelemetryInvocationSummary[] {
+  return invocations
+    .map((invocation) => telemetryInvocationSummary(invocation))
+    .sort((left, right) => {
+      if (right.estimatedCostUsd !== left.estimatedCostUsd) return right.estimatedCostUsd - left.estimatedCostUsd;
+      const rightTokens = right.inputTokens + right.approxInputTokens + right.outputTokens + right.approxOutputTokens;
+      const leftTokens = left.inputTokens + left.approxInputTokens + left.outputTokens + left.approxOutputTokens;
+      if (rightTokens !== leftTokens) return rightTokens - leftTokens;
+      return telemetryTimestampValue(right.createdAt) - telemetryTimestampValue(left.createdAt);
+    });
+}
+
+function telemetryInvocationSummary(invocation: AgentInvocation): TelemetryInvocationSummary {
+  const usage = telemetryInvocationUsage(invocation);
+  const sections = telemetryInvocationSections(invocation);
+  const largestSection = sections[0]?.name || "";
+  const promptBytes = telemetryInvocationPromptBytes(invocation);
+  const runtime = telemetryInvocationRuntime(invocation);
+  return {
+    id: invocation.id,
+    createdAt: invocation.created_at,
+    agentName: invocation.agent_name || "agent",
+    model: invocation.model || recordString(runtime, "model") || "unknown model",
+    validationStatus: invocation.validation_status || "unknown",
+    usageKind: usage.usageKind,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    approxInputTokens: usage.approxInputTokens,
+    approxOutputTokens: usage.approxOutputTokens,
+    cachedInputTokens: usage.cachedInputTokens,
+    reasoningTokens: usage.reasoningTokens,
+    estimatedCostUsd: usage.estimatedCostUsd,
+    promptBytes,
+    sections,
+    largestSection,
+  };
+}
+
+function telemetryInvocationUsage(
+  invocation: AgentInvocation,
+): {
+  usageKind: "exact" | "approximate";
+  inputTokens: number;
+  outputTokens: number;
+  approxInputTokens: number;
+  approxOutputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  estimatedCostUsd: number;
+} {
+  const runtime = telemetryInvocationRuntime(invocation);
+  const usage = recordObject(runtime.llm_usage);
+  const exactInputTokens = Math.max(0, numberPayload(usage.input_tokens) ?? 0);
+  const exactOutputTokens = Math.max(0, numberPayload(usage.output_tokens) ?? 0);
+  const exactTotalTokens = Math.max(0, numberPayload(usage.total_tokens) ?? 0);
+  const cachedInputTokens = Math.max(0, numberPayload(usage.cached_input_tokens) ?? 0);
+  const reasoningTokens = Math.max(0, numberPayload(usage.reasoning_tokens) ?? 0);
+  const hasExactUsage = exactInputTokens > 0 || exactOutputTokens > 0 || exactTotalTokens > 0 || cachedInputTokens > 0 || reasoningTokens > 0;
+  const approxInputTokens = hasExactUsage ? 0 : telemetryApproximateTokensFromInput(invocation);
+  const approxOutputTokens = hasExactUsage ? 0 : telemetryApproximateTokensFromText(invocation.raw_output || "");
+  const pricing = telemetryPricingForModel(invocation.model || recordString(runtime, "model") || recordString(usage, "request_model"));
+  const inputCostTokens = hasExactUsage ? exactInputTokens : approxInputTokens;
+  const outputCostTokens = hasExactUsage ? exactOutputTokens : approxOutputTokens;
+  const estimatedCostUsd =
+    pricing.input > 0
+      ? ((Math.max(0, inputCostTokens - cachedInputTokens) * pricing.input) +
+          (cachedInputTokens * (pricing.cached ?? pricing.input)) +
+          (outputCostTokens * pricing.output)) / 1_000_000
+      : 0;
+
+  return {
+    usageKind: hasExactUsage ? "exact" : "approximate",
+    inputTokens: exactInputTokens,
+    outputTokens: exactOutputTokens,
+    approxInputTokens,
+    approxOutputTokens,
+    cachedInputTokens,
+    reasoningTokens,
+    estimatedCostUsd,
+  };
+}
+
+function telemetryInvocationRuntime(invocation: AgentInvocation) {
+  const inputContext = recordObject(invocation.input_context);
+  return recordObject(inputContext.invocation_runtime);
+}
+
+function telemetryPromptSectionSummaries(invocations: AgentInvocation[]): TelemetrySectionSummary[] {
+  const grouped = new Map<string, TelemetrySectionSummary>();
+  for (const invocation of invocations) {
+    for (const section of telemetryInvocationSections(invocation)) {
+      const key = section.name || "section";
+      const current = grouped.get(key) ?? {
+        name: key,
+        calls: 0,
+        bytes: 0,
+        approxTokens: 0,
+        exampleSource: section.exampleSource,
+      };
+      current.calls += section.calls;
+      current.bytes += section.bytes;
+      current.approxTokens += section.approxTokens;
+      if (!current.exampleSource && section.exampleSource) {
+        current.exampleSource = section.exampleSource;
+      }
+      grouped.set(key, current);
+    }
+  }
+  return Array.from(grouped.values()).sort((left, right) => right.bytes - left.bytes || right.approxTokens - left.approxTokens);
+}
+
+function telemetryApproximateTokensFromInput(invocation: AgentInvocation) {
+  const messageBytes = byteLengthOfJson(invocation.input_messages ?? []);
+  return Math.max(0, Math.ceil(messageBytes / 4));
+}
+
+function telemetryApproximateTokensFromText(text: string) {
+  return Math.max(0, Math.ceil(byteLengthOfText(text) / 4));
+}
+
+function telemetryInvocationPromptBytes(invocation: AgentInvocation) {
+  return byteLengthOfJson(invocation.input_messages ?? []);
+}
+
+function telemetryInvocationSections(invocation: AgentInvocation) {
+  const inputContext = recordObject(invocation.input_context);
+  const snapshots = [
+    { name: "planner_context_snapshot", snapshot: recordObject(inputContext.planner_context_snapshot) },
+    { name: "training_monitor_context_snapshot", snapshot: recordObject(inputContext.training_monitor_context_snapshot) },
+  ].filter(({ snapshot }) => Object.keys(snapshot).length > 0);
+  if (snapshots.length === 0) {
+    return [];
+  }
+
+  const sections = snapshots.flatMap(({ name, snapshot }) =>
+    telemetrySectionsFromSnapshot(snapshot).map((section) => ({
+      ...section,
+      exampleSource: section.exampleSource || `${invocation.agent_name || "agent"} - ${name}`,
+    })),
+  );
+  const grouped = new Map<string, TelemetrySectionSummary>();
+  for (const section of sections) {
+    const key = section.name || "section";
+    const current = grouped.get(key) ?? {
+      name: key,
+      calls: 0,
+      bytes: 0,
+      approxTokens: 0,
+      exampleSource: section.exampleSource,
+    };
+    current.calls += section.calls;
+    current.bytes += section.bytes;
+    current.approxTokens += section.approxTokens;
+    if (!current.exampleSource && section.exampleSource) {
+      current.exampleSource = section.exampleSource;
+    }
+    grouped.set(key, current);
+  }
+  return Array.from(grouped.values()).sort((left, right) => right.bytes - left.bytes || right.approxTokens - left.approxTokens);
+}
+
+function telemetrySectionsFromSnapshot(snapshot: Record<string, unknown>) {
+  const promptBudget = recordObject(snapshot.prompt_budget ?? snapshot.promptBudget);
+  const explicitEstimates = telemetrySectionEstimateList(promptBudget.section_estimates ?? promptBudget.sectionEstimates);
+  if (explicitEstimates.length > 0) {
+    return explicitEstimates;
+  }
+
+  const out: TelemetrySectionSummary[] = [];
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (["context_version", "prompt_budget"].includes(key)) {
+      continue;
+    }
+    if (value === undefined || value === null) {
+      continue;
+    }
+    const bytes = byteLengthOfJson(value);
+    if (bytes <= 0) {
+      continue;
+    }
+    out.push({
+      name: key,
+      calls: 1,
+      bytes,
+      approxTokens: Math.max(1, Math.ceil(bytes / 4)),
+    });
+  }
+  return out;
+}
+
+function telemetrySectionEstimateList(value: unknown): TelemetrySectionSummary[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => telemetrySectionEstimateList(item));
+  }
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) {
+    return [];
+  }
+
+  const name = recordString(record, "name") || recordString(record, "section") || recordString(record, "label") || recordString(record, "id");
+  const bytes = Math.max(
+    0,
+    recordNumber(record, "bytes") ||
+      recordNumber(record, "byte_estimate") ||
+      recordNumber(record, "approx_bytes") ||
+      recordNumber(record, "approximate_bytes"),
+  );
+  const approxTokens = Math.max(
+    0,
+    recordNumber(record, "approx_tokens") ||
+      recordNumber(record, "approximate_tokens") ||
+      recordNumber(record, "token_estimate") ||
+      recordNumber(record, "approx_token_estimate"),
+  );
+  const calls = Math.max(
+    1,
+    recordNumber(record, "calls") || recordNumber(record, "count") || recordNumber(record, "invocations") || 0,
+  );
+  if (!name && bytes === 0 && approxTokens === 0) {
+    return [];
+  }
+  return [
+    {
+      name: name || "section",
+      calls,
+      bytes,
+      approxTokens: approxTokens || (bytes > 0 ? Math.max(1, Math.ceil(bytes / 4)) : 0),
+      exampleSource: recordString(record, "source") || recordString(record, "example_source") || recordString(record, "exampleSource") || undefined,
+    },
+  ];
+}
+
+function telemetryEmbeddingSummaryFromUsageEvents(events: MemoryEmbeddingUsageEvent[]) {
+  const sourceIndexEvents = events.filter((event) => telemetryEmbeddingPurpose(event) === "source_index");
+  const retrievalEvents = events.filter((event) => telemetryEmbeddingPurpose(event) === "retrieval_query");
+
+  return {
+    totalUsageEvents: events.length,
+    sourceIndex: telemetryEmbeddingPurposeSummary("source_index", sourceIndexEvents),
+    retrievalQuery: telemetryEmbeddingPurposeSummary("retrieval_query", retrievalEvents),
+  };
+}
+
+function telemetryEmbeddingPurposeSummary(purpose: string, events: MemoryEmbeddingUsageEvent[]): TelemetryEmbeddingPurposeSummary {
+  const bySourceTable = telemetryEmbeddingBreakdownSummary(events, (event) => event.source_table || event.source_id || "unknown");
+  const byModel = telemetryEmbeddingBreakdownSummary(events, (event) => event.embedding_model || "unknown");
+  const retrievalPurpose =
+    purpose === "retrieval_query"
+      ? uniqueStrings(
+          events
+            .map((event) => event.retrieval_purpose || recordString(recordObject(event.metadata), "retrieval_purpose"))
+            .filter((value): value is string => Boolean(value)),
+        ).join(", ")
+      : "";
+  return {
+    purpose,
+    retrievalPurpose,
+    count: events.length,
+    providerCalls: sumTelemetry(events.map((event) => event.provider_call_count || 0)),
+    inputBytes: sumTelemetry(events.map((event) => event.input_bytes || 0)),
+    estimatedCostUsd: sumTelemetry(events.map((event) => telemetryEmbeddingEstimatedCost(event))),
+    retrievedCount: sumTelemetry(events.map((event) => event.retrieved_count || 0)),
+    injected: events.filter((event) => event.injected === true).length,
+    logOnly: events.filter((event) => event.log_only === true).length,
+    cached: events.filter((event) => event.cached === true).length,
+    skipped: events.filter((event) => event.skipped === true).length,
+    bySourceTable,
+    byModel,
+  };
+}
+
+function telemetryEmbeddingBreakdownSummary(
+  events: MemoryEmbeddingUsageEvent[],
+  labelForEvent: (event: MemoryEmbeddingUsageEvent) => string,
+): TelemetryEmbeddingBreakdownRow[] {
+  const grouped = new Map<string, TelemetryEmbeddingBreakdownRow>();
+  for (const event of events) {
+    const label = labelForEvent(event) || "unknown";
+    const current = grouped.get(label) ?? {
+      label,
+      count: 0,
+      providerCalls: 0,
+      inputBytes: 0,
+      estimatedCostUsd: 0,
+      retrievedCount: 0,
+      injected: 0,
+      logOnly: 0,
+      cached: 0,
+      skipped: 0,
+    };
+    current.count += 1;
+    current.providerCalls += Math.max(0, event.provider_call_count || 0);
+    current.inputBytes += Math.max(0, event.input_bytes || 0);
+    current.estimatedCostUsd += telemetryEmbeddingEstimatedCost(event);
+    current.retrievedCount += Math.max(0, event.retrieved_count || 0);
+    current.injected += event.injected === true ? 1 : 0;
+    current.logOnly += event.log_only === true ? 1 : 0;
+    current.cached += event.cached === true ? 1 : 0;
+    current.skipped += event.skipped === true ? 1 : 0;
+    grouped.set(label, current);
+  }
+  return Array.from(grouped.values()).sort((left, right) => right.count - left.count || right.inputBytes - left.inputBytes);
+}
+
+function telemetryEmbeddingPurpose(event: MemoryEmbeddingUsageEvent) {
+  const purpose = String(event.purpose || "").toLowerCase().trim();
+  if (purpose === "source_index" || purpose === "retrieval_query") {
+    return purpose;
+  }
+  if (purpose.includes("source")) return "source_index";
+  if (purpose.includes("retrieval")) return "retrieval_query";
+  return "source_index";
+}
+
+function telemetryEmbeddingEstimatedCost(event: MemoryEmbeddingUsageEvent) {
+  const model = String(event.embedding_model || "").toLowerCase();
+  const pricing = telemetryEmbeddingPricingForModel(model);
+  const tokens = Math.max(0, event.input_bytes || 0) / 4;
+  return (tokens * pricing.input) / 1_000_000;
+}
+
+function telemetryEmbeddingPricingForModel(model: string) {
+  if (model.includes("text-embedding-3-large")) {
+    return { input: 0.13 };
+  }
+  if (model.includes("text-embedding-3-small")) {
+    return { input: 0.02 };
+  }
+  return { input: 0.02 };
+}
+
+function telemetryPricingForModel(model: string) {
+  const lower = model.toLowerCase();
+  if (lower.includes("gpt-5.4-pro")) return { input: 30, cached: 3, output: 180 };
+  if (lower.includes("gpt-5.4-mini")) return { input: 0.75, cached: 0.075, output: 4.5 };
+  if (lower.includes("gpt-5.4")) return { input: 2.5, cached: 0.25, output: 15 };
+  if (lower.includes("gpt-5 mini")) return { input: 0.25, cached: 0.025, output: 2 };
+  return { input: 0.75, cached: 0.075, output: 4.5 };
+}
+
+function telemetryInvocationTimestamp(invocation: AgentInvocation) {
+  const timestamp = Date.parse(invocation.created_at || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function telemetryTimestampValue(value: string) {
+  const timestamp = Date.parse(value || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function sumTelemetry(values: number[]) {
+  return values.reduce((total, value) => total + (Number.isFinite(value) ? value : 0), 0);
+}
+
+function byteLengthOfText(value: string) {
+  return new TextEncoder().encode(value).length;
+}
+
+function byteLengthOfJson(value: unknown) {
+  try {
+    return byteLengthOfText(JSON.stringify(value) ?? "");
+  } catch {
+    return 0;
+  }
+}
+
+function formatCompactNumber(value: number) {
+  if (!Number.isFinite(value)) return "-";
+  const abs = Math.abs(value);
+  if (abs < 1000) {
+    return String(Math.round(value));
+  }
+  return new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
+function formatTelemetryTokenPair(exactTokens: number, approxTokens: number) {
+  const hasExact = Number.isFinite(exactTokens) && exactTokens > 0;
+  const hasApprox = Number.isFinite(approxTokens) && approxTokens > 0;
+  if (hasExact && hasApprox) {
+    return `${formatCompactNumber(exactTokens)} exact + ~${formatCompactNumber(approxTokens)} approx`;
+  }
+  if (hasExact) {
+    return `${formatCompactNumber(exactTokens)} exact`;
+  }
+  if (hasApprox) {
+    return `~${formatCompactNumber(approxTokens)}`;
+  }
+  return "0";
+}
+
 function invocationRuntimeRecord(inputContext: Record<string, unknown>) {
   for (const key of ["invocation_runtime", "runtime", "llm_runtime", "responses_runtime"]) {
     const runtime = recordObject(inputContext[key]);
@@ -5006,6 +8441,39 @@ function clamp01(value: number) {
   return Math.max(0, Math.min(1, value));
 }
 
+function buildMemoryRetrievalProbeSnapshots(events: ExecutionEvent[]): MemoryRetrievalProbeSnapshot[] {
+  return events
+    .filter((event) => event.event_type === "MEMORY_RETRIEVAL_LOGGED")
+    .map((event) => {
+      const payload = recordObject(event.payload);
+      const cards = uniqueBy(memoryCardsFromUnknown(payload.retrieved_cards), memoryDisplayKey).slice(0, 12);
+      const retrievedCount = recordNumber(payload, "retrieved_count");
+      return {
+        id: event.id,
+        purpose: recordString(payload, "purpose") || "memory_retrieval",
+        logOnly: recordBoolean(payload, "log_only"),
+        crossProjectOK: recordBoolean(payload, "cross_project_ok"),
+        retrievedCount: retrievedCount || cards.length,
+        createdAt: event.created_at,
+        cards,
+      };
+    })
+    .sort((left, right) => Date.parse(right.createdAt || "") - Date.parse(left.createdAt || ""));
+}
+
+function humanizeMemoryPurpose(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "planner" || normalized === "experiment_planner") return "Planner retrieval";
+  if (normalized === "training_monitor") return "Training monitor retrieval";
+  if (!normalized) return "Memory retrieval";
+  return `${normalized.replace(/[_-]+/g, " ")} retrieval`;
+}
+
+function memoryPurposeSuffix(value: string) {
+  const label = humanizeMemoryPurpose(value).replace(/\s+retrieval$/i, "").toLowerCase();
+  return label && label !== "memory" ? ` for ${label}` : "";
+}
+
 function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[] {
   const rankings = Array.isArray(decision.payload?.candidate_rankings) ? decision.payload.candidate_rankings : [];
   return rankings
@@ -5213,6 +8681,7 @@ function isMemoryContainerKey(key: string, entry: unknown) {
     normalized.includes("retrieved_run_memory") ||
     normalized.includes("memory_hits") ||
     normalized.includes("memory_cards") ||
+    normalized.includes("retrieved_cards") ||
     normalized.includes("successful_strategy_cards") ||
     normalized.includes("failed_strategy_cards") ||
     normalized.includes("blocked_or_rejected_cards") ||
@@ -5357,6 +8826,7 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
       preprocessing: [],
       demoImages: [],
       demoPredictions: [],
+      feedback: [],
     };
   }
 
@@ -5370,13 +8840,26 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
     ...recordObject(deployment.model_profile),
     ...recordObject(evaluation.model_profile),
   };
-  const deploymentONNXArtifact =
-    recordString(deployment, "onnx_artifact_uri") ||
-    recordString(deployment, "artifact_uri") ||
-    recordString(modelProfile, "onnx_artifact_uri") ||
-    recordString(modelProfile, "artifact_uri");
+  const deploymentArtifactCandidates = [
+    recordString(deployment, "onnx_artifact_uri"),
+    recordString(modelProfile, "onnx_artifact_uri"),
+    recordString(deployment, "artifact_uri"),
+    recordString(modelProfile, "artifact_uri"),
+  ];
+  const deploymentONNXArtifact = firstChampionArtifactMatchingFormat(deploymentArtifactCandidates, "onnx");
+  const deploymentSourceArtifact = deploymentArtifactCandidates.find(Boolean) || "";
+  const deploymentSourceFormat = championExportFormatFromArtifact(deploymentSourceArtifact);
   const deploymentExportManifest = recordObject(deployment.export_manifest);
   const modelExportManifest = recordObject(modelProfile.export_manifest);
+  const sourceExportStatus =
+    recordString(modelCard, "export_status") ||
+    recordString(deployment, "export_status") ||
+    recordString(modelProfile, "export_status") ||
+    "PENDING_ARTIFACT";
+  const sourceValidationErrors = championExportValidationErrorsForFormat(
+    stringArrayPayload(modelProfile.export_validation_errors),
+    deploymentSourceFormat,
+  );
   const exports = [
     ...(deploymentONNXArtifact
       ? [
@@ -5388,6 +8871,25 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
             status: "READY",
             format: "onnx",
             artifact_uri: deploymentONNXArtifact,
+            metadata: {
+              manifest: Object.keys(deploymentExportManifest).length > 0 ? deploymentExportManifest : modelExportManifest,
+              deployment_profile: deployment,
+              model_profile: modelProfile,
+            },
+          } satisfies ChampionExport,
+        ]
+      : []),
+    ...(deploymentSourceArtifact && deploymentSourceArtifact !== deploymentONNXArtifact
+      ? [
+          {
+            id: `${champion.id}-training-source`,
+            project_id: champion.project_id,
+            champion_id: champion.id,
+            job_id: champion.job_id,
+            status: deploymentSourceFormat ? "READY" : sourceExportStatus,
+            format: deploymentSourceFormat || "model artifact",
+            artifact_uri: deploymentSourceArtifact,
+            validation_errors: sourceValidationErrors,
             metadata: {
               manifest: Object.keys(deploymentExportManifest).length > 0 ? deploymentExportManifest : modelExportManifest,
               deployment_profile: deployment,
@@ -5463,7 +8965,47 @@ function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDemo {
     preprocessing: preprocessing.length > 0 ? preprocessing : ["Use the preprocessing from the winning experiment config."],
     demoImages,
     demoPredictions,
+    feedback: detail.championFeedback,
   };
+}
+
+function championFeedbackMetricsSnapshot(detail: ProjectDetail) {
+  const champion = detail.champion;
+  if (!champion) return {};
+  const runSummary = detail.runSummaries.find((summary) => summary.job_id === champion.job_id) ?? null;
+  const runEvaluation = detail.runEvaluations.find((evaluation) => evaluation.job_id === champion.job_id) ?? null;
+  return {
+    champion_id: champion.id,
+    champion_job_id: champion.job_id,
+    champion_metrics: champion.metrics,
+    champion_evaluation: champion.evaluation,
+    deployment_profile: champion.deployment_profile,
+    run_summary: runSummary,
+    run_evaluation: runEvaluation,
+  };
+}
+
+function feedbackRatingLabel(rating: string) {
+  switch (rating) {
+    case "good":
+      return "Good";
+    case "bad":
+      return "Bad";
+    default:
+      return "Mediocre";
+  }
+}
+
+function normalizeChampionFeedbackResponse(response: { feedback?: ChampionFeedback } | ChampionFeedback): ChampionFeedback | null {
+  const wrapped = recordObject(response).feedback;
+  if (isChampionFeedback(wrapped)) return wrapped;
+  if (isChampionFeedback(response)) return response;
+  return null;
+}
+
+function isChampionFeedback(value: unknown): value is ChampionFeedback {
+  const record = recordObject(value);
+  return Boolean(record.id && record.champion_id && record.rating);
 }
 
 function experimentPreprocessingItems(experiment: PlannedExperiment) {
@@ -6145,6 +9687,76 @@ function championExportsFromUnknown(value: unknown): ChampionExport[] {
   return value.map((item) => recordObject(item) as ChampionExport).filter((item) => Object.keys(item).length > 0);
 }
 
+function championExportExternalData(exportRecord: ChampionExport) {
+  const metadata = recordObject(exportRecord.metadata);
+  const manifests = [
+    recordObject(metadata.manifest),
+    recordObject(recordObject(metadata.deployment_profile).export_manifest),
+    recordObject(recordObject(metadata.model_profile).export_manifest),
+  ].filter((item) => Object.keys(item).length > 0);
+  const sidecars = manifests.flatMap((manifest) => {
+    const artifacts = Array.isArray(manifest.artifacts) ? manifest.artifacts : [];
+    return artifacts.flatMap((item) => {
+      const artifact = recordObject(item);
+      if (recordString(artifact, "format").toLowerCase() !== "onnx") return [];
+      const externalData = Array.isArray(artifact.external_data) ? artifact.external_data : [];
+      return externalData
+        .map((entry) => {
+          const record = recordObject(entry);
+          const sidecarPath = recordFirstString(record, ["path", "relative_path", "file_name"]);
+          if (!sidecarPath) return null;
+          return {
+            path: sidecarPath,
+            relative_path: recordString(record, "relative_path"),
+            uri: recordFirstString(record, ["uri", "artifact_uri"]),
+            artifact_path: recordString(record, "artifact_path"),
+            local_path: recordString(record, "local_path"),
+            file_name: recordString(record, "file_name"),
+          };
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+    });
+  });
+  return uniqueBy(sidecars, (item) => item.path);
+}
+
+function firstChampionArtifactMatchingFormat(values: string[], format: string) {
+  return values.find((value) => value && artifactMatchesChampionExportFormat(value, format)) || "";
+}
+
+function championExportFormatFromArtifact(uri: string) {
+  if (artifactMatchesChampionExportFormat(uri, "onnx")) return "onnx";
+  if (artifactMatchesChampionExportFormat(uri, "torchscript")) return "torchscript";
+  if (artifactMatchesChampionExportFormat(uri, "safetensors")) return "safetensors";
+  if (artifactMatchesChampionExportFormat(uri, "pytorch")) return "pytorch";
+  return "";
+}
+
+function championExportValidationErrorsForFormat(errors: string[], format: string) {
+  const normalized = format.toLowerCase();
+  if (normalized === "onnx" || !normalized) return errors;
+  return errors.filter((error) => !/onnx|onnxscript/i.test(error));
+}
+
+function artifactMatchesChampionExportFormat(uri: string, format: string) {
+  const path = artifactComparablePath(uri);
+  if (format === "onnx") return path.endsWith(".onnx");
+  if (format === "torchscript") return path.endsWith(".torchscript.pt") || path.endsWith(".torchscript");
+  if (format === "pytorch") return path.endsWith(".pt") || path.endsWith(".pth");
+  if (format === "safetensors") return path.endsWith(".safetensors");
+  return false;
+}
+
+function artifactComparablePath(uri: string) {
+  const trimmed = uri.trim();
+  const fallback = trimmed.split(/[?#]/)[0].toLowerCase();
+  try {
+    return decodeURIComponent(new URL(trimmed).pathname || fallback).toLowerCase();
+  } catch {
+    return fallback;
+  }
+}
+
 function demoImagesFromUnknown(value: unknown): ChampionDemoImage[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => recordObject(item) as ChampionDemoImage).filter((item) => Object.keys(item).length > 0);
@@ -6153,6 +9765,138 @@ function demoImagesFromUnknown(value: unknown): ChampionDemoImage[] {
 function demoPredictionsFromUnknown(value: unknown): ChampionDemoPrediction[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => recordObject(item) as ChampionDemoPrediction).filter((item) => Object.keys(item).length > 0);
+}
+
+function championExportDemoIsDetection(data: ChampionExportDemo) {
+  const records = [
+    data.modelProfile,
+    data.deploymentProfile,
+    data.modelCard,
+    ...data.exports.map((item) => recordObject(item.metadata)),
+    ...data.exports.map((item) => recordObject(recordObject(item.metadata).manifest)),
+  ];
+  return records.some((record) => {
+    const metadata = recordObject(record);
+    const manifestMetadata = recordObject(recordObject(metadata.manifest).metadata);
+    const candidates = [metadata, manifestMetadata, recordObject(metadata.model_profile)];
+    return candidates.some((candidate) => {
+      const modelKind = recordString(candidate, "model_kind").toLowerCase();
+      const taskType = recordString(candidate, "task_type").toLowerCase();
+      const model = recordString(candidate, "model").toLowerCase();
+      return modelKind.includes("detect") || taskType.includes("object_detection") || model.includes("yolo");
+    });
+  });
+}
+
+function detectionDefaultsFromChampionExportDemo(data: ChampionExportDemo) {
+  const records = [
+    data.modelProfile,
+    data.deploymentProfile,
+    data.modelCard,
+    ...data.exports.map((item) => recordObject(item.metadata)),
+    ...data.exports.map((item) => recordObject(recordObject(item.metadata).manifest)),
+    ...data.exports.map((item) => recordObject(recordObject(recordObject(item.metadata).manifest).metadata)),
+  ];
+  let confidenceThreshold = 0.25;
+  let iouThreshold = 0.7;
+  for (const record of records) {
+    const metadata = recordObject(record);
+    const defaults = recordObject(metadata.confidence_threshold_defaults);
+    const detection = recordObject(defaults.detection);
+    const postprocessing = recordObject(metadata.postprocessing_contract);
+    const nms = recordObject(postprocessing.nms);
+    const confidence = numericValue(detection.confidence_threshold ?? nms.confidence_threshold ?? postprocessing.confidence_threshold);
+    const iou = numericValue(detection.iou_threshold ?? nms.iou_threshold ?? postprocessing.iou_threshold);
+    if (confidence > 0 && confidence <= 1) confidenceThreshold = confidence;
+    if (iou > 0 && iou <= 1) iouThreshold = iou;
+  }
+  return {
+    isDetection: championExportDemoIsDetection(data),
+    confidenceThreshold,
+    iouThreshold,
+  };
+}
+
+function detectionBoxesFromPrediction(prediction?: ChampionDemoPrediction | null): ChampionDetection[] {
+  if (!prediction) return [];
+  const metadata = { ...recordObject(prediction.image_metadata), ...recordObject(prediction.metadata) };
+  let raw: unknown[] = [];
+  if (Array.isArray(prediction.detections)) {
+    raw = prediction.detections;
+  } else if (Array.isArray(metadata.detections)) {
+    raw = metadata.detections;
+  } else {
+    const detectionResult = recordObject(metadata.detection_result);
+    if (Array.isArray(detectionResult.detections)) {
+      raw = detectionResult.detections;
+    }
+  }
+  return raw
+    .map((item) => normalizeDetection(item))
+    .filter((item): item is ChampionDetection => Boolean(item))
+    .sort((left, right) => Number(right.confidence ?? right.score ?? 0) - Number(left.confidence ?? left.score ?? 0));
+}
+
+function normalizeDetection(value: unknown): ChampionDetection | null {
+  const record = recordObject(value);
+  if (Object.keys(record).length === 0) return null;
+  const box = normalizedDetectionBox(record as ChampionDetection);
+  if (!box) return null;
+  const label = recordString(record, "label") || recordString(record, "class_name") || recordString(record, "name");
+  const confidence = numericValue(record.confidence ?? record.score);
+  const classID = numericValue(record.class_id ?? record.class_index);
+  return {
+    ...(record as ChampionDetection),
+    label: label || (Number.isFinite(classID) ? `class_${classID}` : "object"),
+    class_name: label || (Number.isFinite(classID) ? `class_${classID}` : "object"),
+    class_id: Number.isFinite(classID) ? Math.round(classID) : undefined,
+    confidence: confidence || 0,
+    score: confidence || 0,
+    box,
+    x: box.x,
+    y: box.y,
+    width: box.width,
+    height: box.height,
+    x1: box.x,
+    y1: box.y,
+    x2: box.x + box.width,
+    y2: box.y + box.height,
+  };
+}
+
+function normalizedDetectionBox(detection: ChampionDetection): { x: number; y: number; width: number; height: number } | null {
+  const box = recordObject(detection.box);
+  const x = numericValue(box.x ?? detection.x ?? detection.x1);
+  const y = numericValue(box.y ?? detection.y ?? detection.y1);
+  const width = numericValue(box.width ?? detection.width);
+  const height = numericValue(box.height ?? detection.height);
+  if (width > 0 && height > 0) {
+    return boundedDetectionBox(x, y, width, height);
+  }
+  const x1 = numericValue(box.x1 ?? detection.x1);
+  const y1 = numericValue(box.y1 ?? detection.y1);
+  const x2 = numericValue(box.x2 ?? detection.x2);
+  const y2 = numericValue(box.y2 ?? detection.y2);
+  if ([x1, y1, x2, y2].every(Number.isFinite)) {
+    return boundedDetectionBox(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+  }
+  return null;
+}
+
+function boundedDetectionBox(x: number, y: number, width: number, height: number) {
+  const left = Math.max(0, Math.min(1, x));
+  const top = Math.max(0, Math.min(1, y));
+  const boundedWidth = Math.max(0, Math.min(1 - left, width));
+  const boundedHeight = Math.max(0, Math.min(1 - top, height));
+  if (boundedWidth <= 0 || boundedHeight <= 0) return null;
+  return { x: left, y: top, width: boundedWidth, height: boundedHeight };
+}
+
+function predictionPostprocessLatency(prediction?: ChampionDemoPrediction | null) {
+  if (!prediction) return 0;
+  const metadata = { ...recordObject(prediction.image_metadata), ...recordObject(prediction.metadata) };
+  const breakdown = recordObject(metadata.latency_breakdown_ms);
+  return numericValue(prediction.postprocess_latency_ms ?? metadata.postprocess_latency_ms ?? breakdown.postprocess);
 }
 
 function normalizeDemoPredictionResponse(value: ChampionDemoPrediction | { prediction?: ChampionDemoPrediction }) {

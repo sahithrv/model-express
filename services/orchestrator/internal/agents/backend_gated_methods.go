@@ -715,7 +715,7 @@ func plannerHasDeploymentLatencyEvidence(input ExperimentPlannerInput, evidence 
 		return true
 	}
 	for _, evaluation := range append(append([]runs.TrainingRunEvaluation(nil), input.PlanEvaluations...), input.PriorEvaluations...) {
-		if firstPositivePayloadFloat(evaluation.ModelProfile, "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms") > 0 {
+		if firstPositivePayloadFloat(evaluation.ModelProfile, "estimated_pipeline_latency_ms", "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms") > 0 {
 			return true
 		}
 	}

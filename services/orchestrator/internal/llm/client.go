@@ -39,6 +39,14 @@ func newOpenAICompatibleClient(config Config) OpenAICompatibleClient {
 }
 
 func (c OpenAICompatibleClient) GenerateJSON(ctx context.Context, req JSONRequest) ([]byte, error) {
+	result, err := c.GenerateJSONWithUsage(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return result.RawJSON, nil
+}
+
+func (c OpenAICompatibleClient) GenerateJSONWithUsage(ctx context.Context, req JSONRequest) (JSONResult, error) {
 	if c.useResponses() {
 		result, err := c.CreateResponse(ctx, ResponseRequest{
 			Model:              req.Model,
@@ -48,23 +56,27 @@ func (c OpenAICompatibleClient) GenerateJSON(ctx context.Context, req JSONReques
 			PreviousResponseID: req.PreviousResponseID,
 		})
 		if err != nil {
-			return nil, err
+			return JSONResult{}, err
 		}
 		if len(result.FunctionCalls) > 0 {
-			return nil, fmt.Errorf("llm response requested %d information tool calls but no answerer was provided", len(result.FunctionCalls))
+			return JSONResult{}, fmt.Errorf("llm response requested %d information tool calls but no answerer was provided", len(result.FunctionCalls))
 		}
 		if len(result.FinalJSON) == 0 {
-			return nil, fmt.Errorf("llm response content was empty")
+			return JSONResult{}, fmt.Errorf("llm response content was empty")
 		}
-		return result.FinalJSON, nil
+		return JSONResult{RawJSON: result.FinalJSON, Usage: result.Usage}, nil
 	}
-	return c.generateChatJSON(ctx, req)
+	raw, usage, err := c.generateChatJSONWithUsage(ctx, req)
+	if err != nil {
+		return JSONResult{}, err
+	}
+	return JSONResult{RawJSON: raw, Usage: usage}, nil
 }
 
 func (c OpenAICompatibleClient) GenerateJSONWithTools(ctx context.Context, req ToolLoopRequest) (ToolLoopResult, error) {
 	if !c.useResponses() {
-		raw, err := c.generateChatJSON(ctx, req.JSONRequest)
-		return ToolLoopResult{FinalJSON: raw}, err
+		result, err := c.GenerateJSONWithUsage(ctx, req.JSONRequest)
+		return ToolLoopResult{FinalJSON: result.RawJSON, Usage: result.Usage}, err
 	}
 
 	model, err := c.modelForRequest(req.JSONRequest)
@@ -99,11 +111,15 @@ func (c OpenAICompatibleClient) GenerateJSONWithTools(ctx context.Context, req T
 
 		result.ResponseID = response.ID
 		result.PreviousResponseID = response.PreviousResponseID
+		result.Usage = mergeUsage(result.Usage, response.Usage)
 		if len(response.FunctionCalls) == 0 {
 			if len(response.FinalJSON) == 0 {
 				return result, fmt.Errorf("llm response content was empty")
 			}
 			result.FinalJSON = response.FinalJSON
+			if result.Usage != nil {
+				result.Usage.ToolRounds = result.ToolRounds
+			}
 			return result, nil
 		}
 		if req.ToolAnswerer == nil {
@@ -149,12 +165,12 @@ func (c OpenAICompatibleClient) GenerateJSONWithTools(ctx context.Context, req T
 
 func (c OpenAICompatibleClient) CreateResponse(ctx context.Context, req ResponseRequest) (ResponseResult, error) {
 	if !c.useResponses() {
-		raw, err := c.generateChatJSON(ctx, JSONRequest{
+		raw, usage, err := c.generateChatJSONWithUsage(ctx, JSONRequest{
 			Model:       req.Model,
 			Messages:    req.Messages,
 			Temperature: req.Temperature,
 		})
-		return ResponseResult{FinalJSON: raw, Text: string(raw)}, err
+		return ResponseResult{FinalJSON: raw, Text: string(raw), Usage: usage}, err
 	}
 
 	model, err := c.modelForRequest(JSONRequest{Model: req.Model})
@@ -179,17 +195,22 @@ func (c OpenAICompatibleClient) CreateResponse(ctx context.Context, req Response
 }
 
 func (c OpenAICompatibleClient) generateChatJSON(ctx context.Context, req JSONRequest) ([]byte, error) {
+	raw, _, err := c.generateChatJSONWithUsage(ctx, req)
+	return raw, err
+}
+
+func (c OpenAICompatibleClient) generateChatJSONWithUsage(ctx context.Context, req JSONRequest) ([]byte, *Usage, error) {
 	if !c.config.Enabled {
-		return nil, fmt.Errorf("llm is disabled")
+		return nil, nil, fmt.Errorf("llm is disabled")
 	}
 	if c.config.BaseURL == "" {
-		return nil, fmt.Errorf("MODEL_EXPRESS_LLM_BASE_URL is required for provider %s", c.config.Provider)
+		return nil, nil, fmt.Errorf("MODEL_EXPRESS_LLM_BASE_URL is required for provider %s", c.config.Provider)
 	}
 	if c.config.Model == "" && req.Model == "" {
-		return nil, fmt.Errorf("MODEL_EXPRESS_LLM_MODEL is required")
+		return nil, nil, fmt.Errorf("MODEL_EXPRESS_LLM_MODEL is required")
 	}
 	if c.config.APIKey == "" && c.config.Provider != ProviderLocal {
-		return nil, fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY is required for provider %s", c.config.Provider)
+		return nil, nil, fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY is required for provider %s", c.config.Provider)
 	}
 
 	model := req.Model
@@ -205,12 +226,12 @@ func (c OpenAICompatibleClient) generateChatJSON(ctx context.Context, req JSONRe
 
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("marshal llm request: %w", err)
+		return nil, nil, fmt.Errorf("marshal llm request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.BaseURL+"/chat/completions", bytes.NewReader(encoded))
 	if err != nil {
-		return nil, fmt.Errorf("build llm request: %w", err)
+		return nil, nil, fmt.Errorf("build llm request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.config.APIKey != "" {
@@ -219,32 +240,32 @@ func (c OpenAICompatibleClient) generateChatJSON(ctx context.Context, req JSONRe
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("call llm: %w", err)
+		return nil, nil, fmt.Errorf("call llm: %w", err)
 	}
 	defer resp.Body.Close()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read llm response: %w", err)
+		return nil, nil, fmt.Errorf("read llm response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("llm request failed: %s: %s", resp.Status, string(responseBody))
+		return nil, nil, fmt.Errorf("llm request failed: %s: %s", resp.Status, string(responseBody))
 	}
 
 	var decoded chatCompletionResponse
 	if err := json.Unmarshal(responseBody, &decoded); err != nil {
-		return nil, fmt.Errorf("decode llm response: %w", err)
+		return nil, nil, fmt.Errorf("decode llm response: %w", err)
 	}
 	if len(decoded.Choices) == 0 {
-		return nil, fmt.Errorf("llm response had no choices")
+		return nil, nil, fmt.Errorf("llm response had no choices")
 	}
 
 	content := strings.TrimSpace(decoded.Choices[0].Message.Content)
 	if content == "" {
-		return nil, fmt.Errorf("llm response content was empty")
+		return nil, nil, fmt.Errorf("llm response content was empty")
 	}
 
-	return []byte(content), nil
+	return []byte(content), chatUsageFromChatCompletion(decoded, body.Model, APIStyleChatCompletions), nil
 }
 
 func (c OpenAICompatibleClient) postResponse(ctx context.Context, call responsesCall) (ResponseResult, error) {
@@ -314,6 +335,10 @@ func (c OpenAICompatibleClient) postResponse(ctx context.Context, call responses
 		return ResponseResult{}, fmt.Errorf("decode llm responses response: %w", err)
 	}
 	result := decoded.result()
+	if result.Usage != nil {
+		result.Usage.RequestModel = call.model
+		result.Usage.APIStyle = APIStyleResponses
+	}
 	if len(result.FinalJSON) == 0 && len(result.FunctionCalls) == 0 {
 		return ResponseResult{}, fmt.Errorf("llm response content was empty")
 	}
@@ -355,6 +380,23 @@ type chatCompletionResponse struct {
 	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
+	Usage *chatCompletionUsage `json:"usage"`
+}
+
+type chatCompletionUsage struct {
+	PromptTokens            int                           `json:"prompt_tokens"`
+	PromptTokensDetails     chatCompletionTokenBreak      `json:"prompt_tokens_details"`
+	CompletionTokens        int                           `json:"completion_tokens"`
+	CompletionTokensDetails chatCompletionCompletionBreak `json:"completion_tokens_details"`
+	TotalTokens             int                           `json:"total_tokens"`
+}
+
+type chatCompletionTokenBreak struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+type chatCompletionCompletionBreak struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 type ResponseRequest struct {
@@ -374,6 +416,7 @@ type ResponseResult struct {
 	Text               string
 	FinalJSON          []byte
 	FunctionCalls      []ToolCall
+	Usage              *Usage
 
 	outputItems []json.RawMessage
 }
@@ -400,6 +443,7 @@ type ToolLoopResult struct {
 	ToolRounds         int
 	ToolCalls          []ToolCall
 	ToolResults        []ToolResult
+	Usage              *Usage
 }
 
 type InformationToolAnswerer interface {
@@ -482,6 +526,23 @@ type responsesResponse struct {
 	PreviousResponseID string                `json:"previous_response_id"`
 	OutputText         string                `json:"output_text"`
 	Output             []responsesOutputItem `json:"output"`
+	Usage              *responsesUsage       `json:"usage"`
+}
+
+type responsesUsage struct {
+	InputTokens         int                  `json:"input_tokens"`
+	InputTokensDetails  responsesUsageInput  `json:"input_tokens_details"`
+	OutputTokens        int                  `json:"output_tokens"`
+	OutputTokensDetails responsesUsageOutput `json:"output_tokens_details"`
+	TotalTokens         int                  `json:"total_tokens"`
+}
+
+type responsesUsageInput struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+type responsesUsageOutput struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 type responsesOutputItem struct {
@@ -516,6 +577,7 @@ func (r responsesResponse) result() ResponseResult {
 		ID:                 r.ID,
 		PreviousResponseID: r.PreviousResponseID,
 		outputItems:        make([]json.RawMessage, 0, len(r.Output)),
+		Usage:              responsesUsageToUsage(r.Usage),
 	}
 
 	var textParts []string
@@ -555,6 +617,59 @@ func (r responsesResponse) result() ResponseResult {
 		result.FinalJSON = extractFinalJSON(result.Text)
 	}
 	return result
+}
+
+func chatUsageFromChatCompletion(response chatCompletionResponse, requestModel string, apiStyle string) *Usage {
+	if response.Usage == nil {
+		return nil
+	}
+	return &Usage{
+		InputTokens:       response.Usage.PromptTokens,
+		OutputTokens:      response.Usage.CompletionTokens,
+		TotalTokens:       response.Usage.TotalTokens,
+		CachedInputTokens: response.Usage.PromptTokensDetails.CachedTokens,
+		ReasoningTokens:   response.Usage.CompletionTokensDetails.ReasoningTokens,
+		RequestModel:      requestModel,
+		APIStyle:          apiStyle,
+	}
+}
+
+func responsesUsageToUsage(response *responsesUsage) *Usage {
+	if response == nil {
+		return nil
+	}
+	return &Usage{
+		InputTokens:       response.InputTokens,
+		OutputTokens:      response.OutputTokens,
+		TotalTokens:       response.TotalTokens,
+		CachedInputTokens: response.InputTokensDetails.CachedTokens,
+		ReasoningTokens:   response.OutputTokensDetails.ReasoningTokens,
+	}
+}
+
+func mergeUsage(existing *Usage, next *Usage) *Usage {
+	if next == nil {
+		return existing
+	}
+	if existing == nil {
+		clone := *next
+		return &clone
+	}
+	existing.InputTokens += next.InputTokens
+	existing.OutputTokens += next.OutputTokens
+	existing.TotalTokens += next.TotalTokens
+	existing.CachedInputTokens += next.CachedInputTokens
+	existing.ReasoningTokens += next.ReasoningTokens
+	if existing.RequestModel == "" {
+		existing.RequestModel = next.RequestModel
+	}
+	if existing.APIStyle == "" {
+		existing.APIStyle = next.APIStyle
+	}
+	if existing.ToolRounds == 0 {
+		existing.ToolRounds = next.ToolRounds
+	}
+	return existing
 }
 
 func responseInputFromMessages(messages []Message) []any {

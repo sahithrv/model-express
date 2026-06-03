@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -26,26 +28,40 @@ const (
 )
 
 const (
-	plannerSnapshotVersion              = "planner_context_snapshot_v1"
-	plannerSnapshotMaxSourceExperiments = 5
-	plannerSnapshotMaxLedgerEntries     = 24
-	plannerSnapshotMaxMechanisms        = 24
-	plannerSnapshotMaxSignatureSample   = 24
-	plannerSnapshotMaxStrategyLessons   = 10
-	plannerSnapshotMaxBlockedRepeats    = 8
-	plannerSnapshotMaxRunDeltas         = 8
-	plannerRetrievedMemoryMaxTotal      = 10
-	plannerRetrievedMemoryMaxSuccessful = 3
-	plannerRetrievedMemoryMaxFailed     = 3
-	plannerRetrievedMemoryMaxBlocked    = 4
-	plannerRetrievedMemoryMaxDataset    = 2
-	plannerVisualMaxObservedTraits      = 8
-	plannerVisualMaxClassesToWatch      = 6
-	plannerVisualMaxHypotheses          = 6
-	plannerVisualMaxCautions            = 6
-	plannerVisualMaxLimitations         = 8
-	plannerVisualMaxPerClassCounts      = 12
-	plannerVisualPromptBudget           = 4000
+	plannerSnapshotVersionV1                 = "planner_context_snapshot_v1"
+	plannerSnapshotVersionV2                 = "planner_context_snapshot_v2"
+	plannerStaticPromptVersionV1             = "v1"
+	plannerStaticPromptVersionCompactV1      = "compact_v1"
+	plannerSnapshotMaxSourceExperiments      = 5
+	plannerSnapshotMaxLedgerEntries          = 24
+	plannerSnapshotMaxMechanisms             = 24
+	plannerSnapshotMaxSignatureSample        = 24
+	plannerSnapshotMaxStrategyLessons        = 10
+	plannerSnapshotMaxBlockedRepeats         = 8
+	plannerSnapshotMaxRunDeltas              = 8
+	plannerRetrievedMemoryMaxTotal           = 10
+	plannerRetrievedMemoryMaxDistilled       = 6
+	plannerRetrievedMemoryMaxFailedOrBlocked = 4
+	plannerRetrievedMemoryMaxRawFallback     = 8
+	plannerVisualMaxObservedTraits           = 8
+	plannerVisualMaxClassesToWatch           = 6
+	plannerVisualMaxHypotheses               = 6
+	plannerVisualMaxCautions                 = 6
+	plannerVisualMaxLimitations              = 8
+	plannerVisualMaxPerClassCounts           = 12
+	plannerVisualPromptBudget                = 4000
+
+	plannerSnapshotV2MaxLedgerEntries     = 8
+	plannerSnapshotV2MaxMechanisms        = 12
+	plannerSnapshotV2MaxSignatureSample   = 8
+	plannerSnapshotV2MaxStrategyLessons   = 4
+	plannerSnapshotV2MaxBlockedRepeats    = 4
+	plannerSnapshotV2MaxRunDeltas         = 4
+	plannerRetrievedMemoryV2MaxTotal      = 6
+	plannerRetrievedMemoryV2MaxSuccessful = 2
+	plannerRetrievedMemoryV2MaxFailed     = 2
+	plannerRetrievedMemoryV2MaxBlocked    = 2
+	plannerRetrievedMemoryV2MaxDataset    = 1
 )
 
 type ExperimentPlannerAgent struct {
@@ -118,7 +134,7 @@ type PlannerContextSnapshot struct {
 	OptimizerFeedback      []automl.OptimizerFeedbackSummary `json:"optimizer_feedback_summary,omitempty"`
 	BlockedRepeats         []RejectedPlannerOption           `json:"blocked_repeats"`
 	VisualEvidence         map[string]any                    `json:"visual_evidence"`
-	ModelCatalog           []SupportedModelSpec              `json:"model_catalog"`
+	ModelCatalog           []PlannerModelCatalogCard         `json:"model_catalog"`
 	ValidationFeedback     []PlannerValidationFeedback       `json:"planner_validation_feedback,omitempty"`
 	StopOrContinuePressure PlannerStopContinueCard           `json:"stop_or_continue_pressure"`
 	PromptBudget           PlannerPromptBudget               `json:"prompt_budget"`
@@ -196,6 +212,7 @@ type PlannerResultSummary struct {
 	FailedRuns       int     `json:"failed_runs"`
 	BestModel        string  `json:"best_model,omitempty"`
 	BestScore        float64 `json:"best_score,omitempty"`
+	BestScoreBasis   string  `json:"best_score_basis,omitempty"`
 	TotalCostUSD     float64 `json:"total_cost_usd"`
 	TotalRuntimeSecs float64 `json:"total_runtime_seconds"`
 	BestJobID        string  `json:"best_job_id,omitempty"`
@@ -220,8 +237,11 @@ type PlannerExperimentLog struct {
 	Mechanism           string         `json:"mechanism"`
 	TargetMetric        string         `json:"target_metric"`
 	Score               float64        `json:"score"`
+	ScoreBasis          string         `json:"score_basis,omitempty"`
 	BestMacroF1         float64        `json:"best_macro_f1"`
 	BestAccuracy        float64        `json:"best_accuracy"`
+	FinalTrainLoss      float64        `json:"final_train_loss,omitempty"`
+	FinalValLoss        float64        `json:"final_val_loss,omitempty"`
 	DeltaVsChampion     float64        `json:"delta_vs_champion"`
 	EpochsCompleted     int            `json:"epochs_completed"`
 	CostUSD             float64        `json:"cost_usd"`
@@ -377,22 +397,35 @@ type PlannerStrategyLesson struct {
 }
 
 type PlannerRetrievedMemorySnapshot struct {
-	SuccessfulStrategyCards   []PlannerRetrievedMemoryCard `json:"successful_strategy_cards"`
-	FailedStrategyCards       []PlannerRetrievedMemoryCard `json:"failed_strategy_cards"`
-	BlockedOrRejectedCards    []PlannerRetrievedMemoryCard `json:"blocked_or_rejected_cards"`
-	DatasetPreprocessingCards []PlannerRetrievedMemoryCard `json:"dataset_preprocessing_cards"`
-	OtherCards                []PlannerRetrievedMemoryCard `json:"other_cards"`
-	Caps                      PlannerRetrievedMemoryCaps   `json:"caps"`
-	RetrievalEnabled          bool                         `json:"retrieval_enabled"`
-	ApproximateBytes          int                          `json:"approximate_bytes"`
+	DistilledLessons       []PlannerDistilledMemoryCard `json:"distilled_lessons,omitempty"`
+	FailedOrBlockedLessons []PlannerDistilledMemoryCard `json:"failed_or_blocked_lessons,omitempty"`
+	RawFallbackCards       []PlannerRetrievedMemoryCard `json:"raw_fallback_cards,omitempty"`
+	Caps                   PlannerRetrievedMemoryCaps   `json:"caps"`
+	RetrievalEnabled       bool                         `json:"retrieval_enabled"`
+	ApproximateBytes       int                          `json:"approximate_bytes"`
 }
 
 type PlannerRetrievedMemoryCaps struct {
-	MaxTotal                int `json:"max_total"`
-	MaxSuccessfulStrategies int `json:"max_successful_strategy_cards"`
-	MaxFailedStrategies     int `json:"max_failed_strategy_cards"`
-	MaxBlockedOrRejected    int `json:"max_blocked_or_rejected_cards"`
-	MaxDatasetPreprocessing int `json:"max_dataset_preprocessing_cards"`
+	MaxTotal            int `json:"max_total"`
+	MaxDistilledLessons int `json:"max_distilled_lessons"`
+	MaxFailedOrBlocked  int `json:"max_failed_or_blocked_lessons"`
+	MaxRawFallbackCards int `json:"max_raw_fallback_cards"`
+}
+
+type PlannerDistilledMemoryCard struct {
+	SourceTable  string   `json:"source_table"`
+	SourceID     string   `json:"source_id"`
+	ProjectID    string   `json:"project_id"`
+	DatasetID    string   `json:"dataset_id,omitempty"`
+	PlanID       string   `json:"plan_id,omitempty"`
+	JobID        string   `json:"job_id,omitempty"`
+	Kind         string   `json:"kind"`
+	Outcome      string   `json:"outcome,omitempty"`
+	Mechanism    string   `json:"mechanism,omitempty"`
+	AppliesWhen  []string `json:"applies_when,omitempty"`
+	Lesson       string   `json:"lesson"`
+	EvidenceUsed []string `json:"evidence_used,omitempty"`
+	Confidence   float64  `json:"confidence,omitempty"`
 }
 
 type PlannerRetrievedMemoryCard struct {
@@ -414,6 +447,16 @@ type PlannerRetrievedMemoryCard struct {
 	Metadata        map[string]any `json:"metadata,omitempty"`
 }
 
+type PlannerModelCatalogCard struct {
+	ID               string   `json:"id"`
+	TaskType         string   `json:"task"`
+	Tier             string   `json:"tier,omitempty"`
+	Default          bool     `json:"default,omitempty"`
+	LatencyTier      string   `json:"latency,omitempty"`
+	DefaultImageSize int      `json:"size,omitempty"`
+	EligibilityNotes []string `json:"notes,omitempty"`
+}
+
 type PlannerStopContinueCard struct {
 	NoImprovementRounds int      `json:"no_improvement_rounds"`
 	StopSignals         []string `json:"stop_signals"`
@@ -421,14 +464,20 @@ type PlannerStopContinueCard struct {
 }
 
 type PlannerPromptBudget struct {
-	RawSectionsExcluded             []string `json:"raw_sections_excluded"`
-	MaxLedgerEntries                int      `json:"max_ledger_entries"`
-	MaxMechanisms                   int      `json:"max_mechanisms"`
-	MaxStrategyLessons              int      `json:"max_strategy_lessons"`
-	MaxBlockedRepeats               int      `json:"max_blocked_repeats"`
-	MaxRetrievedMemoryCards         int      `json:"max_retrieved_memory_cards,omitempty"`
-	RetrievedMemoryCount            int      `json:"retrieved_memory_count,omitempty"`
-	RetrievedMemoryApproximateBytes int      `json:"retrieved_memory_approximate_bytes,omitempty"`
+	RawSectionsExcluded             []string                                `json:"raw_sections_excluded"`
+	MaxLedgerEntries                int                                     `json:"max_ledger_entries"`
+	MaxMechanisms                   int                                     `json:"max_mechanisms"`
+	MaxStrategyLessons              int                                     `json:"max_strategy_lessons"`
+	MaxBlockedRepeats               int                                     `json:"max_blocked_repeats"`
+	MaxRetrievedMemoryCards         int                                     `json:"max_retrieved_memory_cards,omitempty"`
+	RetrievedMemoryCount            int                                     `json:"retrieved_memory_count,omitempty"`
+	RetrievedMemoryApproximateBytes int                                     `json:"retrieved_memory_approximate_bytes,omitempty"`
+	SectionEstimates                map[string]PlannerPromptSectionEstimate `json:"section_estimates,omitempty"`
+}
+
+type PlannerPromptSectionEstimate struct {
+	Bytes             int `json:"bytes"`
+	ApproximateTokens int `json:"approximate_tokens"`
 }
 
 type DatasetPlanningInsights struct {
@@ -547,8 +596,11 @@ type ExperimentChampion struct {
 	Model            string  `json:"model"`
 	TargetMetric     string  `json:"target_metric"`
 	Score            float64 `json:"score"`
+	ScoreBasis       string  `json:"score_basis,omitempty"`
 	BestMacroF1      float64 `json:"best_macro_f1"`
 	BestAccuracy     float64 `json:"best_accuracy"`
+	FinalTrainLoss   float64 `json:"final_train_loss,omitempty"`
+	FinalValLoss     float64 `json:"final_val_loss,omitempty"`
 	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
 	RuntimeSeconds   float64 `json:"runtime_seconds"`
 	EpochsCompleted  int     `json:"epochs_completed"`
@@ -561,8 +613,11 @@ type ExperimentRunDelta struct {
 	Status                   string  `json:"status"`
 	TargetMetric             string  `json:"target_metric"`
 	Score                    float64 `json:"score"`
+	ScoreBasis               string  `json:"score_basis,omitempty"`
 	BestMacroF1              float64 `json:"best_macro_f1"`
 	BestAccuracy             float64 `json:"best_accuracy"`
+	FinalTrainLoss           float64 `json:"final_train_loss,omitempty"`
+	FinalValLoss             float64 `json:"final_val_loss,omitempty"`
 	EstimatedCostUSD         float64 `json:"estimated_cost_usd"`
 	RuntimeSeconds           float64 `json:"runtime_seconds"`
 	EpochsCompleted          int     `json:"epochs_completed"`
@@ -719,6 +774,7 @@ type ExperimentPlanningTrace struct {
 	ResponseID              string
 	PreviousResponseID      string
 	ToolRounds              int
+	Usage                   *llm.Usage
 	ToolCalls               []AgentToolCallTrace
 	ToolResults             []AgentToolResultTrace
 	RejectedToolCalls       []AgentToolResultTrace
@@ -813,9 +869,21 @@ type plannerToolLoopGenerator interface {
 	GenerateJSONWithTools(context.Context, llm.ToolLoopRequest) (llm.ToolLoopResult, error)
 }
 
+type jsonUsageGenerator interface {
+	GenerateJSONWithUsage(context.Context, llm.JSONRequest) (llm.JSONResult, error)
+}
+
 func (a ExperimentPlannerAgent) generatePlannerJSON(ctx context.Context, trace *ExperimentPlanningTrace, input ExperimentPlannerInput) ([]byte, error) {
 	toolGenerator, ok := a.generator.(plannerToolLoopGenerator)
 	if !ok {
+		if usageGenerator, ok := a.generator.(jsonUsageGenerator); ok {
+			result, err := usageGenerator.GenerateJSONWithUsage(ctx, trace.Request)
+			if err != nil {
+				return nil, err
+			}
+			trace.Usage = result.Usage
+			return result.RawJSON, nil
+		}
 		return a.generator.GenerateJSON(ctx, trace.Request)
 	}
 
@@ -831,6 +899,7 @@ func (a ExperimentPlannerAgent) generatePlannerJSON(ctx context.Context, trace *
 	trace.ResponseID = result.ResponseID
 	trace.PreviousResponseID = result.PreviousResponseID
 	trace.ToolRounds = result.ToolRounds
+	trace.Usage = result.Usage
 	trace.ToolCalls = toolCallTraces(result.ToolCalls)
 	trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults = toolResultTraces(result.ToolResults)
 	return result.FinalJSON, nil
@@ -870,6 +939,9 @@ func (a plannerInformationAnswerer) AnswerInformationToolCall(_ context.Context,
 }
 
 func experimentPlannerJSONRequest(model string, contextBlob []byte) llm.JSONRequest {
+	if plannerStaticPromptVersion() == plannerStaticPromptVersionCompactV1 {
+		return experimentPlannerJSONRequestCompact(model, contextBlob)
+	}
 	return llm.JSONRequest{
 		Model:       model,
 		Temperature: 0.35,
@@ -1079,11 +1151,12 @@ Rules:
 - Model family is a parameter inside a mechanism, not a mechanism by itself. Do not use architecture_challenge unless deterministic diagnosis supports capacity, underfitting, plateau, or a clear champion challenge.
 - Treat distillation as a rejected/future option unless the context shows backend support. Label-quality audit mechanisms are supported only as report-only jobs with template label_quality_audit.
 - Use only model names from planner_context_snapshot.model_catalog.
+- Do not schedule a model_catalog entry whose training_enabled is false. Schedule YOLO detector entries only when the dataset card/model catalog show YOLO object-detection evidence.
 - Use only supported optimizers: adamw, adam, sgd.
 - Use only supported schedulers: none, cosine, step.
 - Use dropout 0-0.7, label_smoothing 0-0.3, gradient_clip_norm 0-10, optimizer_momentum 0-0.99 only with optimizer sgd, and scheduler_step_size 1-100 plus scheduler_gamma 0.05-0.95 only with scheduler step.
 - Use only supported resolution_strategy values: fixed, low_latency, compare_224_256, high_resolution_ablation.
-- Use preprocessing.resize_strategy values: squash, preserve_aspect_pad, center_crop, random_resized_crop, bbox_crop_if_available.
+- Use preprocessing.resize_strategy values: squash, preserve_aspect_pad, center_crop, random_resized_crop, bbox_crop_if_available, letterbox.
 - Use preprocessing.normalization values: imagenet, dataset, none.
 - Use preprocessing.crop_strategy values: none, center_crop, random_resized_crop, bbox_crop_if_available, bbox_crop_ablation.
 - Use preprocessing.bbox_mode values: ignore, crop_if_available, crop_and_compare_full_image, use_boxes_as_metadata.
@@ -1093,7 +1166,7 @@ Rules:
 - Use class_balancing values: none, weighted_loss, class_weighted_loss, class_balanced_sampler, weighted_random_sampler, focal_loss, effective_number_loss.
 - Use class_balancing_config.effective_number_beta only with effective_number_loss, between 0.9 and 0.99999; use class_balancing_config.focal_loss_gamma only with focal_loss, between 0.5 and 5.
 - Use sampling_strategy values: none, class_balanced_sampler, weighted_random_sampler.
-- Keep epochs between 3 and 40, batch_size between 4 and 128, image_size between 96 and 384.
+- Keep classifier epochs between 3 and 40, batch_size between 4 and 128, image_size between 96 and 384. For YOLO detector experiments, use 640 as the default image_size and stay within 160-1280.
 - Use fine_tune_strategy values head_only, last_block, or full.
 - Optional AutoML fields live under proposed_experiments[].automl and are only hyperparameter search constraints; omit or set enabled=false when not needed. Samplers: seeded_random, grid, adaptive_bayesian.
 - AutoML may tune only learning_rate, weight_decay, batch_size, epochs, early_stopping_patience, optimizer, scheduler, dropout, optimizer_momentum when optimizer is sgd, scheduler_step_size and scheduler_gamma when scheduler is step, label_smoothing, gradient_clip_norm, augmentation_policy_config.magnitude, augmentation_policy_config.num_ops, augmentation_policy_config.num_magnitude_bins, augmentation_policy_config.probability, augmentation_policy_config.alpha, class_balancing_config.effective_number_beta, and class_balancing_config.focal_loss_gamma.
@@ -1148,6 +1221,69 @@ Context:
 	}
 }
 
+func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.JSONRequest {
+	systemPrompt := strings.TrimSpace(strings.Join([]string{
+		"You are the Model Express Experiment Planning Agent.",
+		"Work only from completed plans, runs, and memory; tool calls are questions only and cannot create plans, jobs, workers, champions, exports, inference runs, or dataset mutations.",
+		"Return only valid JSON.",
+		"Use planner_context_snapshot; prefer dataset_card, objective_context, failure_diagnosis, champion_card, project_trajectory_card, training_dynamics_card, per_class_error_card, deployment_card, mechanism_coverage_card, label_quality_card, search_coverage, strategy_lessons, retrieved_memory, model_catalog, optimizer_feedback_summary, validation_feedback, and visual_evidence, when present.",
+		"Treat visual_evidence, when present, only as backend-curated advisory evidence; cite latest accepted visual-analysis IDs, raw images, raw Visual Agent output, and local paths are never included.",
+		"Backend validation remains the gate; retrieved memory cannot bypass backend validation.",
+		"Mechanism values should come from this taxonomy: baseline_control, architecture_challenge, capacity_finetune, optimizer_scheduler, regularization, augmentation_basic, augmentation_auto, augmentation_mixed_sample, class_imbalance, minority_targeting, resolution_crop, bbox_crop_ablation, label_noise_audit, hard_example_audit, deployment_latency, distillation.",
+		"Model family is a parameter inside a mechanism, not a mechanism by itself.",
+		"Use preprocessing.resize_strategy values, augmentation_policy values, class_balancing values, sampling_strategy values, and focal_loss only when backend validation allows them.",
+		"You must choose mechanisms before concrete models/configs; for ADD_EXPERIMENTS, provide candidate_hypotheses and keep direct proposed_experiments draft-only.",
+		"If planner_context_snapshot.project_trajectory_card marks architecture_challenge as exhausted, use a different mechanism or stop/continue pivot.",
+		"Invalid shallow proposals include shallow epoch/lr-only repeats, choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.",
+		"Latency is a live-budget tiebreaker; if observed or expected latency is below roughly 25ms, prioritize macro-F1, per-class recall, and meaningful quality gains.",
+		"If planner_validation_feedback is present, correct the rejected draft instead of repeating it.",
+	}, " "))
+
+	outputContract := strings.TrimSpace(strings.Join([]string{
+		"Return JSON with these required top-level keys: summary, decision_type, rationale, confidence, planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, primary_mechanism, governor_compliance, expected_failure_modes, dataset_preprocessing_rationale, changed_variables, success_criteria, stop_condition, deployment_tradeoff, candidate_hypotheses, proposed_experiments, proposal_mechanisms, champion_job_id, why_can_beat_champion, expected_delta_vs_champion, stop_reason, risks, expected_tradeoffs, novelty_notes, rejected_options, tags.",
+		"ADD_EXPERIMENTS also requires candidate_hypotheses[] items with hypothesis, planning_mode, mechanism, intervention, proposed_changes, expected_effect, expected_metric_impact, expected_tradeoffs, risk, cost_level, novelty_score, evidence_used, similar_success_memory_ids, similar_failure_memory_ids, and experiment_config.",
+		"experiment_config must still be backend-valid and include template, model, epochs, batch_size, learning_rate, and any other supported knobs only when evidence justifies them.",
+		"proposal_mechanisms[] must mirror selected experiments with experiment_index, mechanism, intervention, evidence_used, and expected_effect.",
+		"Do not rely on direct proposed_experiments to force scheduling; they are draft-only for ADD_EXPERIMENTS.",
+	}, " "))
+
+	return llm.JSONRequest{
+		Model:       model,
+		Temperature: 0.35,
+		Messages: []llm.Message{
+			{
+				Role:    "system",
+				Content: systemPrompt,
+			},
+			{
+				Role: "user",
+				Content: strings.TrimSpace(fmt.Sprintf(`%s
+
+Context:
+%s`, outputContract, string(contextBlob))),
+			},
+		},
+	}
+}
+
+func plannerStaticPromptVersion() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION"))) {
+	case plannerStaticPromptVersionCompactV1:
+		return plannerStaticPromptVersionCompactV1
+	default:
+		return plannerStaticPromptVersionV1
+	}
+}
+
+func plannerContextSnapshotVersion() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION"))) {
+	case "v2":
+		return "v2"
+	default:
+		return "v1"
+	}
+}
+
 func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningRecommendation, maxExperiments int) error {
 	if strings.TrimSpace(recommendation.Summary) == "" {
 		return fmt.Errorf("experiment planner recommendation missing summary")
@@ -1172,46 +1308,48 @@ func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningR
 		if err := validatePlanningModeName(recommendation.PlanningMode); err != nil {
 			return err
 		}
-		if len(nonEmptyStrings(recommendation.DeterministicDiagnosisUsed)) == 0 {
+		if plannerStrictValidationEnabled() && len(nonEmptyStrings(recommendation.DeterministicDiagnosisUsed)) == 0 {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing deterministic_diagnosis_used")
 		}
-		if len(nonEmptyStrings(recommendation.EvidenceUsed)) == 0 {
+		if plannerStrictValidationEnabled() && len(nonEmptyStrings(recommendation.EvidenceUsed)) == 0 {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing evidence_used")
 		}
-		if strings.TrimSpace(recommendation.Hypothesis) == "" {
+		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.Hypothesis) == "" {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing hypothesis")
 		}
-		if len(nonEmptyStrings(recommendation.ExpectedFailureModes)) == 0 {
+		if plannerStrictValidationEnabled() && len(nonEmptyStrings(recommendation.ExpectedFailureModes)) == 0 {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing expected_failure_modes")
 		}
-		if strings.TrimSpace(recommendation.DatasetPreprocessingRationale) == "" {
+		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.DatasetPreprocessingRationale) == "" {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing dataset_preprocessing_rationale")
 		}
 		changedVariables := nonEmptyStrings(recommendation.ChangedVariables)
-		if len(changedVariables) < 2 {
+		if plannerStrictValidationEnabled() && len(changedVariables) < 2 {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS needs at least two changed_variables")
 		}
-		if onlyMinorChangedVariables(changedVariables) {
+		if plannerStrictValidationEnabled() && onlyMinorChangedVariables(changedVariables) {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS changed_variables are only minor tuning knobs")
 		}
-		if strings.TrimSpace(recommendation.SuccessCriteria) == "" {
+		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.SuccessCriteria) == "" {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing success_criteria")
 		}
-		if strings.TrimSpace(recommendation.StopCondition) == "" {
+		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.StopCondition) == "" {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing stop_condition")
 		}
-		if strings.TrimSpace(recommendation.DeploymentTradeoff) == "" {
+		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.DeploymentTradeoff) == "" {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing deployment_tradeoff")
 		}
-		if len(recommendation.RejectedOptions) == 0 {
+		if plannerStrictValidationEnabled() && len(recommendation.RejectedOptions) == 0 {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing rejected_options")
 		}
-		for index, candidate := range recommendation.CandidateHypotheses {
-			if err := validateCandidateMechanismExpectation(candidate, index); err != nil {
-				return err
+		if plannerStrictValidationEnabled() {
+			for index, candidate := range recommendation.CandidateHypotheses {
+				if err := validateCandidateMechanismExpectation(candidate, index); err != nil {
+					return err
+				}
 			}
 		}
-		if strings.TrimSpace(recommendation.WhyCanBeatChampion) == "" {
+		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.WhyCanBeatChampion) == "" {
 			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing why_can_beat_champion")
 		}
 		if len(recommendation.ProposedExperiments) > maxExperiments {
@@ -1222,14 +1360,16 @@ func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningR
 				return err
 			}
 		}
-		if err := validatePlannerProposalMechanisms(recommendation.ProposedExperiments, recommendation.ProposalMechanisms); err != nil {
-			return err
-		}
-		if err := validatePlannerExperimentDiversity(recommendation.ProposedExperiments); err != nil {
-			return err
-		}
-		if err := validatePlanningModeRules(recommendation); err != nil {
-			return err
+		if plannerStrictValidationEnabled() {
+			if err := validatePlannerProposalMechanisms(recommendation.ProposedExperiments, recommendation.ProposalMechanisms); err != nil {
+				return err
+			}
+			if err := validatePlannerExperimentDiversity(recommendation.ProposedExperiments); err != nil {
+				return err
+			}
+			if err := validatePlanningModeRules(recommendation); err != nil {
+				return err
+			}
 		}
 	case decisions.TypeSelectChampion, decisions.TypeStopProject, decisions.TypeWait:
 		if strings.TrimSpace(recommendation.PlanningMode) != "" {
@@ -1438,6 +1578,18 @@ func containsAnyText(value string, needles ...string) bool {
 	return false
 }
 
+func plannerStrictValidationEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION")))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return false
+	}
+}
+
 func nonEmptyStrings(values []string) []string {
 	out := []string{}
 	for _, value := range values {
@@ -1520,6 +1672,7 @@ func experimentPlannerPromptContext(input ExperimentPlannerInput) map[string]any
 }
 
 func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSnapshot {
+	contextVersion := plannerContextSnapshotVersion()
 	retrievedMemory := buildPlannerRetrievedMemorySnapshot(input.RetrievedMemory)
 	promptBudget := PlannerPromptBudget{
 		RawSectionsExcluded: []string{
@@ -1554,8 +1707,8 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		promptBudget.RetrievedMemoryCount = plannerRetrievedMemoryCardCount(retrievedMemory)
 		promptBudget.RetrievedMemoryApproximateBytes = retrievedMemory.ApproximateBytes
 	}
-	return PlannerContextSnapshot{
-		ContextVersion:         plannerSnapshotVersion,
+	snapshot := PlannerContextSnapshot{
+		ContextVersion:         contextVersion,
 		Project:                plannerProjectCard(input),
 		DatasetCard:            plannerDatasetCard(input),
 		SourcePlanCard:         plannerSourcePlanCard(input),
@@ -1576,11 +1729,425 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		OptimizerFeedback:      capOptimizerFeedback(input.OptimizerFeedback, 5),
 		BlockedRepeats:         capRejectedPlannerOptions(input.RejectedStrategyMemory, plannerSnapshotMaxBlockedRepeats),
 		VisualEvidence:         visualExemplarPromptContext(input.VisualExemplarContext),
-		ModelCatalog:           input.ModelCatalog,
+		ModelCatalog:           compactPlannerModelCatalog(input.ModelCatalog),
 		ValidationFeedback:     input.ValidationFeedback,
 		StopOrContinuePressure: plannerStopContinueCard(input),
 		PromptBudget:           promptBudget,
 	}
+	if contextVersion == "v2" {
+		snapshot = plannerContextSnapshotV2(snapshot)
+	}
+	snapshot.PromptBudget = plannerPromptBudgetWithEstimates(snapshot, promptBudget)
+	return snapshot
+}
+
+func plannerPromptBudgetWithEstimates(snapshot PlannerContextSnapshot, base PlannerPromptBudget) PlannerPromptBudget {
+	budget := base
+	if snapshot.RetrievedMemory != nil {
+		budget.MaxRetrievedMemoryCards = snapshot.RetrievedMemory.Caps.MaxTotal
+		budget.RetrievedMemoryCount = plannerRetrievedMemoryCardCount(snapshot.RetrievedMemory)
+		budget.RetrievedMemoryApproximateBytes = snapshot.RetrievedMemory.ApproximateBytes
+	} else {
+		budget.MaxRetrievedMemoryCards = 0
+		budget.RetrievedMemoryCount = 0
+		budget.RetrievedMemoryApproximateBytes = 0
+	}
+	budget.SectionEstimates = map[string]PlannerPromptSectionEstimate{}
+
+	measurementRequest := experimentPlannerJSONRequest("", []byte(`{}`))
+	if len(measurementRequest.Messages) > 0 {
+		budget.SectionEstimates["static_instructions"] = plannerPromptSectionEstimateFromText(measurementRequest.Messages[0].Content)
+	}
+	if len(measurementRequest.Messages) > 1 {
+		userContent := measurementRequest.Messages[1].Content
+		if index := strings.LastIndex(userContent, "Context:\n"); index >= 0 {
+			userContent = userContent[:index]
+		}
+		budget.SectionEstimates["output_schema"] = plannerPromptSectionEstimateFromText(userContent)
+	}
+
+	budget.SectionEstimates["planner_context_snapshot_total"] = plannerPromptSectionEstimateFromValue(snapshot)
+	budget.SectionEstimates["project_card"] = plannerPromptSectionEstimateFromValue(snapshot.Project)
+	budget.SectionEstimates["dataset_card"] = plannerPromptSectionEstimateFromValue(snapshot.DatasetCard)
+	budget.SectionEstimates["source_plan_card"] = plannerPromptSectionEstimateFromValue(snapshot.SourcePlanCard)
+	budget.SectionEstimates["objective_context"] = plannerPromptSectionEstimateFromValue(snapshot.ObjectiveContext)
+	budget.SectionEstimates["champion_card"] = plannerPromptSectionEstimateFromValue(snapshot.ChampionCard)
+	budget.SectionEstimates["completed_experiment_log"] = plannerPromptSectionEstimateFromValue(snapshot.CompletedExperimentLog)
+	budget.SectionEstimates["failure_diagnosis"] = plannerPromptSectionEstimateFromValue(snapshot.FailureDiagnosis)
+	budget.SectionEstimates["project_trajectory_card"] = plannerPromptSectionEstimateFromValue(snapshot.ProjectTrajectoryCard)
+	budget.SectionEstimates["training_dynamics_card"] = plannerPromptSectionEstimateFromValue(snapshot.TrainingDynamicsCard)
+	budget.SectionEstimates["per_class_error_card"] = plannerPromptSectionEstimateFromValue(snapshot.PerClassErrorCard)
+	budget.SectionEstimates["deployment_card"] = plannerPromptSectionEstimateFromValue(snapshot.DeploymentCard)
+	budget.SectionEstimates["mechanism_coverage_card"] = plannerPromptSectionEstimateFromValue(snapshot.MechanismCoverageCard)
+	budget.SectionEstimates["backend_gated_methods"] = plannerPromptSectionEstimateFromValue(snapshot.BackendGatedMethods)
+	budget.SectionEstimates["label_quality_card"] = plannerPromptSectionEstimateFromValue(snapshot.LabelQualityCard)
+	budget.SectionEstimates["search_coverage"] = plannerPromptSectionEstimateFromValue(snapshot.SearchCoverage)
+	budget.SectionEstimates["strategy_lessons"] = plannerPromptSectionEstimateFromValue(snapshot.StrategyLessons)
+	budget.SectionEstimates["blocked_repeats"] = plannerPromptSectionEstimateFromValue(snapshot.BlockedRepeats)
+	budget.SectionEstimates["visual_evidence"] = plannerPromptSectionEstimateFromValue(snapshot.VisualEvidence)
+	budget.SectionEstimates["model_catalog"] = plannerPromptSectionEstimateFromValue(snapshot.ModelCatalog)
+	budget.SectionEstimates["stop_or_continue_pressure"] = plannerPromptSectionEstimateFromValue(snapshot.StopOrContinuePressure)
+	if snapshot.RetrievedMemory != nil {
+		budget.SectionEstimates["retrieved_memory"] = plannerPromptSectionEstimateFromValue(snapshot.RetrievedMemory)
+	}
+	if len(snapshot.OptimizerFeedback) > 0 {
+		budget.SectionEstimates["optimizer_feedback"] = plannerPromptSectionEstimateFromValue(snapshot.OptimizerFeedback)
+	}
+	if len(snapshot.ValidationFeedback) > 0 {
+		budget.SectionEstimates["validation_feedback"] = plannerPromptSectionEstimateFromValue(snapshot.ValidationFeedback)
+	}
+
+	return budget
+}
+
+func plannerPromptSectionEstimateFromText(text string) PlannerPromptSectionEstimate {
+	bytes := len([]byte(text))
+	return PlannerPromptSectionEstimate{
+		Bytes:             bytes,
+		ApproximateTokens: approximatePromptTokens(bytes),
+	}
+}
+
+func plannerPromptSectionEstimateFromValue(value any) PlannerPromptSectionEstimate {
+	bytes := approximateJSONBytes(value)
+	return PlannerPromptSectionEstimate{
+		Bytes:             bytes,
+		ApproximateTokens: approximatePromptTokens(bytes),
+	}
+}
+
+func approximatePromptTokens(bytes int) int {
+	if bytes <= 0 {
+		return 0
+	}
+	return int(math.Ceil(float64(bytes) / 4.0))
+}
+
+func plannerContextSnapshotV2(snapshot PlannerContextSnapshot) PlannerContextSnapshot {
+	snapshot.DatasetCard = plannerCompactDatasetCardV2(snapshot.DatasetCard)
+	snapshot.SourcePlanCard = plannerCompactSourcePlanCardV2(snapshot.SourcePlanCard)
+	snapshot.ObjectiveContext = plannerCompactObjectiveContextV2(snapshot.ObjectiveContext)
+	snapshot.ChampionCard = plannerCompactChampionCardV2(snapshot.ChampionCard)
+	snapshot.CompletedExperimentLog = plannerCompactExperimentLogsV2(snapshot.CompletedExperimentLog, plannerSnapshotV2MaxLedgerEntries)
+	snapshot.FailureDiagnosis = plannerCompactFailureDiagnosisV2(snapshot.FailureDiagnosis)
+	snapshot.ProjectTrajectoryCard = plannerCompactProjectTrajectoryCardV2(snapshot.ProjectTrajectoryCard)
+	snapshot.TrainingDynamicsCard = plannerCompactTrainingDynamicsCardV2(snapshot.TrainingDynamicsCard)
+	snapshot.PerClassErrorCard = plannerCompactPerClassErrorCardV2(snapshot.PerClassErrorCard)
+	snapshot.DeploymentCard = plannerCompactDeploymentCardV2(snapshot.DeploymentCard)
+	snapshot.MechanismCoverageCard = plannerCompactMechanismCoverageCardV2(snapshot.MechanismCoverageCard)
+	snapshot.BackendGatedMethods = plannerCompactBackendGatedMethodsV2(snapshot.BackendGatedMethods)
+	snapshot.LabelQualityCard = plannerCompactLabelQualityCardV2(snapshot.LabelQualityCard)
+	snapshot.SearchCoverage = plannerCompactSearchCoverageV2(snapshot.SearchCoverage)
+	snapshot.StrategyLessons = plannerCompactStrategyLessonsV2(snapshot.StrategyLessons)
+	snapshot.RetrievedMemory = plannerCompactRetrievedMemorySnapshotV2(snapshot.RetrievedMemory)
+	snapshot.OptimizerFeedback = capOptimizerFeedback(snapshot.OptimizerFeedback, 2)
+	snapshot.BlockedRepeats = capRejectedPlannerOptions(snapshot.BlockedRepeats, plannerSnapshotV2MaxBlockedRepeats)
+	snapshot.ModelCatalog = plannerCompactModelCatalogV2(snapshot.ModelCatalog)
+	snapshot.ValidationFeedback = capPlannerValidationFeedback(snapshot.ValidationFeedback, 2)
+	snapshot.StopOrContinuePressure = plannerCompactStopContinueCardV2(snapshot.StopOrContinuePressure)
+	return snapshot
+}
+
+func plannerCompactDatasetCardV2(card PlannerDatasetCard) PlannerDatasetCard {
+	card.Summary = compactPlannerRetrievedMemoryText(card.Summary, 180)
+	card.ImageDimensionStats = compactAnyMap(card.ImageDimensionStats, 6)
+	card.SplitSummary = compactAnyMap(card.SplitSummary, 6)
+	card.MetadataSummary = compactSafeMetadataMap(card.MetadataSummary, 8)
+	card.AgentSafeMetadataSummary = compactSafeMetadataMap(card.AgentSafeMetadataSummary, 8)
+	card.DatasetTraits = cappedStrings(card.DatasetTraits, 8)
+	card.Constraints = cappedStrings(card.Constraints, 8)
+	card.RecommendedPreprocessing = cappedStrings(card.RecommendedPreprocessing, 6)
+	card.RecommendedAugmentations = cappedStrings(card.RecommendedAugmentations, 6)
+	card.RecommendedMetrics = cappedStrings(card.RecommendedMetrics, 4)
+	card.LiveInferencePriorities = cappedStrings(card.LiveInferencePriorities, 4)
+	return card
+}
+
+func plannerCompactSourcePlanCardV2(card PlannerSourcePlanCard) PlannerSourcePlanCard {
+	card.Experiments = plannerCompactExperimentsV2(card.Experiments, 3)
+	return card
+}
+
+func plannerCompactExperimentsV2(values []PlannerExperiment, limit int) []PlannerExperiment {
+	out := []PlannerExperiment{}
+	for _, value := range values {
+		copy := value
+		copy.MeaningfulAxes = cappedStrings(copy.MeaningfulAxes, 2)
+		copy.AutoMLSummary = compactAnyMap(copy.AutoMLSummary, 4)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactObjectiveContextV2(context ProjectObjectiveContext) ProjectObjectiveContext {
+	context.GoalText = compactPlannerRetrievedMemoryText(context.GoalText, 160)
+	context.MetricPreferences = cappedStrings(context.MetricPreferences, 4)
+	context.DeploymentPriorities = cappedStrings(context.DeploymentPriorities, 4)
+	context.Constraints = cappedStrings(context.Constraints, 4)
+	context.RankingWeights = compactFloatMap(context.RankingWeights, 6)
+	return context
+}
+
+func plannerCompactChampionCardV2(card PlannerChampionCard) PlannerChampionCard {
+	card.SourcePlanRunDeltas = plannerCompactRunDeltasV2(card.SourcePlanRunDeltas, 3)
+	card.Interpretation = compactPlannerRetrievedMemoryText(card.Interpretation, 160)
+	return card
+}
+
+func plannerCompactRunDeltasV2(values []ExperimentRunDelta, limit int) []ExperimentRunDelta {
+	out := []ExperimentRunDelta{}
+	for _, value := range values {
+		copy := value
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactFailureDiagnosisV2(card PlannerFailureDiagnosis) PlannerFailureDiagnosis {
+	card.RecommendedModes = cappedStrings(card.RecommendedModes, 4)
+	card.Evidence = cappedStrings(card.Evidence, 4)
+	card.Interpretation = cappedStrings(card.Interpretation, 3)
+	card.DeterministicRaw = PlannerDiagnosis{}
+	return card
+}
+
+func plannerCompactExperimentLogsV2(values []PlannerExperimentLog, limit int) []PlannerExperimentLog {
+	out := []PlannerExperimentLog{}
+	for _, value := range values {
+		out = append(out, PlannerExperimentLog{
+			PlanID:          value.PlanID,
+			JobID:           value.JobID,
+			Model:           value.Model,
+			ModelFamily:     value.ModelFamily,
+			Status:          value.Status,
+			Mechanism:       value.Mechanism,
+			TargetMetric:    value.TargetMetric,
+			Score:           value.Score,
+			ScoreBasis:      value.ScoreBasis,
+			BestMacroF1:     value.BestMacroF1,
+			BestAccuracy:    value.BestAccuracy,
+			DeltaVsChampion: value.DeltaVsChampion,
+			EpochsCompleted: value.EpochsCompleted,
+			CostUSD:         value.CostUSD,
+			RuntimeSeconds:  value.RuntimeSeconds,
+			Outcome:         value.Outcome,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactProjectTrajectoryCardV2(card PlannerProjectTrajectoryCard) PlannerProjectTrajectoryCard {
+	card.MechanismOutcomes = plannerCompactMechanismOutcomesV2(card.MechanismOutcomes, 6)
+	card.BlockedMechanisms = cappedStrings(card.BlockedMechanisms, 6)
+	card.Warnings = cappedStrings(card.Warnings, 4)
+	return card
+}
+
+func plannerCompactMechanismOutcomesV2(values []PlannerMechanismOutcome, limit int) []PlannerMechanismOutcome {
+	out := []PlannerMechanismOutcome{}
+	for _, value := range values {
+		copy := value
+		copy.AllowedNextOnlyWith = cappedStrings(copy.AllowedNextOnlyWith, 2)
+		copy.ExhaustionReason = compactPlannerRetrievedMemoryText(copy.ExhaustionReason, 160)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactTrainingDynamicsCardV2(card PlannerTrainingDynamicsCard) PlannerTrainingDynamicsCard {
+	card.Evidence = cappedStrings(card.Evidence, 3)
+	card.EarlyStoppingRecommendation = compactPlannerRetrievedMemoryText(card.EarlyStoppingRecommendation, 120)
+	return card
+}
+
+func plannerCompactPerClassErrorCardV2(card PlannerPerClassErrorCard) PlannerPerClassErrorCard {
+	card.WorstClasses = card.WorstClasses[:minInt(len(card.WorstClasses), 3)]
+	card.TopConfusionPairs = card.TopConfusionPairs[:minInt(len(card.TopConfusionPairs), 3)]
+	card.Evidence = cappedStrings(card.Evidence, 4)
+	return card
+}
+
+func plannerCompactDeploymentCardV2(card PlannerDeploymentCard) PlannerDeploymentCard {
+	card.DeploymentPriorities = cappedStrings(card.DeploymentPriorities, 4)
+	card.Evidence = cappedStrings(card.Evidence, 3)
+	card.TradeoffSummary = compactPlannerRetrievedMemoryText(card.TradeoffSummary, 140)
+	return card
+}
+
+func plannerCompactMechanismCoverageCardV2(card PlannerMechanismCoverageCard) PlannerMechanismCoverageCard {
+	card.TriedMechanisms = cappedStrings(card.TriedMechanisms, plannerSnapshotV2MaxMechanisms)
+	card.BlockedMechanisms = cappedStrings(card.BlockedMechanisms, plannerSnapshotV2MaxMechanisms)
+	card.EligibleMechanisms = cappedStrings(card.EligibleMechanisms, plannerSnapshotV2MaxMechanisms)
+	card.BestResultByMechanism = plannerCompactMechanismResultsV2(card.BestResultByMechanism, 6)
+	card.FailedMechanismLessons = plannerCompactMechanismLessonsV2(card.FailedMechanismLessons, 4)
+	card.ShallowRepeatWarnings = cappedStrings(card.ShallowRepeatWarnings, 4)
+	return card
+}
+
+func plannerCompactMechanismResultsV2(values []PlannerMechanismResult, limit int) []PlannerMechanismResult {
+	out := []PlannerMechanismResult{}
+	for _, value := range values {
+		out = append(out, value)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactMechanismLessonsV2(values []PlannerMechanismLesson, limit int) []PlannerMechanismLesson {
+	out := []PlannerMechanismLesson{}
+	for _, value := range values {
+		copy := value
+		copy.Tags = cappedStrings(copy.Tags, 2)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactBackendGatedMethodsV2(values []PlannerBackendGatedMethod) []PlannerBackendGatedMethod {
+	out := []PlannerBackendGatedMethod{}
+	for _, value := range values {
+		copy := value
+		copy.Evidence = cappedStrings(copy.Evidence, 3)
+		copy.RequiredConcreteFields = cappedStrings(copy.RequiredConcreteFields, 4)
+		copy.RequiredBackendEvidence = cappedStrings(copy.RequiredBackendEvidence, 4)
+		copy.MissingRequirements = cappedStrings(copy.MissingRequirements, 4)
+		copy.SupportedConfigHints = compactAnyMap(copy.SupportedConfigHints, 4)
+		out = append(out, copy)
+		if len(out) >= 6 {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactLabelQualityCardV2(card PlannerLabelQualityCard) PlannerLabelQualityCard {
+	card.Signals = cappedStrings(card.Signals, 4)
+	card.SuspectClasses = cappedStrings(card.SuspectClasses, 4)
+	card.AsymmetricConfusions = card.AsymmetricConfusions[:minInt(len(card.AsymmetricConfusions), 3)]
+	card.Evidence = cappedStrings(card.Evidence, 4)
+	return card
+}
+
+func plannerCompactSearchCoverageV2(card PlannerSearchCoverage) PlannerSearchCoverage {
+	card.AttemptedModels = cappedStrings(card.AttemptedModels, 6)
+	card.AttemptedFamilies = cappedStrings(card.AttemptedFamilies, 6)
+	card.TriedMechanisms = cappedStrings(card.TriedMechanisms, plannerSnapshotV2MaxMechanisms)
+	card.ExistingExperimentSignatureSample = cappedStrings(card.ExistingExperimentSignatureSample, plannerSnapshotV2MaxSignatureSample)
+	card.NoveltyInstruction = compactPlannerRetrievedMemoryText(card.NoveltyInstruction, 160)
+	return card
+}
+
+func plannerCompactStrategyLessonsV2(values []PlannerStrategyLesson) []PlannerStrategyLesson {
+	out := []PlannerStrategyLesson{}
+	for _, value := range values {
+		copy := value
+		copy.DiagnosisTriggers = cappedStrings(copy.DiagnosisTriggers, 2)
+		copy.Models = cappedStrings(copy.Models, 3)
+		copy.Tags = cappedStrings(copy.Tags, 2)
+		copy.Lesson = compactPlannerRetrievedMemoryText(copy.Lesson, 220)
+		out = append(out, copy)
+		if len(out) >= plannerSnapshotV2MaxStrategyLessons {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactRetrievedMemorySnapshotV2(snapshot *PlannerRetrievedMemorySnapshot) *PlannerRetrievedMemorySnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	copy := *snapshot
+	copy.DistilledLessons = plannerCompactDistilledMemoryCardsV2(copy.DistilledLessons, plannerRetrievedMemoryV2MaxSuccessful)
+	copy.FailedOrBlockedLessons = plannerCompactDistilledMemoryCardsV2(copy.FailedOrBlockedLessons, plannerRetrievedMemoryV2MaxFailed)
+	copy.RawFallbackCards = plannerCompactRetrievedMemoryCardsV2(copy.RawFallbackCards, plannerRetrievedMemoryV2MaxDataset)
+	copy.Caps.MaxTotal = plannerRetrievedMemoryV2MaxTotal
+	copy.Caps.MaxDistilledLessons = plannerRetrievedMemoryV2MaxSuccessful
+	copy.Caps.MaxFailedOrBlocked = plannerRetrievedMemoryV2MaxFailed
+	copy.Caps.MaxRawFallbackCards = plannerRetrievedMemoryV2MaxDataset
+	copy.ApproximateBytes = 0
+	copy.ApproximateBytes = approximateJSONBytes(copy)
+	return &copy
+}
+
+func plannerCompactDistilledMemoryCardsV2(values []PlannerDistilledMemoryCard, limit int) []PlannerDistilledMemoryCard {
+	out := []PlannerDistilledMemoryCard{}
+	for _, value := range values {
+		copy := value
+		copy.AppliesWhen = cappedStrings(copy.AppliesWhen, 3)
+		copy.EvidenceUsed = cappedStrings(copy.EvidenceUsed, 3)
+		copy.Lesson = compactPlannerRetrievedMemoryText(copy.Lesson, 180)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactRetrievedMemoryCardsV2(values []PlannerRetrievedMemoryCard, limit int) []PlannerRetrievedMemoryCard {
+	out := []PlannerRetrievedMemoryCard{}
+	for _, value := range values {
+		copy := value
+		copy.RetrievalReason = compactPlannerRetrievedMemoryText(copy.RetrievalReason, 140)
+		copy.Lesson = compactPlannerRetrievedMemoryText(copy.Lesson, 160)
+		copy.Summary = compactPlannerRetrievedMemoryText(copy.Summary, 160)
+		copy.SummaryCard = compactAnyMap(copy.SummaryCard, 4)
+		copy.Metadata = compactAnyMap(copy.Metadata, 4)
+		out = append(out, copy)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func plannerCompactModelCatalogV2(values []PlannerModelCatalogCard) []PlannerModelCatalogCard {
+	if len(values) <= 4 {
+		return append([]PlannerModelCatalogCard(nil), values...)
+	}
+	out := []PlannerModelCatalogCard{}
+	seenTask := map[string]bool{}
+	for _, value := range values {
+		if len(out) >= 4 {
+			break
+		}
+		task := strings.ToLower(strings.TrimSpace(value.TaskType))
+		if seenTask[task] {
+			continue
+		}
+		seenTask[task] = true
+		copy := value
+		copy.EligibilityNotes = cappedStrings(copy.EligibilityNotes, 2)
+		out = append(out, copy)
+	}
+	if len(out) == 0 {
+		return append([]PlannerModelCatalogCard(nil), values[:minInt(len(values), 4)]...)
+	}
+	return out
+}
+
+func plannerCompactStopContinueCardV2(card PlannerStopContinueCard) PlannerStopContinueCard {
+	card.StopSignals = cappedStrings(card.StopSignals, 4)
+	card.Instruction = compactPlannerRetrievedMemoryText(card.Instruction, 120)
+	return card
 }
 
 func plannerProjectCard(input ExperimentPlannerInput) PlannerProjectCard {
@@ -1631,12 +2198,13 @@ func plannerSourcePlanCard(input ExperimentPlannerInput) PlannerSourcePlanCard {
 		TargetMetric:    normalizedDiagnosisMetric(input.SourcePlan.TargetMetric),
 		ExperimentCount: len(input.SourcePlan.Experiments),
 		Experiments:     experiments,
-		ResultSummary:   plannerResultSummary(input.PlanSummaries, input.SourcePlan.TargetMetric),
+		ResultSummary:   plannerResultSummary(input.PlanSummaries, input.PlanEvaluations, input.SourcePlan.TargetMetric),
 	}
 }
 
-func plannerResultSummary(summaries []runs.TrainingRunSummary, targetMetric string) PlannerResultSummary {
+func plannerResultSummary(summaries []runs.TrainingRunSummary, evaluations []runs.TrainingRunEvaluation, targetMetric string) PlannerResultSummary {
 	normalizedMetric := normalizedDiagnosisMetric(targetMetric)
+	evaluationsByJob := diagnosisEvaluationsByJobID(evaluations)
 	result := PlannerResultSummary{}
 	hasBest := false
 	for _, summary := range summaries {
@@ -1650,11 +2218,12 @@ func plannerResultSummary(summaries []runs.TrainingRunSummary, targetMetric stri
 		}
 		result.TotalCostUSD += summary.EstimatedCostUSD
 		result.TotalRuntimeSecs += summary.RuntimeSeconds
-		score := diagnosisSummaryMetric(summary, normalizedMetric)
+		score := diagnosisRunScore(summary, evaluationsByJob[summary.JobID], normalizedMetric)
 		if strings.EqualFold(summary.Status, jobs.StatusSucceeded) && (!hasBest || score > result.BestScore) {
 			hasBest = true
 			result.BestModel = summary.Model
 			result.BestScore = score
+			result.BestScoreBasis = "loss_heavy_deployment_readiness"
 			result.BestJobID = summary.JobID
 			result.BestAccuracy = summary.BestAccuracy
 			result.BestMacroF1 = summary.BestMacroF1
@@ -1735,7 +2304,7 @@ func plannerCompletedExperimentLedger(input ExperimentPlannerInput) []PlannerExp
 			model = plannerConfigString(job.Config, "model")
 		}
 		evaluation := evaluationsByID[summary.JobID]
-		score := diagnosisSummaryMetric(summary, targetMetric)
+		score := diagnosisRunScore(summary, evaluation, targetMetric)
 		delta := 0.0
 		if input.CurrentChampion != nil && input.CurrentChampion.JobID != "" {
 			delta = score - input.CurrentChampion.Score
@@ -1747,10 +2316,13 @@ func plannerCompletedExperimentLedger(input ExperimentPlannerInput) []PlannerExp
 			ModelFamily:         inferExperimentFamily(model),
 			Status:              summary.Status,
 			Mechanism:           plannerExperimentMechanism(experiment, model),
-			TargetMetric:        targetMetric,
+			TargetMetric:        "deployment_readiness",
 			Score:               score,
+			ScoreBasis:          "loss_heavy_deployment_readiness",
 			BestMacroF1:         summary.BestMacroF1,
 			BestAccuracy:        summary.BestAccuracy,
+			FinalTrainLoss:      summary.FinalTrainLoss,
+			FinalValLoss:        summary.FinalValLoss,
 			DeltaVsChampion:     delta,
 			EpochsCompleted:     summary.EpochsCompleted,
 			CostUSD:             summary.EstimatedCostUSD,
@@ -1812,14 +2384,14 @@ func plannerTrainingDynamicsCard(input ExperimentPlannerInput) PlannerTrainingDy
 		InstabilityScore:            input.DeterministicDiagnosis.InstabilityScore,
 		EarlyStoppingRecommendation: "Use existing early-stopping defaults; do not extend epochs unless the recent metric slope is still positive.",
 	}
-	best, ok := bestRunSummary(input.PlanSummaries, targetMetric)
+	best, ok := bestRunSummary(input.PlanSummaries, input.PlanEvaluations, targetMetric)
 	if !ok {
 		card.Evidence = []string{"no completed run summary available for training dynamics"}
 		return card
 	}
 	card.BestJobID = best.JobID
 	card.BestModel = best.Model
-	card.BestMetric = roundDiagnosis(diagnosisSummaryMetric(best, targetMetric))
+	card.BestMetric = roundDiagnosis(diagnosisRunScore(best, diagnosisEvaluationsByJobID(input.PlanEvaluations)[best.JobID], targetMetric))
 	card.FinalTrainLoss = roundDiagnosis(best.FinalTrainLoss)
 	card.FinalValidationLoss = roundDiagnosis(best.FinalValLoss)
 	if best.FinalTrainLoss > 0 || best.FinalValLoss > 0 {
@@ -1887,7 +2459,7 @@ func plannerDeploymentCard(input ExperimentPlannerInput) PlannerDeploymentCard {
 	bestEvaluation, bestSummary, ok := bestEvaluationForPlanner(input)
 	if ok {
 		card.BestModel = bestSummary.Model
-		card.BestLatencyMS = roundDiagnosis(firstPositivePayloadFloat(bestEvaluation.ModelProfile, "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms"))
+		card.BestLatencyMS = roundDiagnosis(firstPositivePayloadFloat(bestEvaluation.ModelProfile, "estimated_pipeline_latency_ms", "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms"))
 		card.BestThroughput = roundDiagnosis(firstPositivePayloadFloat(bestEvaluation.ModelProfile, "throughput_images_per_second", "throughput", "images_per_second"))
 		card.BestParameterCount = firstPositivePayloadFloat(bestEvaluation.ModelProfile, "parameter_count", "parameters", "num_parameters")
 		card.BestModelSizeMB = roundDiagnosis(firstPositivePayloadFloat(bestEvaluation.ModelProfile, "model_size_mb", "size_mb", "artifact_size_mb"))
@@ -2064,73 +2636,414 @@ func buildPlannerRetrievedMemorySnapshot(results []memory.MemoryRetrievalResult)
 	if len(results) == 0 {
 		return nil
 	}
+	distilledByKey := map[string]PlannerDistilledMemoryCard{}
+	rawFallback := []PlannerRetrievedMemoryCard{}
+	for _, result := range results {
+		if card, ok := plannerDistilledMemoryCard(result); ok {
+			key := plannerDistilledMemoryDedupeKey(card)
+			if key == "" {
+				rawFallback = append(rawFallback, plannerRetrievedMemoryCard(result))
+				continue
+			}
+			if existing, exists := distilledByKey[key]; exists {
+				merged := plannerDistilledMemoryMerge(existing, card)
+				if plannerDistilledMemoryPrefer(card, existing) {
+					distilledByKey[key] = plannerDistilledMemoryMerge(card, merged)
+				} else {
+					distilledByKey[key] = plannerDistilledMemoryMerge(existing, merged)
+				}
+			} else {
+				distilledByKey[key] = card
+			}
+			continue
+		}
+		rawFallback = append(rawFallback, plannerRetrievedMemoryCard(result))
+	}
+
+	distilledCards := make([]PlannerDistilledMemoryCard, 0, len(distilledByKey))
+	for _, card := range distilledByKey {
+		distilledCards = append(distilledCards, card)
+	}
+	sort.SliceStable(distilledCards, func(i, j int) bool {
+		leftPriority := plannerDistilledMemoryPriority(distilledCards[i])
+		rightPriority := plannerDistilledMemoryPriority(distilledCards[j])
+		if leftPriority != rightPriority {
+			return leftPriority > rightPriority
+		}
+		if distilledCards[i].Confidence == distilledCards[j].Confidence {
+			return distilledCards[i].SourceID < distilledCards[j].SourceID
+		}
+		return distilledCards[i].Confidence > distilledCards[j].Confidence
+	})
+
+	if len(distilledCards) > plannerRetrievedMemoryMaxTotal {
+		distilledCards = distilledCards[:plannerRetrievedMemoryMaxTotal]
+	}
+	if len(distilledCards) > 0 {
+		failedOrBlocked := []PlannerDistilledMemoryCard{}
+		highValue := []PlannerDistilledMemoryCard{}
+		for _, card := range distilledCards {
+			if plannerDistilledMemoryBucket(card) == "failed_or_blocked" {
+				if len(failedOrBlocked) < plannerRetrievedMemoryMaxFailedOrBlocked {
+					failedOrBlocked = append(failedOrBlocked, card)
+				}
+				continue
+			}
+			if len(highValue) < plannerRetrievedMemoryMaxDistilled {
+				highValue = append(highValue, card)
+			}
+		}
+		snapshot := &PlannerRetrievedMemorySnapshot{
+			DistilledLessons:       highValue,
+			FailedOrBlockedLessons: failedOrBlocked,
+			Caps: PlannerRetrievedMemoryCaps{
+				MaxTotal:            plannerRetrievedMemoryMaxTotal,
+				MaxDistilledLessons: plannerRetrievedMemoryMaxDistilled,
+				MaxFailedOrBlocked:  plannerRetrievedMemoryMaxFailedOrBlocked,
+				MaxRawFallbackCards: plannerRetrievedMemoryMaxRawFallback,
+			},
+			RetrievalEnabled: true,
+		}
+		snapshot.ApproximateBytes = approximateJSONBytes(snapshot)
+		return snapshot
+	}
+
+	rawFallback = plannerRawFallbackMemoryCards(rawFallback, plannerRetrievedMemoryMaxRawFallback)
+	if len(rawFallback) == 0 {
+		return nil
+	}
 	snapshot := &PlannerRetrievedMemorySnapshot{
-		SuccessfulStrategyCards:   []PlannerRetrievedMemoryCard{},
-		FailedStrategyCards:       []PlannerRetrievedMemoryCard{},
-		BlockedOrRejectedCards:    []PlannerRetrievedMemoryCard{},
-		DatasetPreprocessingCards: []PlannerRetrievedMemoryCard{},
-		OtherCards:                []PlannerRetrievedMemoryCard{},
+		RawFallbackCards: rawFallback,
 		Caps: PlannerRetrievedMemoryCaps{
-			MaxTotal:                plannerRetrievedMemoryMaxTotal,
-			MaxSuccessfulStrategies: plannerRetrievedMemoryMaxSuccessful,
-			MaxFailedStrategies:     plannerRetrievedMemoryMaxFailed,
-			MaxBlockedOrRejected:    plannerRetrievedMemoryMaxBlocked,
-			MaxDatasetPreprocessing: plannerRetrievedMemoryMaxDataset,
+			MaxTotal:            plannerRetrievedMemoryMaxTotal,
+			MaxDistilledLessons: plannerRetrievedMemoryMaxDistilled,
+			MaxFailedOrBlocked:  plannerRetrievedMemoryMaxFailedOrBlocked,
+			MaxRawFallbackCards: plannerRetrievedMemoryMaxRawFallback,
 		},
 		RetrievalEnabled: true,
 	}
+	snapshot.ApproximateBytes = approximateJSONBytes(snapshot)
+	return snapshot
+}
 
+func plannerDistilledMemoryCard(result memory.MemoryRetrievalResult) (PlannerDistilledMemoryCard, bool) {
+	distilled, ok := memory.BuildDistilledMemoryCardFromRetrievalResult(result)
+	if !ok {
+		return PlannerDistilledMemoryCard{}, false
+	}
+	card := PlannerDistilledMemoryCard{
+		SourceTable:  distilled.SourceTable,
+		SourceID:     distilled.SourceID,
+		ProjectID:    distilled.ProjectID,
+		DatasetID:    distilled.DatasetID,
+		PlanID:       distilled.PlanID,
+		JobID:        distilled.JobID,
+		Kind:         distilled.Kind,
+		Outcome:      distilled.Outcome,
+		Mechanism:    normalizeMechanism(distilled.Mechanism),
+		AppliesWhen:  normalizedPlannerStrings(distilled.AppliesWhen, 8),
+		Lesson:       compactPlannerRetrievedMemoryText(distilled.Lesson, 200),
+		EvidenceUsed: plannerMergeEvidenceIDs(distilled.EvidenceUsed, nil, 6),
+		Confidence:   roundDiagnosis(distilled.Confidence),
+	}
+	if len(card.EvidenceUsed) == 0 && strings.TrimSpace(card.SourceID) != "" {
+		card.EvidenceUsed = []string{card.SourceID}
+	}
+	return card, true
+}
+
+func plannerDistilledMemoryBucket(card PlannerDistilledMemoryCard) string {
+	text := strings.ToLower(strings.Join([]string{card.Outcome, card.Lesson, card.Mechanism}, " "))
+	if containsAnyText(text, "blocked", "rejected", "invalid proposal", "validation rejected", "failed", "no improvement", "noimprovement") {
+		return "failed_or_blocked"
+	}
+	if containsAnyText(strings.ToLower(card.Outcome), ExperimentPlanningOutcomeImprovedChampion, ExperimentPlanningOutcomeMinorImprovement, "success", "succeeded", "accepted") {
+		return "high_value"
+	}
+	if card.Confidence >= 0.55 {
+		return "high_value"
+	}
+	return "failed_or_blocked"
+}
+
+func plannerDistilledMemoryPriority(card PlannerDistilledMemoryCard) int {
+	switch plannerDistilledMemoryBucket(card) {
+	case "high_value":
+		return 2
+	case "failed_or_blocked":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func plannerDistilledMemoryPrefer(left PlannerDistilledMemoryCard, right PlannerDistilledMemoryCard) bool {
+	leftPriority := plannerDistilledMemoryPriority(left)
+	rightPriority := plannerDistilledMemoryPriority(right)
+	if leftPriority != rightPriority {
+		return leftPriority > rightPriority
+	}
+	if left.Confidence != right.Confidence {
+		return left.Confidence > right.Confidence
+	}
+	if len(left.EvidenceUsed) != len(right.EvidenceUsed) {
+		return len(left.EvidenceUsed) > len(right.EvidenceUsed)
+	}
+	return len(left.Lesson) > len(right.Lesson)
+}
+
+func plannerDistilledMemoryMerge(base PlannerDistilledMemoryCard, other PlannerDistilledMemoryCard) PlannerDistilledMemoryCard {
+	base.EvidenceUsed = plannerMergeEvidenceIDs(base.EvidenceUsed, other.EvidenceUsed, 8)
+	if len(base.AppliesWhen) == 0 {
+		base.AppliesWhen = append([]string(nil), other.AppliesWhen...)
+	}
+	if strings.TrimSpace(base.Lesson) == "" {
+		base.Lesson = other.Lesson
+	}
+	if strings.TrimSpace(base.Outcome) == "" {
+		base.Outcome = other.Outcome
+	}
+	if strings.TrimSpace(base.Mechanism) == "" {
+		base.Mechanism = other.Mechanism
+	}
+	if base.Confidence == 0 {
+		base.Confidence = other.Confidence
+	}
+	if strings.TrimSpace(base.SourceTable) == "" {
+		base.SourceTable = other.SourceTable
+	}
+	if strings.TrimSpace(base.SourceID) == "" {
+		base.SourceID = other.SourceID
+	}
+	return base
+}
+
+func plannerMergeEvidenceIDs(first []string, second []string, limit int) []string {
+	out := []string{}
 	seen := map[string]bool{}
-	total := 0
-	for _, result := range results {
-		if total >= plannerRetrievedMemoryMaxTotal {
-			break
+	appendList := func(values []string) {
+		for _, value := range values {
+			normalized := strings.TrimSpace(value)
+			if normalized == "" {
+				continue
+			}
+			key := strings.ToLower(normalized)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, normalized)
+			if limit > 0 && len(out) >= limit {
+				return
+			}
 		}
-		card := plannerRetrievedMemoryCard(result)
+	}
+	appendList(first)
+	if limit > 0 && len(out) >= limit {
+		return out
+	}
+	appendList(second)
+	return out
+}
+
+func plannerDistilledMemoryDedupeKey(card PlannerDistilledMemoryCard) string {
+	mechanism := normalizeMechanism(card.Mechanism)
+	appliesWhen := normalizedPlannerStrings(card.AppliesWhen, 8)
+	if mechanism == "" && len(appliesWhen) == 0 {
+		return strings.ToLower(strings.TrimSpace(card.SourceTable + "\x00" + card.SourceID))
+	}
+	return strings.ToLower(strings.Join([]string{mechanism, strings.Join(appliesWhen, "|")}, "\x00"))
+}
+
+func plannerRawFallbackMemoryCards(cards []PlannerRetrievedMemoryCard, limit int) []PlannerRetrievedMemoryCard {
+	if len(cards) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	ordered := append([]PlannerRetrievedMemoryCard(nil), cards...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Score == ordered[j].Score {
+			if ordered[i].SemanticScore == ordered[j].SemanticScore {
+				return ordered[i].StructuredScore > ordered[j].StructuredScore
+			}
+			return ordered[i].SemanticScore > ordered[j].SemanticScore
+		}
+		return ordered[i].Score > ordered[j].Score
+	})
+	out := []PlannerRetrievedMemoryCard{}
+	for _, card := range ordered {
 		key := plannerRetrievedMemoryDedupeKey(card)
 		if key != "" && seen[key] {
 			continue
 		}
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, card)
+		if key != "" {
+			seen[key] = true
+		}
+	}
+	return out
+}
 
-		added := false
-		switch plannerRetrievedMemoryBucket(card) {
-		case "successful_strategy":
-			if len(snapshot.SuccessfulStrategyCards) < plannerRetrievedMemoryMaxSuccessful {
-				snapshot.SuccessfulStrategyCards = append(snapshot.SuccessfulStrategyCards, card)
-				added = true
-			}
-		case "failed_strategy":
-			if len(snapshot.FailedStrategyCards) < plannerRetrievedMemoryMaxFailed {
-				snapshot.FailedStrategyCards = append(snapshot.FailedStrategyCards, card)
-				added = true
-			}
-		case "blocked_or_rejected":
-			if len(snapshot.BlockedOrRejectedCards) < plannerRetrievedMemoryMaxBlocked {
-				snapshot.BlockedOrRejectedCards = append(snapshot.BlockedOrRejectedCards, card)
-				added = true
-			}
-		case "dataset_preprocessing":
-			if len(snapshot.DatasetPreprocessingCards) < plannerRetrievedMemoryMaxDataset {
-				snapshot.DatasetPreprocessingCards = append(snapshot.DatasetPreprocessingCards, card)
-				added = true
-			}
-		default:
-			snapshot.OtherCards = append(snapshot.OtherCards, card)
-			added = true
+func normalizedPlannerStrings(values []string, limit int) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" || seen[normalized] {
+			continue
 		}
-		if added {
-			total++
-			if key != "" {
-				seen[key] = true
-			}
+		seen[normalized] = true
+		out = append(out, normalized)
+	}
+	sort.Strings(out)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func compactPlannerModelCatalog(specs []SupportedModelSpec) []PlannerModelCatalogCard {
+	out := []PlannerModelCatalogCard{}
+	seenIDs := map[string]bool{}
+	seenDefaultByTask := map[string]bool{}
+	for _, spec := range specs {
+		card, ok := plannerModelCatalogCard(spec)
+		if !ok {
+			continue
 		}
+		if seenIDs[card.ID] {
+			continue
+		}
+		seenIDs[card.ID] = true
+		if !seenDefaultByTask[card.TaskType] {
+			card.Default = true
+			seenDefaultByTask[card.TaskType] = true
+		}
+		out = append(out, card)
 	}
-	if total == 0 {
-		return nil
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].TaskType != out[j].TaskType {
+			return out[i].TaskType < out[j].TaskType
+		}
+		if out[i].Default != out[j].Default {
+			return out[i].Default
+		}
+		if out[i].Tier != out[j].Tier {
+			return out[i].Tier < out[j].Tier
+		}
+		if out[i].LatencyTier != out[j].LatencyTier {
+			return out[i].LatencyTier < out[j].LatencyTier
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func plannerModelCatalogCard(spec SupportedModelSpec) (PlannerModelCatalogCard, bool) {
+	id := strings.TrimSpace(spec.Name)
+	if id == "" || !spec.TrainingEnabled {
+		return PlannerModelCatalogCard{}, false
 	}
-	snapshot.ApproximateBytes = approximateJSONBytes(snapshot)
-	snapshot.ApproximateBytes = approximateJSONBytes(snapshot)
-	return snapshot
+	card := PlannerModelCatalogCard{
+		ID:               id,
+		TaskType:         plannerModelCatalogTaskType(spec),
+		Tier:             plannerModelCatalogQualityTier(spec),
+		LatencyTier:      plannerModelCatalogLatencyTier(spec),
+		DefaultImageSize: spec.DefaultImageSize,
+		EligibilityNotes: plannerModelCatalogEligibilityNotes(spec),
+	}
+	if card.TaskType == "" {
+		card.TaskType = "image_classification"
+	}
+	card.Default = plannerModelCatalogIsDefault(spec)
+	if len(card.EligibilityNotes) == 0 {
+		card.EligibilityNotes = []string{plannerModelCatalogTaskNote(card.TaskType)}
+	}
+	return card, true
+}
+
+func plannerModelCatalogIsDefault(spec SupportedModelSpec) bool {
+	switch plannerModelCatalogTaskType(spec) {
+	case "object_detection":
+		return strings.EqualFold(strings.TrimSpace(spec.Name), "yolo11n.pt")
+	default:
+		return strings.EqualFold(strings.TrimSpace(spec.Name), "mobilenet_v3_small")
+	}
+}
+
+func plannerModelCatalogTaskType(spec SupportedModelSpec) string {
+	taskType := strings.TrimSpace(spec.TaskType)
+	if taskType != "" {
+		return taskType
+	}
+	if strings.EqualFold(strings.TrimSpace(spec.Family), "yolo11") || strings.Contains(strings.ToLower(strings.TrimSpace(spec.ModelKind)), "yolo") {
+		return "object_detection"
+	}
+	return "image_classification"
+}
+
+func plannerModelCatalogLatencyTier(spec SupportedModelSpec) string {
+	tier := strings.ToLower(strings.TrimSpace(spec.ExpectedLatencyClass))
+	if tier != "" {
+		return tier
+	}
+	switch strings.ToLower(strings.TrimSpace(spec.DeploymentTier)) {
+	case "fast_live", "realtime_detector":
+		return "very_fast"
+	case "balanced":
+		return "medium"
+	case "quality_challenger", "quality_detector":
+		return "slow"
+	default:
+		return ""
+	}
+}
+
+func plannerModelCatalogQualityTier(spec SupportedModelSpec) string {
+	switch strings.ToLower(strings.TrimSpace(spec.DeploymentTier)) {
+	case "fast_live", "realtime_detector":
+		return "fast"
+	case "balanced":
+		return "balanced"
+	case "quality_challenger", "quality_detector":
+		return "quality"
+	default:
+		return ""
+	}
+}
+
+func plannerModelCatalogEligibilityNotes(spec SupportedModelSpec) []string {
+	notes := []string{}
+	taskType := plannerModelCatalogTaskType(spec)
+	notes = append(notes, plannerModelCatalogTaskNote(taskType))
+	if spec.DefaultImageSize > 0 {
+		notes = append(notes, fmt.Sprintf("size=%d", spec.DefaultImageSize))
+	}
+	if spec.MinRecommendedImages > 0 {
+		notes = append(notes, fmt.Sprintf("min=%d", spec.MinRecommendedImages))
+	}
+	if taskType == "object_detection" {
+		notes = append(notes, "yolo only")
+	}
+	if taskType == "image_classification" && len(spec.SupportsFineTuneModes) > 0 {
+		notes = append(notes, "fine_tune="+strings.Join(normalizedPlannerStrings(spec.SupportsFineTuneModes, 4), ","))
+	}
+	if spec.SupportsTransfer {
+		notes = append(notes, "transfer")
+	}
+	return cappedStrings(notes, 4)
+}
+
+func plannerModelCatalogTaskNote(taskType string) string {
+	switch strings.ToLower(strings.TrimSpace(taskType)) {
+	case "object_detection":
+		return "detect only"
+	default:
+		return "classify only"
+	}
 }
 
 func plannerRetrievedMemoryCard(result memory.MemoryRetrievalResult) PlannerRetrievedMemoryCard {
@@ -2227,11 +3140,9 @@ func plannerRetrievedMemoryCardCount(snapshot *PlannerRetrievedMemorySnapshot) i
 	if snapshot == nil {
 		return 0
 	}
-	return len(snapshot.SuccessfulStrategyCards) +
-		len(snapshot.FailedStrategyCards) +
-		len(snapshot.BlockedOrRejectedCards) +
-		len(snapshot.DatasetPreprocessingCards) +
-		len(snapshot.OtherCards)
+	return len(snapshot.DistilledLessons) +
+		len(snapshot.FailedOrBlockedLessons) +
+		len(snapshot.RawFallbackCards)
 }
 
 func firstPlannerRetrievedMemoryString(records []map[string]any, keys ...string) string {
@@ -2787,16 +3698,19 @@ func plannerExperimentMechanismSignature(experiment plans.PlannedExperiment) str
 	}, ":")
 }
 
-func bestRunSummary(summaries []runs.TrainingRunSummary, targetMetric string) (runs.TrainingRunSummary, bool) {
+func bestRunSummary(summaries []runs.TrainingRunSummary, evaluations []runs.TrainingRunEvaluation, targetMetric string) (runs.TrainingRunSummary, bool) {
 	best := runs.TrainingRunSummary{}
 	found := false
+	evaluationsByJob := diagnosisEvaluationsByJobID(evaluations)
+	bestScore := 0.0
 	for _, summary := range summaries {
 		if !strings.EqualFold(summary.Status, jobs.StatusSucceeded) {
 			continue
 		}
-		score := diagnosisSummaryMetric(summary, targetMetric)
-		if !found || score > diagnosisSummaryMetric(best, targetMetric) {
+		score := diagnosisRunScore(summary, evaluationsByJob[summary.JobID], targetMetric)
+		if !found || score > bestScore {
 			best = summary
+			bestScore = score
 			found = true
 		}
 	}
@@ -2823,11 +3737,11 @@ func bestEvaluationForPlanner(input ExperimentPlannerInput) (runs.TrainingRunEva
 	if len(summaries) == 0 {
 		summaries = append(summaries, input.PriorSummaries...)
 	}
-	best, ok := bestRunSummary(summaries, targetMetric)
+	evaluations := append(append([]runs.TrainingRunEvaluation(nil), input.PlanEvaluations...), input.PriorEvaluations...)
+	best, ok := bestRunSummary(summaries, evaluations, targetMetric)
 	if !ok {
 		return runs.TrainingRunEvaluation{}, runs.TrainingRunSummary{}, false
 	}
-	evaluations := append(append([]runs.TrainingRunEvaluation(nil), input.PlanEvaluations...), input.PriorEvaluations...)
 	for _, evaluation := range evaluations {
 		if evaluation.JobID == best.JobID {
 			return evaluation, best, true
@@ -2956,7 +3870,7 @@ func championLatency(input ExperimentPlannerInput) float64 {
 	}
 	for _, evaluation := range append(append([]runs.TrainingRunEvaluation(nil), input.PlanEvaluations...), input.PriorEvaluations...) {
 		if evaluation.JobID == input.CurrentChampion.JobID {
-			return roundDiagnosis(firstPositivePayloadFloat(evaluation.ModelProfile, "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms"))
+			return roundDiagnosis(firstPositivePayloadFloat(evaluation.ModelProfile, "estimated_pipeline_latency_ms", "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms"))
 		}
 	}
 	return 0
@@ -2969,7 +3883,7 @@ func bestQualityChallenger(input ExperimentPlannerInput) string {
 		}
 	}
 	targetMetric := normalizedDiagnosisMetric(input.SourcePlan.TargetMetric)
-	best, ok := bestRunSummary(input.PlanSummaries, targetMetric)
+	best, ok := bestRunSummary(input.PlanSummaries, input.PlanEvaluations, targetMetric)
 	if ok && input.CurrentChampion != nil && !strings.EqualFold(best.JobID, input.CurrentChampion.JobID) {
 		return best.Model
 	}
@@ -3259,6 +4173,30 @@ func compactAnyMap(values map[string]any, limit int) map[string]any {
 			break
 		}
 		out[key] = compactAnyValue(values[key])
+	}
+	return out
+}
+
+func compactFloatMap(values map[string]float64, limit int) map[string]float64 {
+	if len(values) == 0 || limit <= 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	out := map[string]float64{}
+	for _, key := range keys {
+		if len(out) >= limit {
+			break
+		}
+		out[key] = values[key]
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

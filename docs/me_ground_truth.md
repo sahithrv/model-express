@@ -43,8 +43,11 @@ Major tables and store concepts:
 - `project_champions`: selected champion job plus metrics, evaluation, deployment profile.
 - `champion_exports`: additive export records for selected champions; repeated requests for the same project/champion/format update the existing record.
 - `champion_demo_predictions`: demo prediction audit/history rows for selected champions, including image metadata, status, top-k payloads when available, latency/correctness, and runtime errors.
-- `agent_invocations`: LLM input/output, validation status, parsed output, downstream outcome.
+- `agent_invocations`: LLM input/output, validation status, parsed output, downstream outcome, and invocation runtime metadata. When the provider returns usage, `input_context.invocation_runtime.llm_usage` stores exact input, output, total, cached-input, and reasoning-token counts plus request model, API style, and tool round count; byte-based token estimates remain the fallback.
 - `agent_memory_records`: distilled training/planning memory.
+- `agent_memory_embeddings`: compact vector-memory rows with source-card text hashes so unchanged source cards are not re-embedded for the same model/dimensions/content.
+- `memory_embedding_usage_events`: embedding spend telemetry split by `source_index` versus `retrieval_query`, including provider-call count, input bytes, source/query hash, retrieved count, injected/log-only/cache/skipped flags, and provider usage when available.
+- `memory_retrieval_query_cache`: short-lived cache for repeated retrieval-query embeddings by project/dataset scope, purpose, model, dimensions, and normalized query hash.
 - `agent_decisions`: accepted project decisions such as `ADD_EXPERIMENTS`, `SELECT_CHAMPION`, or `REOPEN_EXPERIMENTATION`.
 - `strategy_scorecards`: structured follow-up outcome memory, including first-class mechanism/intervention/evidence metadata.
 - `automl_studies`: backend-owned hyperparameter optimization studies linked to project, plan, dataset, experiment index, LLM-owned strategy snapshot, sampler, seed, and validated search space.
@@ -63,7 +66,35 @@ Major tables and store concepts:
 
 Profile JSON includes class counts, image counts, image dimension stats, corrupt-file counts, split summaries, metadata/artifact detection, leakage warnings, dataset traits, layout summary, normalization metadata, and optional `visual_exemplars`/`demo_images` arrays. CUB-style `bounding_boxes.txt` is treated as bbox evidence in the legacy profile/visual-trait summary, even though normalized metadata remains the richer source for executable bbox crops.
 
-Normalized dataset metadata imports currently support image/split-folder inventory, single archive-wrapper folders, common image roots such as `images/`, `JPEGImages/`, `img(s)/`, and `data/`, generic CSV manifests, CUB sidecars, CUB part-location keypoints, and Pascal VOC XML bounding-box evidence. Manifest and sidecar paths are canonicalized against the dataset inventory when possible so metadata that omits the wrapper or image-root prefix can still resolve to the stored dataset path. Worker discovery sends up to 50,000 inventory files by default so common 10k-image datasets can be canonicalized without truncating the image inventory. Unsupported metadata-like files, including attribute/part/keypoint candidates outside supported parsers, are recorded as warnings rather than blocking normal registration in non-strict mode. `datasets.profile` remains the legacy profile surface; normalized imports live beside it and do not activate `dataset_profiles`.
+The legacy worker profiler now accepts YOLO object-detection datasets. It detects `data.yaml`, `data.yml`, `dataset.yaml`, or `dataset.yml`, plus `labels/**/*.txt` files containing normalized YOLO rows shaped as `class_id x_center y_center width height`. YOLO evidence sets `task_type: object_detection` and emits `yolo_available`, `object_detection_available`, `bbox_count`, `bbox_per_class`, and `yolo_summary` at the profile/metadata-summary surfaces. `yolo_summary` includes bounded class names/ids, label-file counts, bbox counts, split hints, per-split image/label/bbox counts, and per-class box distribution. The profiler supports YOLO `names` as an inline list, inline dict, keyed YAML block, or list YAML block.
+
+Accepted YOLO dataset structures for full current use:
+
+```text
+dataset/
+  data.yaml
+  images/train/*.jpg
+  images/val/*.jpg
+  images/test/*.jpg        # optional
+  labels/train/*.txt
+  labels/val/*.txt
+  labels/test/*.txt        # optional
+```
+
+```text
+dataset/
+  data.yaml
+  train/images/*.jpg
+  train/labels/*.txt
+  valid/images/*.jpg       # val is also accepted
+  valid/labels/*.txt
+  test/images/*.jpg        # optional
+  test/labels/*.txt        # optional
+```
+
+`data.yaml` should declare `train`, `val` or `valid`, optional `test`, `nc`, and `names`. `train.txt`, `val.txt`, and `test.txt` split files referenced by `data.yaml` are accepted as split hints. Label files use one object per line with 0-based class ids and normalized coordinates in `[0, 1]`; empty label files mean the image has no annotated objects. YOLO segmentation, pose/keypoint, rotated-box, tracking, and video datasets are not part of the current accepted detector contract.
+
+Normalized dataset metadata imports currently support image/split-folder inventory, single archive-wrapper folders, common image roots such as `images/`, `JPEGImages/`, `img(s)/`, and `data/`, generic CSV manifests, CUB sidecars, CUB part-location keypoints, and Pascal VOC XML bounding-box evidence. Manifest and sidecar paths are canonicalized against the dataset inventory when possible so metadata that omits the wrapper or image-root prefix can still resolve to the stored dataset path. Worker discovery sends up to 50,000 inventory files by default so common 10k-image datasets can be canonicalized without truncating the image inventory. Unsupported metadata-like files, including attribute/part/keypoint candidates outside supported parsers, are recorded as warnings rather than blocking normal registration in non-strict mode. YOLO is currently accepted through the legacy profiler/training path, not as a normalized metadata import parser. `datasets.profile` remains the legacy profile surface; normalized imports live beside it and do not activate `dataset_profiles`.
 
 Current dataset metadata APIs:
 
@@ -98,6 +129,8 @@ Supported execution-facing planning fields include:
 
 The backend validates allowed model names, epochs, batch size, learning rate, image size, optimizer, scheduler, optimizer-specific knobs, scheduler-specific knobs, dropout, label smoothing, gradient clipping, preprocessing values, augmentation keys, augmentation policy, class balancing config, sampling strategy, early stopping, and fine-tune strategy.
 
+Planning is task-aware for YOLO evidence. When a dataset profile or agent-safe summary contains YOLO-specific evidence, the supported model catalog includes COCO-pretrained YOLO11 detector candidates: `yolo11n.pt`, `yolo11s.pt`, `yolo11m.pt`, `yolo11l.pt`, and `yolo11x.pt`. These entries are marked `task_type: object_detection`, `model_kind: ultralytics_yolo_detector`, `pretrained_weights`, default image size `640`, and `training_enabled: true`. The deterministic initial planner creates YOLO detector plans with target metric `mAP50_95` instead of classifier plans. Execution validates dataset/model compatibility: YOLO detector models require YOLO evidence, classifier models are rejected for YOLO object-detection datasets, and detection templates cannot be paired with classifier models. Detector jobs still use the existing `train_experiment` template but carry explicit `task_type`, `model_kind`, `pretrained_weights`, class names, and bounded YOLO summary metadata in job config.
+
 AutoML is an optional backend hyperparameter suggestion layer, disabled by default through `automation_settings.automl_enabled`. When enabled, the backend can synthesize a default validated AutoML search space for a proposed experiment that omits `PlannedExperiment.automl`, so the LLM does not have to remember the AutoML JSON shape for every run. LLM-provided AutoML metadata is still honored when present, and an explicit disabled AutoML block remains disabled. The LLM remains responsible for strategy: model/template, preprocessing, image size/resolution intent, augmentation policy type, class-balancing strategy, sampling strategy, pretrained/freeze/fine-tune strategy, exploration/exploitation intent, and bounded search constraints.
 
 AutoML may tune only backend/worker-supported hyperparameters: `learning_rate`, `weight_decay`, `batch_size`, `epochs`, `early_stopping_patience`, `optimizer`, `scheduler`, `dropout`, `optimizer_momentum` only with SGD, `scheduler_step_size` and `scheduler_gamma` only with the step scheduler, `label_smoothing`, `gradient_clip_norm`, selected structured augmentation config values after the LLM chose the policy type, `class_balancing_config.effective_number_beta` only with effective-number class balancing, and `class_balancing_config.focal_loss_gamma` only with focal loss. It cannot tune strategy-owned fields such as `model`, `template`, `preprocessing`, `resolution_strategy`, `image_size`, `augmentation_policy`, `augmentation_policy_config.policy_type`, `class_balancing`, `sampling_strategy`, `pretrained`, `freeze_backbone`, or `fine_tune_strategy`. Samplers are `seeded_random`, `grid`, and lightweight `adaptive_bayesian`, which exploits compact persisted trial history without adding a heavy Bayesian dependency.
@@ -114,19 +147,23 @@ Autonomous mode is more conservative than propose mode. Unless overridden by env
 
 When an LLM planner proposal passes JSON/schema parsing but fails backend validation, the backend records the rejected invocation outcome and performs one bounded correction retry with `planner_validation_feedback` in the prompt context. The retry can only succeed if the corrected JSON passes the same backend validation and scheduling gates.
 
+The default LLM model is `gpt-5.4-mini` unless explicitly overridden by environment or automation settings. The planner supports `MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION=compact_v1` and `MODEL_EXPRESS_PLANNER_CONTEXT_VERSION=v2`; V1 prompt/context behavior remains selectable for rollback. Prompt compression preserves the existing `ExperimentPlanningRecommendation` contract, including schema-valid `ADD_EXPERIMENTS` candidates with complete executable experiment configs.
+
 ## Training Flow
 
 1. A user or autonomous backend path executes a validated plan through `POST /plans/:id/execute`.
 2. The backend creates one `train_experiment` job per novel experiment/provider/index.
 3. Workers poll `POST /workers/:id/poll` and receive assigned jobs with backend-owned attempt and lease metadata.
-4. Local training simulates contract behavior for fast local demos.
-5. Modal training performs torchvision transfer learning for supported model families.
+4. Local training simulates contract behavior for fast local demos, including a detection-shaped YOLO simulator for object-detection jobs.
+5. Modal training performs torchvision transfer learning for supported classifier model families and Ultralytics YOLO training for supported detector jobs.
 6. Workers report epoch metrics, summary updates, and final evaluation.
 7. Workers complete or fail the job through backend APIs.
 
 For AutoML-enabled experiments, the orchestrator samples concrete hyperparameters before job creation, persists study/suggestion provenance, and places only compact `automl_summary`, `automl_study_id`, and `automl_suggestion_id` metadata in the job config. Backend default AutoML samples concrete knobs such as learning rate, weight decay, batch size, epochs, early stopping, dropout, label smoothing, gradient clipping, optimizer/scheduler conditional numeric knobs, and numeric policy/loss parameters only after the LLM has selected the owning strategy. Workers still receive concrete training config and do not run search, schedule follow-up jobs, mutate datasets, or choose strategies.
 
-Worker-side training currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, structured image augmentation, training-only MixUp/CutMix, weighted/focal/effective-number loss, weighted sampling, dropout heads, SGD momentum, step scheduler size/gamma, label smoothing, focal-loss gamma, gradient clipping, and bbox crop/full-image ablations when backend-validated annotations are available. Modal training fetches the active normalized metadata bundle when present and can use backend-owned labels, official splits, and bbox annotations; train/test-only metadata derives a deterministic validation subset from train while keeping test held out. If the bundle is absent or unavailable, legacy ImageFolder/random split behavior remains the fallback, with single archive wrappers and common image roots such as `images/` handled before falling back to the archive root.
+Worker-side classifier training currently supports deterministic resize/crop options, ImageNet/none normalization, bounded dataset-computed normalization, structured image augmentation, training-only MixUp/CutMix, weighted/focal/effective-number loss, weighted sampling, dropout heads, SGD momentum, step scheduler size/gamma, label smoothing, focal-loss gamma, gradient clipping, and bbox crop/full-image ablations when backend-validated annotations are available. Modal classifier training fetches the active normalized metadata bundle when present and can use backend-owned labels, official splits, and bbox annotations; train/test-only metadata derives a deterministic validation subset from train while keeping test held out. If the bundle is absent or unavailable, legacy ImageFolder/random split behavior remains the fallback, with single archive wrappers and common image roots such as `images/` handled before falling back to the archive root.
+
+YOLO detector training is separate from classifier training. Local detector jobs emit deterministic mAP/precision/recall/box-loss/cls-loss/DFL-loss metrics so control-plane E2E smoke tests can run without a GPU. Modal detector jobs dispatch to `train_yolo_detector`, load the dataset's `data.yaml`/`dataset.yaml`, train with Ultralytics from the requested YOLO11 pretrained weights, preserve official train/val/test splits, validate on `val`, and run final `test` evaluation when the config declares a test split. Detector summaries map `best_macro_f1` to `mAP50_95` and `best_accuracy` to `mAP50` for backward-compatible champion ranking, while the evaluation payload also carries explicit detection metrics, detection losses, latency/FPS estimates, `task_type: object_detection`, and `model_kind: ultralytics_yolo_detector`.
 
 Training evaluations for image classification include confusion matrices and per-class precision/recall/F1 when real validation/test labels are available. The backend enriches final evaluation payloads with deterministic `training_diagnostics` inside `holistic_scores`, including train/validation loss gap, divergence status, severity, and trend deltas derived from persisted epoch metrics and run summaries.
 
@@ -136,7 +173,7 @@ Worker utility modules also include:
 - split-file, Pascal VOC XML, and annotation JSON helper parsers
 - class-balanced visual exemplar and visual-analysis sample generation with PIL downscale/compression and byte/image caps; both unwrap single archive folders and common image roots before treating immediate subfolders as classes
 - report-only label-quality audit jobs that persist capped profile audit metadata without label mutation
-- champion export manifest/checkpoint helpers with guarded TorchScript/ONNX paths
+- champion export manifest/checkpoint helpers with guarded TorchScript/ONNX paths and detection-aware export metadata contracts
 - TorchScript demo inference helper that returns a ranked payload when a valid worker-owned artifact exists, or a deterministic pending/error payload when dependencies/artifacts are missing
 - champion job handlers for `export_champion`, `champion_demo_prediction`, and `generate_visual_exemplars`
 
@@ -153,7 +190,7 @@ Experiment Planner reviews completed plans and can recommend:
 - `STOP_PROJECT`
 - `WAIT`
 
-Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional agent-safe normalized metadata summaries, optional visual evidence, objective context, deterministic diagnosis, project trajectory, training dynamics, per-class errors, deployment, mechanism coverage, label quality, supported model catalog, current champion, run deltas, memory lessons, rejected options, scorecards, retrieved memory cards when enabled, validation feedback, and existing experiment signatures.
+Planner input is compacted into decision-ready cards rather than raw table dumps. It includes project and dataset cards, optional agent-safe normalized metadata summaries, optional visual evidence, objective context, deterministic diagnosis, project trajectory, training dynamics, per-class errors, deployment, mechanism coverage, label quality, a compact task-separated model catalog, current champion, run deltas, distilled memory lessons, rejected options, scorecards, retrieved memory cards when enabled, validation feedback, and existing experiment signatures.
 
 For `ADD_EXPERIMENTS`, the Planner must return `candidate_hypotheses` with mechanism, intervention, evidence, expected effect, expected metric impact, tradeoffs, risk/cost/novelty, proposed changes, and a complete executable experiment config. `FinalizePlannerRecommendation` then applies deterministic backend ranking and governor checks. If no candidate survives, the planner output is rejected rather than scheduled.
 
@@ -161,9 +198,11 @@ Planner decisions persist the `project_trajectory_card` alongside candidate rank
 
 Live/real-time objective handling treats latency as a budget and tiebreaker rather than a primary search driver. Latency below roughly 25ms is considered acceptable for live use, so the Planner and Training Monitor should prioritize macro-F1, per-class recall, and meaningful quality gains unless latency exceeds the budget or quality is otherwise close.
 
-Training Monitor input is also compacted into run-evaluation cards. The backend still stores full run summaries, evaluations, epoch metrics, plans, and job configs, but the LLM receives capped cards and prompt-budget telemetry.
+Experiment Planner context includes `prompt_budget.section_estimates` so recent invocations can rank static instructions, output contract text, model catalog, retrieved memory, completed experiment ledger, and other prompt sections by approximate token weight. Training Monitor input is also compacted into run-evaluation cards. The backend still stores full run summaries, evaluations, epoch metrics, plans, and job configs, but the LLM receives capped cards and prompt-budget telemetry.
 
-Vector retrieval indexes compact memory cards only: strategy scorecards, distilled planning/training memories, dataset profile fingerprints, accepted visual-analysis cards, and preprocessing hypotheses. New eligible writes trigger indexing when embeddings are configured, and existing project memories can be indexed through `POST /projects/:id/memory-embeddings/backfill`. It does not vectorize raw prompts, raw LLM outputs, full invocation contexts, full epoch arrays, full manifests, image URIs, or unbounded JSON payloads. Retrieval can inform planner/monitor context and deterministic ranking, but backend validation remains the execution gate.
+Vector retrieval indexes compact memory cards only: strategy scorecards, distilled planning/training memories, dataset profile fingerprints, accepted visual-analysis cards, and preprocessing hypotheses. New eligible writes trigger indexing when embeddings are configured, and existing project memories can be indexed through `POST /projects/:id/memory-embeddings/backfill`. Source indexing records usage telemetry, pre-checks unchanged source-card hashes, obeys daily call caps, and uses a conservative backfill limit. It does not vectorize raw prompts, raw LLM outputs, full invocation contexts, full epoch arrays, full manifests, image URIs, or unbounded JSON payloads.
+
+Retrieval-query embeddings are accountable separately from source indexing. Log-only memory probes use lexical fallback unless `MODEL_EXPRESS_MEMORY_LOG_ONLY_EMBEDDINGS=true`; repeated queries use the retrieval-query cache; too-small indexes and exhausted budgets downgrade to lexical retrieval. Retrieval usage records whether cards were returned and whether they were actually injected into Planner or Training Monitor context. Retrieval can inform planner/monitor context and deterministic ranking, but backend validation remains the execution gate.
 
 When AutoML trials exist, the Planner and Training Monitor receive compact `optimizer_feedback_summary` cards: trial counts, best score/job, best hyperparameters, train/validation gap, trend, failed-trial count/patterns, and bounded narrowing advice. Raw trial dumps are not included in default LLM context.
 
@@ -205,11 +244,13 @@ Current backend export/demo APIs:
 
 `POST /projects/:id/champion/exports` validates that a champion exists, the champion job succeeded, and the requested format is supported. If worker work is needed, the backend records the export and queues an `export_champion` job. Workers report results through `POST /jobs/:id/champion-export-result`; the backend validates the job template/config before updating `champion_exports`. If no artifact can be produced, the export stays `PENDING_ARTIFACT` or `FAILED` with validation errors rather than pretending it is ready. Repeated requests for the same project/champion/format are idempotent at the store/API behavior level.
 
-Demo image listing reads capped metadata from `datasets.profile.demo_images` or `datasets.profile.visual_exemplars`. Demo prediction requests create durable `champion_demo_predictions` audit rows. When a `READY` champion export exists, the backend queues a `champion_demo_prediction` job and workers report results through `POST /jobs/:id/champion-demo-prediction-result`. Missing manifests, missing dependencies, or unavailable local artifacts are recorded as `RUNTIME_UNAVAILABLE`; the backend never fabricates predictions.
+Champion export metadata now exposes a model-agnostic live inference contract. Metadata includes `model_kind`, `task_type`, `runtime`/`default_runtime`, input shape, class labels, confidence-threshold defaults, latency budget/profile fields when known, export self-test placeholders, preprocessing contract, and postprocessing contract. Classification postprocessing is logits plus softmax. Detection/YOLO postprocessing describes boxes, scores, classes, confidence threshold, IoU threshold, NMS, and max detections. YOLO Modal training attempts an ONNX export from the trained Ultralytics checkpoint and falls back to a checkpoint artifact with validation errors if ONNX export is unavailable.
+
+Demo image listing reads capped metadata from `datasets.profile.demo_images` or `datasets.profile.visual_exemplars`. Demo prediction requests create durable `champion_demo_predictions` audit rows. When a `READY` champion export exists, the backend queues a `champion_demo_prediction` job and workers report results through `POST /jobs/:id/champion-demo-prediction-result`. Demo requests can carry detector confidence, IoU, and max-detection settings. Missing manifests, missing dependencies, or unavailable local artifacts are recorded as `RUNTIME_UNAVAILABLE`; the backend never fabricates predictions. Detection results are persisted in the existing `image_metadata` JSON as bounded boxes/classes/scores so no database migration is required.
 
 Workers can generate class-balanced exemplars with `generate_visual_exemplars` and persist the capped result through `POST /datasets/:id/visual-exemplars`. The backend enforces count/per-class/byte caps and merges accepted `visual_exemplars` and `demo_images` into canonical `datasets.profile` JSON.
 
-Mission Control can request an ONNX export record, show export status/errors, list demo images, browse next/random demo examples, and display prediction history, pending/running/succeeded/failed/runtime-unavailable status, true labels, top-k rows, latency, and correctness fields when present.
+Mission Control can request an ONNX export record, show export status/errors, list demo images, browse next/random demo examples, run timed slideshow inference, and display prediction history, pending/running/succeeded/failed/runtime-unavailable status, true labels, top-k rows, latency, and correctness fields when present. Local ONNX inference supports classifier logits/softmax and YOLO-style detector outputs. For detector champions, Mission Control decodes common Ultralytics ONNX output shapes, applies confidence filtering and class-aware NMS, draws box overlays, exposes confidence/IoU/speed controls, and shows per-frame detection count, FPS estimate, and postprocess latency. Worker-backed demo inference also supports ONNX detector artifacts and returns the same detection metadata shape when the browser cannot run local inference.
 
 ## Mission Control Flow
 
@@ -225,6 +266,7 @@ Mission Control polls project detail endpoints and optionally consumes `GET /pro
 - run summaries/evaluations, metric charts, per-class metrics, confusion previews, and backend training diagnostics
 - selected champion and export/demo panel
 - champion demo prediction history and runtime-unavailable audit rows
+- LLM/embedding telemetry showing today/7-day/lifetime token and cost estimates, exact versus approximate usage, model split, token-heavy invocations, prompt-section offenders, source-index embedding usage, retrieval-query hit/injection/cache/skipped usefulness, and embedding cost estimates
 
 Mission Control does not invent orchestration state. It uses backend APIs, renders partial data defensively, and surfaces rejection/failure states as part of operator trust. The Electron orchestrator request bridge returns HTTP error envelopes to the renderer instead of throwing inside the IPC handler, so expected optional-endpoint or empty-state failures can be handled without noisy main-process handler errors.
 
@@ -249,10 +291,10 @@ Implemented/current-scale hardening:
 - Follow-up rounds remain bounded by automation settings and max follow-up rounds.
 - Experiment Planner `ADD_EXPERIMENTS` cannot bypass backend candidate ranking.
 - Dry-run planner validation uses the same backend finalizer as scheduling, so repair prompts receive finalizer rejection reasons.
-- Deterministic replay evals under `services/orchestrator/internal/agents/evals` include the `plateau_backbone_lottery` fixture for the 20+ low-yield backbone/model-family failure mode.
+- Deterministic replay evals under `services/orchestrator/internal/agents/evals` include plateau, image-classification, and YOLO smoke fixtures. Replay compares current V1, compact static prompt, V2 compact context, and distilled-memory-first variants for parse/finalizer success, duplicate-signature avoidance, mechanism diversity, task/model alignment, and prompt-size ordering.
 - AutoML is settings-gated, backend-validated, persisted with provenance, and linked to normal plan/job execution rather than owning scheduling.
 - Normalized dataset metadata imports are additive, active-import replacement is transactional in Postgres, and agent-safe summaries are separated from raw source previews.
-- Vector retrieval uses a separate `agent_memory_embeddings` table, pgvector in Postgres, in-memory lexical/vector fallback for tests, prompt-budget caps, log-only rollout mode by default, and deterministic replay eval telemetry.
+- Vector retrieval uses a separate `agent_memory_embeddings` table, pgvector in Postgres, in-memory lexical/vector fallback for tests, prompt-budget caps, log-only rollout mode by default, source-index/retrieval-query usage telemetry, query caching, unchanged-card hash guards, daily caps, and deterministic replay eval telemetry.
 
 Known reliability gaps:
 
@@ -266,13 +308,14 @@ Known reliability gaps:
 
 - Fully promote `dataset_profiles` or keep it permanently documented as deferred.
 - Persist visual exemplar generation/audit history beyond compact profile JSON/planner context.
-- Expand normalized metadata parsers beyond the MVP CSV/CUB/VOC/image-folder set, including COCO, YOLO, OpenImages, CVAT, Label Studio, JSONL/YAML, and video metadata.
+- Expand normalized metadata parsers beyond the MVP CSV/CUB/VOC/image-folder set, including COCO, OpenImages, CVAT, Label Studio, JSONL/YAML, video metadata, and a normalized YOLO import path separate from the current legacy YOLO profiler/training path.
+- Add full export self-test/parity runs over heldout images, including framework-vs-export drift, p50/p95 latency, FPS, failure rate, low-confidence rate, and detector runtime parity checks.
 - Add richer worker/local-training support for normalized metadata bundles beyond the Modal path.
 - Advanced augmentation object policies.
 - Production storage upload for generated export/exemplar artifacts beyond current worker-local `file://` URIs.
 - Real model reconstruction/export from completed training runs when no worker-visible artifact exists.
 - Heavier Bayesian/TPE/GP AutoML dependencies and richer multi-trial acquisition policies beyond the current lightweight adaptive sampler.
 - Durable idempotency keys, async agent task queue, and a standalone lease-recovery loop.
-- Multi-agent planner debate, tree search/MCTS over plans, planner fine-tuning, and prompt caching.
+- Multi-agent planner debate, tree search/MCTS over plans, planner fine-tuning, and provider prompt caching beyond recorded cached-token telemetry.
 
 Do not add Kafka, Redis, NATS, WebSockets, or a workflow engine until Postgres hardening, leases, idempotency, and SSE are no longer sufficient.

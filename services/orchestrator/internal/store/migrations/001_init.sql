@@ -12,6 +12,7 @@ CREATE SEQUENCE IF NOT EXISTS agent_invocation_id_seq;
 CREATE SEQUENCE IF NOT EXISTS project_champion_id_seq;
 CREATE SEQUENCE IF NOT EXISTS champion_export_id_seq;
 CREATE SEQUENCE IF NOT EXISTS champion_demo_prediction_id_seq;
+CREATE SEQUENCE IF NOT EXISTS champion_feedback_id_seq;
 CREATE SEQUENCE IF NOT EXISTS strategy_scorecard_id_seq;
 CREATE SEQUENCE IF NOT EXISTS dataset_visual_analysis_id_seq;
 
@@ -236,6 +237,24 @@ CREATE TABLE IF NOT EXISTS champion_demo_predictions (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS champion_feedback (
+  id text PRIMARY KEY DEFAULT 'champion_feedback_' || nextval('champion_feedback_id_seq'),
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  champion_id text NOT NULL REFERENCES project_champions(id) ON DELETE CASCADE,
+  prediction_id text NOT NULL DEFAULT '',
+  job_id text NOT NULL DEFAULT '',
+  dataset_id text NOT NULL DEFAULT '',
+  image_uri text NOT NULL DEFAULT '',
+  image_id text NOT NULL DEFAULT '',
+  rating text NOT NULL,
+  message text NOT NULL DEFAULT '',
+  prediction_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+  metrics_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT champion_feedback_rating_check CHECK (rating IN ('good', 'mediocre', 'bad'))
+);
+
 CREATE TABLE IF NOT EXISTS agent_decisions (
   id text PRIMARY KEY DEFAULT 'decision_' || nextval('agent_decision_id_seq'),
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -447,6 +466,9 @@ CREATE INDEX IF NOT EXISTS idx_champion_exports_project_created_at ON champion_e
 CREATE INDEX IF NOT EXISTS idx_champion_exports_champion_id ON champion_exports(champion_id);
 CREATE INDEX IF NOT EXISTS idx_champion_demo_predictions_project_created_at ON champion_demo_predictions(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_champion_demo_predictions_champion_id ON champion_demo_predictions(champion_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_champion_feedback_project_created_at ON champion_feedback(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_champion_feedback_champion_created_at ON champion_feedback(champion_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_champion_feedback_prediction_id ON champion_feedback(prediction_id);
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_project_id ON agent_decisions(project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_plan_id ON agent_decisions(plan_id);
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_project_plan_created_at ON agent_decisions(project_id, plan_id, created_at DESC);

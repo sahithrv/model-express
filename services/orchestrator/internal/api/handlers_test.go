@@ -23,6 +23,7 @@ import (
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
@@ -66,6 +67,29 @@ func TestAutomationSettingsPersistAndReload(t *testing.T) {
 	}
 	if current.DefaultTrainingProvider != provider || current.DefaultGPUType != gpuType {
 		t.Fatalf("expected provider %s/%s, got %s/%s", provider, gpuType, current.DefaultTrainingProvider, current.DefaultGPUType)
+	}
+}
+
+func TestExperimentPlannerLLMConfigUsesHigherDefaultToolRounds(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_PLANNER_MAX_TOOL_ROUNDS", "")
+
+	config := experimentPlannerLLMConfig(llm.Config{MaxToolRounds: llm.DefaultMaxToolRounds})
+	if config.MaxToolRounds != plannerDefaultMaxToolRounds {
+		t.Fatalf("expected planner tool rounds %d, got %d", plannerDefaultMaxToolRounds, config.MaxToolRounds)
+	}
+
+	config = experimentPlannerLLMConfig(llm.Config{MaxToolRounds: plannerDefaultMaxToolRounds + 2})
+	if config.MaxToolRounds != plannerDefaultMaxToolRounds+2 {
+		t.Fatalf("expected explicit higher generic tool rounds to win, got %d", config.MaxToolRounds)
+	}
+}
+
+func TestExperimentPlannerLLMConfigAllowsPlannerToolRoundOverride(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_PLANNER_MAX_TOOL_ROUNDS", "6")
+
+	config := experimentPlannerLLMConfig(llm.Config{MaxToolRounds: llm.DefaultMaxToolRounds})
+	if config.MaxToolRounds != 6 {
+		t.Fatalf("expected planner override to set tool rounds to 6, got %d", config.MaxToolRounds)
 	}
 }
 
@@ -627,9 +651,18 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	if export.Status != runs.ChampionExportStatusPending {
 		t.Fatalf("expected pending worker export, got %s", export.Status)
 	}
+	if export.ArtifactURI != "" {
+		t.Fatalf("expected pending ONNX export to omit mismatched checkpoint artifact, got %q", export.ArtifactURI)
+	}
 	exportJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateExportChampion)
 	if exportJob.Config["export_id"] != export.ID || exportJob.Config["champion_id"] != champion.ID {
 		t.Fatalf("unexpected export job config: %#v", exportJob.Config)
+	}
+	if artifactURI := jobConfigString(exportJob.Config, "artifact_uri"); artifactURI != "" {
+		t.Fatalf("expected export job artifact_uri to be empty until ONNX exists, got %q", artifactURI)
+	}
+	if sourceArtifactURI := jobConfigString(exportJob.Config, "source_artifact_uri"); sourceArtifactURI != "file:///checkpoint.pt" {
+		t.Fatalf("expected source checkpoint to be preserved separately, got %q", sourceArtifactURI)
 	}
 
 	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+exportJob.ID+"/champion-export-result", strings.NewReader(`{"status":"READY","artifact_uri":"file:///exports/champion.onnx","metadata":{"labels":["cat","dog"]}}`))
@@ -652,6 +685,22 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	}
 	if updatedJob.Status != jobs.StatusSucceeded {
 		t.Fatalf("expected export job to complete, got %s", updatedJob.Status)
+	}
+}
+
+func TestChampionArtifactURIForFormatPrefersMatchingArtifact(t *testing.T) {
+	deploymentProfile := map[string]any{
+		"artifact_uri": "file:///checkpoint.pt",
+		"model_profile": map[string]any{
+			"onnx_artifact_uri": "file:///model.onnx",
+		},
+	}
+
+	if artifactURI := championArtifactURIForFormat(deploymentProfile, "onnx"); artifactURI != "file:///model.onnx" {
+		t.Fatalf("expected ONNX artifact to be preferred, got %q", artifactURI)
+	}
+	if artifactURI := championArtifactURIForFormat(deploymentProfile, "pytorch"); artifactURI != "file:///checkpoint.pt" {
+		t.Fatalf("expected checkpoint artifact to be preferred for pytorch, got %q", artifactURI)
 	}
 }
 
@@ -736,6 +785,80 @@ func TestChampionDemoPredictionQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	}
 	if predictions[0].Status != runs.ChampionDemoPredictionStatusSucceeded || predictions[0].PredictedLabel != "cat" || predictions[0].Correct == nil || !*predictions[0].Correct {
 		t.Fatalf("expected succeeded prediction result, got %#v", predictions[0])
+	}
+}
+
+func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	trainingJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(trainingJob.ID, "mlflow-run"); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+	manifest := map[string]any{
+		"schema_version": "champion_export_manifest_v1",
+		"metadata": map[string]any{
+			"model":        "mobilenet_v3_small",
+			"class_labels": []string{"cat", "dog"},
+			"input_shape":  []int{1, 3, 224, 224},
+		},
+		"artifacts": []map[string]any{
+			{"format": "framework_native_checkpoint", "status": "created", "path": "file:///exports/model.pt"},
+		},
+	}
+	if _, err := memoryStore.UpsertProjectChampion(runs.ProjectChampionUpsert{
+		ProjectID:       project.ID,
+		DatasetID:       dataset.ID,
+		JobID:           trainingJob.ID,
+		SelectionReason: "best validation score",
+		DeploymentProfile: map[string]any{
+			"artifact_uri": "file:///exports/model.pt",
+			"model_profile": map[string]any{
+				"export_manifest": manifest,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("upsert champion: %v", err)
+	}
+	champion, err := memoryStore.GetProjectChampion(project.ID)
+	if err != nil {
+		t.Fatalf("get champion: %v", err)
+	}
+	if _, err := memoryStore.CreateChampionExport(runs.ChampionExportCreate{
+		ProjectID:   project.ID,
+		ChampionID:  champion.ID,
+		JobID:       trainingJob.ID,
+		Status:      runs.ChampionExportStatusReady,
+		Format:      "onnx",
+		ArtifactURI: "file:///exports/model.pt",
+	}); err != nil {
+		t.Fatalf("create stale mismatched export: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/demo-predictions", strings.NewReader(`{"image_uri":"data:image/jpeg;base64,/9j/4AAQSkZJRg==","true_label":"cat"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, resp.Code, resp.Body.String())
+	}
+	predictionJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateChampionDemoPrediction)
+	if artifactURI := jobConfigString(predictionJob.Config, "export_artifact_uri"); artifactURI != "file:///exports/model.pt" {
+		t.Fatalf("expected deployment checkpoint artifact, got %q", artifactURI)
+	}
+	if manifest := payloadMap(payloadMap(predictionJob.Config, "export_metadata"), "manifest"); len(manifest) == 0 {
+		t.Fatalf("expected deployment manifest metadata in prediction job config: %#v", predictionJob.Config)
 	}
 }
 
@@ -1473,6 +1596,112 @@ func TestValidatePlannedExperimentRejectsUnsupportedModel(t *testing.T) {
 	}
 }
 
+func TestYOLODatasetAddsDetectorModelCatalogOptions(t *testing.T) {
+	dataset := datasets.Dataset{
+		Profile: map[string]any{
+			"task_type": "object_detection",
+			"metadata_summary": map[string]any{
+				"yolo_available": true,
+				"artifact_counts": map[string]any{
+					"yolo_dataset_config": 1,
+					"yolo_label_file":     12,
+				},
+			},
+			"dataset_traits": []any{"yolo_format", "object_detection"},
+		},
+	}
+
+	catalog := supportedModelCatalogForDataset(dataset, map[string]any{})
+
+	yoloOptions := 0
+	for _, spec := range catalog {
+		if spec.Family == "yolo11" {
+			yoloOptions++
+			if spec.TaskType != "object_detection" {
+				t.Fatalf("expected object_detection task type for %#v", spec)
+			}
+			if spec.ModelKind != "ultralytics_yolo_detector" {
+				t.Fatalf("expected yolo detector model kind for %#v", spec)
+			}
+			if !spec.TrainingEnabled {
+				t.Fatalf("yolo detector catalog options should be schedulable now that worker support is enabled: %#v", spec)
+			}
+		}
+	}
+	if yoloOptions < 2 {
+		t.Fatalf("expected YOLO detector catalog options, got %d in %#v", yoloOptions, catalog)
+	}
+}
+
+func TestBBoxMetadataAloneDoesNotAddYOLOCatalogOptions(t *testing.T) {
+	dataset := datasets.Dataset{
+		Profile: map[string]any{
+			"task_type": "image_classification",
+			"metadata_summary": map[string]any{
+				"bbox_available":              true,
+				"object_detection_available":  true,
+				"bbox_annotation_count":       42,
+				"yolo_available":              false,
+				"yolo_dataset_config_present": false,
+			},
+			"dataset_traits": []any{"bbox_available"},
+		},
+	}
+
+	catalog := supportedModelCatalogForDataset(dataset, map[string]any{})
+
+	for _, spec := range catalog {
+		if spec.Family == "yolo11" {
+			t.Fatalf("did not expect YOLO detector option for bbox-only metadata: %#v", spec)
+		}
+	}
+}
+
+func TestDatasetPlanningInsightsUsesDetectionMetricsForYOLO(t *testing.T) {
+	dataset := datasets.Dataset{
+		Profile: map[string]any{
+			"task_type":    "object_detection",
+			"total_images": 120,
+			"class_count":  2,
+			"metadata_summary": map[string]any{
+				"yolo_available": true,
+				"yolo_summary": map[string]any{
+					"available":        true,
+					"label_file_count": 120,
+					"bbox_count":       180,
+				},
+			},
+			"dataset_traits": []any{"yolo_format", "object_detection"},
+		},
+	}
+
+	insights := datasetPlanningInsights(dataset, map[string]any{})
+
+	if insights.TaskType != "object_detection" {
+		t.Fatalf("expected object_detection insights, got %s", insights.TaskType)
+	}
+	metrics := strings.Join(insights.RecommendedMetrics, " ")
+	for _, expected := range []string{"mAP50_95", "box_loss", "cls_loss", "dfl_loss", "latency_p95_ms"} {
+		if !strings.Contains(metrics, expected) {
+			t.Fatalf("expected detection metric %s in %#v", expected, insights.RecommendedMetrics)
+		}
+	}
+	if !strings.Contains(strings.Join(insights.Constraints, " "), "YOLO object-detection files detected") {
+		t.Fatalf("expected YOLO detection constraint, got %#v", insights.Constraints)
+	}
+}
+
+func TestValidatePlannedExperimentAcceptsYOLODetectorWorkerModels(t *testing.T) {
+	experiment := testExperiment("yolo11n.pt", 8)
+	experiment.Template = "yolo11_detection"
+
+	err := validatePlannedExperiment(experiment, 0)
+
+	if err != nil {
+		t.Fatalf("expected detector-worker model to validate: %v", err)
+	}
+}
+
 func TestValidatePlannedExperimentAcceptsStructuredPreprocessing(t *testing.T) {
 	experiment := testExperiment("efficientnet_b0", 8)
 	experiment.ImageSize = 224
@@ -1686,6 +1915,56 @@ func TestPrepareAutoMLExperimentsAutoEnablesBackendDefaultWhenEnabled(t *testing
 	if got.AutoML.ValueProvenance["learning_rate"] != automl.ProvenanceRandomSearch {
 		t.Fatalf("expected sampled learning_rate provenance, got %#v", got.AutoML.ValueProvenance)
 	}
+	findSpec := func(name string) automl.HyperparameterParameterSpec {
+		t.Helper()
+		for _, spec := range got.AutoML.SearchSpace.Parameters {
+			if spec.Name == name {
+				return spec
+			}
+		}
+		t.Fatalf("expected backend default search space to include %s", name)
+		return automl.HyperparameterParameterSpec{}
+	}
+	assertFloatBounds := func(name string, minValue float64, maxValue float64) {
+		t.Helper()
+		spec := findSpec(name)
+		if spec.Min == nil || spec.Max == nil || *spec.Min != minValue || *spec.Max != maxValue {
+			t.Fatalf("expected %s bounds [%g, %g], got %#v", name, minValue, maxValue, spec)
+		}
+	}
+	assertIntRange := func(name string, minValue int, maxValue int) {
+		t.Helper()
+		spec := findSpec(name)
+		if spec.Min == nil || spec.Max == nil || int(*spec.Min) != minValue || int(*spec.Max) != maxValue {
+			t.Fatalf("expected %s range [%d, %d], got %#v", name, minValue, maxValue, spec)
+		}
+	}
+	assertIntChoices := func(name string, choices []int) {
+		t.Helper()
+		spec := findSpec(name)
+		if len(spec.IntChoices) != len(choices) {
+			t.Fatalf("expected %s choices %#v, got %#v", name, choices, spec.IntChoices)
+		}
+		for index, choice := range choices {
+			if spec.IntChoices[index] != choice {
+				t.Fatalf("expected %s choices %#v, got %#v", name, choices, spec.IntChoices)
+			}
+		}
+	}
+	assertFloatBounds("learning_rate", 1e-5, 1e-1)
+	assertFloatBounds("weight_decay", 0, 0.3)
+	assertIntChoices("batch_size", []int{4, 8, 16, 32, 64, 128})
+	assertIntRange("epochs", 3, 24)
+	assertIntChoices("early_stopping_patience", []int{0, 2, 4, 6, 8, 10, 12})
+	assertFloatBounds("dropout", 0, 0.7)
+	assertFloatBounds("label_smoothing", 0, 0.3)
+	assertFloatBounds("gradient_clip_norm", 0, 10)
+	assertFloatBounds("optimizer_momentum", 0, 0.99)
+	assertIntRange("scheduler_step_size", 1, 24)
+	assertFloatBounds("scheduler_gamma", 0.05, 0.95)
+	assertIntRange("augmentation_policy_config.magnitude", 0, 15)
+	assertFloatBounds("augmentation_policy_config.probability", 0, 1)
+	assertFloatBounds("class_balancing_config.focal_loss_gamma", 0.5, 5)
 	if got.Model != experiment.Model || got.Template != experiment.Template || got.FineTuneStrategy != experiment.FineTuneStrategy {
 		t.Fatalf("AutoML changed LLM-owned strategy fields: before %#v after %#v", experiment, got)
 	}
@@ -1809,6 +2088,117 @@ func TestExecuteExperimentPlanIncludesStructuredAugmentationPolicyConfig(t *test
 	}
 }
 
+func TestExecuteExperimentPlanConfiguresYOLODetectorJob(t *testing.T) {
+	experiment := testExperiment("yolo11n.pt", 6)
+	experiment.Template = "yolo11_detection"
+	experiment.ImageSize = 640
+	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{experiment})
+	if _, err := server.store.UpdateDatasetProfile(plan.DatasetID, map[string]any{
+		"task_type":    "object_detection",
+		"total_images": 2,
+		"class_count":  2,
+		"class_names":  []any{"real_face", "fake_face"},
+		"metadata_summary": map[string]any{
+			"yolo_available": true,
+			"yolo_summary": map[string]any{
+				"available":        true,
+				"format":           "yolo",
+				"label_file_count": 2,
+				"bbox_count":       3,
+				"class_names":      []any{"real_face", "fake_face"},
+			},
+		},
+		"dataset_traits": []any{"yolo_format", "object_detection"},
+	}); err != nil {
+		t.Fatalf("profile yolo dataset: %v", err)
+	}
+
+	response, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "local"})
+	if err != nil {
+		t.Fatalf("execute yolo experiment plan: %v", err)
+	}
+	if len(response.Jobs) != 1 {
+		t.Fatalf("expected one job, got %d", len(response.Jobs))
+	}
+	config := response.Jobs[0].Config
+	if got := config["task_type"]; got != "object_detection" {
+		t.Fatalf("expected object_detection task_type, got %#v in %#v", got, config)
+	}
+	if got := config["model_kind"]; got != "ultralytics_yolo_detector" {
+		t.Fatalf("expected yolo detector model_kind, got %#v in %#v", got, config)
+	}
+	if got := config["pretrained_weights"]; got != "yolo11n.pt" {
+		t.Fatalf("expected pretrained weights, got %#v in %#v", got, config)
+	}
+	if got := config["class_names"]; len(got.([]string)) != 2 {
+		t.Fatalf("expected class names in yolo job config, got %#v", got)
+	}
+}
+
+func TestExecuteExperimentPlanRejectsClassifierForYOLODataset(t *testing.T) {
+	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 3)})
+	if _, err := server.store.UpdateDatasetProfile(plan.DatasetID, map[string]any{
+		"task_type":    "object_detection",
+		"total_images": 2,
+		"class_count":  1,
+		"metadata_summary": map[string]any{
+			"yolo_available": true,
+			"artifact_counts": map[string]any{
+				"yolo_dataset_config": 1,
+				"yolo_label_file":     2,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("profile yolo dataset: %v", err)
+	}
+
+	_, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "local"})
+	if err == nil || !strings.Contains(err.Error(), "classifier model") {
+		t.Fatalf("expected classifier/detection compatibility error, got %v", err)
+	}
+}
+
+func TestDatasetPlannerCreatesYOLOInitialPlan(t *testing.T) {
+	project := projects.Project{ID: "project_1", Goal: "detect objects live"}
+	dataset := datasets.Dataset{
+		ID:        "dataset_1",
+		ProjectID: "project_1",
+		Status:    datasets.StatusProfiled,
+		Profile: map[string]any{
+			"task_type":    "object_detection",
+			"total_images": 20,
+			"class_count":  1,
+			"metadata_summary": map[string]any{
+				"yolo_available": true,
+				"yolo_summary": map[string]any{
+					"available":        true,
+					"format":           "yolo",
+					"label_file_count": 20,
+				},
+			},
+		},
+	}
+
+	recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{})
+	if err != nil {
+		t.Fatalf("build yolo initial plan: %v", err)
+	}
+	if recommendation.TargetMetric != "mAP50_95" {
+		t.Fatalf("expected detector target metric, got %s", recommendation.TargetMetric)
+	}
+	if len(recommendation.Experiments) == 0 {
+		t.Fatal("expected yolo experiments")
+	}
+	for _, experiment := range recommendation.Experiments {
+		if !strings.HasPrefix(experiment.Model, "yolo11") {
+			t.Fatalf("expected yolo model, got %#v", experiment)
+		}
+		if experiment.Template != "yolo11_detection" {
+			t.Fatalf("expected yolo detection template, got %#v", experiment)
+		}
+	}
+}
+
 func TestHolisticRunScoreCanPreferFastModelForLiveGoal(t *testing.T) {
 	slowSummary := runs.TrainingRunSummary{
 		JobID:            "job_slow",
@@ -1881,6 +2271,158 @@ func TestSelectChampionDecisionCreatesChampionRecord(t *testing.T) {
 	}
 	if !hasExecutionEvent(events, execution.EventChampionSelected) {
 		t.Fatal("expected champion selected event")
+	}
+}
+
+func TestSelectChampionDecisionUsesHolisticValidationMetrics(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 6),
+	})
+	requestedJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.96)
+	healthyJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[1], jobs.StatusSucceeded, 0.91)
+
+	badTrainLoss := 3.1
+	badValLoss := 3.7
+	if _, err := server.store.UpsertTrainingRunSummary(requestedJob.ID, runs.TrainingRunSummaryUpdate{
+		FinalTrainLoss: &badTrainLoss,
+		FinalValLoss:   &badValLoss,
+	}); err != nil {
+		t.Fatalf("upsert requested losses: %v", err)
+	}
+	goodTrainLoss := 0.18
+	goodValLoss := 0.22
+	if _, err := server.store.UpsertTrainingRunSummary(healthyJob.ID, runs.TrainingRunSummaryUpdate{
+		FinalTrainLoss: &goodTrainLoss,
+		FinalValLoss:   &goodValLoss,
+	}); err != nil {
+		t.Fatalf("upsert healthy losses: %v", err)
+	}
+	if _, err := server.store.UpsertTrainingRunEvaluation(requestedJob.ID, runs.TrainingRunEvaluationUpdate{
+		ObjectiveProfile: map[string]any{
+			"heldout_test_macro_f1": 0.62,
+			"heldout_test_accuracy": 0.64,
+			"heldout_test_loss":     3.6,
+		},
+		PerClassMetrics: map[string]any{
+			"cat":       map[string]any{"recall": 0.42, "f1-score": 0.48},
+			"dog":       map[string]any{"recall": 0.52, "f1-score": 0.54},
+			"macro avg": map[string]any{"f1-score": 0.51},
+		},
+		ConfusionMatrix: [][]int{{10, 20}, {14, 16}},
+		ModelProfile:    map[string]any{"class_labels": []string{"cat", "dog"}},
+		HolisticScores: map[string]any{
+			"overall_score": 0.55,
+			"training_diagnostics": map[string]any{
+				"severity":            0.92,
+				"divergence_detected": true,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("upsert requested evaluation: %v", err)
+	}
+	if _, err := server.store.UpsertTrainingRunEvaluation(healthyJob.ID, runs.TrainingRunEvaluationUpdate{
+		ObjectiveProfile: map[string]any{
+			"heldout_test_macro_f1": 0.90,
+			"heldout_test_accuracy": 0.91,
+			"heldout_test_loss":     0.24,
+		},
+		PerClassMetrics: map[string]any{
+			"cat":       map[string]any{"recall": 0.90, "f1-score": 0.91},
+			"dog":       map[string]any{"recall": 0.89, "f1-score": 0.90},
+			"macro avg": map[string]any{"f1-score": 0.90},
+		},
+		ConfusionMatrix: [][]int{{28, 2}, {3, 27}},
+		ModelProfile:    map[string]any{"class_labels": []string{"cat", "dog"}},
+		HolisticScores:  map[string]any{"overall_score": 0.91},
+	}); err != nil {
+		t.Fatalf("upsert healthy evaluation: %v", err)
+	}
+
+	decision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select the highest macro_f1 model.", map[string]any{
+		"champion_job_id": requestedJob.ID,
+		"target_metric":   "macro_f1",
+	})
+	if err != nil {
+		t.Fatalf("create decision: %v", err)
+	}
+
+	if err := server.persistProjectChampionFromDecision(projectID, decision); err != nil {
+		t.Fatalf("persist champion: %v", err)
+	}
+	champion, err := server.store.GetProjectChampion(projectID)
+	if err != nil {
+		t.Fatalf("get champion: %v", err)
+	}
+	if champion.JobID != healthyJob.ID {
+		t.Fatalf("expected holistic guard to choose healthy job %s, got %s", healthyJob.ID, champion.JobID)
+	}
+	if payloadString(champion.Metrics, "selection_source") != "backend_holistic_override" {
+		t.Fatalf("expected backend override source, got %#v", champion.Metrics)
+	}
+	if payloadString(champion.Metrics, "requested_champion_job_id") != requestedJob.ID {
+		t.Fatalf("expected requested job retained in metrics, got %#v", champion.Metrics)
+	}
+	if payloadFloat(champion.Metrics, "deployment_readiness_score") <= payloadFloat(champion.Metrics, "requested_deployment_readiness_score") {
+		t.Fatalf("expected selected readiness score to beat requested score, got %#v", champion.Metrics)
+	}
+}
+
+func TestSelectChampionQueuesONNXExportFromCheckpoint(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.91)
+	if _, err := server.store.UpsertTrainingRunEvaluation(job.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri":   "file:///exports/model.pt",
+			"export_status":  "PENDING_ARTIFACT",
+			"class_labels":   []string{"cat", "dog"},
+			"training_shape": []int{1, 3, 64, 64},
+		},
+	}); err != nil {
+		t.Fatalf("upsert evaluation: %v", err)
+	}
+	decision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select the best live model.", map[string]any{
+		"champion_job_id": job.ID,
+	})
+	if err != nil {
+		t.Fatalf("create decision: %v", err)
+	}
+
+	if err := server.persistProjectChampionFromDecision(projectID, decision); err != nil {
+		t.Fatalf("persist champion: %v", err)
+	}
+	exports, err := server.store.ListProjectChampionExports(projectID)
+	if err != nil {
+		t.Fatalf("list exports: %v", err)
+	}
+	if len(exports) != 1 {
+		t.Fatalf("expected automatic ONNX export record, got %#v", exports)
+	}
+	export := exports[0]
+	if export.Format != "onnx" || export.Status != runs.ChampionExportStatusPending || export.ArtifactURI != "" {
+		t.Fatalf("expected pending ONNX conversion export, got %#v", export)
+	}
+	projectJobs, err := server.store.ListProjectJobs(projectID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	var exportJob jobs.ExperimentJob
+	for _, projectJob := range projectJobs {
+		if projectJob.Template == jobs.TemplateExportChampion {
+			exportJob = projectJob
+			break
+		}
+	}
+	if exportJob.ID == "" {
+		t.Fatalf("expected automatic export job, got %#v", projectJobs)
+	}
+	if exportJob.Config["export_id"] != export.ID {
+		t.Fatalf("expected export job linked to automatic export, got %#v", exportJob.Config)
+	}
+	if sourceArtifactURI := jobConfigString(exportJob.Config, "source_artifact_uri"); sourceArtifactURI != "file:///exports/model.pt" {
+		t.Fatalf("expected checkpoint source artifact, got %q", sourceArtifactURI)
 	}
 }
 
@@ -2044,6 +2586,8 @@ func TestProposedExperimentPlannerDecisionDoesNotAutoSchedule(t *testing.T) {
 }
 
 func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	responses := []string{
 		`{
 			"summary": "Try the same MobileNet mechanism for more epochs.",
@@ -2285,6 +2829,175 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 	}
 }
 
+func TestExperimentPlannerRetriesAfterPlannerValidationRejection(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
+	response := func(fixChampionReason bool) string {
+		secondReason := "Keep a compact latency control."
+		secondStrategy := "calibration control"
+		if fixChampionReason {
+			secondReason = "Challenge the champion with a compact latency tradeoff control that can improve macro-F1 without losing deployability."
+			secondStrategy = "champion challenge compact tradeoff"
+		}
+		recommendation := agents.ExperimentPlanningRecommendation{
+			Summary:                       "Challenge the current champion with two targeted candidates.",
+			DecisionType:                  decisions.TypeAddExperiments,
+			Rationale:                     "The champion is strong, so the next fleet should test only candidates with a clear path to beating it.",
+			Confidence:                    0.78,
+			PlanningMode:                  "champion_challenge",
+			DeterministicDiagnosisUsed:    []string{"champion still has measurable macro-F1 headroom"},
+			EvidenceUsed:                  []string{"current champion is below target", "prior run plateaued"},
+			Hypothesis:                    "A stronger challenger or compact tradeoff challenger can beat the current champion.",
+			ExpectedFailureModes:          []string{"stronger model may overfit", "compact control may underperform"},
+			DatasetPreprocessingRationale: "Keep preprocessing comparable while challenging the champion on architecture and regularization.",
+			ChangedVariables:              []string{"model_family", "augmentation_policy", "regularization"},
+			SuccessCriteria:               "Beat the current champion by at least 0.01 macro-F1.",
+			StopCondition:                 "Select champion if neither challenger improves enough.",
+			DeploymentTradeoff:            "Higher quality challengers must justify latency or preserve compact deployment.",
+			CandidateHypotheses: []agents.CandidateHypothesis{
+				{
+					Hypothesis:           "EfficientNet with augmentation can beat the current champion on macro-F1.",
+					PlanningMode:         "champion_challenge",
+					Mechanism:            "architecture_challenge",
+					Intervention:         "Challenge the champion with a stronger EfficientNet family and moderate augmentation.",
+					ProposedChanges:      map[string]any{"model_family": "efficientnet", "augmentation_policy": "moderate"},
+					ExpectedEffect:       "Improve macro-F1 through a stronger pretrained family.",
+					ExpectedMetricImpact: 0.02,
+					ExpectedTradeoffs:    []string{"higher runtime"},
+					Risk:                 "medium",
+					CostLevel:            "medium",
+					NoveltyScore:         0.75,
+					EvidenceUsed:         []string{"current champion is below target"},
+					ExperimentConfig: plans.PlannedExperiment{
+						Template:           "efficientnet_transfer",
+						Model:              "efficientnet_b0",
+						Epochs:             10,
+						BatchSize:          16,
+						LearningRate:       0.0003,
+						Reason:             "Challenge the champion with a stronger EfficientNet candidate that can improve macro-F1.",
+						AugmentationPolicy: "moderate",
+						Strategy:           "champion challenge quality tradeoff",
+					},
+				},
+				{
+					Hypothesis:           "A compact regularized challenger can test whether the champion is beatable without a latency penalty.",
+					PlanningMode:         "champion_challenge",
+					Mechanism:            "regularization",
+					Intervention:         "Use dropout and AdamW on a compact model as a deployable challenger.",
+					ProposedChanges:      map[string]any{"dropout": 0.2, "optimizer": "adamw"},
+					ExpectedEffect:       "Improve generalization while preserving compact deployment.",
+					ExpectedMetricImpact: 0.012,
+					ExpectedTradeoffs:    []string{"possible underfitting"},
+					Risk:                 "low",
+					CostLevel:            "low",
+					NoveltyScore:         0.65,
+					EvidenceUsed:         []string{"prior run plateaued"},
+					ExperimentConfig: plans.PlannedExperiment{
+						Template:     "mobilenet_transfer",
+						Model:        "mobilenet_v3_small",
+						Epochs:       10,
+						BatchSize:    16,
+						LearningRate: 0.00025,
+						Reason:       secondReason,
+						Optimizer:    "adamw",
+						Dropout:      0.2,
+						Strategy:     secondStrategy,
+					},
+				},
+			},
+			WhyCanBeatChampion:      "Each selected experiment changes a meaningful mechanism with a direct champion challenge rationale.",
+			ExpectedDeltaVsChampion: 0.02,
+			Risks:                   []string{"higher runtime", "regularized compact model may underfit"},
+			ExpectedTradeoffs:       []string{"quality for runtime", "compact deployability for smaller upside"},
+			NoveltyNotes:            []string{"architecture challenge", "regularization challenge"},
+			RejectedOptions:         []agents.RejectedPlannerOption{{Option: "more epochs only", Reason: "not a meaningful champion challenge", Evidence: "prior plateau", AppliesWhen: []string{"plateau"}}},
+			Tags:                    []string{"champion_challenge_retry"},
+		}
+		blob, err := json.Marshal(recommendation)
+		if err != nil {
+			t.Fatalf("marshal planner response: %v", err)
+		}
+		return string(blob)
+	}
+	responses := []string{response(false), response(true)}
+	requestBodies := []string{}
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode llm request: %v", err)
+		}
+		combined := ""
+		for _, message := range request.Messages {
+			combined += message.Content + "\n"
+		}
+		requestBodies = append(requestBodies, combined)
+		index := len(requestBodies) - 1
+		if index >= len(responses) {
+			index = len(responses) - 1
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": responses[index],
+				},
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "test-model")
+	t.Setenv("MODEL_EXPRESS_AGENT_MODE", "autonomous")
+	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.62)
+
+	handled, err := server.runExperimentPlannerAfterTrainingJob(job)
+	if err != nil {
+		t.Fatalf("run planner: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected planner to handle the completed job")
+	}
+	if len(requestBodies) != 2 {
+		t.Fatalf("expected planner validation retry, got %d requests", len(requestBodies))
+	}
+	if !strings.Contains(requestBodies[1], "planner_validation_feedback") || !strings.Contains(requestBodies[1], "champion_challenge experiment") {
+		t.Fatalf("expected retry prompt to include champion challenge validation feedback, got %s", requestBodies[1])
+	}
+
+	agentDecisions := listAgentDecisions(t, server, projectID)
+	if len(agentDecisions) != 1 {
+		t.Fatalf("expected one accepted decision after retry, got %d", len(agentDecisions))
+	}
+	if retryCount, _ := agentDecisions[0].Payload["validation_retry_count"].(int); retryCount != 1 {
+		t.Fatalf("expected retry count 1 in decision payload, got %#v", agentDecisions[0].Payload["validation_retry_count"])
+	}
+	experiments := plannedExperimentsFromUnknown(t, agentDecisions[0].Payload["proposed_experiments"])
+	if len(experiments) != 2 {
+		t.Fatalf("expected two corrected champion challenge experiments, got %#v", experiments)
+	}
+	if !strings.Contains(strings.ToLower(experiments[1].Reason+" "+experiments[1].Strategy), "champion") {
+		t.Fatalf("expected corrected second experiment to explain champion challenge, got %#v", experiments[1])
+	}
+	projectPlans := listExperimentPlans(t, server, projectID)
+	if len(projectPlans) != 2 {
+		t.Fatalf("expected corrected retry proposal to schedule a follow-up plan, got %d plans", len(projectPlans))
+	}
+}
+
 func TestExperimentPlannerResponsesToolCallsAreAuditOnly(t *testing.T) {
 	requestCount := 0
 	secondRequestBody := ""
@@ -2431,6 +3144,8 @@ func TestExperimentPlannerResponsesToolCallsAreAuditOnly(t *testing.T) {
 }
 
 func TestExperimentPlannerRejectsDuplicateProposedExperiment(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 6),
 	})
@@ -2463,6 +3178,8 @@ func TestExperimentPlannerRejectsDuplicateProposedExperiment(t *testing.T) {
 }
 
 func TestExperimentPlannerRejectsProposedExperimentWithoutMechanism(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 6),
 	})
@@ -2479,6 +3196,8 @@ func TestExperimentPlannerRejectsProposedExperimentWithoutMechanism(t *testing.T
 }
 
 func TestExperimentPlannerRejectsMinorOnlyRepeat(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		func() plans.PlannedExperiment {
 			experiment := testExperiment("efficientnet_b1", 12)
@@ -2520,6 +3239,8 @@ func TestExperimentPlannerRejectsMinorOnlyRepeat(t *testing.T) {
 }
 
 func TestEnsureFollowUpPlanRevalidatesStaleDecisionPayload(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		func() plans.PlannedExperiment {
 			experiment := testExperiment("efficientnet_b1", 12)
@@ -2566,6 +3287,7 @@ func TestEnsureFollowUpPlanRevalidatesStaleDecisionPayload(t *testing.T) {
 }
 
 func TestEnsureFollowUpPlanBlocksWhenAllExperimentsFiltered(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
 
 	first := testExperiment("efficientnet_b1", 12)
@@ -2609,7 +3331,49 @@ func TestEnsureFollowUpPlanBlocksWhenAllExperimentsFiltered(t *testing.T) {
 	}
 }
 
+func TestEnsureFollowUpPlanAllowsRepeatExperimentsInRelaxedMode(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "false")
+
+	first := testExperiment("efficientnet_b1", 12)
+	first.Template = "efficientnet_transfer"
+	second := testExperiment("resnet18", 10)
+	second.Template = "resnet_transfer"
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{first, second})
+	repeatFirst := first
+	repeatFirst.Epochs = 24
+	repeatFirst.Reason = "Stale payload extends EfficientNet-B1 epochs."
+	repeatSecond := second
+	repeatSecond.Reason = "Stale payload repeats ResNet-18 exactly."
+	decision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeAddExperiments, "relaxed all-repeat ADD_EXPERIMENTS payload", map[string]any{
+		"proposed_experiments": []plans.PlannedExperiment{repeatFirst, repeatSecond},
+	})
+	if err != nil {
+		t.Fatalf("create repeat decision: %v", err)
+	}
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected relaxed follow-up plan, got %v", err)
+	}
+	if !created || len(followUp.Experiments) != 2 {
+		t.Fatalf("expected both repeat experiments to be retained, created=%v experiments=%#v", created, followUp.Experiments)
+	}
+	warnings := strings.Join(followUp.Warnings, " ")
+	if !strings.Contains(warnings, "Relaxed planner validation") || !strings.Contains(warnings, "Allowed relaxed follow-up experiment") {
+		t.Fatalf("expected relaxed novelty warning, got %#v", followUp.Warnings)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if hasBlockedFollowUpEvent(events) {
+		t.Fatalf("did not expect blocked follow-up event in relaxed mode, got %#v", events)
+	}
+}
+
 func TestExistingStaleFollowUpPlanIsRevalidatedBeforeExecution(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	first := testExperiment("efficientnet_b1", 12)
 	first.Template = "efficientnet_transfer"
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{first})
@@ -2647,6 +3411,8 @@ func TestExistingStaleFollowUpPlanIsRevalidatedBeforeExecution(t *testing.T) {
 }
 
 func TestEnsureFollowUpPlanBlocksBBoxCropWithoutAnnotations(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
@@ -2675,6 +3441,44 @@ func TestEnsureFollowUpPlanBlocksBBoxCropWithoutAnnotations(t *testing.T) {
 	}
 	if !hasBlockedFollowUpEvent(events) {
 		t.Fatalf("expected blocked follow-up event, got %#v", events)
+	}
+}
+
+func TestEnsureFollowUpPlanAllowsMechanismEvidenceFailureInRelaxedMode(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	experiment := testExperiment("efficientnet_b1", 10)
+	experiment.Template = "efficientnet_transfer"
+	experiment.Mechanism = "bbox_crop_ablation"
+	experiment.Intervention = "Compare bbox crop against full-image training."
+	experiment.EvidenceUsed = []string{"planner wants to test tighter crops"}
+	experiment.ExpectedEffect = "Learn whether crop-focused training helps this dataset."
+	experiment.Preprocessing = &plans.Preprocessing{
+		CropStrategy: "bbox_crop_ablation",
+		BBoxMode:     "crop_and_compare_full_image",
+	}
+	decision := createLLMAddExperimentsDecision(t, server, projectID, plan.ID, []plans.PlannedExperiment{experiment}, []string{"planner-only crop hypothesis"})
+
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
+		t.Fatalf("expected relaxed mechanism-evidence follow-up to pass, got %v", err)
+	}
+	if !created || len(followUp.Experiments) != 1 {
+		t.Fatalf("expected one relaxed follow-up experiment, created=%v plan=%#v", created, followUp)
+	}
+	warnings := strings.Join(followUp.Warnings, " ")
+	if !strings.Contains(warnings, "Relaxed planner validation") || !strings.Contains(warnings, "bbox/annotation") {
+		t.Fatalf("expected relaxed mechanism-evidence warning, got %#v", followUp.Warnings)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if hasBlockedFollowUpEvent(events) {
+		t.Fatalf("did not expect blocked follow-up event in relaxed mode, got %#v", events)
 	}
 }
 
@@ -2710,6 +3514,8 @@ func TestEnsureFollowUpPlanAllowsBBoxCropWithBackendAnnotations(t *testing.T) {
 }
 
 func TestEnsureFollowUpPlanBlocksAuditOnlyMechanismTrainingJob(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
@@ -2826,6 +3632,8 @@ func TestEffectiveNumberClassBalancingPassesWithBackendEvidence(t *testing.T) {
 }
 
 func TestEnsureFollowUpPlanBlocksHighResolutionWithoutObjectScaleEvidence(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
@@ -2918,6 +3726,8 @@ func TestEnsureFollowUpPlanAllowsResolutionCropLinkedToAcceptedVisualHypothesis(
 }
 
 func TestEnsureFollowUpPlanBlocksUnsupportedVisualHypothesisEvidence(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
@@ -3017,6 +3827,8 @@ func TestEnsureFollowUpPlanAllowsMixedSampleLinkedToAcceptedVisualHypothesisWith
 }
 
 func TestEnsureFollowUpPlanBlocksMixedSampleVisualHypothesisWithoutPolicy(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
@@ -3090,6 +3902,8 @@ func TestEnsureFollowUpPlanAllowsDiagnosisMatchedClassImbalanceMechanism(t *test
 }
 
 func TestExistingStaleFollowUpPlanRevalidatesMechanismDatasetEvidenceBeforeExecution(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
@@ -3168,6 +3982,499 @@ func TestExperimentPlannerInputTracksChampionAndNoImprovementRounds(t *testing.T
 	}
 	if input.SourcePlanDeltas[0].DeltaScoreVsChampion >= 0 {
 		t.Fatalf("expected latest follow-up to trail the champion, got delta %.3f", input.SourcePlanDeltas[0].DeltaScoreVsChampion)
+	}
+}
+
+func TestExperimentPlannerInputUsesLossHeavyReadinessChampion(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 6),
+	})
+	badJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.96)
+	healthyJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[1], jobs.StatusSucceeded, 0.90)
+
+	badTrainLoss := 3.0
+	badValLoss := 3.4
+	if _, err := server.store.UpsertTrainingRunSummary(badJob.ID, runs.TrainingRunSummaryUpdate{
+		FinalTrainLoss: &badTrainLoss,
+		FinalValLoss:   &badValLoss,
+	}); err != nil {
+		t.Fatalf("upsert bad losses: %v", err)
+	}
+	goodTrainLoss := 0.16
+	goodValLoss := 0.21
+	if _, err := server.store.UpsertTrainingRunSummary(healthyJob.ID, runs.TrainingRunSummaryUpdate{
+		FinalTrainLoss: &goodTrainLoss,
+		FinalValLoss:   &goodValLoss,
+	}); err != nil {
+		t.Fatalf("upsert healthy losses: %v", err)
+	}
+	if _, err := server.store.UpsertTrainingRunEvaluation(badJob.ID, runs.TrainingRunEvaluationUpdate{
+		ObjectiveProfile: map[string]any{
+			"heldout_test_macro_f1": 0.60,
+			"heldout_test_accuracy": 0.62,
+			"heldout_test_loss":     3.2,
+		},
+		PerClassMetrics: map[string]any{
+			"cat":       map[string]any{"recall": 0.43, "f1-score": 0.48},
+			"dog":       map[string]any{"recall": 0.50, "f1-score": 0.52},
+			"macro avg": map[string]any{"f1-score": 0.50},
+		},
+		ConfusionMatrix: [][]int{{9, 21}, {15, 15}},
+		ModelProfile:    map[string]any{"class_labels": []string{"cat", "dog"}},
+		HolisticScores:  map[string]any{"overall_score": 0.52},
+	}); err != nil {
+		t.Fatalf("upsert bad evaluation: %v", err)
+	}
+	if _, err := server.store.UpsertTrainingRunEvaluation(healthyJob.ID, runs.TrainingRunEvaluationUpdate{
+		ObjectiveProfile: map[string]any{
+			"heldout_test_macro_f1": 0.89,
+			"heldout_test_accuracy": 0.90,
+			"heldout_test_loss":     0.23,
+		},
+		PerClassMetrics: map[string]any{
+			"cat":       map[string]any{"recall": 0.90, "f1-score": 0.90},
+			"dog":       map[string]any{"recall": 0.88, "f1-score": 0.89},
+			"macro avg": map[string]any{"f1-score": 0.895},
+		},
+		ConfusionMatrix: [][]int{{27, 3}, {4, 26}},
+		ModelProfile:    map[string]any{"class_labels": []string{"cat", "dog"}},
+		HolisticScores:  map[string]any{"overall_score": 0.90},
+	}); err != nil {
+		t.Fatalf("upsert healthy evaluation: %v", err)
+	}
+
+	input, ready, err := server.buildExperimentPlannerInput(projectID, plan.ID)
+	if err != nil {
+		t.Fatalf("build planner input: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected planner input to be ready")
+	}
+	if input.CurrentChampion == nil || input.CurrentChampion.JobID != healthyJob.ID {
+		t.Fatalf("expected healthy-loss job %s as planner champion, got %#v", healthyJob.ID, input.CurrentChampion)
+	}
+	if input.CurrentChampion.ScoreBasis != "loss_heavy_deployment_readiness" {
+		t.Fatalf("expected readiness score basis, got %#v", input.CurrentChampion)
+	}
+	if input.CurrentChampion.FinalValLoss != goodValLoss {
+		t.Fatalf("expected champion loss context, got %#v", input.CurrentChampion)
+	}
+}
+
+func TestExperimentPlannerInputHandlesEmptyMemoryStore(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_LOG_ONLY", "false")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.70)
+
+	input, ready, err := server.buildExperimentPlannerInput(projectID, plan.ID)
+	if err != nil {
+		t.Fatalf("build planner input with empty memory: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected planner input to be ready with empty memory")
+	}
+	if len(input.PriorMemory) != 0 {
+		t.Fatalf("expected no prior memory, got %d", len(input.PriorMemory))
+	}
+	if len(input.SuccessfulStrategyMemory) != 0 || len(input.FailedStrategyMemory) != 0 || len(input.RejectedStrategyMemory) != 0 {
+		t.Fatalf("expected empty strategy memory, got success=%d failed=%d rejected=%d", len(input.SuccessfulStrategyMemory), len(input.FailedStrategyMemory), len(input.RejectedStrategyMemory))
+	}
+	if len(input.RetrievedMemory) != 0 {
+		t.Fatalf("expected no retrieved memory, got %d", len(input.RetrievedMemory))
+	}
+	if len(input.StrategyScorecards) != 0 {
+		t.Fatalf("expected no strategy scorecards, got %d", len(input.StrategyScorecards))
+	}
+}
+
+func TestExperimentPlannerMemoryRetrievalLogOnlyRecordsProbeWithoutPromptInjection(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_LOG_ONLY", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "false")
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_MIN_SCORE", "0.01")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.70)
+
+	if _, err := server.store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+		SourceTable:         memory.SourceAgentMemoryRecord,
+		SourceID:            "memory_probe_1",
+		ProjectID:           projectID,
+		DatasetID:           plan.DatasetID,
+		PlanID:              plan.ID,
+		Kind:                memory.KindPlanningOutcome,
+		Scope:               memory.ScopeDataset,
+		EmbeddingModel:      "test-embedding",
+		EmbeddingDimensions: 3,
+		Embedding:           []float32{1, 0, 0},
+		EmbeddingText:       "class imbalance weighted loss improved macro f1 for image classification",
+		SummaryCard: map[string]any{
+			"summary":      "Weighted loss helped minority classes.",
+			"lesson":       "Use class balancing when macro F1 lags accuracy.",
+			"storage_uri":  "s3://private-bucket/raw-card.json",
+			"local_path":   `C:\Users\Sahith\secret-card.json`,
+			"raw_prompt":   "hidden planner prompt",
+			"base64_image": "data:image/jpeg;base64,/9j/4AAQSkZJRg",
+		},
+		Metadata: map[string]any{
+			"mechanism":                  "class_balancing",
+			"intervention":               "weighted_cross_entropy",
+			"outcome_status":             agents.ExperimentPlanningOutcomeImprovedChampion,
+			"accepted_for_vector_memory": true,
+			"token":                      "sk-secret-value",
+		},
+		QualityScore: 0.90,
+		OutcomeScore: 0.80,
+	}); err != nil {
+		t.Fatalf("upsert memory embedding: %v", err)
+	}
+
+	input, ready, err := server.buildExperimentPlannerInput(projectID, plan.ID)
+	if err != nil {
+		t.Fatalf("build planner input: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected planner input to be ready")
+	}
+	if len(input.RetrievedMemory) != 0 {
+		t.Fatalf("log-only retrieval should not inject prompt memory, got %d", len(input.RetrievedMemory))
+	}
+
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	var retrievalEvent *execution.ExecutionEvent
+	for i := range events {
+		if events[i].EventType == execution.EventMemoryRetrievalLogged {
+			retrievalEvent = &events[i]
+			break
+		}
+	}
+	if retrievalEvent == nil {
+		t.Fatalf("expected %s execution event, got %#v", execution.EventMemoryRetrievalLogged, events)
+	}
+	if retrievalEvent.Payload["log_only"] != true {
+		t.Fatalf("expected log_only payload, got %#v", retrievalEvent.Payload)
+	}
+	if count := payloadFloat(retrievalEvent.Payload, "retrieved_count"); count < 1 {
+		t.Fatalf("expected retrieved_count >= 1, got %#v", retrievalEvent.Payload)
+	}
+	cards, ok := retrievalEvent.Payload["retrieved_cards"].([]map[string]any)
+	if !ok || len(cards) != 1 {
+		t.Fatalf("expected one diagnostic card, got %#v", retrievalEvent.Payload["retrieved_cards"])
+	}
+	blob, err := json.Marshal(retrievalEvent.Payload)
+	if err != nil {
+		t.Fatalf("marshal retrieval payload: %v", err)
+	}
+	for _, leaked := range []string{"s3://private-bucket", `C:\Users\Sahith`, "hidden planner prompt", "/9j/4AAQSkZJRg", "sk-secret-value"} {
+		if strings.Contains(string(blob), leaked) {
+			t.Fatalf("expected retrieval diagnostics to avoid leaking %q, got %s", leaked, blob)
+		}
+	}
+}
+
+func TestMemoryRetrievalLogOnlySkipsEmbeddingProviderWhenLexicalFallbackIsAllowed(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_LOG_ONLY", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_LOG_ONLY_EMBEDDINGS", "false")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_MODEL", "test-embedding")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_BASE_URL", "")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_DIMENSIONS", "3")
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_MIN_SCORE", "0.01")
+
+	embeddingCalls := 0
+	embeddingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		embeddingCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model": "test-embedding",
+			"data": []map[string]any{{
+				"embedding": []float32{1, 0, 0},
+			}},
+		})
+	}))
+	defer embeddingServer.Close()
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_BASE_URL", embeddingServer.URL)
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("retrieval demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := memoryStore.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+			SourceTable:         memory.SourceAgentMemoryRecord,
+			SourceID:            "memory_" + strconv.Itoa(i),
+			ProjectID:           project.ID,
+			DatasetID:           dataset.ID,
+			Kind:                memory.KindPlanningOutcome,
+			Scope:               memory.ScopeDataset,
+			EmbeddingModel:      "test-embedding",
+			EmbeddingDimensions: 3,
+			Embedding:           []float32{1, 0, 0},
+			EmbeddingText:       "class balancing improved minority recall and weighted loss helped",
+			Metadata: map[string]any{
+				"mechanism":                  "class_balancing",
+				"accepted_for_vector_memory": true,
+			},
+		}); err != nil {
+			t.Fatalf("seed embedding %d: %v", i, err)
+		}
+	}
+
+	server := newServer(memoryStore)
+	results, usage := server.searchRetrievedMemory(context.Background(), memory.MemoryRetrievalQuery{
+		ProjectID: project.ID,
+		DatasetID: dataset.ID,
+		AgentName: agents.ExperimentPlannerAgentName,
+		Purpose:   "experiment_planner",
+		Text:      "class balancing improved minority recall",
+		Kinds:     []string{memory.KindPlanningOutcome},
+		Limit:     5,
+	}, "plan_1", "")
+	if embeddingCalls != 0 {
+		t.Fatalf("expected no embedding provider calls, got %d", embeddingCalls)
+	}
+	if !usage.LogOnly || !usage.Skipped || usage.Injected {
+		t.Fatalf("unexpected log-only usage: %#v", usage)
+	}
+	if usage.ProviderCallCount != 0 {
+		t.Fatalf("expected zero provider calls, got %#v", usage)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected lexical fallback to return retrieved memory")
+	}
+}
+
+func TestMemoryRetrievalQueryCacheAvoidsRepeatedProviderCalls(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_LOG_ONLY", "false")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_MODEL", "test-embedding")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_DIMENSIONS", "3")
+	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_MIN_SCORE", "0.01")
+
+	embeddingCalls := 0
+	embeddingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		embeddingCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model": "test-embedding",
+			"data": []map[string]any{{
+				"embedding": []float32{1, 0, 0},
+			}},
+		})
+	}))
+	defer embeddingServer.Close()
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_BASE_URL", embeddingServer.URL)
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("retrieval cache demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := memoryStore.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
+			SourceTable:         memory.SourceAgentMemoryRecord,
+			SourceID:            "cache_memory_" + strconv.Itoa(i),
+			ProjectID:           project.ID,
+			DatasetID:           dataset.ID,
+			Kind:                memory.KindPlanningOutcome,
+			Scope:               memory.ScopeDataset,
+			EmbeddingModel:      "test-embedding",
+			EmbeddingDimensions: 3,
+			Embedding:           []float32{1, 0, 0},
+			EmbeddingText:       "class balancing improved minority recall and weighted loss helped",
+			Metadata: map[string]any{
+				"mechanism":                  "class_balancing",
+				"accepted_for_vector_memory": true,
+			},
+		}); err != nil {
+			t.Fatalf("seed embedding %d: %v", i, err)
+		}
+	}
+
+	server := newServer(memoryStore)
+	query := memory.MemoryRetrievalQuery{
+		ProjectID: project.ID,
+		DatasetID: dataset.ID,
+		AgentName: agents.ExperimentPlannerAgentName,
+		Purpose:   "experiment_planner",
+		Text:      "class balancing improved minority recall",
+		Kinds:     []string{memory.KindPlanningOutcome},
+		Limit:     5,
+	}
+
+	firstResults, firstUsage := server.searchRetrievedMemory(context.Background(), query, "plan_1", "")
+	if len(firstResults) == 0 {
+		t.Fatal("expected first retrieval to return results")
+	}
+	if firstUsage.Cached || firstUsage.ProviderCallCount != 1 {
+		t.Fatalf("unexpected first retrieval usage: %#v", firstUsage)
+	}
+
+	secondResults, secondUsage := server.searchRetrievedMemory(context.Background(), query, "plan_1", "")
+	if len(secondResults) == 0 {
+		t.Fatal("expected second retrieval to return results")
+	}
+	if !secondUsage.Cached || secondUsage.ProviderCallCount != 0 {
+		t.Fatalf("unexpected cached retrieval usage: %#v", secondUsage)
+	}
+	if embeddingCalls != 1 {
+		t.Fatalf("expected one embedding provider call total, got %d", embeddingCalls)
+	}
+}
+
+func TestProjectTelemetrySummaryIncludesInvocationsAndEmbeddingUsage(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+
+	invocation, err := server.store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:        projectID,
+		AgentName:        agents.ExperimentPlannerAgentName,
+		Provider:         llm.ProviderOpenAI,
+		Model:            "gpt-5.4-mini",
+		ValidationStatus: memory.InvocationValidationValid,
+		InputMessages: []map[string]string{
+			{"role": "system", "content": "You are a planner."},
+			{"role": "user", "content": "Improve the project."},
+		},
+		InputContext: map[string]any{
+			"invocation_runtime": map[string]any{
+				"api_style": llm.APIStyleResponses,
+				"provider":  llm.ProviderOpenAI,
+				"model":     "gpt-5.4-mini",
+				"llm_usage": map[string]any{
+					"input_tokens":        120,
+					"output_tokens":       24,
+					"total_tokens":        144,
+					"cached_input_tokens": 18,
+					"reasoning_tokens":    6,
+				},
+			},
+			"planner_context_snapshot": map[string]any{
+				"context_version": "planner_context_snapshot_v1",
+				"project": map[string]any{
+					"id":   projectID,
+					"name": "Telemetry",
+					"goal": "Measure cost",
+				},
+				"dataset_card": map[string]any{
+					"id":   plan.DatasetID,
+					"name": "Dataset",
+				},
+				"objective_context": map[string]any{
+					"primary_objective": "macro_f1",
+					"goal_text":         "Improve macro F1",
+				},
+				"champion_card": map[string]any{
+					"current": map[string]any{"job_id": "job_1"},
+				},
+			},
+		},
+		RawOutput:         `{"decision_type":"WAIT"}`,
+		ParsedOutput:      map[string]any{"decision_type": "WAIT"},
+		AcceptedForMemory: false,
+	})
+	if err != nil {
+		t.Fatalf("create agent invocation: %v", err)
+	}
+
+	if _, err := server.store.CreateMemoryEmbeddingUsageEvent(memory.MemoryEmbeddingUsageEvent{
+		ProjectID:           projectID,
+		Purpose:             memory.EmbeddingUsagePurposeSourceIndex,
+		SourceTable:         memory.SourceStrategyScorecard,
+		SourceID:            "scorecard_1",
+		EmbeddingModel:      "text-embedding-3-small",
+		EmbeddingDimensions: 1536,
+		InputBytes:          2048,
+		ProviderCallCount:   2,
+		Metadata: map[string]any{
+			"mechanism": "class_balancing",
+		},
+	}); err != nil {
+		t.Fatalf("create source-index usage event: %v", err)
+	}
+
+	if _, err := server.store.CreateMemoryEmbeddingUsageEvent(memory.MemoryEmbeddingUsageEvent{
+		ProjectID:           projectID,
+		Purpose:             memory.EmbeddingUsagePurposeRetrievalQuery,
+		RetrievalPurpose:    "experiment_planner",
+		EmbeddingModel:      "text-embedding-3-small",
+		EmbeddingDimensions: 1536,
+		InputBytes:          320,
+		ProviderCallCount:   1,
+		RetrievedCount:      3,
+		Injected:            true,
+		LogOnly:             false,
+		Cached:              true,
+		Metadata: map[string]any{
+			"query_hash": "hash_1",
+		},
+	}); err != nil {
+		t.Fatalf("create retrieval usage event: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/projects/"+projectID+"/telemetry-summary?limit=10", nil)
+	resp := httptest.NewRecorder()
+	router := NewRouter(server.store)
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("telemetry summary status = %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	var payload struct {
+		AgentInvocations           []memory.AgentInvocation           `json:"agent_invocations"`
+		MemoryEmbeddingUsageEvents []memory.MemoryEmbeddingUsageEvent `json:"memory_embedding_usage_events"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode telemetry summary: %v", err)
+	}
+	var foundInvocation bool
+	for _, row := range payload.AgentInvocations {
+		if row.ID == invocation.ID {
+			foundInvocation = true
+			break
+		}
+	}
+	if !foundInvocation {
+		t.Fatalf("expected telemetry summary to include invocation %s", invocation.ID)
+	}
+	var foundSourceIndex bool
+	var foundRetrievalQuery bool
+	for _, row := range payload.MemoryEmbeddingUsageEvents {
+		switch row.Purpose {
+		case memory.EmbeddingUsagePurposeSourceIndex:
+			foundSourceIndex = true
+		case memory.EmbeddingUsagePurposeRetrievalQuery:
+			foundRetrievalQuery = true
+		}
+	}
+	if !foundSourceIndex || !foundRetrievalQuery {
+		t.Fatalf("expected telemetry summary to include source_index and retrieval_query usage events, got %#v", payload.MemoryEmbeddingUsageEvents)
 	}
 }
 
@@ -3734,7 +5041,8 @@ func TestNearCeilingChampionBlocksPlannerFollowUpScheduling(t *testing.T) {
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
-	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.996448)
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 1.0)
+	setHealthyNearCeilingRunEvidence(t, server, job.ID)
 
 	handled, err := server.runExperimentPlannerAfterTrainingJob(job)
 	if err != nil {
@@ -3773,6 +5081,95 @@ func TestNearCeilingChampionBlocksPlannerFollowUpScheduling(t *testing.T) {
 	}
 }
 
+func TestPlannerWaitAfterCompletedTrainingSelectsChampion(t *testing.T) {
+	response := `{
+		"summary": "Pause new training until audit evidence is available.",
+		"decision_type": "WAIT",
+		"rationale": "The completed run is deployment-ready and another follow-up has low expected value.",
+		"confidence": 0.78,
+		"planning_mode": "stop_or_select",
+		"deterministic_diagnosis_used": ["improvement_stagnation_score=1.000"],
+		"evidence_used": ["current champion is deployment-ready", "more epochs are not justified"],
+		"hypothesis": "Waiting avoids another low-value training batch.",
+		"expected_failure_modes": ["audit may not change the next action"],
+		"dataset_preprocessing_rationale": "Keep current preprocessing until new evidence arrives.",
+		"changed_variables": ["decision_type"],
+		"success_criteria": "Avoid additional low-value training.",
+		"stop_condition": "Keep the current champion unless new audit evidence appears.",
+		"deployment_tradeoff": "No deployment disruption.",
+		"candidate_hypotheses": [],
+		"proposed_experiments": [],
+		"proposal_mechanisms": [],
+		"champion_job_id": "",
+		"why_can_beat_champion": "",
+		"expected_delta_vs_champion": 0,
+		"stop_reason": "",
+		"risks": [],
+		"expected_tradeoffs": ["less immediate experimentation"],
+		"novelty_notes": [],
+		"rejected_options": [],
+		"tags": ["wait_for_audit"]
+	}`
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": response,
+				},
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_LLM_PROVIDER", "local")
+	t.Setenv("MODEL_EXPRESS_LLM_BASE_URL", llmServer.URL)
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "test-model")
+	t.Setenv("MODEL_EXPRESS_AGENT_MODE", "autonomous")
+	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 8),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.82)
+
+	handled, err := server.runExperimentPlannerAfterTrainingJob(job)
+	if err != nil {
+		t.Fatalf("run planner: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected planner to handle the completed job")
+	}
+
+	agentDecisions := listAgentDecisions(t, server, projectID)
+	if len(agentDecisions) != 1 {
+		t.Fatalf("expected one planner decision, got %d", len(agentDecisions))
+	}
+	decision := agentDecisions[0]
+	if decision.DecisionType != decisions.TypeSelectChampion {
+		t.Fatalf("expected WAIT to be converted to SELECT_CHAMPION, got %s", decision.DecisionType)
+	}
+	if championJobID, _ := decision.Payload["champion_job_id"].(string); championJobID != job.ID {
+		t.Fatalf("expected selected champion %s, got %#v", job.ID, decision.Payload["champion_job_id"])
+	}
+	if stopReason, _ := decision.Payload["stop_reason"].(string); !strings.Contains(stopReason, "WAIT") {
+		t.Fatalf("expected wait conversion stop reason, got %q", stopReason)
+	}
+	champion, err := server.store.GetProjectChampion(projectID)
+	if err != nil {
+		t.Fatalf("expected persisted project champion: %v", err)
+	}
+	if champion.JobID != job.ID || champion.SourceDecisionID != decision.ID {
+		t.Fatalf("expected champion %s from decision %s, got %#v", job.ID, decision.ID, champion)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected no follow-up plan after WAIT conversion, got %d total plans", got)
+	}
+}
+
 func TestNearCeilingStaleAddDecisionCannotScheduleFollowUp(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
@@ -3781,7 +5178,8 @@ func TestNearCeilingStaleAddDecisionCannotScheduleFollowUp(t *testing.T) {
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
 	})
-	createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.996448)
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 1.0)
+	setHealthyNearCeilingRunEvidence(t, server, job.ID)
 	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
 	recommendation := experimentPlannerAddExperimentsRecommendation()
 	payload, err := experimentPlannerDecisionPayload(recommendation, invocation, "autonomous", plannerInputForPayload(t, server, projectID))
@@ -3791,6 +5189,22 @@ func TestNearCeilingStaleAddDecisionCannotScheduleFollowUp(t *testing.T) {
 	decision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeAddExperiments, "stale ADD_EXPERIMENTS decision", payload)
 	if err != nil {
 		t.Fatalf("create stale decision: %v", err)
+	}
+	stopReason, guardTag, ok, err := server.plannerFollowUpStopReason(projectID, plan, listExperimentPlans(t, server, projectID))
+	if err != nil {
+		t.Fatalf("compute planner stop reason: %v", err)
+	}
+	if !ok || guardTag != "near_metric_ceiling_guard" {
+		summaries, err := server.store.ListProjectTrainingRunSummaries(projectID)
+		if err != nil {
+			t.Fatalf("list summaries for debug: %v", err)
+		}
+		evaluations, err := server.store.ListProjectTrainingRunEvaluations(projectID)
+		if err != nil {
+			t.Fatalf("list evaluations for debug: %v", err)
+		}
+		champion, _, _, rounds, _ := experimentPlannerPerformanceContext(plan.TargetMetric, listExperimentPlans(t, server, projectID), summaries, evaluations, agents.ProjectObjectiveContext{}, plan.ID)
+		t.Fatalf("expected live near-ceiling guard before scheduling, ok=%t tag=%q reason=%q champion=%#v rounds=%d", ok, guardTag, stopReason, champion, rounds)
 	}
 
 	if err := server.schedulePlannerDecision(projectID, plan, decision, automaticExperimentReviewResult{Decision: &decision}); err != nil {
@@ -4630,6 +6044,38 @@ func createTerminalTrainingJob(
 	}
 
 	return job, summary
+}
+
+func setHealthyNearCeilingRunEvidence(t *testing.T, server *Server, jobID string) {
+	t.Helper()
+	trainLoss := 0.01
+	valLoss := 0.012
+	if _, err := server.store.UpsertTrainingRunSummary(jobID, runs.TrainingRunSummaryUpdate{
+		FinalTrainLoss: &trainLoss,
+		FinalValLoss:   &valLoss,
+	}); err != nil {
+		t.Fatalf("upsert near-ceiling losses: %v", err)
+	}
+	if _, err := server.store.UpsertTrainingRunEvaluation(jobID, runs.TrainingRunEvaluationUpdate{
+		ObjectiveProfile: map[string]any{
+			"heldout_test_macro_f1": 1.0,
+			"heldout_test_accuracy": 1.0,
+			"heldout_test_loss":     0.012,
+		},
+		PerClassMetrics: map[string]any{
+			"cat":       map[string]any{"recall": 1.0, "f1-score": 1.0},
+			"dog":       map[string]any{"recall": 1.0, "f1-score": 1.0},
+			"macro avg": map[string]any{"f1-score": 1.0},
+		},
+		ConfusionMatrix: [][]int{{300, 0}, {0, 300}},
+		ModelProfile: map[string]any{
+			"class_labels":         []string{"cat", "dog"},
+			"estimated_latency_ms": 1.0,
+		},
+		HolisticScores: map[string]any{"overall_score": 1.0},
+	}); err != nil {
+		t.Fatalf("upsert near-ceiling evaluation: %v", err)
+	}
 }
 
 func createExperimentPlannerInvocation(t *testing.T, server *Server, projectID string, plan plans.ExperimentPlan) memory.AgentInvocation {

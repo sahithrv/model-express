@@ -12,6 +12,10 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     config = job["config"]
     job_id = job["id"]
 
+    if _is_detection_training_config(config):
+        _run_local_yolo_detection_training(client, job)
+        return
+
     model = str(config.get("model", "unknown_model"))
     epochs = _positive_int(config.get("epochs"), default=3)
     learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
@@ -187,6 +191,123 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     client.complete_job(job_id, mlflow_run_id=f"local-training-{job_id}")
 
 
+def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) -> None:
+    config = job["config"]
+    job_id = job["id"]
+
+    model = str(config.get("model", "yolo11n.pt"))
+    epochs = _positive_int(config.get("epochs"), default=5)
+    batch_size = _positive_int(config.get("batch_size"), default=8)
+    image_size = _positive_int(config.get("image_size"), default=640)
+    learning_rate = _positive_float(config.get("learning_rate"), default=0.001)
+    epoch_sleep = _positive_float(os.getenv("LOCAL_TRAINING_EPOCH_SECONDS"), default=0.5)
+    started_at = time.time()
+
+    model_quality = _detector_model_score(model)
+    size_bonus = 0.015 if image_size >= 640 else 0.0
+    batch_penalty = 0.015 if batch_size < 4 else 0.0
+    lr_penalty = 0.02 if learning_rate > 0.005 else 0.0
+    final_map50_95 = max(0.28, min(0.92, model_quality + size_bonus - batch_penalty - lr_penalty))
+    final_map50 = max(final_map50_95, min(0.97, final_map50_95 + 0.16))
+    best_map50_95 = 0.0
+    best_map50 = 0.0
+    box_loss = 0.0
+    cls_loss = 0.0
+    dfl_loss = 0.0
+
+    for epoch in range(1, epochs + 1):
+        progress = epoch / epochs
+        map50_95 = round(0.16 + (final_map50_95 - 0.16) * progress, 4)
+        map50 = round(0.28 + (final_map50 - 0.28) * progress, 4)
+        precision = round(max(0.0, min(1.0, map50 - 0.045)), 4)
+        recall = round(max(0.0, min(1.0, map50 - 0.065)), 4)
+        box_loss = round(max(0.025, 1.12 - 0.74 * progress - model_quality * 0.08), 4)
+        cls_loss = round(max(0.02, 0.82 - 0.50 * progress - model_quality * 0.05), 4)
+        dfl_loss = round(max(0.018, 0.62 - 0.36 * progress - model_quality * 0.03), 4)
+        val_loss = round(box_loss + cls_loss + dfl_loss, 4)
+        best_map50_95 = max(best_map50_95, map50_95)
+        best_map50 = max(best_map50, map50)
+
+        client.report_metric(
+            job_id,
+            epoch,
+            {
+                "train_loss": round(val_loss * 1.04, 4),
+                "val_loss": val_loss,
+                "box_loss": box_loss,
+                "cls_loss": cls_loss,
+                "dfl_loss": dfl_loss,
+                "mAP50_95": map50_95,
+                "map50_95": map50_95,
+                "mAP50": map50,
+                "map50": map50,
+                "precision": precision,
+                "recall": recall,
+                "learning_rate": learning_rate,
+            },
+        )
+        client.report_training_run_summary(
+            job_id,
+            {
+                "model": model,
+                "provider": "local",
+                "gpu_type": str(config.get("gpu_type", "local")),
+                "status": "RUNNING",
+                "runtime_seconds": round(time.time() - started_at, 3),
+                "estimated_cost_usd": 0,
+                "best_macro_f1": best_map50_95,
+                "best_accuracy": best_map50,
+                "final_train_loss": round(val_loss * 1.04, 4),
+                "final_val_loss": val_loss,
+                "epochs_completed": epoch,
+            },
+        )
+        print(f"Reported detector epoch {epoch}/{epochs} for {job_id} ({model})")
+        time.sleep(epoch_sleep)
+
+    runtime_seconds = round(time.time() - started_at, 3)
+    client.report_training_run_summary(
+        job_id,
+        {
+            "model": model,
+            "provider": "local",
+            "gpu_type": str(config.get("gpu_type", "local")),
+            "status": "SUCCEEDED",
+            "runtime_seconds": runtime_seconds,
+            "estimated_cost_usd": 0,
+            "best_macro_f1": best_map50_95,
+            "best_accuracy": best_map50,
+            "final_train_loss": round((box_loss + cls_loss + dfl_loss) * 1.04, 4),
+            "final_val_loss": round(box_loss + cls_loss + dfl_loss, 4),
+            "epochs_completed": epochs,
+        },
+    )
+    client.report_training_run_evaluation(
+        job_id,
+        _local_detection_evaluation_payload(
+            config=config,
+            model=model,
+            best_map50_95=best_map50_95,
+            best_map50=best_map50,
+            box_loss=box_loss,
+            cls_loss=cls_loss,
+            dfl_loss=dfl_loss,
+            runtime_seconds=runtime_seconds,
+        ),
+    )
+    client.complete_job(job_id, mlflow_run_id=f"local-yolo-training-{job_id}")
+
+
+def _is_detection_training_config(config: dict) -> bool:
+    model = str(config.get("model", "")).lower()
+    return (
+        str(config.get("task_type", "")).lower() == "object_detection"
+        or str(config.get("model_kind", "")).lower() == "ultralytics_yolo_detector"
+        or model.startswith("yolo11")
+        or model.startswith("yolo")
+    )
+
+
 def _model_score(model: str) -> float:
     normalized = model.lower()
     if "convnext" in normalized:
@@ -212,6 +333,21 @@ def _model_score(model: str) -> float:
 
     checksum = sum(ord(char) for char in normalized)
     return 0.62 + (checksum % 20) / 100
+
+
+def _detector_model_score(model: str) -> float:
+    normalized = model.lower()
+    if "yolo11x" in normalized:
+        return 0.76
+    if "yolo11l" in normalized:
+        return 0.735
+    if "yolo11m" in normalized:
+        return 0.705
+    if "yolo11s" in normalized:
+        return 0.665
+    if "yolo11n" in normalized:
+        return 0.625
+    return 0.58
 
 
 def _local_evaluation_payload(config: dict, model: str, best_macro_f1: float, best_accuracy: float, runtime_seconds: float) -> dict:
@@ -282,6 +418,88 @@ def _local_evaluation_payload(config: dict, model: str, best_macro_f1: float, be
     }
 
 
+def _local_detection_evaluation_payload(
+    *,
+    config: dict,
+    model: str,
+    best_map50_95: float,
+    best_map50: float,
+    box_loss: float,
+    cls_loss: float,
+    dfl_loss: float,
+    runtime_seconds: float,
+) -> dict:
+    class_names = _detection_class_names(config)
+    precision = round(max(0.0, min(1.0, best_map50 - 0.045)), 4)
+    recall = round(max(0.0, min(1.0, best_map50 - 0.065)), 4)
+    model_profile = _local_detection_model_profile(model, config)
+    latency_ms = float(model_profile["estimated_latency_ms"])
+    latency_score = max(0.0, min(1.0, 1.0 - latency_ms / 160.0))
+    loss_score = max(0.0, min(1.0, 1.0 - (box_loss + cls_loss + dfl_loss) / 3.0))
+    quality_score = round(best_map50_95 * 0.65 + best_map50 * 0.20 + recall * 0.15, 4)
+    overall_score = round(quality_score * 0.78 + latency_score * 0.12 + loss_score * 0.10, 4)
+    per_class_metrics = {
+        class_name: {
+            "precision": round(max(0.0, min(1.0, precision - 0.01 + index * 0.004)), 4),
+            "recall": round(max(0.0, min(1.0, recall - 0.012 + index * 0.003)), 4),
+            "AP50": round(max(0.0, min(1.0, best_map50 - 0.015 + index * 0.002)), 4),
+            "AP50_95": round(max(0.0, min(1.0, best_map50_95 - 0.018 + index * 0.002)), 4),
+            "support": 20,
+        }
+        for index, class_name in enumerate(class_names)
+    }
+    return {
+        "objective_profile": {
+            "target_metric": str(config.get("target_metric", "mAP50_95")),
+            "metric_preferences": ["mAP50_95", "mAP50", "recall", "precision", "latency_p95_ms"],
+            "task_type": "object_detection",
+            "split_strategy": "yolo_train_validation_with_heldout_test_when_available",
+            "heldout_test_map50_95": round(best_map50_95, 6),
+            "heldout_test_map50": round(best_map50, 6),
+            "heldout_test_precision": precision,
+            "heldout_test_recall": recall,
+            "heldout_test_box_loss": round(box_loss, 6),
+            "heldout_test_cls_loss": round(cls_loss, 6),
+            "heldout_test_dfl_loss": round(dfl_loss, 6),
+        },
+        "per_class_metrics": per_class_metrics,
+        "confusion_matrix": [],
+        "model_profile": model_profile,
+        "holistic_scores": {
+            "quality_score": quality_score,
+            "latency_score": round(latency_score, 4),
+            "loss_health_score": round(loss_score, 4),
+            "cost_score": 1.0,
+            "overall_score": overall_score,
+            "runtime_seconds": runtime_seconds,
+            "detection_metrics": {
+                "mAP50_95": round(best_map50_95, 6),
+                "mAP50": round(best_map50, 6),
+                "precision": precision,
+                "recall": recall,
+                "box_loss": round(box_loss, 6),
+                "cls_loss": round(cls_loss, 6),
+                "dfl_loss": round(dfl_loss, 6),
+            },
+        },
+        "preprocessing_summary": {
+            "task_type": "object_detection",
+            "preserves_yolo_splits": True,
+            "preprocessing": config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {},
+            "training_hyperparameters": {
+                "learning_rate": _positive_float(config.get("learning_rate"), default=0.001),
+                "batch_size": _positive_int(config.get("batch_size"), default=8),
+                "epochs": _positive_int(config.get("epochs"), default=5),
+                "image_size": _positive_int(config.get("image_size"), default=640),
+            },
+        },
+        "recommendation_summary": (
+            f"{model} simulated detector evaluation: mAP50-95 {best_map50_95:.3f}, "
+            f"mAP50 {best_map50:.3f}, recall {recall:.3f}, estimated latency {latency_ms:.1f}ms."
+        ),
+    }
+
+
 def _local_model_profile(model: str, config: dict) -> dict:
     normalized = model.lower()
     metadata = {
@@ -310,6 +528,56 @@ def _local_model_profile(model: str, config: dict) -> dict:
         "pretrained": bool(config.get("pretrained", True)),
         "dropout": _bounded_float(config.get("dropout"), default=0.0, minimum=0.0, maximum=0.7),
     }
+
+
+def _local_detection_model_profile(model: str, config: dict) -> dict:
+    normalized = model.lower()
+    metadata = {
+        "yolo11n.pt": (2_600_000, 5.4, 8.0),
+        "yolo11s.pt": (9_400_000, 19.2, 14.0),
+        "yolo11m.pt": (20_100_000, 41.0, 24.0),
+        "yolo11l.pt": (25_300_000, 52.0, 38.0),
+        "yolo11x.pt": (56_900_000, 114.0, 62.0),
+    }
+    parameter_count, size_mb, latency_ms = metadata.get(normalized, (9_400_000, 20.0, 18.0))
+    image_size = _positive_int(config.get("image_size"), default=640)
+    latency_scale = max(0.35, (image_size / 640) ** 2)
+    class_names = _detection_class_names(config)
+    return {
+        "task_type": "object_detection",
+        "model_kind": "ultralytics_yolo_detector",
+        "runtime": "onnx",
+        "parameter_count": parameter_count,
+        "estimated_model_size_mb": round(size_mb, 2),
+        "estimated_latency_ms": round(latency_ms * latency_scale, 2),
+        "latency_p50_ms": round(latency_ms * latency_scale * 0.82, 2),
+        "latency_p95_ms": round(latency_ms * latency_scale * 1.35, 2),
+        "estimated_throughput_images_per_second": round(1000.0 / max(latency_ms * latency_scale, 1.0), 2),
+        "image_size": image_size,
+        "input_shape": [1, 3, image_size, image_size],
+        "class_labels": class_names,
+        "confidence_threshold": _bounded_float(config.get("confidence_threshold"), default=0.25, minimum=0.01, maximum=0.99),
+        "iou_threshold": _bounded_float(config.get("iou_threshold"), default=0.7, minimum=0.1, maximum=0.99),
+        "pretrained": True,
+    }
+
+
+def _detection_class_names(config: dict) -> list[str]:
+    for key in ("class_names", "class_labels", "classes"):
+        value = config.get(key)
+        if isinstance(value, list):
+            out = [str(item) for item in value if str(item).strip()]
+            if out:
+                return out[:200]
+    metadata = config.get("metadata_summary") if isinstance(config.get("metadata_summary"), dict) else {}
+    yolo_summary = metadata.get("yolo_summary") if isinstance(metadata.get("yolo_summary"), dict) else {}
+    value = yolo_summary.get("class_names")
+    if isinstance(value, list):
+        out = [str(item) for item in value if str(item).strip()]
+        if out:
+            return out[:200]
+    class_count = _positive_int(config.get("class_count"), default=2)
+    return [f"class_{index}" for index in range(class_count)]
 
 
 def _synthetic_confusion_matrix(class_count: int, accuracy: float) -> list[list[int]]:

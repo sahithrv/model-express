@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { Transform } = require("stream");
-const { pathToFileURL } = require("url");
+const { fileURLToPath, pathToFileURL } = require("url");
 const { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 const { collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
 
@@ -194,10 +194,14 @@ ipcMain.handle("artifact:loadModel", async (_event, request) => {
   const buffer = artifactUri.startsWith("s3://")
     ? await readS3ObjectBuffer(artifactUri, request)
     : readLocalArtifactBuffer(artifactUri);
+  const externalData = artifactUri.startsWith("s3://")
+    ? await readS3ExternalDataFiles(artifactUri, request)
+    : readLocalExternalDataFiles(artifactUri, request);
   return {
     artifact_uri: artifactUri,
     size_bytes: buffer.byteLength,
-    bytes: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
+    bytes: bufferToArrayBuffer(buffer),
+    external_data: externalData,
   };
 });
 
@@ -235,24 +239,162 @@ function imageMimeType(imagePath) {
 }
 
 function readLocalArtifactBuffer(artifactUri) {
-  const artifactPath = artifactPathFromURI(artifactUri);
+  const artifactPath = localPathFromURI(artifactUri);
   if (!artifactPath) {
     throw new Error(`Unsupported model artifact URI: ${artifactUri}`);
   }
   return fs.readFileSync(artifactPath);
 }
 
-function artifactPathFromURI(value) {
+function readLocalExternalDataFiles(artifactUri, request = {}) {
+  const artifactPath = localPathFromURI(artifactUri);
+  if (!artifactPath) {
+    return [];
+  }
+  const artifactDir = path.dirname(artifactPath);
+  const out = [];
+  const seen = new Set();
+  for (const candidate of externalDataCandidates(artifactUri, request.externalData)) {
+    const mountPath = externalDataMountPath(candidate.path);
+    if (!mountPath || seen.has(mountPath)) {
+      continue;
+    }
+    const sourcePath = externalDataLocalPath(candidate, artifactDir, mountPath);
+    if (!sourcePath || !fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+      if (candidate.explicit) {
+        throw new Error(`Unable to load ONNX external data file: ${mountPath}`);
+      }
+      continue;
+    }
+    const buffer = fs.readFileSync(sourcePath);
+    seen.add(mountPath);
+    out.push({
+      path: mountPath,
+      uri: pathToFileURL(sourcePath).toString(),
+      size_bytes: buffer.byteLength,
+      bytes: bufferToArrayBuffer(buffer),
+    });
+  }
+  return out;
+}
+
+async function readS3ExternalDataFiles(artifactUri, request = {}) {
+  const out = [];
+  const seen = new Set();
+  for (const candidate of externalDataCandidates(artifactUri, request.externalData)) {
+    const mountPath = externalDataMountPath(candidate.path);
+    if (!mountPath || seen.has(mountPath)) {
+      continue;
+    }
+    const sidecarUri = externalDataS3URI(artifactUri, candidate, mountPath);
+    if (!sidecarUri) {
+      continue;
+    }
+    try {
+      const buffer = await readS3ObjectBuffer(sidecarUri, request);
+      seen.add(mountPath);
+      out.push({
+        path: mountPath,
+        uri: sidecarUri,
+        size_bytes: buffer.byteLength,
+        bytes: bufferToArrayBuffer(buffer),
+      });
+    } catch (error) {
+      if (candidate.explicit) {
+        throw new Error(`Unable to load ONNX external data file ${mountPath}: ${error.message}`);
+      }
+    }
+  }
+  return out;
+}
+
+function localPathFromURI(value) {
   if (process.platform === "win32" && value.length > 2 && value[1] === ":") {
     return value;
   }
   if (value.startsWith("file://")) {
-    return new URL(value);
+    return fileURLToPath(value);
   }
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
     return null;
   }
   return value;
+}
+
+function externalDataLocalPath(candidate, artifactDir, mountPath) {
+  for (const key of ["uri", "artifact_uri", "artifactPath", "artifact_path", "localPath", "local_path"]) {
+    const value = String(candidate[key] ?? "").trim();
+    if (!value) {
+      continue;
+    }
+    const localPath = localPathFromURI(value);
+    if (!localPath) {
+      continue;
+    }
+    return path.isAbsolute(localPath) ? localPath : path.resolve(artifactDir, localPath);
+  }
+  return path.resolve(artifactDir, storageRelativePath(mountPath));
+}
+
+function externalDataCandidates(artifactUri, externalData) {
+  const candidates = Array.isArray(externalData)
+    ? externalData
+        .filter((item) => item && typeof item === "object")
+        .map((item) => ({
+          ...item,
+          path: item.path ?? item.relative_path ?? item.file_name,
+          explicit: true,
+        }))
+    : [];
+  const inferred = `${artifactFileName(artifactUri)}.data`;
+  if (inferred) {
+    candidates.push({ path: inferred, explicit: false });
+  }
+  return candidates;
+}
+
+function artifactFileName(artifactUri) {
+  if (artifactUri.startsWith("s3://") || artifactUri.startsWith("file://")) {
+    return path.basename(decodeURIComponent(new URL(artifactUri).pathname));
+  }
+  return path.basename(artifactUri);
+}
+
+function externalDataMountPath(value) {
+  const text = String(value ?? "").trim();
+  if (!text || /^[a-z][a-z0-9+.-]*:\/\//i.test(text) || path.isAbsolute(text) || path.win32.isAbsolute(text)) {
+    return "";
+  }
+  const parts = text.replace(/\\/g, "/").split("/");
+  if (parts.some((part) => part === "..")) {
+    return "";
+  }
+  return text;
+}
+
+function storageRelativePath(value) {
+  return String(value)
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part && part !== ".")
+    .join("/");
+}
+
+function externalDataS3URI(artifactUri, candidate, mountPath) {
+  for (const key of ["uri", "artifact_uri", "artifactPath", "artifact_path"]) {
+    const value = String(candidate[key] ?? "").trim();
+    if (value.startsWith("s3://")) {
+      return value;
+    }
+  }
+  const parsed = new URL(artifactUri);
+  const baseDir = path.posix.dirname(parsed.pathname.replace(/^\/+/, ""));
+  const key = path.posix.join(baseDir === "." ? "" : baseDir, storageRelativePath(mountPath));
+  return `s3://${parsed.hostname}/${key}`;
+}
+
+function bufferToArrayBuffer(buffer) {
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 }
 
 async function readS3ObjectBuffer(artifactUri, options = {}) {

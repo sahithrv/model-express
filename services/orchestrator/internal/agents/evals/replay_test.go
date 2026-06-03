@@ -1,7 +1,10 @@
 package evals
 
 import (
+	"context"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"model-express/services/orchestrator/internal/agents"
@@ -9,6 +12,40 @@ import (
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 )
+
+func TestReplayClassificationSmokeArtifactSummaries(t *testing.T) {
+	fixture := loadClassificationFixture(t)
+	artifact := replayArtifactFromFixture(t, fixture)
+
+	assertReplayArtifactSmoke(t, artifact, "image_classification")
+	if artifact.CurrentPromptBytes <= 0 {
+		t.Fatalf("expected current prompt bytes, got %#v", artifact)
+	}
+	if artifact.BestVariant == "" || artifact.BestVariant == PlannerReplayVariantCurrentV1 {
+		t.Fatalf("expected a compacted variant to win the replay comparison, got %q", artifact.BestVariant)
+	}
+	assertReplayVariantPromptOrdering(t, artifact)
+}
+
+func TestReplayYoloSmokeArtifactSummaries(t *testing.T) {
+	fixture := loadYoloFixture(t)
+	artifact := replayArtifactFromFixture(t, fixture)
+
+	assertReplayArtifactSmoke(t, artifact, "object_detection")
+	if artifact.BestVariant == "" || artifact.BestVariant == PlannerReplayVariantCurrentV1 {
+		t.Fatalf("expected a compacted variant to win the replay comparison, got %q", artifact.BestVariant)
+	}
+	assertReplayVariantPromptOrdering(t, artifact)
+}
+
+func TestReplayLiveMiniGateDefaultOff(t *testing.T) {
+	if plannerReplayLiveEnabled() {
+		t.Skip("live replay gate is enabled in this environment")
+	}
+	if _, err := ReplayLiveMiniIfEnabled(context.Background(), agents.ExperimentPlannerAgent{}, loadClassificationFixture(t)); err == nil {
+		t.Fatal("expected live replay helper to remain gated off by default")
+	}
+}
 
 func TestReplayPlateauBackboneLotteryRejectsArchitectureChallenge(t *testing.T) {
 	fixture := loadPlateauFixture(t)
@@ -237,6 +274,111 @@ func loadPlateauFixture(t *testing.T) PlannerReplayFixture {
 		t.Fatalf("unexpected fixture name %q", fixture.Name)
 	}
 	return fixture
+}
+
+func loadClassificationFixture(t *testing.T) PlannerReplayFixture {
+	t.Helper()
+	fixture, err := LoadPlannerReplayFixture(filepath.Join("testdata", "classification_smoke.json"))
+	if err != nil {
+		t.Fatalf("load classification fixture: %v", err)
+	}
+	if fixture.Name != "classification_smoke" {
+		t.Fatalf("unexpected fixture name %q", fixture.Name)
+	}
+	return fixture
+}
+
+func loadYoloFixture(t *testing.T) PlannerReplayFixture {
+	t.Helper()
+	fixture, err := LoadPlannerReplayFixture(filepath.Join("testdata", "yolo_smoke.json"))
+	if err != nil {
+		t.Fatalf("load yolo fixture: %v", err)
+	}
+	if fixture.Name != "yolo_smoke" {
+		t.Fatalf("unexpected fixture name %q", fixture.Name)
+	}
+	return fixture
+}
+
+func replayArtifactFromFixture(t *testing.T, fixture PlannerReplayFixture) PlannerReplayArtifact {
+	t.Helper()
+	raw, err := ReplayPlannerResponse(fixture)
+	if err != nil {
+		t.Fatalf("marshal replay response: %v", err)
+	}
+	artifact, err := ReplayPlannerResponseBytes(context.Background(), fixture, raw)
+	if err != nil {
+		t.Fatalf("build replay artifact: %v", err)
+	}
+	blob, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatalf("marshal replay artifact: %v", err)
+	}
+	if artifact.BestVariant != "" && !strings.Contains(string(blob), string(artifact.BestVariant)) {
+		t.Fatalf("expected artifact JSON to include best variant, got %s", string(blob))
+	}
+	return artifact
+}
+
+func assertReplayArtifactSmoke(t *testing.T, artifact PlannerReplayArtifact, expectedTaskType string) {
+	t.Helper()
+	if artifact.TaskType != expectedTaskType {
+		t.Fatalf("expected task type %q, got %q", expectedTaskType, artifact.TaskType)
+	}
+	if !artifact.SchemaParseSuccess || artifact.SchemaParseError != "" {
+		t.Fatalf("expected schema parse success, got %#v", artifact)
+	}
+
+	sawDuplicate := false
+	for _, result := range artifact.Variants {
+		if !result.Scores.SchemaValid || !result.FinalizerSucceeded || !result.BackendValidationPassed {
+			t.Fatalf("expected replay variant to pass schema/finalizer/backend checks, got %#v", result)
+		}
+		if !result.TaskAligned || !result.ValidModelSelection {
+			t.Fatalf("expected replay variant to align with task/model selection, got %#v", result)
+		}
+		if result.CandidateMechanismDiversity < 2 {
+			t.Fatalf("expected replay variant to preserve candidate mechanism diversity, got %#v", result)
+		}
+		if result.CandidateRankingScore < 0.5 {
+			t.Fatalf("expected a useful candidate ranking score, got %#v", result)
+		}
+		if result.DuplicateSignatureRejectedCount > 0 || result.Scores.AvoidedDuplicateSignatures {
+			sawDuplicate = true
+		}
+	}
+	if !sawDuplicate {
+		t.Fatalf("expected at least one duplicate-signature rejection in the replay artifact, got %#v", artifact.Variants)
+	}
+}
+
+func assertReplayVariantPromptOrdering(t *testing.T, artifact PlannerReplayArtifact) {
+	t.Helper()
+	var current, compact, contextV2, distilled int
+	for _, result := range artifact.Variants {
+		switch result.Variant {
+		case PlannerReplayVariantCurrentV1:
+			current = result.PromptBytes
+		case PlannerReplayVariantCompactStaticPrompt:
+			compact = result.PromptBytes
+		case PlannerReplayVariantContextV2:
+			contextV2 = result.PromptBytes
+		case PlannerReplayVariantDistilledMemoryFirst:
+			distilled = result.PromptBytes
+		}
+	}
+	if current == 0 || compact == 0 || contextV2 == 0 || distilled == 0 {
+		t.Fatalf("expected all replay variants to have prompt sizes, got %#v", artifact.Variants)
+	}
+	if !(compact < current) {
+		t.Fatalf("expected compact static prompt to be smaller than current V1, current=%d compact=%d", current, compact)
+	}
+	if !(contextV2 < current) {
+		t.Fatalf("expected context V2 to be smaller than current V1, current=%d context_v2=%d", current, contextV2)
+	}
+	if !(distilled < current) {
+		t.Fatalf("expected distilled-memory-first to be smaller than current V1, current=%d distilled=%d", current, distilled)
+	}
 }
 
 func replayRetrievedMemory(sourceTable string, sourceID string, mechanism string, intervention string, outcome string) memory.MemoryRetrievalResult {

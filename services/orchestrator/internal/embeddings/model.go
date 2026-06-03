@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,8 @@ type Config struct {
 	APIKey            string
 	Dimensions        int
 	BackfillLimit     int
+	MaxCallsPerDay    int
+	DailyBudgetUSD    float64
 	Timeout           time.Duration
 }
 
@@ -44,6 +47,8 @@ func ConfigFromEnv() Config {
 		APIKey:            envStringDefault("", "MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY"),
 		Dimensions:        envIntDefault(DefaultEmbeddingDimensions, "MODEL_EXPRESS_MEMORY_EMBEDDING_DIMENSIONS"),
 		BackfillLimit:     envIntDefault(DefaultBackfillLimit, "MODEL_EXPRESS_MEMORY_BACKFILL_LIMIT"),
+		MaxCallsPerDay:    envIntDefault(100, "MODEL_EXPRESS_MEMORY_EMBEDDING_MAX_CALLS_PER_DAY"),
+		DailyBudgetUSD:    envFloatDefault(1.0, "MODEL_EXPRESS_MEMORY_EMBEDDING_DAILY_BUDGET_USD"),
 		Timeout:           DefaultTimeout,
 	}
 	return config.Normalized()
@@ -62,6 +67,12 @@ func (c Config) Normalized() Config {
 	}
 	if c.BackfillLimit <= 0 {
 		c.BackfillLimit = DefaultBackfillLimit
+	}
+	if c.MaxCallsPerDay <= 0 {
+		c.MaxCallsPerDay = 100
+	}
+	if c.DailyBudgetUSD < 0 || math.IsNaN(c.DailyBudgetUSD) || math.IsInf(c.DailyBudgetUSD, 0) {
+		c.DailyBudgetUSD = 1.0
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = DefaultTimeout
@@ -145,6 +156,18 @@ func envIntDefault(defaultValue int, name string) int {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
+}
+
+func envFloatDefault(defaultValue float64, name string) float64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 {
 		return defaultValue
 	}
 	return parsed

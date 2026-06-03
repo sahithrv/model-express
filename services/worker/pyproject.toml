@@ -9,13 +9,16 @@ dependencies = [
   "modal",
   "numpy",
   "onnx",
+  "onnxruntime",
   "onnxscript",
   "pillow",
   "pydantic",
+  "pyyaml",
   "requests",
   "scikit-learn",
   "torch",
   "torchvision",
+  "ultralytics",
 ]
 
 [project.scripts]

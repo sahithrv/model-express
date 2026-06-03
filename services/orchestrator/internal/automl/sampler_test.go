@@ -2,6 +2,8 @@ package automl
 
 import (
 	"context"
+	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -121,5 +123,31 @@ func TestAdaptiveBayesianSamplerUsesBestHistory(t *testing.T) {
 	}
 	if err := ValidateSuggestion(suggestion, space, StrategyContext{}); err != nil {
 		t.Fatalf("adaptive suggestion should stay valid: %v", err)
+	}
+}
+
+func TestAdaptiveBayesianSamplerClampsFloatBoundary(t *testing.T) {
+	minLR := 1.6000000000000003e-05
+	maxLR := 0.0004
+	spec := HyperparameterParameterSpec{
+		Name:  "learning_rate",
+		Type:  ParameterFloat,
+		Min:   &minLR,
+		Max:   &maxLR,
+		Scale: SearchScaleLog,
+	}
+	value, err := adaptiveValue(rand.New(rand.NewSource(1)), spec, 1.0)
+	if err != nil {
+		t.Fatalf("adaptive value should clamp boundary float: %v", err)
+	}
+	got, ok := NumberValue(value)
+	if !ok {
+		t.Fatalf("learning rate should be numeric: %#v", value)
+	}
+	if got < minLR || got > maxLR {
+		t.Fatalf("learning rate should stay inside [%g, %g], got %.18g", minLR, maxLR, got)
+	}
+	if math.Abs(got-maxLR) > 1e-18 {
+		t.Fatalf("expected boundary value to clamp to max %g, got %.18g", maxLR, got)
 	}
 }

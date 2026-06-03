@@ -114,6 +114,106 @@ class DatasetProfilerTests(unittest.TestCase):
             self.assertEqual(profile["class_distribution"], {"cat": 1, "dog": 1})
             self.assertEqual(profile["layout_summary"]["image_folder_root"], "images")
 
+    def test_profile_detects_yolo_object_detection_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            _write_image(dataset_dir / "images" / "train" / "one.jpg", (16, 12), (255, 0, 0))
+            _write_image(dataset_dir / "images" / "val" / "two.jpg", (18, 10), (0, 255, 0))
+            _write_image(dataset_dir / "images" / "test" / "three.jpg", (12, 12), (0, 0, 255))
+            train_label_dir = dataset_dir / "labels" / "train"
+            val_label_dir = dataset_dir / "labels" / "val"
+            train_label_dir.mkdir(parents=True)
+            val_label_dir.mkdir(parents=True)
+            (train_label_dir / "one.txt").write_text(
+                "0 0.50 0.50 0.25 0.30\n1 0.25 0.25 0.10 0.10\n",
+                encoding="utf-8",
+            )
+            (val_label_dir / "two.txt").write_text("1 0.45 0.40 0.20 0.25\n", encoding="utf-8")
+            (dataset_dir / "data.yaml").write_text(
+                "train: images/train\nval: images/val\ntest: images/test\nnc: 2\nnames: [real_face, fake_face]\n",
+                encoding="utf-8",
+            )
+
+            artifacts = detect_dataset_artifacts(dataset_dir)
+            artifact_types = {artifact["artifact_type"] for artifact in artifacts}
+            profile = profile_image_folder(dataset_dir)
+
+            self.assertIn("yolo_dataset_config", artifact_types)
+            self.assertIn("yolo_label_file", artifact_types)
+            self.assertEqual(profile["task_type"], "object_detection")
+            self.assertEqual(profile["class_names"], ["real_face", "fake_face"])
+            self.assertEqual(profile["class_count"], 2)
+            self.assertEqual(profile["total_images"], 3)
+            self.assertEqual(profile["bbox_count"], 3)
+            self.assertEqual(profile["bbox_per_class"], {"real_face": 1, "fake_face": 2})
+            self.assertTrue(profile["yolo_available"])
+            self.assertTrue(profile["object_detection_available"])
+            self.assertTrue(profile["metadata_summary"]["yolo_available"])
+            self.assertTrue(profile["metadata_summary"]["object_detection_available"])
+            self.assertEqual(profile["metadata_summary"]["bbox_count"], 3)
+            self.assertEqual(profile["metadata_summary"]["bbox_per_class"], {"real_face": 1, "fake_face": 2})
+            self.assertEqual(profile["metadata_summary"]["yolo_summary"], profile["yolo_summary"])
+            self.assertEqual(
+                profile["yolo_summary"]["split_hints"],
+                {"train": "images/train", "val": "images/val", "test": "images/test"},
+            )
+            self.assertEqual(profile["yolo_summary"]["image_count"], 3)
+            self.assertEqual(profile["yolo_summary"]["label_file_count"], 2)
+            self.assertEqual(profile["yolo_summary"]["split_image_counts"], {"train": 1, "val": 1, "test": 1})
+            self.assertEqual(profile["yolo_summary"]["split_label_file_counts"], {"train": 1, "val": 1, "test": 0})
+            self.assertEqual(profile["yolo_summary"]["split_bbox_counts"], {"train": 2, "val": 1, "test": 0})
+            self.assertTrue(profile["split_summary"]["has_explicit_split"])
+            self.assertEqual(
+                profile["split_summary"]["yolo_split_hints"],
+                {"train": "images/train", "val": "images/val", "test": "images/test"},
+            )
+            self.assertIn("yolo_format", profile["dataset_traits"])
+            self.assertIn("object_detection", profile["dataset_traits"])
+
+    def test_profile_accepts_yolo_config_variants_and_name_formats(self) -> None:
+        cases = [
+            ("data.yml", "names: {0: real_face, 1: fake_face}\n"),
+            ("dataset.yaml", "names:\n  0: real_face\n  1: fake_face\n"),
+            ("dataset.yml", "names:\n  - real_face\n  - fake_face\n"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for index, (config_name, names_yaml) in enumerate(cases):
+                with self.subTest(config_name=config_name):
+                    dataset_dir = root / f"case_{index}"
+                    _write_image(dataset_dir / "images" / "train" / "one.jpg", (14, 10), (255, 0, 0))
+                    label_dir = dataset_dir / "labels" / "train"
+                    label_dir.mkdir(parents=True)
+                    (label_dir / "one.txt").write_text("1 0.50 0.50 0.20 0.30\n", encoding="utf-8")
+                    (dataset_dir / config_name).write_text(
+                        f"train: images/train\nnc: 2\n{names_yaml}",
+                        encoding="utf-8",
+                    )
+
+                    artifacts = detect_dataset_artifacts(dataset_dir)
+                    profile = profile_image_folder(dataset_dir)
+
+                    self.assertIn("yolo_dataset_config", {artifact["artifact_type"] for artifact in artifacts})
+                    self.assertEqual(profile["task_type"], "object_detection")
+                    self.assertEqual(profile["class_names"], ["real_face", "fake_face"])
+                    self.assertEqual(profile["bbox_per_class"], {"fake_face": 1})
+                    self.assertEqual(profile["yolo_summary"]["split_hints"], {"train": "images/train"})
+
+    def test_profile_detects_yolo_labels_without_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            _write_image(dataset_dir / "images" / "train" / "one.jpg", (12, 8), (255, 0, 0))
+            label_dir = dataset_dir / "labels" / "train"
+            label_dir.mkdir(parents=True)
+            (label_dir / "one.txt").write_text("0 0.50 0.50 0.25 0.25\n", encoding="utf-8")
+
+            profile = profile_image_folder(dataset_dir)
+
+            self.assertEqual(profile["task_type"], "object_detection")
+            self.assertEqual(profile["class_names"], ["class_0"])
+            self.assertEqual(profile["bbox_count"], 1)
+            self.assertTrue(profile["metadata_summary"]["yolo_available"])
+
 
 def _write_image(path: Path, size: tuple[int, int], color: tuple[int, int, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

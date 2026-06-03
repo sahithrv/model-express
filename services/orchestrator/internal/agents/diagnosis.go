@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -63,6 +64,7 @@ type PlannerMechanismOutcome struct {
 
 func ComputePlannerDiagnosis(input ExperimentPlannerInput) PlannerDiagnosis {
 	targetMetric := normalizedDiagnosisMetric(input.SourcePlan.TargetMetric)
+	evaluationsByJob := diagnosisEvaluationsByJobID(input.PlanEvaluations)
 	bestScore := 0.0
 	hasBest := false
 	totalCost := 0.0
@@ -74,7 +76,7 @@ func ComputePlannerDiagnosis(input ExperimentPlannerInput) PlannerDiagnosis {
 	instabilityScores := []float64{}
 
 	for _, summary := range input.PlanSummaries {
-		score := diagnosisSummaryMetric(summary, targetMetric)
+		score := diagnosisRunScore(summary, evaluationsByJob[summary.JobID], targetMetric)
 		if strings.EqualFold(summary.Status, jobs.StatusSucceeded) && (!hasBest || score > bestScore) {
 			bestScore = score
 			hasBest = true
@@ -153,7 +155,7 @@ func ComputeProjectTrajectoryDiagnosis(input ExperimentPlannerInput) PlannerProj
 	minimumUsefulDelta := math.Max(input.MinimumMeaningfulImprovement, 0.010)
 	jobsByID := projectTrajectoryJobsByID(input)
 	plansByID := projectTrajectoryPlansByID(input)
-	runs := projectTrajectoryRuns(input, jobsByID, plansByID, targetMetric)
+	runs := projectTrajectoryRuns(input, jobsByID, plansByID, targetMetric, diagnosisEvaluationsByJobID(append(append([]runs.TrainingRunEvaluation(nil), input.PriorEvaluations...), input.PlanEvaluations...)))
 	successfulRuns := projectTrajectorySuccessfulRuns(runs)
 	terminalRuns := 0
 	for _, run := range runs {
@@ -274,7 +276,7 @@ func projectTrajectoryPlansByID(input ExperimentPlannerInput) map[string]plans.E
 	return out
 }
 
-func projectTrajectoryRuns(input ExperimentPlannerInput, jobsByID map[string]jobs.ExperimentJob, plansByID map[string]plans.ExperimentPlan, targetMetric string) []projectTrajectoryRun {
+func projectTrajectoryRuns(input ExperimentPlannerInput, jobsByID map[string]jobs.ExperimentJob, plansByID map[string]plans.ExperimentPlan, targetMetric string, evaluationsByJob map[string]runs.TrainingRunEvaluation) []projectTrajectoryRun {
 	summaries := append(append([]runs.TrainingRunSummary(nil), input.PriorSummaries...), input.PlanSummaries...)
 	byJobID := map[string]projectTrajectoryRun{}
 	anonymous := []projectTrajectoryRun{}
@@ -291,7 +293,7 @@ func projectTrajectoryRuns(input ExperimentPlannerInput, jobsByID map[string]job
 			Model:         projectTrajectoryModel(summary, job),
 			Mechanism:     mechanism,
 			Status:        summary.Status,
-			Score:         diagnosisSummaryMetric(summary, targetMetric),
+			Score:         diagnosisRunScore(summary, evaluationsByJob[summary.JobID], targetMetric),
 			CostUSD:       summary.EstimatedCostUSD,
 			RuntimeSecs:   summary.RuntimeSeconds,
 			CompletedAt:   projectTrajectoryCompletedAt(summary, job),
@@ -677,6 +679,209 @@ func diagnosisSummaryMetric(summary runs.TrainingRunSummary, targetMetric string
 	return summary.BestMacroF1
 }
 
+func diagnosisRunScore(summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation, targetMetric string) float64 {
+	validationScore := diagnosisValidationMetricScore(summary, targetMetric)
+	heldoutScore, hasHeldout := diagnosisHeldoutMetricScore(evaluation, targetMetric)
+	lossScore, hasLoss := diagnosisLossHealthScore(summary, evaluation)
+	perClassScore, hasPerClass := diagnosisPerClassScore(evaluation)
+	confusionScore, hasConfusion := diagnosisConfusionScore(evaluation.ConfusionMatrix)
+
+	weighted := diagnosisWeightedScore{}
+	weighted.add(validationScore, 0.12, true)
+	weighted.add(heldoutScore, 0.24, hasHeldout)
+	weighted.add(lossScore, 0.34, hasLoss)
+	weighted.add(perClassScore, 0.17, hasPerClass)
+	weighted.add(confusionScore, 0.09, hasConfusion)
+	return weighted.value(validationScore)
+}
+
+func diagnosisValidationMetricScore(summary runs.TrainingRunSummary, targetMetric string) float64 {
+	macroF1 := clamp01(summary.BestMacroF1)
+	accuracy := clamp01(summary.BestAccuracy)
+	if targetMetric == "accuracy" {
+		return diagnosisWeightedAverage([]diagnosisMetricComponent{{accuracy, 0.55}, {macroF1, 0.45}}, maxDiagnosis(accuracy, macroF1))
+	}
+	return diagnosisWeightedAverage([]diagnosisMetricComponent{{macroF1, 0.60}, {accuracy, 0.40}}, maxDiagnosis(macroF1, accuracy))
+}
+
+func diagnosisHeldoutMetricScore(evaluation runs.TrainingRunEvaluation, targetMetric string) (float64, bool) {
+	macroF1 := diagnosisPayloadFloat(evaluation.ObjectiveProfile, "heldout_test_macro_f1")
+	accuracy := diagnosisPayloadFloat(evaluation.ObjectiveProfile, "heldout_test_accuracy")
+	if macroF1 <= 0 && accuracy <= 0 {
+		return 0, false
+	}
+	if targetMetric == "accuracy" {
+		return diagnosisWeightedAverage([]diagnosisMetricComponent{{accuracy, 0.55}, {macroF1, 0.45}}, maxDiagnosis(accuracy, macroF1)), true
+	}
+	return diagnosisWeightedAverage([]diagnosisMetricComponent{{macroF1, 0.60}, {accuracy, 0.40}}, maxDiagnosis(macroF1, accuracy)), true
+}
+
+func diagnosisLossHealthScore(summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, bool) {
+	weighted := diagnosisWeightedScore{}
+	classCount := diagnosisEvaluationClassCount(evaluation)
+	if summary.FinalTrainLoss > 0 {
+		weighted.add(diagnosisLossValueScore(summary.FinalTrainLoss, classCount), 0.12, true)
+	}
+	if summary.FinalValLoss > 0 {
+		weighted.add(diagnosisLossValueScore(summary.FinalValLoss, classCount), 0.30, true)
+	}
+	if summary.FinalTrainLoss > 0 && summary.FinalValLoss > 0 {
+		gap := summary.FinalValLoss - summary.FinalTrainLoss
+		ratio := summary.FinalValLoss / math.Max(summary.FinalTrainLoss, 0.000001)
+		weighted.add(1-math.Min(1, math.Max(0, gap)/0.75), 0.15, true)
+		weighted.add(1-math.Min(1, math.Max(0, ratio-1)/1.50), 0.10, true)
+	}
+	if heldoutLoss := diagnosisPayloadFloat(evaluation.ObjectiveProfile, "heldout_test_loss"); heldoutLoss > 0 {
+		weighted.add(diagnosisLossValueScore(heldoutLoss, classCount), 0.35, true)
+	}
+	diagnostics := diagnosisPayloadMap(evaluation.HolisticScores, "training_diagnostics")
+	if severity := diagnosisPayloadFloat(diagnostics, "severity"); severity > 0 {
+		weighted.add(1-severity, 0.18, true)
+	}
+	if diagnosisPayloadBool(diagnostics, "divergence_detected") {
+		weighted.add(0.10, 0.15, true)
+	}
+	if weighted.weight <= 0 {
+		return 0, false
+	}
+	return weighted.value(1), true
+}
+
+func diagnosisLossValueScore(loss float64, classCount int) float64 {
+	if loss <= 0 {
+		return 0
+	}
+	randomBaseline := math.Log(float64(maxInt(classCount, 2)))
+	if randomBaseline <= 0 {
+		randomBaseline = math.Log(2)
+	}
+	normalized := loss / randomBaseline
+	return clamp01(1 - (normalized-0.20)/1.30)
+}
+
+func diagnosisPerClassScore(evaluation runs.TrainingRunEvaluation) (float64, bool) {
+	worstRecall := 1.0
+	foundWorst := false
+	macroAvg := diagnosisPerClassAggregate(evaluation.PerClassMetrics, "macro avg")
+	weightedAvg := diagnosisPerClassAggregate(evaluation.PerClassMetrics, "weighted avg")
+	for label, raw := range evaluation.PerClassMetrics {
+		normalizedLabel := strings.ToLower(strings.TrimSpace(label))
+		if normalizedLabel == "" || normalizedLabel == "accuracy" || strings.Contains(normalizedLabel, "avg") {
+			continue
+		}
+		stats := diagnosisPayloadMap(map[string]any{"stats": raw}, "stats")
+		recall := diagnosisPayloadFloat(stats, "recall")
+		if recall <= 0 {
+			recall = diagnosisPayloadFloat(stats, "f1-score")
+		}
+		if recall <= 0 {
+			recall = diagnosisPayloadFloat(stats, "f1")
+		}
+		if recall <= 0 {
+			continue
+		}
+		foundWorst = true
+		if recall < worstRecall {
+			worstRecall = recall
+		}
+	}
+	if !foundWorst && macroAvg <= 0 && weightedAvg <= 0 {
+		return 0, false
+	}
+	weighted := diagnosisWeightedScore{}
+	weighted.add(worstRecall, 0.50, foundWorst)
+	weighted.add(macroAvg, 0.35, macroAvg > 0)
+	weighted.add(weightedAvg, 0.15, weightedAvg > 0)
+	return weighted.value(maxDiagnosis(worstRecall, macroAvg)), true
+}
+
+func diagnosisPerClassAggregate(metrics map[string]any, key string) float64 {
+	stats := diagnosisPayloadMap(metrics, key)
+	value := diagnosisPayloadFloat(stats, "f1-score")
+	if value <= 0 {
+		value = diagnosisPayloadFloat(stats, "f1")
+	}
+	if value <= 0 {
+		value = diagnosisPayloadFloat(stats, "recall")
+	}
+	return clamp01(value)
+}
+
+func diagnosisConfusionScore(matrix [][]int) (float64, bool) {
+	total := 0
+	offDiagonal := 0
+	for rowIndex, row := range matrix {
+		for columnIndex, value := range row {
+			total += value
+			if rowIndex != columnIndex {
+				offDiagonal += value
+			}
+		}
+	}
+	if total <= 0 {
+		return 0, false
+	}
+	return clamp01(1 - (float64(offDiagonal)/float64(total))/0.35), true
+}
+
+func diagnosisEvaluationClassCount(evaluation runs.TrainingRunEvaluation) int {
+	if len(evaluation.ConfusionMatrix) > 0 {
+		return len(evaluation.ConfusionMatrix)
+	}
+	count := 0
+	for label := range evaluation.PerClassMetrics {
+		normalizedLabel := strings.ToLower(strings.TrimSpace(label))
+		if normalizedLabel == "" || normalizedLabel == "accuracy" || strings.Contains(normalizedLabel, "avg") {
+			continue
+		}
+		count++
+	}
+	return maxInt(count, 2)
+}
+
+type diagnosisMetricComponent struct {
+	value  float64
+	weight float64
+}
+
+type diagnosisWeightedScore struct {
+	total  float64
+	weight float64
+}
+
+func (s *diagnosisWeightedScore) add(value float64, weight float64, ok bool) {
+	if !ok || weight <= 0 {
+		return
+	}
+	s.total += clamp01(value) * weight
+	s.weight += weight
+}
+
+func (s diagnosisWeightedScore) value(fallback float64) float64 {
+	if s.weight <= 0 {
+		return clamp01(fallback)
+	}
+	return clamp01(s.total / s.weight)
+}
+
+func diagnosisWeightedAverage(components []diagnosisMetricComponent, fallback float64) float64 {
+	weighted := diagnosisWeightedScore{}
+	for _, component := range components {
+		weighted.add(component.value, component.weight, component.value > 0)
+	}
+	return weighted.value(fallback)
+}
+
+func diagnosisEvaluationsByJobID(evaluations []runs.TrainingRunEvaluation) map[string]runs.TrainingRunEvaluation {
+	out := map[string]runs.TrainingRunEvaluation{}
+	for _, evaluation := range evaluations {
+		if strings.TrimSpace(evaluation.JobID) != "" {
+			out[evaluation.JobID] = evaluation
+		}
+	}
+	return out
+}
+
 func diagnosisPlateauScore(metrics []jobs.EpochMetric, targetMetric string) float64 {
 	values := orderedMetricValues(metrics, targetMetric)
 	if len(values) < 4 {
@@ -793,7 +998,7 @@ func diagnosisMinorityFailure(evaluations []runs.TrainingRunEvaluation) (float64
 func diagnosisLatencyPenalty(evaluations []runs.TrainingRunEvaluation, objective ProjectObjectiveContext) (float64, string) {
 	maxLatency := 0.0
 	for _, evaluation := range evaluations {
-		latency := firstPositivePayloadFloat(evaluation.ModelProfile, "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms")
+		latency := firstPositivePayloadFloat(evaluation.ModelProfile, "estimated_pipeline_latency_ms", "estimated_latency_ms", "latency_ms", "p50_latency_ms", "inference_latency_ms")
 		if latency > maxLatency {
 			maxLatency = latency
 		}
@@ -940,6 +1145,37 @@ func diagnosisPayloadFloat(payload map[string]any, key string) float64 {
 	}
 }
 
+func diagnosisPayloadMap(payload map[string]any, key string) map[string]any {
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return map[string]any{}
+	}
+	if typed, ok := value.(map[string]any); ok {
+		return typed
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(blob, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func diagnosisPayloadBool(payload map[string]any, key string) bool {
+	switch value := payload[key].(type) {
+	case bool:
+		return value
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		return normalized == "true" || normalized == "yes" || normalized == "1"
+	default:
+		return false
+	}
+}
+
 func firstPositivePayloadFloat(payload map[string]any, keys ...string) float64 {
 	for _, key := range keys {
 		if value := diagnosisPayloadFloat(payload, key); value > 0 {
@@ -947,6 +1183,13 @@ func firstPositivePayloadFloat(payload map[string]any, keys ...string) float64 {
 		}
 	}
 	return 0
+}
+
+func maxInt(left int, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func averageScore(values []float64) float64 {

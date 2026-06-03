@@ -5,13 +5,16 @@ import time
 from typing import Iterable
 
 
-def normalized_preprocessing_config(preprocessing: object) -> dict:
+def normalized_preprocessing_config(preprocessing: object, *, model_kind: str = "classification") -> dict:
     payload = dict(preprocessing) if isinstance(preprocessing, dict) else {}
+    kind = _normalized_model_kind(model_kind)
+    default_resize = "preserve_aspect_pad" if kind == "detection" else "squash"
+    default_normalization = "none" if kind == "detection" else "imagenet"
     return {
         **payload,
-        "resize_strategy": _normalized_name(payload.get("resize_strategy"), "squash"),
+        "resize_strategy": _normalized_resize_strategy(payload.get("resize_strategy"), default_resize),
         "crop_strategy": _normalized_name(payload.get("crop_strategy"), "none"),
-        "normalization": _normalized_name(payload.get("normalization"), "imagenet"),
+        "normalization": _normalized_name(payload.get("normalization"), default_normalization),
         "bbox_mode": _normalized_name(payload.get("bbox_mode"), "ignore"),
     }
 
@@ -20,8 +23,20 @@ def build_inference_contract(
     *,
     image_size: int,
     preprocessing: object,
+    model_kind: str = "classification",
+    task_type: str | None = None,
+    runtime: str = "onnx",
+    input_shape: Iterable[int] | None = None,
+    class_labels: Iterable[str] | None = None,
+    confidence_threshold_defaults: dict | None = None,
 ) -> dict:
-    config = normalized_preprocessing_config(preprocessing)
+    resolved_model_kind = _normalized_model_kind(model_kind)
+    resolved_task_type = _normalized_task_type(task_type, resolved_model_kind)
+    tensor_shape = _model_tensor_shape(input_shape, image_size)
+    image_size = int(tensor_shape[-1])
+    labels = [str(label) for label in class_labels or []]
+    thresholds = _confidence_threshold_defaults(confidence_threshold_defaults, resolved_model_kind)
+    config = normalized_preprocessing_config(preprocessing, model_kind=resolved_model_kind)
     resize_strategy = config["resize_strategy"]
     crop_strategy = config["crop_strategy"]
     bbox_mode = config["bbox_mode"]
@@ -93,22 +108,29 @@ def build_inference_contract(
 
     return {
         "schema_version": "model_express_inference_contract_v1",
+        "model_kind": resolved_model_kind,
+        "task_type": resolved_task_type,
+        "runtime": _normalized_name(runtime, "onnx"),
+        "default_runtime": _normalized_name(runtime, "onnx"),
         "input": {
             "accepted_source": "RGB image/frame",
-            "model_tensor_shape": [1, 3, int(image_size), int(image_size)],
+            "model_tensor_shape": tensor_shape,
             "model_tensor_layout": "NCHW",
             "model_tensor_dtype": "float32",
         },
         "preprocessing": {
+            "schema_version": "preprocessing_contract_v1",
             "config": config,
             "steps": steps,
             "train_time_augmentation_excluded": True,
         },
-        "postprocessing": {
-            "model_output": "logits",
-            "activation": "softmax",
-            "label_source": "metadata.class_labels",
-        },
+        "postprocessing": _postprocessing_contract(
+            model_kind=resolved_model_kind,
+            task_type=resolved_task_type,
+            class_count=len(labels),
+            confidence_threshold_defaults=thresholds,
+        ),
+        "confidence_threshold_defaults": thresholds,
         "deployment_notes": [
             "The runtime must apply these deterministic preprocessing steps before model inference.",
             "Training-only augmentation is intentionally excluded from live inference.",
@@ -118,7 +140,7 @@ def build_inference_contract(
 
 def prepare_image_for_inference(Image, image, metadata: dict):
     image_size = image_size_from_metadata(metadata)
-    config = normalized_preprocessing_config(metadata.get("preprocessing"))
+    config = _preprocessing_config_from_metadata(metadata)
     rgb = image.convert("RGB")
     resize_strategy = config["resize_strategy"]
     crop_strategy = config["crop_strategy"]
@@ -144,12 +166,16 @@ def resize_with_padding(Image, image, image_size: int):
 
 
 def image_size_from_metadata(metadata: dict) -> int:
-    input_shape = metadata.get("input_shape")
-    if isinstance(input_shape, list) and len(input_shape) == 4:
-        try:
-            return max(1, int(input_shape[-1]))
-        except (TypeError, ValueError):
-            pass
+    shapes = [metadata.get("input_shape")]
+    contract = metadata.get("inference_contract") if isinstance(metadata.get("inference_contract"), dict) else {}
+    contract_input = contract.get("input") if isinstance(contract.get("input"), dict) else {}
+    shapes.append(contract_input.get("model_tensor_shape"))
+    for input_shape in shapes:
+        if isinstance(input_shape, list) and len(input_shape) == 4:
+            try:
+                return max(1, int(input_shape[-1]))
+            except (TypeError, ValueError):
+                pass
     return 224
 
 
@@ -157,7 +183,7 @@ def image_to_chw_float32_array(image, metadata: dict):
     import numpy as np
 
     tensor = np.asarray(image, dtype=np.float32) / 255.0
-    values = normalization_values(metadata.get("preprocessing"))
+    values = normalization_values(metadata)
     if values is not None:
         mean, std = values
         mean_array = np.asarray(mean, dtype=np.float32).reshape(1, 1, 3)
@@ -167,7 +193,7 @@ def image_to_chw_float32_array(image, metadata: dict):
 
 
 def normalization_values(preprocessing: object) -> tuple[list[float], list[float]] | None:
-    config = normalized_preprocessing_config(preprocessing)
+    config = _preprocessing_config_from_value(preprocessing)
     normalization = config["normalization"]
     if normalization == "none":
         return None
@@ -246,8 +272,208 @@ def preprocessing_latency_p95_ms(profile: dict) -> float:
 
 
 def _normalized_name(value: object, default: str) -> str:
-    text = str(value).strip().lower().replace("-", "_") if value is not None else ""
+    text = str(value).strip().lower().replace("-", "_").replace(" ", "_") if value is not None else ""
     return text or default
+
+
+def _normalized_resize_strategy(value: object, default: str) -> str:
+    text = _normalized_name(value, default)
+    if text in {"letterbox", "yolo_letterbox"}:
+        return "preserve_aspect_pad"
+    return text
+
+
+def _normalized_model_kind(value: object) -> str:
+    text = _normalized_name(value, "classification").replace(" ", "_")
+    if text in {"detection", "detector", "object_detection", "ultralytics_yolo_detector"} or "yolo" in text:
+        return "detection"
+    return "classification"
+
+
+def _normalized_task_type(value: object, model_kind: str) -> str:
+    text = _normalized_name(value, "")
+    if text in {"object_detection", "detection", "detector"} or "yolo" in text:
+        return "object_detection"
+    if text in {"image_classification", "classification", "classifier"}:
+        return "image_classification"
+    return "object_detection" if model_kind == "detection" else "image_classification"
+
+
+def _model_tensor_shape(input_shape: Iterable[int] | None, image_size: int) -> list[int]:
+    if input_shape is not None:
+        parsed = []
+        try:
+            for item in input_shape:
+                parsed.append(int(item))
+        except (TypeError, ValueError):
+            parsed = []
+        if len(parsed) == 4 and all(item > 0 for item in parsed):
+            return parsed
+    return [1, 3, int(image_size), int(image_size)]
+
+
+def _confidence_threshold_defaults(defaults: dict | None, model_kind: str) -> dict:
+    payload = defaults if isinstance(defaults, dict) else {}
+    if model_kind == "detection":
+        detection = payload.get("detection") if isinstance(payload.get("detection"), dict) else {}
+        confidence = _bounded_float(
+            detection.get("confidence_threshold", payload.get("default_confidence_threshold")),
+            default=0.25,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        iou = _bounded_float(
+            detection.get("iou_threshold", detection.get("nms_iou_threshold")),
+            default=0.7,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        max_detections = _positive_int(detection.get("max_detections"), 300)
+        return {
+            "schema_version": "confidence_threshold_defaults_v1",
+            "default_confidence_threshold": confidence,
+            "detection": {
+                "confidence_threshold": confidence,
+                "score_threshold": confidence,
+                "iou_threshold": iou,
+                "nms_iou_threshold": iou,
+                "max_detections": max_detections,
+            },
+        }
+    classification = payload.get("classification") if isinstance(payload.get("classification"), dict) else {}
+    confidence = _bounded_float(
+        classification.get("top_prediction_min_confidence", payload.get("default_confidence_threshold")),
+        default=0.0,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    return {
+        "schema_version": "confidence_threshold_defaults_v1",
+        "default_confidence_threshold": confidence,
+        "classification": {
+            "top_prediction_min_confidence": confidence,
+            "top_k": _positive_int(classification.get("top_k"), 5),
+        },
+    }
+
+
+def _postprocessing_contract(
+    *,
+    model_kind: str,
+    task_type: str,
+    class_count: int,
+    confidence_threshold_defaults: dict,
+) -> dict:
+    if model_kind == "detection":
+        detection = confidence_threshold_defaults["detection"]
+        confidence = detection["confidence_threshold"]
+        iou = detection["iou_threshold"]
+        max_detections = detection["max_detections"]
+        return {
+            "schema_version": "postprocessing_contract_v1",
+            "task_type": task_type,
+            "model_output": "detections",
+            "decoder": {
+                "type": "yolo",
+                "raw_output": "implementation_defined_yolo_head",
+                "decoded_output": "boxes_scores_classes",
+            },
+            "outputs": {
+                "boxes": {
+                    "dtype": "float32",
+                    "shape": ["num_detections", 4],
+                    "coordinate_format": "xyxy",
+                    "coordinate_space": "original_image_pixels",
+                },
+                "scores": {
+                    "dtype": "float32",
+                    "shape": ["num_detections"],
+                    "range": [0.0, 1.0],
+                },
+                "classes": {
+                    "dtype": "int64",
+                    "shape": ["num_detections"],
+                    "label_source": "metadata.class_labels",
+                },
+            },
+            "output_tensors": [
+                {"name": "boxes", "shape": ["num_detections", 4], "dtype": "float32"},
+                {"name": "scores", "shape": ["num_detections"], "dtype": "float32"},
+                {"name": "classes", "shape": ["num_detections"], "dtype": "int64"},
+            ],
+            "nms": {
+                "enabled": True,
+                "method": "class_aware_nms",
+                "confidence_threshold": confidence,
+                "iou_threshold": iou,
+                "max_detections": max_detections,
+            },
+            "confidence_threshold": confidence,
+            "iou_threshold": iou,
+            "label_source": "metadata.class_labels",
+            "class_count": int(class_count),
+        }
+    classification = confidence_threshold_defaults["classification"]
+    return {
+        "schema_version": "postprocessing_contract_v1",
+        "task_type": task_type,
+        "model_output": "logits",
+        "output_tensors": [
+            {"name": "logits", "shape": ["batch", int(class_count)], "dtype": "float32"},
+        ],
+        "activation": "softmax",
+        "confidence_output": "probability",
+        "confidence_threshold": classification["top_prediction_min_confidence"],
+        "top_k": classification["top_k"],
+        "label_source": "metadata.class_labels",
+        "class_count": int(class_count),
+    }
+
+
+def _preprocessing_config_from_value(value: object) -> dict:
+    if _looks_like_export_metadata(value):
+        return _preprocessing_config_from_metadata(value)
+    return normalized_preprocessing_config(value)
+
+
+def _preprocessing_config_from_metadata(metadata: object) -> dict:
+    if not isinstance(metadata, dict):
+        return normalized_preprocessing_config({})
+    model_kind = _normalized_model_kind(metadata.get("model_kind") or metadata.get("task_type"))
+    contract = metadata.get("preprocessing_contract")
+    if isinstance(contract, dict):
+        config = contract.get("config") if isinstance(contract.get("config"), dict) else contract
+        return normalized_preprocessing_config(config, model_kind=model_kind)
+    inference_contract = metadata.get("inference_contract")
+    if isinstance(inference_contract, dict):
+        contract = inference_contract.get("preprocessing")
+        if isinstance(contract, dict):
+            config = contract.get("config") if isinstance(contract.get("config"), dict) else contract
+            return normalized_preprocessing_config(config, model_kind=model_kind)
+    return normalized_preprocessing_config(metadata.get("preprocessing"), model_kind=model_kind)
+
+
+def _looks_like_export_metadata(value: object) -> bool:
+    return isinstance(value, dict) and any(
+        key in value
+        for key in ("preprocessing_contract", "inference_contract", "input_shape", "class_labels", "preprocessing")
+    )
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _bounded_float(value: object, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return round(max(minimum, min(maximum, parsed)), 6)
 
 
 def _bbox_crop_requested(config: dict) -> bool:

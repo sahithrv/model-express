@@ -159,6 +159,44 @@ def test_modal_training_reuses_existing_modal_app_session(monkeypatch):
     assert client.failures == []
 
 
+def test_modal_training_dispatches_detection_jobs_to_yolo_remote(monkeypatch):
+    remote_calls = []
+
+    def classifier_remote(_payload: dict):
+        raise AssertionError("classifier remote should not handle detection jobs")
+
+    def yolo_remote(payload: dict):
+        remote_calls.append(payload["job"]["config"]["model"])
+        return {}
+
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = types.SimpleNamespace(remote=classifier_remote)
+    fake_modal_app.train_yolo_detector = types.SimpleNamespace(remote=yolo_remote)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+
+    client = _FakeClient()
+    run_modal_training(
+        client,
+        {
+            "id": "job_yolo",
+            "project_id": "project_1",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "model": "yolo11n.pt",
+                "task_type": "object_detection",
+                "model_kind": "ultralytics_yolo_detector",
+            },
+        },
+    )
+
+    assert remote_calls == ["yolo11n.pt"]
+    assert client.failures == []
+
+
 def test_modal_app_session_enables_modal_output(monkeypatch):
     events = []
 

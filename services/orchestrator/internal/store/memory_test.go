@@ -1,12 +1,15 @@
 package store
 
 import (
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"model-express/services/orchestrator/internal/datasets"
+	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/strategies"
@@ -321,12 +324,22 @@ func TestMemoryStoreListUnembeddedMemorySources(t *testing.T) {
 		t.Fatalf("CreateStrategyScorecard() error = %v", err)
 	}
 
-	sources, err := store.ListUnembeddedMemorySources(project.ID, 10)
+	sources, err := store.ListUnembeddedMemorySources(project.ID, "test-embedding", 3, 10)
 	if err != nil {
 		t.Fatalf("ListUnembeddedMemorySources() error = %v", err)
 	}
 	if len(sources) != 2 {
 		t.Fatalf("ListUnembeddedMemorySources() returned %d sources, want 2: %#v", len(sources), sources)
+	}
+	var recordSource memory.EmbeddableMemoryCard
+	for _, source := range sources {
+		if source.SourceTable == memory.SourceAgentMemoryRecord && source.SourceID == record.ID {
+			recordSource = source
+			break
+		}
+	}
+	if recordSource.SourceID == "" {
+		t.Fatalf("expected listed source for memory record %s in %#v", record.ID, sources)
 	}
 
 	_, err = store.UpsertMemoryEmbedding(memory.MemoryEmbeddingRecord{
@@ -339,13 +352,13 @@ func TestMemoryStoreListUnembeddedMemorySources(t *testing.T) {
 		EmbeddingModel:      "test-embedding",
 		EmbeddingDimensions: 3,
 		Embedding:           []float32{0.1, 0.2, 0.3},
-		EmbeddingText:       "Class balancing helped minority classes.",
+		EmbeddingText:       recordSource.Text,
 	})
 	if err != nil {
 		t.Fatalf("UpsertMemoryEmbedding() error = %v", err)
 	}
 
-	sources, err = store.ListUnembeddedMemorySources(project.ID, 10)
+	sources, err = store.ListUnembeddedMemorySources(project.ID, "test-embedding", 3, 10)
 	if err != nil {
 		t.Fatalf("ListUnembeddedMemorySources() after embedding error = %v", err)
 	}
@@ -414,7 +427,7 @@ func TestMemoryStoreListUnembeddedMemorySourcesIncludesDatasetAndVisualCards(t *
 		t.Fatalf("CreateDatasetVisualAnalysis() error = %v", err)
 	}
 
-	sources, err := store.ListUnembeddedMemorySources(project.ID, 10)
+	sources, err := store.ListUnembeddedMemorySources(project.ID, "test-embedding", 3, 10)
 	if err != nil {
 		t.Fatalf("ListUnembeddedMemorySources() error = %v", err)
 	}
@@ -450,7 +463,7 @@ func TestMemoryStoreListUnembeddedMemorySourcesIncludesDatasetAndVisualCards(t *
 	if err != nil {
 		t.Fatalf("UpsertMemoryEmbedding() dataset error = %v", err)
 	}
-	sources, err = store.ListUnembeddedMemorySources(project.ID, 10)
+	sources, err = store.ListUnembeddedMemorySources(project.ID, "test-embedding", 3, 10)
 	if err != nil {
 		t.Fatalf("ListUnembeddedMemorySources() after dataset embedding error = %v", err)
 	}
@@ -617,4 +630,156 @@ func TestMemoryStoreDatasetMetadataImportActiveSwapAndBundle(t *testing.T) {
 	if !active.AgentSafeSummary.Capabilities["bbox_annotations"] {
 		t.Fatalf("expected active safe summary bbox capability: %#v", active.AgentSafeSummary)
 	}
+}
+
+func TestMemoryStoreAgentInvocationPersistsLLMUsage(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("usage project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+
+	usage := llm.Usage{
+		InputTokens:       42,
+		OutputTokens:      8,
+		TotalTokens:       50,
+		CachedInputTokens: 11,
+		ReasoningTokens:   3,
+		RequestModel:      "test-model",
+		APIStyle:          llm.APIStyleResponses,
+		ToolRounds:        2,
+	}
+	inputContext := map[string]any{
+		"invocation_runtime": map[string]any{
+			"api_style": llm.APIStyleResponses,
+			"llm_usage": usage,
+		},
+	}
+
+	stored, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:         project.ID,
+		AgentName:         "experiment_planner",
+		InputMessages:     []map[string]string{{"role": "user", "content": "hello"}},
+		InputContext:      inputContext,
+		RawOutput:         `{"ok":true}`,
+		ParsedOutput:      map[string]any{"ok": true},
+		ValidationStatus:  memory.InvocationValidationValid,
+		AcceptedForMemory: true,
+		HumanFeedback:     map[string]any{},
+		DownstreamOutcome: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CreateAgentInvocation() error = %v", err)
+	}
+
+	reloaded, err := store.GetAgentInvocation(stored.ID)
+	if err != nil {
+		t.Fatalf("GetAgentInvocation() error = %v", err)
+	}
+	runtime, ok := reloaded.InputContext["invocation_runtime"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected invocation runtime in input context, got %#v", reloaded.InputContext)
+	}
+	encodedUsage, ok := runtime["llm_usage"].(llm.Usage)
+	if !ok {
+		t.Fatalf("expected stored llm usage struct, got %#v", runtime["llm_usage"])
+	}
+	if encodedUsage.InputTokens != usage.InputTokens || encodedUsage.OutputTokens != usage.OutputTokens || encodedUsage.TotalTokens != usage.TotalTokens {
+		t.Fatalf("unexpected stored usage: %#v", encodedUsage)
+	}
+	if encodedUsage.CachedInputTokens != usage.CachedInputTokens || encodedUsage.ReasoningTokens != usage.ReasoningTokens {
+		t.Fatalf("unexpected stored usage breakdown: %#v", encodedUsage)
+	}
+	if encodedUsage.RequestModel != usage.RequestModel || encodedUsage.APIStyle != usage.APIStyle || encodedUsage.ToolRounds != usage.ToolRounds {
+		t.Fatalf("unexpected stored usage metadata: %#v", encodedUsage)
+	}
+}
+
+func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
+	createdAt := time.Date(2026, time.June, 2, 12, 0, 0, 0, time.UTC)
+	row := fakeAgentInvocationRow{values: []any{
+		"agent_invocation_1",
+		"project_1",
+		"dataset_1",
+		"plan_1",
+		"job_1",
+		"experiment_planner",
+		"v1",
+		"prompt_v1",
+		"openai",
+		"test-model",
+		[]byte(`[{"role":"user","content":"hello"}]`),
+		[]byte(`{"invocation_runtime":{"llm_usage":{"input_tokens":14,"output_tokens":6,"total_tokens":20,"cached_input_tokens":4,"reasoning_tokens":2,"request_model":"test-model","api_style":"responses","tool_rounds":1}}}`),
+		`{"ok":true}`,
+		[]byte(`{"ok":true}`),
+		"valid",
+		"",
+		true,
+		[]byte(`{}`),
+		[]byte(`{}`),
+		createdAt,
+	}}
+
+	invocation, err := scanAgentInvocation(row)
+	if err != nil {
+		t.Fatalf("scanAgentInvocation() error = %v", err)
+	}
+	runtime, ok := invocation.InputContext["invocation_runtime"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected invocation runtime, got %#v", invocation.InputContext)
+	}
+	usage, ok := runtime["llm_usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected llm usage map, got %#v", runtime["llm_usage"])
+	}
+	if usage["input_tokens"] != float64(14) || usage["output_tokens"] != float64(6) || usage["total_tokens"] != float64(20) {
+		t.Fatalf("unexpected scanned usage tokens: %#v", usage)
+	}
+	if usage["cached_input_tokens"] != float64(4) || usage["reasoning_tokens"] != float64(2) {
+		t.Fatalf("unexpected scanned usage breakdown: %#v", usage)
+	}
+	if usage["request_model"] != "test-model" || usage["api_style"] != "responses" || usage["tool_rounds"] != float64(1) {
+		t.Fatalf("unexpected scanned usage metadata: %#v", usage)
+	}
+}
+
+type fakeAgentInvocationRow struct {
+	values []any
+}
+
+func (r fakeAgentInvocationRow) Scan(dest ...any) error {
+	if len(dest) != len(r.values) {
+		return fmt.Errorf("expected %d scan destinations, got %d", len(r.values), len(dest))
+	}
+	for i, value := range r.values {
+		if err := assignScanValue(dest[i], value); err != nil {
+			return fmt.Errorf("scan value %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func assignScanValue(dest any, value any) error {
+	destination := reflect.ValueOf(dest)
+	if destination.Kind() != reflect.Ptr || destination.IsNil() {
+		return fmt.Errorf("destination is not a pointer")
+	}
+	target := destination.Elem()
+	if !target.CanSet() {
+		return fmt.Errorf("destination cannot be set")
+	}
+	if value == nil {
+		target.Set(reflect.Zero(target.Type()))
+		return nil
+	}
+	source := reflect.ValueOf(value)
+	if source.Type().AssignableTo(target.Type()) {
+		target.Set(source)
+		return nil
+	}
+	if source.Type().ConvertibleTo(target.Type()) {
+		target.Set(source.Convert(target.Type()))
+		return nil
+	}
+	return fmt.Errorf("cannot assign %T to %T", value, dest)
 }

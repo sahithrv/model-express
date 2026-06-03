@@ -23,6 +23,25 @@ const (
 	KindDatasetPreprocessingHypothesis = "dataset_preprocessing_hypothesis"
 )
 
+type DistilledMemoryCard struct {
+	SourceTable  string   `json:"source_table"`
+	SourceID     string   `json:"source_id"`
+	ProjectID    string   `json:"project_id"`
+	DatasetID    string   `json:"dataset_id,omitempty"`
+	PlanID       string   `json:"plan_id,omitempty"`
+	JobID        string   `json:"job_id,omitempty"`
+	InvocationID string   `json:"invocation_id,omitempty"`
+	Kind         string   `json:"kind"`
+	Outcome      string   `json:"outcome,omitempty"`
+	Mechanism    string   `json:"mechanism,omitempty"`
+	AppliesWhen  []string `json:"applies_when,omitempty"`
+	Lesson       string   `json:"lesson"`
+	EvidenceUsed []string `json:"evidence_used,omitempty"`
+	Confidence   float64  `json:"confidence,omitempty"`
+	ValueScore   float64  `json:"value_score,omitempty"`
+	Summary      string   `json:"summary,omitempty"`
+}
+
 func NewAgentMemoryCard(record AgentMemoryRecord) EmbeddableMemoryCard {
 	card, _ := BuildAgentMemoryCard(record)
 	return card
@@ -147,6 +166,161 @@ func BuildAgentMemoryCard(record AgentMemoryRecord) (EmbeddableMemoryCard, bool)
 func NewStrategyScorecardMemoryCard(scorecard strategies.StrategyScorecard) EmbeddableMemoryCard {
 	card, _ := BuildStrategyScorecardCard(scorecard)
 	return card
+}
+
+func BuildDistilledMemoryCardFromAgentMemoryRecord(record AgentMemoryRecord) (DistilledMemoryCard, bool) {
+	payload := emptyMap(record.Payload)
+	outcome := firstNonEmptyString(payload, "outcome_status", "outcome", "decision_type")
+	lesson := firstNonEmptyString(payload, "lesson")
+	mechanism := firstNonEmptyString(payload, "primary_mechanism", "mechanism", "mechanism_group")
+	intervention := firstNonEmptyString(payload, "intervention")
+	if mechanism == "" || intervention == "" {
+		mechanism, intervention = mechanismInterventionFromPayload(payload, mechanism, intervention)
+	}
+	if lesson == "" {
+		lesson = firstNonEmptyString(payload, "summary", "hypothesis", "expected_effect")
+	}
+	if lesson == "" {
+		lesson = strings.TrimSpace(record.Summary)
+	}
+	if strings.TrimSpace(record.ID) == "" || strings.TrimSpace(lesson) == "" {
+		return DistilledMemoryCard{}, false
+	}
+
+	appliesWhen := distilledMemoryAppliesWhenFromValues([]map[string]any{
+		payload,
+		{
+			"planning_mode": firstNonEmptyString(payload, "planning_mode"),
+			"task_type":     firstNonEmptyString(payload, "task_type"),
+			"mechanism":     mechanism,
+			"intervention":  intervention,
+		},
+	})
+	evidenceUsed := distilledMemoryEvidenceIDs(record.ID, []map[string]any{payload}, 6)
+	if len(evidenceUsed) == 0 {
+		evidenceUsed = []string{record.ID}
+	}
+	summary := strings.TrimSpace(record.Summary)
+
+	return DistilledMemoryCard{
+		SourceTable:  SourceAgentMemoryRecord,
+		SourceID:     record.ID,
+		ProjectID:    record.ProjectID,
+		DatasetID:    record.DatasetID,
+		PlanID:       record.PlanID,
+		JobID:        record.JobID,
+		InvocationID: record.InvocationID,
+		Kind:         record.Kind,
+		Outcome:      outcome,
+		Mechanism:    normalizeDistilledMemoryMechanism(mechanism),
+		AppliesWhen:  appliesWhen,
+		Lesson:       compactDistilledMemoryText(lesson, 220),
+		EvidenceUsed: evidenceUsed,
+		Confidence:   clampScore(qualityScoreFromPayload(payload)),
+		ValueScore:   outcomeScore(outcome),
+		Summary:      compactDistilledMemoryText(summary, 180),
+	}, true
+}
+
+func BuildDistilledMemoryCardFromStrategyScorecard(scorecard strategies.StrategyScorecard) (DistilledMemoryCard, bool) {
+	lesson := strings.TrimSpace(scorecard.Lesson)
+	if lesson == "" {
+		lesson = strings.TrimSpace(scorecard.ExpectedEffect)
+	}
+	if strings.TrimSpace(scorecard.ID) == "" || strings.TrimSpace(lesson) == "" {
+		return DistilledMemoryCard{}, false
+	}
+	records := []map[string]any{
+		{
+			"diagnosis_triggers": scorecard.DiagnosisTriggers,
+			"dataset_traits":     scorecard.DatasetTraits,
+			"objective_profile":  scorecard.ObjectiveProfile,
+			"planning_mode":      scorecard.PlanningMode,
+			"strategy_type":      scorecard.StrategyType,
+			"tags":               scorecard.Tags,
+			"mechanism":          scorecard.Mechanism,
+			"intervention":       scorecard.Intervention,
+			"expected_effect":    scorecard.ExpectedEffect,
+		},
+		scorecard.ProposedChanges,
+	}
+	appliesWhen := distilledMemoryAppliesWhenFromValues(records)
+	evidenceUsed := distilledMemoryEvidenceIDs(scorecard.ID, []map[string]any{
+		{
+			"source_decision_id": scorecard.SourceDecisionID,
+			"source_plan_id":     scorecard.SourcePlanID,
+			"followup_plan_id":   scorecard.FollowUpPlanID,
+			"scorecard_id":       scorecard.ID,
+		},
+	}, 6)
+	if len(evidenceUsed) == 0 {
+		evidenceUsed = []string{scorecard.ID}
+	}
+	return DistilledMemoryCard{
+		SourceTable:  SourceStrategyScorecard,
+		SourceID:     scorecard.ID,
+		ProjectID:    scorecard.ProjectID,
+		DatasetID:    scorecard.DatasetID,
+		PlanID:       scorecard.SourcePlanID,
+		Kind:         "strategy_scorecard",
+		Outcome:      scorecard.Outcome,
+		Mechanism:    normalizeDistilledMemoryMechanism(scorecard.Mechanism),
+		AppliesWhen:  appliesWhen,
+		Lesson:       compactDistilledMemoryText(lesson, 220),
+		EvidenceUsed: evidenceUsed,
+		Confidence:   clampScore(scorecardQualityScore(scorecard)),
+		ValueScore:   outcomeScore(scorecard.Outcome),
+		Summary:      compactDistilledMemoryText(scorecard.StrategyType, 160),
+	}, true
+}
+
+func BuildDistilledMemoryCardFromRetrievalResult(result MemoryRetrievalResult) (DistilledMemoryCard, bool) {
+	summaryCard := emptyMap(result.SummaryCard)
+	metadata := emptyMap(result.Metadata)
+	records := []map[string]any{summaryCard, metadata}
+	sourceID := strings.TrimSpace(result.SourceID)
+	if sourceID == "" {
+		sourceID = distilledMemoryFirstString(records, "source_id", "memory_id", "scorecard_id", "id", "source_plan_id", "source_decision_id", "plan_id", "job_id", "invocation_id")
+	}
+	if sourceID == "" {
+		return DistilledMemoryCard{}, false
+	}
+	lesson := distilledMemoryFirstString(records, "lesson", "compact_lesson", "summary", "compact_summary", "recommendation_summary", "preprocessing_hypothesis", "training_dynamics", "dynamics")
+	if lesson == "" {
+		lesson = strings.TrimSpace(result.RetrievalReason)
+	}
+	if strings.TrimSpace(lesson) == "" {
+		lesson = distilledMemoryFirstString(records, "expected_effect", "intervention")
+	}
+	if strings.TrimSpace(lesson) == "" {
+		return DistilledMemoryCard{}, false
+	}
+	mechanism := normalizeDistilledMemoryMechanism(distilledMemoryFirstString(records, "mechanism", "mechanism_group", "strategy_type", "selected_mechanism"))
+	outcome := distilledMemoryFirstString(records, "outcome", "outcome_status", "decision_type", "status")
+	appliesWhen := distilledMemoryAppliesWhenFromValues(records)
+	evidenceUsed := distilledMemoryEvidenceIDs(sourceID, records, 6)
+	if len(evidenceUsed) == 0 {
+		evidenceUsed = []string{sourceID}
+	}
+	confidence := clampScore(result.Score)
+	if confidence == 0 {
+		confidence = clampScore(result.SemanticScore)
+	}
+	return DistilledMemoryCard{
+		SourceTable:  strings.TrimSpace(result.SourceTable),
+		SourceID:     sourceID,
+		ProjectID:    strings.TrimSpace(result.ProjectID),
+		DatasetID:    strings.TrimSpace(result.DatasetID),
+		Kind:         strings.TrimSpace(result.Kind),
+		Outcome:      outcome,
+		Mechanism:    mechanism,
+		AppliesWhen:  appliesWhen,
+		Lesson:       compactDistilledMemoryText(lesson, 220),
+		EvidenceUsed: evidenceUsed,
+		Confidence:   confidence,
+		ValueScore:   clampScore(outcomeScore(outcome)),
+		Summary:      compactDistilledMemoryText(distilledMemoryFirstString(records, "summary", "compact_summary"), 180),
+	}, true
 }
 
 func BuildStrategyScorecardCard(scorecard strategies.StrategyScorecard) (EmbeddableMemoryCard, bool) {
@@ -681,6 +855,142 @@ func removeEmpty(values map[string]any) {
 			delete(values, key)
 		}
 	}
+}
+
+func distilledMemoryAppliesWhenFromValues(records []map[string]any) []string {
+	values := []string{}
+	for _, record := range records {
+		if len(record) == 0 {
+			continue
+		}
+		values = append(values, stringsFromAny(record["applies_when"], 6)...)
+		values = append(values, stringsFromAny(record["diagnosis_triggers"], 6)...)
+		values = append(values, stringsFromAny(record["dataset_traits"], 6)...)
+		values = append(values, stringsFromAny(record["tags"], 6)...)
+		for _, key := range []string{"planning_mode", "task_type", "model_family", "mechanism", "strategy_type"} {
+			if text := firstNonEmptyString(record, key); text != "" {
+				values = append(values, text)
+			}
+		}
+		for _, key := range []string{"dataset_traits", "objective_profile"} {
+			if text := distilledMemoryValueText(record[key]); text != "" {
+				values = append(values, text)
+			}
+		}
+	}
+	return distilledMemoryCleanStrings(values, 8)
+}
+
+func distilledMemoryEvidenceIDs(seed string, records []map[string]any, limit int) []string {
+	values := []string{}
+	for _, record := range records {
+		for _, key := range []string{
+			"source_id",
+			"memory_id",
+			"scorecard_id",
+			"source_decision_id",
+			"source_plan_id",
+			"followup_plan_id",
+			"follow_up_plan_id",
+			"plan_id",
+			"job_id",
+			"invocation_id",
+			"decision_id",
+		} {
+			if text := strings.TrimSpace(firstNonEmptyString(record, key)); text != "" {
+				values = append(values, text)
+			}
+		}
+	}
+	if seed != "" {
+		values = append([]string{seed}, values...)
+	}
+	return distilledMemoryCleanStrings(values, limit)
+}
+
+func distilledMemoryFirstString(records []map[string]any, keys ...string) string {
+	for _, key := range keys {
+		for _, record := range records {
+			if len(record) == 0 {
+				continue
+			}
+			if text := compactDistilledMemoryText(distilledMemoryValueText(record[key]), 220); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func distilledMemoryValueText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []string:
+		return strings.Join(typed, " ")
+	case []any:
+		values := []string{}
+		for _, item := range typed {
+			if text := distilledMemoryValueText(item); text != "" {
+				values = append(values, text)
+			}
+		}
+		return strings.Join(values, " ")
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		values := []string{}
+		for _, key := range keys {
+			if text := distilledMemoryValueText(typed[key]); text != "" {
+				values = append(values, key+"="+text)
+			}
+		}
+		return strings.Join(values, "; ")
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func distilledMemoryCleanStrings(values []string, limit int) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		normalized := strings.TrimSpace(value)
+		if normalized == "" {
+			continue
+		}
+		key := strings.ToLower(normalized)
+		if key == "<nil>" || key == "nil" || key == "null" {
+			continue
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, normalized)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func compactDistilledMemoryText(value string, limit int) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if limit > 0 && len(trimmed) > limit {
+		trimmed = strings.TrimSpace(trimmed[:limit])
+	}
+	return trimmed
+}
+
+func normalizeDistilledMemoryMechanism(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func firstNonEmptyString(values map[string]any, keys ...string) string {

@@ -168,7 +168,7 @@ func sampleValue(rng *rand.Rand, spec HyperparameterParameterSpec) (any, error) 
 		} else {
 			value = minValue + rng.Float64()*(maxValue-minValue)
 		}
-		return roundStep(value, spec.Step), nil
+		return boundedFloatValue(value, minValue, maxValue, spec.Step), nil
 	case ParameterInteger:
 		if len(spec.IntChoices) > 0 {
 			return spec.IntChoices[rng.Intn(len(spec.IntChoices))], nil
@@ -219,10 +219,10 @@ func gridValue(index int, spec HyperparameterParameterSpec) (any, error) {
 				return nil, fmt.Errorf("automl log parameter %q must have min > 0", spec.Name)
 			}
 			value := math.Exp(math.Log(minValue) + float64(position)/4*(math.Log(maxValue)-math.Log(minValue)))
-			return roundStep(value, spec.Step), nil
+			return boundedFloatValue(value, minValue, maxValue, spec.Step), nil
 		}
 		value := minValue + float64(position)/4*(maxValue-minValue)
-		return roundStep(value, spec.Step), nil
+		return boundedFloatValue(value, minValue, maxValue, spec.Step), nil
 	case ParameterInteger:
 		if len(spec.IntChoices) > 0 {
 			return spec.IntChoices[index%len(spec.IntChoices)], nil
@@ -252,6 +252,10 @@ func roundStep(value float64, step *float64) float64 {
 	return math.Round(value / *step) * *step
 }
 
+func boundedFloatValue(value float64, minValue float64, maxValue float64, step *float64) float64 {
+	return clampFloat(roundStep(value, step), minValue, maxValue)
+}
+
 func adaptiveValue(rng *rand.Rand, spec HyperparameterParameterSpec, best any) (any, error) {
 	if best == nil {
 		return sampleValue(rng, spec)
@@ -273,11 +277,11 @@ func adaptiveValue(rng *rand.Rand, spec HyperparameterParameterSpec, best any) (
 			center := math.Log(bestNumber)
 			radius := math.Max((logMax-logMin)*0.18, 0.05)
 			value := math.Exp(clampFloat(center+(rng.Float64()*2-1)*radius, logMin, logMax))
-			return roundStep(value, spec.Step), nil
+			return boundedFloatValue(value, minValue, maxValue, spec.Step), nil
 		}
 		span := maxValue - minValue
 		value := clampFloat(bestNumber+(rng.Float64()*2-1)*span*0.18, minValue, maxValue)
-		return roundStep(value, spec.Step), nil
+		return boundedFloatValue(value, minValue, maxValue, spec.Step), nil
 	case ParameterInteger:
 		bestInt, ok := IntValue(best)
 		if !ok {

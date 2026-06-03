@@ -73,6 +73,158 @@ func TestGenerateJSONChatPathUnchanged(t *testing.T) {
 	}
 }
 
+func TestGenerateJSONWithUsageCapturesChatUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("expected chat completions path, got %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"choices":[{"message":{"role":"assistant","content":"{\"ok\":true}"}}],
+			"usage":{
+				"prompt_tokens":11,
+				"prompt_tokens_details":{"cached_tokens":3},
+				"completion_tokens":7,
+				"completion_tokens_details":{"reasoning_tokens":2},
+				"total_tokens":18
+			}
+		}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Enabled:  true,
+		Provider: ProviderOpenAI,
+		BaseURL:  server.URL,
+		APIKey:   "test-key",
+		Model:    "test-model",
+	})
+
+	result, err := client.GenerateJSONWithUsage(context.Background(), JSONRequest{
+		Messages: []Message{{Role: "user", Content: "Return JSON."}},
+	})
+	if err != nil {
+		t.Fatalf("GenerateJSONWithUsage returned error: %v", err)
+	}
+	if string(result.RawJSON) != `{"ok":true}` {
+		t.Fatalf("expected chat content unchanged, got %s", result.RawJSON)
+	}
+	if result.Usage == nil {
+		t.Fatal("expected usage to be captured")
+	}
+	if result.Usage.InputTokens != 11 || result.Usage.OutputTokens != 7 || result.Usage.TotalTokens != 18 {
+		t.Fatalf("unexpected chat usage: %#v", result.Usage)
+	}
+	if result.Usage.CachedInputTokens != 3 || result.Usage.ReasoningTokens != 2 {
+		t.Fatalf("unexpected chat token breakdown: %#v", result.Usage)
+	}
+	if result.Usage.RequestModel != "test-model" || result.Usage.APIStyle != APIStyleChatCompletions {
+		t.Fatalf("unexpected chat usage metadata: %#v", result.Usage)
+	}
+}
+
+func TestGenerateJSONWithUsageUsesRequestModelOverride(t *testing.T) {
+	testCases := []struct {
+		name          string
+		apiStyle      string
+		expectedPath  string
+		expectedStyle string
+	}{
+		{
+			name:          "chat",
+			apiStyle:      APIStyleChatCompletions,
+			expectedPath:  "/chat/completions",
+			expectedStyle: APIStyleChatCompletions,
+		},
+		{
+			name:          "responses",
+			apiStyle:      APIStyleResponses,
+			expectedPath:  "/responses",
+			expectedStyle: APIStyleResponses,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tc.expectedPath {
+					t.Errorf("expected %s path, got %s", tc.expectedPath, r.URL.Path)
+				}
+
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode request body: %v", err)
+					return
+				}
+				if body["model"] != "request-model" {
+					t.Errorf("expected request model override, got %#v", body["model"])
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				if tc.apiStyle == APIStyleResponses {
+					fmt.Fprint(w, `{
+						"id":"resp_override",
+						"output":[
+							{"type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}
+						],
+						"usage":{
+							"input_tokens":5,
+							"input_tokens_details":{"cached_tokens":1},
+							"output_tokens":4,
+							"output_tokens_details":{"reasoning_tokens":2},
+							"total_tokens":9
+						}
+					}`)
+					return
+				}
+
+				fmt.Fprint(w, `{
+					"choices":[{"message":{"role":"assistant","content":"{\"ok\":true}"}}],
+					"usage":{
+						"prompt_tokens":5,
+						"prompt_tokens_details":{"cached_tokens":1},
+						"completion_tokens":4,
+						"completion_tokens_details":{"reasoning_tokens":2},
+						"total_tokens":9
+					}
+				}`)
+			}))
+			defer server.Close()
+
+			client := NewClient(Config{
+				Enabled:  true,
+				Provider: ProviderOpenAI,
+				BaseURL:  server.URL,
+				APIKey:   "test-key",
+				Model:    "config-model",
+				APIStyle: tc.apiStyle,
+			})
+
+			result, err := client.GenerateJSONWithUsage(context.Background(), JSONRequest{
+				Model:       "request-model",
+				Messages:    []Message{{Role: "user", Content: "Return JSON."}},
+				Temperature: 0.2,
+			})
+			if err != nil {
+				t.Fatalf("GenerateJSONWithUsage returned error: %v", err)
+			}
+			if string(result.RawJSON) != `{"ok":true}` {
+				t.Fatalf("expected JSON payload, got %s", result.RawJSON)
+			}
+			if result.Usage == nil {
+				t.Fatal("expected usage to be captured")
+			}
+			if result.Usage.RequestModel != "request-model" {
+				t.Fatalf("expected request-model usage metadata, got %#v", result.Usage)
+			}
+			if result.Usage.APIStyle != tc.expectedStyle {
+				t.Fatalf("expected %s usage metadata, got %#v", tc.expectedStyle, result.Usage)
+			}
+		})
+	}
+}
+
 func TestGenerateJSONResponsesPathAndFinalJSONExtraction(t *testing.T) {
 	var seenPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +258,14 @@ func TestGenerateJSONResponsesPathAndFinalJSONExtraction(t *testing.T) {
 			"id":"resp_final",
 			"output":[
 				{"type":"message","content":[{"type":"output_text","text":"Here is the result: {\"ok\":true,\"nested\":{\"a\":1}}"}]}
-			]
+			],
+			"usage":{
+				"input_tokens":21,
+				"input_tokens_details":{"cached_tokens":4},
+				"output_tokens":9,
+				"output_tokens_details":{"reasoning_tokens":5},
+				"total_tokens":30
+			}
 		}`)
 	}))
 	defer server.Close()
@@ -122,15 +281,27 @@ func TestGenerateJSONResponsesPathAndFinalJSONExtraction(t *testing.T) {
 		StoredResponses: true,
 	})
 
-	raw, err := client.GenerateJSON(context.Background(), JSONRequest{
+	result, err := client.GenerateJSONWithUsage(context.Background(), JSONRequest{
 		Temperature: 0.2,
 		Messages:    []Message{{Role: "user", Content: "Return JSON."}},
 	})
 	if err != nil {
-		t.Fatalf("GenerateJSON returned error: %v", err)
+		t.Fatalf("GenerateJSONWithUsage returned error: %v", err)
 	}
-	if string(raw) != `{"ok":true,"nested":{"a":1}}` {
-		t.Fatalf("expected extracted JSON, got %s", raw)
+	if string(result.RawJSON) != `{"ok":true,"nested":{"a":1}}` {
+		t.Fatalf("expected extracted JSON, got %s", result.RawJSON)
+	}
+	if result.Usage == nil {
+		t.Fatal("expected usage to be captured")
+	}
+	if result.Usage.InputTokens != 21 || result.Usage.OutputTokens != 9 || result.Usage.TotalTokens != 30 {
+		t.Fatalf("unexpected responses usage: %#v", result.Usage)
+	}
+	if result.Usage.CachedInputTokens != 4 || result.Usage.ReasoningTokens != 5 {
+		t.Fatalf("unexpected responses token breakdown: %#v", result.Usage)
+	}
+	if result.Usage.RequestModel != "test-model" || result.Usage.APIStyle != APIStyleResponses {
+		t.Fatalf("unexpected responses usage metadata: %#v", result.Usage)
 	}
 	if seenPath != "/responses" {
 		t.Fatalf("expected responses path, got %q", seenPath)
@@ -173,7 +344,14 @@ func TestGenerateJSONWithToolsParsesFunctionCallsAndSendsPreviousResponseID(t *t
 				"id":"resp_1",
 				"output":[
 					{"type":"function_call","id":"fc_1","call_id":"call_1","name":"dataset_profile","arguments":"{\"dataset_id\":\"ds1\"}"}
-				]
+				],
+				"usage":{
+					"input_tokens":80,
+					"input_tokens_details":{"cached_tokens":12},
+					"output_tokens":30,
+					"output_tokens_details":{"reasoning_tokens":7},
+					"total_tokens":110
+				}
 			}`)
 		case 2:
 			if body["previous_response_id"] == "resp_1" {
@@ -195,7 +373,14 @@ func TestGenerateJSONWithToolsParsesFunctionCallsAndSendsPreviousResponseID(t *t
 				"previous_response_id":"resp_1",
 				"output":[
 					{"type":"message","content":[{"type":"output_text","text":"{\"answer\":true}"}]}
-				]
+				],
+				"usage":{
+					"input_tokens":120,
+					"input_tokens_details":{"cached_tokens":8},
+					"output_tokens":40,
+					"output_tokens_details":{"reasoning_tokens":3},
+					"total_tokens":160
+				}
 			}`)
 		default:
 			t.Errorf("unexpected extra response request %d", requestCount)
@@ -259,6 +444,18 @@ func TestGenerateJSONWithToolsParsesFunctionCallsAndSendsPreviousResponseID(t *t
 	}
 	if len(result.ToolCalls) != 1 {
 		t.Fatalf("expected one tool call, got %d", len(result.ToolCalls))
+	}
+	if result.Usage == nil {
+		t.Fatal("expected aggregate usage to be captured")
+	}
+	if result.Usage.InputTokens != 200 || result.Usage.OutputTokens != 70 || result.Usage.TotalTokens != 270 {
+		t.Fatalf("unexpected aggregate usage: %#v", result.Usage)
+	}
+	if result.Usage.CachedInputTokens != 20 || result.Usage.ReasoningTokens != 10 {
+		t.Fatalf("unexpected aggregate token breakdown: %#v", result.Usage)
+	}
+	if result.Usage.RequestModel != "test-model" || result.Usage.APIStyle != APIStyleResponses || result.Usage.ToolRounds != 1 {
+		t.Fatalf("unexpected aggregate usage metadata: %#v", result.Usage)
 	}
 
 	mu.Lock()

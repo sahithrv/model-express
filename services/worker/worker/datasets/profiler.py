@@ -1,5 +1,7 @@
 from __future__ import annotations
+import ast
 from pathlib import Path
+import re
 import statistics
 from PIL import Image, ImageStat
 
@@ -42,6 +44,10 @@ LABELS_FILE_NAMES = {"labels.csv", "classes.csv", "annotations.csv", "image_clas
 CLASS_HIERARCHY_NAMES = {"class_hierarchy.json", "class_hierarchy.csv", "hierarchy.json", "synsets.txt"}
 CUB_METADATA_FILE_NAMES = {"classes.txt", "images.txt", "parts.txt", "part_locs.txt"}
 CUB_BBOX_FILE_NAMES = {"bounding_boxes.txt"}
+YOLO_CONFIG_FILE_NAMES = {"data.yaml", "data.yml", "dataset.yaml", "dataset.yml"}
+YOLO_LABEL_DIR_NAMES = {"label", "labels"}
+YOLO_IMAGE_DIR_NAMES = {"images", "image", "imgs", "img", "jpegimages"}
+YOLO_SPLIT_KEYS = {"train": "train", "val": "val", "valid": "val", "test": "test"}
 METADATA_ARTIFACT_TYPES = {
     "annotation_xml",
     "annotation_json",
@@ -51,6 +57,8 @@ METADATA_ARTIFACT_TYPES = {
     "metadata_folder",
     "bounding_boxes",
     "class_hierarchy",
+    "yolo_dataset_config",
+    "yolo_label_file",
 }
 NORMALIZATION_THUMBNAIL_SIZE = 256
 
@@ -99,7 +107,40 @@ def profile_image_folder(dataset_dir: Path) -> dict:
     dimension_stats = _dimension_stats(widths, heights)
     artifacts = detect_dataset_artifacts(dataset_dir)
     metadata_summary = _metadata_summary(artifacts)
+    yolo_summary = _yolo_dataset_summary(dataset_dir, artifacts)
+    yolo_available = bool(yolo_summary.get("available"))
+    bbox_count = int(yolo_summary.get("bbox_count") or 0)
+    bbox_per_class = yolo_summary.get("bbox_per_class") or yolo_summary.get("box_distribution") or {}
+    metadata_summary["bbox_count"] = bbox_count
+    metadata_summary["bbox_per_class"] = bbox_per_class
+    metadata_summary["yolo_summary"] = yolo_summary
+    if yolo_available:
+        metadata_summary["bbox_available"] = True
+        metadata_summary["object_detection_available"] = True
+        metadata_summary["yolo_available"] = True
+    if yolo_summary.get("available"):
+        yolo_images = list(_iter_all_image_files(dataset_dir))
+        if yolo_images:
+            image_paths = yolo_images
+            total_images = len(yolo_images)
+            dimension_stats = _dimension_stats_for_paths(yolo_images)
+        yolo_class_names = list(yolo_summary.get("class_names") or [])
+        if not yolo_class_names:
+            yolo_class_names = [f"class_{class_id}" for class_id in yolo_summary.get("class_ids", [])]
+        if yolo_class_names:
+            box_distribution = yolo_summary.get("box_distribution") or {}
+            class_counts = {
+                str(class_name): int(box_distribution.get(str(class_name), 0))
+                for class_name in yolo_class_names
+            }
+            non_empty_counts = [count for count in class_counts.values() if count > 0]
+            imbalance_ratio = max(non_empty_counts) / min(non_empty_counts) if non_empty_counts else 0.0
     split_summary = split_summary_from_artifacts(artifacts)
+    if yolo_summary.get("split_hints"):
+        split_summary["has_explicit_split"] = True
+        split_summary["yolo_split_hints"] = yolo_summary.get("split_hints")
+        split_summary["yolo_split_image_counts"] = yolo_summary.get("split_image_counts") or {}
+        split_summary["yolo_split_label_file_counts"] = yolo_summary.get("split_label_file_counts") or {}
     leakage_warnings = _leakage_warnings(image_paths)
     visual_traits = _visual_trait_summary(image_paths, artifacts, class_counts)
     traits = _dataset_traits(
@@ -110,7 +151,12 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         artifacts=artifacts,
         corrupt_file_count=len(corrupt_images),
         visual_traits=visual_traits,
+        metadata_summary=metadata_summary,
     )
+    task_type = "object_detection" if yolo_available else "image_classification"
+    class_names = list(yolo_summary.get("class_names") or []) if yolo_available else sorted(class_counts.keys())
+    if not class_names:
+        class_names = sorted(class_counts.keys())
     
     return {
         "schema_version": "dataset_profile_v1",
@@ -123,13 +169,19 @@ def profile_image_folder(dataset_dir: Path) -> dict:
             "class_folder_count": len(class_counts),
             "single_wrapper_unwrapped": class_root != dataset_dir and _is_under_single_wrapper(dataset_dir, class_root),
         },
-        "task_type": "image_classification",
-        "class_names": sorted(class_counts.keys()),
-        "class_count": len(class_counts),
+        "task_type": task_type,
+        "class_names": class_names,
+        "class_count": len(class_names),
         "image_count": total_images,
         "class_distribution": class_counts,
         "images_per_class": class_counts,
         "total_images": total_images,
+        "object_detection_available": bool(metadata_summary.get("object_detection_available")),
+        "yolo_available": yolo_available,
+        "object_count": bbox_count,
+        "bbox_count": bbox_count,
+        "bbox_per_class": bbox_per_class,
+        "yolo_summary": yolo_summary,
         "corrupt_file_count": len(corrupt_images),
         "corrupt_image_count": len(corrupt_images),
         "corrupt_images": corrupt_images[:25],
@@ -278,6 +330,20 @@ def _dimension_stats(widths: list[int], heights: list[int]) -> dict:
     }
 
 
+def _dimension_stats_for_paths(image_paths: list[Path]) -> dict:
+    widths: list[int] = []
+    heights: list[int] = []
+    for image_path in image_paths:
+        try:
+            with Image.open(image_path) as image:
+                width, height = image.size
+        except Exception:
+            continue
+        widths.append(width)
+        heights.append(height)
+    return _dimension_stats(widths, heights)
+
+
 def _numeric_stats(values: list[float]) -> dict:
     if not values:
         return {}
@@ -333,6 +399,8 @@ def detect_dataset_artifacts(dataset_dir: Path) -> list[dict]:
         suffix = path.suffix.lower()
         if name in CUB_BBOX_FILE_NAMES:
             file_artifacts.append({"artifact_type": "bounding_boxes", "path": str(path), "format": "cub_txt"})
+        elif name in YOLO_CONFIG_FILE_NAMES and _looks_like_yolo_dataset_config(path):
+            file_artifacts.append({"artifact_type": "yolo_dataset_config", "path": str(path), "format": "yaml"})
         elif suffix == ".xml":
             artifact_type = "bounding_boxes" if _looks_like_bbox_xml(path) else "annotation_xml"
             file_artifacts.append({"artifact_type": artifact_type, "path": str(path), "format": "xml"})
@@ -351,6 +419,8 @@ def detect_dataset_artifacts(dataset_dir: Path) -> list[dict]:
             )
         elif name in CUB_METADATA_FILE_NAMES:
             file_artifacts.append({"artifact_type": "metadata_file", "path": str(path), "format": suffix.lstrip(".") or "txt"})
+        elif suffix == ".txt" and _is_yolo_label_file(path, dataset_dir):
+            file_artifacts.append({"artifact_type": "yolo_label_file", "path": str(path), "format": "txt"})
     return (artifacts + file_artifacts + folder_artifacts)[:200]
 
 
@@ -440,6 +510,12 @@ def _iter_image_files(dataset_dir: Path):
             yield image_path
 
 
+def _iter_all_image_files(dataset_dir: Path):
+    for image_path in sorted(Path(dataset_dir).rglob("*")):
+        if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXT:
+            yield image_path
+
+
 def _looks_like_bbox_xml(path: Path) -> bool:
     try:
         sample = path.read_text(encoding="utf-8", errors="ignore")[:4096].lower()
@@ -448,18 +524,642 @@ def _looks_like_bbox_xml(path: Path) -> bool:
     return "<bndbox>" in sample or all(token in sample for token in ("<xmin>", "<ymin>", "<xmax>", "<ymax>"))
 
 
+def _looks_like_yolo_dataset_config(path: Path) -> bool:
+    try:
+        sample = path.read_text(encoding="utf-8", errors="ignore")[:8192].lower()
+    except Exception:
+        return False
+    return ("train:" in sample or "val:" in sample or "valid:" in sample) and (
+        "names:" in sample or re.search(r"(?m)^\s*nc\s*:", sample) is not None
+    )
+
+
+def _is_yolo_label_file(path: Path, dataset_dir: Path) -> bool:
+    parts = {part.lower() for part in path.relative_to(dataset_dir).parts[:-1]}
+    if not parts.intersection(YOLO_LABEL_DIR_NAMES):
+        return False
+    if path.name.lower() in SPLIT_FILE_NAMES or path.name.lower() in LABELS_FILE_NAMES:
+        return False
+    return _looks_like_yolo_label_txt(path)
+
+
+def _looks_like_yolo_label_txt(path: Path) -> bool:
+    try:
+        lines = [line.strip() for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()]
+    except Exception:
+        return False
+    non_empty = [line for line in lines if line and not line.startswith("#")]
+    if not non_empty:
+        return True
+    for line in non_empty[:20]:
+        if _parse_yolo_label_row(line) is None:
+            return False
+    return True
+
+
+def _parse_yolo_label_row(line: str) -> tuple[int, float, float, float, float] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    fields = stripped.split()
+    if len(fields) < 5:
+        return None
+    try:
+        class_value = float(fields[0])
+        class_id = int(class_value)
+        x_center, y_center, width, height = [float(value) for value in fields[1:5]]
+    except ValueError:
+        return None
+    if class_id < 0 or abs(class_value - class_id) > 1e-6:
+        return None
+    coords = [x_center, y_center, width, height]
+    if any(value < -0.001 or value > 1.001 for value in coords):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return class_id, x_center, y_center, width, height
+
+
+def _yolo_dataset_summary(dataset_dir: Path, artifacts: list[dict]) -> dict:
+    dataset_dir = Path(dataset_dir)
+    config_paths = _unique_paths(
+        [
+            Path(str(artifact.get("path") or ""))
+            for artifact in artifacts
+            if artifact.get("artifact_type") == "yolo_dataset_config"
+        ]
+        + _find_yolo_config_paths(dataset_dir)
+    )
+    label_paths = _unique_paths(
+        [
+            Path(str(artifact.get("path") or ""))
+            for artifact in artifacts
+            if artifact.get("artifact_type") == "yolo_label_file"
+        ]
+        + _find_yolo_label_paths(dataset_dir)
+    )
+    available = bool(config_paths or label_paths)
+    class_names: list[str] = []
+    split_hints: dict[str, str | list[str]] = {}
+    split_config_path: Path | None = None
+    split_path_hint: str | list[str] | None = None
+    for config_path in config_paths[:3]:
+        config = _parse_yolo_config_file(config_path)
+        if not class_names and config["class_names"]:
+            class_names = list(config["class_names"])
+        if not split_hints and config["split_hints"]:
+            split_hints = dict(config["split_hints"])
+            split_config_path = config_path
+            split_path_hint = config["path"]
+
+    class_ids: set[int] = set()
+    box_counts_by_id: dict[int, int] = {}
+    parsed_label_counts_by_path: dict[Path, dict[int, int]] = {}
+    bbox_count = 0
+    for label_path in label_paths:
+        parsed = _parse_yolo_label_file(label_path)
+        parsed_label_counts_by_path[label_path] = parsed
+        for class_id, count in parsed.items():
+            class_ids.add(class_id)
+            box_counts_by_id[class_id] = box_counts_by_id.get(class_id, 0) + count
+            bbox_count += count
+
+    class_name_by_id: dict[int, str] = {}
+    if class_names:
+        class_name_by_id = {class_id: name for class_id, name in enumerate(class_names)}
+        for class_id in sorted(class_ids):
+            if class_id not in class_name_by_id:
+                class_name_by_id[class_id] = f"class_{class_id}"
+                class_names.append(class_name_by_id[class_id])
+    elif class_ids:
+        class_name_by_id = {class_id: f"class_{class_id}" for class_id in sorted(class_ids)}
+        class_names = [class_name_by_id[class_id] for class_id in sorted(class_ids)]
+
+    distribution: dict[str, int] = {}
+    for class_id, count in sorted(box_counts_by_id.items()):
+        class_name = class_name_by_id.get(class_id, f"class_{class_id}")
+        distribution[class_name] = distribution.get(class_name, 0) + count
+
+    split_image_counts: dict[str, int] = {}
+    split_label_file_counts: dict[str, int] = {}
+    split_bbox_counts: dict[str, int] = {}
+    if split_hints and split_config_path is not None:
+        split_image_counts, split_label_file_counts, split_bbox_counts = _yolo_split_counts(
+            dataset_dir=dataset_dir,
+            config_path=split_config_path,
+            path_hint=split_path_hint,
+            split_hints=split_hints,
+            label_paths=label_paths,
+            parsed_label_counts_by_path=parsed_label_counts_by_path,
+        )
+
+    image_count = sum(1 for _ in _iter_all_image_files(dataset_dir)) if available else 0
+    return {
+        "available": available,
+        "format": "yolo" if available else "",
+        "config_count": len(config_paths),
+        "config_paths": [str(path) for path in config_paths[:10]],
+        "label_file_count": len(label_paths),
+        "label_count": len(label_paths),
+        "image_count": image_count,
+        "bbox_count": bbox_count,
+        "bbox_per_class": distribution,
+        "class_names": class_names,
+        "class_ids": sorted(class_ids),
+        "box_distribution": distribution,
+        "split_hints": split_hints,
+        "split_paths": split_hints,
+        "split_image_counts": split_image_counts,
+        "split_label_file_counts": split_label_file_counts,
+        "split_bbox_counts": split_bbox_counts,
+    }
+
+
+def _find_yolo_config_paths(dataset_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    try:
+        iterator = sorted(Path(dataset_dir).rglob("*"))
+    except OSError:
+        return paths
+    for path in iterator:
+        if path.is_file() and path.name.lower() in YOLO_CONFIG_FILE_NAMES and _looks_like_yolo_dataset_config(path):
+            paths.append(path)
+    return paths
+
+
+def _find_yolo_label_paths(dataset_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    try:
+        iterator = sorted(Path(dataset_dir).rglob("*.txt"))
+    except OSError:
+        return paths
+    for path in iterator:
+        if path.is_file() and _is_yolo_label_file(path, dataset_dir):
+            paths.append(path)
+    return paths
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        if not str(path):
+            continue
+        key = _path_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve()).lower()
+    except OSError:
+        return str(path.absolute()).lower()
+
+
+def _parse_yolo_config_file(path: Path) -> dict:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return {"class_names": [], "split_hints": {}, "path": None}
+    return {
+        "class_names": _parse_yolo_names(text),
+        "split_hints": _parse_yolo_split_hints(text),
+        "path": _parse_yolo_value_at_key(text, "path"),
+    }
+
+
+def _parse_yolo_split_hints(text: str) -> dict[str, str | list[str]]:
+    hints: dict[str, str | list[str]] = {}
+    for raw_key, normalized_key in YOLO_SPLIT_KEYS.items():
+        value = _parse_yolo_value_at_key(text, raw_key)
+        if value is not None and normalized_key not in hints:
+            hints[normalized_key] = value
+    return hints
+
+
+def _parse_yolo_value_at_key(text: str, key: str) -> str | list[str] | None:
+    lines = text.splitlines()
+    pattern = re.compile(rf"^(\s*){re.escape(key)}\s*:\s*(.*?)\s*$", re.IGNORECASE)
+    for index, line in enumerate(lines):
+        match = pattern.match(line)
+        if not match:
+            continue
+        base_indent = len(match.group(1))
+        inline_value = _strip_yaml_comment(match.group(2)).strip()
+        if inline_value:
+            return _parse_yolo_scalar_or_list(inline_value)
+
+        block_values: list[str] = []
+        for block_line in lines[index + 1 :]:
+            stripped = block_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(block_line) - len(block_line.lstrip())
+            if indent <= base_indent:
+                break
+            listed = re.match(r"^\s*-\s*(.*?)\s*$", block_line)
+            if listed:
+                value = _parse_yolo_scalar_or_list(listed.group(1))
+                if isinstance(value, str):
+                    block_values.append(value)
+        return block_values or None
+    return None
+
+
+def _parse_yolo_scalar_or_list(value: str) -> str | list[str] | None:
+    cleaned = _strip_yaml_comment(value).strip()
+    if not cleaned or cleaned.lower() in {"null", "none", "~"}:
+        return None
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        try:
+            parsed = ast.literal_eval(cleaned)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            return [_clean_yaml_scalar(item) for item in parsed if _clean_yaml_scalar(item)]
+        return [
+            _clean_yaml_scalar(item)
+            for item in _split_inline_csv(cleaned[1:-1])
+            if _clean_yaml_scalar(item)
+        ]
+    return _clean_yaml_scalar(cleaned)
+
+
+def _strip_yaml_comment(value: str) -> str:
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+        elif char == "#" and quote is None:
+            return value[:index]
+    return value
+
+
+def _clean_yaml_scalar(value) -> str:
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1]
+    return text.strip()
+
+
+def _split_inline_csv(value: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    depth = 0
+    for char in value:
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            continue
+        if char in "[{(":
+            depth += 1
+        elif char in "]})" and depth > 0:
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def _yolo_split_counts(
+    dataset_dir: Path,
+    config_path: Path,
+    path_hint: str | list[str] | None,
+    split_hints: dict[str, str | list[str]],
+    label_paths: list[Path],
+    parsed_label_counts_by_path: dict[Path, dict[int, int]],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    image_counts: dict[str, int] = {}
+    label_file_counts: dict[str, int] = {}
+    bbox_counts: dict[str, int] = {}
+    label_lookup = {_path_key(path): path for path in label_paths}
+
+    for split, hint in split_hints.items():
+        targets = _resolve_yolo_split_targets(config_path, path_hint, hint)
+        image_counts[split] = sum(_count_yolo_images_for_target(target, config_path.parent) for target in targets)
+
+        split_label_paths: set[Path] = set()
+        for target in targets:
+            split_label_paths.update(
+                _yolo_label_paths_for_target(
+                    target=target,
+                    dataset_dir=dataset_dir,
+                    split=split,
+                    label_lookup=label_lookup,
+                    config_base=config_path.parent,
+                )
+            )
+        if not split_label_paths:
+            split_label_paths.update(_known_label_paths_for_split_name(label_lookup, split))
+
+        label_file_counts[split] = len(split_label_paths)
+        bbox_counts[split] = sum(
+            sum(parsed_label_counts_by_path.get(label_path, {}).values())
+            for label_path in split_label_paths
+        )
+    return image_counts, label_file_counts, bbox_counts
+
+
+def _resolve_yolo_split_targets(
+    config_path: Path,
+    path_hint: str | list[str] | None,
+    split_hint: str | list[str],
+) -> list[Path]:
+    roots = _resolve_yolo_config_roots(config_path, path_hint)
+    targets: list[Path] = []
+    for value in _as_path_values(split_hint):
+        if _is_remote_yolo_path(value):
+            continue
+        split_path = Path(value)
+        if split_path.is_absolute():
+            targets.append(split_path)
+        else:
+            targets.extend(root / split_path for root in roots)
+    return _unique_paths(targets)
+
+
+def _resolve_yolo_config_roots(config_path: Path, path_hint: str | list[str] | None) -> list[Path]:
+    roots: list[Path] = []
+    for value in _as_path_values(path_hint):
+        if _is_remote_yolo_path(value):
+            continue
+        root = Path(value)
+        roots.append(root if root.is_absolute() else config_path.parent / root)
+    return _unique_paths(roots) or [config_path.parent]
+
+
+def _as_path_values(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _is_remote_yolo_path(value: str) -> bool:
+    lowered = value.lower()
+    return "://" in lowered or lowered.startswith(("s3:", "gs:"))
+
+
+def _count_yolo_images_for_target(target: Path, config_base: Path) -> int:
+    if target.is_dir():
+        return sum(1 for path in target.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXT)
+    if target.is_file() and target.suffix.lower() in IMAGE_EXT:
+        return 1
+    if target.is_file() and target.suffix.lower() == ".txt":
+        return sum(1 for _ in _image_paths_from_yolo_split_file(target, config_base))
+    return 0
+
+
+def _yolo_label_paths_for_target(
+    target: Path,
+    dataset_dir: Path,
+    split: str,
+    label_lookup: dict[str, Path],
+    config_base: Path,
+) -> set[Path]:
+    label_paths: set[Path] = set()
+    if target.is_dir():
+        for label_dir in _candidate_label_dirs_for_image_dir(target, dataset_dir, split):
+            label_paths.update(_known_label_paths_under(label_dir, label_lookup))
+    elif target.is_file() and target.suffix.lower() == ".txt":
+        if any(part.lower() in YOLO_LABEL_DIR_NAMES for part in target.parts):
+            known = label_lookup.get(_path_key(target))
+            if known is not None:
+                label_paths.add(known)
+        else:
+            for image_path in _image_paths_from_yolo_split_file(target, config_base):
+                for label_path in _candidate_label_paths_for_image(image_path, dataset_dir):
+                    known = label_lookup.get(_path_key(label_path))
+                    if known is not None:
+                        label_paths.add(known)
+    elif target.is_file() and target.suffix.lower() in IMAGE_EXT:
+        for label_path in _candidate_label_paths_for_image(target, dataset_dir):
+            known = label_lookup.get(_path_key(label_path))
+            if known is not None:
+                label_paths.add(known)
+    return label_paths
+
+
+def _candidate_label_dirs_for_image_dir(image_dir: Path, dataset_dir: Path, split: str) -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        relative_parts = list(image_dir.resolve().relative_to(dataset_dir.resolve()).parts)
+    except (OSError, ValueError):
+        relative_parts = []
+    for index, part in enumerate(relative_parts):
+        if part.lower() in YOLO_IMAGE_DIR_NAMES:
+            candidates.append(dataset_dir.joinpath(*(relative_parts[:index] + ["labels"] + relative_parts[index + 1 :])))
+
+    for split_name in _yolo_split_aliases(split):
+        candidates.append(dataset_dir / "labels" / split_name)
+        parent = image_dir.parent
+        if parent.name.lower() in YOLO_IMAGE_DIR_NAMES:
+            candidates.append(parent.parent / "labels" / split_name)
+    return _unique_paths(candidates)
+
+
+def _candidate_label_paths_for_image(image_path: Path, dataset_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        relative_parts = list(image_path.resolve().relative_to(dataset_dir.resolve()).parts)
+    except (OSError, ValueError):
+        relative_parts = []
+    for index, part in enumerate(relative_parts):
+        if part.lower() in YOLO_IMAGE_DIR_NAMES:
+            candidate = dataset_dir.joinpath(*(relative_parts[:index] + ["labels"] + relative_parts[index + 1 :]))
+            candidates.append(candidate.with_suffix(".txt"))
+    candidates.append(dataset_dir / "labels" / image_path.with_suffix(".txt").name)
+    return _unique_paths(candidates)
+
+
+def _known_label_paths_under(label_dir: Path, label_lookup: dict[str, Path]) -> set[Path]:
+    out: set[Path] = set()
+    if not label_dir.is_dir():
+        return out
+    for path in sorted(label_dir.rglob("*.txt")):
+        known = label_lookup.get(_path_key(path))
+        if known is not None:
+            out.add(known)
+    return out
+
+
+def _known_label_paths_for_split_name(label_lookup: dict[str, Path], split: str) -> set[Path]:
+    aliases = set(_yolo_split_aliases(split))
+    return {
+        path
+        for path in label_lookup.values()
+        if aliases.intersection({part.lower() for part in path.parts})
+    }
+
+
+def _yolo_split_aliases(split: str) -> list[str]:
+    if split == "val":
+        return ["val", "valid", "validation"]
+    return [split]
+
+
+def _image_paths_from_yolo_split_file(path: Path, config_base: Path):
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return
+    for line in lines:
+        value = _strip_yaml_comment(line).strip()
+        if not value:
+            continue
+        candidate = Path(value)
+        if candidate.is_absolute():
+            yield candidate
+            continue
+        from_list_dir = path.parent / candidate
+        if from_list_dir.exists():
+            yield from_list_dir
+        else:
+            yield config_base / candidate
+
+
+def _yolo_class_names_from_configs(paths: list[Path]) -> list[str]:
+    for path in paths[:3]:
+        names = _parse_yolo_config_file(path)["class_names"]
+        if names:
+            return list(names)
+    return []
+
+
+def _parse_yolo_names(text: str) -> list[str]:
+    lines = text.splitlines()
+    pattern = re.compile(r"^(\s*)names\s*:\s*(.*?)\s*$", re.IGNORECASE)
+    for index, line in enumerate(lines):
+        match = pattern.match(line)
+        if not match:
+            continue
+        base_indent = len(match.group(1))
+        inline_value = _strip_yaml_comment(match.group(2)).strip()
+        if inline_value:
+            return _parse_yolo_inline_names(inline_value)
+
+        block_items: list[tuple[object, object]] = []
+        list_index = 0
+        for block_line in lines[index + 1 :]:
+            stripped = block_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(block_line) - len(block_line.lstrip())
+            if indent <= base_indent:
+                break
+            cleaned = _strip_yaml_comment(stripped).strip()
+            if not cleaned:
+                continue
+            keyed = re.match(r"^([^:]+)\s*:\s*(.+?)\s*$", cleaned)
+            listed = re.match(r"^-\s*(.+?)\s*$", cleaned)
+            if keyed:
+                block_items.append((_clean_yaml_scalar(keyed.group(1)), keyed.group(2)))
+            elif listed:
+                block_items.append((list_index, listed.group(1)))
+                list_index += 1
+            elif cleaned.startswith("[") or cleaned.startswith("{"):
+                return _parse_yolo_inline_names(cleaned)
+        return _names_from_mapping_items(block_items)
+    return []
+
+
+def _parse_yolo_inline_names(value: str) -> list[str]:
+    cleaned = _strip_yaml_comment(value).strip()
+    if not cleaned:
+        return []
+    try:
+        parsed = ast.literal_eval(cleaned)
+    except (SyntaxError, ValueError):
+        parsed = None
+    if isinstance(parsed, list):
+        return [_clean_yaml_scalar(item) for item in parsed if _clean_yaml_scalar(item)]
+    if isinstance(parsed, dict):
+        return _names_from_mapping_items(list(parsed.items()))
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        return [
+            _clean_yaml_scalar(item)
+            for item in _split_inline_csv(cleaned[1:-1])
+            if _clean_yaml_scalar(item)
+        ]
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        items: list[tuple[object, object]] = []
+        for item in _split_inline_csv(cleaned[1:-1]):
+            if ":" not in item:
+                continue
+            key, raw_name = item.split(":", 1)
+            items.append((_clean_yaml_scalar(key), raw_name))
+        return _names_from_mapping_items(items)
+    return []
+
+
+def _names_from_mapping_items(items: list[tuple[object, object]]) -> list[str]:
+    ordered: list[tuple[tuple[int, int, int], str]] = []
+    for order, (key, value) in enumerate(items):
+        name = _clean_yaml_scalar(value)
+        if not name:
+            continue
+        try:
+            numeric_key = int(str(key).strip().strip("'\""))
+            sort_key = (0, numeric_key, order)
+        except ValueError:
+            sort_key = (1, order, order)
+        ordered.append((sort_key, name))
+    return [name for _, name in sorted(ordered, key=lambda item: item[0])]
+
+
+def _parse_yolo_label_file(path: Path) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return counts
+    for line in lines:
+        parsed = _parse_yolo_label_row(line)
+        if parsed is None:
+            continue
+        class_id = parsed[0]
+        counts[class_id] = counts.get(class_id, 0) + 1
+    return counts
+
+
 def _metadata_summary(artifacts: list[dict]) -> dict:
     counts: dict[str, int] = {}
     for artifact in artifacts:
         artifact_type = str(artifact.get("artifact_type", "unknown"))
         counts[artifact_type] = counts.get(artifact_type, 0) + 1
+    yolo_available = any(
+        artifact.get("artifact_type") in {"yolo_dataset_config", "yolo_label_file"}
+        for artifact in artifacts
+    )
+    bbox_available = any(artifact.get("artifact_type") == "bounding_boxes" for artifact in artifacts) or yolo_available
     return {
         "artifact_counts": counts,
         "metadata_available": any(
             artifact.get("artifact_type") in METADATA_ARTIFACT_TYPES
             for artifact in artifacts
         ),
-        "bbox_available": any(artifact.get("artifact_type") == "bounding_boxes" for artifact in artifacts),
+        "bbox_available": bbox_available,
+        "object_detection_available": yolo_available or bbox_available,
+        "yolo_available": yolo_available,
     }
 
 
@@ -545,10 +1245,15 @@ def _bbox_trait_summary(artifacts: list[dict]) -> dict:
     bbox_count = 0
     area_ratios: list[float] = []
     for artifact in artifacts:
-        if artifact.get("artifact_type") not in {"bounding_boxes", "annotation_json"}:
+        if artifact.get("artifact_type") not in {"bounding_boxes", "annotation_json", "yolo_label_file"}:
             continue
         path = Path(str(artifact.get("path") or ""))
         try:
+            if artifact.get("artifact_type") == "yolo_label_file":
+                label_areas = _yolo_label_area_ratios(path)
+                bbox_count += len(label_areas)
+                area_ratios.extend(label_areas)
+                continue
             if path.name.lower() in CUB_BBOX_FILE_NAMES:
                 bbox_count += _count_cub_bbox_rows(path)
                 continue
@@ -584,6 +1289,23 @@ def _bbox_trait_summary(artifacts: list[dict]) -> dict:
     else:
         object_scale = "medium"
     return {"bbox_count": bbox_count, "median_area_ratio": median_area, "object_scale": object_scale}
+
+
+def _yolo_label_area_ratios(path: Path) -> list[float]:
+    areas: list[float] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return areas
+    for line in lines:
+        parsed = _parse_yolo_label_row(line)
+        if parsed is None:
+            continue
+        _, _, _, width, height = parsed
+        area = width * height
+        if area > 0:
+            areas.append(max(0.0, min(1.0, area)))
+    return areas
 
 
 def _count_cub_bbox_rows(path: Path) -> int:
@@ -654,8 +1376,13 @@ def _dataset_traits(
     artifacts: list[dict],
     corrupt_file_count: int,
     visual_traits: dict | None = None,
+    metadata_summary: dict | None = None,
 ) -> list[str]:
     traits: list[str] = []
+    metadata_summary = metadata_summary or {}
+    if metadata_summary.get("yolo_available"):
+        traits.append("yolo_format")
+        traits.append("object_detection")
     if image_count < 500:
         traits.append("small_dataset")
     elif image_count < 5000:
@@ -676,7 +1403,7 @@ def _dataset_traits(
         traits.append("high_resolution")
     if min_dimension and max_dimension > min_dimension * 2:
         traits.append("variable_image_dimensions")
-    if any(artifact.get("artifact_type") == "bounding_boxes" for artifact in artifacts):
+    if metadata_summary.get("bbox_available") or any(artifact.get("artifact_type") == "bounding_boxes" for artifact in artifacts):
         traits.append("bbox_available")
     if any(
         artifact.get("artifact_type") in METADATA_ARTIFACT_TYPES

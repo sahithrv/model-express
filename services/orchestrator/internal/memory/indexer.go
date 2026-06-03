@@ -4,19 +4,24 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"model-express/services/orchestrator/internal/embeddings"
 )
 
 const (
-	MaxEmbeddingTextRunes = 12000
-	maxCardMapEntries     = 100
-	maxCardSliceEntries   = 100
+	MaxEmbeddingTextRunes     = 12000
+	maxCardMapEntries         = 100
+	maxCardSliceEntries       = 100
+	maxAutomaticBackfillLimit = 50
 )
 
 type MemoryEmbeddingStore interface {
-	ListUnembeddedMemorySources(projectID string, limit int) ([]EmbeddableMemoryCard, error)
+	ListUnembeddedMemorySources(projectID string, embeddingModel string, embeddingDimensions int, limit int) ([]EmbeddableMemoryCard, error)
+	GetMemoryEmbeddingSourceState(projectID string, sourceTable string, sourceID string, embeddingModel string) (MemoryEmbeddingSourceState, error)
 	UpsertMemoryEmbedding(record MemoryEmbeddingRecord) (MemoryEmbeddingRecord, error)
+	CreateMemoryEmbeddingUsageEvent(event MemoryEmbeddingUsageEvent) (MemoryEmbeddingUsageEvent, error)
+	CountProjectMemoryEmbeddingUsageEvents(projectID string, purpose string, since time.Time) (int, error)
 }
 
 type MemoryIndexer struct {
@@ -60,7 +65,11 @@ func (i *MemoryIndexer) BackfillProject(ctx context.Context, projectID string) (
 	if projectID == "" {
 		return MemoryIndexResult{}, fmt.Errorf("project_id is required for memory embedding backfill")
 	}
-	sources, err := i.store.ListUnembeddedMemorySources(projectID, i.config.Normalized().BackfillLimit)
+	limit := i.config.Normalized().BackfillLimit
+	if limit <= 0 || limit > maxAutomaticBackfillLimit {
+		limit = maxAutomaticBackfillLimit
+	}
+	sources, err := i.store.ListUnembeddedMemorySources(projectID, i.config.Model, i.config.Dimensions, limit)
 	if err != nil {
 		return MemoryIndexResult{}, err
 	}
@@ -89,6 +98,33 @@ func (i *MemoryIndexer) IndexCards(ctx context.Context, cards []EmbeddableMemory
 				Kind:        card.Kind,
 				Reason:      reason,
 			})
+			_ = i.recordSourceIndexUsage(card, 0, false, true, false, reason, nil, MemoryEmbeddingRecord{})
+			continue
+		}
+
+		if capExceeded, capReason := i.sourceIndexCapExceeded(card.ProjectID); capExceeded {
+			result.Skipped++
+			result.Skips = append(result.Skips, MemoryIndexSkip{
+				SourceTable: card.SourceTable,
+				SourceID:    card.SourceID,
+				Kind:        card.Kind,
+				Reason:      capReason,
+			})
+			_ = i.recordSourceIndexUsage(card, 0, false, true, true, capReason, nil, MemoryEmbeddingRecord{})
+			continue
+		}
+
+		state, err := i.store.GetMemoryEmbeddingSourceState(card.ProjectID, card.SourceTable, card.SourceID, config.Model)
+		if err == nil && state.EmbeddingDimensions == config.Dimensions && strings.EqualFold(state.EmbeddingTextHash, HashEmbeddingText(card.Text)) {
+			result.Skipped++
+			reason := "unchanged source card already embedded for model and dimensions"
+			result.Skips = append(result.Skips, MemoryIndexSkip{
+				SourceTable: card.SourceTable,
+				SourceID:    card.SourceID,
+				Kind:        card.Kind,
+				Reason:      reason,
+			})
+			_ = i.recordSourceIndexUsage(card, 0, false, true, false, reason, nil, MemoryEmbeddingRecord{})
 			continue
 		}
 
@@ -98,6 +134,10 @@ func (i *MemoryIndexer) IndexCards(ctx context.Context, cards []EmbeddableMemory
 			Dimensions: config.Dimensions,
 		})
 		if err != nil {
+			usageErr := i.recordSourceIndexUsage(card, 1, false, false, false, err.Error(), nil, MemoryEmbeddingRecord{})
+			if usageErr != nil {
+				return result, fmt.Errorf("record source indexing usage %s/%s: %w", card.SourceTable, card.SourceID, usageErr)
+			}
 			return result, fmt.Errorf("embed memory card %s/%s: %w", card.SourceTable, card.SourceID, err)
 		}
 		if len(embedded.Vector) == 0 {
@@ -115,7 +155,7 @@ func (i *MemoryIndexer) IndexCards(ctx context.Context, cards []EmbeddableMemory
 			model = config.Model
 		}
 
-		if _, err := i.store.UpsertMemoryEmbedding(MemoryEmbeddingRecord{
+		record, err := i.store.UpsertMemoryEmbedding(MemoryEmbeddingRecord{
 			SourceTable:         strings.TrimSpace(card.SourceTable),
 			SourceID:            strings.TrimSpace(card.SourceID),
 			ProjectID:           strings.TrimSpace(card.ProjectID),
@@ -129,12 +169,18 @@ func (i *MemoryIndexer) IndexCards(ctx context.Context, cards []EmbeddableMemory
 			EmbeddingDimensions: dimensions,
 			Embedding:           append([]float32(nil), embedded.Vector...),
 			EmbeddingText:       strings.TrimSpace(card.Text),
+			EmbeddingTextHash:   HashEmbeddingText(card.Text),
 			SummaryCard:         copyCardMap(card.SummaryCard),
 			Metadata:            copyCardMap(card.Metadata),
 			QualityScore:        card.QualityScore,
 			OutcomeScore:        card.OutcomeScore,
-		}); err != nil {
+		})
+		if err != nil {
+			_ = i.recordSourceIndexUsage(card, 1, false, false, false, err.Error(), embedded.Usage, MemoryEmbeddingRecord{})
 			return result, fmt.Errorf("upsert memory embedding %s/%s: %w", card.SourceTable, card.SourceID, err)
+		}
+		if usageErr := i.recordSourceIndexUsage(card, 1, false, false, false, "", embedded.Usage, record); usageErr != nil {
+			return result, fmt.Errorf("record source indexing usage %s/%s: %w", card.SourceTable, card.SourceID, usageErr)
 		}
 		result.Indexed++
 	}
@@ -155,6 +201,76 @@ func (i *MemoryIndexer) noopReason() string {
 		return "memory embedding store is not configured"
 	}
 	return ""
+}
+
+func (i *MemoryIndexer) sourceIndexCapExceeded(projectID string) (bool, string) {
+	if i == nil || i.store == nil {
+		return false, ""
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return false, ""
+	}
+	config := i.config.Normalized()
+	if config.MaxCallsPerDay <= 0 {
+		return false, ""
+	}
+	since := time.Now().UTC().Truncate(24 * time.Hour)
+	count, err := i.store.CountProjectMemoryEmbeddingUsageEvents(projectID, EmbeddingUsagePurposeSourceIndex, since)
+	if err != nil {
+		return false, ""
+	}
+	if count >= config.MaxCallsPerDay {
+		return true, "source indexing embedding call cap reached for today"
+	}
+	return false, ""
+}
+
+func (i *MemoryIndexer) recordSourceIndexUsage(card EmbeddableMemoryCard, providerCallCount int, cached bool, skipped bool, budgetExceeded bool, skipReason string, providerUsage map[string]any, upserted MemoryEmbeddingRecord) error {
+	if i == nil || i.store == nil {
+		return nil
+	}
+	metadata := map[string]any{
+		"provider_call_count": providerCallCount,
+		"cached":              cached,
+		"skipped":             skipped,
+		"budget_exhausted":    budgetExceeded,
+	}
+	if len(providerUsage) > 0 {
+		metadata["provider_usage"] = providerUsage
+	}
+	if upserted.ID != "" {
+		metadata["embedding_id"] = upserted.ID
+		metadata["embedding_model"] = upserted.EmbeddingModel
+	}
+	event := MemoryEmbeddingUsageEvent{
+		ProjectID:           strings.TrimSpace(card.ProjectID),
+		DatasetID:           strings.TrimSpace(card.DatasetID),
+		PlanID:              strings.TrimSpace(card.PlanID),
+		JobID:               strings.TrimSpace(card.JobID),
+		InvocationID:        strings.TrimSpace(card.InvocationID),
+		Purpose:             EmbeddingUsagePurposeSourceIndex,
+		SourceTable:         strings.TrimSpace(card.SourceTable),
+		SourceID:            strings.TrimSpace(card.SourceID),
+		EmbeddingModel:      strings.TrimSpace(upserted.EmbeddingModel),
+		EmbeddingDimensions: upserted.EmbeddingDimensions,
+		InputBytes:          len([]byte(card.Text)),
+		ProviderCallCount:   providerCallCount,
+		Skipped:             skipped,
+		SkipReason:          skipReason,
+		SourceTextHash:      HashEmbeddingText(card.Text),
+		ProviderUsage:       providerUsage,
+		Metadata:            metadata,
+	}
+	if upserted.ID == "" {
+		event.EmbeddingModel = strings.TrimSpace(i.config.Model)
+		event.EmbeddingDimensions = i.config.Dimensions
+	}
+	if event.SourceTable == "" || event.SourceID == "" || event.ProjectID == "" {
+		return nil
+	}
+	_, err := i.store.CreateMemoryEmbeddingUsageEvent(event)
+	return err
 }
 
 func memoryCardIndexSkipReason(card EmbeddableMemoryCard) string {
@@ -205,7 +321,7 @@ func supportedMemoryCardKind(card EmbeddableMemoryCard) bool {
 		return kind == "strategy_scorecard"
 	case SourceAgentMemoryRecord:
 		switch kind {
-		case KindPlanningOutcome, KindPlanningFeedback, KindTrainingEvaluation:
+		case KindPlanningOutcome, KindPlanningFeedback, KindTrainingEvaluation, KindChampionFeedback:
 			return true
 		default:
 			return false

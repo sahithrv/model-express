@@ -74,6 +74,7 @@ type TrainingMonitorEvaluationTrace struct {
 	ResponseID              string
 	PreviousResponseID      string
 	ToolRounds              int
+	Usage                   *llm.Usage
 	ToolCalls               []AgentToolCallTrace
 	ToolResults             []AgentToolResultTrace
 	RejectedToolCalls       []AgentToolResultTrace
@@ -162,6 +163,14 @@ type trainingMonitorToolLoopGenerator interface {
 func (a TrainingMonitorAgent) generateTrainingMonitorJSON(ctx context.Context, trace *TrainingMonitorEvaluationTrace, input TrainingMonitorInput) ([]byte, error) {
 	toolGenerator, ok := a.generator.(trainingMonitorToolLoopGenerator)
 	if !ok {
+		if usageGenerator, ok := a.generator.(jsonUsageGenerator); ok {
+			result, err := usageGenerator.GenerateJSONWithUsage(ctx, trace.Request)
+			if err != nil {
+				return nil, err
+			}
+			trace.Usage = result.Usage
+			return result.RawJSON, nil
+		}
 		return a.generator.GenerateJSON(ctx, trace.Request)
 	}
 
@@ -177,6 +186,7 @@ func (a TrainingMonitorAgent) generateTrainingMonitorJSON(ctx context.Context, t
 	trace.ResponseID = result.ResponseID
 	trace.PreviousResponseID = result.PreviousResponseID
 	trace.ToolRounds = result.ToolRounds
+	trace.Usage = result.Usage
 	trace.ToolCalls = toolCallTraces(result.ToolCalls)
 	trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults = toolResultTraces(result.ToolResults)
 	return result.FinalJSON, nil

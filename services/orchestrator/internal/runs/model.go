@@ -16,6 +16,12 @@ const (
 	ChampionDemoPredictionStatusFailed             = "FAILED"
 )
 
+const (
+	ChampionFeedbackRatingGood     = "good"
+	ChampionFeedbackRatingMediocre = "mediocre"
+	ChampionFeedbackRatingBad      = "bad"
+)
+
 type TrainingRunSummary struct {
 	JobID               string    `json:"job_id"`
 	ProjectID           string    `json:"project_id"`
@@ -191,4 +197,36 @@ type ChampionDemoPredictionUpdate struct {
 	Correct        *bool
 	Error          string
 	ImageMetadata  map[string]any
+}
+
+type ChampionFeedback struct {
+	ID                 string         `json:"id"`
+	ProjectID          string         `json:"project_id"`
+	ChampionID         string         `json:"champion_id"`
+	PredictionID       string         `json:"prediction_id,omitempty"`
+	JobID              string         `json:"job_id"`
+	DatasetID          string         `json:"dataset_id"`
+	ImageURI           string         `json:"image_uri,omitempty"`
+	ImageID            string         `json:"image_id,omitempty"`
+	Rating             string         `json:"rating"`
+	Message            string         `json:"message,omitempty"`
+	PredictionSnapshot map[string]any `json:"prediction_snapshot"`
+	MetricsSnapshot    map[string]any `json:"metrics_snapshot"`
+	Metadata           map[string]any `json:"metadata"`
+	CreatedAt          time.Time      `json:"created_at"`
+}
+
+type ChampionFeedbackCreate struct {
+	ProjectID          string
+	ChampionID         string
+	PredictionID       string
+	JobID              string
+	DatasetID          string
+	ImageURI           string
+	ImageID            string
+	Rating             string
+	Message            string
+	PredictionSnapshot map[string]any
+	MetricsSnapshot    map[string]any
+	Metadata           map[string]any
 }

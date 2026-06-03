@@ -165,10 +165,14 @@ def run_champion_demo_prediction_job(client: OrchestratorClient, job: dict) -> N
             image_path=image_path,
             top_k=_positive_int(config.get("top_k"), 5),
             true_label=true_label,
+            confidence_threshold=_optional_float(config.get("confidence_threshold")),
+            iou_threshold=_optional_float(config.get("iou_threshold")),
+            max_detections=_optional_positive_int(config.get("max_detections")),
         )
         payload = _prediction_result_from_inference(inference)
 
-    result_image_metadata = dict(image_metadata)
+    inference_image_metadata = payload.get("image_metadata") if isinstance(payload.get("image_metadata"), dict) else {}
+    result_image_metadata = {**dict(image_metadata), **inference_image_metadata}
     latency_breakdown = payload.get("latency_breakdown_ms")
     if isinstance(latency_breakdown, dict):
         result_image_metadata["latency_breakdown_ms"] = latency_breakdown
@@ -779,7 +783,7 @@ def _export_result_payload(
 
 def _prediction_result_from_inference(payload: dict) -> dict:
     if payload.get("status") == "ok":
-        return {
+        result = {
             "status": "SUCCEEDED",
             "predicted_label": payload.get("predicted_label", ""),
             "confidence": payload.get("confidence", 0.0),
@@ -788,6 +792,16 @@ def _prediction_result_from_inference(payload: dict) -> dict:
             "correct": payload.get("correct"),
             "runtime": payload.get("runtime", "torchscript"),
         }
+        if isinstance(payload.get("image_metadata"), dict):
+            result["image_metadata"] = payload["image_metadata"]
+        if isinstance(payload.get("detections"), list):
+            result.setdefault("image_metadata", {})
+            result["image_metadata"]["detections"] = payload["detections"]
+            result["image_metadata"]["detection_count"] = len(payload["detections"])
+        if "postprocess_latency_ms" in payload:
+            result.setdefault("image_metadata", {})
+            result["image_metadata"]["postprocess_latency_ms"] = payload["postprocess_latency_ms"]
+        return result
     error_code = str(payload.get("error_code", "INFERENCE_UNAVAILABLE"))
     status = "RUNTIME_UNAVAILABLE"
     if error_code in {"INFERENCE_FAILED"}:
@@ -801,6 +815,22 @@ def _prediction_result_from_inference(payload: dict) -> dict:
         "top_k": [],
         "latency_ms": 0.0,
     }
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    parsed = _positive_int(value, 0)
+    return parsed if parsed > 0 else None
 
 
 def _validated_exemplar_payload(pack: dict, caps: dict) -> dict:

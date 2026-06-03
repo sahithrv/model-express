@@ -23,6 +23,7 @@ type EmbedResult struct {
 	Model      string
 	Dimensions int
 	Vector     []float32
+	Usage      map[string]any
 }
 
 type Client interface {
@@ -137,6 +138,7 @@ func (c *OpenAICompatibleClient) Embed(ctx context.Context, req EmbedRequest) (E
 		Model:      model,
 		Dimensions: len(vector),
 		Vector:     vector,
+		Usage:      copyAnyMap(decoded.Usage),
 	}, nil
 }
 
@@ -192,6 +194,7 @@ type embeddingResponse struct {
 	Data  []struct {
 		Embedding []float32 `json:"embedding"`
 	} `json:"data"`
+	Usage map[string]any `json:"usage,omitempty"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type,omitempty"`
@@ -224,4 +227,15 @@ type errorsText string
 
 func (e errorsText) Error() string {
 	return string(e)
+}
+
+func copyAnyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }

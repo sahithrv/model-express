@@ -209,7 +209,7 @@ func ExecuteExperimentPlannerInformationTool(input ExperimentPlannerInput, name 
 		})
 	case PlannerToolModelCatalog:
 		return acceptedPlannerTool(normalized, map[string]any{
-			"model_catalog": input.ModelCatalog,
+			"model_catalog": compactPlannerModelCatalog(input.ModelCatalog),
 		})
 	case PlannerToolRecentPlannerFailures:
 		return acceptedPlannerTool(normalized, map[string]any{

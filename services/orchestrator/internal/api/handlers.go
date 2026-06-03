@@ -110,10 +110,12 @@ const (
 	maxLLMPlannerExperiments               = 5
 	plannerMinimumMeaningfulImprovement    = 0.005
 	plannerAutonomousMeaningfulImprovement = 0.010
+	championSelectionOverrideMinDelta      = 0.025
 	plannerNoImprovementRoundsToSelect     = 2
 	plannerDefaultMaxFollowUpRounds        = 10
 	plannerAutonomousMaxFollowUpRounds     = 3
 	plannerBackendValidationRetryLimit     = 1
+	plannerDefaultMaxToolRounds            = 10
 
 	visualAnalysisDefaultCooldownMinutes      = 360
 	visualAnalysisDefaultMaxRunsPerProfile    = 3
@@ -176,11 +178,25 @@ type createChampionExportRequest struct {
 }
 
 type createChampionDemoPredictionRequest struct {
-	ImageURI      string         `json:"image_uri" binding:"required"`
-	ImageID       string         `json:"image_id"`
-	TrueLabel     string         `json:"true_label"`
-	ImageMetadata map[string]any `json:"image_metadata"`
-	TopK          int            `json:"top_k"`
+	ImageURI            string         `json:"image_uri" binding:"required"`
+	ImageID             string         `json:"image_id"`
+	TrueLabel           string         `json:"true_label"`
+	ImageMetadata       map[string]any `json:"image_metadata"`
+	TopK                int            `json:"top_k"`
+	ConfidenceThreshold *float64       `json:"confidence_threshold"`
+	IOUThreshold        *float64       `json:"iou_threshold"`
+	MaxDetections       int            `json:"max_detections"`
+}
+
+type createChampionFeedbackRequest struct {
+	PredictionID       string         `json:"prediction_id"`
+	ImageURI           string         `json:"image_uri"`
+	ImageID            string         `json:"image_id"`
+	Rating             string         `json:"rating" binding:"required"`
+	Message            string         `json:"message"`
+	PredictionSnapshot map[string]any `json:"prediction_snapshot"`
+	MetricsSnapshot    map[string]any `json:"metrics_snapshot"`
+	Metadata           map[string]any `json:"metadata"`
 }
 
 type championExportResultRequest struct {
@@ -1360,23 +1376,47 @@ func (s *Server) createProjectChampionExport(c *gin.Context) {
 		return
 	}
 
-	requestArtifactURI := strings.TrimSpace(req.ArtifactURI)
-	artifactURI := requestArtifactURI
-	if artifactURI == "" {
-		artifactURI = championArtifactURI(champion.DeploymentProfile)
+	export, err := s.ensureChampionExport(projectID, champion, job, format, req.ArtifactURI, req.Metadata)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, export)
+}
+
+func (s *Server) ensureChampionExport(
+	projectID string,
+	champion runs.ProjectChampion,
+	championJob jobs.ExperimentJob,
+	format string,
+	requestArtifactURI string,
+	requestMetadata map[string]any,
+) (runs.ChampionExport, error) {
+	requestArtifactURI = strings.TrimSpace(requestArtifactURI)
+	sourceArtifactURI := requestArtifactURI
+	if sourceArtifactURI == "" {
+		sourceArtifactURI = championArtifactURIForFormat(champion.DeploymentProfile, format)
+	}
+	artifactURI := ""
+	if requestArtifactURI != "" || artifactMatchesChampionExportFormat(sourceArtifactURI, format) {
+		artifactURI = sourceArtifactURI
 	}
 	status := runs.ChampionExportStatusPending
 	validationErrors := []string{}
-	if artifactURI == "" {
+	if sourceArtifactURI == "" {
 		status = runs.ChampionExportStatusPendingArtifact
 		validationErrors = append(validationErrors, "selected champion has no exportable artifact URI yet")
-	} else if artifactMatchesChampionExportFormat(artifactURI, format) {
+	} else if artifactURI != "" {
 		status = runs.ChampionExportStatusReady
-	} else if requestArtifactURI != "" {
-		status = runs.ChampionExportStatusReady
+	} else {
+		validationErrors = append(validationErrors, fmt.Sprintf("selected champion artifact does not match requested %s export; worker export required", format))
 	}
 
-	metadata := championExportMetadata(champion, format, req.Metadata)
+	metadata := championExportMetadata(champion, format, requestMetadata)
+	if sourceArtifactURI != "" && sourceArtifactURI != artifactURI {
+		metadata["source_artifact_uri"] = sourceArtifactURI
+	}
 	export, err := s.store.CreateChampionExport(runs.ChampionExportCreate{
 		ProjectID:        projectID,
 		ChampionID:       champion.ID,
@@ -1388,24 +1428,23 @@ func (s *Server) createProjectChampionExport(c *gin.Context) {
 		ValidationErrors: validationErrors,
 	})
 	if err != nil {
-		writeStoreError(c, err)
-		return
+		return runs.ChampionExport{}, err
 	}
-	datasetID := championDatasetID(champion, job)
-	if datasetID != "" && export.Status != runs.ChampionExportStatusReady {
+	datasetID := championDatasetID(champion, championJob)
+	if datasetID != "" && sourceArtifactURI != "" && export.Status != runs.ChampionExportStatusReady {
 		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateExportChampion, map[string]any{
-			"dataset_id":      datasetID,
-			"champion_id":     champion.ID,
-			"champion_job_id": champion.JobID,
-			"export_id":       export.ID,
-			"format":          export.Format,
-			"artifact_uri":    artifactURI,
-			"metadata":        metadata,
+			"dataset_id":          datasetID,
+			"champion_id":         champion.ID,
+			"champion_job_id":     champion.JobID,
+			"export_id":           export.ID,
+			"format":              export.Format,
+			"artifact_uri":        artifactURI,
+			"source_artifact_uri": sourceArtifactURI,
+			"metadata":            metadata,
 		}, func(existing jobs.ExperimentJob) bool {
 			return jobConfigString(existing.Config, "export_id") == export.ID
 		}); err != nil {
-			writeStoreError(c, err)
-			return
+			return runs.ChampionExport{}, err
 		}
 	}
 	if _, err := s.store.CreateExecutionEvent(projectID, champion.PlanID, execution.EventChampionExportRequested, fmt.Sprintf("Champion export requested for job %s.", champion.JobID), map[string]any{
@@ -1418,7 +1457,7 @@ func (s *Server) createProjectChampionExport(c *gin.Context) {
 		log.Printf("record champion export event failed: %v", err)
 	}
 
-	c.JSON(http.StatusCreated, export)
+	return export, nil
 }
 
 func (s *Server) listProjectChampionDemoImages(c *gin.Context) {
@@ -1471,6 +1510,18 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		writeStoreError(c, fmt.Errorf("%w: top_k must be at most 10", store.ErrInvalidRequest))
 		return
 	}
+	if req.ConfidenceThreshold != nil && (*req.ConfidenceThreshold < 0 || *req.ConfidenceThreshold > 1) {
+		writeStoreError(c, fmt.Errorf("%w: confidence_threshold must be between 0 and 1", store.ErrInvalidRequest))
+		return
+	}
+	if req.IOUThreshold != nil && (*req.IOUThreshold < 0 || *req.IOUThreshold > 1) {
+		writeStoreError(c, fmt.Errorf("%w: iou_threshold must be between 0 and 1", store.ErrInvalidRequest))
+		return
+	}
+	if req.MaxDetections < 0 || req.MaxDetections > 1000 {
+		writeStoreError(c, fmt.Errorf("%w: max_detections must be between 0 and 1000", store.ErrInvalidRequest))
+		return
+	}
 	imageURI := strings.TrimSpace(req.ImageURI)
 	if imageURI == "" {
 		writeStoreError(c, fmt.Errorf("%w: image_uri is required", store.ErrInvalidRequest))
@@ -1496,6 +1547,15 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 	imageMetadata := map[string]any{}
 	for key, value := range req.ImageMetadata {
 		imageMetadata[key] = value
+	}
+	if req.ConfidenceThreshold != nil {
+		imageMetadata["confidence_threshold"] = *req.ConfidenceThreshold
+	}
+	if req.IOUThreshold != nil {
+		imageMetadata["iou_threshold"] = *req.IOUThreshold
+	}
+	if req.MaxDetections > 0 {
+		imageMetadata["max_detections"] = req.MaxDetections
 	}
 	if err == nil {
 		if matchedImageID, matchedTrueLabel, matchedMetadata, ok := championDemoImageMetadata(dataset.Profile, imageURI); ok {
@@ -1529,10 +1589,10 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
-	readyExport, hasReadyExport := usableChampionExport(s.store, champion.ProjectID, champion.ID)
+	readyExport, hasReadyExport := usableChampionExport(s.store, champion)
 	runtimeAvailable := hasReadyExport
 	if hasReadyExport {
-		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateChampionDemoPrediction, map[string]any{
+		jobConfig := map[string]any{
 			"dataset_id":             datasetID,
 			"champion_id":            champion.ID,
 			"champion_job_id":        champion.JobID,
@@ -1549,7 +1609,17 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 			"requested_at":           time.Now().UTC().Format(time.RFC3339),
 			"prediction_contract":    "worker reports via /jobs/:id/champion-demo-prediction-result",
 			"backend_runs_inference": false,
-		}, func(existing jobs.ExperimentJob) bool {
+		}
+		if req.ConfidenceThreshold != nil {
+			jobConfig["confidence_threshold"] = *req.ConfidenceThreshold
+		}
+		if req.IOUThreshold != nil {
+			jobConfig["iou_threshold"] = *req.IOUThreshold
+		}
+		if req.MaxDetections > 0 {
+			jobConfig["max_detections"] = req.MaxDetections
+		}
+		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateChampionDemoPrediction, jobConfig, func(existing jobs.ExperimentJob) bool {
 			return jobConfigString(existing.Config, "prediction_id") == prediction.ID
 		}); err != nil {
 			writeStoreError(c, err)
@@ -1582,9 +1652,202 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 			"champion_job_id": champion.JobID,
 			"image_uri":       imageURI,
 			"top_k":           req.TopK,
-			"returns":         []string{"predicted_label", "true_label", "confidence", "top_k", "latency_ms", "correct"},
+			"returns":         []string{"predicted_label", "true_label", "confidence", "top_k", "latency_ms", "correct", "image_metadata.detections"},
 		},
 	})
+}
+
+func (s *Server) listProjectChampionFeedback(c *gin.Context) {
+	feedback, err := s.store.ListProjectChampionFeedback(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"feedback": feedback})
+}
+
+func (s *Server) createProjectChampionFeedback(c *gin.Context) {
+	projectID := c.Param("id")
+	var req createChampionFeedbackRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	rating := normalizeChampionFeedbackRating(req.Rating)
+	if rating == "" {
+		writeStoreError(c, fmt.Errorf("%w: rating must be good, mediocre, or bad", store.ErrInvalidRequest))
+		return
+	}
+	champion, err := s.store.GetProjectChampion(projectID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	predictionSnapshot := copyPayloadMap(req.PredictionSnapshot)
+	predictionID := strings.TrimSpace(req.PredictionID)
+	imageURI := strings.TrimSpace(req.ImageURI)
+	imageID := strings.TrimSpace(req.ImageID)
+	if predictionID != "" && !strings.HasPrefix(predictionID, "local-") {
+		if prediction, ok, err := s.findProjectChampionDemoPrediction(projectID, predictionID); err != nil {
+			writeStoreError(c, err)
+			return
+		} else if ok {
+			if len(predictionSnapshot) == 0 {
+				if payload, payloadErr := mapFromStruct(prediction); payloadErr == nil {
+					predictionSnapshot = payload
+				}
+			}
+			if imageURI == "" {
+				imageURI = prediction.ImageURI
+			}
+			if imageID == "" {
+				imageID = prediction.ImageID
+			}
+		}
+	}
+	if imageURI == "" {
+		imageURI = firstString(predictionSnapshot, "image_uri", "uri")
+	}
+	if imageID == "" {
+		imageID = firstString(predictionSnapshot, "image_id", "id")
+	}
+
+	metricsSnapshot := championFeedbackMetricsSnapshot(champion)
+	if len(req.MetricsSnapshot) > 0 {
+		metricsSnapshot["user_supplied_metrics"] = copyPayloadMap(req.MetricsSnapshot)
+	}
+	metadata := copyPayloadMap(req.Metadata)
+	metadata["source"] = "champion_test_feedback"
+	metadata["rating_scale"] = []string{runs.ChampionFeedbackRatingGood, runs.ChampionFeedbackRatingMediocre, runs.ChampionFeedbackRatingBad}
+
+	created, err := s.store.CreateChampionFeedback(runs.ChampionFeedbackCreate{
+		ProjectID:          champion.ProjectID,
+		ChampionID:         champion.ID,
+		PredictionID:       predictionID,
+		JobID:              champion.JobID,
+		DatasetID:          champion.DatasetID,
+		ImageURI:           imageURI,
+		ImageID:            imageID,
+		Rating:             rating,
+		Message:            strings.TrimSpace(req.Message),
+		PredictionSnapshot: predictionSnapshot,
+		MetricsSnapshot:    metricsSnapshot,
+		Metadata:           metadata,
+	})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	if record, err := s.store.CreateAgentMemoryRecord(memory.AgentMemoryRecord{
+		ProjectID: champion.ProjectID,
+		DatasetID: champion.DatasetID,
+		PlanID:    champion.PlanID,
+		JobID:     champion.JobID,
+		AgentName: "human_champion_feedback",
+		Kind:      memory.KindChampionFeedback,
+		Summary:   championFeedbackMemorySummary(created, champion),
+		Payload: map[string]any{
+			"outcome_status":       rating,
+			"human_rating":         rating,
+			"human_message":        created.Message,
+			"champion_job_id":      champion.JobID,
+			"champion_model":       payloadString(champion.Metrics, "model"),
+			"prediction_id":        created.PredictionID,
+			"prediction_snapshot":  created.PredictionSnapshot,
+			"metrics_snapshot":     created.MetricsSnapshot,
+			"deployment_feedback":  true,
+			"primary_mechanism":    "model_selection",
+			"intervention":         "champion_export_feedback",
+			"lesson":               championFeedbackLesson(created, champion),
+			"accepted_for_memory":  true,
+			"accepted_for_vector":  true,
+			"rating_scale_version": "champion_feedback_v1",
+		},
+		Tags: []string{"champion_feedback", rating, "user_reported"},
+	}); err == nil {
+		s.indexMemoryCard(c.Request.Context(), memory.NewAgentMemoryCard(record))
+	} else {
+		log.Printf("record champion feedback memory failed: %v", err)
+	}
+
+	if _, err := s.store.CreateExecutionEvent(champion.ProjectID, champion.PlanID, execution.EventChampionFeedbackRecorded, fmt.Sprintf("Champion feedback recorded as %s for job %s.", rating, champion.JobID), map[string]any{
+		"champion_id":     champion.ID,
+		"champion_job_id": champion.JobID,
+		"feedback_id":     created.ID,
+		"prediction_id":   created.PredictionID,
+		"rating":          created.Rating,
+	}); err != nil {
+		log.Printf("record champion feedback event failed: %v", err)
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"feedback": created})
+}
+
+func (s *Server) findProjectChampionDemoPrediction(projectID string, predictionID string) (runs.ChampionDemoPrediction, bool, error) {
+	predictions, err := s.store.ListProjectChampionDemoPredictions(projectID)
+	if err != nil {
+		return runs.ChampionDemoPrediction{}, false, err
+	}
+	for _, prediction := range predictions {
+		if prediction.ID == predictionID {
+			return prediction, true, nil
+		}
+	}
+	return runs.ChampionDemoPrediction{}, false, nil
+}
+
+func normalizeChampionFeedbackRating(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "good", "up", "thumbs_up", "thumbsup", "positive", "yes":
+		return runs.ChampionFeedbackRatingGood
+	case "mediocre", "neutral", "mixed", "okay", "ok", "meh":
+		return runs.ChampionFeedbackRatingMediocre
+	case "bad", "down", "thumbs_down", "thumbsdown", "negative", "no":
+		return runs.ChampionFeedbackRatingBad
+	default:
+		return ""
+	}
+}
+
+func championFeedbackMetricsSnapshot(champion runs.ProjectChampion) map[string]any {
+	return map[string]any{
+		"champion_id":        champion.ID,
+		"champion_job_id":    champion.JobID,
+		"champion_metrics":   copyPayloadMap(champion.Metrics),
+		"evaluation":         copyPayloadMap(champion.Evaluation),
+		"deployment_profile": copyPayloadMap(champion.DeploymentProfile),
+	}
+}
+
+func championFeedbackMemorySummary(feedback runs.ChampionFeedback, champion runs.ProjectChampion) string {
+	model := payloadString(champion.Metrics, "model")
+	if model == "" {
+		model = champion.JobID
+	}
+	message := strings.TrimSpace(feedback.Message)
+	if message != "" {
+		return fmt.Sprintf("User rated champion %s (%s) as %s after export/demo testing: %s", champion.JobID, model, feedback.Rating, message)
+	}
+	return fmt.Sprintf("User rated champion %s (%s) as %s after export/demo testing.", champion.JobID, model, feedback.Rating)
+}
+
+func championFeedbackLesson(feedback runs.ChampionFeedback, champion runs.ProjectChampion) string {
+	model := payloadString(champion.Metrics, "model")
+	if model == "" {
+		model = champion.JobID
+	}
+	switch feedback.Rating {
+	case runs.ChampionFeedbackRatingBad:
+		return fmt.Sprintf("Treat %s metrics as insufficient for deployment unless held-out/custom image behavior improves.", model)
+	case runs.ChampionFeedbackRatingMediocre:
+		return fmt.Sprintf("Treat %s as a borderline champion; future runs should improve user-visible held-out/custom predictions, not only aggregate metrics.", model)
+	default:
+		return fmt.Sprintf("User-visible testing supported %s as a useful champion; similar metric and preprocessing profiles may be deployable.", model)
+	}
 }
 
 func (s *Server) reviewProjectExperiments(c *gin.Context) {
@@ -1829,37 +2092,70 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
+	relaxedValidationWarnings := []string{}
+	baseExperiments := append([]plans.PlannedExperiment(nil), experiments...)
 	experiments, err = plannedExperimentsWithStoredProposalMechanisms(decision.Payload, experiments)
 	if err != nil {
-		return plans.ExperimentPlan{}, false, err
+		if plannerStrictValidationEnabled() {
+			return plans.ExperimentPlan{}, false, err
+		}
+		experiments = baseExperiments
+		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 	}
 	var automlWarnings []string
 	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProject(projectID, experiments)
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
-	if err := validateLLMPlannerStoredMechanismContract(decision, experiments); err != nil {
+	for index, experiment := range experiments {
+		if err := validatePlannedExperiment(experiment, index); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
+	}
+	if err := s.validateExperimentsDatasetCompatibility(sourcePlan.DatasetID, experiments); err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	if err := validateLLMPlannerStoredMechanismContract(decision, experiments); err != nil && plannerStrictValidationEnabled() {
 		message := "Follow-up scheduling blocked because the stored planner decision lacks a valid mechanism contract."
 		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{err.Error()})
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+	} else if err != nil {
+		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 	}
 	experiments, err = s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, sourcePlan.DatasetID, sourcePlan.ID, decision.ID, "", experiments, payloadStringSlice(decision.Payload, "evidence_used"))
 	if err != nil {
-		return plans.ExperimentPlan{}, false, err
+		if plannerStrictValidationEnabled() {
+			return plans.ExperimentPlan{}, false, err
+		}
+		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 	}
-	experiments, skippedExperiments := filterNovelPlannedExperiments(experiments, projectPlans)
-	if len(experiments) == 0 {
-		message := "Follow-up scheduling blocked because every proposed experiment duplicated an existing experiment or only changed minor tuning knobs."
-		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, skippedExperiments)
-		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: follow-up decision has no novel experiments after filtering duplicate or minor-only repeats", errNoNovelFollowUpExperiments)
+	skippedExperiments := []string{}
+	if plannerStrictValidationEnabled() {
+		var filtered []plans.PlannedExperiment
+		filtered, skippedExperiments = filterNovelPlannedExperiments(experiments, projectPlans)
+		experiments = filtered
+		if len(experiments) == 0 {
+			message := "Follow-up scheduling blocked because every proposed experiment duplicated an existing experiment or only changed minor tuning knobs."
+			s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, skippedExperiments)
+			return plans.ExperimentPlan{}, false, fmt.Errorf("%w: follow-up decision has no novel experiments after filtering duplicate or minor-only repeats", errNoNovelFollowUpExperiments)
+		}
+	} else {
+		_, skippedExperiments = filterNovelPlannedExperiments(experiments, projectPlans)
+		for _, warning := range skippedExperiments {
+			warning = strings.Replace(warning, "Skipped follow-up experiment", "Allowed relaxed follow-up experiment", 1)
+			relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarningText(warning))
+		}
 	}
 
 	warnings := []string{
 		fmt.Sprintf("Follow-up plan generated from reviewer decision %s.", decision.ID),
 		fmt.Sprintf("Previous plan: %s.", sourcePlan.ID),
 	}
-	warnings = append(warnings, skippedExperiments...)
+	if plannerStrictValidationEnabled() {
+		warnings = append(warnings, skippedExperiments...)
+	}
 	warnings = append(warnings, automlWarnings...)
+	warnings = append(warnings, uniqueStrings(relaxedValidationWarnings)...)
 
 	plan, err := s.store.CreateExperimentPlan(
 		projectID,
@@ -1898,6 +2194,14 @@ func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisi
 			s.recordFollowUpValidationBlocked(projectID, followUpPlan.ID, decisionID, followUpPlan.ID, message, []string{err.Error()})
 			return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 		}
+	}
+	if err := s.validateExperimentsDatasetCompatibility(followUpPlan.DatasetID, followUpPlan.Experiments); err != nil {
+		message := fmt.Sprintf("Existing follow-up plan %s is blocked because its experiments no longer match the dataset task.", followUpPlan.ID)
+		s.recordFollowUpValidationBlocked(projectID, followUpPlan.ID, decisionID, followUpPlan.ID, message, []string{err.Error()})
+		return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+	}
+	if !plannerStrictValidationEnabled() {
+		return nil
 	}
 	if _, err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, followUpPlan.DatasetID, followUpPlan.ID, decisionID, followUpPlan.ID, followUpPlan.Experiments, nil); err != nil {
 		return err
@@ -1940,8 +2244,10 @@ func (s *Server) validateFollowUpExperimentMechanismsAgainstDataset(
 		if followUpPlanID != "" {
 			message = fmt.Sprintf("Existing follow-up plan %s is blocked because one or more mechanisms lack backend-verifiable diagnosis or dataset support.", followUpPlanID)
 		}
-		s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, []string{err.Error()})
-		return experiments, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+		if plannerStrictValidationEnabled() {
+			s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, []string{err.Error()})
+		}
+		return enrichedExperiments, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 	}
 	return enrichedExperiments, nil
 }
@@ -1958,6 +2264,19 @@ func (s *Server) recordFollowUpValidationBlocked(projectID string, planID string
 	}
 	if _, err := s.store.CreateExecutionEvent(projectID, planID, execution.EventAgentOutcomeRecorded, message, payload); err != nil {
 		log.Printf("record follow-up validation block failed for project %s decision %s: %v", projectID, decisionID, err)
+	}
+}
+
+func (s *Server) recordFollowUpSchedulingFailed(projectID string, planID string, decisionID string, err error) {
+	if err == nil {
+		return
+	}
+	if _, eventErr := s.store.CreateExecutionEvent(projectID, planID, execution.EventAgentOutcomeRecorded, fmt.Sprintf("Planner follow-up scheduling failed for plan %s.", planID), map[string]any{
+		"decision_id":               decisionID,
+		"backend_validation_status": "failed",
+		"backend_validation_error":  err.Error(),
+	}); eventErr != nil {
+		log.Printf("record follow-up scheduling failure failed for project %s decision %s: %v", projectID, decisionID, eventErr)
 	}
 }
 
@@ -2843,6 +3162,34 @@ func (s *Server) listProjectAgentInvocations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"invocations": invocations})
 }
 
+func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
+	projectID := c.Param("id")
+	if _, err := s.store.GetProject(projectID); err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	limit := queryInt(c, "limit", 1000, 1, 5000)
+	invocations, err := s.store.ListProjectAgentInvocations(projectID, memory.AgentInvocationFilter{Limit: limit})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	usageEvents, err := s.store.ListProjectMemoryEmbeddingUsageEvents(projectID, limit)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"project_id":                    projectID,
+		"generated_at":                  time.Now().UTC(),
+		"limit":                         limit,
+		"agent_invocations":             invocations,
+		"memory_embedding_usage_events": usageEvents,
+	})
+}
+
 func (s *Server) listProjectStrategyScorecards(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "25"))
 	scorecards, err := s.store.ListProjectStrategyScorecards(c.Param("id"), limit)
@@ -3052,7 +3399,7 @@ func (s *Server) reportChampionDemoPredictionResult(c *gin.Context) {
 		writeStoreError(c, fmt.Errorf("%w: prediction status must be SUCCEEDED, FAILED, or RUNTIME_UNAVAILABLE", store.ErrInvalidRequest))
 		return
 	}
-	if status == runs.ChampionDemoPredictionStatusSucceeded && strings.TrimSpace(req.PredictedLabel) == "" {
+	if status == runs.ChampionDemoPredictionStatusSucceeded && strings.TrimSpace(req.PredictedLabel) == "" && !championDemoPredictionHasDetectionMetadata(req.ImageMetadata) {
 		writeStoreError(c, fmt.Errorf("%w: predicted_label is required for successful prediction", store.ErrInvalidRequest))
 		return
 	}
@@ -3370,7 +3717,17 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	if err != nil {
 		return err
 	}
-	outcome, err := experimentPlanningOutcomeForPlan(sourceDecision, plan, projectPlans, summaries)
+	evaluations, err := s.store.ListProjectTrainingRunEvaluations(job.ProjectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	goalText := ""
+	if project, err := s.store.GetProject(job.ProjectID); err == nil {
+		goalText = project.Goal
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	outcome, err := experimentPlanningOutcomeForPlan(sourceDecision, plan, projectPlans, summaries, evaluations, projectObjectiveContext(goalText))
 	if err != nil {
 		return err
 	}
@@ -3564,6 +3921,15 @@ func trainingMonitorLLMEnabled() bool {
 	return envFlag("MODEL_EXPRESS_TRAINING_MONITOR_LLM_ENABLED", false)
 }
 
+func experimentPlannerLLMConfig(config llm.Config) llm.Config {
+	defaultRounds := plannerDefaultMaxToolRounds
+	if config.MaxToolRounds > defaultRounds {
+		defaultRounds = config.MaxToolRounds
+	}
+	config.MaxToolRounds = envInt("MODEL_EXPRESS_PLANNER_MAX_TOOL_ROUNDS", defaultRounds, 1, 32)
+	return config
+}
+
 func (s *Server) recordTrainingMonitorInvocation(
 	job jobs.ExperimentJob,
 	summary runs.TrainingRunSummary,
@@ -3575,7 +3941,7 @@ func (s *Server) recordTrainingMonitorInvocation(
 	if validationStatus == "" {
 		validationStatus = memory.InvocationValidationFailed
 	}
-	inputContext := agentInvocationInputContext(trace.PromptContext, config, trace.ToolRounds, trace.ToolCalls, trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults)
+	inputContext := agentInvocationInputContext(trace.PromptContext, config, trace.ToolRounds, trace.Usage, trace.ToolCalls, trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults)
 
 	return s.store.CreateAgentInvocation(memory.AgentInvocation{
 		ProjectID:         job.ProjectID,
@@ -3614,6 +3980,7 @@ func agentInvocationInputContext(
 	promptContext map[string]any,
 	config llm.Config,
 	toolRounds int,
+	usage *llm.Usage,
 	toolCalls []agents.AgentToolCallTrace,
 	toolResults []agents.AgentToolResultTrace,
 	rejectedToolCalls []agents.AgentToolResultTrace,
@@ -3639,6 +4006,9 @@ func agentInvocationInputContext(
 		"dry_run_validation_results": dryRunValidationResults,
 		"tool_calls_are_questions":   true,
 		"mutation_authority":         false,
+	}
+	if usage != nil {
+		out["invocation_runtime"].(map[string]any)["llm_usage"] = usage
 	}
 	return out
 }
@@ -3705,7 +4075,9 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		}
 	}
 
-	config := llm.ConfigFromEnv(automationSettings.LLMEnabled, automationSettings.LLMProvider, automationSettings.LLMModel)
+	s.recordExperimentPlannerStarted(input)
+
+	config := experimentPlannerLLMConfig(llm.ConfigFromEnv(automationSettings.LLMEnabled, automationSettings.LLMProvider, automationSettings.LLMModel))
 	client := llm.NewClient(config)
 	agent := agents.NewExperimentPlannerAgentWithRuntime(client, config.Model, config, agents.PlannerInformationToolOptions{
 		ValidateCandidateExperiments: plannerCandidateDryRunValidator(input),
@@ -3814,6 +4186,20 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 	}
 
 	return true, s.schedulePlannerDecision(job.ProjectID, input.SourcePlan, decision, result)
+}
+
+func (s *Server) recordExperimentPlannerStarted(input agents.ExperimentPlannerInput) {
+	if input.Project.ID == "" || input.SourcePlan.ID == "" {
+		return
+	}
+	if _, err := s.store.CreateExecutionEvent(input.Project.ID, input.SourcePlan.ID, execution.EventAgentStarted, "Experiment Planner started; reading completed runs, memories, and evaluations.", map[string]any{
+		"agent_name":          agents.ExperimentPlannerAgentName,
+		"completed_run_count": len(input.PlanSummaries),
+		"memory_count":        len(input.PriorMemory),
+		"evaluation_count":    len(input.PlanEvaluations),
+	}); err != nil {
+		log.Printf("record experiment planner start event failed for plan %s: %v", input.SourcePlan.ID, err)
+	}
 }
 
 func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (agents.ExperimentPlannerInput, bool, error) {
@@ -3931,7 +4317,7 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		VisualExemplarContext:        visualContext,
 		ObjectiveContext:             objectiveContext,
 		DeterministicDiagnosis:       deterministicDiagnosis,
-		ModelCatalog:                 supportedModelCatalog(),
+		ModelCatalog:                 supportedModelCatalogForDataset(dataset, metadataSummary),
 		CurrentChampion:              currentChampion,
 		SourcePlanBaselineChampion:   baselineChampion,
 		SourcePlanDeltas:             sourcePlanDeltas,
@@ -3969,7 +4355,7 @@ func (s *Server) recordExperimentPlannerInvocation(
 	if validationStatus == "" {
 		validationStatus = memory.InvocationValidationFailed
 	}
-	inputContext := agentInvocationInputContext(trace.PromptContext, config, trace.ToolRounds, trace.ToolCalls, trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults)
+	inputContext := agentInvocationInputContext(trace.PromptContext, config, trace.ToolRounds, trace.Usage, trace.ToolCalls, trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults)
 
 	return s.store.CreateAgentInvocation(memory.AgentInvocation{
 		ProjectID:         input.Project.ID,
@@ -4023,6 +4409,14 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			Invocation: invocation,
 		}
 		if err != nil {
+			lastErr = err
+			willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerTraceValidation(trace, err)
+			s.recordPlannerValidationRejection(invocation, err, attempt, willRetry)
+			if willRetry {
+				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(trace.Recommendation, err, attempt+1))
+				continue
+			}
+			result.Recommendation = trace.Recommendation
 			return result, err
 		}
 
@@ -4094,6 +4488,16 @@ func shouldRetryExperimentPlannerValidation(recommendation agents.ExperimentPlan
 	return strings.EqualFold(strings.TrimSpace(recommendation.DecisionType), decisions.TypeAddExperiments)
 }
 
+func shouldRetryExperimentPlannerTraceValidation(trace agents.ExperimentPlanningTrace, validationErr error) bool {
+	if validationErr == nil {
+		return false
+	}
+	if shouldRetryExperimentPlannerValidation(trace.Recommendation) {
+		return true
+	}
+	return len(trace.RawOutput) > 0 && trace.ValidationStatus == memory.InvocationValidationInvalid
+}
+
 func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents.PlannerCandidateDryRunValidator {
 	return func(recommendation agents.ExperimentPlanningRecommendation) agents.PlannerCandidateDryRunResult {
 		result := agents.PlannerCandidateDryRunResult{
@@ -4109,9 +4513,14 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 			},
 		}
 		if strings.EqualFold(strings.TrimSpace(recommendation.DecisionType), decisions.TypeAddExperiments) {
+			relaxedValidationWarnings := []string{}
 			experiments, err := plannerExperimentsWithProposalMechanisms(recommendation)
 			if err != nil {
-				return invalidPlannerDryRunResult(result, err)
+				if plannerStrictValidationEnabled() {
+					return invalidPlannerDryRunResult(result, err)
+				}
+				experiments, relaxedValidationWarnings = plannerExperimentsWithProposalMechanismsRelaxed(recommendation)
+				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 			}
 			for index := range experiments {
 				if experiments[index].AutoML == nil || !experiments[index].AutoML.Enabled {
@@ -4123,21 +4532,37 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 				}
 				experiments[index] = prepared
 			}
-			if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
-				return invalidPlannerDryRunResult(result, err)
-			}
-			if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
-				return invalidPlannerDryRunResult(result, err)
-			}
 			for index, experiment := range experiments {
 				if err := validatePlannedExperiment(experiment, index); err != nil {
 					return invalidPlannerDryRunResult(result, err)
 				}
+				if err := validateExperimentDatasetCompatibility(experiment, input.Dataset, index); err != nil {
+					return invalidPlannerDryRunResult(result, err)
+				}
+			}
+			if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
+				if plannerStrictValidationEnabled() {
+					return invalidPlannerDryRunResult(result, err)
+				}
+				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
+			}
+			if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
+				if plannerStrictValidationEnabled() {
+					return invalidPlannerDryRunResult(result, err)
+				}
+				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 			}
 			if err := validateMechanismDatasetEvidence(profileWithAgentSafeMetadataSummary(input.Dataset.Profile, input.DatasetInsights.AgentSafeMetadataSummary), experiments, recommendation.EvidenceUsed); err != nil {
-				return invalidPlannerDryRunResult(result, err)
+				if plannerStrictValidationEnabled() {
+					return invalidPlannerDryRunResult(result, err)
+				}
+				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 			}
 			result.Details["validated_experiment_count"] = len(experiments)
+			if len(relaxedValidationWarnings) > 0 {
+				result.Details["planner_validation_mode"] = "relaxed"
+				result.Details["planner_validation_warnings"] = uniqueStrings(relaxedValidationWarnings)
+			}
 		}
 		return result
 	}
@@ -4166,7 +4591,7 @@ func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommend
 			rejectedModels = append(rejectedModels, experiment.Model)
 		}
 	}
-	return agents.PlannerValidationFeedback{
+	feedback := agents.PlannerValidationFeedback{
 		Attempt:             attempt,
 		ValidationError:     validationErr.Error(),
 		RejectedDecision:    recommendation.DecisionType,
@@ -4179,6 +4604,13 @@ func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommend
 			"Only propose experiments that backend validation can schedule.",
 		},
 	}
+	if validationErr != nil && strings.Contains(strings.ToLower(validationErr.Error()), "champion_challenge") {
+		feedback.Instructions = append(
+			feedback.Instructions,
+			"For champion_challenge, every selected experiment_config reason or strategy must explicitly explain how that experiment can beat, improve on, or trade off against the current champion.",
+		)
+	}
+	return feedback
 }
 
 func experimentFeedbackSummary(experiment plans.PlannedExperiment) string {
@@ -4210,6 +4642,9 @@ func applyExperimentPlannerStopCriteria(
 ) agents.ExperimentPlanningRecommendation {
 	decisionType := strings.ToUpper(strings.TrimSpace(recommendation.DecisionType))
 	recommendation.DecisionType = decisionType
+	if decisionType == decisions.TypeWait && plannerWaitShouldSelectChampion(recommendation) && input.CurrentChampion != nil && strings.TrimSpace(input.CurrentChampion.JobID) != "" {
+		return selectChampionForPlannerWaitDecision(recommendation, input)
+	}
 	if decisionType != decisions.TypeAddExperiments {
 		return recommendation
 	}
@@ -4231,6 +4666,49 @@ func applyExperimentPlannerStopCriteria(
 	recommendation.Rationale = strings.TrimSpace(recommendation.Rationale + " Backend stop criteria applied: " + stopReason)
 	recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend guard converted ADD_EXPERIMENTS to SELECT_CHAMPION because additional training had insufficient meaningful upside.")
 	recommendation.Tags = append(recommendation.Tags, "select_champion", guardTag)
+	return recommendation
+}
+
+func plannerWaitShouldSelectChampion(recommendation agents.ExperimentPlanningRecommendation) bool {
+	for _, tag := range recommendation.Tags {
+		if strings.EqualFold(strings.TrimSpace(tag), "audit_only") {
+			return false
+		}
+	}
+	return len(recommendation.EvidenceUsed) > 0 ||
+		len(recommendation.DeterministicDiagnosisUsed) > 0 ||
+		len(recommendation.ChangedVariables) > 0 ||
+		strings.TrimSpace(recommendation.StopCondition) != "" ||
+		strings.TrimSpace(recommendation.StopReason) != "" ||
+		strings.TrimSpace(recommendation.Hypothesis) != "" ||
+		strings.TrimSpace(recommendation.DatasetPreprocessingRationale) != "" ||
+		strings.TrimSpace(recommendation.SuccessCriteria) != "" ||
+		strings.TrimSpace(recommendation.DeploymentTradeoff) != ""
+}
+
+func selectChampionForPlannerWaitDecision(
+	recommendation agents.ExperimentPlanningRecommendation,
+	input agents.ExperimentPlannerInput,
+) agents.ExperimentPlanningRecommendation {
+	championJobID := strings.TrimSpace(input.CurrentChampion.JobID)
+	stopReason := "Planner returned WAIT after completed training; backend selected the current champion so the project has a deployable model before pausing."
+	recommendation.DecisionType = decisions.TypeSelectChampion
+	recommendation.ChampionJobID = championJobID
+	recommendation.ProposedExperiments = nil
+	recommendation.CandidateHypotheses = nil
+	recommendation.CandidateRankings = nil
+	recommendation.ProposalMechanisms = nil
+	if strings.TrimSpace(recommendation.Summary) == "" || strings.EqualFold(strings.TrimSpace(recommendation.Summary), "wait") {
+		recommendation.Summary = fmt.Sprintf("Select champion %s; planner pause converted to champion selection.", championJobID)
+	}
+	if strings.TrimSpace(recommendation.StopReason) == "" {
+		recommendation.StopReason = stopReason
+	} else if !strings.Contains(recommendation.StopReason, stopReason) {
+		recommendation.StopReason = strings.TrimSpace(recommendation.StopReason + " " + stopReason)
+	}
+	recommendation.Rationale = strings.TrimSpace(recommendation.Rationale + " Backend guard applied: " + stopReason)
+	recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend guard converted WAIT to SELECT_CHAMPION because completed autonomous training must leave a persisted champion.")
+	recommendation.Tags = uniqueStrings(append(recommendation.Tags, "select_champion", "wait_converted_to_champion"))
 	return recommendation
 }
 
@@ -4286,7 +4764,7 @@ func plannerMeaningfulImprovementThreshold(value float64) float64 {
 
 func boundedHigherIsBetterMetricCeiling(metric string) (float64, bool) {
 	switch normalizedPlannerTargetMetric(metric) {
-	case "accuracy", "macro_f1":
+	case "accuracy", "macro_f1", "deployment_readiness":
 		return 1.0, true
 	default:
 		return 0, false
@@ -4346,17 +4824,44 @@ func experimentPlannerDecisionPayload(
 	}
 
 	if strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
-		experiments, err := plannerExperimentsWithProposalMechanisms(recommendation)
-		if err != nil {
-			return nil, err
+		relaxedValidationWarnings := []string{}
+		var experiments []plans.PlannedExperiment
+		if plannerStrictValidationEnabled() {
+			var err error
+			experiments, err = plannerExperimentsWithProposalMechanisms(recommendation)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
+				return nil, err
+			}
+			if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
+				return nil, err
+			}
+		} else {
+			experiments, relaxedValidationWarnings = plannerExperimentsWithProposalMechanismsRelaxed(recommendation)
+			for index, experiment := range experiments {
+				if err := validatePlannedExperiment(experiment, index); err != nil {
+					return nil, err
+				}
+			}
+			if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
+				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
+			}
+			if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
+				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
+			}
 		}
-		if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
-			return nil, err
-		}
-		if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
-			return nil, err
+		for index, experiment := range experiments {
+			if err := validateExperimentDatasetCompatibility(experiment, input.Dataset, index); err != nil {
+				return nil, err
+			}
 		}
 		payload["proposed_experiments"] = experiments
+		if len(relaxedValidationWarnings) > 0 {
+			payload["planner_validation_mode"] = "relaxed"
+			payload["planner_validation_warnings"] = uniqueStrings(relaxedValidationWarnings)
+		}
 	}
 
 	return payload, nil
@@ -4374,6 +4879,7 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 			championJobID = champion.JobID
 		}
 	}
+	requestedChampionJobID := championJobID
 	fallbackSelection := false
 	if championJobID == "" && decisionType == decisions.TypeStopProject {
 		fallbackJobID, ok, err := s.bestAvailableChampionJobForStoppedProject(projectID, decision)
@@ -4386,6 +4892,9 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		championJobID = fallbackJobID
 		fallbackSelection = true
 	}
+	if requestedChampionJobID == "" {
+		requestedChampionJobID = championJobID
+	}
 	if championJobID == "" {
 		return fmt.Errorf("%w: SELECT_CHAMPION decision is missing champion_job_id", store.ErrInvalidRequest)
 	}
@@ -4394,19 +4903,30 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 	if err != nil {
 		return err
 	}
-	job, err := s.store.GetJob(championJobID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return err
-	}
 	goalText := ""
 	if project, err := s.store.GetProject(projectID); err == nil {
 		goalText = project.Goal
 	}
-	targetMetric := "macro_f1"
-	if summary.PlanID != "" {
+	targetMetric := payloadString(decision.Payload, "target_metric")
+	if targetMetric == "" && summary.PlanID != "" {
 		if plan, err := s.store.GetExperimentPlan(summary.PlanID); err == nil && plan.TargetMetric != "" {
 			targetMetric = plan.TargetMetric
 		}
+	}
+	if targetMetric == "" {
+		targetMetric = "macro_f1"
+	}
+	selectionReview, err := s.reviewChampionSelection(projectID, championJobID, targetMetric, goalText)
+	if err != nil {
+		return err
+	}
+	if selectionReview.SelectedJobID != "" {
+		championJobID = selectionReview.SelectedJobID
+		summary = selectionReview.SelectedSummary
+	}
+	job, err := s.store.GetJob(championJobID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
 	}
 
 	evaluationPayload := map[string]any{}
@@ -4430,7 +4950,9 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		deploymentProfile["diagnostics"] = "available"
 		if artifactURI := championArtifactURIFromEvaluation(evaluation.ModelProfile); artifactURI != "" {
 			deploymentProfile["artifact_uri"] = artifactURI
-			deploymentProfile["onnx_artifact_uri"] = artifactURI
+			if artifactMatchesChampionExportFormat(artifactURI, "onnx") {
+				deploymentProfile["onnx_artifact_uri"] = artifactURI
+			}
 			deploymentProfile["export_status"] = firstString(evaluation.ModelProfile, "export_status")
 		}
 		if manifestURI := firstString(evaluation.ModelProfile, "export_manifest_uri", "manifest_uri"); manifestURI != "" {
@@ -4455,6 +4977,19 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 			selectionReason = strings.TrimSpace(selectionReason + " " + fallbackReason)
 		}
 	}
+	if selectionReview.Overridden {
+		overrideReason := fmt.Sprintf("Backend champion guard selected %s instead of requested %s because holistic validation/test readiness %.3f beat %.3f.",
+			selectionReview.SelectedJobID,
+			selectionReview.RequestedJobID,
+			selectionReview.SelectedScore,
+			selectionReview.RequestedScore,
+		)
+		if selectionReason == "" {
+			selectionReason = overrideReason
+		} else {
+			selectionReason = strings.TrimSpace(selectionReason + " " + overrideReason)
+		}
+	}
 	metrics := map[string]any{
 		"model":                  summary.Model,
 		"status":                 summary.Status,
@@ -4470,6 +5005,28 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 	}
 	if fallbackSelection {
 		metrics["selection_source"] = "terminal_stop_best_available"
+	} else {
+		metrics["selection_source"] = "agent_decision"
+	}
+	if selectionReview.SelectedJobID != "" {
+		if selectionReview.Overridden {
+			metrics["selection_source"] = "backend_holistic_override"
+		}
+		metrics["requested_champion_job_id"] = requestedChampionJobID
+		metrics["requested_deployment_readiness_score"] = roundDiagnosticFloat(selectionReview.RequestedScore)
+		metrics["deployment_readiness_score"] = roundDiagnosticFloat(selectionReview.SelectedScore)
+		metrics["selection_overridden"] = selectionReview.Overridden
+		metrics["selection_score_breakdown"] = selectionReview.SelectedBreakdown
+		metrics["selection_candidates"] = selectionReview.Candidates
+		deploymentProfile["selection_score"] = selectionReview.SelectedBreakdown
+		deploymentProfile["selection_guard"] = map[string]any{
+			"requested_champion_job_id": requestedChampionJobID,
+			"selected_champion_job_id":  selectionReview.SelectedJobID,
+			"requested_score":           roundDiagnosticFloat(selectionReview.RequestedScore),
+			"selected_score":            roundDiagnosticFloat(selectionReview.SelectedScore),
+			"override_min_delta":        championSelectionOverrideMinDelta,
+			"overridden":                selectionReview.Overridden,
+		}
 	}
 	if job.ID != "" {
 		metrics["job_config"] = job.Config
@@ -4493,14 +5050,22 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		return err
 	}
 
-	_, err = s.store.CreateExecutionEvent(projectID, summary.PlanID, execution.EventChampionSelected, fmt.Sprintf("Champion selected: %s for project %s.", championJobID, projectID), map[string]any{
+	if _, err := s.store.CreateExecutionEvent(projectID, summary.PlanID, execution.EventChampionSelected, fmt.Sprintf("Champion selected: %s for project %s.", championJobID, projectID), map[string]any{
 		"champion_id":        champion.ID,
 		"champion_job_id":    champion.JobID,
+		"requested_job_id":   requestedChampionJobID,
 		"source_decision_id": decision.ID,
 		"selection_source":   metrics["selection_source"],
+		"selection_score":    metrics["deployment_readiness_score"],
+		"selection_overrode": selectionReview.Overridden,
 		"model":              metrics["model"],
-	})
-	return err
+	}); err != nil {
+		return err
+	}
+	if _, err := s.ensureChampionExport(projectID, champion, job, "onnx", "", nil); err != nil {
+		log.Printf("auto champion ONNX export request failed for project %s champion %s job %s: %v", projectID, champion.ID, champion.JobID, err)
+	}
+	return nil
 }
 
 func (s *Server) bestAvailableChampionJobForStoppedProject(projectID string, decision decisions.AgentDecision) (string, bool, error) {
@@ -4535,6 +5100,119 @@ func (s *Server) bestAvailableChampionJobForStoppedProject(projectID string, dec
 		return "", false, nil
 	}
 	return best.JobID, true, nil
+}
+
+type championSelectionReview struct {
+	RequestedJobID     string
+	SelectedJobID      string
+	SelectedSummary    runs.TrainingRunSummary
+	RequestedScore     float64
+	SelectedScore      float64
+	RequestedBreakdown map[string]any
+	SelectedBreakdown  map[string]any
+	Candidates         []map[string]any
+	Overridden         bool
+}
+
+func (s *Server) reviewChampionSelection(projectID, requestedJobID, targetMetric, goalText string) (championSelectionReview, error) {
+	review := championSelectionReview{RequestedJobID: requestedJobID}
+	summaries, err := s.store.ListProjectTrainingRunSummaries(projectID)
+	if err != nil {
+		return review, err
+	}
+	evaluations, err := s.store.ListProjectTrainingRunEvaluations(projectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return review, err
+	}
+	evaluationsByJob := map[string]runs.TrainingRunEvaluation{}
+	for _, evaluation := range evaluations {
+		evaluationsByJob[evaluation.JobID] = evaluation
+	}
+
+	objectiveContext := projectObjectiveContext(goalText)
+	var requested runs.TrainingRunSummary
+	requestedFound := false
+	var best runs.TrainingRunSummary
+	bestScore := 0.0
+	hasBest := false
+	requestedSucceeded := false
+	candidates := make([]map[string]any, 0, len(summaries))
+	for _, summary := range summaries {
+		if strings.ToUpper(strings.TrimSpace(summary.Status)) != jobs.StatusSucceeded {
+			if summary.JobID == requestedJobID {
+				requested = summary
+				requestedFound = true
+			}
+			continue
+		}
+		evaluation := evaluationsByJob[summary.JobID]
+		score, breakdown := holisticRunScoreBreakdown(targetMetric, summary, evaluation, objectiveContext)
+		candidate := championSelectionCandidatePayload(summary, breakdown)
+		candidates = append(candidates, candidate)
+		if summary.JobID == requestedJobID {
+			requested = summary
+			requestedFound = true
+			requestedSucceeded = true
+			review.RequestedScore = score
+			review.RequestedBreakdown = breakdown
+		}
+		if !hasBest || score > bestScore || (score == bestScore && summary.EstimatedCostUSD < best.EstimatedCostUSD) {
+			best = summary
+			bestScore = score
+			review.SelectedBreakdown = breakdown
+			hasBest = true
+		}
+	}
+	sort.SliceStable(candidates, func(left, right int) bool {
+		return payloadFloat(candidates[left], "deployment_readiness_score") > payloadFloat(candidates[right], "deployment_readiness_score")
+	})
+	if len(candidates) > 8 {
+		candidates = candidates[:8]
+	}
+	review.Candidates = candidates
+	if !hasBest {
+		return review, nil
+	}
+	if !requestedFound {
+		return review, nil
+	}
+	if review.RequestedBreakdown == nil {
+		review.RequestedScore, review.RequestedBreakdown = holisticRunScoreBreakdown(targetMetric, requested, evaluationsByJob[requested.JobID], objectiveContext)
+	}
+
+	selected := requested
+	selectedScore := review.RequestedScore
+	selectedBreakdown := review.RequestedBreakdown
+	if best.JobID != requested.JobID && (!requestedSucceeded || bestScore >= review.RequestedScore+championSelectionOverrideMinDelta) {
+		selected = best
+		selectedScore = bestScore
+		selectedBreakdown = review.SelectedBreakdown
+		review.Overridden = true
+	}
+	review.SelectedSummary = selected
+	review.SelectedJobID = selected.JobID
+	review.SelectedScore = selectedScore
+	review.SelectedBreakdown = selectedBreakdown
+	return review, nil
+}
+
+func championSelectionCandidatePayload(summary runs.TrainingRunSummary, breakdown map[string]any) map[string]any {
+	return map[string]any{
+		"job_id":                     summary.JobID,
+		"model":                      summary.Model,
+		"status":                     summary.Status,
+		"deployment_readiness_score": roundDiagnosticFloat(payloadFloat(breakdown, "score")),
+		"quality_score":              roundDiagnosticFloat(payloadFloat(breakdown, "quality_score")),
+		"validation_metric_score":    roundDiagnosticFloat(payloadFloat(breakdown, "validation_metric_score")),
+		"heldout_metric_score":       roundDiagnosticFloat(payloadFloat(breakdown, "heldout_metric_score")),
+		"loss_health_score":          roundDiagnosticFloat(payloadFloat(breakdown, "loss_health_score")),
+		"best_macro_f1":              roundDiagnosticFloat(summary.BestMacroF1),
+		"best_accuracy":              roundDiagnosticFloat(summary.BestAccuracy),
+		"final_train_loss":           roundDiagnosticFloat(summary.FinalTrainLoss),
+		"final_val_loss":             roundDiagnosticFloat(summary.FinalValLoss),
+		"estimated_cost_usd":         roundDiagnosticFloat(summary.EstimatedCostUSD),
+		"runtime_seconds":            roundDiagnosticFloat(summary.RuntimeSeconds),
+	}
 }
 
 func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.ExperimentPlan, decision decisions.AgentDecision, result automaticExperimentReviewResult) error {
@@ -4584,6 +5262,7 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 		if errors.Is(err, errNoNovelFollowUpExperiments) {
 			return nil
 		}
+		s.recordFollowUpSchedulingFailed(projectID, sourcePlan.ID, decision.ID, err)
 		return err
 	}
 
@@ -4717,6 +5396,10 @@ func datasetPlanningInsights(dataset datasets.Dataset, agentSafeMetadataSummary 
 	if len(agentSafeMetadataSummary) > 0 {
 		metadataSummary = mergeMetadataEvidenceSummary(metadataSummary, agentSafeMetadataSummary)
 	}
+	yoloDetectionEvidence := profileHasYOLODetectionEvidence(profile) || metadataSummaryHasYOLOEvidence(metadataSummary)
+	if yoloDetectionEvidence {
+		taskType = "object_detection"
+	}
 	leakageWarnings := profileStringSlice(profile, "leakage_warnings")
 	datasetTraits := profileStringSlice(profile, "dataset_traits")
 	artifacts := profileMapSlice(profile, "artifacts")
@@ -4729,15 +5412,33 @@ func datasetPlanningInsights(dataset datasets.Dataset, agentSafeMetadataSummary 
 		"Prefer compact architectures when quality is close so the final model can classify live images with low latency.",
 		"Only increase image_size when prior results show a meaningful quality gain over the deployment cost.",
 	}
+	if yoloDetectionEvidence {
+		recommendedMetrics = []string{"mAP50_95", "mAP50", "precision", "recall", "box_loss", "cls_loss", "dfl_loss", "latency_p95_ms"}
+		recommendedPreprocessing = []string{"preserve YOLO normalized bounding boxes and official train/val/test splits", "use 640px detector inputs as the default baseline"}
+		recommendedAugmentations = append(recommendedAugmentations, "YOLO-safe mosaic/scale/color augmentation once the detection worker is enabled")
+		liveInferencePriorities = []string{
+			"Prefer YOLO nano/small detectors first for live streams, then challenge with medium only when p95 latency remains inside budget.",
+			"Rank detector champions by validation/test detection loss, mAP, recall, export parity, p95 latency, and frame-level stability.",
+		}
+		constraints = append(constraints, "YOLO object-detection files detected; keep bounding-box supervision and do not collapse this dataset into image classification.")
+	}
 
 	if totalImages == 0 {
 		constraints = append(constraints, "Dataset has not been profiled yet; use conservative transfer-learning defaults and prioritize profiling before aggressive search.")
 	} else if totalImages < 500 {
-		constraints = append(constraints, "Small dataset; avoid overfitting and prefer stronger augmentation, early stopping, and regularization.")
-		recommendedAugmentations = append(recommendedAugmentations, "horizontal_flip", "color_jitter", "random_crop")
+		if yoloDetectionEvidence {
+			constraints = append(constraints, "Small detection dataset; preserve official splits, watch recall/mAP variance, and avoid trusting a single validation slice.")
+		} else {
+			constraints = append(constraints, "Small dataset; avoid overfitting and prefer stronger augmentation, early stopping, and regularization.")
+			recommendedAugmentations = append(recommendedAugmentations, "horizontal_flip", "color_jitter", "random_crop")
+		}
 	} else if totalImages < 2000 {
-		constraints = append(constraints, "Medium-small dataset; compare efficient transfer models with moderate augmentation.")
-		recommendedAugmentations = append(recommendedAugmentations, "horizontal_flip", "color_jitter")
+		if yoloDetectionEvidence {
+			constraints = append(constraints, "Medium-small detection dataset; compare nano/small YOLO detectors before raising capacity.")
+		} else {
+			constraints = append(constraints, "Medium-small dataset; compare efficient transfer models with moderate augmentation.")
+			recommendedAugmentations = append(recommendedAugmentations, "horizontal_flip", "color_jitter")
+		}
 	}
 	if imbalanceRatio >= 1.5 {
 		constraints = append(constraints, fmt.Sprintf("Class imbalance detected (ratio %.2f); optimize macro-F1 and test class balancing.", imbalanceRatio))
@@ -4765,14 +5466,24 @@ func datasetPlanningInsights(dataset datasets.Dataset, agentSafeMetadataSummary 
 		if heightMin > 0 && (minDimension == 0 || heightMin < minDimension) {
 			minDimension = heightMin
 		}
-		if maxDimension >= 512 {
+		if yoloDetectionEvidence {
+			if maxDimension >= 512 {
+				recommendedPreprocessing = append(recommendedPreprocessing, "start YOLO detector training at 640 image size and only raise resolution when small-object recall needs it")
+			} else if maxDimension <= 160 {
+				recommendedPreprocessing = append(recommendedPreprocessing, "verify small-input upscaling does not inflate false positives before trusting live detections")
+			}
+		} else if maxDimension >= 512 {
 			recommendedPreprocessing = append(recommendedPreprocessing, "compare 224 and 256 image_size before trying larger inputs")
 		} else if maxDimension <= 160 {
 			recommendedPreprocessing = append(recommendedPreprocessing, "avoid unnecessary upscaling beyond 224 unless validation gains justify latency")
 		}
 		if minDimension > 0 && maxDimension > minDimension*2 {
-			constraints = append(constraints, "Large variation in image dimensions; prefer resize plus random crop to improve robustness.")
-			recommendedAugmentations = append(recommendedAugmentations, "random_crop")
+			if yoloDetectionEvidence {
+				constraints = append(constraints, "Large variation in detection image dimensions; preserve box coordinates and use detector-native letterbox resizing.")
+			} else {
+				constraints = append(constraints, "Large variation in image dimensions; prefer resize plus random crop to improve robustness.")
+				recommendedAugmentations = append(recommendedAugmentations, "random_crop")
+			}
 		}
 	}
 	if len(recommendedAugmentations) == 0 {
@@ -4959,6 +5670,7 @@ func safeLegacyMetadataSummary(input map[string]any) map[string]any {
 		"bbox_available":           true,
 		"bbox_count":               true,
 		"bbox_coverage_ratio":      true,
+		"bbox_per_class":           true,
 		"bbox_sample_count":        true,
 		"capabilities":             true,
 		"class_count":              true,
@@ -4981,6 +5693,53 @@ func safeLegacyMetadataSummary(input map[string]any) map[string]any {
 		"status":                   true,
 		"unsupported_source_count": true,
 		"warnings":                 true,
+		"yolo_available":           true,
+		"yolo_label_count":         true,
+		"yolo_label_file_count":    true,
+		"yolo_summary":             true,
+	}
+	out := map[string]any{}
+	for key, value := range input {
+		normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "-", "_")
+		if !allowed[normalized] || metadataSummaryKeyLooksRaw(normalized) {
+			continue
+		}
+		if normalized == "yolo_summary" {
+			if summary := safeYOLOSummary(mapFromAny(value)); len(summary) > 0 {
+				out[normalized] = summary
+			}
+			continue
+		}
+		if text, ok := value.(string); ok && metadataSummaryTextLooksRaw(text) {
+			continue
+		}
+		out[normalized] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func safeYOLOSummary(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return nil
+	}
+	allowed := map[string]bool{
+		"available":         true,
+		"bbox_count":        true,
+		"bbox_per_class":    true,
+		"box_distribution":  true,
+		"class_ids":         true,
+		"class_names":       true,
+		"config_count":      true,
+		"empty_label_count": true,
+		"format":            true,
+		"image_count":       true,
+		"label_file_count":  true,
+		"missing_labels":    true,
+		"split_counts":      true,
+		"split_summary":     true,
 	}
 	out := map[string]any{}
 	for key, value := range input {
@@ -5292,9 +6051,9 @@ func (s *Server) retrievePlannerMemory(ctx context.Context, input agents.Experim
 		Limit:          memoryRetrievalMaxCards(),
 		CrossProjectOK: memoryRetrievalCrossProjectOK(),
 	}
-	results := s.searchRetrievedMemory(ctx, query)
-	s.logMemoryRetrieval("planner", input.Project.ID, input.Dataset.ID, results)
-	if memoryRetrievalLogOnly() {
+	results, usage := s.searchRetrievedMemory(ctx, query, input.SourcePlan.ID, "")
+	s.logMemoryRetrieval("planner", input.Project.ID, input.Dataset.ID, input.SourcePlan.ID, "", results, usage)
+	if usage.LogOnly {
 		return nil
 	}
 	return results
@@ -5320,36 +6079,116 @@ func (s *Server) retrieveTrainingMonitorMemory(ctx context.Context, plan plans.E
 		Limit:          minInt(memoryRetrievalMaxCards(), trainingMonitorMemoryRetrievalMaxCards()),
 		CrossProjectOK: memoryRetrievalCrossProjectOK(),
 	}
-	results := s.searchRetrievedMemory(ctx, query)
-	s.logMemoryRetrieval("training_monitor", job.ProjectID, summary.DatasetID, results)
-	if memoryRetrievalLogOnly() {
+	results, usage := s.searchRetrievedMemory(ctx, query, plan.ID, job.ID)
+	s.logMemoryRetrieval("training_monitor", job.ProjectID, summary.DatasetID, plan.ID, job.ID, results, usage)
+	if usage.LogOnly {
 		return nil
 	}
 	return results
 }
 
-func (s *Server) searchRetrievedMemory(ctx context.Context, query memory.MemoryRetrievalQuery) []memory.MemoryRetrievalResult {
+func (s *Server) searchRetrievedMemory(ctx context.Context, query memory.MemoryRetrievalQuery, planID string, jobID string) ([]memory.MemoryRetrievalResult, memory.MemoryEmbeddingUsageEvent) {
 	query.Text = strings.TrimSpace(query.Text)
+	usage := memory.MemoryEmbeddingUsageEvent{
+		ProjectID:           strings.TrimSpace(query.ProjectID),
+		DatasetID:           strings.TrimSpace(query.DatasetID),
+		PlanID:              strings.TrimSpace(planID),
+		JobID:               strings.TrimSpace(jobID),
+		Purpose:             memory.EmbeddingUsagePurposeRetrievalQuery,
+		RetrievalPurpose:    strings.TrimSpace(query.Purpose),
+		EmbeddingModel:      strings.TrimSpace(query.EmbeddingModel),
+		EmbeddingDimensions: query.EmbeddingDimensions,
+		InputBytes:          len([]byte(query.Text)),
+		QueryHash:           memory.HashRetrievalQueryText(query.Text),
+		Metadata: map[string]any{
+			"agent_name":       strings.TrimSpace(query.AgentName),
+			"cross_project_ok": query.CrossProjectOK,
+			"limit":            query.Limit,
+		},
+	}
 	if query.ProjectID == "" || query.Text == "" {
-		return nil
+		usage.Skipped = true
+		usage.SkipReason = "project_id and text are required"
+		return nil, usage
 	}
 	if query.Limit <= 0 {
 		query.Limit = memoryRetrievalMaxCards()
 	}
-	query = s.withMemoryQueryEmbedding(ctx, query)
+	usage.Metadata["limit"] = query.Limit
+	query, usage = s.withMemoryQueryEmbedding(ctx, query, usage)
 	results, err := s.store.SearchMemoryEmbeddings(query)
 	if err != nil {
 		log.Printf("memory retrieval failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, err)
-		return nil
+		usage.Skipped = true
+		usage.SkipReason = err.Error()
+		usage.LogOnly = memoryRetrievalLogOnly()
+		usage.RetrievedCount = 0
+		if _, recordErr := s.store.CreateMemoryEmbeddingUsageEvent(usage); recordErr != nil {
+			log.Printf("memory retrieval usage event failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, recordErr)
+		}
+		return nil, usage
 	}
-	return filterMemoryRetrievalResults(results, memoryRetrievalMinScore(), query.Limit)
+	results = filterMemoryRetrievalResults(results, memoryRetrievalMinScore(), query.Limit)
+	usage.LogOnly = memoryRetrievalLogOnly()
+	usage.RetrievedCount = len(results)
+	usage.Injected = !usage.LogOnly && len(results) > 0
+	if _, recordErr := s.store.CreateMemoryEmbeddingUsageEvent(usage); recordErr != nil {
+		log.Printf("memory retrieval usage event failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, recordErr)
+	}
+	return results, usage
 }
 
-func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.MemoryRetrievalQuery) memory.MemoryRetrievalQuery {
+func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.MemoryRetrievalQuery, usage memory.MemoryEmbeddingUsageEvent) (memory.MemoryRetrievalQuery, memory.MemoryEmbeddingUsageEvent) {
 	config := embeddings.ConfigFromEnv()
-	if !config.EmbeddingsEnabled || config.ReadyForIndexing() != nil {
-		return query
+	usage.EmbeddingModel = strings.TrimSpace(config.Model)
+	usage.EmbeddingDimensions = config.Dimensions
+	usage.LogOnly = memoryRetrievalLogOnly()
+	usage.InputBytes = len([]byte(query.Text))
+	usage.QueryHash = memory.HashRetrievalQueryText(query.Text)
+
+	readyErr := config.ReadyForIndexing()
+	shouldEmbed := config.EmbeddingsEnabled && readyErr == nil
+	if !config.EmbeddingsEnabled {
+		usage.Skipped = true
+		usage.SkipReason = "retrieval embeddings disabled"
+	} else if readyErr != nil {
+		usage.Skipped = true
+		usage.SkipReason = readyErr.Error()
 	}
+	if usage.LogOnly && !memoryRetrievalLogOnlyEmbeddings() {
+		shouldEmbed = false
+		usage.Skipped = true
+		usage.SkipReason = "log-only retrieval uses lexical fallback"
+	}
+	if shouldEmbed {
+		if count, err := s.store.CountMemoryEmbeddings(query.ProjectID, query.DatasetID, config.Model); err == nil && count < memoryRetrievalMinIndexedCards() {
+			shouldEmbed = false
+			usage.Skipped = true
+			usage.SkipReason = "too few indexed cards for semantic retrieval"
+		}
+	}
+	if shouldEmbed && memoryRetrievalCapReached(s.store, query.ProjectID) {
+		shouldEmbed = false
+		usage.Skipped = true
+		usage.SkipReason = "retrieval embedding call cap reached for today"
+	}
+	if !shouldEmbed {
+		return query, usage
+	}
+
+	normalizedQuery := memory.NormalizeRetrievalQueryText(query.Text)
+	queryHash := memory.HashRetrievalQueryText(normalizedQuery)
+	usage.QueryHash = queryHash
+	if queryHash != "" {
+		if cached, err := s.store.GetMemoryRetrievalQueryCache(query.ProjectID, query.DatasetID, usage.RetrievalPurpose, config.Model, config.Dimensions, queryHash); err == nil {
+			query.EmbeddingModel = cached.EmbeddingModel
+			query.EmbeddingDimensions = cached.EmbeddingDimensions
+			query.Embedding = append([]float32(nil), cached.Embedding...)
+			usage.Cached = true
+			return query, usage
+		}
+	}
+
 	result, err := embeddings.NewClient(config).Embed(ctx, embeddings.EmbedRequest{
 		Model:      config.Model,
 		Text:       query.Text,
@@ -5357,26 +6196,183 @@ func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.Memo
 	})
 	if err != nil {
 		log.Printf("memory retrieval embedding failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, err)
-		return query
+		usage.Skipped = true
+		usage.SkipReason = err.Error()
+		return query, usage
 	}
 	query.EmbeddingModel = result.Model
 	query.EmbeddingDimensions = result.Dimensions
 	query.Embedding = result.Vector
-	return query
+	usage.ProviderCallCount = 1
+	usage.ProviderUsage = result.Usage
+	if ttl := memoryRetrievalQueryCacheTTL(); ttl > 0 && queryHash != "" {
+		if _, err := s.store.UpsertMemoryRetrievalQueryCache(memory.MemoryRetrievalQueryCacheRecord{
+			ProjectID:           query.ProjectID,
+			DatasetID:           query.DatasetID,
+			Purpose:             usage.RetrievalPurpose,
+			EmbeddingModel:      query.EmbeddingModel,
+			EmbeddingDimensions: query.EmbeddingDimensions,
+			NormalizedQueryHash: queryHash,
+			QueryText:           normalizedQuery,
+			Embedding:           append([]float32(nil), result.Vector...),
+			ExpiresAt:           time.Now().UTC().Add(ttl),
+		}); err != nil {
+			log.Printf("memory retrieval query cache upsert failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, err)
+		}
+	}
+	return query, usage
 }
 
-func (s *Server) logMemoryRetrieval(purpose string, projectID string, datasetID string, results []memory.MemoryRetrievalResult) {
-	if len(results) == 0 {
-		return
-	}
-	diagnostics.Event("info", "memory_retrieval", map[string]any{
+func (s *Server) logMemoryRetrieval(purpose string, projectID string, datasetID string, planID string, jobID string, results []memory.MemoryRetrievalResult, usage memory.MemoryEmbeddingUsageEvent) {
+	payload := map[string]any{
 		"purpose":          purpose,
 		"project_id":       projectID,
 		"dataset_id":       datasetID,
 		"retrieved_count":  len(results),
-		"log_only":         memoryRetrievalLogOnly(),
+		"retrieved_cards":  memoryRetrievalDiagnosticCards(results),
+		"log_only":         usage.LogOnly,
+		"injected":         usage.Injected,
+		"cached":           usage.Cached,
+		"skipped":          usage.Skipped,
+		"skip_reason":      usage.SkipReason,
+		"embedding_model":  usage.EmbeddingModel,
+		"embedding_dim":    usage.EmbeddingDimensions,
+		"input_bytes":      usage.InputBytes,
+		"query_hash":       usage.QueryHash,
+		"provider_calls":   usage.ProviderCallCount,
 		"cross_project_ok": memoryRetrievalCrossProjectOK(),
-	})
+	}
+	if planID != "" {
+		payload["plan_id"] = planID
+	}
+	if jobID != "" {
+		payload["job_id"] = jobID
+	}
+	if usage.RetrievalPurpose != "" {
+		payload["retrieval_purpose"] = usage.RetrievalPurpose
+	}
+	diagnostics.Event("info", "memory_retrieval", payload)
+
+	message := fmt.Sprintf("Memory retrieval checked for %s; found %d candidate card(s).", purpose, len(results))
+	if _, err := s.store.CreateExecutionEvent(projectID, planID, execution.EventMemoryRetrievalLogged, message, payload); err != nil {
+		log.Printf("memory retrieval execution event failed for project %s purpose %s: %v", projectID, purpose, err)
+	}
+}
+
+func memoryRetrievalDiagnosticCards(results []memory.MemoryRetrievalResult) []map[string]any {
+	limit := minInt(len(results), 12)
+	out := make([]map[string]any, 0, limit)
+	for _, result := range results[:limit] {
+		card := map[string]any{
+			"source_table":     result.SourceTable,
+			"source_id":        result.SourceID,
+			"project_id":       result.ProjectID,
+			"dataset_id":       result.DatasetID,
+			"kind":             result.Kind,
+			"score":            roundDiagnosticFloat(result.Score),
+			"semantic_score":   roundDiagnosticFloat(result.SemanticScore),
+			"structured_score": roundDiagnosticFloat(result.StructuredScore),
+			"retrieval_reason": compactDiagnosticMemoryText(result.RetrievalReason, 240),
+		}
+		if summary := memoryRetrievalDiagnosticSummary(result.SummaryCard); len(summary) > 0 {
+			card["summary_card"] = summary
+		}
+		if metadata := memoryRetrievalDiagnosticSummary(result.Metadata); len(metadata) > 0 {
+			card["metadata"] = metadata
+		}
+		out = append(out, card)
+	}
+	return out
+}
+
+func memoryRetrievalDiagnosticSummary(values map[string]any) map[string]any {
+	if len(values) == 0 {
+		return nil
+	}
+	allowed := []string{
+		"kind",
+		"outcome",
+		"outcome_status",
+		"mechanism",
+		"mechanism_group",
+		"strategy_type",
+		"intervention",
+		"action",
+		"model",
+		"model_family",
+		"target_metric",
+		"lesson",
+		"compact_lesson",
+		"summary",
+		"compact_summary",
+		"recommendation_summary",
+		"preprocessing_hypothesis",
+		"dataset_traits",
+		"training_dynamics",
+		"dynamics",
+	}
+	out := map[string]any{}
+	for _, key := range allowed {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		if compact, ok := compactDiagnosticMemoryValue(value); ok {
+			out[key] = compact
+		}
+		if len(out) >= 10 {
+			break
+		}
+	}
+	return out
+}
+
+func compactDiagnosticMemoryValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		text := compactDiagnosticMemoryText(typed, 300)
+		return text, text != ""
+	case []string:
+		out := []string{}
+		for _, item := range typed {
+			text := compactDiagnosticMemoryText(item, 120)
+			if text != "" {
+				out = append(out, text)
+			}
+			if len(out) >= 8 {
+				break
+			}
+		}
+		return out, len(out) > 0
+	case []any:
+		out := []string{}
+		for _, item := range typed {
+			text := compactDiagnosticMemoryText(fmt.Sprint(item), 120)
+			if text != "" {
+				out = append(out, text)
+			}
+			if len(out) >= 8 {
+				break
+			}
+		}
+		return out, len(out) > 0
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, bool:
+		return typed, true
+	case float32:
+		return roundDiagnosticFloat(float64(typed)), true
+	case float64:
+		return roundDiagnosticFloat(typed), true
+	default:
+		return nil, false
+	}
+}
+
+func compactDiagnosticMemoryText(value string, limit int) string {
+	text := activitySafeText(value, limit)
+	if text == "" {
+		return ""
+	}
+	return text
 }
 
 func (s *Server) indexMemoryCard(ctx context.Context, card memory.EmbeddableMemoryCard) {
@@ -5477,6 +6473,10 @@ func memoryRetrievalLogOnly() bool {
 	return envFlag("MODEL_EXPRESS_MEMORY_RETRIEVAL_LOG_ONLY", true)
 }
 
+func memoryRetrievalLogOnlyEmbeddings() bool {
+	return envFlag("MODEL_EXPRESS_MEMORY_LOG_ONLY_EMBEDDINGS", false)
+}
+
 func memoryRetrievalMaxCards() int {
 	return envInt("MODEL_EXPRESS_MEMORY_RETRIEVAL_MAX_CARDS", memoryRetrievalDefaultMaxCards, 1, 50)
 }
@@ -5487,6 +6487,33 @@ func trainingMonitorMemoryRetrievalMaxCards() int {
 
 func memoryRetrievalMinScore() float64 {
 	return envFloat("MODEL_EXPRESS_MEMORY_RETRIEVAL_MIN_SCORE", memoryRetrievalDefaultMinScore, 0, 1)
+}
+
+func memoryRetrievalMinIndexedCards() int {
+	return envInt("MODEL_EXPRESS_MEMORY_RETRIEVAL_MIN_INDEXED_CARDS", 3, 1, 500)
+}
+
+func memoryRetrievalQueryCacheTTL() time.Duration {
+	seconds := envInt("MODEL_EXPRESS_MEMORY_RETRIEVAL_QUERY_CACHE_TTL_SECONDS", 3600, 0, 24*3600)
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func memoryRetrievalCapReached(storer interface {
+	CountProjectMemoryEmbeddingUsageEvents(projectID string, purpose string, since time.Time) (int, error)
+}, projectID string) bool {
+	config := embeddings.ConfigFromEnv()
+	if config.MaxCallsPerDay <= 0 {
+		return false
+	}
+	since := time.Now().UTC().Truncate(24 * time.Hour)
+	count, err := storer.CountProjectMemoryEmbeddingUsageEvents(projectID, memory.EmbeddingUsagePurposeRetrievalQuery, since)
+	if err != nil {
+		return false
+	}
+	return count >= config.MaxCallsPerDay
 }
 
 func memoryModelFamily(model string) string {
@@ -5506,6 +6533,8 @@ func memoryModelFamily(model string) string {
 		return "swin"
 	case strings.Contains(normalized, "vit"):
 		return "vit"
+	case strings.Contains(normalized, "yolo"):
+		return "yolo"
 	default:
 		return normalized
 	}
@@ -5522,17 +6551,69 @@ func containsAny(value string, needles ...string) bool {
 
 func supportedModelCatalog() []agents.SupportedModelSpec {
 	return []agents.SupportedModelSpec{
-		{Name: "mobilenet_v3_small", Family: "mobilenet", DeploymentTier: "fast_live", DefaultImageSize: 224, MinRecommendedImages: 50, SupportsTransfer: true, ExpectedLatencyClass: "very_fast", RecommendedUse: "fast live baseline and compact champion refinement", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "mobilenet_v3_large", Family: "mobilenet", DeploymentTier: "fast_live", DefaultImageSize: 224, MinRecommendedImages: 80, SupportsTransfer: true, ExpectedLatencyClass: "fast", RecommendedUse: "higher-capacity MobileNet challenger for live use", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "efficientnet_b0", Family: "efficientnet", DeploymentTier: "fast_live", DefaultImageSize: 224, MinRecommendedImages: 80, SupportsTransfer: true, ExpectedLatencyClass: "fast", RecommendedUse: "strong quality/latency baseline", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "regnet_y_400mf", Family: "regnet", DeploymentTier: "fast_live", DefaultImageSize: 224, MinRecommendedImages: 100, SupportsTransfer: true, ExpectedLatencyClass: "fast", RecommendedUse: "compact architecture challenger", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "efficientnet_b1", Family: "efficientnet", DeploymentTier: "balanced", DefaultImageSize: 240, MinRecommendedImages: 150, SupportsTransfer: true, ExpectedLatencyClass: "medium", RecommendedUse: "balanced quality challenger", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "efficientnet_b2", Family: "efficientnet", DeploymentTier: "balanced", DefaultImageSize: 260, MinRecommendedImages: 250, SupportsTransfer: true, ExpectedLatencyClass: "medium", RecommendedUse: "stronger quality challenger when budget allows", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "resnet18", Family: "resnet", DeploymentTier: "balanced", DefaultImageSize: 224, MinRecommendedImages: 100, SupportsTransfer: true, ExpectedLatencyClass: "medium", RecommendedUse: "stable control architecture", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "resnet34", Family: "resnet", DeploymentTier: "balanced", DefaultImageSize: 224, MinRecommendedImages: 150, SupportsTransfer: true, ExpectedLatencyClass: "medium_slow", RecommendedUse: "larger ResNet comparison", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "convnext_tiny", Family: "convnext", DeploymentTier: "quality_challenger", DefaultImageSize: 224, MinRecommendedImages: 300, SupportsTransfer: true, ExpectedLatencyClass: "slow", RecommendedUse: "quality-first challenger", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "swin_t", Family: "swin", DeploymentTier: "quality_challenger", DefaultImageSize: 224, MinRecommendedImages: 500, SupportsTransfer: true, ExpectedLatencyClass: "slow", RecommendedUse: "transformer challenger for larger datasets", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
-		{Name: "vit_b_16", Family: "vit", DeploymentTier: "quality_challenger", DefaultImageSize: 224, MinRecommendedImages: 800, SupportsTransfer: true, ExpectedLatencyClass: "slowest", RecommendedUse: "explicit quality-first experiments on larger datasets", SupportsFineTuneModes: []string{"head_only", "last_block", "full"}},
+		classificationModelSpec("mobilenet_v3_small", "mobilenet", "fast_live", 224, 50, "very_fast", "fast live baseline and compact champion refinement"),
+		classificationModelSpec("mobilenet_v3_large", "mobilenet", "fast_live", 224, 80, "fast", "higher-capacity MobileNet challenger for live use"),
+		classificationModelSpec("efficientnet_b0", "efficientnet", "fast_live", 224, 80, "fast", "strong quality/latency baseline"),
+		classificationModelSpec("regnet_y_400mf", "regnet", "fast_live", 224, 100, "fast", "compact architecture challenger"),
+		classificationModelSpec("efficientnet_b1", "efficientnet", "balanced", 240, 150, "medium", "balanced quality challenger"),
+		classificationModelSpec("efficientnet_b2", "efficientnet", "balanced", 260, 250, "medium", "stronger quality challenger when budget allows"),
+		classificationModelSpec("resnet18", "resnet", "balanced", 224, 100, "medium", "stable control architecture"),
+		classificationModelSpec("resnet34", "resnet", "balanced", 224, 150, "medium_slow", "larger ResNet comparison"),
+		classificationModelSpec("convnext_tiny", "convnext", "quality_challenger", 224, 300, "slow", "quality-first challenger"),
+		classificationModelSpec("swin_t", "swin", "quality_challenger", 224, 500, "slow", "transformer challenger for larger datasets"),
+		classificationModelSpec("vit_b_16", "vit", "quality_challenger", 224, 800, "slowest", "explicit quality-first experiments on larger datasets"),
+	}
+}
+
+func classificationModelSpec(name, family, deploymentTier string, imageSize, minImages int, latencyClass, recommendedUse string) agents.SupportedModelSpec {
+	return agents.SupportedModelSpec{
+		Name:                  name,
+		Family:                family,
+		TaskType:              "image_classification",
+		ModelKind:             "torchvision_classifier",
+		DeploymentTier:        deploymentTier,
+		DefaultImageSize:      imageSize,
+		MinRecommendedImages:  minImages,
+		SupportsTransfer:      true,
+		TrainingEnabled:       true,
+		ExpectedLatencyClass:  latencyClass,
+		RecommendedUse:        recommendedUse,
+		SupportsFineTuneModes: []string{"head_only", "last_block", "full"},
+	}
+}
+
+func supportedModelCatalogForDataset(dataset datasets.Dataset, agentSafeMetadataSummary map[string]any) []agents.SupportedModelSpec {
+	catalog := append([]agents.SupportedModelSpec{}, supportedModelCatalog()...)
+	if datasetHasYOLODetectionEvidence(dataset, agentSafeMetadataSummary) {
+		catalog = append(catalog, supportedYOLODetectorModelCatalog()...)
+	}
+	return catalog
+}
+
+func supportedYOLODetectorModelCatalog() []agents.SupportedModelSpec {
+	return []agents.SupportedModelSpec{
+		yoloDetectorModelSpec("yolo11n.pt", "realtime_detector", "very_fast", "nano COCO-pretrained detector for the first live-stream baseline"),
+		yoloDetectorModelSpec("yolo11s.pt", "realtime_detector", "fast", "small COCO-pretrained detector with stronger accuracy while staying live-friendly"),
+		yoloDetectorModelSpec("yolo11m.pt", "quality_detector", "medium", "medium COCO-pretrained detector for quality challengers when latency budget allows"),
+		yoloDetectorModelSpec("yolo11l.pt", "quality_detector", "slow", "large COCO-pretrained detector for high-accuracy offline comparison"),
+		yoloDetectorModelSpec("yolo11x.pt", "quality_detector", "slowest", "extra-large COCO-pretrained detector for upper-bound detection quality studies"),
+	}
+}
+
+func yoloDetectorModelSpec(name, deploymentTier, latencyClass, recommendedUse string) agents.SupportedModelSpec {
+	return agents.SupportedModelSpec{
+		Name:                 name,
+		Family:               "yolo11",
+		TaskType:             "object_detection",
+		ModelKind:            "ultralytics_yolo_detector",
+		PretrainedWeights:    name,
+		DeploymentTier:       deploymentTier,
+		DefaultImageSize:     640,
+		MinRecommendedImages: 100,
+		SupportsTransfer:     true,
+		TrainingEnabled:      true,
+		ExpectedLatencyClass: latencyClass,
+		RecommendedUse:       recommendedUse + "; schedule only for YOLO object-detection datasets.",
 	}
 }
 
@@ -5541,7 +6622,64 @@ func supportedModelNames() map[string]bool {
 	for _, spec := range supportedModelCatalog() {
 		out[strings.ToLower(spec.Name)] = true
 	}
+	for _, spec := range supportedYOLODetectorModelCatalog() {
+		out[strings.ToLower(spec.Name)] = true
+	}
 	return out
+}
+
+func supportedModelSpecByName(model string) (agents.SupportedModelSpec, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	for _, spec := range append(supportedModelCatalog(), supportedYOLODetectorModelCatalog()...) {
+		if strings.ToLower(spec.Name) == normalized {
+			return spec, true
+		}
+	}
+	return agents.SupportedModelSpec{}, false
+}
+
+func datasetHasYOLODetectionEvidence(dataset datasets.Dataset, agentSafeMetadataSummary map[string]any) bool {
+	return profileHasYOLODetectionEvidence(dataset.Profile) || metadataSummaryHasYOLOEvidence(agentSafeMetadataSummary)
+}
+
+func profileHasYOLODetectionEvidence(profile map[string]any) bool {
+	if profileBool(profile, "yolo_available") {
+		return true
+	}
+	if containsString(profileStringSlice(profile, "dataset_traits"), "yolo_format") {
+		return true
+	}
+	return metadataSummaryHasYOLOEvidence(profileMap(profile, "metadata_summary")) ||
+		metadataSummaryHasYOLOEvidence(profileMap(profile, "agent_safe_metadata_summary")) ||
+		metadataSummaryHasYOLOEvidence(profileMap(profile, "normalized_metadata_summary"))
+}
+
+func metadataSummaryHasYOLOEvidence(summary map[string]any) bool {
+	if len(summary) == 0 {
+		return false
+	}
+	if metadataBool(summary, "yolo_available") {
+		return true
+	}
+	if metadataBool(summary, "available") && strings.EqualFold(strings.TrimSpace(profileString(summary, "format")), "yolo") {
+		return true
+	}
+	if payloadNumber(summary["yolo_label_file_count"]) > 0 || payloadNumber(summary["yolo_label_count"]) > 0 ||
+		payloadNumber(summary["label_file_count"]) > 0 {
+		return true
+	}
+	if metadataBool(summary, "available") && (payloadNumber(summary["bbox_count"]) > 0 || len(profileMap(summary, "bbox_per_class")) > 0 || len(profileMap(summary, "box_distribution")) > 0) {
+		return true
+	}
+	if nested := profileMap(summary, "yolo_summary"); len(nested) > 0 && metadataSummaryHasYOLOEvidence(nested) {
+		return true
+	}
+	counts := profileMap(summary, "artifact_counts")
+	if payloadNumber(counts["yolo_dataset_config"]) > 0 || payloadNumber(counts["yolo_label_file"]) > 0 {
+		return true
+	}
+	capabilities := profileMap(summary, "capabilities")
+	return metadataBool(capabilities, "yolo")
 }
 
 func plannerStrategyMemory(records []memory.AgentMemoryRecord) ([]agents.PlannerStrategyMemory, []agents.PlannerStrategyMemory) {
@@ -5708,20 +6846,23 @@ func experimentPlanningOutcomeForPlan(
 	followUpPlan plans.ExperimentPlan,
 	projectPlans []plans.ExperimentPlan,
 	summaries []runs.TrainingRunSummary,
+	evaluations []runs.TrainingRunEvaluation,
+	objectiveContext agents.ProjectObjectiveContext,
 ) (agents.ExperimentPlanningOutcome, error) {
 	planSummaries := summariesForPlanID(summaries, followUpPlan.ID)
+	evaluationsByJob := evaluationsByJobID(evaluations)
 	proposedExperiments, err := plannedExperimentsFromPayload(sourceDecision.Payload)
 	if err != nil {
 		proposedExperiments = []plans.PlannedExperiment{}
 	}
 
-	baselineChampion := baselineChampionForPlannerOutcome(sourceDecision, followUpPlan, projectPlans, summaries)
-	bestSummary, hasBest := bestSuccessfulTrainingSummary(followUpPlan.TargetMetric, planSummaries)
+	baselineChampion := baselineChampionForPlannerOutcome(sourceDecision, followUpPlan, projectPlans, summaries, evaluations, objectiveContext)
+	bestSummary, hasBest := bestSuccessfulTrainingSummaryForObjective(followUpPlan.TargetMetric, planSummaries, evaluationsForPlanID(evaluations, followUpPlan.ID), objectiveContext)
 
 	var actualBest *agents.ExperimentChampion
 	actualDelta := 0.0
 	if hasBest {
-		best := experimentChampionFromSummary(followUpPlan.TargetMetric, bestSummary)
+		best := experimentChampionFromSummaryWithEvaluation(followUpPlan.TargetMetric, bestSummary, evaluationsByJob[bestSummary.JobID], objectiveContext)
 		actualBest = &best
 		if baselineChampion != nil {
 			actualDelta = best.Score - baselineChampion.Score
@@ -5764,6 +6905,8 @@ func baselineChampionForPlannerOutcome(
 	followUpPlan plans.ExperimentPlan,
 	projectPlans []plans.ExperimentPlan,
 	summaries []runs.TrainingRunSummary,
+	evaluations []runs.TrainingRunEvaluation,
+	objectiveContext agents.ProjectObjectiveContext,
 ) *agents.ExperimentChampion {
 	if champion, ok := experimentChampionFromPayload(sourceDecision.Payload["current_champion"]); ok {
 		return champion
@@ -5771,8 +6914,9 @@ func baselineChampionForPlannerOutcome(
 	if champion, ok := experimentChampionFromPayload(sourceDecision.Payload["source_plan_baseline_champion"]); ok {
 		return champion
 	}
-	if summary, ok := bestSuccessfulTrainingSummaryBeforePlan(followUpPlan.TargetMetric, projectPlans, summaries, followUpPlan.ID); ok {
-		champion := experimentChampionFromSummary(followUpPlan.TargetMetric, summary)
+	evaluationsByJob := evaluationsByJobID(evaluations)
+	if summary, ok := bestSuccessfulTrainingSummaryBeforePlanForObjective(followUpPlan.TargetMetric, projectPlans, summaries, evaluations, objectiveContext, followUpPlan.ID); ok {
+		champion := experimentChampionFromSummaryWithEvaluation(followUpPlan.TargetMetric, summary, evaluationsByJob[summary.JobID], objectiveContext)
 		return &champion
 	}
 	return nil
@@ -5823,7 +6967,7 @@ func plannerOutcomeConfidence(outcome agents.ExperimentPlanningOutcome) float64 
 }
 
 func plannerOutcomeLesson(targetMetric string, outcome agents.ExperimentPlanningOutcome) string {
-	metric := normalizedPlannerTargetMetric(targetMetric)
+	metric := "deployment readiness"
 	if outcome.OutcomeStatus == agents.ExperimentPlanningOutcomeFailed {
 		return fmt.Sprintf("Planner follow-up plan %s produced no successful runs after %.3f total cost; avoid repeating this failed strategy without changing the setup.", outcome.FollowUpPlanID, outcome.TotalCostUSD)
 	}
@@ -6186,6 +7330,17 @@ func evaluationsForPlanID(evaluations []runs.TrainingRunEvaluation, planID strin
 	return out
 }
 
+func evaluationsByJobID(evaluations []runs.TrainingRunEvaluation) map[string]runs.TrainingRunEvaluation {
+	out := map[string]runs.TrainingRunEvaluation{}
+	for _, evaluation := range evaluations {
+		if strings.TrimSpace(evaluation.JobID) == "" {
+			continue
+		}
+		out[evaluation.JobID] = evaluation
+	}
+	return out
+}
+
 func experimentPlannerPerformanceContext(
 	targetMetric string,
 	projectPlans []plans.ExperimentPlan,
@@ -6199,26 +7354,40 @@ func experimentPlannerPerformanceContext(
 		return nil, nil, []agents.ExperimentRunDelta{}, 0, []string{"No successful champion run is available yet."}
 	}
 
-	champion := experimentChampionFromSummary(targetMetric, championSummary)
+	evaluationsByJob := evaluationsByJobID(evaluations)
+	champion := experimentChampionFromSummaryWithEvaluation(targetMetric, championSummary, evaluationsByJob[championSummary.JobID], objectiveContext)
 	baselineChampion := champion
-	if baselineSummary, ok := bestSuccessfulTrainingSummaryBeforePlan(targetMetric, projectPlans, summaries, sourcePlanID); ok {
-		baselineChampion = experimentChampionFromSummary(targetMetric, baselineSummary)
+	if baselineSummary, ok := bestSuccessfulTrainingSummaryBeforePlanForObjective(targetMetric, projectPlans, summaries, evaluations, objectiveContext, sourcePlanID); ok {
+		baselineChampion = experimentChampionFromSummaryWithEvaluation(targetMetric, baselineSummary, evaluationsByJob[baselineSummary.JobID], objectiveContext)
 	}
-	sourcePlanDeltas := experimentRunDeltasForPlan(targetMetric, summariesForPlanID(summaries, sourcePlanID), baselineChampion)
-	noImprovementRounds := consecutiveNoImprovementFollowUpRounds(targetMetric, projectPlans, summaries)
+	sourcePlanDeltas := experimentRunDeltasForPlan(targetMetric, summariesForPlanID(summaries, sourcePlanID), evaluationsByJob, baselineChampion, objectiveContext)
+	noImprovementRounds := consecutiveNoImprovementFollowUpRounds(targetMetric, projectPlans, summaries, evaluations, objectiveContext)
 	stopSignals := experimentPlannerStopSignals(champion, noImprovementRounds)
 	return &champion, &baselineChampion, sourcePlanDeltas, noImprovementRounds, stopSignals
 }
 
 func experimentChampionFromSummary(targetMetric string, summary runs.TrainingRunSummary) agents.ExperimentChampion {
+	return experimentChampionFromSummaryWithEvaluation(targetMetric, summary, runs.TrainingRunEvaluation{}, agents.ProjectObjectiveContext{})
+}
+
+func experimentChampionFromSummaryWithEvaluation(
+	targetMetric string,
+	summary runs.TrainingRunSummary,
+	evaluation runs.TrainingRunEvaluation,
+	objectiveContext agents.ProjectObjectiveContext,
+) agents.ExperimentChampion {
+	score := holisticRunScore(targetMetric, summary, evaluation, objectiveContext)
 	return agents.ExperimentChampion{
 		JobID:            summary.JobID,
 		PlanID:           summary.PlanID,
 		Model:            summary.Model,
-		TargetMetric:     normalizedPlannerTargetMetric(targetMetric),
-		Score:            plannerTargetMetricValue(targetMetric, summary),
+		TargetMetric:     "deployment_readiness",
+		Score:            roundDiagnosticFloat(score),
+		ScoreBasis:       "loss_heavy_deployment_readiness",
 		BestMacroF1:      summary.BestMacroF1,
 		BestAccuracy:     summary.BestAccuracy,
+		FinalTrainLoss:   summary.FinalTrainLoss,
+		FinalValLoss:     summary.FinalValLoss,
 		EstimatedCostUSD: summary.EstimatedCostUSD,
 		RuntimeSeconds:   summary.RuntimeSeconds,
 		EpochsCompleted:  summary.EpochsCompleted,
@@ -6228,20 +7397,25 @@ func experimentChampionFromSummary(targetMetric string, summary runs.TrainingRun
 func experimentRunDeltasForPlan(
 	targetMetric string,
 	summaries []runs.TrainingRunSummary,
+	evaluationsByJob map[string]runs.TrainingRunEvaluation,
 	champion agents.ExperimentChampion,
+	objectiveContext agents.ProjectObjectiveContext,
 ) []agents.ExperimentRunDelta {
 	out := make([]agents.ExperimentRunDelta, 0, len(summaries))
 	for _, summary := range summaries {
-		score := plannerTargetMetricValue(targetMetric, summary)
+		score := holisticRunScore(targetMetric, summary, evaluationsByJob[summary.JobID], objectiveContext)
 		out = append(out, agents.ExperimentRunDelta{
 			JobID:                    summary.JobID,
 			PlanID:                   summary.PlanID,
 			Model:                    summary.Model,
 			Status:                   summary.Status,
-			TargetMetric:             normalizedPlannerTargetMetric(targetMetric),
-			Score:                    score,
+			TargetMetric:             "deployment_readiness",
+			Score:                    roundDiagnosticFloat(score),
+			ScoreBasis:               "loss_heavy_deployment_readiness",
 			BestMacroF1:              summary.BestMacroF1,
 			BestAccuracy:             summary.BestAccuracy,
+			FinalTrainLoss:           summary.FinalTrainLoss,
+			FinalValLoss:             summary.FinalValLoss,
 			EstimatedCostUSD:         summary.EstimatedCostUSD,
 			RuntimeSeconds:           summary.RuntimeSeconds,
 			EpochsCompleted:          summary.EpochsCompleted,
@@ -6259,6 +7433,8 @@ func consecutiveNoImprovementFollowUpRounds(
 	targetMetric string,
 	projectPlans []plans.ExperimentPlan,
 	summaries []runs.TrainingRunSummary,
+	evaluations []runs.TrainingRunEvaluation,
+	objectiveContext agents.ProjectObjectiveContext,
 ) int {
 	orderedPlans := append([]plans.ExperimentPlan(nil), projectPlans...)
 	sort.Slice(orderedPlans, func(i, j int) bool {
@@ -6271,13 +7447,14 @@ func consecutiveNoImprovementFollowUpRounds(
 	hasChampion := false
 	championScore := 0.0
 	noImprovementRounds := 0
+	evaluationsByJob := evaluationsByJobID(evaluations)
 	for _, plan := range orderedPlans {
 		planSummaries := summariesForPlanID(summaries, plan.ID)
 		if !planTrainingRunsComplete(plan, planSummaries) {
 			continue
 		}
 
-		best, ok := bestSuccessfulTrainingSummary(targetMetric, planSummaries)
+		best, ok := bestSuccessfulTrainingSummaryForObjective(targetMetric, planSummaries, evaluationsForPlanID(evaluations, plan.ID), objectiveContext)
 		if !ok {
 			if plan.SourceDecisionID != "" && hasChampion {
 				noImprovementRounds++
@@ -6285,7 +7462,7 @@ func consecutiveNoImprovementFollowUpRounds(
 			continue
 		}
 
-		score := plannerTargetMetricValue(targetMetric, best)
+		score := holisticRunScore(targetMetric, best, evaluationsByJob[best.JobID], objectiveContext)
 		if !hasChampion {
 			hasChampion = true
 			championScore = score
@@ -6337,7 +7514,7 @@ func bestSuccessfulTrainingSummary(targetMetric string, summaries []runs.Trainin
 		if strings.ToUpper(strings.TrimSpace(summary.Status)) != jobs.StatusSucceeded {
 			continue
 		}
-		score := plannerTargetMetricValue(targetMetric, summary)
+		score := holisticRunScore(targetMetric, summary, runs.TrainingRunEvaluation{}, agents.ProjectObjectiveContext{})
 		if !hasBest || score > bestScore || (score == bestScore && summary.EstimatedCostUSD < best.EstimatedCostUSD) {
 			best = summary
 			bestScore = score
@@ -6379,33 +7556,305 @@ func bestSuccessfulTrainingSummaryForObjective(
 }
 
 func holisticRunScore(targetMetric string, summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation, objectiveContext agents.ProjectObjectiveContext) float64 {
-	quality := plannerTargetMetricValue(targetMetric, summary)
-	if overall := payloadFloat(evaluation.HolisticScores, "overall_score"); overall > 0 {
-		quality = maxFloat(quality, overall)
+	score, _ := holisticRunScoreBreakdown(targetMetric, summary, evaluation, objectiveContext)
+	return score
+}
+
+func holisticRunScoreBreakdown(targetMetric string, summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation, objectiveContext agents.ProjectObjectiveContext) (float64, map[string]any) {
+	quality, readinessBreakdown := deploymentReadinessScoreBreakdown(targetMetric, summary, evaluation)
+	latencyScore, costScore, runtimeScore := deploymentUtilityScores(summary, evaluation)
+	score := quality*0.88 + latencyScore*0.06 + costScore*0.03 + runtimeScore*0.03
+	weights := map[string]float64{
+		"quality": 0.88,
+		"latency": 0.06,
+		"cost":    0.03,
+		"runtime": 0.03,
 	}
+	if objectiveContext.PrimaryObjective == "low_latency_live_service" {
+		score = quality*0.82 + latencyScore*0.10 + costScore*0.05 + runtimeScore*0.03
+		weights = map[string]float64{"quality": 0.82, "latency": 0.10, "cost": 0.05, "runtime": 0.03}
+	} else if objectiveContext.PrimaryObjective == "budget_sensitive" {
+		score = quality*0.80 + costScore*0.12 + latencyScore*0.05 + runtimeScore*0.03
+		weights = map[string]float64{"quality": 0.80, "latency": 0.05, "cost": 0.12, "runtime": 0.03}
+	} else if objectiveContext.PrimaryObjective == "quality_first" {
+		score = quality*0.92 + latencyScore*0.03 + costScore*0.025 + runtimeScore*0.025
+		weights = map[string]float64{"quality": 0.92, "latency": 0.03, "cost": 0.025, "runtime": 0.025}
+	}
+	breakdown := map[string]any{
+		"score":                   roundDiagnosticFloat(score),
+		"quality_score":           roundDiagnosticFloat(quality),
+		"latency_score":           roundDiagnosticFloat(latencyScore),
+		"cost_score":              roundDiagnosticFloat(costScore),
+		"runtime_score":           roundDiagnosticFloat(runtimeScore),
+		"objective":               objectiveContext.PrimaryObjective,
+		"target_metric":           normalizedPlannerTargetMetric(targetMetric),
+		"objective_weights":       weights,
+		"readiness_components":    readinessBreakdown,
+		"validation_metric_score": payloadFloat(readinessBreakdown, "validation_metric_score"),
+		"heldout_metric_score":    payloadFloat(readinessBreakdown, "heldout_metric_score"),
+		"per_class_score":         payloadFloat(readinessBreakdown, "per_class_score"),
+		"loss_health_score":       payloadFloat(readinessBreakdown, "loss_health_score"),
+		"confusion_health_score":  payloadFloat(readinessBreakdown, "confusion_health_score"),
+	}
+	return clamp01(score), breakdown
+}
+
+func deploymentUtilityScores(summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, float64, float64) {
 	latencyScore := 0.5
-	if latencyMS := payloadFloat(evaluation.ModelProfile, "estimated_latency_ms"); latencyMS > 0 {
+	if latencyMS := payloadFloat(evaluation.ModelProfile, "estimated_pipeline_latency_ms"); latencyMS > 0 {
+		latencyScore = maxFloat(0, minFloat(1, 1-latencyMS/160))
+	} else if latencyMS := payloadFloat(evaluation.ModelProfile, "estimated_latency_ms"); latencyMS > 0 {
 		latencyScore = maxFloat(0, minFloat(1, 1-latencyMS/160))
 	}
 	costScore := maxFloat(0, minFloat(1, 1-summary.EstimatedCostUSD/10))
 	runtimeScore := maxFloat(0, minFloat(1, 1-summary.RuntimeSeconds/1800))
+	return latencyScore, costScore, runtimeScore
+}
 
-	if objectiveContext.PrimaryObjective == "low_latency_live_service" {
-		return quality*0.76 + latencyScore*0.10 + costScore*0.08 + runtimeScore*0.06
+func deploymentReadinessScore(targetMetric string, summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) float64 {
+	score, _ := deploymentReadinessScoreBreakdown(targetMetric, summary, evaluation)
+	return score
+}
+
+func deploymentReadinessScoreBreakdown(targetMetric string, summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, map[string]any) {
+	validationScore := validationMetricScore(targetMetric, summary)
+	heldoutScore, hasHeldoutScore := heldoutMetricScore(targetMetric, evaluation.ObjectiveProfile)
+	perClassScore, hasPerClassScore := perClassMetricScore(evaluation.PerClassMetrics)
+	lossScore, hasLossScore := lossHealthScore(summary, evaluation)
+	confusionScore, hasConfusionScore := confusionHealthScore(evaluation.ConfusionMatrix)
+	overallScore := payloadFloat(evaluation.HolisticScores, "overall_score")
+
+	weighted := weightedScore{}
+	weighted.add(validationScore, 0.12, true)
+	weighted.add(heldoutScore, 0.24, hasHeldoutScore)
+	weighted.add(perClassScore, 0.17, hasPerClassScore)
+	weighted.add(lossScore, 0.34, hasLossScore)
+	weighted.add(confusionScore, 0.09, hasConfusionScore)
+	weighted.add(overallScore, 0.04, overallScore > 0)
+	score := weighted.value(validationScore)
+	return score, map[string]any{
+		"score":                   roundDiagnosticFloat(score),
+		"validation_metric_score": roundDiagnosticFloat(validationScore),
+		"heldout_metric_score":    roundDiagnosticFloat(heldoutScore),
+		"has_heldout_metric":      hasHeldoutScore,
+		"per_class_score":         roundDiagnosticFloat(perClassScore),
+		"has_per_class_metrics":   hasPerClassScore,
+		"loss_health_score":       roundDiagnosticFloat(lossScore),
+		"has_loss_health":         hasLossScore,
+		"confusion_health_score":  roundDiagnosticFloat(confusionScore),
+		"has_confusion_matrix":    hasConfusionScore,
+		"overall_score":           roundDiagnosticFloat(overallScore),
+		"component_weights": map[string]float64{
+			"validation_metric": 0.12,
+			"heldout_metric":    0.24,
+			"per_class":         0.17,
+			"loss_health":       0.34,
+			"confusion_health":  0.09,
+			"overall":           0.04,
+		},
 	}
-	if objectiveContext.PrimaryObjective == "budget_sensitive" {
-		return quality*0.68 + costScore*0.18 + latencyScore*0.08 + runtimeScore*0.06
+}
+
+type weightedScore struct {
+	total  float64
+	weight float64
+}
+
+func (s *weightedScore) add(value float64, weight float64, ok bool) {
+	if !ok || weight <= 0 || !isFiniteFloat(value) {
+		return
 	}
-	if objectiveContext.PrimaryObjective == "quality_first" {
-		return quality*0.82 + latencyScore*0.07 + costScore*0.06 + runtimeScore*0.05
+	s.total += clamp01(value) * weight
+	s.weight += weight
+}
+
+func (s weightedScore) value(fallback float64) float64 {
+	if s.weight <= 0 {
+		return clamp01(fallback)
 	}
-	return quality*0.74 + latencyScore*0.12 + costScore*0.08 + runtimeScore*0.06
+	return clamp01(s.total / s.weight)
+}
+
+func validationMetricScore(targetMetric string, summary runs.TrainingRunSummary) float64 {
+	macroF1 := clamp01(summary.BestMacroF1)
+	accuracy := clamp01(summary.BestAccuracy)
+	switch normalizedPlannerTargetMetric(targetMetric) {
+	case "accuracy":
+		return weightedMetricAverage([]metricComponent{{accuracy, 0.55}, {macroF1, 0.45}}, maxFloat(accuracy, macroF1))
+	case "map50_95", "map50", "map":
+		return weightedMetricAverage([]metricComponent{{macroF1, 0.65}, {accuracy, 0.35}}, maxFloat(macroF1, accuracy))
+	default:
+		return weightedMetricAverage([]metricComponent{{macroF1, 0.60}, {accuracy, 0.40}}, maxFloat(macroF1, accuracy))
+	}
+}
+
+func heldoutMetricScore(targetMetric string, objectiveProfile map[string]any) (float64, bool) {
+	map50_95 := payloadFloat(objectiveProfile, "heldout_test_map50_95")
+	if map50_95 <= 0 {
+		map50_95 = payloadFloat(objectiveProfile, "heldout_test_map")
+	}
+	map50 := payloadFloat(objectiveProfile, "heldout_test_map50")
+	recall := payloadFloat(objectiveProfile, "heldout_test_recall")
+	precision := payloadFloat(objectiveProfile, "heldout_test_precision")
+	if map50_95 > 0 || map50 > 0 {
+		weighted := weightedScore{}
+		weighted.add(map50_95, 0.62, map50_95 > 0)
+		weighted.add(map50, 0.20, map50 > 0)
+		weighted.add(recall, 0.12, recall > 0)
+		weighted.add(precision, 0.06, precision > 0)
+		return weighted.value(maxFloat(map50_95, map50)), true
+	}
+	macroF1 := payloadFloat(objectiveProfile, "heldout_test_macro_f1")
+	accuracy := payloadFloat(objectiveProfile, "heldout_test_accuracy")
+	if macroF1 <= 0 && accuracy <= 0 {
+		return 0, false
+	}
+	switch normalizedPlannerTargetMetric(targetMetric) {
+	case "accuracy":
+		return weightedMetricAverage([]metricComponent{{accuracy, 0.55}, {macroF1, 0.45}}, maxFloat(accuracy, macroF1)), true
+	default:
+		return weightedMetricAverage([]metricComponent{{macroF1, 0.60}, {accuracy, 0.40}}, maxFloat(macroF1, accuracy)), true
+	}
+}
+
+func perClassMetricScore(metrics map[string]any) (float64, bool) {
+	worstLabel, worstRecall := worstPerClassRecall(metrics)
+	macroAvg := perClassAggregateMetric(metrics, "macro avg")
+	weightedAvg := perClassAggregateMetric(metrics, "weighted avg")
+	if worstLabel == "" && macroAvg <= 0 && weightedAvg <= 0 {
+		return 0, false
+	}
+	weighted := weightedScore{}
+	weighted.add(worstRecall, 0.50, worstLabel != "")
+	weighted.add(macroAvg, 0.35, macroAvg > 0)
+	weighted.add(weightedAvg, 0.15, weightedAvg > 0)
+	return weighted.value(maxFloat(worstRecall, macroAvg)), true
+}
+
+func perClassAggregateMetric(metrics map[string]any, key string) float64 {
+	stats := mapFromAny(metrics[key])
+	value := payloadFloat(stats, "f1-score")
+	if value <= 0 {
+		value = payloadFloat(stats, "f1")
+	}
+	if value <= 0 {
+		value = payloadFloat(stats, "recall")
+	}
+	return clamp01(value)
+}
+
+func lossHealthScore(summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, bool) {
+	classCount := evaluationClassCount(evaluation)
+	diagnostics := payloadMap(evaluation.HolisticScores, "training_diagnostics")
+	weighted := weightedScore{}
+	if severity := payloadFloat(diagnostics, "severity"); severity > 0 {
+		weighted.add(1-severity, 0.18, true)
+	}
+	if payloadBool(diagnostics, "divergence_detected") {
+		weighted.add(0.10, 0.15, true)
+	}
+	trainLoss := summary.FinalTrainLoss
+	valLoss := summary.FinalValLoss
+	if trainLoss > 0 {
+		weighted.add(lossValueScore(trainLoss, classCount), 0.12, true)
+	}
+	if valLoss > 0 {
+		weighted.add(lossValueScore(valLoss, classCount), 0.30, true)
+	}
+	if trainLoss > 0 && valLoss > 0 {
+		gap := valLoss - trainLoss
+		ratio := valLoss / maxFloat(trainLoss, 0.000001)
+		weighted.add(1-minFloat(1, maxFloat(0, gap)/0.75), 0.15, true)
+		weighted.add(1-minFloat(1, maxFloat(0, ratio-1)/1.50), 0.10, true)
+	}
+	if heldoutLoss := payloadFloat(evaluation.ObjectiveProfile, "heldout_test_loss"); heldoutLoss > 0 {
+		weighted.add(lossValueScore(heldoutLoss, classCount), 0.35, true)
+	}
+	if weighted.weight <= 0 {
+		return 0, false
+	}
+	return weighted.value(1), true
+}
+
+func lossValueScore(loss float64, classCount int) float64 {
+	if loss <= 0 || !isFiniteFloat(loss) {
+		return 0
+	}
+	randomBaseline := math.Log(float64(maxInt(classCount, 2)))
+	if randomBaseline <= 0 {
+		randomBaseline = math.Log(2)
+	}
+	normalized := loss / randomBaseline
+	return clamp01(1 - (normalized-0.20)/1.30)
+}
+
+func confusionHealthScore(matrix [][]int) (float64, bool) {
+	if len(matrix) == 0 {
+		return 0, false
+	}
+	_, ratio := topConfusionPairRatio(matrix)
+	if ratio <= 0 {
+		return 1, true
+	}
+	return clamp01(1 - ratio/0.25), true
+}
+
+func evaluationClassCount(evaluation runs.TrainingRunEvaluation) int {
+	if len(evaluation.ConfusionMatrix) > 0 {
+		return len(evaluation.ConfusionMatrix)
+	}
+	count := 0
+	for label := range evaluation.PerClassMetrics {
+		normalizedLabel := strings.ToLower(strings.TrimSpace(label))
+		if normalizedLabel == "" || normalizedLabel == "accuracy" || strings.Contains(normalizedLabel, "avg") {
+			continue
+		}
+		count++
+	}
+	if count > 0 {
+		return count
+	}
+	if labels := payloadStringSlice(evaluation.ModelProfile, "class_labels"); len(labels) > 0 {
+		return len(labels)
+	}
+	return 2
+}
+
+type metricComponent struct {
+	value  float64
+	weight float64
+}
+
+func weightedMetricAverage(components []metricComponent, fallback float64) float64 {
+	weighted := weightedScore{}
+	for _, component := range components {
+		weighted.add(component.value, component.weight, component.value > 0)
+	}
+	return weighted.value(fallback)
+}
+
+func clamp01(value float64) float64 {
+	if !isFiniteFloat(value) {
+		return 0
+	}
+	return maxFloat(0, minFloat(1, value))
 }
 
 func bestSuccessfulTrainingSummaryBeforePlan(
 	targetMetric string,
 	projectPlans []plans.ExperimentPlan,
 	summaries []runs.TrainingRunSummary,
+	sourcePlanID string,
+) (runs.TrainingRunSummary, bool) {
+	return bestSuccessfulTrainingSummaryBeforePlanForObjective(targetMetric, projectPlans, summaries, nil, agents.ProjectObjectiveContext{}, sourcePlanID)
+}
+
+func bestSuccessfulTrainingSummaryBeforePlanForObjective(
+	targetMetric string,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+	evaluations []runs.TrainingRunEvaluation,
+	objectiveContext agents.ProjectObjectiveContext,
 	sourcePlanID string,
 ) (runs.TrainingRunSummary, bool) {
 	orderedPlans := append([]plans.ExperimentPlan(nil), projectPlans...)
@@ -6430,7 +7879,7 @@ func bestSuccessfulTrainingSummaryBeforePlan(
 			priorSummaries = append(priorSummaries, summary)
 		}
 	}
-	return bestSuccessfulTrainingSummary(targetMetric, priorSummaries)
+	return bestSuccessfulTrainingSummaryForObjective(targetMetric, priorSummaries, evaluations, objectiveContext)
 }
 
 func plannerTargetMetricValue(targetMetric string, summary runs.TrainingRunSummary) float64 {
@@ -6446,6 +7895,11 @@ func normalizedPlannerTargetMetric(targetMetric string) string {
 	normalized := strings.ToLower(strings.TrimSpace(targetMetric))
 	if normalized == "" {
 		return "macro_f1"
+	}
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, "@", "")
+	if normalized == "map50_95" || normalized == "map5095" || normalized == "map" {
+		return "map50_95"
 	}
 	return normalized
 }
@@ -6930,6 +8384,9 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 
 	out := make([]jobs.ExperimentJob, 0, len(plan.Experiments))
 	for index, experiment := range plan.Experiments {
+		if err := validateExperimentDatasetCompatibility(experiment, dataset, index); err != nil {
+			return executeExperimentPlanResponse{}, err
+		}
 		if job, ok := jobsByExperiment[index]; ok {
 			out = append(out, job)
 			continue
@@ -6951,6 +8408,24 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			config["epochs"] = experiment.Epochs
 			config["batch_size"] = experiment.BatchSize
 			config["learning_rate"] = experiment.LearningRate
+			if modelSpec, ok := supportedModelSpecByName(experiment.Model); ok {
+				config["task_type"] = modelSpec.TaskType
+				config["model_kind"] = modelSpec.ModelKind
+				if modelSpec.PretrainedWeights != "" {
+					config["pretrained_weights"] = modelSpec.PretrainedWeights
+				}
+				if modelSpec.DefaultImageSize > 0 && config["image_size"] == nil {
+					config["image_size"] = modelSpec.DefaultImageSize
+				}
+				if modelSpec.TaskType == "object_detection" {
+					if classNames := profileStringSlice(dataset.Profile, "class_names"); len(classNames) > 0 {
+						config["class_names"] = classNames
+					}
+					if yoloSummary := profileMap(dataset.Profile, "yolo_summary"); len(yoloSummary) > 0 {
+						config["yolo_summary"] = safeYOLOSummary(yoloSummary)
+					}
+				}
+			}
 		} else if jobTemplate == jobs.TemplateLabelQualityAudit {
 			config["audit_type"] = strings.ToLower(strings.TrimSpace(experiment.Mechanism))
 			config["report_only"] = true
@@ -7162,87 +8637,73 @@ func defaultBackendAutoMLForExperiment(experiment plans.PlannedExperiment, defau
 func defaultBackendAutoMLSearchSpace(experiment plans.PlannedExperiment) automl.HyperparameterSearchSpace {
 	params := []automl.HyperparameterParameterSpec{}
 
-	baseLR := experiment.LearningRate
-	if baseLR <= 0 {
-		baseLR = 3e-4
-	}
-	lrMin := maxFloat(1e-6, baseLR/5)
-	lrMax := minFloat(3e-3, baseLR*5)
-	if lrMax <= lrMin {
+	lrMin := 1e-6
+	lrMax := 1e-2
+	lrNotes := "broad log-scale learning-rate search for Adam-like optimizers"
+	if strings.EqualFold(strings.TrimSpace(experiment.Optimizer), "sgd") {
 		lrMin = 1e-5
-		lrMax = 3e-4
+		lrMax = 1e-1
+		lrNotes = "broad log-scale learning-rate search for SGD"
 	}
-	params = append(params, autoMLFloatSpec("learning_rate", lrMin, lrMax, automl.SearchScaleLog, "centered around the LLM-provided learning rate"))
+	params = append(params, autoMLFloatSpec("learning_rate", lrMin, lrMax, automl.SearchScaleLog, lrNotes))
 
-	wdMin := 0.0
-	wdMax := 0.08
-	if experiment.WeightDecay > 0 {
-		wdMin = maxFloat(0, experiment.WeightDecay/5)
-		wdMax = minFloat(0.2, maxFloat(experiment.WeightDecay*4, experiment.WeightDecay+0.02))
-	}
-	params = append(params, autoMLFloatSpec("weight_decay", wdMin, wdMax, automl.SearchScaleLinear, "regularization strength"))
+	params = append(params, autoMLFloatSpec("weight_decay", 0, 0.3, automl.SearchScaleLinear, "broad regularization strength"))
 
-	params = append(params, autoMLIntChoicesSpec("batch_size", defaultAutoMLBatchSizeChoices(experiment.BatchSize), "worker-supported batch sizes near the LLM budget"))
+	params = append(params, autoMLIntChoicesSpec("batch_size", defaultAutoMLBatchSizeChoices(experiment.BatchSize), "full worker-supported batch-size sweep"))
 
 	epochBase := experiment.Epochs
 	if epochBase < 3 {
 		epochBase = 10
 	}
-	epochMin := maxInt(3, epochBase-4)
-	epochMax := minInt(40, epochBase+8)
+	epochMin := 3
+	epochMax := minInt(80, maxInt(24, epochBase*3))
 	if epochMax < epochMin {
 		epochMax = epochMin
 	}
-	params = append(params, autoMLIntRangeSpec("epochs", epochMin, epochMax, "bounded training budget around the LLM proposal"))
-	params = append(params, autoMLIntChoicesSpec("early_stopping_patience", defaultAutoMLPatienceChoices(epochMax), "bounded early-stopping patience"))
+	params = append(params, autoMLIntRangeSpec("epochs", epochMin, epochMax, "broad training budget with early stopping"))
+	params = append(params, autoMLIntChoicesSpec("early_stopping_patience", defaultAutoMLPatienceChoices(epochMax), "early-stopping patience sweep"))
 
-	dropoutMin := 0.0
-	dropoutMax := 0.35
-	if experiment.Dropout > 0 {
-		dropoutMin = maxFloat(0, experiment.Dropout/3)
-		dropoutMax = minFloat(0.7, maxFloat(0.35, experiment.Dropout*2.5))
-	}
-	params = append(params, autoMLFloatSpec("dropout", dropoutMin, dropoutMax, automl.SearchScaleLinear, "head regularization"))
-	params = append(params, autoMLFloatSpec("label_smoothing", 0, 0.15, automl.SearchScaleLinear, "classification regularization"))
-	params = append(params, autoMLFloatSpec("gradient_clip_norm", 0, 3, automl.SearchScaleLinear, "gradient stability"))
+	params = append(params, autoMLFloatSpec("dropout", 0, 0.7, automl.SearchScaleLinear, "full head regularization range"))
+	params = append(params, autoMLFloatSpec("label_smoothing", 0, 0.3, automl.SearchScaleLinear, "classification regularization"))
+	params = append(params, autoMLFloatSpec("gradient_clip_norm", 0, 10, automl.SearchScaleLinear, "gradient stability"))
 
 	if strings.EqualFold(strings.TrimSpace(experiment.Optimizer), "sgd") {
-		params = append(params, autoMLFloatSpec("optimizer_momentum", 0.7, 0.95, automl.SearchScaleLinear, "SGD momentum"))
+		params = append(params, autoMLFloatSpec("optimizer_momentum", 0, 0.99, automl.SearchScaleLinear, "SGD momentum"))
 	}
 	if strings.EqualFold(strings.TrimSpace(experiment.Scheduler), "step") {
-		stepMax := minInt(10, maxInt(2, epochMax/2))
+		stepMax := minInt(100, maxInt(2, epochMax))
 		params = append(params, autoMLIntRangeSpec("scheduler_step_size", 1, stepMax, "step scheduler cadence"))
-		params = append(params, autoMLFloatSpec("scheduler_gamma", 0.2, 0.8, automl.SearchScaleLinear, "step scheduler decay"))
+		params = append(params, autoMLFloatSpec("scheduler_gamma", 0.05, 0.95, automl.SearchScaleLinear, "step scheduler decay"))
 	}
 
 	if experiment.AugmentationPolicyConfig != nil {
 		switch strings.ToLower(strings.TrimSpace(experiment.AugmentationPolicyConfig.PolicyType)) {
 		case "randaugment":
 			params = append(params,
-				autoMLIntRangeSpec("augmentation_policy_config.magnitude", 4, 12, "numeric strength for the LLM-selected randaugment policy"),
+				autoMLIntRangeSpec("augmentation_policy_config.magnitude", 0, 15, "numeric strength for the LLM-selected randaugment policy"),
 				autoMLIntRangeSpec("augmentation_policy_config.num_ops", 1, 3, "operation count for the LLM-selected randaugment policy"),
-				autoMLFloatSpec("augmentation_policy_config.probability", 0.5, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"),
+				autoMLFloatSpec("augmentation_policy_config.probability", 0, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"),
 			)
 		case "trivialaugment", "trivialaugmentwide":
 			params = append(params,
-				autoMLIntRangeSpec("augmentation_policy_config.num_magnitude_bins", 8, 31, "magnitude bins for the LLM-selected augmentation policy"),
-				autoMLFloatSpec("augmentation_policy_config.probability", 0.5, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"),
+				autoMLIntRangeSpec("augmentation_policy_config.num_magnitude_bins", 2, 31, "magnitude bins for the LLM-selected augmentation policy"),
+				autoMLFloatSpec("augmentation_policy_config.probability", 0, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"),
 			)
 		case "autoaugment":
-			params = append(params, autoMLFloatSpec("augmentation_policy_config.probability", 0.5, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"))
+			params = append(params, autoMLFloatSpec("augmentation_policy_config.probability", 0, 1, automl.SearchScaleLinear, "application probability for the LLM-selected augmentation policy"))
 		case "mixup", "cutmix":
 			params = append(params,
-				autoMLFloatSpec("augmentation_policy_config.alpha", 0.05, 0.6, automl.SearchScaleLinear, "mixing strength for the LLM-selected mixed-sample policy"),
-				autoMLFloatSpec("augmentation_policy_config.probability", 0.3, 0.9, automl.SearchScaleLinear, "application probability for the LLM-selected mixed-sample policy"),
+				autoMLFloatSpec("augmentation_policy_config.alpha", 0, 1, automl.SearchScaleLinear, "mixing strength for the LLM-selected mixed-sample policy"),
+				autoMLFloatSpec("augmentation_policy_config.probability", 0, 1, automl.SearchScaleLinear, "application probability for the LLM-selected mixed-sample policy"),
 			)
 		}
 	}
 
 	if effectiveNumberClassBalancing(experiment.ClassBalancing) {
-		params = append(params, autoMLFloatSpec("class_balancing_config.effective_number_beta", 0.95, 0.9999, automl.SearchScaleLinear, "effective-number loss beta"))
+		params = append(params, autoMLFloatSpec("class_balancing_config.effective_number_beta", 0.9, 0.99999, automl.SearchScaleLinear, "effective-number loss beta"))
 	}
 	if strings.EqualFold(strings.TrimSpace(experiment.ClassBalancing), "focal_loss") {
-		params = append(params, autoMLFloatSpec("class_balancing_config.focal_loss_gamma", 1, 4, automl.SearchScaleLinear, "focal loss gamma"))
+		params = append(params, autoMLFloatSpec("class_balancing_config.focal_loss_gamma", 0.5, 5, automl.SearchScaleLinear, "focal loss gamma"))
 	}
 
 	return automl.HyperparameterSearchSpace{Parameters: params}
@@ -7292,37 +8753,20 @@ func autoMLIntChoicesSpec(name string, choices []int, notes string) automl.Hyper
 }
 
 func defaultAutoMLBatchSizeChoices(current int) []int {
-	supported := []int{4, 8, 16, 32, 64, 128}
-	if current <= 0 {
-		return []int{8, 16, 32}
-	}
-	lower := maxInt(4, current/2)
-	upper := maxInt(lower, current*2)
-	choices := []int{}
-	for _, choice := range supported {
-		if choice >= lower && choice <= upper {
-			choices = append(choices, choice)
-		}
-	}
-	if len(choices) > 0 {
-		return choices
-	}
-	nearest := supported[0]
-	bestDistance := absInt(current - nearest)
-	for _, choice := range supported[1:] {
-		if distance := absInt(current - choice); distance < bestDistance {
-			nearest = choice
-			bestDistance = distance
-		}
-	}
-	return []int{nearest}
+	return []int{4, 8, 16, 32, 64, 128}
 }
 
 func defaultAutoMLPatienceChoices(maxEpochs int) []int {
-	limit := minInt(8, maxInt(2, maxEpochs/2))
-	choices := []int{}
-	for value := 2; value <= limit; value++ {
-		choices = append(choices, value)
+	limit := minInt(50, maxInt(0, maxEpochs/2))
+	candidates := []int{0, 2, 4, 6, 8, 10, 12, 16, 20, 30, 40, 50}
+	choices := make([]int, 0, len(candidates))
+	for _, value := range candidates {
+		if value <= limit {
+			choices = append(choices, value)
+		}
+	}
+	if len(choices) == 0 {
+		return []int{0}
 	}
 	return choices
 }
@@ -7332,13 +8776,6 @@ func minInt(left int, right int) int {
 		return left
 	}
 	return right
-}
-
-func absInt(value int) int {
-	if value < 0 {
-		return -value
-	}
-	return value
 }
 
 func prepareAutoMLExperiment(experiment plans.PlannedExperiment, index int, defaultSampler string) (plans.PlannedExperiment, error) {
@@ -7863,13 +9300,23 @@ func (s *Server) observeAutoMLTrialForJob(job jobs.ExperimentJob) error {
 	if status == "" {
 		status = job.Status
 	}
-	score := plannerTargetMetricValue(targetMetric, summary)
+	targetMetricScore := plannerTargetMetricValue(targetMetric, summary)
+	score := targetMetricScore
+	evaluation := runs.TrainingRunEvaluation{}
+	if storedEvaluation, err := s.store.GetTrainingRunEvaluation(job.ID); err == nil {
+		evaluation = storedEvaluation
+		score = holisticRunScore(targetMetric, summary, evaluation, agents.ProjectObjectiveContext{})
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
 	if status != jobs.StatusSucceeded {
 		score = 0
 	}
 	metrics := map[string]any{
 		"best_macro_f1":        summary.BestMacroF1,
 		"best_accuracy":        summary.BestAccuracy,
+		"target_metric_score":  targetMetricScore,
+		"trial_score_basis":    "loss_heavy_deployment_readiness",
 		"final_train_loss":     summary.FinalTrainLoss,
 		"final_val_loss":       summary.FinalValLoss,
 		"epochs_completed":     summary.EpochsCompleted,
@@ -7879,12 +9326,16 @@ func (s *Server) observeAutoMLTrialForJob(job jobs.ExperimentJob) error {
 		"automl_summary":       job.Config["automl_summary"],
 		"train_validation_gap": summary.FinalValLoss - summary.FinalTrainLoss,
 	}
-	if evaluation, err := s.store.GetTrainingRunEvaluation(job.ID); err == nil {
+	if evaluation.JobID != "" {
+		metrics["deployment_readiness_score"] = score
 		if diagnostics, ok := evaluation.HolisticScores["training_diagnostics"]; ok {
 			metrics["training_diagnostics"] = diagnostics
 		}
 		if gap, ok := evaluation.HolisticScores["train_validation_gap"]; ok {
 			metrics["train_validation_gap"] = gap
+		}
+		if heldoutLoss := payloadFloat(evaluation.ObjectiveProfile, "heldout_test_loss"); heldoutLoss > 0 {
+			metrics["heldout_test_loss"] = heldoutLoss
 		}
 	}
 	_, err = s.store.UpsertOptimizerTrial(automl.OptimizerTrial{
@@ -8100,6 +9551,14 @@ func plannerExperimentsWithProposalMechanisms(recommendation agents.ExperimentPl
 	return attachProposalMechanismsToExperiments(experiments, recommendation.ProposalMechanisms)
 }
 
+func plannerExperimentsWithProposalMechanismsRelaxed(recommendation agents.ExperimentPlanningRecommendation) ([]plans.PlannedExperiment, []string) {
+	experiments := append([]plans.PlannedExperiment(nil), recommendation.ProposedExperiments...)
+	if len(experiments) == 0 {
+		return experiments, nil
+	}
+	return attachProposalMechanismsToExperimentsRelaxed(experiments, recommendation.ProposalMechanisms)
+}
+
 func plannedExperimentsWithStoredProposalMechanisms(payload map[string]any, experiments []plans.PlannedExperiment) ([]plans.PlannedExperiment, error) {
 	mechanisms, ok, err := plannerProposalMechanismsFromPayload(payload)
 	if err != nil {
@@ -8150,6 +9609,48 @@ func attachProposalMechanismsToExperiments(experiments []plans.PlannedExperiment
 		out[index].ExpectedEffect = mechanism.ExpectedEffect
 	}
 	return out, nil
+}
+
+func attachProposalMechanismsToExperimentsRelaxed(experiments []plans.PlannedExperiment, mechanisms []agents.PlannerProposalMechanism) ([]plans.PlannedExperiment, []string) {
+	out := append([]plans.PlannedExperiment(nil), experiments...)
+	if len(out) == 0 {
+		return out, nil
+	}
+	if len(mechanisms) == 0 {
+		return out, []string{plannerRelaxedValidationWarningText("proposal_mechanisms missing; using proposed experiment fields as-is")}
+	}
+
+	warnings := []string{}
+	seen := map[int]bool{}
+	for index, mechanism := range mechanisms {
+		if mechanism.ExperimentIndex < 0 || mechanism.ExperimentIndex >= len(out) {
+			warnings = append(warnings, plannerRelaxedValidationWarningText(fmt.Sprintf("proposal_mechanisms[%d] has invalid experiment_index %d", index, mechanism.ExperimentIndex)))
+			continue
+		}
+		if seen[mechanism.ExperimentIndex] {
+			warnings = append(warnings, plannerRelaxedValidationWarningText(fmt.Sprintf("proposal_mechanisms duplicate experiment_index %d", mechanism.ExperimentIndex)))
+			continue
+		}
+		seen[mechanism.ExperimentIndex] = true
+		if strings.TrimSpace(mechanism.Mechanism) != "" {
+			out[mechanism.ExperimentIndex].Mechanism = mechanism.Mechanism
+		}
+		if strings.TrimSpace(mechanism.Intervention) != "" {
+			out[mechanism.ExperimentIndex].Intervention = mechanism.Intervention
+		}
+		if len(nonEmptyStringValues(mechanism.EvidenceUsed)) > 0 {
+			out[mechanism.ExperimentIndex].EvidenceUsed = append([]string(nil), mechanism.EvidenceUsed...)
+		}
+		if strings.TrimSpace(mechanism.ExpectedEffect) != "" {
+			out[mechanism.ExperimentIndex].ExpectedEffect = mechanism.ExpectedEffect
+		}
+	}
+	for index := range out {
+		if !seen[index] {
+			warnings = append(warnings, plannerRelaxedValidationWarningText(fmt.Sprintf("proposal_mechanisms missing experiment_index %d; using proposed experiment fields as-is", index)))
+		}
+	}
+	return out, uniqueStrings(warnings)
 }
 
 func validateLLMPlannerMechanismContract(experiments []plans.PlannedExperiment, evidenceUsed []string) error {
@@ -8537,8 +10038,12 @@ func validatePlannedExperiment(experiment plans.PlannedExperiment, index int) er
 	if strings.TrimSpace(experiment.Model) == "" {
 		return fmt.Errorf("%w: proposed experiment %d is missing model", store.ErrInvalidRequest, index)
 	}
-	if !supportedModelNames()[strings.ToLower(strings.TrimSpace(experiment.Model))] {
+	modelSpec, ok := supportedModelSpecByName(experiment.Model)
+	if !ok {
 		return fmt.Errorf("%w: proposed experiment %d uses unsupported model %q", store.ErrInvalidRequest, index, experiment.Model)
+	}
+	if !modelSpec.TrainingEnabled {
+		return fmt.Errorf("%w: proposed experiment %d uses detector model %q before the %s training worker is enabled", store.ErrInvalidRequest, index, experiment.Model, modelSpec.ModelKind)
 	}
 	if experiment.Epochs < 1 || experiment.Epochs > 100 {
 		return fmt.Errorf("%w: proposed experiment %d must have 1-100 epochs", store.ErrInvalidRequest, index)
@@ -8549,8 +10054,12 @@ func validatePlannedExperiment(experiment plans.PlannedExperiment, index int) er
 	if experiment.LearningRate <= 0 || experiment.LearningRate > 1 {
 		return fmt.Errorf("%w: proposed experiment %d must have learning_rate in (0, 1]", store.ErrInvalidRequest, index)
 	}
-	if experiment.ImageSize < 0 || experiment.ImageSize > 1024 {
-		return fmt.Errorf("%w: proposed experiment %d image_size must be at most 1024", store.ErrInvalidRequest, index)
+	maxImageSize := 1024
+	if modelSpec.TaskType == "object_detection" {
+		maxImageSize = 1280
+	}
+	if experiment.ImageSize < 0 || experiment.ImageSize > maxImageSize {
+		return fmt.Errorf("%w: proposed experiment %d image_size must be at most %d", store.ErrInvalidRequest, index, maxImageSize)
 	}
 	if experiment.ResolutionStrategy != "" && !allowedExperimentValue(experiment.ResolutionStrategy, allowedResolutionStrategies()) {
 		return fmt.Errorf("%w: proposed experiment %d has unsupported resolution_strategy %q", store.ErrInvalidRequest, index, experiment.ResolutionStrategy)
@@ -8631,6 +10140,57 @@ func validatePlannedExperiment(experiment plans.PlannedExperiment, index int) er
 	}
 	if err := validateExperimentAutoML(experiment, index); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateExperimentDatasetCompatibility(experiment plans.PlannedExperiment, dataset datasets.Dataset, index int) error {
+	if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+		return nil
+	}
+	modelSpec, ok := supportedModelSpecByName(experiment.Model)
+	if !ok {
+		return validatePlannedExperiment(experiment, index)
+	}
+	template := strings.ToLower(strings.TrimSpace(experiment.Template))
+	yoloEvidence := datasetHasYOLODetectionEvidence(dataset, map[string]any{})
+	if modelSpec.TaskType == "object_detection" {
+		if !yoloEvidence {
+			return fmt.Errorf("%w: proposed experiment %d uses detector model %q but the dataset has no YOLO detection evidence", store.ErrInvalidRequest, index, experiment.Model)
+		}
+		if template != "" && !containsAnyText(template, "yolo", "detect") {
+			return fmt.Errorf("%w: proposed experiment %d uses detector model %q with non-detection template %q", store.ErrInvalidRequest, index, experiment.Model, experiment.Template)
+		}
+		return nil
+	}
+	if yoloEvidence {
+		return fmt.Errorf("%w: proposed experiment %d uses classifier model %q for a YOLO object-detection dataset", store.ErrInvalidRequest, index, experiment.Model)
+	}
+	if containsAnyText(template, "yolo", "detect") {
+		return fmt.Errorf("%w: proposed experiment %d uses detection template %q with classifier model %q", store.ErrInvalidRequest, index, experiment.Template, experiment.Model)
+	}
+	return nil
+}
+
+func (s *Server) validateExperimentsDatasetCompatibility(datasetID string, experiments []plans.PlannedExperiment) error {
+	if strings.TrimSpace(datasetID) == "" {
+		return nil
+	}
+	dataset, err := s.store.GetDataset(datasetID)
+	if err != nil {
+		return err
+	}
+	metadataSummary, err := s.activeAgentSafeDatasetMetadataSummary(dataset)
+	if err != nil {
+		return err
+	}
+	if len(metadataSummary) > 0 {
+		dataset.Profile = profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary)
+	}
+	for index, experiment := range experiments {
+		if err := validateExperimentDatasetCompatibility(experiment, dataset, index); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -8818,6 +10378,8 @@ func allowedResizeStrategies() map[string]bool {
 		"center_crop":            true,
 		"random_resized_crop":    true,
 		"bbox_crop_if_available": true,
+		"letterbox":              true,
+		"yolo_letterbox":         true,
 	}
 }
 
@@ -9117,6 +10679,51 @@ func championArtifactURI(deploymentProfile map[string]any) string {
 	return championArtifactURIFromEvaluation(payloadMap(deploymentProfile, "model_profile"))
 }
 
+func championArtifactURIForFormat(deploymentProfile map[string]any, format string) string {
+	modelProfile := payloadMap(deploymentProfile, "model_profile")
+	for _, artifactURI := range championArtifactURICandidatesForFormat(deploymentProfile, modelProfile, format) {
+		if artifactMatchesChampionExportFormat(artifactURI, format) {
+			return artifactURI
+		}
+	}
+	return championArtifactURI(deploymentProfile)
+}
+
+func championArtifactURICandidatesForFormat(deploymentProfile map[string]any, modelProfile map[string]any, format string) []string {
+	switch format {
+	case "onnx":
+		return []string{
+			firstString(deploymentProfile, "onnx_artifact_uri"),
+			firstString(modelProfile, "onnx_artifact_uri"),
+			firstString(deploymentProfile, "artifact_uri"),
+			firstString(modelProfile, "artifact_uri"),
+		}
+	case "torchscript":
+		return []string{
+			firstString(deploymentProfile, "torchscript_artifact_uri", "torchscript_uri"),
+			firstString(modelProfile, "torchscript_artifact_uri", "torchscript_uri"),
+			firstString(deploymentProfile, "artifact_uri"),
+			firstString(modelProfile, "artifact_uri"),
+		}
+	case "pytorch":
+		return []string{
+			firstString(deploymentProfile, "checkpoint_uri", "pytorch_uri", "model_uri"),
+			firstString(modelProfile, "checkpoint_uri", "pytorch_uri", "model_uri"),
+			firstString(deploymentProfile, "artifact_uri"),
+			firstString(modelProfile, "artifact_uri"),
+		}
+	case "safetensors":
+		return []string{
+			firstString(deploymentProfile, "safetensors_artifact_uri", "safetensors_uri"),
+			firstString(modelProfile, "safetensors_artifact_uri", "safetensors_uri"),
+			firstString(deploymentProfile, "artifact_uri"),
+			firstString(modelProfile, "artifact_uri"),
+		}
+	default:
+		return []string{championArtifactURI(deploymentProfile)}
+	}
+}
+
 func championArtifactURIFromEvaluation(modelProfile map[string]any) string {
 	return firstString(modelProfile, "onnx_artifact_uri", "artifact_uri", "model_artifact_uri", "export_artifact_uri", "checkpoint_uri")
 }
@@ -9178,12 +10785,29 @@ func normalizeChampionDemoPredictionResultStatus(status string) string {
 	}
 }
 
+func championDemoPredictionHasDetectionMetadata(metadata map[string]any) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	taskType := strings.ToLower(strings.TrimSpace(payloadString(metadata, "task_type")))
+	if strings.Contains(taskType, "object_detection") || strings.Contains(taskType, "detect") {
+		return true
+	}
+	if _, ok := metadata["detections"]; ok {
+		return true
+	}
+	if _, ok := metadata["detection_count"]; ok {
+		return true
+	}
+	return false
+}
+
 func championExportManifestPath(metadata map[string]any) string {
 	manifest, _ := metadata["manifest"].(map[string]any)
-	if manifestPath := firstString(manifest, "manifest_path", "local_manifest_path"); manifestPath != "" {
+	if manifestPath := firstString(manifest, "manifest_path", "local_manifest_path", "manifest_uri", "export_manifest_uri"); manifestPath != "" {
 		return manifestPath
 	}
-	return firstString(metadata, "manifest_path", "local_manifest_path", "export_manifest_path")
+	return firstString(metadata, "manifest_path", "local_manifest_path", "export_manifest_path", "manifest_uri", "export_manifest_uri")
 }
 
 func championDatasetID(champion runs.ProjectChampion, job jobs.ExperimentJob) string {
@@ -9193,17 +10817,80 @@ func championDatasetID(champion runs.ProjectChampion, job jobs.ExperimentJob) st
 	return jobConfigString(job.Config, "dataset_id")
 }
 
-func usableChampionExport(dataStore store.Store, projectID string, championID string) (runs.ChampionExport, bool) {
-	exports, err := dataStore.ListProjectChampionExports(projectID)
+func usableChampionExport(dataStore store.Store, champion runs.ProjectChampion) (runs.ChampionExport, bool) {
+	exports, err := dataStore.ListProjectChampionExports(champion.ProjectID)
 	if err != nil {
 		return runs.ChampionExport{}, false
 	}
 	for _, export := range exports {
-		if export.ChampionID == championID && export.Status == runs.ChampionExportStatusReady && strings.TrimSpace(export.ArtifactURI) != "" {
+		if export.ChampionID == champion.ID &&
+			export.Status == runs.ChampionExportStatusReady &&
+			strings.TrimSpace(export.ArtifactURI) != "" &&
+			artifactMatchesChampionExportFormat(export.ArtifactURI, export.Format) {
 			return export, true
 		}
 	}
+	if export, ok := championDeploymentProfileExport(champion); ok {
+		return export, true
+	}
 	return runs.ChampionExport{}, false
+}
+
+func championDeploymentProfileExport(champion runs.ProjectChampion) (runs.ChampionExport, bool) {
+	artifactURI := championArtifactURI(champion.DeploymentProfile)
+	if artifactURI == "" {
+		return runs.ChampionExport{}, false
+	}
+	format := championExportFormatFromArtifactURI(artifactURI)
+	if format == "" {
+		format = "pytorch"
+	}
+	metadata := championDeploymentExportMetadata(champion, format)
+	return runs.ChampionExport{
+		ID:          champion.ID + "-deployment-artifact",
+		ProjectID:   champion.ProjectID,
+		ChampionID:  champion.ID,
+		JobID:       champion.JobID,
+		Status:      runs.ChampionExportStatusReady,
+		Format:      format,
+		ArtifactURI: artifactURI,
+		Metadata:    metadata,
+	}, true
+}
+
+func championDeploymentExportMetadata(champion runs.ProjectChampion, format string) map[string]any {
+	deploymentProfile := champion.DeploymentProfile
+	modelProfile := payloadMap(deploymentProfile, "model_profile")
+	metadata := championExportMetadata(champion, format, map[string]any{
+		"deployment_profile": deploymentProfile,
+		"model_profile":      modelProfile,
+	})
+	if manifest := payloadMap(deploymentProfile, "export_manifest"); len(manifest) > 0 {
+		metadata["manifest"] = manifest
+	} else if manifest := payloadMap(modelProfile, "export_manifest"); len(manifest) > 0 {
+		metadata["manifest"] = manifest
+	}
+	if manifestURI := firstString(deploymentProfile, "export_manifest_uri", "manifest_uri"); manifestURI != "" {
+		metadata["manifest_uri"] = manifestURI
+	} else if manifestURI := firstString(modelProfile, "export_manifest_uri", "manifest_uri"); manifestURI != "" {
+		metadata["manifest_uri"] = manifestURI
+	}
+	return metadata
+}
+
+func championExportFormatFromArtifactURI(artifactURI string) string {
+	switch {
+	case artifactMatchesChampionExportFormat(artifactURI, "onnx"):
+		return "onnx"
+	case artifactMatchesChampionExportFormat(artifactURI, "torchscript"):
+		return "torchscript"
+	case artifactMatchesChampionExportFormat(artifactURI, "safetensors"):
+		return "safetensors"
+	case artifactMatchesChampionExportFormat(artifactURI, "pytorch"):
+		return "pytorch"
+	default:
+		return ""
+	}
 }
 
 func latestVisualAnalysisFromList(analyses []datasets.DatasetVisualAnalysis) *datasets.DatasetVisualAnalysis {
@@ -9656,7 +11343,7 @@ func (s *Server) queueDatasetVisualAnalysis(dataset datasets.Dataset, trigger da
 	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if provider == "" {
-		provider = "local"
+		provider = s.defaultVisualAnalysisProvider()
 	}
 	config := map[string]any{
 		"dataset_id":             dataset.ID,
@@ -10545,6 +12232,14 @@ func (s *Server) defaultExecuteExperimentPlanRequest() executeExperimentPlanRequ
 	}
 }
 
+func (s *Server) defaultVisualAnalysisProvider() string {
+	provider := strings.ToLower(strings.TrimSpace(s.currentAutomationSettings().DefaultTrainingProvider))
+	if provider == "" {
+		return "local"
+	}
+	return provider
+}
+
 func (s *Server) shouldAutoReviewExperimentJobs() bool {
 	return s.currentAutomationSettings().AutoReviewExperiments
 }
@@ -10600,6 +12295,31 @@ func terminalPlannerGuardsEnabledForMode(agentMode string) bool {
 		return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", true)
 	}
 	return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", false)
+}
+
+func plannerStrictValidationEnabled() bool {
+	return envFlag("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", false)
+}
+
+func plannerRelaxedValidationWarning(err error) string {
+	if err == nil {
+		return ""
+	}
+	return plannerRelaxedValidationWarningText(err.Error())
+}
+
+func plannerRelaxedValidationWarningText(message string) string {
+	message = strings.TrimSpace(message)
+	message = strings.TrimPrefix(message, store.ErrInvalidRequest.Error()+": ")
+	message = strings.TrimPrefix(message, errNoNovelFollowUpExperiments.Error()+": ")
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "planner soft validation did not pass"
+	}
+	if strings.HasPrefix(message, "Relaxed planner validation: ") {
+		return message
+	}
+	return "Relaxed planner validation: " + message
 }
 
 func maxAutoWorkersFromEnv() int {

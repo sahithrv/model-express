@@ -54,6 +54,15 @@ interface Window {
     } | null>;
     loadModelArtifact(options: {
       artifactUri: string;
+      externalData?: Array<{
+        path?: string;
+        relative_path?: string;
+        uri?: string;
+        artifact_uri?: string;
+        artifact_path?: string;
+        local_path?: string;
+        file_name?: string;
+      }>;
       endpoint?: string;
       accessKeyId?: string;
       secretAccessKey?: string;
@@ -62,6 +71,12 @@ interface Window {
       artifact_uri: string;
       size_bytes: number;
       bytes: ArrayBuffer;
+      external_data?: Array<{
+        path: string;
+        uri?: string;
+        size_bytes?: number;
+        bytes: ArrayBuffer;
+      }>;
     }>;
     ensureProjectWorker(options: {
       projectId: string;

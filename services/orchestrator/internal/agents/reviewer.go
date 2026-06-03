@@ -89,12 +89,15 @@ func (r ExperimentReviewer) Review(project projects.Project, plan plans.Experime
 	}
 
 	best := bestSummary(plan.TargetMetric, successful)
-	bestScore := targetMetricValue(plan.TargetMetric, best)
+	bestScore := summaryReadinessScore(plan.TargetMetric, best)
 	payload["champion_job_id"] = best.JobID
 	payload["champion_model"] = best.Model
 	payload["champion_score"] = roundFloat(bestScore, 6)
+	payload["champion_score_basis"] = "loss_heavy_summary_readiness"
 	payload["champion_macro_f1"] = roundFloat(best.BestMacroF1, 6)
 	payload["champion_accuracy"] = roundFloat(best.BestAccuracy, 6)
+	payload["champion_final_train_loss"] = roundFloat(best.FinalTrainLoss, 6)
+	payload["champion_final_val_loss"] = roundFloat(best.FinalValLoss, 6)
 	payload["champion_estimated_cost_usd"] = roundFloat(best.EstimatedCostUSD, 6)
 	payload["champion_runtime_seconds"] = roundFloat(best.RuntimeSeconds, 3)
 	payload["cost_efficiency"] = roundFloat(costEfficiency(bestScore, best.EstimatedCostUSD), 6)
@@ -104,10 +107,9 @@ func (r ExperimentReviewer) Review(project projects.Project, plan plans.Experime
 			PlanID:       plan.ID,
 			DecisionType: decisions.TypeSelectChampion,
 			Rationale: fmt.Sprintf(
-				"%s is the current champion because it reached %.3f %s, meeting the quality threshold for this plan.",
+				"%s is the current champion because it reached %.3f loss-aware readiness, meeting the quality threshold for this plan.",
 				best.Model,
 				bestScore,
-				normalizedTargetMetric(plan.TargetMetric),
 			),
 			Payload: payload,
 		}
@@ -119,9 +121,8 @@ func (r ExperimentReviewer) Review(project projects.Project, plan plans.Experime
 			PlanID:       plan.ID,
 			DecisionType: decisions.TypeAddExperiments,
 			Rationale: fmt.Sprintf(
-				"The best run reached %.3f %s, which is below the %.2f champion threshold. Estimated spend is still below $%.2f, so the reviewer recommends another experiment round.",
+				"The best run reached %.3f loss-aware readiness, which is below the %.2f champion threshold. Estimated spend is still below $%.2f, so the reviewer recommends another experiment round.",
 				bestScore,
-				normalizedTargetMetric(plan.TargetMetric),
 				r.championThreshold,
 				r.costBudgetUSD,
 			),
@@ -133,9 +134,8 @@ func (r ExperimentReviewer) Review(project projects.Project, plan plans.Experime
 		PlanID:       plan.ID,
 		DecisionType: decisions.TypeStopProject,
 		Rationale: fmt.Sprintf(
-			"The best run reached %.3f %s, below the %.2f champion threshold, and the estimated review budget has been reached.",
+			"The best run reached %.3f loss-aware readiness, below the %.2f champion threshold, and the estimated review budget has been reached.",
 			bestScore,
-			normalizedTargetMetric(plan.TargetMetric),
 			r.championThreshold,
 		),
 		Payload: payload,
@@ -195,9 +195,9 @@ func successfulSummaries(summaries []runs.TrainingRunSummary) []runs.TrainingRun
 
 func bestSummary(targetMetric string, summaries []runs.TrainingRunSummary) runs.TrainingRunSummary {
 	best := summaries[0]
-	bestScore := targetMetricValue(targetMetric, best)
+	bestScore := summaryReadinessScore(targetMetric, best)
 	for _, summary := range summaries[1:] {
-		score := targetMetricValue(targetMetric, summary)
+		score := summaryReadinessScore(targetMetric, summary)
 		if score > bestScore {
 			best = summary
 			bestScore = score
@@ -209,6 +209,73 @@ func bestSummary(targetMetric string, summaries []runs.TrainingRunSummary) runs.
 		}
 	}
 	return best
+}
+
+func summaryReadinessScore(targetMetric string, summary runs.TrainingRunSummary) float64 {
+	metricScore := targetMetricValue(targetMetric, summary)
+	lossScore, hasLoss := summaryLossHealthScore(summary)
+	if !hasLoss {
+		return metricScore
+	}
+	return metricScore*0.35 + lossScore*0.65
+}
+
+func summaryLossHealthScore(summary runs.TrainingRunSummary) (float64, bool) {
+	weighted := summaryWeightedScore{}
+	if summary.FinalTrainLoss > 0 {
+		weighted.add(summaryLossValueScore(summary.FinalTrainLoss), 0.25, true)
+	}
+	if summary.FinalValLoss > 0 {
+		weighted.add(summaryLossValueScore(summary.FinalValLoss), 0.45, true)
+	}
+	if summary.FinalTrainLoss > 0 && summary.FinalValLoss > 0 {
+		gap := summary.FinalValLoss - summary.FinalTrainLoss
+		ratio := summary.FinalValLoss / math.Max(summary.FinalTrainLoss, 0.000001)
+		weighted.add(1-math.Min(1, math.Max(0, gap)/0.75), 0.18, true)
+		weighted.add(1-math.Min(1, math.Max(0, ratio-1)/1.50), 0.12, true)
+	}
+	if weighted.weight <= 0 {
+		return 0, false
+	}
+	return weighted.value(1), true
+}
+
+func summaryLossValueScore(loss float64) float64 {
+	if loss <= 0 {
+		return 0
+	}
+	normalized := loss / math.Log(2)
+	return clampReviewerScore(1 - (normalized-0.20)/1.30)
+}
+
+type summaryWeightedScore struct {
+	total  float64
+	weight float64
+}
+
+func (s *summaryWeightedScore) add(value float64, weight float64, ok bool) {
+	if !ok || weight <= 0 {
+		return
+	}
+	s.total += clampReviewerScore(value) * weight
+	s.weight += weight
+}
+
+func (s summaryWeightedScore) value(fallback float64) float64 {
+	if s.weight <= 0 {
+		return clampReviewerScore(fallback)
+	}
+	return clampReviewerScore(s.total / s.weight)
+}
+
+func clampReviewerScore(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
 }
 
 func targetMetricValue(targetMetric string, summary runs.TrainingRunSummary) float64 {

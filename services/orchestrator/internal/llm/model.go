@@ -23,8 +23,9 @@ const (
 	ReasoningEffortHigh    = "high"
 	ReasoningEffortXHigh   = "xhigh"
 
-	DefaultMaxToolRounds = 4
+	DefaultMaxToolRounds  = 4
 	DefaultTimeoutSeconds = 180
+	DefaultModel          = "gpt-5.4-mini"
 
 	AgentModePropose    = "propose"
 	AgentModeAutonomous = "autonomous"
@@ -57,8 +58,28 @@ type JSONRequest struct {
 	PreviousResponseID string
 }
 
+type Usage struct {
+	InputTokens       int    `json:"input_tokens"`
+	OutputTokens      int    `json:"output_tokens"`
+	TotalTokens       int    `json:"total_tokens"`
+	CachedInputTokens int    `json:"cached_input_tokens"`
+	ReasoningTokens   int    `json:"reasoning_tokens"`
+	RequestModel      string `json:"request_model,omitempty"`
+	APIStyle          string `json:"api_style,omitempty"`
+	ToolRounds        int    `json:"tool_rounds,omitempty"`
+}
+
+type JSONResult struct {
+	RawJSON []byte
+	Usage   *Usage
+}
+
 type JSONGenerator interface {
 	GenerateJSON(ctx context.Context, req JSONRequest) ([]byte, error)
+}
+
+type JSONUsageGenerator interface {
+	GenerateJSONWithUsage(ctx context.Context, req JSONRequest) (JSONResult, error)
 }
 
 func ConfigFromEnv(enabled bool, provider string, model string) Config {
@@ -200,5 +221,5 @@ func envIntDefault(defaultValue int, names ...string) int {
 }
 
 func defaultModelForProvider(_ string) string {
-	return ""
+	return DefaultModel
 }

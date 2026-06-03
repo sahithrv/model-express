@@ -54,20 +54,31 @@ func (p DatasetPlanner) BuildExperimentPlan(project projects.Project, dataset da
 	classCount := intFromProfile(dataset.Profile, "class_count")
 	imbalanceRatio := floatFromProfile(dataset.Profile, "imbalance_ratio")
 	corruptImageCount := intFromProfile(dataset.Profile, "corrupt_image_count")
+	detectionTask := profileIsYOLODetection(dataset.Profile)
 
 	if totalImages <= 0 {
 		return PlanRecommendation{}, fmt.Errorf("dataset profile has no images")
 	}
-	if classCount < 2 {
+	if !detectionTask && classCount < 2 {
 		return PlanRecommendation{}, fmt.Errorf("classification planning requires at least two classes")
+	}
+	if detectionTask && classCount < 1 {
+		return PlanRecommendation{}, fmt.Errorf("object-detection planning requires at least one class")
 	}
 
 	targetMetric := strings.TrimSpace(preferences.TargetMetric)
 	if targetMetric == "" {
-		targetMetric = chooseTargetMetric(imbalanceRatio)
+		if detectionTask {
+			targetMetric = "mAP50_95"
+		} else {
+			targetMetric = chooseTargetMetric(imbalanceRatio)
+		}
 	}
 
 	experiments := plannedExperiments(priority, totalImages, classCount)
+	if detectionTask {
+		experiments = plannedDetectionExperiments(priority, totalImages)
+	}
 	maxWorkers := preferences.MaxWorkers
 	if maxWorkers <= 0 {
 		maxWorkers = defaultWorkerCap(priority)
@@ -88,6 +99,9 @@ func (p DatasetPlanner) BuildExperimentPlan(project projects.Project, dataset da
 	}
 
 	warnings := buildPlanningWarnings(project, totalImages, classCount, imbalanceRatio, corruptImageCount)
+	if detectionTask {
+		warnings = append(warnings, "YOLO object-detection evidence detected; initial plan preserves bounding-box supervision and official YOLO splits.")
+	}
 
 	return PlanRecommendation{
 		TargetMetric:       targetMetric,
@@ -96,6 +110,67 @@ func (p DatasetPlanner) BuildExperimentPlan(project projects.Project, dataset da
 		Experiments:        experiments,
 		Warnings:           warnings,
 	}, nil
+}
+
+func plannedDetectionExperiments(priority string, totalImages int) []plans.PlannedExperiment {
+	baselineEpochs := 10
+	challengerEpochs := 14
+	if totalImages < 250 {
+		baselineEpochs = 8
+		challengerEpochs = 10
+	}
+
+	nano := plans.PlannedExperiment{
+		Template:       "yolo11_detection",
+		Model:          "yolo11n.pt",
+		Mechanism:      "baseline_control",
+		Intervention:   "Train a COCO-pretrained YOLO11 nano detector on the official YOLO splits.",
+		EvidenceUsed:   []string{"dataset profile reports YOLO object-detection labels"},
+		ExpectedEffect: "Establish a fast live-stream detector baseline with bounding-box supervision.",
+		Epochs:         baselineEpochs,
+		BatchSize:      8,
+		LearningRate:   0.001,
+		ImageSize:      640,
+		Pretrained:     true,
+		Reason:         "Fast YOLO detector baseline for an object-detection dataset.",
+	}
+	small := plans.PlannedExperiment{
+		Template:       "yolo11_detection",
+		Model:          "yolo11s.pt",
+		Mechanism:      "architecture_challenge",
+		Intervention:   "Compare YOLO11 small against the nano detector while preserving the same YOLO splits.",
+		EvidenceUsed:   []string{"dataset profile reports YOLO object-detection labels"},
+		ExpectedEffect: "Improve mAP/recall while staying live-friendly.",
+		Epochs:         challengerEpochs,
+		BatchSize:      8,
+		LearningRate:   0.001,
+		ImageSize:      640,
+		Pretrained:     true,
+		Reason:         "Small YOLO detector challenger for better mAP with moderate latency.",
+	}
+	medium := plans.PlannedExperiment{
+		Template:       "yolo11_detection",
+		Model:          "yolo11m.pt",
+		Mechanism:      "architecture_challenge",
+		Intervention:   "Run a YOLO11 medium quality challenger when the budget allows.",
+		EvidenceUsed:   []string{"dataset profile reports YOLO object-detection labels"},
+		ExpectedEffect: "Test whether additional detector capacity improves mAP enough to justify latency.",
+		Epochs:         challengerEpochs,
+		BatchSize:      6,
+		LearningRate:   0.0008,
+		ImageSize:      640,
+		Pretrained:     true,
+		Reason:         "Medium YOLO detector quality challenger.",
+	}
+
+	switch priority {
+	case PriorityFastTraining, PriorityLowCost:
+		return []plans.PlannedExperiment{nano}
+	case PriorityBestQuality:
+		return []plans.PlannedExperiment{nano, small, medium}
+	default:
+		return []plans.PlannedExperiment{nano, small}
+	}
 }
 
 func plannedExperiments(priority string, totalImages int, classCount int) []plans.PlannedExperiment {
@@ -144,6 +219,31 @@ func plannedExperiments(priority string, totalImages int, classCount int) []plan
 	default:
 		return []plans.PlannedExperiment{mobilenet, efficientnet}
 	}
+}
+
+func profileIsYOLODetection(profile map[string]any) bool {
+	if strings.EqualFold(stringFromProfile(profile, "task_type"), "object_detection") && profileHasYOLOEvidence(profile) {
+		return true
+	}
+	return profileHasYOLOEvidence(profile)
+}
+
+func profileHasYOLOEvidence(profile map[string]any) bool {
+	if boolFromProfile(profile, "yolo_available") {
+		return true
+	}
+	if summary, ok := profile["metadata_summary"].(map[string]any); ok && profileHasYOLOEvidence(summary) {
+		return true
+	}
+	if summary, ok := profile["yolo_summary"].(map[string]any); ok {
+		if boolFromProfile(summary, "available") || strings.EqualFold(stringFromProfile(summary, "format"), "yolo") || intFromProfile(summary, "label_file_count") > 0 {
+			return true
+		}
+	}
+	if counts, ok := profile["artifact_counts"].(map[string]any); ok {
+		return intFromProfile(counts, "yolo_dataset_config") > 0 || intFromProfile(counts, "yolo_label_file") > 0
+	}
+	return false
 }
 
 func chooseTargetMetric(imbalanceRatio float64) string {
@@ -242,6 +342,22 @@ func intFromProfile(profile map[string]any, key string) int {
 		return int(out)
 	default:
 		return 0
+	}
+}
+
+func stringFromProfile(profile map[string]any, key string) string {
+	value, _ := profile[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func boolFromProfile(profile map[string]any, key string) bool {
+	switch value := profile[key].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	default:
+		return false
 	}
 }
 

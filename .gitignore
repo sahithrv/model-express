@@ -37,6 +37,7 @@ coverage/
 datasets/**
 artifacts/**
 exports/**
+.db_backups/**
 mlruns/**
 mlartifacts/**
 *.db

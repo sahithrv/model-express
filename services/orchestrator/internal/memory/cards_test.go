@@ -77,6 +77,186 @@ func TestNewStrategyScorecardMemoryCardIsCompactAndDeterministic(t *testing.T) {
 	}
 }
 
+func TestBuildDistilledMemoryCardFromAgentMemoryRecordPreservesSourceIDsAndCapsLesson(t *testing.T) {
+	record := AgentMemoryRecord{
+		ID:        "memory_10",
+		ProjectID: "project_1",
+		DatasetID: "dataset_1",
+		PlanID:    "plan_1",
+		JobID:     "job_1",
+		AgentName: "experiment_planner",
+		Kind:      KindPlanningOutcome,
+		Summary:   "Long lesson summary that should not be used verbatim once the distilled lesson is capped.",
+		Payload: map[string]any{
+			"outcome_status":             strategies.OutcomeImprovedChampion,
+			"lesson":                     strings.Repeat("use the smaller detector first; ", 20),
+			"mechanism":                  "resolution_crop",
+			"intervention":               "compare 224 and 256 before increasing image size",
+			"planning_mode":              "live_latency_budget",
+			"applies_when":               []any{"small objects", "live service"},
+			"evidence_used":              []any{"scorecard_1", "job_9"},
+			"expected_delta_vs_champion": 0.07,
+			"confidence":                 0.91,
+		},
+	}
+
+	card, ok := BuildDistilledMemoryCardFromAgentMemoryRecord(record)
+	if !ok {
+		t.Fatal("expected distilled card from agent memory record")
+	}
+	if card.SourceTable != SourceAgentMemoryRecord || card.SourceID != "memory_10" {
+		t.Fatalf("unexpected source linkage: %#v", card)
+	}
+	if len(card.EvidenceUsed) == 0 || card.EvidenceUsed[0] != "memory_10" {
+		t.Fatalf("expected source id to be preserved in evidence_used, got %#v", card.EvidenceUsed)
+	}
+	if got := strings.TrimSpace(card.Lesson); len(got) > 220 {
+		t.Fatalf("expected capped lesson, got %d chars: %q", len(got), got)
+	}
+	if len(card.AppliesWhen) == 0 || !containsStringFold(card.AppliesWhen, "small objects") || !containsStringFold(card.AppliesWhen, "resolution_crop") {
+		t.Fatalf("unexpected applies_when signature: %#v", card.AppliesWhen)
+	}
+	if card.ValueScore <= 0 {
+		t.Fatalf("expected positive value score, got %#v", card)
+	}
+}
+
+func TestBuildDistilledMemoryCardFromStrategyScorecardPreservesSourceIDs(t *testing.T) {
+	scorecard := strategies.StrategyScorecard{
+		ID:               "scorecard_2",
+		ProjectID:        "project_1",
+		DatasetID:        "dataset_1",
+		SourceDecisionID: "decision_1",
+		SourcePlanID:     "plan_1",
+		FollowUpPlanID:   "plan_2",
+		StrategyType:     "class_imbalance_ablation",
+		PlanningMode:     "minority_focus",
+		Mechanism:        "class_imbalance",
+		Intervention:     "weighted loss and balanced sampler",
+		DiagnosisTriggers: []string{
+			"minority recall is low",
+			"macro f1 trails accuracy",
+		},
+		DatasetTraits: map[string]any{"imbalance_ratio": 4.2},
+		ObjectiveProfile: map[string]any{
+			"primary_objective": "macro_f1",
+		},
+		ExpectedEffect:  "Boost minority recall without changing labels.",
+		Lesson:          "Class balancing unlocked the best run.",
+		Outcome:         strategies.OutcomeMinorImprovement,
+		ConfidenceAfter: 0.83,
+		Tags:            []string{"class_imbalance"},
+	}
+
+	card, ok := BuildDistilledMemoryCardFromStrategyScorecard(scorecard)
+	if !ok {
+		t.Fatal("expected distilled card from strategy scorecard")
+	}
+	if card.SourceTable != SourceStrategyScorecard || card.SourceID != "scorecard_2" {
+		t.Fatalf("unexpected source linkage: %#v", card)
+	}
+	if len(card.EvidenceUsed) == 0 || !containsStringFold(card.EvidenceUsed, "scorecard_2") || !containsStringFold(card.EvidenceUsed, "decision_1") {
+		t.Fatalf("expected source ids to be preserved in evidence_used, got %#v", card.EvidenceUsed)
+	}
+	if card.Mechanism != "class_imbalance" {
+		t.Fatalf("unexpected mechanism: %#v", card.Mechanism)
+	}
+	if len(card.AppliesWhen) == 0 || !containsStringFold(card.AppliesWhen, "minority_focus") {
+		t.Fatalf("expected applies_when signature, got %#v", card.AppliesWhen)
+	}
+	if card.Confidence <= 0 {
+		t.Fatalf("expected positive confidence, got %#v", card)
+	}
+}
+
+func containsStringFold(values []string, target string) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+	for _, value := range values {
+		if strings.ToLower(strings.TrimSpace(value)) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildDistilledMemoryCardFromRetrievalResultUsesRetrievalReasonAndSourceIds(t *testing.T) {
+	result := MemoryRetrievalResult{
+		SourceTable:     SourceStrategyScorecard,
+		SourceID:        "scorecard_3",
+		ProjectID:       "project_1",
+		DatasetID:       "dataset_1",
+		Kind:            "strategy_scorecard",
+		Score:           0.84,
+		SemanticScore:   0.75,
+		StructuredScore: 0.62,
+		RetrievalReason: "similar class imbalance lesson",
+		SummaryCard: map[string]any{
+			"lesson":         strings.Repeat("prefer weighted loss; ", 18),
+			"mechanism":      "class_imbalance",
+			"applies_when":   []any{"macro_f1", "minority recall"},
+			"source_plan_id": "plan_1",
+		},
+		Metadata: map[string]any{
+			"source_decision_id": "decision_1",
+		},
+	}
+
+	card, ok := BuildDistilledMemoryCardFromRetrievalResult(result)
+	if !ok {
+		t.Fatal("expected distilled card from retrieval result")
+	}
+	if card.SourceID != "scorecard_3" || card.SourceTable != SourceStrategyScorecard {
+		t.Fatalf("unexpected source linkage: %#v", card)
+	}
+	if !containsStringFold(card.EvidenceUsed, "scorecard_3") || !containsStringFold(card.EvidenceUsed, "decision_1") {
+		t.Fatalf("expected source ids in evidence_used, got %#v", card.EvidenceUsed)
+	}
+	if len(card.Lesson) > 220 {
+		t.Fatalf("expected capped lesson, got %d chars", len(card.Lesson))
+	}
+	if card.Mechanism != "class_imbalance" {
+		t.Fatalf("unexpected mechanism: %#v", card.Mechanism)
+	}
+}
+
+func TestBuildDistilledMemoryCardFromRetrievalResultIgnoresEvidenceIdsInAppliesWhenSignature(t *testing.T) {
+	result := MemoryRetrievalResult{
+		SourceTable:     SourceStrategyScorecard,
+		SourceID:        "scorecard_4",
+		ProjectID:       "project_1",
+		DatasetID:       "dataset_1",
+		Kind:            "strategy_scorecard",
+		Score:           0.88,
+		SemanticScore:   0.8,
+		StructuredScore: 0.7,
+		RetrievalReason: "same mechanism with different evidence ids",
+		SummaryCard: map[string]any{
+			"lesson":         "Weighted loss helped minority recall.",
+			"mechanism":      "class_imbalance",
+			"applies_when":   []any{"minority recall", "macro_f1"},
+			"evidence_used":  []any{"plan_1", "job_1"},
+			"source_plan_id": "plan_1",
+		},
+		Metadata: map[string]any{
+			"evidence_used": []any{"scorecard_4", "decision_4"},
+		},
+	}
+
+	card, ok := BuildDistilledMemoryCardFromRetrievalResult(result)
+	if !ok {
+		t.Fatal("expected distilled card from retrieval result")
+	}
+	if len(card.EvidenceUsed) == 0 || !containsStringFold(card.EvidenceUsed, "scorecard_4") || !containsStringFold(card.EvidenceUsed, "plan_1") {
+		t.Fatalf("expected evidence ids to be preserved, got %#v", card.EvidenceUsed)
+	}
+	if containsStringFold(card.AppliesWhen, "scorecard_4") || containsStringFold(card.AppliesWhen, "plan_1") || containsStringFold(card.AppliesWhen, "job_1") {
+		t.Fatalf("expected applies_when signature to stay mechanism-based, got %#v", card.AppliesWhen)
+	}
+	if !containsStringFold(card.AppliesWhen, "minority recall") || !containsStringFold(card.AppliesWhen, "macro_f1") {
+		t.Fatalf("expected applies_when signature, got %#v", card.AppliesWhen)
+	}
+}
+
 func TestNewAgentMemoryCardPlanningOutcome(t *testing.T) {
 	record := AgentMemoryRecord{
 		ID:        "memory_1",

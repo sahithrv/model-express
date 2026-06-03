@@ -438,6 +438,9 @@ export type ChampionDemoPrediction = {
   latency_ms?: number;
   correct?: boolean;
   top_k?: Array<{ label?: string; class_name?: string; confidence?: number; probability?: number; score?: number }>;
+  detections?: ChampionDetection[];
+  detection_count?: number;
+  postprocess_latency_ms?: number;
   error?: string;
   error_message?: string;
   runtime_unavailable?: boolean;
@@ -448,6 +451,50 @@ export type ChampionDemoPrediction = {
   updated_at?: string;
   image_metadata?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+};
+
+export type ChampionDetection = {
+  label?: string;
+  class_name?: string;
+  class_id?: number;
+  confidence?: number;
+  score?: number;
+  box?: {
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    x1?: number;
+    y1?: number;
+    x2?: number;
+    y2?: number;
+  };
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
+};
+
+export type ChampionFeedback = {
+  id: string;
+  project_id: string;
+  champion_id: string;
+  prediction_id?: string;
+  job_id?: string;
+  dataset_id?: string;
+  image_uri?: string;
+  image_id?: string;
+  rating: "good" | "mediocre" | "bad";
+  message?: string;
+  prediction_snapshot?: Record<string, unknown>;
+  metrics_snapshot?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
 };
 
 export type RetrievedMemoryCard = {
@@ -480,6 +527,38 @@ export type RetrievedMemoryCard = {
   structured_score?: number;
   summary_card?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export type LLMUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  cached_input_tokens?: number;
+  reasoning_tokens?: number;
+  request_model?: string;
+  api_style?: string;
+  tool_rounds?: number;
+  [key: string]: unknown;
+};
+
+export type AgentInvocationRuntime = {
+  api_style?: string;
+  provider?: string;
+  model?: string;
+  reasoning_effort?: string;
+  plateau_reasoning_effort?: string;
+  stored_responses?: boolean;
+  max_tool_rounds?: number;
+  tool_rounds?: number;
+  tool_names?: string[];
+  rejected_tool_calls?: unknown[];
+  dry_run_validation_results?: unknown[];
+  tool_calls?: unknown[];
+  tool_results?: unknown[];
+  tool_calls_are_questions?: boolean;
+  mutation_authority?: boolean;
+  llm_usage?: LLMUsage;
   [key: string]: unknown;
 };
 
@@ -601,6 +680,20 @@ export type ExecutionEvent = {
   created_at: string;
 };
 
+export type AgentActivityEvent = {
+  id: string;
+  project_id: string;
+  plan_id?: string;
+  job_id?: string;
+  type: string;
+  severity: "info" | "warning" | "error" | "success" | string;
+  title: string;
+  message: string;
+  status: "active" | "waiting" | "succeeded" | "failed" | "blocked" | string;
+  created_at: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type AgentMemoryRecord = {
   id: string;
   invocation_id?: string;
@@ -629,6 +722,7 @@ export type AgentInvocation = {
   model?: string;
   input_messages?: Array<Record<string, string>>;
   input_context?: Record<string, unknown> & {
+    invocation_runtime?: AgentInvocationRuntime;
     retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
     retrieved_run_memory?: RetrievedMemoryCard[];
     planner_context_snapshot?: {
@@ -648,6 +742,45 @@ export type AgentInvocation = {
   human_feedback?: Record<string, unknown>;
   downstream_outcome?: Record<string, unknown>;
   created_at: string;
+};
+
+export type MemoryEmbeddingUsageEvent = {
+  id: string;
+  project_id: string;
+  dataset_id?: string;
+  plan_id?: string;
+  job_id?: string;
+  invocation_id?: string;
+  purpose: string;
+  retrieval_purpose?: string;
+  source_table?: string;
+  source_id?: string;
+  embedding_model?: string;
+  embedding_dimensions?: number;
+  input_bytes?: number;
+  provider_call_count?: number;
+  retrieved_count?: number;
+  injected?: boolean;
+  log_only?: boolean;
+  cached?: boolean;
+  skipped?: boolean;
+  skip_reason?: string;
+  source_text_hash?: string;
+  query_hash?: string;
+  provider_usage?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+};
+
+export type MissionControlTelemetryResponse = {
+  project_id?: string;
+  generated_at?: string;
+  limit?: number;
+  agent_invocations?: AgentInvocation[];
+  invocations?: AgentInvocation[];
+  memory_embedding_usage_events?: MemoryEmbeddingUsageEvent[];
+  embedding_usage_events?: MemoryEmbeddingUsageEvent[];
+  usage_events?: MemoryEmbeddingUsageEvent[];
 };
 
 export type EpochMetric = {

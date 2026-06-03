@@ -80,6 +80,7 @@ type MemoryEmbeddingRecord struct {
 	EmbeddingDimensions int            `json:"embedding_dimensions"`
 	Embedding           []float32      `json:"embedding"`
 	EmbeddingText       string         `json:"embedding_text"`
+	EmbeddingTextHash   string         `json:"embedding_text_hash,omitempty"`
 	SummaryCard         map[string]any `json:"summary_card"`
 	Metadata            map[string]any `json:"metadata"`
 	QualityScore        float64        `json:"quality_score"`

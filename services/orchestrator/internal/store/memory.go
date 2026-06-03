@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,7 @@ type MemoryStore struct {
 	champions            map[string]runs.ProjectChampion
 	championExports      map[string]runs.ChampionExport
 	demoPredictions      map[string]runs.ChampionDemoPrediction
+	championFeedback     map[string]runs.ChampionFeedback
 	metadataImports      map[string]datasets.DatasetMetadataImport
 	visualAnalyses       map[string]datasets.DatasetVisualAnalysis
 	decisions            map[string]decisions.AgentDecision
@@ -52,6 +54,8 @@ type MemoryStore struct {
 	agentMemoryRecords   map[string]memory.AgentMemoryRecord
 	agentInvocations     map[string]memory.AgentInvocation
 	memoryEmbeddings     map[string]memory.MemoryEmbeddingRecord
+	memoryUsageEvents    map[string]memory.MemoryEmbeddingUsageEvent
+	queryCache           map[string]memory.MemoryRetrievalQueryCacheRecord
 	strategyScorecards   map[string]strategies.StrategyScorecard
 	optimizerStudies     map[string]automl.OptimizerStudy
 	optimizerSuggestions map[string]automl.OptimizerSuggestion
@@ -72,6 +76,7 @@ func NewMemoryStore() *MemoryStore {
 		champions:            make(map[string]runs.ProjectChampion),
 		championExports:      make(map[string]runs.ChampionExport),
 		demoPredictions:      make(map[string]runs.ChampionDemoPrediction),
+		championFeedback:     make(map[string]runs.ChampionFeedback),
 		metadataImports:      make(map[string]datasets.DatasetMetadataImport),
 		visualAnalyses:       make(map[string]datasets.DatasetVisualAnalysis),
 		decisions:            make(map[string]decisions.AgentDecision),
@@ -80,6 +85,8 @@ func NewMemoryStore() *MemoryStore {
 		agentMemoryRecords:   make(map[string]memory.AgentMemoryRecord),
 		agentInvocations:     make(map[string]memory.AgentInvocation),
 		memoryEmbeddings:     make(map[string]memory.MemoryEmbeddingRecord),
+		memoryUsageEvents:    make(map[string]memory.MemoryEmbeddingUsageEvent),
+		queryCache:           make(map[string]memory.MemoryRetrievalQueryCacheRecord),
 		strategyScorecards:   make(map[string]strategies.StrategyScorecard),
 		optimizerStudies:     make(map[string]automl.OptimizerStudy),
 		optimizerSuggestions: make(map[string]automl.OptimizerSuggestion),
@@ -1058,6 +1065,57 @@ func (s *MemoryStore) UpdateChampionDemoPrediction(id string, update runs.Champi
 	return prediction, nil
 }
 
+func (s *MemoryStore) CreateChampionFeedback(feedback runs.ChampionFeedbackCreate) (runs.ChampionFeedback, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[feedback.ProjectID]; !ok {
+		return runs.ChampionFeedback{}, ErrNotFound
+	}
+	champion, ok := s.champions[feedback.ProjectID]
+	if !ok || champion.ID != feedback.ChampionID {
+		return runs.ChampionFeedback{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	created := runs.ChampionFeedback{
+		ID:                 s.newID("champion_feedback"),
+		ProjectID:          feedback.ProjectID,
+		ChampionID:         feedback.ChampionID,
+		PredictionID:       feedback.PredictionID,
+		JobID:              feedback.JobID,
+		DatasetID:          feedback.DatasetID,
+		ImageURI:           feedback.ImageURI,
+		ImageID:            feedback.ImageID,
+		Rating:             feedback.Rating,
+		Message:            feedback.Message,
+		PredictionSnapshot: emptyMapIfNil(feedback.PredictionSnapshot),
+		MetricsSnapshot:    emptyMapIfNil(feedback.MetricsSnapshot),
+		Metadata:           emptyMapIfNil(feedback.Metadata),
+		CreatedAt:          now,
+	}
+	s.championFeedback[created.ID] = created
+	return created, nil
+}
+
+func (s *MemoryStore) ListProjectChampionFeedback(projectID string) ([]runs.ChampionFeedback, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []runs.ChampionFeedback{}
+	for _, feedback := range s.championFeedback {
+		if feedback.ProjectID == projectID {
+			out = append(out, feedback)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1410,9 +1468,15 @@ func (s *MemoryStore) UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord)
 	if err != nil {
 		return memory.MemoryEmbeddingRecord{}, err
 	}
+	if normalized.EmbeddingTextHash == "" {
+		normalized.EmbeddingTextHash = memory.HashEmbeddingText(normalized.EmbeddingText)
+	}
 	for id, existing := range s.memoryEmbeddings {
 		if memoryEmbeddingSourceModelKey(existing) != memoryEmbeddingSourceModelKey(normalized) {
 			continue
+		}
+		if existing.EmbeddingDimensions == normalized.EmbeddingDimensions && strings.EqualFold(existing.EmbeddingTextHash, normalized.EmbeddingTextHash) {
+			return existing, nil
 		}
 		normalized.ID = existing.ID
 		normalized.CreatedAt = existing.CreatedAt
@@ -1427,6 +1491,182 @@ func (s *MemoryStore) UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord)
 	normalized.CreatedAt = now
 	normalized.UpdatedAt = now
 	s.memoryEmbeddings[normalized.ID] = normalized
+	return normalized, nil
+}
+
+func (s *MemoryStore) GetMemoryEmbeddingSourceState(projectID string, sourceTable string, sourceID string, embeddingModel string) (memory.MemoryEmbeddingSourceState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return memory.MemoryEmbeddingSourceState{}, ErrNotFound
+	}
+	normalizedModel := strings.TrimSpace(embeddingModel)
+	for _, record := range s.memoryEmbeddings {
+		if record.ProjectID != projectID || record.SourceTable != strings.TrimSpace(sourceTable) || record.SourceID != strings.TrimSpace(sourceID) {
+			continue
+		}
+		if normalizedModel != "" && record.EmbeddingModel != normalizedModel {
+			continue
+		}
+		return memory.MemoryEmbeddingSourceState{
+			SourceTable:         record.SourceTable,
+			SourceID:            record.SourceID,
+			ProjectID:           record.ProjectID,
+			EmbeddingModel:      record.EmbeddingModel,
+			EmbeddingDimensions: record.EmbeddingDimensions,
+			EmbeddingTextHash:   record.EmbeddingTextHash,
+			UpdatedAt:           record.UpdatedAt,
+		}, nil
+	}
+	return memory.MemoryEmbeddingSourceState{}, ErrNotFound
+}
+
+func (s *MemoryStore) CreateMemoryEmbeddingUsageEvent(event memory.MemoryEmbeddingUsageEvent) (memory.MemoryEmbeddingUsageEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[event.ProjectID]; !ok {
+		return memory.MemoryEmbeddingUsageEvent{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	event.ID = s.newID("memory_embedding_usage_event")
+	event.ProjectID = strings.TrimSpace(event.ProjectID)
+	event.DatasetID = strings.TrimSpace(event.DatasetID)
+	event.PlanID = strings.TrimSpace(event.PlanID)
+	event.JobID = strings.TrimSpace(event.JobID)
+	event.InvocationID = strings.TrimSpace(event.InvocationID)
+	event.Purpose = strings.TrimSpace(event.Purpose)
+	event.RetrievalPurpose = strings.TrimSpace(event.RetrievalPurpose)
+	event.SourceTable = strings.TrimSpace(event.SourceTable)
+	event.SourceID = strings.TrimSpace(event.SourceID)
+	event.EmbeddingModel = strings.TrimSpace(event.EmbeddingModel)
+	event.SkipReason = strings.TrimSpace(event.SkipReason)
+	event.SourceTextHash = strings.TrimSpace(event.SourceTextHash)
+	event.QueryHash = strings.TrimSpace(event.QueryHash)
+	if event.Metadata == nil {
+		event.Metadata = map[string]any{}
+	} else {
+		event.Metadata = copyAnyMap(event.Metadata)
+	}
+	if event.ProviderUsage == nil {
+		event.ProviderUsage = map[string]any{}
+	} else {
+		event.ProviderUsage = copyAnyMap(event.ProviderUsage)
+	}
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = now
+	}
+	s.memoryUsageEvents[event.ID] = event
+	return event, nil
+}
+
+func (s *MemoryStore) ListProjectMemoryEmbeddingUsageEvents(projectID string, limit int) ([]memory.MemoryEmbeddingUsageEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	out := make([]memory.MemoryEmbeddingUsageEvent, 0, len(s.memoryUsageEvents))
+	for _, event := range s.memoryUsageEvents {
+		if event.ProjectID == projectID {
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) CountProjectMemoryEmbeddingUsageEvents(projectID string, purpose string, since time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return 0, ErrNotFound
+	}
+	count := 0
+	for _, event := range s.memoryUsageEvents {
+		if event.ProjectID != projectID {
+			continue
+		}
+		if strings.TrimSpace(purpose) != "" && event.Purpose != strings.TrimSpace(purpose) {
+			continue
+		}
+		if !since.IsZero() && event.CreatedAt.Before(since) {
+			continue
+		}
+		if event.ProviderCallCount > 0 {
+			count += event.ProviderCallCount
+		}
+	}
+	return count, nil
+}
+
+func (s *MemoryStore) GetMemoryRetrievalQueryCache(projectID string, datasetID string, purpose string, embeddingModel string, embeddingDimensions int, normalizedQueryHash string) (memory.MemoryRetrievalQueryCacheRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return memory.MemoryRetrievalQueryCacheRecord{}, ErrNotFound
+	}
+	key := memoryRetrievalQueryCacheKey(projectID, datasetID, purpose, embeddingModel, embeddingDimensions, normalizedQueryHash)
+	record, ok := s.queryCache[key]
+	if !ok {
+		return memory.MemoryRetrievalQueryCacheRecord{}, ErrNotFound
+	}
+	if !record.ExpiresAt.IsZero() && time.Now().UTC().After(record.ExpiresAt) {
+		delete(s.queryCache, key)
+		return memory.MemoryRetrievalQueryCacheRecord{}, ErrNotFound
+	}
+	record.Embedding = append([]float32(nil), record.Embedding...)
+	return record, nil
+}
+
+func (s *MemoryStore) UpsertMemoryRetrievalQueryCache(record memory.MemoryRetrievalQueryCacheRecord) (memory.MemoryRetrievalQueryCacheRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[record.ProjectID]; !ok {
+		return memory.MemoryRetrievalQueryCacheRecord{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	normalized := record
+	normalized.ID = strings.TrimSpace(normalized.ID)
+	normalized.ProjectID = strings.TrimSpace(normalized.ProjectID)
+	normalized.DatasetID = strings.TrimSpace(normalized.DatasetID)
+	normalized.Purpose = strings.TrimSpace(normalized.Purpose)
+	normalized.EmbeddingModel = strings.TrimSpace(normalized.EmbeddingModel)
+	normalized.NormalizedQueryHash = strings.TrimSpace(normalized.NormalizedQueryHash)
+	normalized.QueryText = strings.TrimSpace(normalized.QueryText)
+	if normalized.EmbeddingDimensions <= 0 && len(normalized.Embedding) > 0 {
+		normalized.EmbeddingDimensions = len(normalized.Embedding)
+	}
+	if normalized.CreatedAt.IsZero() {
+		normalized.CreatedAt = now
+	}
+	if normalized.ExpiresAt.IsZero() {
+		normalized.ExpiresAt = now.Add(time.Hour)
+	}
+	normalized.UpdatedAt = now
+	key := memoryRetrievalQueryCacheKey(normalized.ProjectID, normalized.DatasetID, normalized.Purpose, normalized.EmbeddingModel, normalized.EmbeddingDimensions, normalized.NormalizedQueryHash)
+	if existing, ok := s.queryCache[key]; ok {
+		normalized.ID = existing.ID
+		normalized.CreatedAt = existing.CreatedAt
+	}
+	if normalized.ID == "" {
+		normalized.ID = s.newID("memory_retrieval_query_cache")
+	}
+	normalized.Embedding = append([]float32(nil), normalized.Embedding...)
+	s.queryCache[key] = normalized
 	return normalized, nil
 }
 
@@ -1475,7 +1715,30 @@ func (s *MemoryStore) SearchMemoryEmbeddings(query memory.MemoryRetrievalQuery) 
 	return out, nil
 }
 
-func (s *MemoryStore) ListUnembeddedMemorySources(projectID string, limit int) ([]memory.EmbeddableMemoryCard, error) {
+func (s *MemoryStore) CountMemoryEmbeddings(projectID string, datasetID string, embeddingModel string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return 0, ErrNotFound
+	}
+	count := 0
+	for _, record := range s.memoryEmbeddings {
+		if record.ProjectID != projectID {
+			continue
+		}
+		if strings.TrimSpace(datasetID) != "" && record.DatasetID != strings.TrimSpace(datasetID) {
+			continue
+		}
+		if strings.TrimSpace(embeddingModel) != "" && record.EmbeddingModel != strings.TrimSpace(embeddingModel) {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+func (s *MemoryStore) ListUnembeddedMemorySources(projectID string, embeddingModel string, embeddingDimensions int, limit int) ([]memory.EmbeddableMemoryCard, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1483,40 +1746,45 @@ func (s *MemoryStore) ListUnembeddedMemorySources(projectID string, limit int) (
 		return nil, ErrNotFound
 	}
 	limit = unembeddedMemorySourceLimit(limit)
-	embedded := map[string]bool{}
+	embeddingModel = strings.TrimSpace(embeddingModel)
+	embeddings := map[string]memory.MemoryEmbeddingRecord{}
 	for _, record := range s.memoryEmbeddings {
-		if record.ProjectID == projectID {
-			embedded[memoryEmbeddingSourceKey(record.SourceTable, record.SourceID)] = true
+		if record.ProjectID != projectID {
+			continue
 		}
+		if embeddingModel != "" && record.EmbeddingModel != embeddingModel {
+			continue
+		}
+		embeddings[memoryEmbeddingSourceKey(record.SourceTable, record.SourceID)] = record
 	}
 
 	candidates := []embeddableMemorySourceCandidate{}
 	for _, record := range s.agentMemoryRecords {
-		if record.ProjectID != projectID || embedded[memoryEmbeddingSourceKey(memory.SourceAgentMemoryRecord, record.ID)] {
+		if record.ProjectID != projectID {
 			continue
 		}
 		card, ok := memory.BuildAgentMemoryCard(record)
-		if !ok || !memoryCardShouldBeIndexed(card) {
+		if !ok || !memoryCardShouldBeIndexed(card) || !memorySourceNeedsEmbedding(card, embeddings, embeddingDimensions) {
 			continue
 		}
 		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: record.CreatedAt})
 	}
 	for _, scorecard := range s.strategyScorecards {
-		if scorecard.ProjectID != projectID || embedded[memoryEmbeddingSourceKey(memory.SourceStrategyScorecard, scorecard.ID)] {
+		if scorecard.ProjectID != projectID {
 			continue
 		}
 		card, ok := memory.BuildStrategyScorecardCard(scorecard)
-		if !ok || !memoryCardShouldBeIndexed(card) {
+		if !ok || !memoryCardShouldBeIndexed(card) || !memorySourceNeedsEmbedding(card, embeddings, embeddingDimensions) {
 			continue
 		}
 		candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: scorecard.CreatedAt})
 	}
 	for _, dataset := range s.datasets {
-		if dataset.ProjectID != projectID || embedded[memoryEmbeddingSourceKey(memory.SourceDatasetProfile, dataset.ID)] {
+		if dataset.ProjectID != projectID {
 			continue
 		}
 		card, ok := memory.BuildDatasetProfileCard(dataset)
-		if !ok || !memoryCardShouldBeIndexed(card) {
+		if !ok || !memoryCardShouldBeIndexed(card) || !memorySourceNeedsEmbedding(card, embeddings, embeddingDimensions) {
 			continue
 		}
 		createdAt := dataset.CreatedAt
@@ -1529,14 +1797,12 @@ func (s *MemoryStore) ListUnembeddedMemorySources(projectID string, limit int) (
 		if analysis.ProjectID != projectID {
 			continue
 		}
-		if !embedded[memoryEmbeddingSourceKey(memory.SourceDatasetVisualAnalysis, analysis.ID)] {
-			card, ok := memory.BuildDatasetVisualAnalysisCard(analysis)
-			if ok && memoryCardShouldBeIndexed(card) {
-				candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: analysis.CreatedAt})
-			}
+		card, ok := memory.BuildDatasetVisualAnalysisCard(analysis)
+		if ok && memoryCardShouldBeIndexed(card) && memorySourceNeedsEmbedding(card, embeddings, embeddingDimensions) {
+			candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: analysis.CreatedAt})
 		}
 		for _, card := range memory.BuildDatasetPreprocessingHypothesisCards(analysis) {
-			if embedded[memoryEmbeddingSourceKey(card.SourceTable, card.SourceID)] || !memoryCardShouldBeIndexed(card) {
+			if !memoryCardShouldBeIndexed(card) || !memorySourceNeedsEmbedding(card, embeddings, embeddingDimensions) {
 				continue
 			}
 			candidates = append(candidates, embeddableMemorySourceCandidate{card: card, createdAt: analysis.CreatedAt})
@@ -2357,6 +2623,7 @@ func normalizeMemoryEmbeddingRecord(record memory.MemoryEmbeddingRecord, now tim
 	record.Scope = strings.TrimSpace(record.Scope)
 	record.EmbeddingModel = strings.TrimSpace(record.EmbeddingModel)
 	record.EmbeddingText = strings.TrimSpace(record.EmbeddingText)
+	record.EmbeddingTextHash = strings.TrimSpace(record.EmbeddingTextHash)
 	if record.SourceTable == "" {
 		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: source_table is required", ErrInvalidRequest)
 	}
@@ -2386,6 +2653,9 @@ func normalizeMemoryEmbeddingRecord(record memory.MemoryEmbeddingRecord, now tim
 	}
 	if record.EmbeddingText == "" {
 		return memory.MemoryEmbeddingRecord{}, fmt.Errorf("%w: embedding_text is required", ErrInvalidRequest)
+	}
+	if record.EmbeddingTextHash == "" {
+		record.EmbeddingTextHash = memory.HashEmbeddingText(record.EmbeddingText)
 	}
 	record.Embedding = append([]float32(nil), record.Embedding...)
 	record.SummaryCard = copyAnyMap(record.SummaryCard)
@@ -2741,6 +3011,31 @@ func memoryEmbeddingSourceKey(sourceTable string, sourceID string) string {
 
 func memoryEmbeddingSourceModelKey(record memory.MemoryEmbeddingRecord) string {
 	return memoryEmbeddingSourceKey(record.SourceTable, record.SourceID) + "\x00" + strings.TrimSpace(record.EmbeddingModel)
+}
+
+func memorySourceNeedsEmbedding(card memory.EmbeddableMemoryCard, embeddings map[string]memory.MemoryEmbeddingRecord, embeddingDimensions int) bool {
+	existing, ok := embeddings[memoryEmbeddingSourceKey(card.SourceTable, card.SourceID)]
+	if !ok {
+		return true
+	}
+	if embeddingDimensions > 0 && existing.EmbeddingDimensions != embeddingDimensions {
+		return true
+	}
+	if memory.HashEmbeddingText(card.Text) != existing.EmbeddingTextHash {
+		return true
+	}
+	return false
+}
+
+func memoryRetrievalQueryCacheKey(projectID string, datasetID string, purpose string, embeddingModel string, embeddingDimensions int, normalizedQueryHash string) string {
+	return strings.Join([]string{
+		strings.TrimSpace(projectID),
+		strings.TrimSpace(datasetID),
+		strings.TrimSpace(purpose),
+		strings.TrimSpace(embeddingModel),
+		strconv.Itoa(embeddingDimensions),
+		strings.TrimSpace(normalizedQueryHash),
+	}, "\x00")
 }
 
 func copyAnyMap(values map[string]any) map[string]any {

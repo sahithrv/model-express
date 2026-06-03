@@ -13,6 +13,8 @@ import (
 type PlannerReplayScores struct {
 	SchemaValid                     bool           `json:"schema_valid"`
 	BackendValidationPassed         bool           `json:"backend_validation_passed"`
+	FinalizerSucceeded              bool           `json:"finalizer_succeeded"`
+	FinalizerError                  string         `json:"finalizer_error,omitempty"`
 	CandidateRankingApplied         bool           `json:"candidate_ranking_applied"`
 	AvoidedBlockedMechanisms        bool           `json:"avoided_blocked_mechanisms"`
 	AvoidedDuplicateSignatures      bool           `json:"avoided_duplicate_signatures"`
@@ -20,6 +22,11 @@ type PlannerReplayScores struct {
 	ExpectedValueAboveFloor         bool           `json:"expected_value_above_floor"`
 	EvidencePresent                 bool           `json:"evidence_present"`
 	SelectedExperimentCountOK       bool           `json:"selected_experiment_count_ok"`
+	DuplicateSignatureRejectedCount int            `json:"duplicate_signature_rejected_count,omitempty"`
+	SelectedCandidateRankingScore   float64        `json:"selected_candidate_ranking_score,omitempty"`
+	MechanismDiversity              int            `json:"mechanism_diversity,omitempty"`
+	TaskAligned                     bool           `json:"task_aligned"`
+	ValidModelSelection             bool           `json:"valid_model_selection"`
 	RetrievedCardCount              int            `json:"retrieved_card_count,omitempty"`
 	RetrievalPromptBytes            int            `json:"retrieval_prompt_bytes,omitempty"`
 	SelectedCandidateMemoryScore    float64        `json:"selected_candidate_memory_score,omitempty"`
@@ -28,6 +35,11 @@ type PlannerReplayScores struct {
 }
 
 func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendation agents.ExperimentPlanningRecommendation, expected PlannerReplayExpected) PlannerReplayScores {
+	scores, _, _ := scorePlannerRecommendationDetailed(input, recommendation, expected)
+	return scores
+}
+
+func scorePlannerRecommendationDetailed(input agents.ExperimentPlannerInput, recommendation agents.ExperimentPlanningRecommendation, expected PlannerReplayExpected) (PlannerReplayScores, agents.ExperimentPlanningRecommendation, error) {
 	finalized := recommendation
 	decision := normalizedDecision(recommendation.DecisionType)
 	maxExperiments := expected.MaxSelectedExperiments
@@ -41,12 +53,14 @@ func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendat
 
 	rankingApplied := true
 	finalizeOK := true
+	finalizeErr := error(nil)
 	if decision == decisions.TypeAddExperiments {
 		rankingApplied = len(recommendation.CandidateHypotheses) > 0
 		if rankingApplied {
 			var err error
 			finalized, err = agents.FinalizePlannerRecommendation(input, recommendation)
 			finalizeOK = err == nil
+			finalizeErr = err
 			rankingApplied = len(finalized.CandidateRankings) == len(recommendation.CandidateHypotheses)
 		}
 	}
@@ -68,6 +82,11 @@ func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendat
 	countOK := decision != decisions.TypeAddExperiments || len(finalized.ProposedExperiments) <= maxExperiments
 	addHasSelection := decision != decisions.TypeAddExperiments || len(finalized.ProposedExperiments) > 0
 	retrievalMetrics := replayRetrievalMetrics(input, finalized)
+	duplicateSignatureRejections := replayDuplicateSignatureRejections(finalized.CandidateRankings)
+	selectedCandidateScore := replaySelectedCandidateRankingScore(finalized.CandidateRankings)
+	mechanismDiversity := replayMechanismDiversity(selectedMechanisms)
+	taskAligned := replayTaskAligned(input, finalized)
+	validModelSelection := replayValidModelSelection(input, finalized)
 
 	backendPassed := schemaValid &&
 		decisionAllowed &&
@@ -81,7 +100,7 @@ func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendat
 		countOK &&
 		addHasSelection
 
-	return PlannerReplayScores{
+	scores := PlannerReplayScores{
 		SchemaValid:                     schemaValid,
 		BackendValidationPassed:         backendPassed,
 		CandidateRankingApplied:         rankingApplied,
@@ -91,12 +110,150 @@ func ScorePlannerRecommendation(input agents.ExperimentPlannerInput, recommendat
 		ExpectedValueAboveFloor:         expectedValueOK,
 		EvidencePresent:                 evidencePresent,
 		SelectedExperimentCountOK:       countOK,
+		FinalizerSucceeded:              finalizeOK,
+		FinalizerError:                  replayFinalizerError(finalizeErr),
+		DuplicateSignatureRejectedCount: duplicateSignatureRejections,
+		SelectedCandidateRankingScore:   selectedCandidateScore,
+		MechanismDiversity:              mechanismDiversity,
+		TaskAligned:                     taskAligned,
+		ValidModelSelection:             validModelSelection,
 		RetrievedCardCount:              retrievalMetrics.RetrievedCardCount,
 		RetrievalPromptBytes:            retrievalMetrics.RetrievalPromptBytes,
 		SelectedCandidateMemoryScore:    retrievalMetrics.SelectedCandidateMemoryScore,
 		RejectedCandidateMemoryPenalty:  retrievalMetrics.RejectedCandidateMemoryPenalty,
 		RetrievalHitSourceMix:           retrievalMetrics.RetrievalHitSourceMix,
 	}
+	return scores, finalized, finalizeErr
+}
+
+func replayFinalizerError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func replayDuplicateSignatureRejections(rankings []agents.CandidateRanking) int {
+	count := 0
+	for _, ranking := range rankings {
+		if !ranking.Rejected {
+			continue
+		}
+		for _, reason := range ranking.Reasons {
+			if strings.Contains(strings.ToLower(reason), "duplicate") && strings.Contains(strings.ToLower(reason), "signature") {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+func replaySelectedCandidateRankingScore(rankings []agents.CandidateRanking) float64 {
+	selected := 0
+	total := 0.0
+	for _, ranking := range rankings {
+		if !ranking.Selected {
+			continue
+		}
+		selected++
+		total += ranking.Score
+	}
+	if selected == 0 {
+		return 0
+	}
+	return replayRoundScore(total / float64(selected))
+}
+
+func replayMechanismDiversity(mechanisms []string) int {
+	if len(mechanisms) == 0 {
+		return 0
+	}
+	unique := map[string]bool{}
+	for _, mechanism := range mechanisms {
+		if normalized := normalizeReplayValue(mechanism); normalized != "" {
+			unique[normalized] = true
+		}
+	}
+	return len(unique)
+}
+
+func replayTaskAligned(input agents.ExperimentPlannerInput, _ agents.ExperimentPlanningRecommendation) bool {
+	task := replayTaskType(input)
+	targetMetric := strings.ToLower(strings.TrimSpace(input.SourcePlan.TargetMetric))
+	switch task {
+	case "object_detection":
+		return strings.Contains(targetMetric, "map")
+	default:
+		return targetMetric == "" || targetMetric == "macro_f1" || targetMetric == "accuracy"
+	}
+}
+
+func replayTaskType(input agents.ExperimentPlannerInput) string {
+	task := strings.ToLower(strings.TrimSpace(input.DatasetInsights.TaskType))
+	if task != "" {
+		return task
+	}
+	return strings.ToLower(strings.TrimSpace(replayStringFromMap(input.Dataset.Profile, "task_type")))
+}
+
+func replayStringFromMap(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	if value, ok := values[key].(string); ok {
+		return value
+	}
+	return ""
+}
+
+func replayValidModelSelection(input agents.ExperimentPlannerInput, recommendation agents.ExperimentPlanningRecommendation) bool {
+	task := replayTaskType(input)
+	catalog := map[string]agents.SupportedModelSpec{}
+	for _, spec := range input.ModelCatalog {
+		catalog[strings.ToLower(strings.TrimSpace(spec.Name))] = spec
+	}
+	selected := recommendation.ProposedExperiments
+	if len(selected) == 0 {
+		selected = make([]plans.PlannedExperiment, 0, len(recommendation.CandidateRankings))
+		for _, ranking := range recommendation.CandidateRankings {
+			if ranking.Selected && ranking.CandidateIndex >= 0 && ranking.CandidateIndex < len(recommendation.ProposedExperiments) {
+				selected = append(selected, recommendation.ProposedExperiments[ranking.CandidateIndex])
+			}
+		}
+	}
+	if len(selected) == 0 {
+		return false
+	}
+	for _, experiment := range selected {
+		model := strings.ToLower(strings.TrimSpace(experiment.Model))
+		if len(catalog) > 0 {
+			spec, ok := catalog[model]
+			if !ok || !spec.TrainingEnabled {
+				return false
+			}
+			if task == "object_detection" {
+				if strings.ToLower(strings.TrimSpace(spec.TaskType)) != "object_detection" && !strings.HasPrefix(model, "yolo") {
+					return false
+				}
+				continue
+			}
+			if strings.ToLower(strings.TrimSpace(spec.TaskType)) == "object_detection" || strings.HasPrefix(model, "yolo") {
+				return false
+			}
+			continue
+		}
+		if task == "object_detection" {
+			if !strings.HasPrefix(model, "yolo") {
+				return false
+			}
+			continue
+		}
+		if strings.HasPrefix(model, "yolo") {
+			return false
+		}
+	}
+	return true
 }
 
 type plannerReplayRetrievalMetrics struct {

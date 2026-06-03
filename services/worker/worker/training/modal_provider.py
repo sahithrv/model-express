@@ -62,8 +62,12 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     if config.get("gpu_type"):
         os.environ["MODAL_GPU_TYPE"] = str(config["gpu_type"])
 
+    detection_job = _is_detection_training_config(config)
     try:
-        from worker.training.modal_app import app, train_image_classifier
+        if detection_job:
+            from worker.training.modal_app import app, train_yolo_detector as training_function
+        else:
+            from worker.training.modal_app import app, train_image_classifier as training_function
     except ModuleNotFoundError as exc:
         if exc.name == "modal":
             raise RuntimeError(
@@ -96,7 +100,7 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
 
     try:
         with _modal_invocation_context(app):
-            result = _remote_function(train_image_classifier)(payload)
+            result = _remote_function(training_function)(payload)
     except Exception as exc:
         message = _modal_training_error_message(exc)
         client.fail_job(job["id"], message, retryable=True)
@@ -116,6 +120,16 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
 
     _log_dataset_materialization(job.get("id", ""), job.get("project_id", ""), result)
     print(f"Modal training finished for {job['id']}: {result}")
+
+
+def _is_detection_training_config(config: dict) -> bool:
+    model = str(config.get("model", "")).lower()
+    return (
+        str(config.get("task_type", "")).lower() == "object_detection"
+        or str(config.get("model_kind", "")).lower() == "ultralytics_yolo_detector"
+        or model.startswith("yolo11")
+        or model.startswith("yolo")
+    )
 
 
 def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:

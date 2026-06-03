@@ -9,6 +9,7 @@ const (
 	KindPlanningFeedback            = "planning_feedback"
 	KindPlanningOutcome             = "planning_outcome"
 	KindModelRanking                = "model_ranking"
+	KindChampionFeedback            = "champion_feedback"
 )
 
 type AgentMemoryRecord struct {

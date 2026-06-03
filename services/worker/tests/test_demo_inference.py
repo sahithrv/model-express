@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from worker.exporting.artifacts import produce_champion_export_artifacts
-from worker.exporting.inference import run_demo_inference_from_manifest
+from worker.exporting.inference import _postprocess_detection_outputs, run_demo_inference_from_manifest
 from worker.exporting.preprocessing import prepare_image_for_inference
 
 
@@ -132,6 +132,42 @@ class DemoInferenceTests(unittest.TestCase):
             self.assertEqual(payload["runtime"], "framework_native_checkpoint")
             self.assertEqual(payload["predicted_label"], "dog")
             self.assertTrue(payload["correct"])
+
+    def test_yolo_detection_postprocess_decodes_rows_and_applies_nms(self) -> None:
+        try:
+            import numpy as np
+        except Exception as exc:  # pragma: no cover - depends on optional local deps
+            raise unittest.SkipTest(f"numpy is unavailable: {exc}") from exc
+
+        outputs = {
+            "output0": np.array(
+                [
+                    [
+                        [4.0, 4.2, 10.0],
+                        [4.0, 4.2, 10.0],
+                        [4.0, 4.0, 3.0],
+                        [4.0, 4.0, 3.0],
+                        [0.92, 0.88, 0.05],
+                        [0.05, 0.04, 0.91],
+                    ]
+                ],
+                dtype=np.float32,
+            )
+        }
+
+        detections = _postprocess_detection_outputs(
+            outputs=outputs,
+            class_labels=["creeper", "zombie"],
+            input_size=(8, 8),
+            original_size=(8, 8),
+            thresholds={"confidence_threshold": 0.2, "iou_threshold": 0.5, "max_detections": 10},
+        )
+
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(detections[0]["label"], "creeper")
+        self.assertGreater(detections[0]["confidence"], 0.9)
+        self.assertAlmostEqual(detections[0]["box"]["x"], 0.25, places=2)
+        self.assertAlmostEqual(detections[0]["box"]["width"], 0.5, places=2)
 
 
 if __name__ == "__main__":

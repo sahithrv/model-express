@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
@@ -215,6 +216,366 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 	}
 }
 
+func TestExperimentPlannerStaticPromptCompactV1IsShorterAndKeepsContractGuidance(t *testing.T) {
+	v1Prompt := plannerRequestStaticPromptForTest(t, plannerStaticPromptVersionV1)
+	compactPrompt := plannerRequestStaticPromptForTest(t, plannerStaticPromptVersionCompactV1)
+
+	v1Bytes := len([]byte(v1Prompt))
+	compactBytes := len([]byte(compactPrompt))
+	if compactBytes >= v1Bytes {
+		t.Fatalf("expected compact static prompt to be shorter than v1, v1=%d compact=%d", v1Bytes, compactBytes)
+	}
+	if compactBytes*5 >= v1Bytes*3 {
+		t.Fatalf("expected compact static prompt to shrink by at least 40%%, v1=%d compact=%d", v1Bytes, compactBytes)
+	}
+
+	for _, expected := range []string{
+		"candidate_hypotheses",
+		"proposal_mechanisms",
+		"experiment_config",
+		"Backend validation remains the gate",
+		"draft-only for ADD_EXPERIMENTS",
+		"Return only valid JSON",
+	} {
+		if !strings.Contains(compactPrompt, expected) {
+			t.Fatalf("expected compact static prompt to retain %q, got %q", expected, compactPrompt)
+		}
+	}
+}
+
+func TestExperimentPlannerContextSnapshotV2IsSmallerAndRollbackable(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.PlanJobs = append(input.PlanJobs, jobs.ExperimentJob{
+		ID:       "job_2",
+		Template: jobs.TemplateTrainExperiment,
+		Status:   jobs.StatusFailed,
+		Config: map[string]any{
+			"model":      "efficientnet_b0",
+			"template":   "efficientnet_transfer",
+			"image_size": 256,
+			"augmentation": map[string]any{
+				"horizontal_flip": true,
+				"color_jitter":    true,
+			},
+		},
+	})
+	input.PlanSummaries = append(input.PlanSummaries, runs.TrainingRunSummary{
+		JobID:            "job_2",
+		PlanID:           "plan_1",
+		Model:            "efficientnet_b0",
+		Status:           jobs.StatusFailed,
+		BestMacroF1:      0.58,
+		BestAccuracy:     0.63,
+		FinalTrainLoss:   0.24,
+		FinalValLoss:     0.69,
+		EstimatedCostUSD: 1.25,
+		RuntimeSeconds:   842,
+	})
+	for i := 3; i <= 24; i++ {
+		input.PlanSummaries = append(input.PlanSummaries, runs.TrainingRunSummary{
+			JobID:            fmt.Sprintf("job_%d", i),
+			PlanID:           "plan_1",
+			Model:            fmt.Sprintf("efficientnet_b%d", i),
+			Status:           jobs.StatusSucceeded,
+			BestMacroF1:      0.6 + float64(i)*0.01,
+			BestAccuracy:     0.65 + float64(i)*0.01,
+			FinalTrainLoss:   0.30 - float64(i)*0.005,
+			FinalValLoss:     0.60 - float64(i)*0.004,
+			EstimatedCostUSD: 1.0 + float64(i)*0.1,
+			RuntimeSeconds:   700 + float64(i)*10,
+		})
+	}
+	for i := 3; i <= 24; i++ {
+		jobID := fmt.Sprintf("job_%d", i)
+		input.PlanEvaluations = append(input.PlanEvaluations, runs.TrainingRunEvaluation{
+			JobID: jobID,
+			PerClassMetrics: map[string]any{
+				"rare":   map[string]any{"recall": 0.29 + float64(i)*0.005, "f1-score": 0.26 + float64(i)*0.005, "support": 8},
+				"common": map[string]any{"recall": 0.92, "f1-score": 0.90, "support": 80},
+			},
+			ConfusionMatrix: [][]int{{2, 8}, {1, 65}},
+			ModelProfile: map[string]any{
+				"estimated_latency_ms":         118.0 + float64(i),
+				"throughput_images_per_second": 44.0,
+				"parameter_count":              3200000.0 + float64(i)*10000,
+				"model_size_mb":                11.2 + float64(i)*0.1,
+				"deployment_notes":             "this extra-long model profile exists so the compact snapshot can prove it strips v1-only verbose payloads from the ledger",
+			},
+			HolisticScores: map[string]any{
+				"training_diagnostics": map[string]any{
+					"trend":              "validation quality improved, then flattened, then improved again after targeted regularization",
+					"gap_summary":        "train/validation gap remained visible across epochs but narrowed after the augmentation change",
+					"loss_curve_notes":   "the run kept enough headroom to justify the mechanism pivot, not another shallow epoch-only repeat",
+					"diagnostic_warning": "the repeated plateau signal should not be treated as a license for more of the same",
+				},
+			},
+			RecommendationSummary: "long-lived diagnostic evidence for compact-snapshot shrinking",
+		})
+	}
+	input.PlanEvaluations = append(input.PlanEvaluations, runs.TrainingRunEvaluation{
+		JobID: "job_2",
+		PerClassMetrics: map[string]any{
+			"rare":   map[string]any{"recall": 0.29, "f1-score": 0.26, "support": 8},
+			"common": map[string]any{"recall": 0.92, "f1-score": 0.90, "support": 80},
+		},
+		ConfusionMatrix: [][]int{{2, 8}, {1, 65}},
+		ModelProfile: map[string]any{
+			"estimated_latency_ms":         118.0,
+			"throughput_images_per_second": 44.0,
+			"parameter_count":              3200000.0,
+			"model_size_mb":                11.2,
+		},
+		HolisticScores: map[string]any{
+			"label_quality": map[string]any{
+				"high_confidence_error_count": 2,
+				"label_noise_signal":          "rare/common confusion remains",
+			},
+		},
+	})
+	input.SourcePlanDeltas = []ExperimentRunDelta{
+		{
+			JobID:                  "job_2",
+			PlanID:                 "plan_1",
+			Model:                  "efficientnet_b0",
+			Status:                 jobs.StatusFailed,
+			TargetMetric:           "macro_f1",
+			Score:                  0.58,
+			BestMacroF1:            0.58,
+			BestAccuracy:           0.63,
+			EstimatedCostUSD:       1.25,
+			RuntimeSeconds:         842,
+			EpochsCompleted:        10,
+			ChampionJobID:          "champion_1",
+			DeltaScoreVsChampion:   -0.04,
+			DeltaCostVsChampion:    0.25,
+			DeltaRuntimeVsChampion: 112,
+		},
+	}
+	input.SuccessfulStrategyMemory = []PlannerStrategyMemory{
+		{
+			MemoryID:                "memory_success_1",
+			OutcomeStatus:           ExperimentPlanningOutcomeImprovedChampion,
+			Lesson:                  "Weighted loss improved minority recall on the same dataset shape.",
+			BestModel:               "efficientnet_b0",
+			ActualDeltaVsChampion:   0.018,
+			ExpectedDeltaVsChampion: 0.02,
+			TotalCostUSD:            1.2,
+			TotalRuntimeSeconds:     810,
+			ProposedModels:          []string{"efficientnet_b0", "mobilenet_v3_small"},
+			Tags:                    []string{"class_imbalance", "success"},
+		},
+	}
+	input.FailedStrategyMemory = []PlannerStrategyMemory{
+		{
+			MemoryID:                "memory_failed_1",
+			OutcomeStatus:           ExperimentPlanningOutcomeNoImprovement,
+			Lesson:                  "Architecture-only repeats plateaued.",
+			BestModel:               "resnet18",
+			ActualDeltaVsChampion:   -0.03,
+			ExpectedDeltaVsChampion: 0.01,
+			TotalCostUSD:            0.9,
+			TotalRuntimeSeconds:     660,
+			ProposedModels:          []string{"resnet18", "efficientnet_b0"},
+			Tags:                    []string{"architecture_challenge", "failure"},
+		},
+	}
+	input.RejectedStrategyMemory = []RejectedPlannerOption{
+		{Option: "repeat architecture sweep", Reason: "same mechanism only changes epochs", Evidence: "architecture_challenge exhausted", AppliesWhen: []string{"architecture_challenge"}},
+		{Option: "more epochs", Reason: "plateaued", Evidence: "training_dynamics_card says no more epochs", AppliesWhen: []string{"plateau"}},
+	}
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		retrievedPlannerTestResult(memory.SourceStrategyScorecard, "scorecard_1", "strategy_scorecard", ExperimentPlanningOutcomeImprovedChampion, "similar success"),
+		retrievedPlannerTestResult(memory.SourceAgentMemoryRecord, "memory_2", memory.KindPlanningFeedback, "rejected", "blocked repeat"),
+		retrievedPlannerTestResult(memory.SourceDatasetPreprocessing, "dataset_1", memory.KindDatasetPreprocessingHypothesis, "", "similar preprocessing lesson"),
+	}
+	input.StrategyScorecards = []PlannerStrategyScorecard{
+		{
+			ID:               "scorecard_1",
+			DatasetID:        "dataset_1",
+			SourceDecisionID: "decision_1",
+			SourcePlanID:     "plan_1",
+			FollowUpPlanID:   "plan_2",
+			StrategyType:     "class_imbalance",
+			PlanningMode:     "class_imbalance_ablation",
+			Mechanism:        "class_imbalance",
+			Intervention:     "weighted_loss",
+			EvidenceUsed:     []string{"minority class recall is weak", "validation/train gap is visible"},
+			ExpectedEffect:   "Improve macro-F1 and minority recall.",
+			DatasetTraits:    map[string]any{"imbalance_ratio": 4.2, "small_objects": true},
+			ObjectiveProfile: map[string]any{"primary": "macro_f1", "live_budget": 25.0},
+			ProposedChanges:  map[string]any{"class_balancing": "weighted_loss", "sampling_strategy": "weighted_random_sampler"},
+			ExpectedDelta:    0.02,
+			ActualDelta:      0.018,
+			ConfidenceBefore: 0.72,
+			ConfidenceAfter:  0.81,
+			CostUSD:          1.15,
+			RuntimeSeconds:   802,
+			Outcome:          ExperimentPlanningOutcomeImprovedChampion,
+			Lesson:           "Weighted loss helped more than another architecture sweep.",
+			Tags:             []string{"class_imbalance", "improved"},
+		},
+	}
+	input.OptimizerFeedback = []automl.OptimizerFeedbackSummary{
+		{
+			StudyID:                 "study_1",
+			TrialCount:              6,
+			SucceededTrialCount:     4,
+			FailedTrialCount:        2,
+			TargetMetric:            "macro_f1",
+			BestScore:               0.74,
+			BestJobID:               "trial_1",
+			BestHyperparameters:     map[string]any{"learning_rate": 0.0002, "weight_decay": 0.01},
+			TrainValidationGap:      0.11,
+			Trend:                   "plateau",
+			FailedParameterPatterns: []string{"more_epochs_only"},
+			RecommendedNarrowing:    []string{"keep learning rate modest", "change mechanism before more epochs"},
+		},
+	}
+	input.ValidationFeedback = []PlannerValidationFeedback{
+		{
+			Attempt:             2,
+			ValidationError:     "experiment planner ADD_EXPERIMENTS missing candidate_hypotheses",
+			RejectedDecision:    "ADD_EXPERIMENTS",
+			RejectedModels:      []string{"mobilenet_v3_small"},
+			RejectedExperiments: []string{"more epochs"},
+			Instructions:        []string{"include candidate_hypotheses", "change mechanism materially"},
+		},
+	}
+	input.DatasetInsights.AgentSafeMetadataSummary = map[string]any{
+		"source_formats":        []string{"pascal_voc"},
+		"bbox_annotation_count": 12,
+		"bbox_sample_count":     6,
+		"annotation_counts":     map[string]any{"bbox": 12},
+	}
+	input.ProjectTrajectory = PlannerProjectTrajectoryCard{
+		CompletedTrainingRuns:  3,
+		CompletedPlannerRounds: 2,
+		FirstSuccessfulScore:   0.61,
+		CurrentChampionScore:   0.7,
+		AbsoluteChampionGain:   0.09,
+		GainPerCompletedRun:    0.03,
+		RecentBestDelta:        0.018,
+		MinimumUsefulDelta:     0.01,
+		NoImprovementRounds:    1,
+		DecisionPressure:       "champion_confirmation_or_non_architecture_pivot",
+		MechanismOutcomes: []PlannerMechanismOutcome{
+			{
+				Mechanism:           "architecture_challenge",
+				AttemptCount:        3,
+				PlanCount:           3,
+				BestScore:           0.7,
+				BestDeltaVsPrior:    0.0,
+				RecentBestDelta:     0.0,
+				Status:              "exhausted",
+				ExhaustionReason:    "Repeated architecture-only sweeps failed to improve the champion.",
+				AllowedNextOnlyWith: []string{"champion_confirmation", "non_architecture_pivot"},
+			},
+		},
+		BlockedMechanisms: []string{"architecture_challenge"},
+		Warnings:          []string{"avoid shallow repeats"},
+	}
+	addBulkyPlannerHistoryForV2Test(&input)
+
+	v1Snapshot := plannerSnapshotForVersionTest(t, input, "v1")
+	v2Snapshot := plannerSnapshotForVersionTest(t, input, "v2")
+
+	if v1Snapshot.ContextVersion != "v1" {
+		t.Fatalf("expected v1 snapshot version, got %q", v1Snapshot.ContextVersion)
+	}
+	if v2Snapshot.ContextVersion != "v2" {
+		t.Fatalf("expected v2 snapshot version, got %q", v2Snapshot.ContextVersion)
+	}
+
+	v1Blob, err := json.Marshal(v1Snapshot)
+	if err != nil {
+		t.Fatalf("marshal v1 snapshot: %v", err)
+	}
+	v2Blob, err := json.Marshal(v2Snapshot)
+	if err != nil {
+		t.Fatalf("marshal v2 snapshot: %v", err)
+	}
+	if len(v2Blob) >= len(v1Blob) {
+		t.Fatalf("expected v2 context to be smaller than v1, v1=%d v2=%d", len(v1Blob), len(v2Blob))
+	}
+	if len(v2Blob)*2 >= len(v1Blob) {
+		t.Fatalf("expected v2 context to shrink by at least 50%%, v1=%d v2=%d", len(v1Blob), len(v2Blob))
+	}
+	if v2Snapshot.PromptBudget.SectionEstimates["planner_context_snapshot_total"].Bytes <= 0 {
+		t.Fatalf("expected planner context section estimate to be populated, got %#v", v2Snapshot.PromptBudget.SectionEstimates["planner_context_snapshot_total"])
+	}
+}
+
+func TestExperimentPlannerPromptBudgetSectionEstimatesCoverPlannerSections(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION", "v2")
+	t.Setenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION", plannerStaticPromptVersionCompactV1)
+
+	input := testExperimentPlannerInput()
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		retrievedPlannerTestResult(memory.SourceStrategyScorecard, "scorecard_1", "strategy_scorecard", ExperimentPlanningOutcomeImprovedChampion, "similar success"),
+	}
+	input.OptimizerFeedback = []automl.OptimizerFeedbackSummary{
+		{
+			StudyID:              "study_1",
+			TrialCount:           4,
+			SucceededTrialCount:  3,
+			FailedTrialCount:     1,
+			TargetMetric:         "macro_f1",
+			BestScore:            0.74,
+			BestJobID:            "trial_1",
+			BestHyperparameters:  map[string]any{"learning_rate": 0.0002},
+			Trend:                "improving",
+			RecommendedNarrowing: []string{"keep the mechanism but narrow the hyperparameters"},
+		},
+	}
+	input.ValidationFeedback = []PlannerValidationFeedback{
+		{
+			Attempt:          1,
+			ValidationError:  "experiment planner ADD_EXPERIMENTS missing candidate_hypotheses",
+			RejectedDecision: "ADD_EXPERIMENTS",
+			Instructions:     []string{"include candidate_hypotheses", "keep proposed experiments backend-valid"},
+		},
+	}
+
+	context := experimentPlannerPromptContext(input)
+	snapshot, ok := context["planner_context_snapshot"].(PlannerContextSnapshot)
+	if !ok {
+		t.Fatalf("expected planner context snapshot, got %#v", context["planner_context_snapshot"])
+	}
+	budget := snapshot.PromptBudget
+	required := []string{
+		"static_instructions",
+		"output_schema",
+		"planner_context_snapshot_total",
+		"dataset_card",
+		"objective_context",
+		"champion_card",
+		"completed_experiment_log",
+		"project_trajectory_card",
+		"training_dynamics_card",
+		"per_class_error_card",
+		"deployment_card",
+		"mechanism_coverage_card",
+		"backend_gated_methods",
+		"label_quality_card",
+		"search_coverage",
+		"strategy_lessons",
+		"retrieved_memory",
+		"blocked_repeats",
+		"model_catalog",
+		"optimizer_feedback",
+		"validation_feedback",
+	}
+	for _, key := range required {
+		estimate, ok := budget.SectionEstimates[key]
+		if !ok {
+			t.Fatalf("expected section estimate for %q, got %#v", key, budget.SectionEstimates)
+		}
+		if estimate.Bytes <= 0 || estimate.ApproximateTokens <= 0 {
+			t.Fatalf("expected positive estimate for %q, got %#v", key, estimate)
+		}
+	}
+}
+
 func TestExperimentPlannerGovernorComplianceShapeAccepted(t *testing.T) {
 	var recommendation ExperimentPlanningRecommendation
 	if err := json.Unmarshal([]byte(`{
@@ -267,6 +628,8 @@ func TestExperimentPlannerAgentRejectsAddWithoutExperiments(t *testing.T) {
 }
 
 func TestExperimentPlannerAgentRejectsAddWithoutHypothesis(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	agent := NewExperimentPlannerAgent(fakeJSONGenerator{
 		response: `{
 			"summary": "Try a small tweak.",
@@ -337,6 +700,8 @@ func TestExperimentPlannerAgentRejectsAddWithoutHypothesis(t *testing.T) {
 }
 
 func TestExperimentPlannerAgentRejectsMinorOnlyTweaks(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	agent := NewExperimentPlannerAgent(fakeJSONGenerator{
 		response: `{
 			"summary": "Try a small tweak.",
@@ -406,7 +771,21 @@ func TestExperimentPlannerAgentRejectsMinorOnlyTweaks(t *testing.T) {
 	}
 }
 
+func TestExperimentPlannerAgentAllowsMinorOnlyTweaksInRelaxedMode(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "false")
+
+	recommendation := validExperimentPlannerRecommendationForMode("exploit")
+	recommendation.ChangedVariables = []string{"epochs", "learning_rate"}
+	recommendation.ProposalMechanisms = nil
+
+	if err := validateExperimentPlanningRecommendation(recommendation, 5); err != nil {
+		t.Fatalf("expected relaxed planner validation to allow minor-only tweak: %v", err)
+	}
+}
+
 func TestExperimentPlannerRejectsProposalWithoutMechanismExpectations(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	recommendation := validExperimentPlannerRecommendationForMode("champion_challenge")
 	recommendation.ProposalMechanisms = nil
 
@@ -508,22 +887,32 @@ func TestExperimentPlannerPromptContextIncludesRetrievedMemoryCards(t *testing.T
 	if snapshot.RetrievedMemory == nil {
 		t.Fatal("expected retrieved memory snapshot")
 	}
-	if got := len(snapshot.RetrievedMemory.SuccessfulStrategyCards); got != 1 {
-		t.Fatalf("expected one successful retrieved card, got %d", got)
+	if got := len(snapshot.RetrievedMemory.DistilledLessons); got != 1 {
+		t.Fatalf("expected one distilled retrieved card, got %d", got)
 	}
-	card := snapshot.RetrievedMemory.SuccessfulStrategyCards[0]
+	card := snapshot.RetrievedMemory.DistilledLessons[0]
 	if card.SourceTable != memory.SourceStrategyScorecard || card.SourceID != "scorecard_1" {
 		t.Fatalf("expected source-linked retrieved card, got %#v", card)
 	}
 	if card.Outcome != ExperimentPlanningOutcomeImprovedChampion || card.Mechanism != "class_imbalance" {
 		t.Fatalf("expected outcome and mechanism on retrieved card, got %#v", card)
 	}
+	if len(card.EvidenceUsed) == 0 || !containsStringFold(card.EvidenceUsed, "scorecard_1") {
+		t.Fatalf("expected evidence IDs to preserve source IDs, got %#v", card.EvidenceUsed)
+	}
 	if snapshot.PromptBudget.RetrievedMemoryCount != 1 || snapshot.PromptBudget.RetrievedMemoryApproximateBytes <= 0 {
 		t.Fatalf("expected retrieved memory prompt budget telemetry, got %#v", snapshot.PromptBudget)
 	}
-	blob, err := json.Marshal(snapshot)
+	rawBlob, err := json.Marshal(input.RetrievedMemory)
 	if err != nil {
-		t.Fatalf("marshal snapshot: %v", err)
+		t.Fatalf("marshal raw retrieval memory: %v", err)
+	}
+	blob, err := json.Marshal(snapshot.RetrievedMemory)
+	if err != nil {
+		t.Fatalf("marshal retrieved snapshot: %v", err)
+	}
+	if len(blob) >= len(rawBlob) {
+		t.Fatalf("expected distilled retrieved memory to shrink, raw=%d compact=%d", len(rawBlob), len(blob))
 	}
 	text := string(blob)
 	for _, forbidden := range []string{"embedding_text", "do not leak embedding text", "raw_payload", "do not leak raw payload", "private-bucket"} {
@@ -559,17 +948,157 @@ func TestExperimentPlannerRetrievedMemorySnapshotRemainsBounded(t *testing.T) {
 	if got := plannerRetrievedMemoryCardCount(retrieved); got > plannerRetrievedMemoryMaxTotal {
 		t.Fatalf("expected total retrieved memory cap %d, got %d", plannerRetrievedMemoryMaxTotal, got)
 	}
-	if got := len(retrieved.SuccessfulStrategyCards); got > plannerRetrievedMemoryMaxSuccessful {
-		t.Fatalf("expected successful cap %d, got %d", plannerRetrievedMemoryMaxSuccessful, got)
+	if got := len(retrieved.DistilledLessons); got > plannerRetrievedMemoryMaxDistilled {
+		t.Fatalf("expected distilled cap %d, got %d", plannerRetrievedMemoryMaxDistilled, got)
 	}
-	if got := len(retrieved.FailedStrategyCards); got > plannerRetrievedMemoryMaxFailed {
-		t.Fatalf("expected failed cap %d, got %d", plannerRetrievedMemoryMaxFailed, got)
+	if got := len(retrieved.FailedOrBlockedLessons); got > plannerRetrievedMemoryMaxFailedOrBlocked {
+		t.Fatalf("expected failed/blocked cap %d, got %d", plannerRetrievedMemoryMaxFailedOrBlocked, got)
 	}
-	if got := len(retrieved.BlockedOrRejectedCards); got > plannerRetrievedMemoryMaxBlocked {
-		t.Fatalf("expected blocked cap %d, got %d", plannerRetrievedMemoryMaxBlocked, got)
+	if got := len(retrieved.RawFallbackCards); got != 0 {
+		t.Fatalf("expected no raw fallback when distilled lessons exist, got %d", got)
 	}
-	if got := len(retrieved.DatasetPreprocessingCards); got > plannerRetrievedMemoryMaxDataset {
-		t.Fatalf("expected dataset/preprocessing cap %d, got %d", plannerRetrievedMemoryMaxDataset, got)
+}
+
+func TestExperimentPlannerRetrievedMemoryDedupesByMechanismAndAppliesWhenSignature(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.RetrievedMemory = []memory.MemoryRetrievalResult{
+		{
+			SourceTable:     memory.SourceStrategyScorecard,
+			SourceID:        "scorecard_a",
+			ProjectID:       "project_1",
+			DatasetID:       "dataset_1",
+			Kind:            "strategy_scorecard",
+			Score:           0.91,
+			SemanticScore:   0.83,
+			StructuredScore: 0.79,
+			RetrievalReason: "same mechanism and applies_when signature",
+			SummaryCard: map[string]any{
+				"outcome":        ExperimentPlanningOutcomeImprovedChampion,
+				"mechanism":      "class_imbalance",
+				"lesson":         "Weighted loss helped minority recall.",
+				"applies_when":   []any{"low minority recall", "macro_f1 focus"},
+				"evidence_used":  []any{"scorecard_a", "plan_10"},
+				"source_plan_id": "plan_10",
+			},
+		},
+		{
+			SourceTable:     memory.SourceStrategyScorecard,
+			SourceID:        "scorecard_b",
+			ProjectID:       "project_1",
+			DatasetID:       "dataset_1",
+			Kind:            "strategy_scorecard",
+			Score:           0.89,
+			SemanticScore:   0.81,
+			StructuredScore: 0.76,
+			RetrievalReason: "same mechanism and applies_when signature",
+			SummaryCard: map[string]any{
+				"outcome":        ExperimentPlanningOutcomeImprovedChampion,
+				"mechanism":      "class_imbalance",
+				"lesson":         "Balanced sampler also helped minority recall.",
+				"applies_when":   []any{"macro_f1 focus", "low minority recall"},
+				"evidence_used":  []any{"scorecard_b", "plan_11"},
+				"source_plan_id": "plan_11",
+			},
+		},
+	}
+
+	snapshot := BuildPlannerContextSnapshot(input)
+	if snapshot.RetrievedMemory == nil {
+		t.Fatal("expected retrieved memory snapshot")
+	}
+	if got := len(snapshot.RetrievedMemory.DistilledLessons); got != 1 {
+		t.Fatalf("expected deduped distilled lessons, got %d", got)
+	}
+	card := snapshot.RetrievedMemory.DistilledLessons[0]
+	if card.Mechanism != "class_imbalance" {
+		t.Fatalf("unexpected deduped mechanism: %#v", card)
+	}
+	if !containsStringFold(card.EvidenceUsed, "scorecard_a") || !containsStringFold(card.EvidenceUsed, "scorecard_b") {
+		t.Fatalf("expected merged evidence IDs after dedupe, got %#v", card.EvidenceUsed)
+	}
+	if containsStringFold(card.AppliesWhen, "scorecard_a") || containsStringFold(card.AppliesWhen, "scorecard_b") || containsStringFold(card.AppliesWhen, "plan_10") || containsStringFold(card.AppliesWhen, "plan_11") {
+		t.Fatalf("expected applies_when signature to ignore evidence ids, got %#v", card.AppliesWhen)
+	}
+	if len(card.AppliesWhen) == 0 || !containsStringFold(card.AppliesWhen, "low minority recall") {
+		t.Fatalf("expected deduped applies_when signature, got %#v", card.AppliesWhen)
+	}
+}
+
+func TestExperimentPlannerModelCatalogIsCompactAndTaskSeparated(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.ModelCatalog = []SupportedModelSpec{
+		{
+			Name:                  "mobilenet_v3_small",
+			Family:                "mobilenet",
+			TaskType:              "image_classification",
+			ModelKind:             "torchvision_classifier",
+			DeploymentTier:        "fast_live",
+			DefaultImageSize:      224,
+			MinRecommendedImages:  50,
+			SupportsTransfer:      true,
+			TrainingEnabled:       true,
+			ExpectedLatencyClass:  "very_fast",
+			RecommendedUse:        "compact live baseline",
+			SupportsFineTuneModes: []string{"head_only", "last_block", "full"},
+		},
+		{
+			Name:                 "yolo11n.pt",
+			Family:               "yolo11",
+			TaskType:             "object_detection",
+			ModelKind:            "ultralytics_yolo_detector",
+			PretrainedWeights:    "yolo11n.pt",
+			DeploymentTier:       "realtime_detector",
+			DefaultImageSize:     640,
+			MinRecommendedImages: 100,
+			SupportsTransfer:     true,
+			TrainingEnabled:      true,
+			ExpectedLatencyClass: "very_fast",
+			RecommendedUse:       "nano detector",
+		},
+		{
+			Name:            "disabled_test_model",
+			Family:          "resnet",
+			TaskType:        "image_classification",
+			ModelKind:       "torchvision_classifier",
+			TrainingEnabled: false,
+			RecommendedUse:  "should not be exposed",
+		},
+	}
+
+	snapshot := BuildPlannerContextSnapshot(input)
+	if len(snapshot.ModelCatalog) != 2 {
+		t.Fatalf("expected only training-enabled model catalog entries, got %#v", snapshot.ModelCatalog)
+	}
+	blob, err := json.Marshal(snapshot.ModelCatalog)
+	if err != nil {
+		t.Fatalf("marshal compact model catalog: %v", err)
+	}
+	text := string(blob)
+	for _, forbidden := range []string{"recommended_use", "supports_fine_tune_modes", "deployment_tier", "min_recommended_images", "expected_latency_class", "pretrained_weights", "training_enabled", "model_kind", "family", "quality_tier"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("expected compact catalog to omit %q: %s", forbidden, text)
+		}
+	}
+	if !snapshot.ModelCatalog[0].Default || !snapshot.ModelCatalog[1].Default {
+		t.Fatalf("expected task defaults to be marked in compact catalog, got %#v", snapshot.ModelCatalog)
+	}
+	taskTypes := []string{snapshot.ModelCatalog[0].TaskType, snapshot.ModelCatalog[1].TaskType}
+	if !containsStringFold(taskTypes, "image_classification") || !containsStringFold(taskTypes, "object_detection") {
+		t.Fatalf("expected explicit task separation in compact catalog, got %#v", snapshot.ModelCatalog)
+	}
+	if snapshot.ModelCatalog[0].TaskType == snapshot.ModelCatalog[1].TaskType && snapshot.ModelCatalog[0].ID == snapshot.ModelCatalog[1].ID {
+		t.Fatalf("expected distinct compact catalog entries: %#v", snapshot.ModelCatalog)
+	}
+	for _, card := range snapshot.ModelCatalog {
+		if card.ID == "disabled_test_model" {
+			t.Fatalf("did not expect disabled model in compact catalog: %#v", snapshot.ModelCatalog)
+		}
+		if len(card.EligibilityNotes) == 0 {
+			t.Fatalf("expected eligibility notes on compact catalog entry: %#v", card)
+		}
+		if strings.Contains(strings.Join(card.EligibilityNotes, ","), "transfer_enabled") || strings.Contains(strings.Join(card.EligibilityNotes, ","), "YOLO evidence required") {
+			t.Fatalf("expected compact eligibility notes, got %#v", card.EligibilityNotes)
+		}
 	}
 }
 
@@ -1412,6 +1941,8 @@ func TestComputeProjectTrajectoryDiagnosisPrefersStoredMechanismMetadata(t *test
 }
 
 func TestExperimentPlannerRejectsExploreWithoutTwoFamilies(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	recommendation := validExperimentPlannerRecommendationForMode("explore")
 	recommendation.ProposedExperiments = []plans.PlannedExperiment{
 		{
@@ -1480,6 +2011,8 @@ func TestExperimentPlannerClassImbalanceModeAllowsControlExperiment(t *testing.T
 }
 
 func TestExperimentPlannerClassImbalanceMechanismRequiresBalancing(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+
 	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
 	recommendation.Hypothesis = "Weighted loss should improve minority recall and macro-F1."
 	recommendation.SuccessCriteria = "Macro-F1 and minority recall improve without a large accuracy drop."
@@ -2144,6 +2677,122 @@ func findInformationToolSpec(values []AgentInformationToolSpec, name string) (Ag
 	return AgentInformationToolSpec{}, false
 }
 
+func plannerRequestStaticPromptForTest(t *testing.T, version string) string {
+	t.Helper()
+	t.Setenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION", version)
+	request := experimentPlannerJSONRequest("test-model", []byte(`{"planner_context_snapshot":{}}`))
+	if len(request.Messages) != 2 {
+		t.Fatalf("expected system and user messages, got %d", len(request.Messages))
+	}
+	user := request.Messages[1].Content
+	if index := strings.LastIndex(user, "Context:\n"); index >= 0 {
+		user = user[:index]
+	}
+	return request.Messages[0].Content + "\n" + user
+}
+
+func plannerSnapshotForVersionTest(t *testing.T, input ExperimentPlannerInput, version string) PlannerContextSnapshot {
+	t.Helper()
+	t.Setenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION", version)
+	context := experimentPlannerPromptContext(input)
+	snapshot, ok := context["planner_context_snapshot"].(PlannerContextSnapshot)
+	if !ok {
+		t.Fatalf("expected planner context snapshot, got %#v", context["planner_context_snapshot"])
+	}
+	return snapshot
+}
+
+func addBulkyPlannerHistoryForV2Test(input *ExperimentPlannerInput) {
+	mechanisms := []string{"architecture_challenge", "class_imbalance", "resolution_crop", "regularization"}
+	input.PriorJobs = nil
+	input.PriorSummaries = nil
+	input.PriorEvaluations = nil
+	for index := 0; index < 30; index++ {
+		jobID := fmt.Sprintf("history_job_%02d", index)
+		planID := fmt.Sprintf("history_plan_%02d", index)
+		model := fmt.Sprintf("efficientnet_b%d", index%4)
+		mechanism := mechanisms[index%len(mechanisms)]
+		input.PriorJobs = append(input.PriorJobs, jobs.ExperimentJob{
+			ID:       jobID,
+			Template: jobs.TemplateTrainExperiment,
+			Status:   jobs.StatusSucceeded,
+			Config: map[string]any{
+				"model":     model,
+				"mechanism": mechanism,
+				"notes":     strings.Repeat("full historical config detail; ", 10),
+			},
+		})
+		input.PriorSummaries = append(input.PriorSummaries, runs.TrainingRunSummary{
+			JobID:            jobID,
+			PlanID:           planID,
+			Model:            model,
+			Status:           jobs.StatusSucceeded,
+			BestMacroF1:      0.60 + float64(index%8)*0.01,
+			BestAccuracy:     0.64 + float64(index%6)*0.01,
+			FinalTrainLoss:   0.34 + float64(index%4)*0.01,
+			FinalValLoss:     0.45 + float64(index%5)*0.02,
+			EpochsCompleted:  8 + index%5,
+			EstimatedCostUSD: 0.8 + float64(index%5)*0.2,
+			RuntimeSeconds:   500 + float64(index*25),
+		})
+		input.PriorEvaluations = append(input.PriorEvaluations, runs.TrainingRunEvaluation{
+			JobID: jobID,
+			ModelProfile: map[string]any{
+				"estimated_latency_ms":         25 + index,
+				"throughput_images_per_second": 30 + index,
+				"parameter_count":              3000000 + index*10000,
+				"model_size_mb":                11.5 + float64(index%5),
+				"deployment_notes":             strings.Repeat("latency and package-size audit detail; ", 10),
+				"runtime_profile":              strings.Repeat("batch timing histogram; ", 10),
+			},
+			HolisticScores: map[string]any{
+				"training_diagnostics": map[string]any{
+					"trend":             "plateau",
+					"loss_gap":          0.12,
+					"diagnostic_notes":  strings.Repeat("epoch-level dynamics and overfit notes; ", 12),
+					"recommended_pivot": strings.Repeat("avoid shallow architecture repeats; ", 8),
+				},
+			},
+		})
+		input.ExistingExperimentSignatures = append(input.ExistingExperimentSignatures,
+			fmt.Sprintf("%s|%s|%s|%s", planID, model, mechanism, strings.Repeat("augmentation=long_signature_component;", 8)))
+	}
+	for index := 0; index < 16; index++ {
+		mechanism := mechanisms[index%len(mechanisms)]
+		input.StrategyScorecards = append(input.StrategyScorecards, PlannerStrategyScorecard{
+			ID:               fmt.Sprintf("scorecard_bulk_%02d", index),
+			DatasetID:        "dataset_1",
+			SourceDecisionID: fmt.Sprintf("decision_bulk_%02d", index),
+			SourcePlanID:     fmt.Sprintf("history_plan_%02d", index),
+			StrategyType:     mechanism,
+			PlanningMode:     mechanism + "_mode",
+			Mechanism:        mechanism,
+			Intervention:     strings.Repeat("bounded intervention detail; ", 8),
+			EvidenceUsed:     []string{strings.Repeat("historical evidence detail; ", 8)},
+			ExpectedEffect:   strings.Repeat("expected effect detail; ", 8),
+			DatasetTraits:    map[string]any{"trait_notes": strings.Repeat("dataset trait detail; ", 8)},
+			ObjectiveProfile: map[string]any{"objective_notes": strings.Repeat("objective detail; ", 8)},
+			ProposedChanges:  map[string]any{"change_notes": strings.Repeat("proposed change detail; ", 8)},
+			Outcome:          ExperimentPlanningOutcomeNoImprovement,
+			Lesson:           strings.Repeat("strategy lesson detail; ", 10),
+			Tags:             []string{mechanism, "bulk_history"},
+		})
+	}
+	for index := 0; index < 12; index++ {
+		input.ModelCatalog = append(input.ModelCatalog, SupportedModelSpec{
+			Name:                 fmt.Sprintf("catalog_model_%02d", index),
+			Family:               fmt.Sprintf("family_%02d", index%6),
+			TaskType:             "image_classification",
+			ModelKind:            "torchvision_classifier",
+			DeploymentTier:       "balanced",
+			DefaultImageSize:     224 + (index%3)*32,
+			TrainingEnabled:      true,
+			ExpectedLatencyClass: "medium",
+			RecommendedUse:       strings.Repeat("detailed model eligibility note; ", 8),
+		})
+	}
+}
+
 func assertStringifiedDraftSchema(t *testing.T, schema map[string]any, propertyName string) {
 	t.Helper()
 	if schema["type"] != "object" || schema["additionalProperties"] != false {
@@ -2212,4 +2861,14 @@ func testExperimentPlannerInput() ExperimentPlannerInput {
 		},
 		MaxExperiments: 3,
 	}
+}
+
+func containsStringFold(values []string, target string) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+	for _, value := range values {
+		if strings.ToLower(strings.TrimSpace(value)) == target {
+			return true
+		}
+	}
+	return false
 }

@@ -40,6 +40,16 @@ func TestConfigFromEnvPrefersGeneralModelOverVisualFallback(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvDefaultsToMiniModel(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_LLM_MODEL", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_MODEL", "")
+
+	config := ConfigFromEnv(true, ProviderOpenAI, "")
+	if config.Model != DefaultModel {
+		t.Fatalf("expected default mini model %q, got %q", DefaultModel, config.Model)
+	}
+}
+
 func TestConfigFromEnvReadsResponsesSettings(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_LLM_API_STYLE", "responses")
 	t.Setenv("MODEL_EXPRESS_LLM_REASONING_EFFORT", "high")
