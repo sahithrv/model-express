@@ -12,6 +12,7 @@ from worker.training.modal_provider import (
     run_modal_dataset_materialization,
     run_modal_dataset_profile,
     run_modal_training,
+    run_modal_training_batch,
 )
 
 
@@ -195,6 +196,256 @@ def test_modal_training_dispatches_detection_jobs_to_yolo_remote(monkeypatch):
 
     assert remote_calls == ["yolo11n.pt"]
     assert client.failures == []
+
+
+def test_modal_training_batch_stub_falls_back_to_single_training_with_metadata(monkeypatch):
+    submitted = []
+
+    def fake_run_modal_training(_client, job: dict):
+        submitted.append(job)
+
+    monkeypatch.setattr(modal_provider, "run_modal_training", fake_run_modal_training)
+
+    client = _FakeClient()
+    jobs = [
+        {
+            "id": "job_1",
+            "project_id": "project_1",
+            "config": {"dataset_id": "dataset_1", "provider": "modal"},
+        },
+        {
+            "id": "job_2",
+            "project_id": "project_1",
+            "config": {"dataset_id": "dataset_1", "provider": "modal"},
+        },
+    ]
+    batch = {
+        "schema_version": "modal_preview_batch.v1",
+        "batch_id": "modal-preview-batch-test",
+        "batch_key": "project_1|plan_1|dataset_1|sha256-a|preview|image_classification",
+        "project_id": "project_1",
+        "plan_id": "plan_1",
+        "dataset_id": "dataset_1",
+        "dataset_cache_key": "sha256-a",
+        "training_tier": "preview",
+        "task_type": "image_classification",
+    }
+
+    run_modal_training_batch(client, jobs, batch)
+
+    assert [job["id"] for job in submitted] == ["job_1", "job_2"]
+    assert submitted[0]["config"]["modal_batch"]["batch_id"] == "modal-preview-batch-test"
+    assert submitted[0]["config"]["modal_batch"]["batch_index"] == 0
+    assert submitted[1]["config"]["modal_batch"]["batch_index"] == 1
+    assert submitted[1]["config"]["modal_batch"]["batch_remote_status"] == "stubbed_single_job_fallback"
+
+
+def test_modal_training_batch_flag_on_remote_unsupported_falls_back(monkeypatch):
+    submitted = []
+    remote_payloads = []
+
+    def remote(payload: dict):
+        remote_payloads.append(payload)
+        return {
+            "schema_version": "modal_preview_batch_result.v1",
+            "status": "unsupported",
+            "runner_status": "remote_batch_shell_unsupported",
+            "job_results": [
+                {"job_id": "job_1", "status": "unsupported"},
+                {"job_id": "job_2", "status": "unsupported"},
+            ],
+        }
+
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_modal_preview_batch = types.SimpleNamespace(remote=remote)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_BATCH_RUNNER", "1")
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setattr(modal_provider, "run_modal_training", lambda _client, job: submitted.append(job))
+
+    client = _FakeClient()
+    jobs = [
+        {
+            "id": "job_1",
+            "project_id": "project_1",
+            "template": "train_experiment",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "plan_id": "plan_1",
+                "training_tier": "preview",
+                "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+            },
+        },
+        {
+            "id": "job_2",
+            "project_id": "project_1",
+            "template": "train_experiment",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "plan_id": "plan_1",
+                "training_tier": "preview",
+                "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+            },
+        },
+    ]
+    batch = {
+        "schema_version": "modal_preview_batch.v1",
+        "batch_id": "modal-preview-batch-test",
+        "batch_key": "project_1|plan_1|dataset_1|sha256-a|preview|image_classification",
+        "project_id": "project_1",
+        "plan_id": "plan_1",
+        "dataset_id": "dataset_1",
+        "dataset_cache_key": "sha256-a",
+        "training_tier": "preview",
+        "task_type": "image_classification",
+    }
+
+    run_modal_training_batch(client, jobs, batch)
+
+    assert len(remote_payloads) == 1
+    assert remote_payloads[0]["batch"]["batch_id"] == "modal-preview-batch-test"
+    assert [job["id"] for job in remote_payloads[0]["jobs"]] == ["job_1", "job_2"]
+    assert remote_payloads[0]["dataset"]["id"] == "dataset_1"
+    assert [job["id"] for job in submitted] == ["job_1", "job_2"]
+    assert submitted[0]["config"]["modal_batch"]["batch_remote_status"] == (
+        "remote_batch_shell_unsupported_single_job_fallback"
+    )
+
+
+def test_modal_training_batch_flag_on_remote_failure_falls_back(monkeypatch):
+    submitted = []
+
+    def remote(_payload: dict):
+        raise RuntimeError("batch shell unavailable")
+
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_modal_preview_batch = types.SimpleNamespace(remote=remote)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_BATCH_RUNNER", "1")
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setattr(modal_provider, "run_modal_training", lambda _client, job: submitted.append(job))
+
+    client = _FakeClient()
+    jobs = [
+        {
+            "id": "job_1",
+            "project_id": "project_1",
+            "template": "train_experiment",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "plan_id": "plan_1",
+                "training_tier": "preview",
+                "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+            },
+        },
+        {
+            "id": "job_2",
+            "project_id": "project_1",
+            "template": "train_experiment",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "plan_id": "plan_1",
+                "training_tier": "preview",
+                "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+            },
+        },
+    ]
+    batch = {
+        "schema_version": "modal_preview_batch.v1",
+        "batch_id": "modal-preview-batch-test",
+        "batch_key": "project_1|plan_1|dataset_1|sha256-a|preview|image_classification",
+        "project_id": "project_1",
+        "plan_id": "plan_1",
+        "dataset_id": "dataset_1",
+        "dataset_cache_key": "sha256-a",
+        "training_tier": "preview",
+        "task_type": "image_classification",
+    }
+
+    run_modal_training_batch(client, jobs, batch)
+
+    assert [job["id"] for job in submitted] == ["job_1", "job_2"]
+    assert submitted[0]["config"]["modal_batch"]["batch_remote_status"] == (
+        "remote_batch_failed_before_completion_single_job_fallback"
+    )
+
+
+def test_modal_training_batch_flag_on_remote_completed_does_not_fallback(monkeypatch):
+    submitted = []
+    remote_payloads = []
+
+    def remote(payload: dict):
+        remote_payloads.append(payload)
+        return {
+            "schema_version": "modal_preview_batch_result.v1",
+            "status": "completed",
+            "runner_status": "classification_batch_completed",
+            "job_results": [
+                {"job_id": "job_1", "status": "succeeded"},
+                {"job_id": "job_2", "status": "succeeded"},
+            ],
+        }
+
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_modal_preview_batch = types.SimpleNamespace(remote=remote)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_BATCH_RUNNER", "1")
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setattr(modal_provider, "run_modal_training", lambda _client, job: submitted.append(job))
+
+    client = _FakeClient()
+    jobs = [
+        {
+            "id": "job_1",
+            "project_id": "project_1",
+            "template": "train_experiment",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "plan_id": "plan_1",
+                "training_tier": "preview",
+                "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+            },
+        },
+        {
+            "id": "job_2",
+            "project_id": "project_1",
+            "template": "train_experiment",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "plan_id": "plan_1",
+                "training_tier": "preview",
+                "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+            },
+        },
+    ]
+    batch = {
+        "schema_version": "modal_preview_batch.v1",
+        "batch_id": "modal-preview-batch-test",
+        "batch_key": "project_1|plan_1|dataset_1|sha256-a|preview|image_classification",
+        "project_id": "project_1",
+        "plan_id": "plan_1",
+        "dataset_id": "dataset_1",
+        "dataset_cache_key": "sha256-a",
+        "training_tier": "preview",
+        "task_type": "image_classification",
+    }
+
+    run_modal_training_batch(client, jobs, batch)
+
+    assert len(remote_payloads) == 1
+    assert submitted == []
 
 
 def test_modal_app_session_enables_modal_output(monkeypatch):

@@ -225,13 +225,15 @@ func trainingMonitorJSONRequest(model string, contextBlob []byte) llm.JSONReques
 			{
 				Role: "system",
 				Content: strings.TrimSpace(`You are the Model Express Training Monitor Agent.
-Evaluate image-classification training runs holistically.
+Evaluate image-classification and object-detection training runs holistically.
 When approved information tools are available, you may ask bounded run-scoped backend questions before finalizing.
 Tool calls are questions only: they cannot propose experiments, create plans, create jobs, create workers, export champions, run inference, or mutate datasets.
 After any information requests, return only final valid JSON.
-Consider validation quality, macro-F1, accuracy, per-class metrics, confusion matrix,
+Consider validation quality, macro-F1, accuracy, YOLO detector metrics (mAP50-95, mAP50, precision, recall, box/cls/DFL losses),
+per-class metrics, confusion matrix,
 train/validation gap, metric stability, plateauing, cost, runtime, inference latency,
 model size, compact optimizer feedback if present, and whether the run should inform future experiments.
+For object detection, treat mAP50 and mAP50-95 as IoU-threshold-based detector quality metrics; do not invent a separate IoU scalar.
 Retrieved run memory, if present, is advisory prior-run context only; it is not scheduling authority.
 This agent evaluates one run only. Do not propose new experiments or plan a follow-up batch.
 Produce signals that the plan-level Experiment Planning Agent can use later.`),
@@ -395,8 +397,8 @@ func trainingMonitorDynamicsCard(input TrainingMonitorInput) map[string]any {
 		return card
 	}
 
-	firstMetric, firstOK := firstMetricValue(metrics, targetMetric, "macro_f1", "accuracy")
-	lastMetric, lastOK := lastMetricValue(metrics, targetMetric, "macro_f1", "accuracy")
+	firstMetric, firstOK := firstMetricValue(metrics, diagnosisMetricFallbackKeys(targetMetric)...)
+	lastMetric, lastOK := lastMetricValue(metrics, diagnosisMetricFallbackKeys(targetMetric)...)
 	if firstOK && lastOK {
 		metricDelta := roundMonitorFloat(lastMetric - firstMetric)
 		card["target_metric_delta"] = metricDelta
@@ -423,6 +425,22 @@ func trainingMonitorDynamicsCard(input TrainingMonitorInput) map[string]any {
 	}
 	if firstVal, lastVal, ok := firstLastMetricValues(metrics, "val_loss", "validation_loss"); ok {
 		card["validation_loss_delta"] = roundMonitorFloat(lastVal - firstVal)
+	}
+	if firstDetectorLoss, lastDetectorLoss, ok := firstLastDetectorLossValues(metrics); ok {
+		card["detector_loss_delta"] = roundMonitorFloat(lastDetectorLoss - firstDetectorLoss)
+		card["final_detector_loss"] = roundMonitorFloat(lastDetectorLoss)
+	}
+	for _, loss := range []struct {
+		cardKey string
+		keys    []string
+	}{
+		{cardKey: "box_loss_delta", keys: []string{"box_loss", "val/box_loss"}},
+		{cardKey: "cls_loss_delta", keys: []string{"cls_loss", "val/cls_loss"}},
+		{cardKey: "dfl_loss_delta", keys: []string{"dfl_loss", "val/dfl_loss"}},
+	} {
+		if first, last, ok := firstLastMetricValues(metrics, loss.keys...); ok {
+			card[loss.cardKey] = roundMonitorFloat(last - first)
+		}
 	}
 	card["diagnostic_summary"] = trainingMonitorDynamicsSummary(card)
 	return card
@@ -515,25 +533,27 @@ func trainingMonitorObjectiveFitCard(input TrainingMonitorInput) map[string]any 
 
 func trainingMonitorTargetMetric(input TrainingMonitorInput) string {
 	if trimmed := strings.TrimSpace(input.Plan.TargetMetric); trimmed != "" {
-		return trimmed
+		return normalizedDiagnosisMetric(trimmed)
 	}
 	if input.Evaluation != nil {
 		if target := stringFromAny(input.Evaluation.ObjectiveProfile["target_metric"]); target != "" {
-			return target
+			return normalizedDiagnosisMetric(target)
 		}
 	}
 	if len(input.ObjectiveContext.MetricPreferences) > 0 {
 		if trimmed := strings.TrimSpace(input.ObjectiveContext.MetricPreferences[0]); trimmed != "" {
-			return trimmed
+			return normalizedDiagnosisMetric(trimmed)
 		}
 	}
 	return "macro_f1"
 }
 
 func trainingMonitorSummaryScore(summary runs.TrainingRunSummary, targetMetric string) float64 {
-	switch strings.ToLower(strings.TrimSpace(targetMetric)) {
+	switch normalizedDiagnosisMetric(targetMetric) {
 	case "accuracy":
 		return summary.BestAccuracy
+	case "map50_95", "map50", "precision", "recall":
+		return summary.BestMacroF1
 	default:
 		return summary.BestMacroF1
 	}
@@ -689,13 +709,32 @@ func recentTrainingMonitorMetrics(metrics []jobs.EpochMetric, targetMetric strin
 	out := make([]map[string]any, 0, len(metrics)-start)
 	for _, metric := range metrics[start:] {
 		row := map[string]any{"epoch": metric.Epoch}
-		if value, ok := metricValue(metric.Metrics, targetMetric, "macro_f1", "accuracy"); ok {
+		if value, ok := metricValue(metric.Metrics, diagnosisMetricFallbackKeys(targetMetric)...); ok {
 			row["target_metric_value"] = value
 		}
 		for _, key := range []string{"macro_f1", "accuracy", "train_loss", "val_loss"} {
 			if value, ok := metricValue(metric.Metrics, key); ok {
 				row[key] = value
 			}
+		}
+		for _, detector := range []struct {
+			key  string
+			keys []string
+		}{
+			{key: "mAP50_95", keys: []string{"mAP50_95", "map50_95", "map"}},
+			{key: "mAP50", keys: []string{"mAP50", "map50"}},
+			{key: "precision", keys: []string{"precision"}},
+			{key: "recall", keys: []string{"recall"}},
+			{key: "box_loss", keys: []string{"box_loss", "val/box_loss"}},
+			{key: "cls_loss", keys: []string{"cls_loss", "val/cls_loss"}},
+			{key: "dfl_loss", keys: []string{"dfl_loss", "val/dfl_loss"}},
+		} {
+			if value, ok := metricValue(metric.Metrics, detector.keys...); ok {
+				row[detector.key] = value
+			}
+		}
+		if detectorLoss, ok := detectorLossValue(metric.Metrics); ok {
+			row["detector_loss"] = detectorLoss
 		}
 		out = append(out, row)
 	}
@@ -724,6 +763,40 @@ func firstLastMetricValues(metrics []jobs.EpochMetric, keys ...string) (float64,
 	first, firstOK := firstMetricValue(metrics, keys...)
 	last, lastOK := lastMetricValue(metrics, keys...)
 	return first, last, firstOK && lastOK
+}
+
+func firstLastDetectorLossValues(metrics []jobs.EpochMetric) (float64, float64, bool) {
+	first, firstOK := firstDetectorLossValue(metrics)
+	last, lastOK := lastDetectorLossValue(metrics)
+	return first, last, firstOK && lastOK
+}
+
+func firstDetectorLossValue(metrics []jobs.EpochMetric) (float64, bool) {
+	for _, metric := range metrics {
+		if value, ok := detectorLossValue(metric.Metrics); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func lastDetectorLossValue(metrics []jobs.EpochMetric) (float64, bool) {
+	for index := len(metrics) - 1; index >= 0; index-- {
+		if value, ok := detectorLossValue(metrics[index].Metrics); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func detectorLossValue(metrics map[string]float64) (float64, bool) {
+	box, boxOK := metricValue(metrics, "box_loss", "val/box_loss")
+	cls, clsOK := metricValue(metrics, "cls_loss", "val/cls_loss")
+	dfl, dflOK := metricValue(metrics, "dfl_loss", "val/dfl_loss")
+	if !boxOK && !clsOK && !dflOK {
+		return 0, false
+	}
+	return box + cls + dfl, true
 }
 
 func metricValue(metrics map[string]float64, keys ...string) (float64, bool) {

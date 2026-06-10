@@ -32,7 +32,7 @@ def main() -> None:
     )
 
     while True:
-        job = client.poll_job(worker_id)
+        job = client.poll_job(worker_id, provider=_poll_provider())
 
         if job is None:
             print("There are no jobs.")
@@ -72,6 +72,13 @@ def main() -> None:
                 traceback=traceback.format_exc(),
             )
             print(f"Job {job['id']} failed: {exc}")
+
+
+def _poll_provider() -> str | None:
+    gpu_type = os.getenv("GPU_TYPE", "").strip().lower().replace("-", "_")
+    if gpu_type.startswith("persistent_gpu") or gpu_type.startswith("persistent_disk"):
+        return "persistent_gpu"
+    return None
 
 
 if __name__ == "__main__":

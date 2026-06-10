@@ -6,6 +6,7 @@ const (
 	WorkerRequirementPending   = "PENDING"
 	WorkerRequirementStarting  = "STARTING"
 	WorkerRequirementActive    = "ACTIVE"
+	WorkerRequirementSatisfied = "SATISFIED"
 	WorkerRequirementFailed    = "FAILED"
 	WorkerRequirementCancelled = "CANCELLED"
 )
@@ -15,6 +16,7 @@ const (
 	DatasetMaterializationCold          = "COLD"
 	DatasetMaterializationMaterializing = "MATERIALIZING"
 	DatasetMaterializationWarm          = "WARM"
+	DatasetMaterializationStagingOnly   = "STAGING_ONLY"
 
 	ColdCachePolicySingleMaterialization = "single_materialization_per_checksum"
 )
@@ -25,11 +27,14 @@ const (
 	EventWorkerScalingUpdated        = "WORKER_SCALING_UPDATED"
 	EventWorkersStarting             = "WORKERS_STARTING"
 	EventWorkersActive               = "WORKERS_ACTIVE"
+	EventDispatcherStatus            = "DISPATCHER_STATUS"
+	EventDispatcherIdleExit          = "DISPATCHER_IDLE_EXIT"
 	EventChampionSelected            = "CHAMPION_SELECTED"
 	EventChampionExportRequested     = "CHAMPION_EXPORT_REQUESTED"
 	EventChampionDemoPrediction      = "CHAMPION_DEMO_PREDICTION"
 	EventChampionFeedbackRecorded    = "CHAMPION_FEEDBACK_RECORDED"
 	EventJobRetryQueued              = "JOB_RETRY_QUEUED"
+	EventCostBudgetBlocked           = "COST_BUDGET_BLOCKED"
 	EventDatasetVisualAnalysisQueued = "DATASET_VISUAL_ANALYSIS_QUEUED"
 	EventDatasetVisualAnalysisResult = "DATASET_VISUAL_ANALYSIS_RESULT"
 	EventExperimentationReopened     = "EXPERIMENTATION_REOPENED"
@@ -63,8 +68,9 @@ type WorkerRequirement struct {
 }
 
 type WorkerRequirementUpdate struct {
-	Status    *string `json:"status"`
-	LastError *string `json:"last_error"`
+	Status                       *string `json:"status"`
+	LastError                    *string `json:"last_error"`
+	DatasetMaterializationStatus *string `json:"dataset_materialization_status"`
 }
 
 type WorkerRequirementPolicy struct {

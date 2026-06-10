@@ -1325,10 +1325,12 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 			epochs_completed,
 			modal_function_call_id,
 			modal_input_id,
+			dataset_materialization,
+			stage_telemetry,
 			created_at,
 			updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		ON CONFLICT (job_id) DO UPDATE SET
 			project_id = EXCLUDED.project_id,
 			plan_id = EXCLUDED.plan_id,
@@ -1346,9 +1348,19 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 			epochs_completed = EXCLUDED.epochs_completed,
 			modal_function_call_id = EXCLUDED.modal_function_call_id,
 			modal_input_id = EXCLUDED.modal_input_id,
+			dataset_materialization = EXCLUDED.dataset_materialization,
+			stage_telemetry = EXCLUDED.stage_telemetry,
 			updated_at = EXCLUDED.updated_at
-		RETURNING job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, created_at, updated_at
+		RETURNING job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
 	`
+	datasetMaterializationJSON, err := json.Marshal(emptyMapIfNil(summary.DatasetMaterialization))
+	if err != nil {
+		return runs.TrainingRunSummary{}, fmt.Errorf("marshal dataset materialization: %w", err)
+	}
+	stageTelemetryJSON, err := json.Marshal(emptyMapIfNil(summary.StageTelemetry))
+	if err != nil {
+		return runs.TrainingRunSummary{}, fmt.Errorf("marshal stage telemetry: %w", err)
+	}
 
 	return scanTrainingRunSummary(s.db.QueryRowContext(
 		context.Background(),
@@ -1370,6 +1382,8 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 		summary.EpochsCompleted,
 		summary.ModalFunctionCallID,
 		summary.ModalInputID,
+		datasetMaterializationJSON,
+		stageTelemetryJSON,
 		summary.CreatedAt,
 		summary.UpdatedAt,
 	))
@@ -1377,7 +1391,7 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 
 func (s *PostgresStore) GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error) {
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
 		FROM training_run_summaries
 		WHERE job_id = $1
 	`
@@ -1391,7 +1405,7 @@ func (s *PostgresStore) ListProjectTrainingRunSummaries(projectID string) ([]run
 	}
 
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
 		FROM training_run_summaries
 		WHERE project_id = $1
 		ORDER BY updated_at DESC
@@ -1925,7 +1939,7 @@ func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions
 
 func (s *PostgresStore) GetAutomationSettings() (settings.AutomationSettings, error) {
 	const query = `
-		SELECT auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, llm_enabled, agent_mode, llm_provider, llm_model, automl_enabled, automl_sampler, updated_at
+		SELECT auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, cost_mode, budget_cap_usd, llm_enabled, agent_mode, llm_provider, llm_model, automl_enabled, automl_sampler, updated_at
 		FROM automation_settings
 		WHERE singleton = true
 	`
@@ -1943,6 +1957,8 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 			max_followup_rounds,
 			default_training_provider,
 			default_gpu_type,
+			cost_mode,
+			budget_cap_usd,
 			llm_enabled,
 			agent_mode,
 			llm_provider,
@@ -1950,7 +1966,7 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 			automl_enabled,
 			automl_sampler
 		)
-		VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (singleton) DO UPDATE SET
 			auto_review_experiments = EXCLUDED.auto_review_experiments,
 			auto_schedule_followups = EXCLUDED.auto_schedule_followups,
@@ -1958,6 +1974,8 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 			max_followup_rounds = EXCLUDED.max_followup_rounds,
 			default_training_provider = EXCLUDED.default_training_provider,
 			default_gpu_type = EXCLUDED.default_gpu_type,
+			cost_mode = EXCLUDED.cost_mode,
+			budget_cap_usd = EXCLUDED.budget_cap_usd,
 			llm_enabled = EXCLUDED.llm_enabled,
 			agent_mode = EXCLUDED.agent_mode,
 			llm_provider = EXCLUDED.llm_provider,
@@ -1965,7 +1983,7 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 			automl_enabled = EXCLUDED.automl_enabled,
 			automl_sampler = EXCLUDED.automl_sampler,
 			updated_at = now()
-		RETURNING auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, llm_enabled, agent_mode, llm_provider, llm_model, automl_enabled, automl_sampler, updated_at
+		RETURNING auto_review_experiments, auto_schedule_followups, auto_execute_plans, max_followup_rounds, default_training_provider, default_gpu_type, cost_mode, budget_cap_usd, llm_enabled, agent_mode, llm_provider, llm_model, automl_enabled, automl_sampler, updated_at
 	`
 
 	return scanAutomationSettings(s.db.QueryRowContext(
@@ -1977,6 +1995,8 @@ func (s *PostgresStore) SaveAutomationSettings(automationSettings settings.Autom
 		automationSettings.MaxFollowUpRounds,
 		automationSettings.DefaultTrainingProvider,
 		automationSettings.DefaultGPUType,
+		automationSettings.CostMode,
+		automationSettings.BudgetCapUSD,
 		automationSettings.LLMEnabled,
 		automationSettings.AgentMode,
 		automationSettings.LLMProvider,
@@ -2002,7 +2022,7 @@ func (s *PostgresStore) UpsertWorkerRequirement(projectID string, planID string,
 	if err == nil {
 		status := existing.Status
 		lastError := existing.LastError
-		if existing.TargetCount != targetCount || status == execution.WorkerRequirementFailed || status == execution.WorkerRequirementCancelled {
+		if existing.TargetCount != targetCount || status == execution.WorkerRequirementSatisfied || status == execution.WorkerRequirementFailed || status == execution.WorkerRequirementCancelled {
 			status = execution.WorkerRequirementPending
 			lastError = ""
 		}
@@ -2105,14 +2125,24 @@ func (s *PostgresStore) UpdateWorkerRequirement(id string, update execution.Work
 	if update.LastError != nil {
 		requirement.LastError = *update.LastError
 	}
+	if update.DatasetMaterializationStatus != nil {
+		requirement.DatasetMaterializationStatus = *update.DatasetMaterializationStatus
+	}
 
 	query := `
 		UPDATE worker_requirements
-		SET status = $1, last_error = $2, updated_at = now()
-		WHERE id = $3
+		SET status = $1, last_error = $2, dataset_materialization_status = $3, updated_at = now()
+		WHERE id = $4
 		RETURNING ` + workerRequirementSelectColumns() + `
 	`
-	return scanWorkerRequirement(s.db.QueryRowContext(context.Background(), query, requirement.Status, requirement.LastError, id))
+	return scanWorkerRequirement(s.db.QueryRowContext(
+		context.Background(),
+		query,
+		requirement.Status,
+		requirement.LastError,
+		requirement.DatasetMaterializationStatus,
+		id,
+	))
 }
 
 func (s *PostgresStore) CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error) {
@@ -4353,6 +4383,8 @@ func scanMetric(row rowScanner) (jobs.EpochMetric, error) {
 
 func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 	var summary runs.TrainingRunSummary
+	var datasetMaterializationJSON []byte
+	var stageTelemetryJSON []byte
 	if err := row.Scan(
 		&summary.JobID,
 		&summary.ProjectID,
@@ -4371,10 +4403,24 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 		&summary.EpochsCompleted,
 		&summary.ModalFunctionCallID,
 		&summary.ModalInputID,
+		&datasetMaterializationJSON,
+		&stageTelemetryJSON,
 		&summary.CreatedAt,
 		&summary.UpdatedAt,
 	); err != nil {
 		return runs.TrainingRunSummary{}, normalizeSQLError(err)
+	}
+	summary.DatasetMaterialization = map[string]any{}
+	if len(datasetMaterializationJSON) > 0 {
+		if err := json.Unmarshal(datasetMaterializationJSON, &summary.DatasetMaterialization); err != nil {
+			return runs.TrainingRunSummary{}, fmt.Errorf("unmarshal dataset materialization: %w", err)
+		}
+	}
+	summary.StageTelemetry = map[string]any{}
+	if len(stageTelemetryJSON) > 0 {
+		if err := json.Unmarshal(stageTelemetryJSON, &summary.StageTelemetry); err != nil {
+			return runs.TrainingRunSummary{}, fmt.Errorf("unmarshal stage telemetry: %w", err)
+		}
 	}
 
 	return summary, nil
@@ -5093,6 +5139,8 @@ func scanAutomationSettings(row rowScanner) (settings.AutomationSettings, error)
 		&automationSettings.MaxFollowUpRounds,
 		&automationSettings.DefaultTrainingProvider,
 		&automationSettings.DefaultGPUType,
+		&automationSettings.CostMode,
+		&automationSettings.BudgetCapUSD,
 		&automationSettings.LLMEnabled,
 		&automationSettings.AgentMode,
 		&automationSettings.LLMProvider,
@@ -5206,16 +5254,18 @@ func newPostgresTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time)
 	}
 
 	return runs.TrainingRunSummary{
-		JobID:     job.ID,
-		ProjectID: job.ProjectID,
-		PlanID:    postgresConfigString(job.Config, "plan_id"),
-		DatasetID: postgresConfigString(job.Config, "dataset_id"),
-		Model:     postgresConfigString(job.Config, "model"),
-		Provider:  provider,
-		GPUType:   postgresConfigString(job.Config, "gpu_type"),
-		Status:    job.Status,
-		CreatedAt: now,
-		UpdatedAt: now,
+		JobID:                  job.ID,
+		ProjectID:              job.ProjectID,
+		PlanID:                 postgresConfigString(job.Config, "plan_id"),
+		DatasetID:              postgresConfigString(job.Config, "dataset_id"),
+		Model:                  postgresConfigString(job.Config, "model"),
+		Provider:               provider,
+		GPUType:                postgresConfigString(job.Config, "gpu_type"),
+		Status:                 job.Status,
+		DatasetMaterialization: map[string]any{},
+		StageTelemetry:         map[string]any{},
+		CreatedAt:              now,
+		UpdatedAt:              now,
 	}
 }
 
@@ -5258,6 +5308,12 @@ func applyPostgresTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, upd
 	}
 	if update.ModalInputID != "" {
 		summary.ModalInputID = update.ModalInputID
+	}
+	if update.DatasetMaterialization != nil {
+		summary.DatasetMaterialization = copyAnyMap(update.DatasetMaterialization)
+	}
+	if update.StageTelemetry != nil {
+		summary.StageTelemetry = copyAnyMap(update.StageTelemetry)
 	}
 
 	summary.UpdatedAt = now

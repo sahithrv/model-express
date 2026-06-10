@@ -260,20 +260,22 @@ type PlannerFailureDiagnosis struct {
 }
 
 type PlannerTrainingDynamicsCard struct {
-	TargetMetric                string   `json:"target_metric"`
-	BestJobID                   string   `json:"best_job_id,omitempty"`
-	BestModel                   string   `json:"best_model,omitempty"`
-	BestMetric                  float64  `json:"best_metric"`
-	FinalMetric                 float64  `json:"final_metric"`
-	FinalTrainLoss              float64  `json:"final_train_loss"`
-	FinalValidationLoss         float64  `json:"final_validation_loss"`
-	TrainValidationLossGap      float64  `json:"train_validation_loss_gap"`
-	MetricSlopeLastNEpochs      float64  `json:"metric_slope_last_n_epochs"`
-	PlateauScore                float64  `json:"plateau_score"`
-	InstabilityScore            float64  `json:"instability_score"`
-	MoreEpochsJustified         bool     `json:"more_epochs_justified"`
-	EarlyStoppingRecommendation string   `json:"early_stopping_recommendation"`
-	Evidence                    []string `json:"evidence"`
+	TargetMetric                string             `json:"target_metric"`
+	BestJobID                   string             `json:"best_job_id,omitempty"`
+	BestModel                   string             `json:"best_model,omitempty"`
+	BestMetric                  float64            `json:"best_metric"`
+	FinalMetric                 float64            `json:"final_metric"`
+	FinalTrainLoss              float64            `json:"final_train_loss"`
+	FinalValidationLoss         float64            `json:"final_validation_loss"`
+	TrainValidationLossGap      float64            `json:"train_validation_loss_gap"`
+	MetricSlopeLastNEpochs      float64            `json:"metric_slope_last_n_epochs"`
+	PlateauScore                float64            `json:"plateau_score"`
+	InstabilityScore            float64            `json:"instability_score"`
+	MoreEpochsJustified         bool               `json:"more_epochs_justified"`
+	EarlyStoppingRecommendation string             `json:"early_stopping_recommendation"`
+	DetectorMetrics             map[string]float64 `json:"detector_metrics,omitempty"`
+	DetectorLossTrend           float64            `json:"detector_loss_trend,omitempty"`
+	Evidence                    []string           `json:"evidence"`
 }
 
 type PlannerClassError struct {
@@ -739,6 +741,8 @@ type CandidateRanking struct {
 	Score               float64                       `json:"score"`
 	ScoreComponents     map[string]float64            `json:"score_components"`
 	RetrievedMemoryHits []CandidateRetrievedMemoryHit `json:"retrieved_memory_hits,omitempty"`
+	PromotionDecision   string                        `json:"promotion_decision,omitempty"`
+	StopReason          string                        `json:"stop_reason,omitempty"`
 	Selected            bool                          `json:"selected"`
 	Rejected            bool                          `json:"rejected"`
 	Reasons             []string                      `json:"reasons"`
@@ -2405,18 +2409,29 @@ func plannerTrainingDynamicsCard(input ExperimentPlannerInput) PlannerTrainingDy
 	} else {
 		card.FinalMetric = card.BestMetric
 	}
+	detectorMetrics := plannerDetectorMetricEvidence(metrics)
+	if len(detectorMetrics) > 0 {
+		card.DetectorMetrics = detectorMetrics
+		if firstDetectorLoss, lastDetectorLoss, ok := firstLastDetectorLossValues(metrics); ok {
+			card.DetectorLossTrend = roundDiagnosis(lastDetectorLoss - firstDetectorLoss)
+		}
+	}
 	card.MoreEpochsJustified = card.MetricSlopeLastNEpochs >= 0.015 && card.PlateauScore < 0.45 && card.InstabilityScore < 0.45
 	if card.MoreEpochsJustified {
 		card.EarlyStoppingRecommendation = "More epochs are defensible only as part of the same mechanism because the recent metric slope is still improving."
 	} else if card.PlateauScore >= 0.55 || card.InstabilityScore >= 0.55 {
 		card.EarlyStoppingRecommendation = "Do not propose more epochs alone; plateau or instability requires a mechanism change and early stopping."
 	}
-	card.Evidence = cappedStrings([]string{
+	evidence := []string{
 		fmt.Sprintf("best %s %.3f from %s", targetMetric, card.BestMetric, card.BestJobID),
 		fmt.Sprintf("final train/validation loss gap %.3f", card.TrainValidationLossGap),
 		fmt.Sprintf("last-3-epoch %s slope %.3f", targetMetric, card.MetricSlopeLastNEpochs),
 		fmt.Sprintf("plateau %.2f instability %.2f", card.PlateauScore, card.InstabilityScore),
-	}, 6)
+	}
+	if len(detectorMetrics) > 0 {
+		evidence = append(evidence, plannerDetectorEvidenceStrings(detectorMetrics, card.DetectorLossTrend)...)
+	}
+	card.Evidence = cappedStrings(evidence, 8)
 	return card
 }
 
@@ -3729,6 +3744,55 @@ func metricSlopeLastN(values []float64, n int) float64 {
 		start = 0
 	}
 	return values[len(values)-1] - values[start]
+}
+
+func plannerDetectorMetricEvidence(metrics []jobs.EpochMetric) map[string]float64 {
+	if len(metrics) == 0 {
+		return nil
+	}
+	out := map[string]float64{}
+	for _, detector := range []struct {
+		key  string
+		keys []string
+	}{
+		{key: "final_mAP50_95", keys: []string{"mAP50_95", "map50_95", "map"}},
+		{key: "final_mAP50", keys: []string{"mAP50", "map50"}},
+		{key: "final_precision", keys: []string{"precision"}},
+		{key: "final_recall", keys: []string{"recall"}},
+		{key: "final_box_loss", keys: []string{"box_loss", "val/box_loss"}},
+		{key: "final_cls_loss", keys: []string{"cls_loss", "val/cls_loss"}},
+		{key: "final_dfl_loss", keys: []string{"dfl_loss", "val/dfl_loss"}},
+	} {
+		if value, ok := lastMetricValue(sortedTrainingMonitorMetrics(metrics), detector.keys...); ok {
+			out[detector.key] = roundDiagnosis(value)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func plannerDetectorEvidenceStrings(metrics map[string]float64, detectorLossTrend float64) []string {
+	evidence := []string{}
+	if value, ok := metrics["final_mAP50_95"]; ok {
+		evidence = append(evidence, fmt.Sprintf("final mAP50-95 %.3f", value))
+	}
+	if value, ok := metrics["final_mAP50"]; ok {
+		evidence = append(evidence, fmt.Sprintf("final mAP50 %.3f", value))
+	}
+	if recall, ok := metrics["final_recall"]; ok {
+		evidence = append(evidence, fmt.Sprintf("final detector recall %.3f", recall))
+	}
+	if box, ok := metrics["final_box_loss"]; ok {
+		cls := metrics["final_cls_loss"]
+		dfl := metrics["final_dfl_loss"]
+		evidence = append(evidence, fmt.Sprintf("final detector losses box %.3f cls %.3f dfl %.3f", box, cls, dfl))
+	}
+	if detectorLossTrend != 0 {
+		evidence = append(evidence, fmt.Sprintf("detector loss trend %.3f", detectorLossTrend))
+	}
+	return evidence
 }
 
 func bestEvaluationForPlanner(input ExperimentPlannerInput) (runs.TrainingRunEvaluation, runs.TrainingRunSummary, bool) {

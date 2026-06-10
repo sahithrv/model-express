@@ -149,6 +149,38 @@ def test_list_project_worker_requirements_gets_project_requirements(monkeypatch)
     ]
 
 
+def test_report_dispatcher_event_posts_project_dispatcher_event(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, *, json: dict | None = None, timeout: int | None = None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setenv("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", "240")
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    client.report_dispatcher_event(
+        "project_1",
+        "DISPATCHER_IDLE_EXIT",
+        message="idle exit",
+        payload={"slot_count": 0, "idle_seconds": 30.0},
+    )
+
+    assert calls == [
+        {
+            "url": "http://orchestrator.test/projects/project_1/dispatcher-events",
+            "json": {
+                "event_type": "DISPATCHER_IDLE_EXIT",
+                "message": "idle exit",
+                "plan_id": "",
+                "payload": {"slot_count": 0, "idle_seconds": 30.0},
+            },
+            "timeout": 240,
+        }
+    ]
+
+
 def test_import_dataset_metadata_old_backend_fallback(monkeypatch):
     calls = []
 

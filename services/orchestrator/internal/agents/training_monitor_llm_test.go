@@ -278,6 +278,52 @@ func TestTrainingMonitorPromptContextUsesCompactRunEvaluationCards(t *testing.T)
 	}
 }
 
+func TestTrainingMonitorPromptContextIncludesYoloRecentEpochMetrics(t *testing.T) {
+	input := testTrainingMonitorInput()
+	input.Plan.TargetMetric = "mAP50_95"
+	input.Summary.BestMacroF1 = 0.51
+	input.Metrics = nil
+	for epoch := 1; epoch <= 6; epoch++ {
+		input.Metrics = append(input.Metrics, jobs.EpochMetric{
+			JobID: "job_1",
+			Epoch: epoch,
+			Metrics: map[string]float64{
+				"mAP50_95":  0.30 + float64(epoch)*0.035,
+				"mAP50":     0.42 + float64(epoch)*0.040,
+				"precision": 0.50 + float64(epoch)*0.020,
+				"recall":    0.45 + float64(epoch)*0.025,
+				"box_loss":  0.90 - float64(epoch)*0.060,
+				"cls_loss":  0.70 - float64(epoch)*0.050,
+				"dfl_loss":  0.50 - float64(epoch)*0.030,
+			},
+		})
+	}
+
+	context := trainingMonitorPromptContext(input)
+	summary := requirePromptMap(t, context, "run_summary_card")
+	if summary["target_metric"] != "map50_95" {
+		t.Fatalf("expected normalized detector target metric, got %#v", summary["target_metric"])
+	}
+	if summary["target_score"] != 0.51 {
+		t.Fatalf("expected mAP summary alias to use BestMacroF1, got %#v", summary["target_score"])
+	}
+
+	dynamics := requirePromptMap(t, context, "training_dynamics_card")
+	recentEpochs, ok := dynamics["recent_epochs"].([]map[string]any)
+	if !ok || len(recentEpochs) == 0 {
+		t.Fatalf("expected recent detector epochs, got %#v", dynamics["recent_epochs"])
+	}
+	last := recentEpochs[len(recentEpochs)-1]
+	for _, key := range []string{"mAP50_95", "mAP50", "precision", "recall", "box_loss", "cls_loss", "dfl_loss", "detector_loss"} {
+		if _, ok := last[key]; !ok {
+			t.Fatalf("expected detector key %s in recent epoch row, got %#v", key, last)
+		}
+	}
+	if _, ok := dynamics["detector_loss_delta"]; !ok {
+		t.Fatalf("expected detector loss trend in dynamics card, got %#v", dynamics)
+	}
+}
+
 func TestTrainingMonitorPromptContextIncludesRetrievedRunMemory(t *testing.T) {
 	input := testTrainingMonitorInput()
 	input.RetrievedRunMemory = []memory.MemoryRetrievalResult{

@@ -17,6 +17,7 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
         return
 
     model = str(config.get("model", "unknown_model"))
+    provider = str(config.get("provider") or "local")
     epochs = _positive_int(config.get("epochs"), default=3)
     learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
     batch_size = _positive_int(config.get("batch_size"), default=16)
@@ -147,7 +148,7 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
             job_id,
             {
                 "model": model,
-                "provider": "local",
+                "provider": provider,
                 "gpu_type": str(config.get("gpu_type", "local")),
                 "status": "RUNNING",
                 "runtime_seconds": round(time.time() - started_at, 3),
@@ -157,6 +158,7 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
                 "final_train_loss": train_loss,
                 "final_val_loss": val_loss,
                 "epochs_completed": epoch,
+                **_summary_metadata(config),
             },
         )
         print(f"Reported training epoch {epoch}/{epochs} for {job_id} ({model})")
@@ -166,7 +168,7 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
         job_id,
         {
             "model": model,
-            "provider": "local",
+            "provider": provider,
             "gpu_type": str(config.get("gpu_type", "local")),
             "status": "SUCCEEDED",
             "runtime_seconds": round(time.time() - started_at, 3),
@@ -176,6 +178,7 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
             "final_train_loss": train_loss,
             "final_val_loss": val_loss,
             "epochs_completed": epochs,
+            **_summary_metadata(config),
         },
     )
     client.report_training_run_evaluation(
@@ -196,6 +199,7 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
     job_id = job["id"]
 
     model = str(config.get("model", "yolo11n.pt"))
+    provider = str(config.get("provider") or "local")
     epochs = _positive_int(config.get("epochs"), default=5)
     batch_size = _positive_int(config.get("batch_size"), default=8)
     image_size = _positive_int(config.get("image_size"), default=640)
@@ -250,7 +254,7 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
             job_id,
             {
                 "model": model,
-                "provider": "local",
+                "provider": provider,
                 "gpu_type": str(config.get("gpu_type", "local")),
                 "status": "RUNNING",
                 "runtime_seconds": round(time.time() - started_at, 3),
@@ -260,6 +264,7 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
                 "final_train_loss": round(val_loss * 1.04, 4),
                 "final_val_loss": val_loss,
                 "epochs_completed": epoch,
+                **_summary_metadata(config),
             },
         )
         print(f"Reported detector epoch {epoch}/{epochs} for {job_id} ({model})")
@@ -270,7 +275,7 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
         job_id,
         {
             "model": model,
-            "provider": "local",
+            "provider": provider,
             "gpu_type": str(config.get("gpu_type", "local")),
             "status": "SUCCEEDED",
             "runtime_seconds": runtime_seconds,
@@ -280,6 +285,7 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
             "final_train_loss": round((box_loss + cls_loss + dfl_loss) * 1.04, 4),
             "final_val_loss": round(box_loss + cls_loss + dfl_loss, 4),
             "epochs_completed": epochs,
+            **_summary_metadata(config),
         },
     )
     client.report_training_run_evaluation(
@@ -306,6 +312,17 @@ def _is_detection_training_config(config: dict) -> bool:
         or model.startswith("yolo11")
         or model.startswith("yolo")
     )
+
+
+def _summary_metadata(config: dict) -> dict:
+    out = {}
+    materialization = config.get("dataset_materialization")
+    if isinstance(materialization, dict):
+        out["dataset_materialization"] = materialization
+    stage_telemetry = config.get("stage_telemetry")
+    if isinstance(stage_telemetry, dict):
+        out["stage_telemetry"] = stage_telemetry
+    return out
 
 
 def _model_score(model: str) -> float:

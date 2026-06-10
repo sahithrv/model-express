@@ -95,6 +95,7 @@ def ensure_dataset_materialized(
     extracted_dir = cache_dir / "extracted"
     complete_marker = cache_dir / ".complete"
     manifest_path = cache_dir / "manifest.json"
+    shards_manifest_path = cache_dir / "shards" / "manifest.json"
     if download_fn is None:
         from worker.datasets.storage import download_s3_uri
 
@@ -107,10 +108,12 @@ def ensure_dataset_materialized(
         checksum_sha256=checksum_sha256,
         storage_fingerprint=storage_fingerprint,
     )
+    materialization_started = time.perf_counter()
 
     if _dataset_materialization_complete(extracted_dir, complete_marker):
         telemetry["dataset_materialization_cache_hit"] = True
         telemetry["dataset_materialization_status"] = "hit"
+        telemetry["dataset_materialization_total_seconds"] = round(time.perf_counter() - materialization_started, 6)
         return DatasetMaterializationResult(extracted_dir, telemetry)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -121,12 +124,56 @@ def ensure_dataset_materialized(
         if _dataset_materialization_complete(extracted_dir, complete_marker):
             telemetry["dataset_materialization_cache_hit"] = True
             telemetry["dataset_materialization_status"] = "hit_after_wait"
+            telemetry["dataset_materialization_total_seconds"] = round(time.perf_counter() - materialization_started, 6)
             return DatasetMaterializationResult(extracted_dir, telemetry)
 
         telemetry["dataset_materialization_cache_miss"] = True
         telemetry["dataset_materialization_status"] = "materializing"
+        shards_enabled = _dataset_shards_enabled()
+        telemetry["dataset_materialization_shards_enabled"] = shards_enabled
+        if shards_enabled and shards_manifest_path.is_file():
+            shard_started = time.perf_counter()
+            _reset_incomplete_materialization(extracted_dir, complete_marker, archive_path)
+            staging_dir = cache_dir / f"shard-materializing-{os.getpid()}-{time.time_ns()}"
+            try:
+                from worker.datasets.shards import materialize_shard_artifacts
+
+                shard_manifest = materialize_shard_artifacts(
+                    manifest_path=shards_manifest_path,
+                    output_dir=staging_dir,
+                    dataset_checksum=checksum_sha256,
+                )
+                if extracted_dir.exists():
+                    shutil.rmtree(extracted_dir)
+                staging_dir.replace(extracted_dir)
+                manifest = _materialization_manifest(
+                    dataset_id=dataset_id,
+                    checksum_sha256=checksum_sha256,
+                    storage_uri=storage_uri,
+                    storage_fingerprint=storage_fingerprint,
+                    cache_key=key,
+                    bytes_downloaded=0,
+                    shard_manifest=shard_manifest,
+                )
+                manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+                complete_marker.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+                telemetry.update(_shard_telemetry(shard_manifest))
+                telemetry["dataset_materialization_shard_status"] = "materialized_from_existing_shards"
+                telemetry["dataset_materialization_shard_seconds"] = round(time.perf_counter() - shard_started, 6)
+                telemetry["dataset_materialization_status"] = "materialized_from_shards"
+                telemetry["dataset_materialization_total_seconds"] = round(time.perf_counter() - materialization_started, 6)
+                return DatasetMaterializationResult(extracted_dir, telemetry)
+            finally:
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
         _reset_incomplete_materialization(extracted_dir, complete_marker, archive_path)
+        download_started = time.perf_counter()
         downloaded_path = downloader(storage_uri, archive_path)
+        telemetry["dataset_materialization_download_seconds"] = round(
+            time.perf_counter() - download_started,
+            6,
+        )
         downloaded_path = Path(downloaded_path) if downloaded_path is not None else archive_path
         telemetry["dataset_materialization_bytes_downloaded"] = _path_size(downloaded_path)
 
@@ -142,21 +189,50 @@ def ensure_dataset_materialized(
             6,
         )
 
+        shard_manifest = None
+        if shards_enabled:
+            shard_started = time.perf_counter()
+            from worker.datasets.shards import create_shard_artifacts, materialize_shard_artifacts
+
+            shard_manifest = create_shard_artifacts(
+                dataset_dir=staging_dir,
+                artifact_root=cache_dir / "shards",
+                dataset_checksum=checksum_sha256,
+                cache_key=key,
+                storage_uri=storage_uri,
+            )
+            shard_materialized_dir = cache_dir / f"shard-extracting-{os.getpid()}-{time.time_ns()}"
+            try:
+                materialize_shard_artifacts(
+                    manifest_path=shards_manifest_path,
+                    output_dir=shard_materialized_dir,
+                    dataset_checksum=checksum_sha256,
+                )
+                shutil.rmtree(staging_dir)
+                staging_dir = shard_materialized_dir
+                telemetry.update(_shard_telemetry(shard_manifest))
+                telemetry["dataset_materialization_shard_status"] = "created_and_materialized"
+                telemetry["dataset_materialization_shard_seconds"] = round(time.perf_counter() - shard_started, 6)
+            except Exception:
+                shutil.rmtree(shard_materialized_dir, ignore_errors=True)
+                raise
+
         if extracted_dir.exists():
             shutil.rmtree(extracted_dir)
         staging_dir.replace(extracted_dir)
-        manifest = {
-            "dataset_id": dataset_id,
-            "dataset_checksum": _normalized_checksum(checksum_sha256),
-            "storage_uri": storage_uri,
-            "storage_uri_fingerprint": storage_fingerprint,
-            "cache_key": key,
-            "bytes_downloaded": telemetry["dataset_materialization_bytes_downloaded"],
-            "completed_at_unix": time.time(),
-        }
+        manifest = _materialization_manifest(
+            dataset_id=dataset_id,
+            checksum_sha256=checksum_sha256,
+            storage_uri=storage_uri,
+            storage_fingerprint=storage_fingerprint,
+            cache_key=key,
+            bytes_downloaded=telemetry["dataset_materialization_bytes_downloaded"],
+            shard_manifest=shard_manifest,
+        )
         manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
         complete_marker.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
         telemetry["dataset_materialization_status"] = "materialized"
+        telemetry["dataset_materialization_total_seconds"] = round(time.perf_counter() - materialization_started, 6)
         return DatasetMaterializationResult(extracted_dir, telemetry)
     finally:
         shutil.rmtree(lock_dir, ignore_errors=True)
@@ -238,13 +314,71 @@ def _materialization_telemetry(
         "dataset_materialization_cache_hit": cache_hit,
         "dataset_materialization_cache_miss": False,
         "dataset_materialization_bytes_downloaded": 0,
+        "dataset_materialization_download_seconds": 0.0,
         "dataset_materialization_extract_seconds": 0.0,
         "dataset_materialization_wait_seconds": 0.0,
+        "dataset_materialization_total_seconds": 0.0,
         "dataset_materialization_status": "checking",
+        "dataset_materialization_shards_enabled": False,
+        "dataset_materialization_shard_status": "disabled",
+        "dataset_materialization_shard_count": 0,
+        "dataset_materialization_shard_file_count": 0,
+        "dataset_materialization_shard_seconds": 0.0,
         "dataset_checksum": checksum,
         "storage_uri_fingerprint": storage_fingerprint,
         "dataset_materialization_cache_key": cache_key,
     }
+
+
+def _materialization_manifest(
+    *,
+    dataset_id: str,
+    checksum_sha256: str | None,
+    storage_uri: str,
+    storage_fingerprint: str,
+    cache_key: str,
+    bytes_downloaded: int,
+    shard_manifest: dict | None,
+) -> dict:
+    manifest = {
+        "dataset_id": dataset_id,
+        "dataset_checksum": _normalized_checksum(checksum_sha256),
+        "storage_uri": storage_uri,
+        "storage_uri_fingerprint": storage_fingerprint,
+        "cache_key": cache_key,
+        "bytes_downloaded": bytes_downloaded,
+        "completed_at_unix": time.time(),
+    }
+    if shard_manifest is not None:
+        manifest["shard_artifact"] = {
+            "schema_version": shard_manifest.get("schema_version"),
+            "dataset_checksum": shard_manifest.get("dataset_checksum"),
+            "task_type": shard_manifest.get("task_type"),
+            "shard_format": shard_manifest.get("shard_format"),
+            "file_counts": shard_manifest.get("file_counts"),
+            "split_counts": shard_manifest.get("split_counts"),
+            "class_counts": shard_manifest.get("class_counts"),
+            "object_counts": shard_manifest.get("object_counts"),
+            "shard_count": len(shard_manifest.get("shards") or []),
+        }
+    return manifest
+
+
+def _shard_telemetry(shard_manifest: dict) -> dict:
+    file_counts = shard_manifest.get("file_counts") if isinstance(shard_manifest, dict) else {}
+    return {
+        "dataset_materialization_shard_count": len(shard_manifest.get("shards") or []),
+        "dataset_materialization_shard_file_count": int((file_counts or {}).get("total") or 0),
+    }
+
+
+def _dataset_shards_enabled() -> bool:
+    try:
+        from worker.datasets.shards import dataset_shards_enabled
+
+        return dataset_shards_enabled()
+    except Exception:
+        return False
 
 
 def _reset_incomplete_materialization(

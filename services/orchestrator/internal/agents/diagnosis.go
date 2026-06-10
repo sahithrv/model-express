@@ -938,20 +938,40 @@ func orderedMetricValues(metrics []jobs.EpochMetric, targetMetric string) []floa
 	sort.Slice(ordered, func(i, j int) bool {
 		return ordered[i].Epoch < ordered[j].Epoch
 	})
+	keys := diagnosisMetricFallbackKeys(targetMetric)
 	values := []float64{}
 	for _, metric := range ordered {
-		value, ok := metric.Metrics[targetMetric]
-		if !ok && targetMetric != "macro_f1" {
-			value, ok = metric.Metrics["macro_f1"]
-		}
-		if !ok && targetMetric != "accuracy" {
-			value, ok = metric.Metrics["accuracy"]
-		}
-		if ok {
+		if value, ok := metricValueByKeys(metric.Metrics, keys...); ok {
 			values = append(values, value)
 		}
 	}
 	return values
+}
+
+func diagnosisMetricFallbackKeys(targetMetric string) []string {
+	switch normalizedDiagnosisMetric(targetMetric) {
+	case "map50_95":
+		return []string{"mAP50_95", "map50_95", "map", "mAP50", "map50", "precision", "recall", "macro_f1", "accuracy"}
+	case "map50":
+		return []string{"mAP50", "map50", "mAP50_95", "map50_95", "precision", "recall", "macro_f1", "accuracy"}
+	case "precision":
+		return []string{"precision", "mAP50_95", "map50_95", "mAP50", "map50", "recall", "macro_f1", "accuracy"}
+	case "recall":
+		return []string{"recall", "mAP50_95", "map50_95", "mAP50", "map50", "precision", "macro_f1", "accuracy"}
+	case "accuracy":
+		return []string{"accuracy", "macro_f1"}
+	default:
+		return []string{"macro_f1", "accuracy"}
+	}
+}
+
+func metricValueByKeys(metrics map[string]float64, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		if value, ok := metrics[key]; ok {
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 func diagnosisMinorityFailure(evaluations []runs.TrainingRunEvaluation) (float64, string) {
@@ -1121,10 +1141,20 @@ func diagnosisEvidence(input ExperimentPlannerInput, diagnosis PlannerDiagnosis,
 
 func normalizedDiagnosisMetric(metric string) string {
 	normalized := strings.ToLower(strings.TrimSpace(metric))
-	if normalized == "accuracy" {
+	switch normalized {
+	case "map50_95", "map50-95", "map":
+		return "map50_95"
+	case "map50", "map_50":
+		return "map50"
+	case "precision":
+		return "precision"
+	case "recall":
+		return "recall"
+	case "accuracy":
 		return "accuracy"
+	default:
+		return "macro_f1"
 	}
-	return "macro_f1"
 }
 
 func diagnosisPayloadFloat(payload map[string]any, key string) float64 {

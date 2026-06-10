@@ -23,6 +23,62 @@ class ModalTrainingHelperTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.modal_app = _import_modal_app()
 
+    def _modal_preview_batch_payload(self, *, task_type: str = "image_classification", model: str = "mobilenet_v3_small") -> dict:
+        batch_key = f"project_1|plan_1|dataset_1|sha256-a|preview|{task_type}"
+        return {
+            "batch": {
+                "schema_version": "modal_preview_batch.v1",
+                "batch_id": "modal-preview-batch-test",
+                "batch_key": batch_key,
+                "project_id": "project_1",
+                "plan_id": "plan_1",
+                "dataset_id": "dataset_1",
+                "dataset_cache_key": "sha256-a",
+                "training_tier": "preview",
+                "task_type": task_type,
+            },
+            "jobs": [
+                {
+                    "id": "job_1",
+                    "project_id": "project_1",
+                    "template": "train_experiment",
+                    "config": {
+                        "provider": "modal",
+                        "plan_id": "plan_1",
+                        "dataset_id": "dataset_1",
+                        "training_tier": "preview",
+                        "task_type": task_type,
+                        "model": model,
+                        "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+                    },
+                },
+                {
+                    "id": "job_2",
+                    "project_id": "project_1",
+                    "template": "train_experiment",
+                    "config": {
+                        "provider": "modal",
+                        "plan_id": "plan_1",
+                        "dataset_id": "dataset_1",
+                        "training_tier": "preview",
+                        "task_type": task_type,
+                        "model": model,
+                        "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+                    },
+                },
+            ],
+            "dataset": {
+                "id": "dataset_1",
+                "storage_uri": "s3://bucket/dataset.zip",
+                "checksum_sha256": "a" * 64,
+            },
+            "orchestrator_url": "https://orchestrator.test",
+            "s3_endpoint_url": "https://s3.test",
+            "aws_access_key_id": "key",
+            "aws_secret_access_key": "secret",
+            "aws_default_region": "us-east-1",
+        }
+
     def test_modal_orchestrator_post_uses_longer_report_timeout(self) -> None:
         calls = []
 
@@ -76,6 +132,47 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertIsNone(self.modal_app._modal_training_buffer_containers())
             self.assertIsNone(self.modal_app._modal_training_scaledown_window_seconds())
 
+    def test_modal_cost_sensitive_defaults_reduce_scaledown_window(self) -> None:
+        with patch.dict("os.environ", {"MODEL_EXPRESS_MODAL_COST_SENSITIVE_DEFAULTS": "1"}, clear=True):
+            self.assertEqual(self.modal_app._modal_training_scaledown_window_seconds(), 120)
+            self.assertIsNone(self.modal_app._modal_training_min_containers())
+            self.assertIsNone(self.modal_app._modal_training_buffer_containers())
+
+    def test_modal_stage_telemetry_payload_summarizes_phases(self) -> None:
+        import time
+
+        started_at = time.time() - 10
+        stage_events = []
+        token = self.modal_app._MODAL_STAGE_EVENTS.set(stage_events)
+        try:
+            with patch.dict("os.environ", {"MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY": "1"}, clear=True):
+                self.modal_app._modal_training_phase("job_1", "dataset_local_materialization_start", started_at)
+                self.modal_app._modal_training_phase("job_1", "dataset_local_materialization_done", started_at)
+                self.modal_app._modal_training_phase("job_1", "epoch_train_start", started_at, epoch=1)
+                self.modal_app._modal_training_phase("job_1", "epoch_train_done", started_at, epoch=1)
+                payload = self.modal_app._modal_stage_telemetry_payload(
+                    {"id": "job_1", "created_at": "2026-06-09T00:00:00Z"},
+                    12.0,
+                    stage_events,
+                    {
+                        "dataset_materialization_extract_seconds": 1.2,
+                        "dataset_materialization_wait_seconds": 0.3,
+                        "dataset_materialization_download_seconds": 2.4,
+                    },
+                    "T4",
+                )
+        finally:
+            self.modal_app._MODAL_STAGE_EVENTS.reset(token)
+
+        self.assertEqual(payload["schema_version"], "remote_gpu_stage_telemetry_v1")
+        self.assertEqual(payload["current_stage"], "epoch_train_done")
+        self.assertGreaterEqual(payload["dataset_materialization_seconds"], 0)
+        self.assertGreaterEqual(payload["active_training_seconds"], 0)
+        self.assertEqual(payload["dataset_download_seconds"], 2.4)
+        self.assertEqual(payload["dataset_extract_seconds"], 1.2)
+        self.assertEqual(payload["warm_container_policy"]["scaledown_window_seconds"], 600)
+        self.assertGreaterEqual(len(payload["events"]), 4)
+
     def test_modal_storage_env_sets_torch_home_default(self) -> None:
         payload = {
             "s3_endpoint_url": "https://s3.test",
@@ -120,6 +217,21 @@ class ModalTrainingHelperTests(unittest.TestCase):
             ):
                 self.assertEqual(self.modal_app._modal_training_dataset_cache_root(), Path(temp_dir))
 
+    def test_modal_cache_relationship_marks_default_prewarm_staging_only(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            fields = self.modal_app._modal_dataset_cache_relationship_fields(
+                self.modal_app.DATASET_MATERIALIZATION_ROOT,
+                materialization_scope="modal_dataset_volume",
+            )
+
+        self.assertEqual(fields["dataset_materialization_cache_root"], "/cache/model-express/datasets")
+        self.assertEqual(fields["dataset_materialization_cache_scope"], "modal_dataset_volume")
+        self.assertEqual(fields["dataset_prewarm_cache_root"], "/cache/model-express/datasets")
+        self.assertEqual(fields["dataset_training_cache_root"], "/tmp/model-express/training-datasets")
+        self.assertFalse(fields["dataset_prewarm_root_matches_training_root"])
+        self.assertFalse(fields["dataset_prewarm_reusable_for_training"])
+        self.assertEqual(fields["dataset_prewarm_reuse_status"], "staging_only_root_mismatch")
+
     def test_modal_remote_paths_are_posix_for_image_builds(self) -> None:
         self.assertEqual(str(self.modal_app.TORCH_CACHE_ROOT), "/cache/model-express/torch")
         self.assertEqual(str(self.modal_app.DATASET_MATERIALIZATION_ROOT), "/cache/model-express/datasets")
@@ -132,6 +244,116 @@ class ModalTrainingHelperTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "absolute POSIX path"):
             self.modal_app._modal_remote_path_env("UNSET_MODAL_PATH", "cache/custom")
+
+    def test_yolo_data_config_normalization_rewrites_stale_archive_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "extracted"
+            for split in ("train", "val"):
+                image_dir = dataset_dir / "dataset" / "images" / split
+                image_dir.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (8, 8)).save(image_dir / f"{split}.jpg")
+
+            source_config = dataset_dir / "dataset.yaml"
+            source_config.parent.mkdir(parents=True, exist_ok=True)
+            source_config.write_text(
+                "\n".join(
+                    [
+                        "path: /root/datasets/dataset",
+                        "train: images/train",
+                        "val: images/val",
+                        "nc: 2",
+                        "names: [drone, aircraft]",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            normalized_path = self.modal_app._normalize_yolo_data_config_for_training(
+                dataset_dir,
+                source_config,
+                output_root=Path(temp_dir) / "normalized",
+            )
+            normalized_text = normalized_path.read_text(encoding="utf-8")
+            normalized = self.modal_app._load_yolo_training_config(normalized_path)
+
+            self.assertEqual(normalized["path"], str(dataset_dir.resolve()))
+            self.assertEqual(normalized["train"], str((dataset_dir / "dataset" / "images" / "train").resolve()))
+            self.assertEqual(normalized["val"], str((dataset_dir / "dataset" / "images" / "val").resolve()))
+            self.assertNotIn("/root/datasets", normalized_text)
+
+    def test_yolo_per_class_metrics_uses_ultralytics_class_arrays(self) -> None:
+        box = SimpleNamespace(
+            map=0.42,
+            map50=0.71,
+            mp=0.66,
+            mr=0.58,
+            p=[0.9, 0.4],
+            r=[0.8, 0.3],
+            ap50=[0.95, 0.45],
+            maps=[0.72, 0.33],
+            ap_class_index=[0, 2],
+        )
+        metrics = SimpleNamespace(results_dict={}, box=box, speed={}, names={0: "cat", 1: "bird", 2: "dog"})
+
+        parsed = self.modal_app._yolo_metrics_from_object(metrics, class_names=["cat", "bird", "dog"])
+        per_class = self.modal_app._yolo_per_class_metrics(["cat", "bird", "dog"], parsed)
+
+        self.assertEqual(per_class["cat"]["AP50_95"], 0.72)
+        self.assertEqual(per_class["dog"]["AP50_95"], 0.33)
+        self.assertNotEqual(per_class["cat"]["AP50_95"], per_class["dog"]["AP50_95"])
+        self.assertEqual(per_class["macro avg"]["AP50_95"], 0.525)
+
+    def test_yolo_per_class_metrics_does_not_clone_aggregate_metrics(self) -> None:
+        per_class = self.modal_app._yolo_per_class_metrics(
+            ["cat", "dog"],
+            {"mAP50_95": 0.72, "mAP50": 0.95, "precision": 0.9, "recall": 0.8},
+        )
+
+        self.assertEqual(per_class, {})
+
+    def test_yolo_epoch_metric_posting_skips_previously_posted_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir)
+            results_path = run_root / "train" / "results.csv"
+            results_path.parent.mkdir(parents=True, exist_ok=True)
+            results_path.write_text(
+                "\n".join(
+                    [
+                        "epoch,metrics/mAP50-95(B),metrics/mAP50(B),metrics/precision(B),metrics/recall(B),val/box_loss,val/cls_loss,val/dfl_loss",
+                        "1,0.2,0.4,0.5,0.6,0.7,0.8,0.9",
+                        "2,0.3,0.5,0.6,0.7,0.6,0.7,0.8",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            def fake_post(url: str, payload: dict) -> None:
+                calls.append({"url": url, "payload": payload})
+
+            posted_epochs: set[int] = set()
+            with patch.object(self.modal_app, "_post_json", fake_post):
+                first_count = self.modal_app._post_yolo_epoch_metrics(
+                    "https://orchestrator.test",
+                    "job_1",
+                    run_root,
+                    learning_rate=0.01,
+                    image_size=640,
+                    posted_epochs=posted_epochs,
+                )
+                second_count = self.modal_app._post_yolo_epoch_metrics(
+                    "https://orchestrator.test",
+                    "job_1",
+                    run_root,
+                    learning_rate=0.01,
+                    image_size=640,
+                    posted_epochs=posted_epochs,
+                )
+
+        self.assertEqual(first_count, 2)
+        self.assertEqual(second_count, 0)
+        self.assertEqual(posted_epochs, {1, 2})
+        self.assertEqual(len(calls), 2)
 
     def test_modal_training_failure_report_marks_retryable(self) -> None:
         calls = []
@@ -153,6 +375,230 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
         self.assertTrue(calls[0]["payload"]["retryable"])
         self.assertIn("container exited unexpectedly", calls[0]["payload"]["error"])
+
+    def test_modal_preview_batch_shell_materializes_once_and_runs_classification_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "dataset"
+            dataset_dir.mkdir()
+            materialize_calls = []
+            train_payloads = []
+
+            def fake_materialize(**kwargs):
+                materialize_calls.append(kwargs)
+                return SimpleNamespace(
+                    dataset_dir=dataset_dir,
+                    telemetry={
+                        "dataset_materialization_cache_hit": False,
+                        "dataset_materialization_cache_miss": True,
+                        "dataset_materialization_bytes_downloaded": 123,
+                    },
+                )
+
+            def fake_train(payload: dict) -> dict:
+                train_payloads.append(payload)
+                return {
+                    "job_id": payload["job"]["id"],
+                    "model": "mobilenet_v3_small",
+                    "best_accuracy": 0.8,
+                    "best_macro_f1": 0.7,
+                    "runtime_seconds": 1.2,
+                }
+
+            payload = self._modal_preview_batch_payload()
+            with patch("worker.datasets.cache.ensure_dataset_materialized", fake_materialize):
+                with patch.object(self.modal_app, "_train_image_classifier_impl", fake_train):
+                    result = self.modal_app._train_modal_preview_batch_impl(payload)
+
+        self.assertEqual(len(materialize_calls), 1)
+        self.assertIn("model-express/batches/modal-preview-batch-test", str(materialize_calls[0]["cache_root"]).replace("\\", "/"))
+        self.assertEqual(len(train_payloads), 2)
+        self.assertEqual([payload["job"]["id"] for payload in train_payloads], ["job_1", "job_2"])
+        self.assertTrue(all(payload["_modal_pre_materialized_dataset"]["dataset_dir"] == str(dataset_dir) for payload in train_payloads))
+        self.assertEqual(result["schema_version"], "modal_preview_batch_result.v1")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["runner_status"], "classification_batch_completed")
+        self.assertEqual([job["status"] for job in result["job_results"]], ["succeeded", "succeeded"])
+        self.assertEqual(result["dataset_materialization"]["dataset_materialization_reused_by_jobs"], 2)
+
+    def test_modal_preview_batch_shell_continues_after_classification_job_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "dataset"
+            dataset_dir.mkdir()
+            fail_calls = []
+
+            def fake_materialize(**_kwargs):
+                return SimpleNamespace(dataset_dir=dataset_dir, telemetry={})
+
+            def fake_train(payload: dict) -> dict:
+                if payload["job"]["id"] == "job_1":
+                    raise RuntimeError("first trial failed")
+                return {"job_id": payload["job"]["id"], "model": "mobilenet_v3_small"}
+
+            def fake_post(url: str, payload: dict) -> None:
+                fail_calls.append({"url": url, "payload": payload})
+
+            with patch("worker.datasets.cache.ensure_dataset_materialized", fake_materialize):
+                with patch.object(self.modal_app, "_train_image_classifier_impl", fake_train):
+                    with patch.object(self.modal_app, "_post_json", fake_post):
+                        result = self.modal_app._train_modal_preview_batch_impl(self._modal_preview_batch_payload())
+
+        self.assertEqual([job["status"] for job in result["job_results"]], ["retryable_failure_reported", "succeeded"])
+        self.assertEqual(len(fail_calls), 1)
+        self.assertEqual(fail_calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
+        self.assertTrue(fail_calls[0]["payload"]["retryable"])
+
+    def test_modal_preview_batch_shell_returns_unsupported_for_yolo_until_phase5(self) -> None:
+        payload = self._modal_preview_batch_payload(task_type="object_detection", model="yolo11n.pt")
+
+        result = self.modal_app._train_modal_preview_batch_impl(payload)
+
+        self.assertEqual(result["status"], "unsupported")
+        self.assertEqual(result["runner_status"], "remote_batch_shell_unsupported")
+        self.assertTrue(all(job["status"] == "unsupported" for job in result["job_results"]))
+
+    def test_modal_preview_batch_shell_runs_yolo_jobs_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "dataset"
+            dataset_dir.mkdir()
+            for split in ("train", "val"):
+                image_dir = dataset_dir / "images" / split
+                image_dir.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (8, 8)).save(image_dir / f"{split}.jpg")
+            data_yaml = dataset_dir / "data.yaml"
+            data_yaml.write_text("train: images/train\nval: images/val\nnc: 2\nnames: [cat, dog]\n", encoding="utf-8")
+            materialize_calls = []
+            yolo_payloads = []
+
+            def fake_materialize(**kwargs):
+                materialize_calls.append(kwargs)
+                return SimpleNamespace(
+                    dataset_dir=dataset_dir,
+                    telemetry={"dataset_materialization_cache_miss": True},
+                )
+
+            def fake_prepare(dataset_dir_arg, data_config_path_arg, config, **kwargs):
+                self.assertEqual(dataset_dir_arg, dataset_dir)
+                self.assertEqual(data_config_path_arg.name, "data.yaml")
+                self.assertNotEqual(data_config_path_arg, data_yaml)
+                normalized = self.modal_app._load_yolo_training_config(data_config_path_arg)
+                self.assertEqual(normalized["path"], str(dataset_dir.resolve()))
+                self.assertTrue(kwargs["force_preview"])
+                return data_yaml, {"manifest_id": "preview-subset-test", "seed": 42}
+
+            def fake_yolo_train(payload: dict) -> dict:
+                yolo_payloads.append(payload)
+                return {
+                    "job_id": payload["job"]["id"],
+                    "model": payload["job"]["config"]["model"],
+                    "mAP50_95": 0.3,
+                    "runtime_seconds": 1.0,
+                }
+
+            payload = self._modal_preview_batch_payload(task_type="object_detection", model="yolo11n.pt")
+            payload["jobs"][1]["config"]["model"] = "yolo11s.pt"
+            with patch.dict("os.environ", {"MODEL_EXPRESS_YOLO_BATCH_PREVIEW": "1"}):
+                with patch("worker.datasets.cache.ensure_dataset_materialized", fake_materialize):
+                    with patch.object(self.modal_app, "_prepare_yolo_dataset_tier", fake_prepare):
+                        with patch.object(self.modal_app, "_train_yolo_detector_impl", fake_yolo_train):
+                            result = self.modal_app._train_modal_preview_batch_impl(payload)
+
+        self.assertEqual(len(materialize_calls), 1)
+        self.assertEqual([call["job"]["id"] for call in yolo_payloads], ["job_1", "job_2"])
+        self.assertTrue(
+            all(call["_modal_pre_materialized_dataset"]["yolo_data_config"] == str(data_yaml) for call in yolo_payloads)
+        )
+        self.assertTrue(
+            all(
+                call["_modal_pre_materialized_dataset"]["subset_manifest"]["manifest_id"] == "preview-subset-test"
+                for call in yolo_payloads
+            )
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["runner_status"], "yolo_batch_completed")
+        self.assertEqual([job["status"] for job in result["job_results"]], ["succeeded", "succeeded"])
+        self.assertEqual(result["dataset_materialization"]["subset_manifest"]["manifest_id"], "preview-subset-test")
+
+    def test_modal_preview_batch_shell_continues_after_yolo_job_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "dataset"
+            dataset_dir.mkdir()
+            for split in ("train", "val"):
+                image_dir = dataset_dir / "images" / split
+                image_dir.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (8, 8)).save(image_dir / f"{split}.jpg")
+            data_yaml = dataset_dir / "data.yaml"
+            data_yaml.write_text("train: images/train\nval: images/val\nnc: 2\nnames: [cat, dog]\n", encoding="utf-8")
+            fail_calls = []
+
+            def fake_materialize(**_kwargs):
+                return SimpleNamespace(dataset_dir=dataset_dir, telemetry={})
+
+            def fake_yolo_train(payload: dict) -> dict:
+                if payload["job"]["id"] == "job_1":
+                    raise RuntimeError("first detector failed")
+                return {"job_id": payload["job"]["id"], "model": "yolo11s.pt"}
+
+            def fake_post(url: str, payload: dict) -> None:
+                fail_calls.append({"url": url, "payload": payload})
+
+            payload = self._modal_preview_batch_payload(task_type="object_detection", model="yolo11n.pt")
+            with patch.dict("os.environ", {"MODEL_EXPRESS_YOLO_BATCH_PREVIEW": "1"}):
+                with patch("worker.datasets.cache.ensure_dataset_materialized", fake_materialize):
+                    with patch.object(self.modal_app, "_prepare_yolo_dataset_tier", lambda *_args, **_kwargs: (data_yaml, {})):
+                        with patch.object(self.modal_app, "_train_yolo_detector_impl", fake_yolo_train):
+                            with patch.object(self.modal_app, "_post_json", fake_post):
+                                result = self.modal_app._train_modal_preview_batch_impl(payload)
+
+        self.assertEqual([job["status"] for job in result["job_results"]], ["retryable_failure_reported", "succeeded"])
+        self.assertEqual(len(fail_calls), 1)
+        self.assertEqual(fail_calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
+        self.assertTrue(fail_calls[0]["payload"]["retryable"])
+
+    def test_modal_preview_batch_shell_rejects_mismatched_cache_key(self) -> None:
+        payload = {
+            "batch": {
+                "schema_version": "modal_preview_batch.v1",
+                "batch_id": "modal-preview-batch-test",
+                "batch_key": "project_1|plan_1|dataset_1|sha256-a|preview|image_classification",
+                "project_id": "project_1",
+                "plan_id": "plan_1",
+                "dataset_id": "dataset_1",
+                "dataset_cache_key": "sha256-a",
+                "training_tier": "preview",
+                "task_type": "image_classification",
+            },
+            "jobs": [
+                {
+                    "id": "job_1",
+                    "project_id": "project_1",
+                    "template": "train_experiment",
+                    "config": {
+                        "provider": "modal",
+                        "plan_id": "plan_1",
+                        "dataset_id": "dataset_1",
+                        "training_tier": "preview",
+                        "dataset_materialization": {"dataset_cache_key": "sha256-b"},
+                    },
+                },
+                {
+                    "id": "job_2",
+                    "project_id": "project_1",
+                    "template": "train_experiment",
+                    "config": {
+                        "provider": "modal",
+                        "plan_id": "plan_1",
+                        "dataset_id": "dataset_1",
+                        "training_tier": "preview",
+                        "dataset_materialization": {"dataset_cache_key": "sha256-a"},
+                    },
+                },
+            ],
+            "dataset": {"id": "dataset_1", "storage_uri": "s3://bucket/dataset.zip"},
+            "orchestrator_url": "https://orchestrator.test",
+        }
+
+        with self.assertRaisesRegex(ValueError, "dataset_cache_key does not match"):
+            self.modal_app._train_modal_preview_batch_impl(payload)
 
     def test_upload_manifest_artifacts_uploads_onnx_external_data(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

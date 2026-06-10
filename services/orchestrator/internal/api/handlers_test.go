@@ -38,6 +38,8 @@ func TestAutomationSettingsPersistAndReload(t *testing.T) {
 	maxRounds := 3
 	provider := "modal"
 	gpuType := "T4"
+	costMode := "cheap"
+	budgetCap := 2.5
 	enabled := true
 	updated, err := applyAutomationSettingsUpdate(server.currentAutomationSettings(), settings.AutomationSettingsUpdate{
 		AutoReviewExperiments:   &enabled,
@@ -46,6 +48,8 @@ func TestAutomationSettingsPersistAndReload(t *testing.T) {
 		MaxFollowUpRounds:       &maxRounds,
 		DefaultTrainingProvider: &provider,
 		DefaultGPUType:          &gpuType,
+		CostMode:                &costMode,
+		BudgetCapUSD:            &budgetCap,
 	})
 	if err != nil {
 		t.Fatalf("apply automation settings update: %v", err)
@@ -67,6 +71,294 @@ func TestAutomationSettingsPersistAndReload(t *testing.T) {
 	}
 	if current.DefaultTrainingProvider != provider || current.DefaultGPUType != gpuType {
 		t.Fatalf("expected provider %s/%s, got %s/%s", provider, gpuType, current.DefaultTrainingProvider, current.DefaultGPUType)
+	}
+	if current.CostMode != "prototype" || current.BudgetCapUSD != budgetCap {
+		t.Fatalf("expected cost policy prototype/%.2f, got %#v", budgetCap, current)
+	}
+}
+
+func TestTrainingRunSummaryPersistsRemoteGpuStageTelemetry(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "s3://bucket/dataset.zip", "a", 12)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+		"gpu_type":   "T4",
+		"model":      "mobilenet_v3_small",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	body := strings.NewReader(`{
+		"model":"mobilenet_v3_small",
+		"provider":"modal",
+		"gpu_type":"T4",
+		"status":"SUCCEEDED",
+		"runtime_seconds":42.5,
+		"estimated_cost_usd":0.21,
+		"dataset_materialization":{
+			"dataset_materialization_cache_key":"sha256-abc",
+			"dataset_materialization_cache_miss":true,
+			"dataset_materialization_bytes_downloaded":1234,
+			"dataset_materialization_extract_seconds":1.25
+		},
+		"stage_telemetry":{
+			"schema_version":"remote_gpu_stage_telemetry_v1",
+			"dataset_materialization_seconds":2.5,
+			"active_training_seconds":35.0,
+			"evaluation_seconds":3.0,
+			"export_seconds":1.0,
+			"idle_wait_seconds":1.0
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/jobs/"+job.ID+"/training-run-summary", nil)
+	getResp := httptest.NewRecorder()
+	router.ServeHTTP(getResp, getReq)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("expected get status %d, got %d: %s", http.StatusOK, getResp.Code, getResp.Body.String())
+	}
+	var summary runs.TrainingRunSummary
+	if err := json.Unmarshal(getResp.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if summary.DatasetMaterialization["dataset_materialization_cache_key"] != "sha256-abc" {
+		t.Fatalf("expected materialization telemetry to round trip, got %#v", summary.DatasetMaterialization)
+	}
+	if summary.StageTelemetry["schema_version"] != "remote_gpu_stage_telemetry_v1" {
+		t.Fatalf("expected stage telemetry to round trip, got %#v", summary.StageTelemetry)
+	}
+	if summary.RuntimeSeconds != 42.5 || summary.EstimatedCostUSD != 0.21 {
+		t.Fatalf("legacy summary fields changed unexpectedly: %#v", summary)
+	}
+}
+
+func TestValidationMetricScorePrefersDetectionMetricsForMapTarget(t *testing.T) {
+	summary := runs.TrainingRunSummary{
+		BestMacroF1:  0.94,
+		BestAccuracy: 0.96,
+	}
+	evaluation := runs.TrainingRunEvaluation{
+		ObjectiveProfile: map[string]any{
+			"heldout_test_map50_95":  0.31,
+			"heldout_test_map50":     0.52,
+			"heldout_test_precision": 0.44,
+			"heldout_test_recall":    0.39,
+		},
+	}
+
+	score := validationMetricScore("mAP50_95", summary, evaluation)
+
+	if score >= 0.60 {
+		t.Fatalf("expected score to use explicit detection mAP instead of macro-F1 fallback, got %.3f", score)
+	}
+	if score <= 0.30 {
+		t.Fatalf("expected detection metric blend to include mAP50/precision/recall, got %.3f", score)
+	}
+}
+
+func TestPerClassMetricScoreUsesDetectionAPMetrics(t *testing.T) {
+	score, ok := perClassMetricScore(map[string]any{
+		"cat":       map[string]any{"AP50_95": 0.72, "AP50": 0.91, "precision": 0.82, "recall": 0.74},
+		"dog":       map[string]any{"AP50_95": 0.21, "AP50": 0.45, "precision": 0.40, "recall": 0.30},
+		"macro avg": map[string]any{"AP50_95": 0.465, "AP50": 0.68, "precision": 0.61, "recall": 0.52},
+	})
+
+	if !ok {
+		t.Fatal("expected detection per-class metrics to produce a score")
+	}
+	if score <= 0.20 || score >= 0.60 {
+		t.Fatalf("expected AP-based per-class score in detection range, got %.3f", score)
+	}
+}
+
+func TestReportProjectDispatcherEventPersistsAllowlistedExecutionEvent(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	body := strings.NewReader(`{
+		"event_type":"DISPATCHER_IDLE_EXIT",
+		"message":"Dispatcher saw s3://private-bucket/raw.zip but should not expose it.",
+		"payload":{
+			"slot_count":0,
+			"desired_slot_count":0,
+			"registered_slot_count":2,
+			"active_slot_count":0,
+			"idle_seconds":30.5,
+			"idle_exit_seconds":30,
+			"storage_uri":"s3://private-bucket/raw.zip"
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/dispatcher-events", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+
+	events, err := memoryStore.ListProjectExecutionEvents(project.ID, 10)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != execution.EventDispatcherIdleExit {
+		t.Fatalf("expected dispatcher idle event, got %#v", events)
+	}
+	if events[0].Payload["slot_count"] != float64(0) {
+		t.Fatalf("expected slot count payload, got %#v", events[0].Payload)
+	}
+	if _, ok := events[0].Payload["storage_uri"]; ok {
+		t.Fatalf("dispatcher event payload should be allowlisted, got %#v", events[0].Payload)
+	}
+}
+
+func TestTrainingRunSummaryUpdatesWorkerRequirementMaterializationStatus(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "s3://bucket/dataset.zip", strings.Repeat("d", 64), 12)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	planID := "plan_1"
+	cacheKey := "sha256-" + strings.Repeat("d", 64)
+	if _, _, err := memoryStore.UpsertWorkerRequirement(
+		project.ID,
+		planID,
+		"modal",
+		"modal",
+		1,
+		"test",
+		execution.WorkerRequirementPolicy{
+			DatasetID:                      dataset.ID,
+			DatasetChecksum:                strings.Repeat("d", 64),
+			DatasetCacheKey:                cacheKey,
+			DatasetMaterializationStatus:   execution.DatasetMaterializationCold,
+			ColdCachePolicy:                execution.ColdCachePolicySingleMaterialization,
+			MaxConcurrentJobs:              1,
+			MaxColdDatasetMaterializations: 1,
+		},
+	); err != nil {
+		t.Fatalf("upsert worker requirement: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"plan_id":    planID,
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+		"gpu_type":   "T4",
+		"model":      "mobilenet_v3_small",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	body := strings.NewReader(`{
+		"model":"mobilenet_v3_small",
+		"provider":"modal",
+		"gpu_type":"T4",
+		"status":"SUCCEEDED",
+		"runtime_seconds":42.5,
+		"estimated_cost_usd":0.21,
+		"dataset_materialization":{
+			"dataset_materialization_cache_key":"` + cacheKey + `",
+			"dataset_materialization_status":"materialized",
+			"dataset_materialization_cache_miss":true,
+			"dataset_prewarm_reusable_for_training":false,
+			"dataset_prewarm_reuse_status":"staging_only_root_mismatch"
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+
+	requirements, err := memoryStore.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list worker requirements: %v", err)
+	}
+	if len(requirements) != 1 {
+		t.Fatalf("expected one worker requirement, got %d", len(requirements))
+	}
+	if requirements[0].DatasetMaterializationStatus != execution.DatasetMaterializationStagingOnly {
+		t.Fatalf("expected staging-only requirement status, got %#v", requirements[0])
+	}
+}
+
+func TestUpdateWorkerRequirementMaterializationStatus(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	requirement, _, err := memoryStore.UpsertWorkerRequirement(
+		project.ID,
+		"plan_1",
+		"modal",
+		"modal",
+		1,
+		"test",
+		execution.WorkerRequirementPolicy{DatasetMaterializationStatus: execution.DatasetMaterializationCold},
+	)
+	if err != nil {
+		t.Fatalf("upsert worker requirement: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	body := strings.NewReader(`{"dataset_materialization_status":"MATERIALIZING"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/worker-requirements/"+requirement.ID, body)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var updated execution.WorkerRequirement
+	if err := json.Unmarshal(resp.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode requirement: %v", err)
+	}
+	if updated.DatasetMaterializationStatus != execution.DatasetMaterializationMaterializing {
+		t.Fatalf("expected materializing status, got %#v", updated)
+	}
+	if updated.Status != execution.WorkerRequirementPending {
+		t.Fatalf("worker lifecycle status changed unexpectedly: %#v", updated)
+	}
+
+	invalidReq := httptest.NewRequest(
+		http.MethodPatch,
+		"/worker-requirements/"+requirement.ID,
+		strings.NewReader(`{"dataset_materialization_status":"banana"}`),
+	)
+	invalidReq.Header.Set("Content-Type", "application/json")
+	invalidResp := httptest.NewRecorder()
+	router.ServeHTTP(invalidResp, invalidReq)
+	if invalidResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid status %d, got %d: %s", http.StatusBadRequest, invalidResp.Code, invalidResp.Body.String())
 	}
 }
 
@@ -1415,6 +1707,591 @@ func TestAutomaticExecutionWorkerRequirementScalesToQueuedJobs(t *testing.T) {
 	}
 	if materialization["dataset_cache_key"] != expectedCacheKey || materialization["cold_cache_policy"] != execution.ColdCachePolicySingleMaterialization {
 		t.Fatalf("unexpected dataset materialization config: %#v", materialization)
+	}
+}
+
+func TestExecuteModalPlanAddsPreviewTrainingTierBehindFlag(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MODAL_PREVIEW_TIER_METADATA", "1")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("a", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 2, 10, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 6),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	executionResult, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+
+	if len(executionResult.Jobs) != 2 {
+		t.Fatalf("expected two jobs, got %d", len(executionResult.Jobs))
+	}
+	for _, job := range executionResult.Jobs {
+		if got := configString(job.Config, "training_tier"); got != "preview" {
+			t.Fatalf("expected preview training tier for job %s, got %q in %#v", job.ID, got, job.Config)
+		}
+	}
+}
+
+func TestExecuteModalPlanLeavesTrainingTierUnsetWhenFlagOff(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MODAL_PREVIEW_TIER_METADATA", "0")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("a", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 1, 10, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	executionResult, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+
+	if got := configString(executionResult.Jobs[0].Config, "training_tier"); got != "" {
+		t.Fatalf("expected no training tier when flag is off, got %q", got)
+	}
+}
+
+func TestCostModePolicyConstrainsWorkerRequirementAndJobConfig(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
+
+	tests := []struct {
+		mode                string
+		expectedMode        string
+		expectedConcurrency int
+		expectedJobs        int
+	}{
+		{"prototype", "prototype", 1, 3},
+		{"balanced", "balanced", 2, 4},
+		{"quality", "quality", 4, 4},
+	}
+	for _, tc := range tests {
+		t.Run(tc.mode, func(t *testing.T) {
+			memoryStore := store.NewMemoryStore()
+			server := newServer(memoryStore)
+			current := server.currentAutomationSettings()
+			current.CostMode = tc.mode
+			server.setAutomationSettings(current)
+			project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+			if err != nil {
+				t.Fatalf("create project: %v", err)
+			}
+			dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("a", 64), 0)
+			if err != nil {
+				t.Fatalf("create dataset: %v", err)
+			}
+			plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 4, 10, []plans.PlannedExperiment{
+				testExperiment("mobilenet_v3_small", 6),
+				testExperiment("efficientnet_b0", 6),
+				testExperiment("regnet_y_400mf", 6),
+				testExperiment("convnext_tiny", 6),
+			}, nil, "")
+			if err != nil {
+				t.Fatalf("create plan: %v", err)
+			}
+			result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+			if err != nil {
+				t.Fatalf("execute plan: %v", err)
+			}
+			if len(result.Jobs) != tc.expectedJobs {
+				t.Fatalf("expected %d jobs, got %d cost policy %#v", tc.expectedJobs, len(result.Jobs), result.CostPolicy)
+			}
+			if result.CostPolicy["cost_mode"] != tc.expectedMode || int(result.CostPolicy["max_concurrent_jobs"].(int)) != tc.expectedConcurrency {
+				t.Fatalf("unexpected cost policy: %#v", result.CostPolicy)
+			}
+			if err := server.recordAutomaticExecutionQueued(plan, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"}, result.Jobs); err != nil {
+				t.Fatalf("record automatic execution queued: %v", err)
+			}
+			requirements, err := memoryStore.ListProjectWorkerRequirements(project.ID)
+			if err != nil {
+				t.Fatalf("list requirements: %v", err)
+			}
+			if len(requirements) != 1 || requirements[0].TargetCount != tc.expectedConcurrency || requirements[0].MaxConcurrentJobs != tc.expectedConcurrency {
+				t.Fatalf("expected capped requirement concurrency %d, got %#v", tc.expectedConcurrency, requirements)
+			}
+			if got := configString(result.Jobs[0].Config, "cost_mode"); got != tc.expectedMode {
+				t.Fatalf("expected job cost mode %s, got %q", tc.expectedMode, got)
+			}
+		})
+	}
+}
+
+func TestBudgetCapBlocksQueuedFullTrainClearly(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	current := server.currentAutomationSettings()
+	current.CostMode = "balanced"
+	current.BudgetCapUSD = 1.0
+	server.setAutomationSettings(current)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("b", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	priorJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID, "provider": "modal"})
+	if err != nil {
+		t.Fatalf("create prior job: %v", err)
+	}
+	cost := 1.0
+	if _, err := memoryStore.UpsertTrainingRunSummary(priorJob.ID, runs.TrainingRunSummaryUpdate{EstimatedCostUSD: &cost, Status: jobs.StatusSucceeded}); err != nil {
+		t.Fatalf("seed prior cost: %v", err)
+	}
+	full := testExperiment("efficientnet_b0", 8)
+	full.Strategy = "full_train_promoted_candidate"
+	preview := testExperiment("mobilenet_v3_small", 3)
+	preview.Strategy = "preview"
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 2, 10, []plans.PlannedExperiment{preview, full}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if len(result.Jobs) != 1 {
+		t.Fatalf("expected only preview job under budget cap, got %d jobs", len(result.Jobs))
+	}
+	if got := configString(result.Jobs[0].Config, "training_tier"); got != "preview" {
+		t.Fatalf("expected queued preview job, got tier %q", got)
+	}
+	skipped, ok := result.CostPolicy["skipped"].([]map[string]any)
+	if !ok || len(skipped) != 1 || skipped[0]["reason"] != "budget_cap_reached" {
+		t.Fatalf("expected budget skip payload, got %#v", result.CostPolicy)
+	}
+	events, err := memoryStore.ListProjectExecutionEvents(project.ID, 10)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != execution.EventCostBudgetBlocked {
+		t.Fatalf("expected budget blocked event, got %#v", events)
+	}
+}
+
+func TestBudgetCapSelectsBestAvailableChampionWhenAllQueuedFullTrainIsBlocked(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	current := server.currentAutomationSettings()
+	current.CostMode = "balanced"
+	current.BudgetCapUSD = 1.0
+	server.setAutomationSettings(current)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("d", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	priorJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+		"model":      "mobilenet_v3_small",
+	})
+	if err != nil {
+		t.Fatalf("create prior job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(priorJob.ID, ""); err != nil {
+		t.Fatalf("complete prior job: %v", err)
+	}
+	cost := 1.0
+	score := 0.74
+	if _, err := memoryStore.UpsertTrainingRunSummary(priorJob.ID, runs.TrainingRunSummaryUpdate{
+		Status:           jobs.StatusSucceeded,
+		EstimatedCostUSD: &cost,
+		BestMacroF1:      &score,
+		BestAccuracy:     &score,
+	}); err != nil {
+		t.Fatalf("seed prior summary: %v", err)
+	}
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(priorJob.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri":  "s3://models/prior/model.onnx",
+			"export_status": "ready",
+		},
+	}); err != nil {
+		t.Fatalf("seed prior evaluation: %v", err)
+	}
+	full := testExperiment("efficientnet_b0", 8)
+	full.Strategy = "full_train_promoted_candidate"
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 1, 10, []plans.PlannedExperiment{full}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if len(result.Jobs) != 0 {
+		t.Fatalf("expected no queued jobs under exhausted budget, got %d", len(result.Jobs))
+	}
+	champion, err := memoryStore.GetProjectChampion(project.ID)
+	if err != nil {
+		t.Fatalf("expected budget-stop champion: %v", err)
+	}
+	if champion.JobID != priorJob.ID {
+		t.Fatalf("expected prior job champion %s, got %s", priorJob.ID, champion.JobID)
+	}
+	if champion.SourceDecisionID == "" {
+		t.Fatalf("expected champion source decision")
+	}
+	exports, err := memoryStore.ListProjectChampionExports(project.ID)
+	if err != nil {
+		t.Fatalf("list champion exports: %v", err)
+	}
+	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI == "" {
+		t.Fatalf("expected ready champion export, got %#v", exports)
+	}
+}
+
+func TestCostPolicySkippedFullTrainSelectsChampionAfterAllowedJobsFinish(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	current := server.currentAutomationSettings()
+	current.CostMode = "balanced"
+	current.BudgetCapUSD = 1.0
+	server.setAutomationSettings(current)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("e", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	priorJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID, "provider": "modal", "model": "mobilenet_v3_small"})
+	if err != nil {
+		t.Fatalf("create prior job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(priorJob.ID, ""); err != nil {
+		t.Fatalf("complete prior job: %v", err)
+	}
+	priorCost := 1.0
+	priorScore := 0.60
+	if _, err := memoryStore.UpsertTrainingRunSummary(priorJob.ID, runs.TrainingRunSummaryUpdate{
+		Status:           jobs.StatusSucceeded,
+		EstimatedCostUSD: &priorCost,
+		BestMacroF1:      &priorScore,
+		BestAccuracy:     &priorScore,
+	}); err != nil {
+		t.Fatalf("seed prior summary: %v", err)
+	}
+	preview := testExperiment("mobilenet_v3_small", 3)
+	preview.Strategy = "preview"
+	full := testExperiment("efficientnet_b0", 8)
+	full.Strategy = "full_train_promoted_candidate"
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 2, 10, []plans.PlannedExperiment{preview, full}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if len(result.Jobs) != 1 {
+		t.Fatalf("expected only preview job queued, got %d", len(result.Jobs))
+	}
+	if _, err := memoryStore.GetProjectChampion(project.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected no champion while preview job is still open, got err %v", err)
+	}
+	previewJob := result.Jobs[0]
+	if _, err := memoryStore.CompleteJob(previewJob.ID, ""); err != nil {
+		t.Fatalf("complete preview job: %v", err)
+	}
+	previewScore := 0.82
+	previewCost := 0.20
+	if _, err := memoryStore.UpsertTrainingRunSummary(previewJob.ID, runs.TrainingRunSummaryUpdate{
+		Status:           jobs.StatusSucceeded,
+		EstimatedCostUSD: &previewCost,
+		BestMacroF1:      &previewScore,
+		BestAccuracy:     &previewScore,
+	}); err != nil {
+		t.Fatalf("upsert preview summary: %v", err)
+	}
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(previewJob.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri":  "s3://models/preview/model.onnx",
+			"export_status": "ready",
+		},
+	}); err != nil {
+		t.Fatalf("upsert preview evaluation: %v", err)
+	}
+
+	selected, err := server.selectBestAvailableChampionIfCostStoppedAfterTrainingJob(previewJob)
+	if err != nil {
+		t.Fatalf("select budget-stop champion: %v", err)
+	}
+	if !selected {
+		t.Fatalf("expected budget-stop champion selection after allowed jobs finished")
+	}
+	champion, err := memoryStore.GetProjectChampion(project.ID)
+	if err != nil {
+		t.Fatalf("expected champion: %v", err)
+	}
+	if champion.JobID != previewJob.ID {
+		t.Fatalf("expected preview job champion %s, got %s", previewJob.ID, champion.JobID)
+	}
+	exports, err := memoryStore.ListProjectChampionExports(project.ID)
+	if err != nil {
+		t.Fatalf("list champion exports: %v", err)
+	}
+	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI != "s3://models/preview/model.onnx" {
+		t.Fatalf("expected ready preview export, got %#v", exports)
+	}
+}
+
+func TestPersistentGPUProviderSchedulesOnlyWhenConfigured(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	checksum := strings.Repeat("c", 64)
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", checksum, 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 2, 10, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 6),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	if _, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "persistent_gpu", GPUType: "A10G"}); err == nil {
+		t.Fatal("expected persistent provider to require configuration")
+	}
+
+	t.Setenv("MODEL_EXPRESS_PERSISTENT_GPU_PROVIDER", "1")
+	t.Setenv("MODEL_EXPRESS_PERSISTENT_GPU_CACHE_ROOT", "/mnt/model-express-cache")
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "persistent-disk", GPUType: "A10G"})
+	if err != nil {
+		t.Fatalf("execute persistent plan: %v", err)
+	}
+	if len(result.Jobs) != 2 {
+		t.Fatalf("expected two persistent jobs, got %d", len(result.Jobs))
+	}
+	config := result.Jobs[0].Config
+	if got := configString(config, "provider"); got != "persistent_gpu" {
+		t.Fatalf("expected normalized persistent provider, got %q", got)
+	}
+	materialization := config["dataset_materialization"].(map[string]any)
+	if materialization["dataset_cache_key"] != "sha256-"+checksum || materialization["cold_cache_policy"] != execution.ColdCachePolicySingleMaterialization {
+		t.Fatalf("unexpected materialization policy: %#v", materialization)
+	}
+	persistentConfig := config["persistent_gpu"].(map[string]any)
+	if persistentConfig["cache_root"] != "/mnt/model-express-cache" || persistentConfig["materialization_status"] != execution.DatasetMaterializationCold {
+		t.Fatalf("unexpected persistent config: %#v", persistentConfig)
+	}
+	if err := server.recordAutomaticExecutionQueued(plan, executeExperimentPlanRequest{Provider: "persistent_gpu", GPUType: "A10G"}, result.Jobs); err != nil {
+		t.Fatalf("record automatic execution queued: %v", err)
+	}
+	requirements, err := memoryStore.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list requirements: %v", err)
+	}
+	if len(requirements) != 1 || requirements[0].Provider != "persistent_gpu" || requirements[0].DatasetCacheKey != "sha256-"+checksum {
+		t.Fatalf("expected persistent requirement metadata, got %#v", requirements)
+	}
+}
+
+func TestFullPlanMockedIntegrationCostAwarePersistentProvider(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
+	t.Setenv("MODEL_EXPRESS_PERSISTENT_GPU_PROVIDER", "1")
+	t.Setenv("MODEL_EXPRESS_PERSISTENT_GPU_CACHE_ROOT", "/mnt/model-express-cache")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	current := server.currentAutomationSettings()
+	current.CostMode = "quality"
+	current.BudgetCapUSD = 5
+	current.DefaultTrainingProvider = "persistent_gpu"
+	current.DefaultGPUType = "A10G"
+	server.setAutomationSettings(current)
+
+	project, err := memoryStore.CreateProject("vision project", "cost aware remote training")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	checksum := strings.Repeat("e", 64)
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "s3://bucket/dataset.zip", checksum, 1024)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	preview := testExperiment("mobilenet_v3_small", 3)
+	preview.Strategy = "preview"
+	full := testExperiment("efficientnet_b0", 8)
+	full.Strategy = "full_train_promoted_candidate"
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 4, 12, []plans.PlannedExperiment{preview, full}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, server.defaultExecuteExperimentPlanRequest())
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if len(result.Jobs) != 2 {
+		t.Fatalf("expected preview and full jobs, got %d", len(result.Jobs))
+	}
+	if result.CostPolicy["cost_mode"] != "quality" || result.CostPolicy["max_concurrent_jobs"] != 4 {
+		t.Fatalf("unexpected cost policy payload: %#v", result.CostPolicy)
+	}
+	cacheKey := "sha256-" + checksum
+	for _, job := range result.Jobs {
+		if configString(job.Config, "provider") != "persistent_gpu" {
+			t.Fatalf("expected persistent provider job, got %#v", job.Config)
+		}
+		materialization := job.Config["dataset_materialization"].(map[string]any)
+		if materialization["dataset_cache_key"] != cacheKey {
+			t.Fatalf("expected checksum cache key %s, got %#v", cacheKey, materialization)
+		}
+		persistentConfig := job.Config["persistent_gpu"].(map[string]any)
+		if persistentConfig["cache_root"] != "/mnt/model-express-cache" || persistentConfig["dataset_cache_key"] != cacheKey {
+			t.Fatalf("unexpected persistent config: %#v", persistentConfig)
+		}
+	}
+	if err := server.recordAutomaticExecutionQueued(plan, server.defaultExecuteExperimentPlanRequest(), result.Jobs); err != nil {
+		t.Fatalf("record automatic execution queued: %v", err)
+	}
+	requirements, err := memoryStore.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list requirements: %v", err)
+	}
+	if len(requirements) != 1 || requirements[0].Provider != "persistent_gpu" || requirements[0].MaxConcurrentJobs != 2 {
+		t.Fatalf("expected persistent quality requirement, got %#v", requirements)
+	}
+
+	runtime := 12.0
+	cost := 0.42
+	epochs := 3
+	reported, err := memoryStore.UpsertTrainingRunSummary(result.Jobs[0].ID, runs.TrainingRunSummaryUpdate{
+		Provider:         "persistent_gpu",
+		GPUType:          "A10G",
+		Status:           jobs.StatusSucceeded,
+		RuntimeSeconds:   &runtime,
+		EstimatedCostUSD: &cost,
+		EpochsCompleted:  &epochs,
+		DatasetMaterialization: map[string]any{
+			"dataset_materialization_cache_key":        cacheKey,
+			"dataset_materialization_cache_hit":        false,
+			"dataset_materialization_cache_miss":       true,
+			"dataset_materialization_cache_root":       "/mnt/model-express-cache",
+			"dataset_materialization_cache_scope":      "persistent_disk",
+			"dataset_materialization_total_seconds":    2.5,
+			"dataset_materialization_download_seconds": 1.1,
+			"dataset_materialization_extract_seconds":  1.2,
+		},
+		StageTelemetry: map[string]any{
+			"schema_version":                  "remote_gpu_stage_telemetry_v1",
+			"dataset_materialization_seconds": 2.5,
+			"active_training_seconds":         8.0,
+			"evaluation_seconds":              1.0,
+			"export_seconds":                  0.0,
+			"queue_wait_seconds":              0.5,
+			"idle_wait_seconds":               0.0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("upsert training summary: %v", err)
+	}
+	if reported.Provider != "persistent_gpu" || reported.DatasetMaterialization["dataset_materialization_cache_key"] != cacheKey {
+		t.Fatalf("expected provider/materialization summary, got %#v", reported)
+	}
+	if reported.StageTelemetry["active_training_seconds"] != 8.0 || reported.StageTelemetry["queue_wait_seconds"] != 0.5 {
+		t.Fatalf("expected stage telemetry, got %#v", reported.StageTelemetry)
+	}
+}
+
+func TestTerminalTrainingJobsSatisfyWorkerRequirementWhenPlanHasNoOpenJobs(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	project, err := memoryStore.CreateProject("vision project", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", "abc123", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 2, 10, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 6),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	executionResult, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	requirement, _, err := memoryStore.UpsertWorkerRequirement(project.ID, plan.ID, "modal", "T4", 2, "test", execution.WorkerRequirementPolicy{})
+	if err != nil {
+		t.Fatalf("upsert requirement: %v", err)
+	}
+	active := execution.WorkerRequirementActive
+	if _, err := memoryStore.UpdateWorkerRequirement(requirement.ID, execution.WorkerRequirementUpdate{Status: &active}); err != nil {
+		t.Fatalf("mark requirement active: %v", err)
+	}
+
+	if _, err := memoryStore.CompleteJob(executionResult.Jobs[0].ID, ""); err != nil {
+		t.Fatalf("complete first job: %v", err)
+	}
+	server.updateWorkerRequirementDemandAfterTerminalJob(executionResult.Jobs[0])
+	requirements, err := memoryStore.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list requirements after first completion: %v", err)
+	}
+	if requirements[0].Status != execution.WorkerRequirementActive {
+		t.Fatalf("expected requirement to remain active while second job is open, got %s", requirements[0].Status)
+	}
+
+	if _, err := memoryStore.CompleteJob(executionResult.Jobs[1].ID, ""); err != nil {
+		t.Fatalf("complete second job: %v", err)
+	}
+	server.updateWorkerRequirementDemandAfterTerminalJob(executionResult.Jobs[1])
+	requirements, err = memoryStore.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list requirements after second completion: %v", err)
+	}
+	if requirements[0].Status != execution.WorkerRequirementSatisfied {
+		t.Fatalf("expected satisfied requirement after all jobs terminal, got %s", requirements[0].Status)
 	}
 }
 

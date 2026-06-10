@@ -1203,7 +1203,7 @@ func (s *MemoryStore) UpsertWorkerRequirement(projectID string, planID string, p
 			requirement.TargetCount = targetCount
 			requirement.Source = source
 			applyWorkerRequirementPolicy(&requirement, policy)
-			if targetChanged || requirement.Status == execution.WorkerRequirementFailed || requirement.Status == execution.WorkerRequirementCancelled {
+			if targetChanged || requirement.Status == execution.WorkerRequirementSatisfied || requirement.Status == execution.WorkerRequirementFailed || requirement.Status == execution.WorkerRequirementCancelled {
 				requirement.Status = execution.WorkerRequirementPending
 				requirement.LastError = ""
 			}
@@ -1273,6 +1273,9 @@ func (s *MemoryStore) UpdateWorkerRequirement(id string, update execution.Worker
 	}
 	if update.LastError != nil {
 		requirement.LastError = *update.LastError
+	}
+	if update.DatasetMaterializationStatus != nil {
+		requirement.DatasetMaterializationStatus = *update.DatasetMaterializationStatus
 	}
 	requirement.UpdatedAt = time.Now().UTC()
 	s.workerRequirements[id] = requirement
@@ -2418,16 +2421,18 @@ func newTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.Tr
 	}
 
 	return runs.TrainingRunSummary{
-		JobID:     job.ID,
-		ProjectID: job.ProjectID,
-		PlanID:    memoryConfigString(job.Config, "plan_id"),
-		DatasetID: memoryConfigString(job.Config, "dataset_id"),
-		Model:     memoryConfigString(job.Config, "model"),
-		Provider:  provider,
-		GPUType:   memoryConfigString(job.Config, "gpu_type"),
-		Status:    job.Status,
-		CreatedAt: now,
-		UpdatedAt: now,
+		JobID:                  job.ID,
+		ProjectID:              job.ProjectID,
+		PlanID:                 memoryConfigString(job.Config, "plan_id"),
+		DatasetID:              memoryConfigString(job.Config, "dataset_id"),
+		Model:                  memoryConfigString(job.Config, "model"),
+		Provider:               provider,
+		GPUType:                memoryConfigString(job.Config, "gpu_type"),
+		Status:                 job.Status,
+		DatasetMaterialization: map[string]any{},
+		StageTelemetry:         map[string]any{},
+		CreatedAt:              now,
+		UpdatedAt:              now,
 	}
 }
 
@@ -2470,6 +2475,12 @@ func applyTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, update runs
 	}
 	if update.ModalInputID != "" {
 		summary.ModalInputID = update.ModalInputID
+	}
+	if update.DatasetMaterialization != nil {
+		summary.DatasetMaterialization = copyAnyMap(update.DatasetMaterialization)
+	}
+	if update.StageTelemetry != nil {
+		summary.StageTelemetry = copyAnyMap(update.StageTelemetry)
 	}
 
 	summary.UpdatedAt = now

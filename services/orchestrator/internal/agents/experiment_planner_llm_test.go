@@ -854,6 +854,56 @@ func TestExperimentPlannerPromptContextIncludesDatasetAndStrategyMemory(t *testi
 	}
 }
 
+func TestPlannerTrainingDynamicsCardUsesYoloMAPEpochSlope(t *testing.T) {
+	input := testExperimentPlannerInput()
+	input.SourcePlan.TargetMetric = "mAP50_95"
+	input.PlanSummaries = []runs.TrainingRunSummary{
+		{
+			JobID:        "job_yolo",
+			PlanID:       "plan_1",
+			Model:        "yolov8n.pt",
+			Status:       jobs.StatusSucceeded,
+			BestMacroF1:  0.44,
+			BestAccuracy: 0.55,
+		},
+	}
+	input.PlanMetrics = map[string][]jobs.EpochMetric{
+		"job_yolo": {
+			{JobID: "job_yolo", Epoch: 1, Metrics: map[string]float64{"mAP50_95": 0.20, "macro_f1": 0.90}},
+			{JobID: "job_yolo", Epoch: 2, Metrics: map[string]float64{"mAP50_95": 0.30, "macro_f1": 0.91}},
+			{JobID: "job_yolo", Epoch: 3, Metrics: map[string]float64{"mAP50_95": 0.36, "macro_f1": 0.92}},
+			{JobID: "job_yolo", Epoch: 4, Metrics: map[string]float64{
+				"mAP50_95":  0.44,
+				"mAP50":     0.55,
+				"precision": 0.61,
+				"recall":    0.58,
+				"box_loss":  0.31,
+				"cls_loss":  0.22,
+				"dfl_loss":  0.18,
+				"macro_f1":  0.99,
+			}},
+		},
+	}
+
+	card := plannerTrainingDynamicsCard(input)
+	if card.TargetMetric != "map50_95" {
+		t.Fatalf("expected detector target metric to be preserved, got %#v", card)
+	}
+	if card.FinalMetric != 0.44 {
+		t.Fatalf("expected final metric from mAP50_95 rows, got %#v", card)
+	}
+	if card.MetricSlopeLastNEpochs != 0.14 {
+		t.Fatalf("expected last-3 slope from mAP50_95 rows, got %#v", card)
+	}
+	if card.DetectorMetrics["final_mAP50_95"] != 0.44 || card.DetectorMetrics["final_recall"] != 0.58 {
+		t.Fatalf("expected compact detector evidence, got %#v", card.DetectorMetrics)
+	}
+	joinedEvidence := strings.Join(card.Evidence, " ")
+	if !strings.Contains(joinedEvidence, "mAP50") || strings.Contains(joinedEvidence, "macro-F1") {
+		t.Fatalf("expected detector evidence wording, got %#v", card.Evidence)
+	}
+}
+
 func TestExperimentPlannerPromptContextIncludesRetrievedMemoryCards(t *testing.T) {
 	input := testExperimentPlannerInput()
 	input.RetrievedMemory = []memory.MemoryRetrievalResult{
@@ -2457,6 +2507,90 @@ func TestCandidateRankingUnrelatedRetrievedMemoryDoesNotOverrideStructuredMismat
 	}
 	if ranking.Score != baseline.Score {
 		t.Fatalf("expected unrelated memory not to change score, baseline=%#v retrieved=%#v", baseline, ranking)
+	}
+}
+
+func TestMultiFidelityPolicyDoesNotLetWeakYOLO11nBlockLargerYOLORescue(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MULTI_FIDELITY_POLICY", "1")
+	input := testExperimentPlannerInput()
+	input.DeterministicDiagnosis.UnderfittingScore = 0.72
+	input.RejectedStrategyMemory = []RejectedPlannerOption{{
+		Option:      "YOLO11n champion",
+		Reason:      "weak YOLO11n preview underperformed",
+		Evidence:    "yolo11n recall was near zero on the preview subset",
+		AppliesWhen: []string{"architecture_challenge"},
+	}}
+	candidate := CandidateHypothesis{
+		Hypothesis:           "A larger YOLO detector may have enough capacity.",
+		PlanningMode:         "champion_challenge",
+		Mechanism:            "architecture_challenge",
+		Intervention:         "Compare YOLO11s against the weak YOLO11n preview baseline.",
+		ExpectedEffect:       "Improve recall and mAP while staying in the YOLO family.",
+		ExpectedMetricImpact: 0.03,
+		Risk:                 "medium",
+		CostLevel:            "medium",
+		NoveltyScore:         0.6,
+		EvidenceUsed:         []string{"weak YOLO11n preview should not block larger YOLO variants"},
+		ExperimentConfig: plans.PlannedExperiment{
+			Template:     "yolo11_detection",
+			Model:        "yolo11s.pt",
+			Epochs:       8,
+			BatchSize:    8,
+			LearningRate: 0.001,
+			ImageSize:    512,
+			Reason:       "Challenge the weak nano detector with a small YOLO model.",
+			Mechanism:    "architecture_challenge",
+		},
+	}
+
+	ranking := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+
+	if ranking.Rejected {
+		t.Fatalf("expected YOLO11s rescue candidate not to be rejected, got %#v", ranking)
+	}
+	if ranking.PromotionDecision != "rescue" {
+		t.Fatalf("expected rescue decision, got %#v", ranking)
+	}
+	if !strings.Contains(strings.Join(ranking.Reasons, " "), "rescued by multi-fidelity policy") {
+		t.Fatalf("expected weak-baseline rescue reason, got %#v", ranking.Reasons)
+	}
+}
+
+func TestMultiFidelityPolicyBudgetStopRejectsHighCostCandidate(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_MULTI_FIDELITY_POLICY", "1")
+	input := testExperimentPlannerInput()
+	input.DeterministicDiagnosis.UnderfittingScore = 0.8
+	input.StopSignals = []string{"budget cap exceeded for new full training"}
+	candidate := CandidateHypothesis{
+		Hypothesis:           "An expensive model might improve quality.",
+		PlanningMode:         "champion_challenge",
+		Mechanism:            "architecture_challenge",
+		Intervention:         "Try an expensive high-capacity challenger.",
+		ExpectedEffect:       "Maybe improve the champion.",
+		ExpectedMetricImpact: 0.04,
+		Risk:                 "medium",
+		CostLevel:            "high",
+		NoveltyScore:         0.7,
+		EvidenceUsed:         []string{"quality target remains unmet"},
+		ExperimentConfig: plans.PlannedExperiment{
+			Template:     "convnext_transfer",
+			Model:        "convnext_tiny",
+			Epochs:       30,
+			BatchSize:    8,
+			LearningRate: 0.0002,
+			ImageSize:    384,
+			Reason:       "Try a high-cost challenger.",
+			Mechanism:    "architecture_challenge",
+		},
+	}
+
+	ranking := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
+
+	if !ranking.Rejected {
+		t.Fatalf("expected budget policy to reject high-cost candidate, got %#v", ranking)
+	}
+	if ranking.PromotionDecision != "reject" || !strings.Contains(ranking.StopReason, "budget stop signal") {
+		t.Fatalf("expected budget stop reason, got %#v", ranking)
 	}
 }
 

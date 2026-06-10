@@ -273,6 +273,8 @@ CREATE TABLE IF NOT EXISTS automation_settings (
   max_followup_rounds integer NOT NULL DEFAULT 2,
   default_training_provider text NOT NULL DEFAULT 'local',
   default_gpu_type text NOT NULL DEFAULT '',
+  cost_mode text NOT NULL DEFAULT 'balanced',
+  budget_cap_usd double precision NOT NULL DEFAULT 0,
   llm_enabled boolean NOT NULL DEFAULT false,
   agent_mode text NOT NULL DEFAULT 'propose',
   llm_provider text NOT NULL DEFAULT 'openai',
@@ -284,6 +286,8 @@ ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS llm_enabled boolean NOT
 ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS agent_mode text NOT NULL DEFAULT 'propose';
 ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS llm_provider text NOT NULL DEFAULT 'openai';
 ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS llm_model text NOT NULL DEFAULT '';
+ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS cost_mode text NOT NULL DEFAULT 'balanced';
+ALTER TABLE automation_settings ADD COLUMN IF NOT EXISTS budget_cap_usd double precision NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS worker_requirements (
   id text PRIMARY KEY DEFAULT 'worker_requirement_' || nextval('worker_requirement_id_seq'),

@@ -121,9 +121,49 @@ def test_ensure_dataset_materialized_reuses_completed_cache(tmp_path):
     assert (second.dataset_dir / "cats" / "one.txt").read_text() == "meow"
     assert first.telemetry["dataset_materialization_cache_miss"] is True
     assert first.telemetry["dataset_materialization_status"] == "materialized"
+    assert first.telemetry["dataset_materialization_download_seconds"] >= 0
+    assert first.telemetry["dataset_materialization_total_seconds"] >= first.telemetry["dataset_materialization_extract_seconds"]
     assert second.telemetry["dataset_materialization_cache_hit"] is True
     assert second.telemetry["dataset_materialization_status"] == "hit"
     assert second.telemetry["dataset_materialization_bytes_downloaded"] == 0
+    assert second.telemetry["dataset_materialization_total_seconds"] >= 0
+
+
+def test_persistent_disk_materialization_reuses_checksum_cache_across_worker_restart(tmp_path):
+    source_zip = tmp_path / "source.zip"
+    with zipfile.ZipFile(source_zip, "w") as archive:
+        archive.writestr("cats/one.txt", "meow")
+    calls = []
+
+    def fake_download(_storage_uri, destination):
+        calls.append(destination)
+        shutil.copyfile(source_zip, destination)
+        return destination
+
+    cache_root = tmp_path / "persistent-disk-cache"
+    checksum = "d" * 64
+    first = ensure_dataset_materialized(
+        dataset_id="dataset_1",
+        storage_uri="s3://bucket/dataset.zip",
+        checksum_sha256=checksum,
+        cache_root=cache_root,
+        download_fn=fake_download,
+    )
+    second = ensure_dataset_materialized(
+        dataset_id="dataset_1",
+        storage_uri="s3://bucket/dataset.zip",
+        checksum_sha256=checksum,
+        cache_root=cache_root,
+        download_fn=fake_download,
+    )
+
+    assert len(calls) == 1
+    assert first.dataset_dir == second.dataset_dir
+    assert second.telemetry["dataset_materialization_cache_hit"] is True
+    assert second.telemetry["dataset_materialization_cache_key"] == dataset_materialization_cache_key(
+        checksum,
+        "s3://bucket/dataset.zip",
+    )
 
 
 def test_concurrent_materialization_uses_single_download(monkeypatch, tmp_path):

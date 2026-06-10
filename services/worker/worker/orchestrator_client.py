@@ -110,6 +110,34 @@ class OrchestratorClient:
         requirements = payload.get("requirements") if isinstance(payload, dict) else None
         return requirements if isinstance(requirements, list) else []
 
+    def report_dispatcher_event(
+        self,
+        project_id: str,
+        event_type: str,
+        *,
+        message: str = "",
+        plan_id: str = "",
+        payload: dict | None = None,
+    ) -> dict:
+        response = requests.post(
+            f"{self.base_url}/projects/{project_id}/dispatcher-events",
+            json={
+                "event_type": event_type,
+                "message": message,
+                "plan_id": plan_id,
+                "payload": payload or {},
+            },
+            timeout=report_timeout_seconds(),
+        )
+        if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
+            return {
+                "status": "unavailable",
+                "reason": "dispatcher_event_endpoint_unavailable",
+                "status_code": response.status_code,
+            }
+        response.raise_for_status()
+        return response.json()
+
 
     def poll_job(
         self,

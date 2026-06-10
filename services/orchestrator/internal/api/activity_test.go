@@ -152,3 +152,59 @@ func TestActivityExecutionEventMetadataIsAllowlisted(t *testing.T) {
 		}
 	}
 }
+
+func TestActivityDispatcherIdleEventIsVisibleAndAllowlisted(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	project, err := memoryStore.CreateProject("activity dispatcher", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	if _, err := memoryStore.CreateExecutionEvent(project.ID, "", execution.EventDispatcherIdleExit, "Dispatcher idle after checking C:\\Users\\Sahith\\private.", map[string]any{
+		"dispatcher":            "modal",
+		"slot_count":            0,
+		"desired_slot_count":    0,
+		"registered_slot_count": 2,
+		"active_slot_count":     0,
+		"idle_seconds":          30.5,
+		"idle_exit_seconds":     30,
+		"storage_uri":           "s3://private-bucket/dataset.zip",
+	}); err != nil {
+		t.Fatalf("create dispatcher event: %v", err)
+	}
+
+	events, err := server.listProjectActivityEvents(project.ID, 10)
+	if err != nil {
+		t.Fatalf("list activity: %v", err)
+	}
+	var dispatcherEvent *agentActivityEvent
+	for index := range events {
+		if events[index].Type == "dispatcher.idle_exit" {
+			dispatcherEvent = &events[index]
+			break
+		}
+	}
+	if dispatcherEvent == nil {
+		t.Fatalf("expected dispatcher idle activity, got %#v", events)
+	}
+	if dispatcherEvent.Status != "succeeded" || dispatcherEvent.Severity != "success" {
+		t.Fatalf("expected succeeded dispatcher idle event, got %#v", dispatcherEvent)
+	}
+	if dispatcherEvent.Metadata["slot_count"] != 0 {
+		t.Fatalf("expected dispatcher slot metadata, got %#v", dispatcherEvent.Metadata)
+	}
+	if _, ok := dispatcherEvent.Metadata["storage_uri"]; ok {
+		t.Fatalf("storage_uri should not be exposed: %#v", dispatcherEvent.Metadata)
+	}
+	blob, err := json.Marshal(events)
+	if err != nil {
+		t.Fatalf("marshal activity: %v", err)
+	}
+	body := string(blob)
+	for _, forbidden := range []string{"C:\\Users\\Sahith", "s3://private-bucket"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("activity stream leaked %q in %s", forbidden, body)
+		}
+	}
+}

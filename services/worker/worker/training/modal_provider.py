@@ -122,6 +122,168 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     print(f"Modal training finished for {job['id']}: {result}")
 
 
+def run_modal_training_batch(client: OrchestratorClient, jobs: list[dict], batch: dict) -> None:
+    """Submit a Modal preview batch when enabled, otherwise preserve single-job behavior."""
+    job_ids = [str(job.get("id") or "") for job in jobs]
+    remote_status = "stubbed_single_job_fallback"
+    log_event(
+        "info",
+        "modal_training_batch_submission_decision",
+        project_id=batch.get("project_id", ""),
+        plan_id=batch.get("plan_id", ""),
+        batch_id=batch.get("batch_id", ""),
+        batch_key=batch.get("batch_key", ""),
+        dataset_id=batch.get("dataset_id", ""),
+        dataset_cache_key=batch.get("dataset_cache_key", ""),
+        training_tier=batch.get("training_tier", ""),
+        task_type=batch.get("task_type", ""),
+        job_ids=job_ids,
+        status=remote_status,
+    )
+
+    if _modal_batch_runner_enabled() and _valid_modal_preview_batch(batch, jobs):
+        result = _try_run_remote_modal_training_batch(client, jobs, batch)
+        if _remote_modal_training_batch_completed(result):
+            return
+        remote_status = _remote_modal_training_batch_status(result)
+
+    for job in _jobs_with_modal_batch_metadata(jobs, batch, remote_status):
+        run_modal_training(client, job)
+
+
+def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[dict], batch: dict) -> dict:
+    try:
+        from worker.training.modal_app import app, train_modal_preview_batch
+    except ModuleNotFoundError as exc:
+        if exc.name == "modal":
+            return {"status": "failed_before_invocation", "error": "Modal is not installed."}
+        raise
+
+    try:
+        dataset = client.get_dataset(str(batch["dataset_id"]))
+        orchestrator_url = os.getenv("MODAL_ORCHESTRATOR_URL", client.base_url)
+        s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
+        _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
+        _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+        payload = {
+            "batch": batch,
+            "jobs": _jobs_with_modal_batch_metadata(jobs, batch, "remote_batch_submitted"),
+            "dataset": dataset,
+            "orchestrator_url": orchestrator_url,
+            "s3_endpoint_url": s3_endpoint_url,
+            "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
+            "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
+            "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        }
+        with _modal_invocation_context(app):
+            result = _remote_function(train_modal_preview_batch)(payload)
+    except Exception as exc:
+        message = _modal_training_batch_error_message(exc)
+        log_event(
+            "warn",
+            "modal_training_batch_remote_fallback",
+            project_id=batch.get("project_id", ""),
+            plan_id=batch.get("plan_id", ""),
+            batch_id=batch.get("batch_id", ""),
+            batch_key=batch.get("batch_key", ""),
+            job_ids=[str(job.get("id") or "") for job in jobs],
+            error=message,
+        )
+        return {"status": "failed_before_completion", "error": message}
+
+    log_event(
+        "info",
+        "modal_training_batch_remote_result",
+        project_id=batch.get("project_id", ""),
+        plan_id=batch.get("plan_id", ""),
+        batch_id=batch.get("batch_id", ""),
+        batch_key=batch.get("batch_key", ""),
+        status=result.get("status") if isinstance(result, dict) else "",
+        runner_status=result.get("runner_status") if isinstance(result, dict) else "",
+        job_ids=[str(job.get("id") or "") for job in jobs],
+    )
+    return result if isinstance(result, dict) else {"status": "invalid_result"}
+
+
+def _jobs_with_modal_batch_metadata(jobs: list[dict], batch: dict, remote_status: str) -> list[dict]:
+    batch_size = len(jobs)
+    tagged_jobs: list[dict] = []
+    for index, job in enumerate(jobs):
+        config = job.get("config") if isinstance(job.get("config"), dict) else {}
+        tagged_jobs.append(
+            {
+                **job,
+                "config": {
+                    **config,
+                    "modal_batch": {
+                        **batch,
+                        "batch_index": index,
+                        "batch_size": batch_size,
+                        "batch_remote_status": remote_status,
+                    },
+                },
+            }
+        )
+    return tagged_jobs
+
+
+def _remote_modal_training_batch_completed(result: dict) -> bool:
+    status = str(result.get("status") or "").strip().lower() if isinstance(result, dict) else ""
+    return status in {"succeeded", "success", "completed", "complete"}
+
+
+def _remote_modal_training_batch_status(result: dict) -> str:
+    if not isinstance(result, dict):
+        return "remote_batch_invalid_result_single_job_fallback"
+    runner_status = str(result.get("runner_status") or "").strip()
+    if runner_status:
+        return f"{runner_status}_single_job_fallback"
+    status = str(result.get("status") or "").strip()
+    if status:
+        return f"remote_batch_{status}_single_job_fallback"
+    return "remote_batch_unknown_single_job_fallback"
+
+
+def _valid_modal_preview_batch(batch: dict, jobs: list[dict]) -> bool:
+    if str(batch.get("schema_version") or "") != "modal_preview_batch.v1":
+        return False
+    if str(batch.get("training_tier") or "").strip().lower() != "preview":
+        return False
+    if len(jobs) < 2:
+        return False
+    if str(batch.get("task_type") or "").strip().lower() == "object_detection" and not _yolo_batch_preview_enabled():
+        return False
+    required = (
+        "batch_id",
+        "batch_key",
+        "project_id",
+        "plan_id",
+        "dataset_id",
+        "dataset_cache_key",
+        "task_type",
+    )
+    return all(str(batch.get(field) or "").strip() for field in required)
+
+
+def _modal_batch_runner_enabled() -> bool:
+    return _optional_bool_value(os.getenv("MODEL_EXPRESS_MODAL_BATCH_RUNNER")) is True
+
+
+def _yolo_batch_preview_enabled() -> bool:
+    return _optional_bool_value(os.getenv("MODEL_EXPRESS_YOLO_BATCH_PREVIEW")) is True
+
+
+def _optional_bool_value(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def _is_detection_training_config(config: dict) -> bool:
     model = str(config.get("model", "")).lower()
     return (
@@ -327,6 +489,13 @@ def _modal_training_error_message(exc: Exception) -> str:
     return f"Modal training invocation failed before completion: {message}"[:2000]
 
 
+def _modal_training_batch_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        message = exc.__class__.__name__
+    return f"Modal preview batch invocation failed before completion: {message}"[:2000]
+
+
 def _modal_dataset_profile_error_message(exc: Exception) -> str:
     message = str(exc).strip()
     if not message:
@@ -359,6 +528,12 @@ def _log_dataset_materialization(job_id: str, project_id: str, result: object) -
         dataset_checksum=telemetry.get("dataset_checksum"),
         storage_uri_fingerprint=telemetry.get("storage_uri_fingerprint"),
         dataset_cache_key=telemetry.get("dataset_materialization_cache_key"),
+        materialization_cache_root=telemetry.get("dataset_materialization_cache_root"),
+        materialization_cache_scope=telemetry.get("dataset_materialization_cache_scope"),
+        prewarm_cache_root=telemetry.get("dataset_prewarm_cache_root"),
+        training_cache_root=telemetry.get("dataset_training_cache_root"),
+        prewarm_reusable_for_training=telemetry.get("dataset_prewarm_reusable_for_training"),
+        prewarm_reuse_status=telemetry.get("dataset_prewarm_reuse_status"),
     )
 
 

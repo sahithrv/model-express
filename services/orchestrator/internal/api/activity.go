@@ -262,6 +262,19 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 		activity.Severity = "success"
 		activity.Title = "Workers active"
 		activity.Status = "active"
+	case execution.EventDispatcherStatus:
+		activity.Type = "dispatcher.status"
+		activity.Severity = "info"
+		activity.Title = "Modal dispatcher status"
+		activity.Status = "active"
+		if activityMetadataInt(event.Payload, "slot_count") == 0 {
+			activity.Status = "waiting"
+		}
+	case execution.EventDispatcherIdleExit:
+		activity.Type = "dispatcher.idle_exit"
+		activity.Severity = "success"
+		activity.Title = "Modal dispatcher idle"
+		activity.Status = "succeeded"
 	case execution.EventJobRetryQueued:
 		requeued := activityMetadataBool(event.Payload, "requeued")
 		activity.Type = "job.retrying"
@@ -576,6 +589,14 @@ func activityMetadataFromPayload(payload map[string]any) map[string]any {
 		"open_job_count",
 		"active_worker_count",
 		"target_count",
+		"previous_slot_count",
+		"slot_count",
+		"desired_slot_count",
+		"registered_slot_count",
+		"active_slot_count",
+		"idle_seconds",
+		"idle_exit_seconds",
+		"dispatcher",
 		"provider",
 		"gpu_type",
 		"requirement_status",

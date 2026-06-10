@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import csv
+import contextvars
 import json
 import os
 import random
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -61,11 +64,16 @@ DEFAULT_ORCHESTRATOR_REPORT_TIMEOUT_SECONDS = 300
 DEFAULT_MODAL_DATASET_MATERIALIZATION_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_MODAL_DATASET_PROFILE_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_MODAL_TRAINING_SCALEDOWN_WINDOW_SECONDS = 10 * 60
+DEFAULT_COST_SENSITIVE_MODAL_TRAINING_SCALEDOWN_WINDOW_SECONDS = 120
 DEFAULT_MODAL_METADATA_DATALOADER_WORKERS = 4
 DEFAULT_MODAL_IMAGEFOLDER_DATALOADER_WORKERS = 2
 DEFAULT_MODAL_TRAINING_DATASET_CACHE_ROOT = "/tmp/model-express/training-datasets"
 DEFAULT_METADATA_BUNDLE_PAGE_SIZE = 5000
 DEFAULT_METADATA_BUNDLE_MAX_RECORDS = 50_000
+_MODAL_STAGE_EVENTS: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
+    "model_express_modal_stage_events",
+    default=None,
+)
 METADATA_ENDPOINT_UNAVAILABLE_STATUS_CODES = {404, 405, 501}
 COMMON_IMAGE_ROOT_NAMES = ("images", "image", "imgs", "img", "JPEGImages", "jpegimages", "data")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -163,6 +171,20 @@ def _positive_int_env(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
 def _modal_dataset_materialization_timeout_seconds() -> int:
     return _positive_int_env(
         "MODEL_EXPRESS_MODAL_MATERIALIZATION_TIMEOUT_SECONDS",
@@ -199,8 +221,14 @@ def _modal_training_buffer_containers() -> int | None:
 def _modal_training_scaledown_window_seconds() -> int | None:
     return _optional_positive_int_env(
         "MODEL_EXPRESS_MODAL_TRAIN_SCALEDOWN_WINDOW_SECONDS",
-        DEFAULT_MODAL_TRAINING_SCALEDOWN_WINDOW_SECONDS,
+        DEFAULT_COST_SENSITIVE_MODAL_TRAINING_SCALEDOWN_WINDOW_SECONDS
+        if _modal_cost_sensitive_defaults_enabled()
+        else DEFAULT_MODAL_TRAINING_SCALEDOWN_WINDOW_SECONDS,
     )
+
+
+def _modal_cost_sensitive_defaults_enabled() -> bool:
+    return _bool(os.getenv("MODEL_EXPRESS_MODAL_COST_SENSITIVE_DEFAULTS"), default=False)
 
 
 class _BBoxCropDataset:
@@ -315,9 +343,9 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     import time
     import torch
 
-    from worker.datasets.cache import ensure_dataset_materialized
-
     started_at = time.time()
+    stage_events: list[dict] = []
+    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
     job = payload["job"]
     config = job["config"]
     dataset = payload["dataset"]
@@ -361,34 +389,14 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     _modal_training_phase(job_id, "torch_cache_reload_start", started_at)
     _reload_modal_torch_cache_volume()
     _modal_training_phase(job_id, "torch_cache_reload_done", started_at)
-    dataset_cache_root = _modal_training_dataset_cache_root()
-    _modal_training_phase(
-        job_id,
-        "dataset_local_materialization_start",
-        started_at,
+    dataset_dir, dataset_materialization = _modal_training_dataset_for_job(
+        payload,
+        dataset=dataset,
+        config=config,
+        job_id=job_id,
         dataset_id=dataset_id,
-        cache_root=dataset_cache_root,
+        started_at=started_at,
     )
-    materialized = ensure_dataset_materialized(
-        dataset_id=dataset_id,
-        storage_uri=dataset["storage_uri"],
-        checksum_sha256=_dataset_checksum(dataset, config),
-        cache_root=dataset_cache_root,
-    )
-    _modal_training_phase(
-        job_id,
-        "dataset_local_materialization_done",
-        started_at,
-        status=materialized.telemetry.get("dataset_materialization_status"),
-        cache_hit=materialized.telemetry.get("dataset_materialization_cache_hit"),
-        bytes_downloaded=materialized.telemetry.get("dataset_materialization_bytes_downloaded"),
-    )
-    dataset_dir = materialized.dataset_dir
-    dataset_materialization = {
-        **materialized.telemetry,
-        "dataset_training_cache": "local",
-        "dataset_training_cache_root": str(dataset_cache_root),
-    }
     _modal_training_phase(job_id, "metadata_fetch_start", started_at)
     metadata_bundle = _fetch_training_metadata_bundle(orchestrator_url, dataset_id, config)
     _modal_training_phase(
@@ -399,6 +407,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     )
 
     _modal_training_phase(job_id, "data_load_start", started_at)
+    dataset_tier_config = _dataset_tier_config(
+        config,
+        dataset=dataset,
+        task_type="image_classification",
+        dataset_dir=dataset_dir,
+    )
     train_loader, val_loader, test_loader, class_names, class_weights, execution_metadata = _load_image_data(
         dataset_dir,
         batch_size,
@@ -409,7 +423,11 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         preprocessing,
         class_balancing_config,
         metadata_bundle=metadata_bundle,
+        dataset_tier_config=dataset_tier_config,
     )
+    subset_manifest = execution_metadata.get("dataset_tier", {}).get("subset_manifest")
+    if isinstance(subset_manifest, dict):
+        dataset_materialization["subset_manifest"] = subset_manifest
     _modal_training_phase(
         job_id,
         "data_load_done",
@@ -528,6 +546,13 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "modal_function_call_id": modal_function_call_id,
                 "modal_input_id": modal_input_id,
                 "dataset_materialization": dataset_materialization,
+                "stage_telemetry": _modal_stage_telemetry_payload(
+                    job,
+                    runtime_seconds,
+                    stage_events,
+                    dataset_materialization,
+                    gpu_type,
+                ),
             },
         )
         if _should_stop_training_early(
@@ -543,6 +568,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
 
     runtime_seconds = time.time() - started_at
     estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
+    _modal_training_phase(job_id, "final_eval_start", started_at)
     test_loss, test_accuracy, test_macro_f1, test_eval_details = _evaluate(
         model,
         test_loader,
@@ -551,6 +577,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         class_names,
         collect_examples=True,
     )
+    _modal_training_phase(job_id, "final_eval_done", started_at)
     if test_eval_details.get("confusion_matrix"):
         final_eval_details = test_eval_details
     bbox_ablation = _bbox_ablation_evaluation(
@@ -563,6 +590,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     )
     model_profile = _model_profile(model, model_name, image_size, device, val_loader)
     demo_images = _demo_images_from_test_examples(test_eval_details, class_names)
+    _modal_training_phase(job_id, "export_start", started_at)
     export_bundle = _export_trained_champion_bundle(
         model=model,
         model_name=model_name,
@@ -574,6 +602,9 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         dataset=dataset,
         job_id=job_id,
     )
+    _modal_training_phase(job_id, "export_done", started_at, status=export_bundle.get("status", ""))
+    runtime_seconds = time.time() - started_at
+    estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
     model_latency_ms = float(model_profile.get("estimated_latency_ms") or 0)
     preprocessing_latency_ms = float(export_bundle.get("preprocessing_latency_ms") or 0)
     pipeline_latency_ms = model_latency_ms + preprocessing_latency_ms if model_latency_ms or preprocessing_latency_ms else 0.0
@@ -615,6 +646,13 @@ def _train_image_classifier_impl(payload: dict) -> dict:
             "modal_function_call_id": modal_function_call_id,
             "modal_input_id": modal_input_id,
             "dataset_materialization": dataset_materialization,
+            "stage_telemetry": _modal_stage_telemetry_payload(
+                job,
+                runtime_seconds,
+                stage_events,
+                dataset_materialization,
+                gpu_type,
+            ),
         },
     )
     _post_training_run_evaluation(
@@ -726,9 +764,10 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     import time
 
     from ultralytics import YOLO
-    from worker.datasets.cache import ensure_dataset_materialized
 
     started_at = time.time()
+    stage_events: list[dict] = []
+    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
     job = payload["job"]
     config = job["config"]
     dataset = payload["dataset"]
@@ -749,45 +788,56 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     modal_function_call_id, modal_input_id = _modal_identifiers()
 
     _modal_training_phase(job_id, "storage_configured", started_at)
-    dataset_cache_root = _modal_training_dataset_cache_root()
-    _modal_training_phase(
-        job_id,
-        "dataset_local_materialization_start",
-        started_at,
+    dataset_dir, dataset_materialization = _modal_training_dataset_for_job(
+        payload,
+        dataset=dataset,
+        config=config,
+        job_id=job_id,
         dataset_id=dataset_id,
-        cache_root=dataset_cache_root,
+        started_at=started_at,
     )
-    materialized = ensure_dataset_materialized(
-        dataset_id=dataset_id,
-        storage_uri=dataset["storage_uri"],
-        checksum_sha256=_dataset_checksum(dataset, config),
-        cache_root=dataset_cache_root,
+    pre_materialized = payload.get("_modal_pre_materialized_dataset")
+    pre_materialized_data_config = (
+        Path(str(pre_materialized.get("yolo_data_config")))
+        if isinstance(pre_materialized, dict) and str(pre_materialized.get("yolo_data_config") or "").strip()
+        else None
     )
-    _modal_training_phase(
-        job_id,
-        "dataset_local_materialization_done",
-        started_at,
-        status=materialized.telemetry.get("dataset_materialization_status"),
-        cache_hit=materialized.telemetry.get("dataset_materialization_cache_hit"),
-        bytes_downloaded=materialized.telemetry.get("dataset_materialization_bytes_downloaded"),
-    )
-    dataset_dir = materialized.dataset_dir
-    data_config_path = _find_yolo_data_config(dataset_dir, config)
+    data_config_path = pre_materialized_data_config if pre_materialized_data_config else _find_yolo_data_config(dataset_dir, config)
     if data_config_path is None:
         raise ValueError(
             "YOLO detector training requires data.yaml/data.yml/dataset.yaml/dataset.yml "
             "with train/val image paths and names/nc."
         )
-
-    dataset_materialization = {
-        **materialized.telemetry,
-        "dataset_training_cache": "local",
-        "dataset_training_cache_root": str(dataset_cache_root),
-        "yolo_data_config": str(data_config_path),
-    }
+    if pre_materialized_data_config is None:
+        data_config_path = _normalize_yolo_data_config_for_training(
+            dataset_dir,
+            data_config_path,
+            output_root=Path(tempfile.gettempdir()) / "model-express-yolo-data-configs" / _safe_path_part(job_id),
+        )
+    if pre_materialized_data_config is None:
+        data_config_path, subset_manifest = _prepare_yolo_dataset_tier(
+            dataset_dir,
+            data_config_path,
+            config,
+            dataset=dataset,
+            output_root=Path(tempfile.gettempdir()) / "model-express-yolo-preview-subsets" / _safe_path_part(job_id),
+        )
+        if subset_manifest:
+            dataset_materialization["subset_manifest"] = subset_manifest
+    dataset_materialization["yolo_data_config"] = str(data_config_path)
     _modal_training_phase(job_id, "yolo_train_start", started_at, model=model_name, data=str(data_config_path))
     run_root = Path(tempfile.gettempdir()) / "model-express-yolo-runs" / _safe_path_part(job_id)
     detector = YOLO(model_name)
+    posted_yolo_epochs: set[int] = set()
+    _install_yolo_epoch_metrics_callback(
+        detector,
+        orchestrator_url=orchestrator_url,
+        job_id=job_id,
+        run_root=run_root,
+        learning_rate=learning_rate,
+        image_size=image_size,
+        posted_epochs=posted_yolo_epochs,
+    )
     detector.train(
         data=str(data_config_path),
         epochs=epochs,
@@ -802,15 +852,27 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         val=True,
     )
     _modal_training_phase(job_id, "yolo_train_done", started_at)
+    final_yolo_epoch_rows_posted = _post_yolo_epoch_metrics(
+        orchestrator_url,
+        job_id,
+        run_root,
+        learning_rate=learning_rate,
+        image_size=image_size,
+        posted_epochs=posted_yolo_epochs,
+    )
+    yolo_epoch_rows_posted = len(posted_yolo_epochs) or final_yolo_epoch_rows_posted
 
     best_model_path = _yolo_best_model_path(run_root)
     trained_detector = YOLO(str(best_model_path)) if best_model_path is not None else detector
+    class_names = _yolo_class_names(trained_detector, config)
+    _modal_training_phase(job_id, "yolo_eval_start", started_at)
     validation_metrics = _collect_yolo_validation_metrics(
         trained_detector,
         data_config_path,
         split="val",
         image_size=image_size,
         batch_size=batch_size,
+        class_names=class_names,
     )
     test_metrics = {}
     if _yolo_config_declares_split(data_config_path, "test"):
@@ -820,7 +882,9 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
             split="test",
             image_size=image_size,
             batch_size=batch_size,
+            class_names=class_names,
         )
+    _modal_training_phase(job_id, "yolo_eval_done", started_at)
     final_metrics = test_metrics or validation_metrics
     map50_95 = _metric_float(final_metrics, "mAP50_95", "map50_95", default=0.0)
     map50 = _metric_float(final_metrics, "mAP50", "map50", default=map50_95)
@@ -832,7 +896,6 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     val_loss = round(box_loss + cls_loss + dfl_loss, 6)
     runtime_seconds = time.time() - started_at
     estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
-    class_names = _yolo_class_names(trained_detector, config)
     model_profile = _yolo_model_profile(
         model_name=model_name,
         model_path=best_model_path,
@@ -842,6 +905,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         iou_threshold=iou_threshold,
         metrics=final_metrics,
     )
+    _modal_training_phase(job_id, "export_start", started_at)
     export_bundle = _export_yolo_detector_bundle(
         model_path=best_model_path,
         model_name=model_name,
@@ -852,6 +916,9 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         dataset=dataset,
         job_id=job_id,
     )
+    _modal_training_phase(job_id, "export_done", started_at, status=export_bundle.get("status", ""))
+    runtime_seconds = time.time() - started_at
+    estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
     if export_bundle.get("artifact_uri"):
         model_profile["artifact_uri"] = export_bundle.get("artifact_uri", "")
     if export_bundle.get("onnx_artifact_uri"):
@@ -862,27 +929,28 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     model_profile["export_manifest"] = export_bundle.get("manifest", {})
     model_profile["export_validation_errors"] = export_bundle.get("validation_errors", [])
 
-    _post_json(
-        f"{orchestrator_url}/jobs/{job_id}/metrics",
-        {
-            "epoch": max(1, epochs),
-            "metrics": {
-                "train_loss": val_loss,
-                "val_loss": val_loss,
-                "box_loss": round(box_loss, 6),
-                "cls_loss": round(cls_loss, 6),
-                "dfl_loss": round(dfl_loss, 6),
-                "mAP50_95": round(map50_95, 6),
-                "map50_95": round(map50_95, 6),
-                "mAP50": round(map50, 6),
-                "map50": round(map50, 6),
-                "precision": round(precision, 6),
-                "recall": round(recall, 6),
-                "learning_rate": learning_rate,
-                "image_size": image_size,
+    if yolo_epoch_rows_posted == 0:
+        _post_json(
+            f"{orchestrator_url}/jobs/{job_id}/metrics",
+            {
+                "epoch": max(1, epochs),
+                "metrics": {
+                    "train_loss": val_loss,
+                    "val_loss": val_loss,
+                    "box_loss": round(box_loss, 6),
+                    "cls_loss": round(cls_loss, 6),
+                    "dfl_loss": round(dfl_loss, 6),
+                    "mAP50_95": round(map50_95, 6),
+                    "map50_95": round(map50_95, 6),
+                    "mAP50": round(map50, 6),
+                    "map50": round(map50, 6),
+                    "precision": round(precision, 6),
+                    "recall": round(recall, 6),
+                    "learning_rate": learning_rate,
+                    "image_size": image_size,
+                },
             },
-        },
-    )
+        )
     _post_training_run_summary(
         orchestrator_url,
         job_id,
@@ -895,12 +963,24 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
             "estimated_cost_usd": round(estimated_cost_usd, 6),
             "best_macro_f1": round(map50_95, 6),
             "best_accuracy": round(map50, 6),
+            "best_map50_95": round(map50_95, 6),
+            "best_map50": round(map50, 6),
+            "best_precision": round(precision, 6),
+            "best_recall": round(recall, 6),
+            "target_metric": "mAP50_95",
             "final_train_loss": val_loss,
             "final_val_loss": val_loss,
             "epochs_completed": epochs,
             "modal_function_call_id": modal_function_call_id,
             "modal_input_id": modal_input_id,
             "dataset_materialization": dataset_materialization,
+            "stage_telemetry": _modal_stage_telemetry_payload(
+                job,
+                runtime_seconds,
+                stage_events,
+                dataset_materialization,
+                gpu_type,
+            ),
         },
     )
     _post_training_run_evaluation(
@@ -969,6 +1049,469 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     }
 
 
+def _modal_training_dataset_for_job(
+    payload: dict,
+    *,
+    dataset: dict,
+    config: dict,
+    job_id: str,
+    dataset_id: str,
+    started_at: float,
+) -> tuple[Path, dict]:
+    pre_materialized = payload.get("_modal_pre_materialized_dataset")
+    if isinstance(pre_materialized, dict):
+        dataset_dir = Path(str(pre_materialized.get("dataset_dir") or ""))
+        telemetry = pre_materialized.get("telemetry") if isinstance(pre_materialized.get("telemetry"), dict) else {}
+        cache_root = Path(str(pre_materialized.get("cache_root") or _modal_training_dataset_cache_root()))
+        materialization_scope = str(pre_materialized.get("materialization_scope") or "modal_batch_local")
+        _modal_training_phase(
+            job_id,
+            "dataset_local_materialization_reused",
+            started_at,
+            dataset_id=dataset_id,
+            cache_root=cache_root,
+            dataset_dir=dataset_dir,
+        )
+        materialization = {
+            **telemetry,
+            "dataset_training_cache": "local",
+            "dataset_materialization_reused_from_batch": True,
+            **_modal_dataset_cache_relationship_fields(
+                cache_root,
+                materialization_scope=materialization_scope,
+                training_cache_root=cache_root,
+            ),
+        }
+        subset_manifest = pre_materialized.get("subset_manifest")
+        if isinstance(subset_manifest, dict):
+            materialization["subset_manifest"] = subset_manifest
+        yolo_data_config = str(pre_materialized.get("yolo_data_config") or "").strip()
+        if yolo_data_config:
+            materialization["yolo_data_config"] = yolo_data_config
+        return dataset_dir, materialization
+
+    from worker.datasets.cache import ensure_dataset_materialized
+
+    dataset_cache_root = _modal_training_dataset_cache_root()
+    _modal_training_phase(
+        job_id,
+        "dataset_local_materialization_start",
+        started_at,
+        dataset_id=dataset_id,
+        cache_root=dataset_cache_root,
+    )
+    materialized = ensure_dataset_materialized(
+        dataset_id=dataset_id,
+        storage_uri=dataset["storage_uri"],
+        checksum_sha256=_dataset_checksum(dataset, config),
+        cache_root=dataset_cache_root,
+    )
+    _modal_training_phase(
+        job_id,
+        "dataset_local_materialization_done",
+        started_at,
+        status=materialized.telemetry.get("dataset_materialization_status"),
+        cache_hit=materialized.telemetry.get("dataset_materialization_cache_hit"),
+        bytes_downloaded=materialized.telemetry.get("dataset_materialization_bytes_downloaded"),
+    )
+    return materialized.dataset_dir, {
+        **materialized.telemetry,
+        "dataset_training_cache": "local",
+        **_modal_dataset_cache_relationship_fields(
+            dataset_cache_root,
+            materialization_scope="modal_training_local",
+        ),
+    }
+
+
+@app.function(
+    image=image,
+    gpu=DEFAULT_GPU,
+    timeout=60 * 60,
+    volumes=training_volume_mounts,
+    min_containers=_modal_training_min_containers(),
+    buffer_containers=_modal_training_buffer_containers(),
+    scaledown_window=_modal_training_scaledown_window_seconds(),
+)
+def train_modal_preview_batch(payload: dict) -> dict:
+    return _train_modal_preview_batch_impl(payload)
+
+
+def _train_modal_preview_batch_impl(payload: dict) -> dict:
+    normalized = _validate_modal_preview_batch_payload(payload)
+    batch = normalized["batch"]
+    jobs = normalized["jobs"]
+    if batch["task_type"] == "object_detection" and not _yolo_batch_preview_enabled():
+        return _unsupported_modal_preview_batch_result(
+            batch,
+            jobs,
+            reason="yolo_preview_batch_disabled",
+        )
+    if batch["task_type"] not in {"image_classification", "object_detection"}:
+        return _unsupported_modal_preview_batch_result(
+            batch,
+            jobs,
+            reason="task_type_not_supported_by_batch_runner",
+        )
+
+    from worker.datasets.cache import ensure_dataset_materialized
+
+    _configure_storage_env(payload)
+
+    dataset = normalized["dataset"]
+    representative_config = jobs[0].get("config") if isinstance(jobs[0].get("config"), dict) else {}
+    batch_cache_root = _modal_preview_batch_cache_root(batch["batch_id"])
+    materialized = ensure_dataset_materialized(
+        dataset_id=batch["dataset_id"],
+        storage_uri=dataset["storage_uri"],
+        checksum_sha256=_dataset_checksum(dataset, representative_config),
+        cache_root=batch_cache_root,
+    )
+    pre_materialized = {
+        "dataset_dir": str(materialized.dataset_dir),
+        "telemetry": materialized.telemetry,
+        "cache_root": str(batch_cache_root),
+        "materialization_scope": "modal_batch_local",
+    }
+    runner_status = "classification_batch_completed"
+    if batch["task_type"] == "object_detection":
+        data_config_path = _find_yolo_data_config(materialized.dataset_dir, representative_config)
+        if data_config_path is None:
+            raise ValueError(
+                "YOLO detector preview batch requires data.yaml/data.yml/dataset.yaml/dataset.yml "
+                "with train/val image paths and names/nc."
+            )
+        yolo_output_root = batch_cache_root / "_preview_subsets" / _safe_path_part(batch["batch_id"])
+        data_config_path = _normalize_yolo_data_config_for_training(
+            materialized.dataset_dir,
+            data_config_path,
+            output_root=yolo_output_root / "_normalized",
+        )
+        data_config_path, subset_manifest = _prepare_yolo_dataset_tier(
+            materialized.dataset_dir,
+            data_config_path,
+            representative_config,
+            dataset=dataset,
+            batch=batch,
+            output_root=yolo_output_root,
+            force_preview=True,
+        )
+        pre_materialized["yolo_data_config"] = str(data_config_path)
+        if subset_manifest:
+            pre_materialized["subset_manifest"] = subset_manifest
+        runner_status = "yolo_batch_completed"
+    job_results: list[dict] = []
+    for index, job in enumerate(jobs):
+        job_payload = {
+            **payload,
+            "job": job,
+            "dataset": dataset,
+            "_modal_pre_materialized_dataset": pre_materialized,
+        }
+        try:
+            if batch["task_type"] == "object_detection":
+                result = _train_yolo_detector_impl(job_payload)
+            else:
+                result = _train_image_classifier_impl(job_payload)
+        except Exception as exc:
+            reported = _report_modal_training_retryable_failure(job_payload, exc)
+            job_results.append(
+                {
+                    "job_id": str(job.get("id") or ""),
+                    "status": "retryable_failure_reported" if reported else "failed",
+                    "error": _modal_training_error_message(exc),
+                    "batch_index": index,
+                    "batch_size": len(jobs),
+                }
+            )
+            continue
+        job_results.append(
+            {
+                "job_id": str(job.get("id") or ""),
+                "status": "succeeded",
+                "batch_index": index,
+                "batch_size": len(jobs),
+                "result": _modal_preview_batch_public_job_result(result),
+            }
+        )
+    return {
+        "schema_version": "modal_preview_batch_result.v1",
+        "status": "completed",
+        "runner_status": runner_status,
+        "batch_id": batch["batch_id"],
+        "batch_key": batch["batch_key"],
+        "project_id": batch["project_id"],
+        "plan_id": batch["plan_id"],
+        "dataset_id": batch["dataset_id"],
+        "dataset_cache_key": batch["dataset_cache_key"],
+        "training_tier": batch["training_tier"],
+        "task_type": batch["task_type"],
+        "batch_size": len(jobs),
+        "dataset_dir": str(materialized.dataset_dir),
+        "dataset_materialization": {
+            **materialized.telemetry,
+            "dataset_training_cache": "local",
+            "dataset_materialization_reused_by_jobs": len(jobs),
+            **({"subset_manifest": pre_materialized["subset_manifest"]} if isinstance(pre_materialized.get("subset_manifest"), dict) else {}),
+            **_modal_dataset_cache_relationship_fields(
+                batch_cache_root,
+                materialization_scope="modal_batch_local",
+                training_cache_root=batch_cache_root,
+            ),
+        },
+        "job_results": job_results,
+    }
+
+
+def _unsupported_modal_preview_batch_result(batch: dict, jobs: list[dict], *, reason: str) -> dict:
+    return {
+        "schema_version": "modal_preview_batch_result.v1",
+        "status": "unsupported",
+        "runner_status": "remote_batch_shell_unsupported",
+        "batch_id": batch["batch_id"],
+        "batch_key": batch["batch_key"],
+        "project_id": batch["project_id"],
+        "plan_id": batch["plan_id"],
+        "dataset_id": batch["dataset_id"],
+        "dataset_cache_key": batch["dataset_cache_key"],
+        "training_tier": batch["training_tier"],
+        "task_type": batch["task_type"],
+        "batch_size": len(jobs),
+        "job_results": [
+            {
+                "job_id": str(job.get("id") or ""),
+                "status": "unsupported",
+                "reason": reason,
+                "batch_index": index,
+                "batch_size": len(jobs),
+            }
+            for index, job in enumerate(jobs)
+        ],
+    }
+
+
+def _modal_preview_batch_cache_root(batch_id: str) -> Path:
+    return Path(tempfile.gettempdir()) / "model-express" / "batches" / _safe_path_part(batch_id)
+
+
+def _modal_preview_batch_public_job_result(result: object) -> dict:
+    if not isinstance(result, dict):
+        return {}
+    public_keys = (
+        "job_id",
+        "model",
+        "classes",
+        "best_accuracy",
+        "best_macro_f1",
+        "estimated_cost_usd",
+        "runtime_seconds",
+        "device",
+    )
+    return {key: result[key] for key in public_keys if key in result}
+
+
+def _validate_modal_preview_batch_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Modal preview batch payload must be a dictionary.")
+    batch = payload.get("batch")
+    if not isinstance(batch, dict):
+        raise ValueError("Modal preview batch payload requires a batch object.")
+    if str(batch.get("schema_version") or "") != "modal_preview_batch.v1":
+        raise ValueError("Modal preview batch schema_version must be modal_preview_batch.v1.")
+
+    required_batch_fields = (
+        "batch_id",
+        "batch_key",
+        "project_id",
+        "plan_id",
+        "dataset_id",
+        "dataset_cache_key",
+        "training_tier",
+        "task_type",
+    )
+    normalized_batch = {field: str(batch.get(field) or "").strip() for field in required_batch_fields}
+    for field in ("subset_fraction", "subset_seed", "split_policy", "image_size_family"):
+        value = str(batch.get(field) or "").strip()
+        if value:
+            normalized_batch[field] = value
+    missing = [field for field, value in normalized_batch.items() if not value]
+    if missing:
+        raise ValueError(f"Modal preview batch is missing required fields: {', '.join(missing)}.")
+    if normalized_batch["training_tier"] != "preview":
+        raise ValueError("Modal preview batch training_tier must be preview.")
+
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list) or len(jobs) < 2:
+        raise ValueError("Modal preview batch requires at least two jobs.")
+    dataset = payload.get("dataset")
+    if not isinstance(dataset, dict):
+        raise ValueError("Modal preview batch payload requires a dataset object.")
+    if str(dataset.get("id") or "").strip() != normalized_batch["dataset_id"]:
+        raise ValueError("Modal preview batch dataset id does not match the batch contract.")
+    if not str(dataset.get("storage_uri") or "").strip():
+        raise ValueError("Modal preview batch dataset requires a storage_uri.")
+    if not str(payload.get("orchestrator_url") or "").strip():
+        raise ValueError("Modal preview batch payload requires orchestrator_url.")
+
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            raise ValueError(f"Modal preview batch job at index {index} must be a dictionary.")
+        job_id = str(job.get("id") or "").strip()
+        if not job_id:
+            raise ValueError(f"Modal preview batch job at index {index} is missing id.")
+        if str(job.get("template") or "").strip() != "train_experiment":
+            raise ValueError(f"Modal preview batch job {job_id} must use train_experiment.")
+        if str(job.get("project_id") or "").strip() != normalized_batch["project_id"]:
+            raise ValueError(f"Modal preview batch job {job_id} project_id does not match.")
+        config = job.get("config")
+        if not isinstance(config, dict):
+            raise ValueError(f"Modal preview batch job {job_id} requires config.")
+        if str(config.get("provider") or "").strip().lower() != "modal":
+            raise ValueError(f"Modal preview batch job {job_id} provider must be modal.")
+        if str(config.get("plan_id") or "").strip() != normalized_batch["plan_id"]:
+            raise ValueError(f"Modal preview batch job {job_id} plan_id does not match.")
+        if str(config.get("dataset_id") or "").strip() != normalized_batch["dataset_id"]:
+            raise ValueError(f"Modal preview batch job {job_id} dataset_id does not match.")
+        if _modal_preview_batch_training_tier(config) != normalized_batch["training_tier"]:
+            raise ValueError(f"Modal preview batch job {job_id} training_tier does not match.")
+        if _modal_preview_batch_dataset_cache_key(config) != normalized_batch["dataset_cache_key"]:
+            raise ValueError(f"Modal preview batch job {job_id} dataset_cache_key does not match.")
+        if _modal_preview_batch_task_type(config) != normalized_batch["task_type"]:
+            raise ValueError(f"Modal preview batch job {job_id} task_type does not match.")
+
+    return {
+        "batch": normalized_batch,
+        "jobs": jobs,
+        "dataset": dataset,
+    }
+
+
+def _modal_preview_batch_training_tier(config: dict) -> str:
+    for key in ("training_tier", "dataset_tier"):
+        value = str(config.get(key) or "").strip().lower()
+        if value:
+            return value
+    modal_batch = config.get("modal_batch") if isinstance(config.get("modal_batch"), dict) else {}
+    return str(modal_batch.get("training_tier") or "").strip().lower()
+
+
+def _modal_preview_batch_dataset_cache_key(config: dict) -> str:
+    materialization = config.get("dataset_materialization") if isinstance(config.get("dataset_materialization"), dict) else {}
+    cache_key = materialization.get("dataset_cache_key")
+    if isinstance(cache_key, str) and cache_key.strip():
+        return cache_key.strip()
+    checksum = config.get("dataset_checksum_sha256")
+    if isinstance(checksum, str) and checksum.strip():
+        return f"sha256-{checksum.strip().lower()}"
+    return ""
+
+
+def _modal_preview_batch_task_type(config: dict) -> str:
+    task_type = str(config.get("task_type") or "").strip().lower()
+    if task_type:
+        return task_type
+    model_kind = str(config.get("model_kind") or "").strip().lower()
+    model = str(config.get("model") or "").strip().lower()
+    if model_kind == "ultralytics_yolo_detector" or model.startswith("yolo"):
+        return "object_detection"
+    return "image_classification"
+
+
+def _preview_dataset_tiers_enabled() -> bool:
+    return _bool(os.getenv("MODEL_EXPRESS_PREVIEW_DATASET_TIERS"), default=False)
+
+
+def _yolo_batch_preview_enabled() -> bool:
+    return _bool(os.getenv("MODEL_EXPRESS_YOLO_BATCH_PREVIEW"), default=False)
+
+
+def _dataset_tier_config(
+    config: dict,
+    *,
+    dataset: dict,
+    task_type: str,
+    dataset_dir: Path | None = None,
+    batch: dict | None = None,
+    force_preview: bool = False,
+) -> dict:
+    tier = str(config.get("training_tier") or config.get("dataset_tier") or "").strip().lower()
+    if not tier and isinstance(config.get("modal_batch"), dict):
+        tier = str(config["modal_batch"].get("training_tier") or "").strip().lower()
+    if force_preview:
+        tier = "preview"
+    if tier not in {"preview", "full", "champion_validation"}:
+        tier = "full"
+    fraction = _bounded_float(
+        config.get("preview_fraction", config.get("dataset_fraction", config.get("preview_dataset_fraction", 0.25))),
+        default=0.25,
+        minimum=0.01,
+        maximum=1.0,
+    )
+    seed = _bounded_int(config.get("preview_seed", config.get("seed", 42)), default=42, minimum=0, maximum=2**31 - 1)
+    split_policy = str(config.get("split_policy") or "official_or_deterministic").strip().lower()
+    image_size = _positive_int(config.get("image_size"), default=0)
+    image_size_family = str(config.get("image_size_family") or "").strip().lower()
+    if not image_size_family:
+        image_size_family = _image_size_family(task_type, image_size)
+    if isinstance(batch, dict):
+        fraction = _bounded_float(batch.get("subset_fraction", fraction), default=fraction, minimum=0.01, maximum=1.0)
+        seed = _bounded_int(batch.get("subset_seed", seed), default=seed, minimum=0, maximum=2**31 - 1)
+        split_policy = str(batch.get("split_policy") or split_policy).strip().lower()
+        image_size_family = str(batch.get("image_size_family") or image_size_family).strip().lower()
+    return {
+        "enabled": _preview_dataset_tiers_enabled(),
+        "tier": tier,
+        "task_type": task_type,
+        "dataset_checksum": _dataset_checksum(dataset, config) or str(config.get("dataset_checksum_sha256") or ""),
+        "fraction": fraction,
+        "seed": seed,
+        "split_policy": split_policy,
+        "image_size_family": image_size_family,
+        "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
+    }
+
+
+def _image_size_family(task_type: str, image_size: int) -> str:
+    if image_size <= 0:
+        return f"{task_type}:default"
+    bucket = ((image_size + 31) // 32) * 32
+    return f"{task_type}:{bucket}"
+
+
+def _prepare_yolo_dataset_tier(
+    dataset_dir: Path,
+    data_config_path: Path,
+    config: dict,
+    *,
+    dataset: dict,
+    output_root: Path,
+    batch: dict | None = None,
+    force_preview: bool = False,
+) -> tuple[Path, dict]:
+    tier_config = _dataset_tier_config(
+        config,
+        dataset=dataset,
+        task_type="object_detection",
+        dataset_dir=dataset_dir,
+        batch=batch,
+        force_preview=force_preview,
+    )
+    if not tier_config["enabled"] or tier_config["tier"] != "preview":
+        return data_config_path, {}
+    from worker.datasets.tiers import materialize_yolo_preview_subset
+
+    return materialize_yolo_preview_subset(
+        dataset_dir=dataset_dir,
+        data_config_path=data_config_path,
+        output_root=output_root,
+        dataset_checksum=str(tier_config["dataset_checksum"]),
+        fraction=float(tier_config["fraction"]),
+        seed=int(tier_config["seed"]),
+        split_policy=str(tier_config["split_policy"]),
+        image_size_family=str(tier_config["image_size_family"]),
+    )
+
+
 YOLO_CONFIG_FILE_NAMES = ("data.yaml", "data.yml", "dataset.yaml", "dataset.yml")
 
 
@@ -1005,6 +1548,312 @@ def _looks_like_yolo_data_config(path: Path) -> bool:
     return ("train:" in text and ("val:" in text or "valid:" in text)) and ("names:" in text or "nc:" in text)
 
 
+def _normalize_yolo_data_config_for_training(
+    dataset_dir: Path,
+    data_config_path: Path,
+    *,
+    output_root: Path,
+) -> Path:
+    loaded = _load_yolo_training_config(data_config_path)
+
+    normalized = dict(loaded)
+    normalized["path"] = str(dataset_dir.resolve())
+    for split in ("train", "val", "test"):
+        source_key = "valid" if split == "val" and "val" not in normalized and "valid" in normalized else split
+        if source_key not in normalized:
+            continue
+        normalized[split] = _normalize_yolo_split_value(
+            dataset_dir,
+            data_config_path,
+            loaded,
+            normalized[source_key],
+        )
+    normalized.pop("valid", None)
+
+    missing_required = [
+        split
+        for split in ("train", "val")
+        if split not in normalized or not _yolo_split_value_has_images(normalized[split])
+    ]
+    if missing_required:
+        raise ValueError(
+            "YOLO detector training could not resolve local image paths for "
+            f"{', '.join(missing_required)} from {data_config_path}."
+        )
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    normalized_path = output_root / "data.yaml"
+    normalized_path.write_text(_dump_yolo_training_config(normalized), encoding="utf-8")
+    return normalized_path
+
+
+def _load_yolo_training_config(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml
+    except Exception:
+        loaded = _load_simple_yolo_training_config(text)
+    else:
+        loaded = yaml.safe_load(text)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"YOLO data config {path} must be a mapping.")
+    return loaded
+
+
+def _dump_yolo_training_config(config: dict) -> str:
+    try:
+        import yaml
+    except Exception:
+        return _dump_simple_yolo_training_config(config)
+    return yaml.safe_dump(config, sort_keys=False)
+
+
+def _load_simple_yolo_training_config(text: str) -> dict:
+    config: dict = {}
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        raw = _strip_yaml_comment(lines[index]).rstrip()
+        index += 1
+        if not raw.strip() or raw.startswith((" ", "\t")) or ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if value:
+            config[key] = _parse_simple_yaml_value(value)
+            continue
+        block: list[str] = []
+        while index < len(lines):
+            child = _strip_yaml_comment(lines[index]).rstrip()
+            if child and not child.startswith((" ", "\t")):
+                break
+            if child.strip():
+                block.append(child.strip())
+            index += 1
+        config[key] = _parse_simple_yaml_block(block)
+    return config
+
+
+def _strip_yaml_comment(line: str) -> str:
+    in_quote = ""
+    for index, char in enumerate(line):
+        if char in {"'", '"'}:
+            in_quote = "" if in_quote == char else char if not in_quote else in_quote
+            continue
+        if char == "#" and not in_quote:
+            return line[:index]
+    return line
+
+
+def _parse_simple_yaml_value(value: str) -> object:
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_unquote_yaml_scalar(part.strip()) for part in inner.split(",")]
+    unquoted = _unquote_yaml_scalar(value)
+    try:
+        return int(unquoted)
+    except ValueError:
+        return unquoted
+
+
+def _parse_simple_yaml_block(block: list[str]) -> object:
+    if not block:
+        return ""
+    if all(line.startswith("- ") for line in block):
+        return [_unquote_yaml_scalar(line[2:].strip()) for line in block]
+    mapped: dict[int | str, str] = {}
+    for line in block:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        parsed_key: int | str
+        try:
+            parsed_key = int(key)
+        except ValueError:
+            parsed_key = key
+        mapped[parsed_key] = _unquote_yaml_scalar(value.strip())
+    if mapped and all(isinstance(key, int) for key in mapped):
+        return [mapped[key] for key in sorted(mapped)]
+    return mapped
+
+
+def _unquote_yaml_scalar(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        if value[0] == '"':
+            try:
+                return str(json.loads(value))
+            except json.JSONDecodeError:
+                pass
+        return value[1:-1]
+    return value
+
+
+def _dump_simple_yolo_training_config(config: dict) -> str:
+    lines: list[str] = []
+    for key in ("path", "train", "val", "test", "nc"):
+        if key in config:
+            lines.append(f"{key}: {_format_simple_yaml_scalar(config[key])}")
+    names = config.get("names")
+    if isinstance(names, dict):
+        lines.append("names:")
+        for key in sorted(names, key=lambda item: int(item) if str(item).isdigit() else str(item)):
+            lines.append(f"  {key}: {_format_simple_yaml_scalar(names[key])}")
+    elif isinstance(names, list):
+        lines.append("names:")
+        for name in names:
+            lines.append(f"  - {_format_simple_yaml_scalar(name)}")
+    elif names is not None:
+        lines.append(f"names: {_format_simple_yaml_scalar(names)}")
+    for key, value in config.items():
+        if key in {"path", "train", "val", "test", "nc", "names", "valid"}:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            lines.append(f"{key}: {_format_simple_yaml_scalar(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_simple_yaml_scalar(value: object) -> str:
+    if isinstance(value, list):
+        return "[" + ", ".join(_format_simple_yaml_scalar(item) for item in value) + "]"
+    text = str(value)
+    if not text or any(char in text for char in ":#[]{}") or text.strip() != text:
+        return json.dumps(text)
+    return text
+
+
+def _normalize_yolo_split_value(
+    dataset_dir: Path,
+    data_config_path: Path,
+    config: dict,
+    value: object,
+) -> object:
+    if isinstance(value, list):
+        return [
+            str(_resolve_existing_yolo_path(dataset_dir, data_config_path, config, str(item)))
+            for item in value
+            if str(item or "").strip()
+        ]
+    if value is None:
+        return value
+    text = str(value).strip()
+    if not text:
+        return value
+    return str(_resolve_existing_yolo_path(dataset_dir, data_config_path, config, text))
+
+
+def _resolve_existing_yolo_path(
+    dataset_dir: Path,
+    data_config_path: Path,
+    config: dict,
+    value: str,
+) -> Path:
+    candidates = _yolo_local_path_candidates(dataset_dir, data_config_path, config, value)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    suffix = _normalized_yolo_suffix(value)
+    if suffix:
+        for candidate in sorted(dataset_dir.rglob(Path(suffix).name), key=lambda path: str(path)):
+            if _path_suffix(candidate, suffix) and candidate.exists():
+                return candidate.resolve()
+    return candidates[0].resolve() if candidates else (data_config_path.parent / value).resolve()
+
+
+def _yolo_local_path_candidates(
+    dataset_dir: Path,
+    data_config_path: Path,
+    config: dict,
+    value: str,
+) -> list[Path]:
+    path = Path(value)
+    candidates: list[Path] = []
+    config_parent = data_config_path.parent
+    if path.is_absolute():
+        candidates.append(path)
+        for suffix in _absolute_path_suffixes(path):
+            candidates.append(dataset_dir / suffix)
+            candidates.append(config_parent / suffix)
+        return _unique_paths(candidates)
+
+    root_value = str(config.get("path") or "").strip()
+    if root_value:
+        root = Path(root_value)
+        if root.is_absolute():
+            if root.name:
+                candidates.append(dataset_dir / root.name / path)
+                candidates.append(config_parent / root.name / path)
+            for suffix in _absolute_path_suffixes(root):
+                candidates.append(dataset_dir / suffix / path)
+                candidates.append(config_parent / suffix / path)
+        else:
+            candidates.append((config_parent / root / path).resolve())
+    candidates.append(config_parent / path)
+    candidates.append(dataset_dir / path)
+    return _unique_paths(candidates)
+
+
+def _absolute_path_suffixes(path: Path) -> list[Path]:
+    parts = [part for part in path.parts if part and part != path.anchor]
+    suffixes: list[Path] = []
+    for index in range(len(parts)):
+        suffixes.append(Path(*parts[index:]))
+    return suffixes
+
+
+def _normalized_yolo_suffix(value: str) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        suffixes = _absolute_path_suffixes(path)
+        return suffixes[-1].as_posix() if suffixes else ""
+    return value.replace("\\", "/").lstrip("./").strip()
+
+
+def _path_suffix(path: Path, suffix: str) -> bool:
+    normalized_path = path.resolve().as_posix().rstrip("/").lower()
+    normalized_suffix = suffix.replace("\\", "/").strip("/").lower()
+    return bool(normalized_suffix) and normalized_path.endswith(f"/{normalized_suffix}")
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _yolo_split_value_has_images(value: object) -> bool:
+    values = value if isinstance(value, list) else [value]
+    for item in values:
+        if item is None:
+            continue
+        path = Path(str(item))
+        if path.is_dir() and any(child.suffix.lower() in IMAGE_SUFFIXES for child in path.rglob("*") if child.is_file()):
+            return True
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
+            return True
+        if path.is_file():
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                image_path = Path(line.strip())
+                if image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES:
+                    return True
+    return False
+
+
 def _yolo_config_declares_split(path: Path, split: str) -> bool:
     split = "val" if split == "valid" else split
     try:
@@ -1017,7 +1866,15 @@ def _yolo_config_declares_split(path: Path, split: str) -> bool:
     return any(re.search(rf"(?m)^\s*{re.escape(key)}\s*:", text) is not None for key in keys)
 
 
-def _collect_yolo_validation_metrics(detector, data_config_path: Path, *, split: str, image_size: int, batch_size: int) -> dict:
+def _collect_yolo_validation_metrics(
+    detector,
+    data_config_path: Path,
+    *,
+    split: str,
+    image_size: int,
+    batch_size: int,
+    class_names: list[str] | None = None,
+) -> dict:
     metrics = detector.val(
         data=str(data_config_path),
         split=split,
@@ -1025,10 +1882,10 @@ def _collect_yolo_validation_metrics(detector, data_config_path: Path, *, split:
         batch=batch_size,
         plots=False,
     )
-    return _yolo_metrics_from_object(metrics)
+    return _yolo_metrics_from_object(metrics, class_names=class_names)
 
 
-def _yolo_metrics_from_object(metrics: object) -> dict:
+def _yolo_metrics_from_object(metrics: object, *, class_names: list[str] | None = None) -> dict:
     results_dict = getattr(metrics, "results_dict", None)
     if not isinstance(results_dict, dict):
         results_dict = {}
@@ -1048,6 +1905,9 @@ def _yolo_metrics_from_object(metrics: object) -> dict:
         out["mAP50"] = out["mAP50"] or _object_float(box, "map50")
         out["precision"] = out["precision"] or _object_float(box, "mp")
         out["recall"] = out["recall"] or _object_float(box, "mr")
+        per_class_metrics = _yolo_per_class_metrics_from_box(box, class_names or _yolo_class_names_from_metrics(metrics))
+        if per_class_metrics:
+            out["per_class_metrics"] = per_class_metrics
     if isinstance(speed, dict):
         inference_ms = _number(speed.get("inference"))
         preprocess_ms = _number(speed.get("preprocess"))
@@ -1058,12 +1918,133 @@ def _yolo_metrics_from_object(metrics: object) -> dict:
             out["latency_preprocess_ms"] = preprocess_ms
         if postprocess_ms > 0:
             out["latency_postprocess_ms"] = postprocess_ms
-    return {key: round(float(value), 6) for key, value in out.items() if _number(value) > 0}
+    cleaned: dict[str, object] = {}
+    for key, value in out.items():
+        if key == "per_class_metrics":
+            if isinstance(value, dict) and value:
+                cleaned[key] = value
+            continue
+        if _number(value) > 0:
+            cleaned[key] = round(float(value), 6)
+    return cleaned
+
+
+def _install_yolo_epoch_metrics_callback(
+    detector,
+    *,
+    orchestrator_url: str,
+    job_id: str,
+    run_root: Path,
+    learning_rate: float,
+    image_size: int,
+    posted_epochs: set[int],
+) -> None:
+    def post_epoch_metrics(_trainer=None) -> None:
+        _post_yolo_epoch_metrics(
+            orchestrator_url,
+            job_id,
+            run_root,
+            learning_rate=learning_rate,
+            image_size=image_size,
+            posted_epochs=posted_epochs,
+        )
+
+    add_callback = getattr(detector, "add_callback", None)
+    if not callable(add_callback):
+        return
+    for event_name in ("on_train_epoch_end", "on_fit_epoch_end"):
+        try:
+            add_callback(event_name, post_epoch_metrics)
+        except Exception as exc:
+            print(f"[model-express] failed to register YOLO {event_name} metric callback: {exc}")
+
+
+def _post_yolo_epoch_metrics(
+    orchestrator_url: str,
+    job_id: str,
+    run_root: Path,
+    *,
+    learning_rate: float,
+    image_size: int,
+    posted_epochs: set[int] | None = None,
+) -> int:
+    results_path = _find_yolo_results_csv(run_root)
+    if results_path is None:
+        return 0
+    posted = 0
+    try:
+        with results_path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                epoch = int(_first_metric_value(row, "epoch")) or posted + 1
+                metrics = _yolo_epoch_metrics_from_row(row, learning_rate=learning_rate, image_size=image_size)
+                if not metrics:
+                    continue
+                normalized_epoch = max(1, epoch)
+                if posted_epochs is not None and normalized_epoch in posted_epochs:
+                    continue
+                _post_json(
+                    f"{orchestrator_url}/jobs/{job_id}/metrics",
+                    {
+                        "epoch": normalized_epoch,
+                        "metrics": metrics,
+                    },
+                )
+                if posted_epochs is not None:
+                    posted_epochs.add(normalized_epoch)
+                posted += 1
+    except Exception as exc:
+        print(f"[model-express] failed to post YOLO epoch metrics from {results_path}: {exc}")
+        return posted
+    return posted
+
+
+def _find_yolo_results_csv(run_root: Path) -> Path | None:
+    candidates = [
+        run_root / "train" / "results.csv",
+        run_root / "results.csv",
+    ]
+    candidates.extend(sorted(run_root.glob("**/results.csv"), key=lambda path: len(path.parts)))
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _yolo_epoch_metrics_from_row(row: dict, *, learning_rate: float, image_size: int) -> dict:
+    metrics = {
+        "mAP50_95": _first_metric_value(row, "metrics/mAP50-95(B)", "metrics/mAP50-95", "mAP50_95", "map50_95"),
+        "mAP50": _first_metric_value(row, "metrics/mAP50(B)", "metrics/mAP50", "mAP50", "map50"),
+        "precision": _first_metric_value(row, "metrics/precision(B)", "metrics/precision", "precision"),
+        "recall": _first_metric_value(row, "metrics/recall(B)", "metrics/recall", "recall"),
+        "box_loss": _first_metric_value(row, "val/box_loss", "box_loss"),
+        "cls_loss": _first_metric_value(row, "val/cls_loss", "cls_loss"),
+        "dfl_loss": _first_metric_value(row, "val/dfl_loss", "dfl_loss"),
+    }
+    train_box = _first_metric_value(row, "train/box_loss")
+    train_cls = _first_metric_value(row, "train/cls_loss")
+    train_dfl = _first_metric_value(row, "train/dfl_loss")
+    val_box = _first_metric_value(row, "val/box_loss")
+    val_cls = _first_metric_value(row, "val/cls_loss")
+    val_dfl = _first_metric_value(row, "val/dfl_loss")
+    if train_box > 0 or train_cls > 0 or train_dfl > 0:
+        metrics["train_loss"] = train_box + train_cls + train_dfl
+    if val_box > 0 or val_cls > 0 or val_dfl > 0:
+        metrics["val_loss"] = val_box + val_cls + val_dfl
+    metrics["learning_rate"] = _first_metric_value(row, "lr/pg0", "lr/pg1", "lr/pg2", "learning_rate") or learning_rate
+    metrics["image_size"] = image_size
+    if metrics["mAP50_95"] > 0:
+        metrics["map50_95"] = metrics["mAP50_95"]
+    if metrics["mAP50"] > 0:
+        metrics["map50"] = metrics["mAP50"]
+    return {key: round(float(value), 6) for key, value in metrics.items() if _number(value) > 0}
 
 
 def _first_metric_value(values: dict, *keys: str) -> float:
+    normalized_values = {}
+    for raw_key, raw_value in values.items():
+        normalized_values[str(raw_key).strip()] = raw_value
     for key in keys:
-        number = _number(values.get(key))
+        number = _number(normalized_values.get(key))
         if number > 0:
             return number
     return 0.0
@@ -1071,6 +2052,134 @@ def _first_metric_value(values: dict, *keys: str) -> float:
 
 def _object_float(obj: object, attr: str) -> float:
     return _number(getattr(obj, attr, None))
+
+
+def _numeric_sequence(value: object) -> list[float]:
+    if value is None:
+        return []
+    if hasattr(value, "detach"):
+        try:
+            value = value.detach()
+        except Exception:
+            pass
+    if hasattr(value, "cpu"):
+        try:
+            value = value.cpu()
+        except Exception:
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            value = value.tolist()
+        except Exception:
+            pass
+    if isinstance(value, (list, tuple)):
+        out: list[float] = []
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                continue
+            number = _number(item)
+            if number >= 0:
+                out.append(number)
+        return out
+    number = _number(value)
+    return [number] if number > 0 else []
+
+
+def _numeric_matrix(value: object) -> list[list[float]]:
+    if value is None:
+        return []
+    if hasattr(value, "detach"):
+        try:
+            value = value.detach()
+        except Exception:
+            pass
+    if hasattr(value, "cpu"):
+        try:
+            value = value.cpu()
+        except Exception:
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            value = value.tolist()
+        except Exception:
+            pass
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[list[float]] = []
+    for row in value:
+        if not isinstance(row, (list, tuple)):
+            continue
+        numbers = [_number(item) for item in row]
+        if any(number > 0 for number in numbers):
+            out.append(numbers)
+    return out
+
+
+def _class_index_sequence(value: object, fallback_count: int) -> list[int]:
+    values = _numeric_sequence(value)
+    if values:
+        return [int(item) for item in values]
+    return list(range(max(0, fallback_count)))
+
+
+def _yolo_class_names_from_metrics(metrics: object) -> list[str]:
+    names = getattr(metrics, "names", None)
+    if isinstance(names, dict):
+        return [str(names[key]).strip() for key in sorted(names) if str(names[key]).strip()][:200]
+    if isinstance(names, list):
+        return [str(item).strip() for item in names if str(item).strip()][:200]
+    return []
+
+
+def _yolo_class_name(class_names: list[str], class_index: int, row_index: int) -> str:
+    if 0 <= class_index < len(class_names) and class_names[class_index].strip():
+        return class_names[class_index].strip()
+    if 0 <= row_index < len(class_names) and class_names[row_index].strip():
+        return class_names[row_index].strip()
+    return f"class_{class_index if class_index >= 0 else row_index}"
+
+
+def _yolo_metric_at(values: list[float], row_index: int, class_index: int) -> float:
+    if 0 <= class_index < len(values):
+        return values[class_index]
+    if 0 <= row_index < len(values):
+        return values[row_index]
+    return 0.0
+
+
+def _yolo_per_class_metrics_from_box(box: object, class_names: list[str]) -> dict:
+    precision_values = _numeric_sequence(getattr(box, "p", None))
+    recall_values = _numeric_sequence(getattr(box, "r", None))
+    ap50_values = _numeric_sequence(getattr(box, "ap50", None))
+    map_values = _numeric_sequence(getattr(box, "maps", None))
+    all_ap = _numeric_matrix(getattr(box, "all_ap", None))
+    row_count = max(len(precision_values), len(recall_values), len(ap50_values), len(map_values), len(all_ap))
+    if row_count == 0:
+        return {}
+    class_indices = _class_index_sequence(getattr(box, "ap_class_index", None), row_count)
+    out: dict[str, dict[str, float]] = {}
+    for row_index in range(row_count):
+        class_index = class_indices[row_index] if row_index < len(class_indices) else row_index
+        ap_row = all_ap[row_index] if row_index < len(all_ap) else []
+        ap50 = _yolo_metric_at(ap50_values, row_index, class_index)
+        if ap50 <= 0 and ap_row:
+            ap50 = ap_row[0]
+        map50_95 = _yolo_metric_at(map_values, row_index, class_index)
+        if map50_95 <= 0 and ap_row:
+            positive_ap = [value for value in ap_row if value > 0]
+            if positive_ap:
+                map50_95 = sum(positive_ap) / len(positive_ap)
+        precision = _yolo_metric_at(precision_values, row_index, class_index)
+        recall = _yolo_metric_at(recall_values, row_index, class_index)
+        if precision <= 0 and recall <= 0 and ap50 <= 0 and map50_95 <= 0:
+            continue
+        out[_yolo_class_name(class_names, class_index, row_index)] = {
+            "precision": round(precision, 6),
+            "recall": round(recall, 6),
+            "AP50": round(ap50, 6),
+            "AP50_95": round(map50_95, 6),
+        }
+    return _yolo_per_class_metrics_with_macro_average(out)
 
 
 def _metric_float(values: dict, *keys: str, default: float) -> float:
@@ -1258,19 +2367,45 @@ def _export_yolo_detector_bundle(
 
 
 def _yolo_per_class_metrics(class_names: list[str], metrics: dict) -> dict:
-    precision = _metric_float(metrics, "precision", default=0.0)
-    recall = _metric_float(metrics, "recall", default=0.0)
-    map50 = _metric_float(metrics, "mAP50", "map50", default=0.0)
-    map50_95 = _metric_float(metrics, "mAP50_95", "map50_95", default=0.0)
-    return {
-        class_name: {
-            "precision": round(precision, 6),
-            "recall": round(recall, 6),
-            "AP50": round(map50, 6),
-            "AP50_95": round(map50_95, 6),
+    per_class = metrics.get("per_class_metrics")
+    if isinstance(per_class, dict) and per_class:
+        return _yolo_per_class_metrics_with_macro_average(
+            {
+                str(class_name): {
+                    "precision": _metric_float(metric_values if isinstance(metric_values, dict) else {}, "precision", default=0.0),
+                    "recall": _metric_float(metric_values if isinstance(metric_values, dict) else {}, "recall", default=0.0),
+                    "AP50": _metric_float(metric_values if isinstance(metric_values, dict) else {}, "AP50", "mAP50", "map50", default=0.0),
+                    "AP50_95": _metric_float(metric_values if isinstance(metric_values, dict) else {}, "AP50_95", "mAP50_95", "map50_95", default=0.0),
+                }
+                for class_name, metric_values in per_class.items()
+                if str(class_name).strip() and str(class_name).lower() != "macro avg"
+            }
+        )
+    return {}
+
+
+def _yolo_per_class_metrics_with_macro_average(per_class: dict) -> dict:
+    cleaned: dict[str, dict[str, float]] = {}
+    for class_name, metric_values in per_class.items():
+        if not isinstance(metric_values, dict):
+            continue
+        normalized = {
+            "precision": round(_number(metric_values.get("precision")), 6),
+            "recall": round(_number(metric_values.get("recall")), 6),
+            "AP50": round(_number(metric_values.get("AP50")), 6),
+            "AP50_95": round(_number(metric_values.get("AP50_95")), 6),
         }
-        for class_name in class_names
-    }
+        if any(value > 0 for value in normalized.values()):
+            cleaned[str(class_name).strip()] = normalized
+    values = list(cleaned.values())
+    if values:
+        cleaned["macro avg"] = {
+            "precision": round(sum(row["precision"] for row in values) / len(values), 6),
+            "recall": round(sum(row["recall"] for row in values) / len(values), 6),
+            "AP50": round(sum(row["AP50"] for row in values) / len(values), 6),
+            "AP50_95": round(sum(row["AP50_95"] for row in values) / len(values), 6),
+        }
+    return cleaned
 
 
 def _detection_holistic_scores(
@@ -1335,10 +2470,17 @@ def materialize_image_dataset(payload: dict) -> dict:
         cache_root=DATASET_MATERIALIZATION_ROOT,
     )
     _commit_modal_dataset_volume()
+    dataset_materialization = {
+        **materialized.telemetry,
+        **_modal_dataset_cache_relationship_fields(
+            DATASET_MATERIALIZATION_ROOT,
+            materialization_scope="modal_dataset_volume",
+        ),
+    }
     return {
         "dataset_id": dataset_id,
         "dataset_dir": str(materialized.dataset_dir),
-        "dataset_materialization": materialized.telemetry,
+        "dataset_materialization": dataset_materialization,
     }
 
 
@@ -1445,10 +2587,67 @@ def _modal_training_dataset_cache_root() -> Path:
     )
 
 
+def _modal_dataset_cache_relationship_fields(
+    materialization_cache_root: Path | PurePosixPath | str,
+    *,
+    materialization_scope: str,
+    training_cache_root: Path | PurePosixPath | str | None = None,
+) -> dict:
+    materialization_root = _modal_cache_path_text(materialization_cache_root)
+    prewarm_root = _modal_cache_path_text(DATASET_MATERIALIZATION_ROOT)
+    training_root = _modal_cache_path_text(training_cache_root or _modal_training_dataset_cache_root())
+    training_mount_paths = sorted(_modal_cache_path_text(path) for path in training_volume_mounts)
+    prewarm_root_matches_training_root = prewarm_root == training_root
+    prewarm_root_mounted_for_training = prewarm_root in training_mount_paths
+    prewarm_reusable_for_training = prewarm_root_matches_training_root and prewarm_root_mounted_for_training
+    if prewarm_reusable_for_training:
+        reuse_status = "reusable_for_training"
+        training_scope = "modal_dataset_volume"
+    elif not prewarm_root_matches_training_root:
+        reuse_status = "staging_only_root_mismatch"
+        training_scope = "modal_training_local"
+    else:
+        reuse_status = "staging_only_training_mount_missing"
+        training_scope = "modal_training_local"
+    return {
+        "dataset_materialization_cache_root": materialization_root,
+        "dataset_materialization_cache_scope": materialization_scope,
+        "dataset_prewarm_cache_root": prewarm_root,
+        "dataset_training_cache_root": training_root,
+        "dataset_training_cache_scope": training_scope,
+        "dataset_training_volume_mounts": training_mount_paths,
+        "dataset_prewarm_root_matches_training_root": prewarm_root_matches_training_root,
+        "dataset_prewarm_root_mounted_for_training": prewarm_root_mounted_for_training,
+        "dataset_prewarm_reusable_for_training": prewarm_reusable_for_training,
+        "dataset_prewarm_reuse_status": reuse_status,
+    }
+
+
+def _modal_cache_path_text(path: Path | PurePosixPath | str) -> str:
+    return str(path).replace("\\", "/").rstrip("/") or "/"
+
+
+def _modal_stage_telemetry_enabled() -> bool:
+    return _bool(os.getenv("MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY"), default=False)
+
+
 def _modal_training_phase(job_id: str, phase: str, started_at: float, **fields: object) -> None:
     import time
 
     elapsed = max(0.0, time.time() - started_at)
+    events = _MODAL_STAGE_EVENTS.get()
+    if events is not None:
+        events.append(
+            {
+                "phase": phase,
+                "elapsed_seconds": round(elapsed, 6),
+                "fields": {
+                    key: _modal_stage_field_value(value)
+                    for key, value in fields.items()
+                    if value is not None
+                },
+            }
+        )
     field_text = " ".join(
         f"{key}={_modal_training_phase_value(value)}"
         for key, value in fields.items()
@@ -1461,6 +2660,135 @@ def _modal_training_phase(job_id: str, phase: str, started_at: float, **fields: 
 def _modal_training_phase_value(value: object) -> str:
     text = str(value)
     return text.replace("\n", " ").replace("\r", " ")[:120]
+
+
+def _modal_stage_field_value(value: object) -> object:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return round(float(value), 6)
+    return _modal_training_phase_value(value)
+
+
+def _modal_stage_telemetry_payload(
+    job: dict,
+    runtime_seconds: float,
+    stage_events: list[dict],
+    dataset_materialization: dict,
+    gpu_type: str,
+) -> dict:
+    if not _modal_stage_telemetry_enabled():
+        return {}
+    materialization_seconds = _stage_duration(
+        stage_events,
+        "dataset_local_materialization_start",
+        "dataset_local_materialization_done",
+    )
+    active_training_seconds = _sum_stage_durations(
+        stage_events,
+        ("epoch_train_start", "epoch_train_done"),
+    ) + _stage_duration(stage_events, "yolo_train_start", "yolo_train_done")
+    evaluation_seconds = _sum_stage_durations(
+        stage_events,
+        ("epoch_eval_start", "epoch_eval_done"),
+    ) + _stage_duration(stage_events, "final_eval_start", "final_eval_done") + _stage_duration(
+        stage_events,
+        "yolo_eval_start",
+        "yolo_eval_done",
+    )
+    export_seconds = _stage_duration(stage_events, "export_start", "export_done")
+    known_seconds = materialization_seconds + active_training_seconds + evaluation_seconds + export_seconds
+    payload = {
+        "schema_version": "remote_gpu_stage_telemetry_v1",
+        "current_stage": stage_events[-1]["phase"] if stage_events else "",
+        "events": stage_events[-80:],
+        "queue_wait_seconds": _job_queue_wait_seconds(job),
+        "dataset_materialization_seconds": round(materialization_seconds, 6),
+        "dataset_download_seconds": _float_from_payload(
+            dataset_materialization,
+            "dataset_materialization_download_seconds",
+        ),
+        "dataset_extract_seconds": _float_from_payload(
+            dataset_materialization,
+            "dataset_materialization_extract_seconds",
+        ),
+        "dataset_materialization_wait_seconds": _float_from_payload(
+            dataset_materialization,
+            "dataset_materialization_wait_seconds",
+        ),
+        "active_training_seconds": round(active_training_seconds, 6),
+        "evaluation_seconds": round(evaluation_seconds, 6),
+        "export_seconds": round(export_seconds, 6),
+        "idle_wait_seconds": round(max(0.0, runtime_seconds - known_seconds), 6),
+        "runtime_seconds": round(max(0.0, runtime_seconds), 6),
+        "gpu_type": gpu_type,
+        "warm_container_policy": _modal_warm_container_policy(),
+    }
+    return payload
+
+
+def _stage_duration(stage_events: list[dict], start_phase: str, done_phase: str) -> float:
+    started = None
+    for event in stage_events:
+        phase = str(event.get("phase") or "")
+        elapsed = _float_from_payload(event, "elapsed_seconds")
+        if phase == start_phase:
+            started = elapsed
+        elif phase == done_phase and started is not None:
+            return max(0.0, elapsed - started)
+    return 0.0
+
+
+def _sum_stage_durations(stage_events: list[dict], phase_pair: tuple[str, str]) -> float:
+    start_phase, done_phase = phase_pair
+    total = 0.0
+    started = None
+    for event in stage_events:
+        phase = str(event.get("phase") or "")
+        elapsed = _float_from_payload(event, "elapsed_seconds")
+        if phase == start_phase:
+            started = elapsed
+        elif phase == done_phase and started is not None:
+            total += max(0.0, elapsed - started)
+            started = None
+    return round(total, 6)
+
+
+def _float_from_payload(payload: dict, key: str) -> float:
+    try:
+        value = float(payload.get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, value), 6)
+
+
+def _job_queue_wait_seconds(job: dict) -> float:
+    created_at = _parse_datetime(job.get("created_at"))
+    if created_at is None:
+        return 0.0
+    return round(max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds()), 6)
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _modal_warm_container_policy() -> dict:
+    return {
+        "min_containers": _modal_training_min_containers() or 0,
+        "buffer_containers": _modal_training_buffer_containers() or 0,
+        "scaledown_window_seconds": _modal_training_scaledown_window_seconds() or 0,
+        "cost_sensitive_defaults_enabled": _modal_cost_sensitive_defaults_enabled(),
+    }
 
 
 class _MetadataBundleImageDataset:
@@ -1557,6 +2885,7 @@ def _load_image_data(
     class_balancing_config: dict | None = None,
     *,
     metadata_bundle: dict | None = None,
+    dataset_tier_config: dict | None = None,
 ):
     import torch
     from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
@@ -1649,6 +2978,35 @@ def _load_image_data(
     else:
         train_indices, val_indices, test_indices = metadata_split_indices
         execution_metadata["metadata_bundle"]["split_strategy"] = "metadata_official"
+
+    tier_config = dataset_tier_config if isinstance(dataset_tier_config, dict) else {}
+    if tier_config.get("enabled") and tier_config.get("tier") == "preview":
+        from worker.datasets.tiers import build_classification_preview_subset
+
+        subset_manifest = build_classification_preview_subset(
+            dataset_dir=dataset_dir,
+            dataset_checksum=str(tier_config.get("dataset_checksum") or ""),
+            targets=list(getattr(base_dataset, "targets", [])),
+            split_indices={
+                "train": list(train_indices),
+                "val": list(val_indices),
+                "test": list(test_indices),
+            },
+            class_names=list(base_dataset.classes),
+            fraction=float(tier_config.get("fraction") or 0.25),
+            seed=int(tier_config.get("seed") or 42),
+            split_policy=str(tier_config.get("split_policy") or execution_metadata["metadata_bundle"].get("split_strategy") or ""),
+            image_size_family=str(tier_config.get("image_size_family") or _image_size_family("image_classification", image_size)),
+        )
+        train_indices = subset_manifest["indices"]["train"]
+        val_indices = subset_manifest["indices"]["val"]
+        test_indices = subset_manifest["indices"]["test"]
+        execution_metadata["dataset_tier"] = {
+            "tier": "preview",
+            "subset_manifest": subset_manifest,
+        }
+    elif tier_config:
+        execution_metadata["dataset_tier"] = {"tier": tier_config.get("tier") or "full"}
 
     if metadata_spec is not None:
         train_dataset = _MetadataBundleImageDataset(metadata_spec, transform=train_transform)
@@ -3458,20 +4816,6 @@ def _positive_float(value: object, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
-
-
-def _bool(value: object, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-    return bool(value)
 
 
 def _non_negative_float(value: object, default: float) -> float:

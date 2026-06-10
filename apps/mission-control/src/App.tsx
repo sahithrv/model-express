@@ -77,15 +77,25 @@ const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localh
 const jobsPerPage = 10;
 const liveRefreshIntervalMs = 10_000;
 
-type MetricKey = "macro_f1" | "accuracy" | "train_loss" | "val_loss";
+type MetricKey = string;
 type ProjectTabKey = "overview" | "data" | "experiments" | "agents" | "operations" | "export";
 
-const metricOptions: Array<{ key: MetricKey; label: string }> = [
-	{ key: "macro_f1", label: "macro_f1" },
-	{ key: "accuracy", label: "Accuracy" },
-	{ key: "train_loss", label: "Train loss" },
-	{ key: "val_loss", label: "Val loss" },
+const classificationMetricPriority = ["macro_f1", "accuracy", "train_loss", "val_loss"];
+const detectionMetricPriority = [
+  "mAP50_95",
+  "mAP50",
+  "precision",
+  "recall",
+  "box_loss",
+  "cls_loss",
+  "dfl_loss",
+  "train_loss",
+  "val_loss",
 ];
+const detectionMetricAliases: Record<string, string[]> = {
+  mAP50_95: ["mAP50_95", "map50_95", "map"],
+  mAP50: ["mAP50", "map50"],
+};
 
 const projectTabs: Array<{ key: ProjectTabKey; label: string }> = [
 	{ key: "overview", label: "Overview" },
@@ -95,6 +105,161 @@ const projectTabs: Array<{ key: ProjectTabKey; label: string }> = [
 	{ key: "operations", label: "Operations" },
 	{ key: "export", label: "Export" },
 ];
+
+function metricLabel(key: MetricKey) {
+  switch (key) {
+    case "mAP50_95":
+    case "map50_95":
+    case "map":
+      return "mAP50-95";
+    case "mAP50":
+    case "map50":
+      return "mAP50";
+    case "dfl_loss":
+      return "DFL loss";
+    case "box_loss":
+      return "Box loss";
+    case "cls_loss":
+      return "Class loss";
+    case "train_loss":
+      return "Train loss";
+    case "val_loss":
+      return "Val loss";
+    case "accuracy":
+      return "Accuracy";
+    default:
+      return key;
+  }
+}
+
+function isDetectionJob(job: Job | null) {
+  if (!job) return false;
+  const config = job.config ?? {};
+  const values = [job.template, config.task, config.task_type, config.model, config.architecture, config.framework]
+    .map((value) => String(value ?? "").toLowerCase())
+    .join(" ");
+  return values.includes("object_detection") || values.includes("detection") || values.includes("yolo");
+}
+
+function isDetectionRun(summary: TrainingRunSummary | null, evaluation: TrainingRunEvaluation | null, job: Job | null) {
+  if (isDetectionJob(job)) return true;
+  const objective = evaluation?.objective_profile ?? {};
+  const modelProfile = evaluation?.model_profile ?? {};
+  const values = [
+    summary?.target_metric,
+    recordString(objective, "target_metric"),
+    recordString(objective, "task_type"),
+    recordString(modelProfile, "task_type"),
+    recordString(modelProfile, "model_kind"),
+    recordString(modelProfile, "architecture"),
+    recordString(modelProfile, "framework"),
+  ]
+    .map((value) => String(value ?? "").toLowerCase())
+    .join(" ");
+  return values.includes("object_detection") || values.includes("detection") || values.includes("yolo") || values.includes("map50");
+}
+
+function firstPositiveMetric(values: Array<number | null | undefined>) {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
+}
+
+function yoloMetricFromEvaluation(evaluation: TrainingRunEvaluation | null, metric: "map50_95" | "map50" | "precision" | "recall") {
+  const objective = evaluation?.objective_profile ?? {};
+  const detectionMetrics = recordObject((evaluation?.holistic_scores ?? {}).detection_metrics);
+  switch (metric) {
+    case "map50_95":
+      return firstPositiveMetric([
+        recordNumber(objective, "heldout_test_map50_95"),
+        recordNumber(objective, "heldout_test_map"),
+        recordNumber(detectionMetrics, "mAP50_95"),
+        recordNumber(detectionMetrics, "map50_95"),
+        recordNumber(detectionMetrics, "map"),
+      ]);
+    case "map50":
+      return firstPositiveMetric([
+        recordNumber(objective, "heldout_test_map50"),
+        recordNumber(detectionMetrics, "mAP50"),
+        recordNumber(detectionMetrics, "map50"),
+      ]);
+    case "precision":
+      return firstPositiveMetric([recordNumber(objective, "heldout_test_precision"), recordNumber(detectionMetrics, "precision")]);
+    case "recall":
+      return firstPositiveMetric([recordNumber(objective, "heldout_test_recall"), recordNumber(detectionMetrics, "recall")]);
+  }
+  return 0;
+}
+
+function runPrimaryMetric(summary: TrainingRunSummary | null, evaluation: TrainingRunEvaluation | null, job: Job | null) {
+  if (isDetectionRun(summary, evaluation, job)) {
+    const map50_95 = firstPositiveMetric([
+      yoloMetricFromEvaluation(evaluation, "map50_95"),
+      summary?.best_map50_95,
+      summary?.best_macro_f1,
+    ]);
+    const map50 = firstPositiveMetric([yoloMetricFromEvaluation(evaluation, "map50"), summary?.best_map50, summary?.best_accuracy]);
+    return {
+      label: "mAP50-95",
+      value: map50_95,
+      secondaryLabel: "mAP50",
+      secondaryValue: map50,
+      isDetection: true,
+    };
+  }
+  return {
+    label: "Macro-F1",
+    value: summary?.best_macro_f1 ?? 0,
+    secondaryLabel: "Accuracy",
+    secondaryValue: summary?.best_accuracy ?? 0,
+    isDetection: false,
+  };
+}
+
+function championPrimaryMetric(
+  champion: ProjectChampion | null,
+  summary: TrainingRunSummary | null,
+  evaluation: TrainingRunEvaluation | null,
+  job: Job | null,
+) {
+  const metric = runPrimaryMetric(summary, evaluation, job);
+  if (!champion) return metric;
+  const explicitLabel = recordString(champion.metrics, "primary_metric_label");
+  const explicitValue = recordNumber(champion.metrics, "primary_metric_value");
+  if (explicitValue > 0) {
+    return { ...metric, label: explicitLabel || metric.label, value: explicitValue };
+  }
+  if (metric.isDetection) {
+    const map50_95 = firstPositiveMetric([recordNumber(champion.metrics, "best_map50_95"), metric.value]);
+    const map50 = firstPositiveMetric([recordNumber(champion.metrics, "best_map50"), metric.secondaryValue]);
+    return { ...metric, value: map50_95, secondaryValue: map50 };
+  }
+  return metric;
+}
+
+function metricTabOptions(metrics: EpochMetric[], job: Job | null): Array<{ key: MetricKey; label: string }> {
+  const present = new Set<string>();
+  metrics.forEach((metric) => {
+    Object.entries(metric.metrics ?? {}).forEach(([key, value]) => {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        present.add(key);
+      }
+    });
+  });
+  const priority = isDetectionJob(job) ? detectionMetricPriority : classificationMetricPriority;
+  const prioritizedKeys = priority
+    .map((key) => (detectionMetricAliases[key] ?? [key]).find((alias) => present.has(alias)))
+    .filter((key): key is string => Boolean(key));
+  const prioritizedAliases = new Set(priority.flatMap((key) => detectionMetricAliases[key] ?? [key]));
+  const ordered = [
+    ...prioritizedKeys,
+    ...Array.from(present)
+      .filter((key) => !prioritizedAliases.has(key))
+      .sort((a, b) => a.localeCompare(b)),
+  ];
+  return ordered.map((key) => ({ key, label: metricLabel(key) }));
+}
 
 type ProjectDetail = {
   decisions: AgentDecision[];
@@ -189,7 +354,8 @@ type MissionChampionSummary = {
   model: string;
   primaryMetricLabel: string;
   primaryMetricValue: string;
-  accuracy: string;
+  secondaryMetricLabel: string;
+  secondaryMetricValue: string;
   cost: string;
   runtime: string;
   latency: string;
@@ -440,8 +606,10 @@ type ChampionComparisonRow = {
   jobId: string;
   model: string;
   rankScore: number;
-  accuracy: number;
-  macroF1: number;
+  primaryMetricLabel: string;
+  primaryMetricValue: number;
+  secondaryMetricLabel: string;
+  secondaryMetricValue: number;
   runtimeSeconds: number;
   costUsd: number;
   latencyMs: number;
@@ -592,6 +760,8 @@ type AutomationSettingsUpdate = Partial<
     | "max_followup_rounds"
     | "default_training_provider"
     | "default_gpu_type"
+    | "cost_mode"
+    | "budget_cap_usd"
     | "llm_enabled"
     | "agent_mode"
     | "llm_provider"
@@ -608,6 +778,8 @@ const defaultAutomationSettings: AutomationSettings = {
   max_followup_rounds: 2,
   default_training_provider: "local",
   default_gpu_type: "",
+  cost_mode: "balanced",
+  budget_cap_usd: 0,
   llm_enabled: false,
   agent_mode: "propose",
   llm_provider: "openai",
@@ -769,6 +941,19 @@ export function App() {
     () => detail.runEvaluations.find((evaluation) => evaluation.job_id === selectedJobId) ?? null,
     [detail.runEvaluations, selectedJobId],
   );
+  const selectedMetricOptions = useMemo(
+    () => metricTabOptions(metrics, selectedJob),
+    [metrics, selectedJob],
+  );
+
+  useEffect(() => {
+    if (selectedMetricOptions.length === 0) {
+      return;
+    }
+    if (!selectedMetricOptions.some((metric) => metric.key === selectedMetricKey)) {
+      setSelectedMetricKey(selectedMetricOptions[0].key);
+    }
+  }, [selectedMetricKey, selectedMetricOptions]);
 
   const latestPlan = detail.plans[0] ?? null;
   const latestDecision = detail.decisions[0] ?? null;
@@ -776,7 +961,19 @@ export function App() {
     ? detail.plans.some((plan) => plan.source_decision_id === latestDecision.id)
     : false;
   const decisionChatTurns = useMemo(() => buildDecisionChatTurns(detail.decisions), [detail.decisions]);
-  const runTotals = useMemo(() => summarizeTrainingRuns(detail.runSummaries), [detail.runSummaries]);
+  const runTotals = useMemo(
+    () => summarizeTrainingRuns(detail.runSummaries, detail.runEvaluations, detail.jobs),
+    [detail.jobs, detail.runEvaluations, detail.runSummaries],
+  );
+  const selectedChampionPrimaryMetric = useMemo(() => {
+    if (!detail.champion) return null;
+    return championPrimaryMetric(
+      detail.champion,
+      detail.runSummaries.find((summary) => summary.job_id === detail.champion?.job_id) ?? null,
+      detail.runEvaluations.find((evaluation) => evaluation.job_id === detail.champion?.job_id) ?? null,
+      detail.jobs.find((job) => job.id === detail.champion?.job_id) ?? null,
+    );
+  }, [detail.champion, detail.jobs, detail.runEvaluations, detail.runSummaries]);
   const timelineItems = useMemo(
     () => buildExperimentTimeline(selectedProject, detail),
     [detail, selectedProject],
@@ -1925,6 +2122,8 @@ export function App() {
           max_followup_rounds: Math.max(0, Math.trunc(settingsDraft.max_followup_rounds || 0)),
           default_training_provider: settingsDraft.default_training_provider,
           default_gpu_type: settingsDraft.default_gpu_type,
+          cost_mode: settingsDraft.cost_mode,
+          budget_cap_usd: Math.max(0, Number(settingsDraft.budget_cap_usd || 0)),
           llm_enabled: settingsDraft.llm_enabled,
           agent_mode: settingsDraft.agent_mode,
           llm_provider: settingsDraft.llm_provider,
@@ -2342,6 +2541,27 @@ export function App() {
                   />
                 </label>
                 <label className="setting-field">
+                  <span>Cost Mode</span>
+                  <select
+                    value={settingsDraft.cost_mode}
+                    onChange={(event) => updateSettingsDraft({ cost_mode: event.currentTarget.value })}
+                  >
+                    <option value="prototype">prototype/cheap</option>
+                    <option value="balanced">balanced</option>
+                    <option value="quality">quality</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>Budget Cap</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={settingsDraft.budget_cap_usd}
+                    onChange={(event) => updateSettingsDraft({ budget_cap_usd: Number.parseFloat(event.currentTarget.value) || 0 })}
+                  />
+                </label>
+                <label className="setting-field">
                   <span>Provider</span>
                   <select
                     value={settingsDraft.default_training_provider}
@@ -2349,6 +2569,7 @@ export function App() {
                   >
                     <option value="local">local</option>
                     <option value="modal">modal</option>
+                    <option value="persistent_gpu">persistent_gpu</option>
                   </select>
                 </label>
                 <label className="setting-field">
@@ -2412,12 +2633,12 @@ export function App() {
                 </div>
                 <div className="champion-grid">
                   <div>
-                    <small>Macro-F1</small>
-                    <strong>{formatMaybeMetric(recordNumber(detail.champion.metrics, "best_macro_f1"))}</strong>
+                    <small>{selectedChampionPrimaryMetric?.label ?? "Macro-F1"}</small>
+                    <strong>{formatMaybeMetric(selectedChampionPrimaryMetric?.value ?? 0)}</strong>
                   </div>
                   <div>
-                    <small>Accuracy</small>
-                    <strong>{formatMaybeMetric(recordNumber(detail.champion.metrics, "best_accuracy"))}</strong>
+                    <small>{selectedChampionPrimaryMetric?.secondaryLabel ?? "Accuracy"}</small>
+                    <strong>{formatMaybeMetric(selectedChampionPrimaryMetric?.secondaryValue ?? 0)}</strong>
                   </div>
                   <div>
                     <small>Cost</small>
@@ -2511,8 +2732,8 @@ export function App() {
                   <strong>{formatCurrency(runTotals.totalCost)}</strong>
                 </div>
                 <div>
-                  <span><Trophy size={15} /> Best macro_f1</span>
-                  <strong>{formatMaybeMetric(runTotals.bestMacroF1)}</strong>
+                  <span><Trophy size={15} /> Best {runTotals.bestPrimaryMetricLabel}</span>
+                  <strong>{formatMaybeMetric(runTotals.bestPrimaryMetricValue)}</strong>
                 </div>
                 <div>
                   <span><Timer size={15} /> GPU Runtime</span>
@@ -2529,28 +2750,34 @@ export function App() {
                   <div className="run-table-row run-table-head">
                     <span>Model</span>
                     <span>Status</span>
-                    <span>Best F1</span>
+                    <span>Best Metric</span>
                     <span>Cost</span>
                     <span>Runtime</span>
                     <span>Epochs</span>
                   </div>
-                  {detail.runSummaries.map((summary) => (
-                    <button
-                      className={summary.job_id === selectedJobId ? "run-table-row run-row active" : "run-table-row run-row"}
-                      key={summary.job_id}
-                      onClick={() => setSelectedJobId(summary.job_id)}
-                    >
-                      <span>
-                        <strong>{summary.model || "unknown"}</strong>
-                        <small>{summary.job_id}</small>
-                      </span>
-                      <Badge value={summary.status || "UNKNOWN"} />
-                      <strong>{formatMaybeMetric(summary.best_macro_f1)}</strong>
-                      <strong>{formatCurrency(summary.estimated_cost_usd)}</strong>
-                      <span>{formatSeconds(summary.runtime_seconds)}</span>
-                      <span>{summary.epochs_completed}</span>
-                    </button>
-                  ))}
+                  {detail.runSummaries.map((summary) => {
+                    const evaluation = detail.runEvaluations.find((item) => item.job_id === summary.job_id) ?? null;
+                    const job = detail.jobs.find((item) => item.id === summary.job_id) ?? null;
+                    const primaryMetric = runPrimaryMetric(summary, evaluation, job);
+                    return (
+                      <button
+                        className={summary.job_id === selectedJobId ? "run-table-row run-row active" : "run-table-row run-row"}
+                        key={summary.job_id}
+                        onClick={() => setSelectedJobId(summary.job_id)}
+                      >
+                        <span>
+                          <strong>{summary.model || "unknown"}</strong>
+                          <small>{summary.job_id}</small>
+                          {trainingRunCacheSummary(summary) && <small>{trainingRunCacheSummary(summary)}</small>}
+                        </span>
+                        <Badge value={summary.status || "UNKNOWN"} />
+                        <strong title={primaryMetric.label}>{formatMaybeMetric(primaryMetric.value)}</strong>
+                        <strong>{formatCurrency(summary.estimated_cost_usd)}</strong>
+                        <span>{formatSeconds(summary.runtime_seconds)}</span>
+                        <span>{summary.epochs_completed}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               ) : (
                 <div className="empty">Training summaries will appear as soon as experiment jobs report their first epoch.</div>
@@ -2564,8 +2791,8 @@ export function App() {
                 <div className="comparison-row comparison-head">
                   <span>Model</span>
                   <span>Rank</span>
-                  <span>Macro-F1</span>
-                  <span>Accuracy</span>
+                  <span>Primary</span>
+                  <span>Secondary</span>
                   <span>Gap</span>
                   <span>Seed Var</span>
                   <span>Runtime</span>
@@ -2584,8 +2811,8 @@ export function App() {
                       <small>{row.isChampion ? "selected champion" : row.jobId}</small>
                     </span>
                     <strong>{formatMaybeMetric(row.rankScore)}</strong>
-                    <strong>{formatMaybeMetric(row.macroF1)}</strong>
-                    <span>{formatMaybeMetric(row.accuracy)}</span>
+                    <strong title={row.primaryMetricLabel}>{formatMaybeMetric(row.primaryMetricValue)}</strong>
+                    <span title={row.secondaryMetricLabel}>{formatMaybeMetric(row.secondaryMetricValue)}</span>
                     <span title={row.divergenceStatus || undefined}>{formatLossGap(row.trainValidationGap)}</span>
                     <span>{formatSeedVariance(row.seedVariance, row.seedRunCount)}</span>
                     <span>{formatSeconds(row.runtimeSeconds)}</span>
@@ -2654,6 +2881,7 @@ export function App() {
                           <small>
                             {requirement.target_count} worker(s) - {requirement.provider}
                             {requirement.gpu_type ? `/${requirement.gpu_type}` : ""}
+                            {workerRequirementMaterializationSummary(requirement) ? ` - ${workerRequirementMaterializationSummary(requirement)}` : ""}
                           </small>
                         </span>
                         <Badge value={requirement.status} />
@@ -2975,7 +3203,7 @@ export function App() {
                 </div>
                 <div className="metric-toolbar">
                   <div className="metric-tabs">
-                    {metricOptions.map((metric) => (
+                    {selectedMetricOptions.map((metric) => (
                       <button
                         key={metric.key}
                         className={selectedMetricKey === metric.key ? "metric-tab active" : "metric-tab"}
@@ -2990,17 +3218,24 @@ export function App() {
                       <span>{formatCurrency(selectedRunSummary.estimated_cost_usd)}</span>
                       <span>{formatSeconds(selectedRunSummary.runtime_seconds)}</span>
                       <span>{selectedRunSummary.epochs_completed} epochs</span>
+                      {trainingRunLifecycleChips(selectedRunSummary).map((chip) => (
+                        <span key={chip}>{chip}</span>
+                      ))}
                       {selectedRunEvaluation && (
                         <span>{formatLatency(recordNumber(selectedRunEvaluation.model_profile, "estimated_latency_ms"))}</span>
                       )}
                     </div>
                   )}
                 </div>
-                <MetricChart
-                  metrics={metrics}
-                  metricKey={selectedMetricKey}
-                  label={metricOptions.find((metric) => metric.key === selectedMetricKey)?.label ?? selectedMetricKey}
-                />
+                {selectedMetricOptions.length > 0 ? (
+                  <MetricChart
+                    metrics={metrics}
+                    metricKey={selectedMetricKey}
+                    label={selectedMetricOptions.find((metric) => metric.key === selectedMetricKey)?.label ?? metricLabel(selectedMetricKey)}
+                  />
+                ) : (
+                  <div className="empty chart-empty">No graphable metrics reported</div>
+                )}
                 {selectedRunEvaluation && <RunEvaluationDetails evaluation={selectedRunEvaluation} />}
               </div>
             ) : (
@@ -3327,7 +3562,7 @@ function ChampionOutcomeSummary({
   onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
 }) {
   const extraFacts = [
-    { label: "Accuracy", value: champion.accuracy },
+    { label: champion.secondaryMetricLabel, value: champion.secondaryMetricValue },
     { label: "Latency", value: champion.latency },
     { label: "Cost", value: champion.cost },
     { label: "Size", value: champion.modelSize },
@@ -5087,7 +5322,14 @@ function MetricChart({ metrics, metricKey, label }: { metrics: EpochMetric[]; me
     return <div className="empty chart-empty">No metrics reported</div>;
   }
 
-  const values = metrics.map((metric) => metric.metrics[metricKey] ?? 0);
+  const rows = metrics
+    .map((metric) => ({ epoch: metric.epoch, value: metric.metrics[metricKey] }))
+    .filter((metric): metric is { epoch: number; value: number } => typeof metric.value === "number" && Number.isFinite(metric.value));
+  if (rows.length === 0) {
+    return <div className="empty chart-empty">No {label} values reported</div>;
+  }
+
+  const values = rows.map((metric) => metric.value);
   const maxValue = Math.max(...values, 1);
   const minValue = Math.min(...values, 0);
   const range = Math.max(maxValue - minValue, 0.001);
@@ -5095,13 +5337,13 @@ function MetricChart({ metrics, metricKey, label }: { metrics: EpochMetric[]; me
   const width = 760;
   const height = 240;
   const padding = 28;
-  const points = values.map((value, index) => {
+  const points = rows.map((row, index) => {
     const x =
-      metrics.length === 1
+      rows.length === 1
         ? width / 2
-        : padding + (index / (metrics.length - 1)) * (width - padding * 2);
-    const y = height - padding - ((value - minValue) / range) * (height - padding * 2);
-    return { x, y, value, epoch: metrics[index].epoch };
+        : padding + (index / (rows.length - 1)) * (width - padding * 2);
+    const y = height - padding - ((row.value - minValue) / range) * (height - padding * 2);
+    return { x, y, value: row.value, epoch: row.epoch };
   });
 
   const latest = points[points.length - 1];
@@ -5211,18 +5453,86 @@ function formatBytes(value: number) {
   return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function summarizeTrainingRuns(summaries: TrainingRunSummary[]) {
-  const best = summaries.reduce<TrainingRunSummary | null>((currentBest, summary) => {
-    if (!currentBest) return summary;
-    return summary.best_macro_f1 > currentBest.best_macro_f1 ? summary : currentBest;
+function summarizeTrainingRuns(
+  summaries: TrainingRunSummary[],
+  evaluations: TrainingRunEvaluation[] = [],
+  jobs: Job[] = [],
+) {
+  const evaluationByJob = new Map(evaluations.map((evaluation) => [evaluation.job_id, evaluation]));
+  const jobById = new Map(jobs.map((job) => [job.id, job]));
+  const best = summaries.reduce<{ summary: TrainingRunSummary; metric: ReturnType<typeof runPrimaryMetric> } | null>((currentBest, summary) => {
+    const metric = runPrimaryMetric(summary, evaluationByJob.get(summary.job_id) ?? null, jobById.get(summary.job_id) ?? null);
+    if (!currentBest) return { summary, metric };
+    return metric.value > currentBest.metric.value ? { summary, metric } : currentBest;
   }, null);
 
   return {
     totalCost: summaries.reduce((total, summary) => total + summary.estimated_cost_usd, 0),
     totalRuntimeSeconds: summaries.reduce((total, summary) => total + summary.runtime_seconds, 0),
-    bestMacroF1: best?.best_macro_f1 ?? 0,
+    bestMacroF1: best?.summary.best_macro_f1 ?? 0,
+    bestPrimaryMetricLabel: best?.metric.label ?? "Macro-F1",
+    bestPrimaryMetricValue: best?.metric.value ?? 0,
     activeRuns: summaries.filter((summary) => ["RUNNING", "ASSIGNED", "QUEUED"].includes(summary.status)).length,
   };
+}
+
+function trainingRunCacheSummary(summary: TrainingRunSummary) {
+  const materialization = recordObject(summary.dataset_materialization);
+  const reuseStatus = recordString(materialization, "dataset_prewarm_reuse_status");
+  const status = recordString(materialization, "dataset_materialization_status");
+  const cacheRoot = recordString(materialization, "dataset_training_cache_root");
+  const cacheKey = recordString(materialization, "dataset_materialization_cache_key");
+  const hitMiss = recordBoolean(materialization, "dataset_materialization_cache_hit")
+    ? "hit"
+    : recordBoolean(materialization, "dataset_materialization_cache_miss")
+      ? "miss"
+      : "";
+  const parts = [
+    reuseStatus ? humanizeAuditKey(reuseStatus) : status ? humanizeAuditKey(status) : "",
+    hitMiss,
+    cacheKey ? shortCacheKey(cacheKey) : "",
+    cacheRoot ? "cache root set" : "",
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" - ") : "";
+}
+
+function trainingRunLifecycleChips(summary: TrainingRunSummary) {
+  const stageTelemetry = recordObject(summary.stage_telemetry);
+  const materialization = recordObject(summary.dataset_materialization);
+  const warmPolicy = recordObject(stageTelemetry.warm_container_policy);
+  const chips = [
+    lifecycleSecondsChip("queue", recordNumber(stageTelemetry, "queue_wait_seconds")),
+    lifecycleSecondsChip("materialize", recordNumber(stageTelemetry, "dataset_materialization_seconds")),
+    lifecycleSecondsChip("train", recordNumber(stageTelemetry, "active_training_seconds")),
+    lifecycleSecondsChip("idle", recordNumber(stageTelemetry, "idle_wait_seconds")),
+    lifecycleSecondsChip("scaledown", recordNumber(warmPolicy, "scaledown_window_seconds")),
+    trainingRunCacheSummary(summary),
+  ].filter(Boolean);
+  const reuseStatus = recordString(materialization, "dataset_prewarm_reuse_status");
+  if (reuseStatus && !chips.includes(reuseStatus)) chips.push(humanizeAuditKey(reuseStatus));
+  return chips.slice(0, 7);
+}
+
+function lifecycleSecondsChip(label: string, seconds: number) {
+  return seconds > 0 ? `${label} ${formatSeconds(seconds)}` : "";
+}
+
+function workerRequirementMaterializationSummary(requirement: WorkerRequirement) {
+  const parts = [
+    requirement.dataset_materialization_status ? humanizeAuditKey(requirement.dataset_materialization_status) : "",
+    requirement.max_concurrent_jobs ? `${requirement.max_concurrent_jobs} concurrent` : "",
+    requirement.max_cold_dataset_materializations ? `${requirement.max_cold_dataset_materializations} cold` : "",
+    requirement.dataset_cache_key ? shortCacheKey(requirement.dataset_cache_key) : "",
+  ].filter(Boolean);
+  return parts.join(" / ");
+}
+
+function shortCacheKey(value: string) {
+  const text = String(value || "").trim();
+  if (text.length <= 18) return text;
+  const [prefix, rest] = text.split("-", 2);
+  if (prefix && rest) return `${prefix}-${rest.slice(0, 8)}`;
+  return text.slice(0, 12);
 }
 
 function buildMissionDigest({
@@ -5253,7 +5563,7 @@ function buildMissionDigest({
   const queuedJobs = counts.QUEUED;
   const activeJobs = counts.ASSIGNED + counts.RUNNING;
   const terminalJobs = counts.SUCCEEDED + counts.FAILED;
-  const runTotals = summarizeTrainingRuns(detail.runSummaries);
+  const runTotals = summarizeTrainingRuns(detail.runSummaries, detail.runEvaluations, detail.jobs);
   const workerSummary = missionWorkerSummary(detail.workers, detail.workerRequirements);
   const latestTerminalTimestamp = Math.max(
     ...detail.jobs
@@ -5575,8 +5885,8 @@ function missionFacts({
   } else {
     facts.push({ label: "Runs", value: "Not launched", tone: latestPlan ? "warning" : "info" });
   }
-  if (runTotals.bestMacroF1 > 0) {
-    facts.push({ label: "Best macro-F1", value: formatMaybeMetric(runTotals.bestMacroF1), tone: "ok" });
+  if (runTotals.bestPrimaryMetricValue > 0) {
+    facts.push({ label: `Best ${runTotals.bestPrimaryMetricLabel}`, value: formatMaybeMetric(runTotals.bestPrimaryMetricValue), tone: "ok" });
   } else if (workerSummary.availableWorkers > 0 || workerSummary.pendingRequirements > 0) {
     facts.push({
       label: "Workers",
@@ -5673,7 +5983,7 @@ function missionStateCopy({
     return {
       headline: activeJobs > 0 ? "Experiments are training." : "Experiments are queued.",
       detail: activeJobs > 0
-        ? `${activeJobs} training job${activeJobs === 1 ? "" : "s"} running${runTotals.bestMacroF1 > 0 ? `; best macro-F1 is ${formatMaybeMetric(runTotals.bestMacroF1)}.` : "."}`
+        ? `${activeJobs} training job${activeJobs === 1 ? "" : "s"} running${runTotals.bestPrimaryMetricValue > 0 ? `; best ${runTotals.bestPrimaryMetricLabel} is ${formatMaybeMetric(runTotals.bestPrimaryMetricValue)}.` : "."}`
         : `${queuedJobs} queued job${queuedJobs === 1 ? "" : "s"} waiting for worker capacity.`,
     };
   }
@@ -5686,7 +5996,7 @@ function missionStateCopy({
   if (state === "champion_selected") {
     return {
       headline: "A champion has been selected.",
-      detail: `The best reported macro-F1 is ${formatMaybeMetric(runTotals.bestMacroF1)}. Export, demo, or compare it against completed runs.`,
+      detail: `The best reported ${runTotals.bestPrimaryMetricLabel} is ${formatMaybeMetric(runTotals.bestPrimaryMetricValue)}. Export, demo, or compare it against completed runs.`,
     };
   }
   if (state === "review_needed") {
@@ -6129,15 +6439,16 @@ function buildMissionChampionSummary(detail: ProjectDetail): MissionChampionSumm
   const modelProfile = championModelProfile(champion);
   const holisticScores = evaluation?.holistic_scores ?? {};
   const objectiveFit = recordNumber(holisticScores, "overall_score") || recordNumber(holisticScores, "objective_fit");
-  const macroF1 = recordNumber(champion.metrics, "best_macro_f1") || summary?.best_macro_f1 || 0;
-  const accuracy = recordNumber(champion.metrics, "best_accuracy") || summary?.best_accuracy || 0;
+  const job = detail.jobs.find((item) => item.id === champion.job_id) ?? null;
+  const primaryMetric = championPrimaryMetric(champion, summary, evaluation, job);
   const cost = recordNumber(champion.metrics, "estimated_cost_usd") || summary?.estimated_cost_usd || 0;
   const runtime = recordNumber(champion.metrics, "runtime_seconds") || summary?.runtime_seconds || 0;
   return {
     model: recordString(champion.metrics, "model") || summary?.model || "Selected champion",
-    primaryMetricLabel: "Macro-F1",
-    primaryMetricValue: formatMaybeMetric(macroF1),
-    accuracy: formatMaybeMetric(accuracy),
+    primaryMetricLabel: primaryMetric.label,
+    primaryMetricValue: formatMaybeMetric(primaryMetric.value),
+    secondaryMetricLabel: primaryMetric.secondaryLabel,
+    secondaryMetricValue: formatMaybeMetric(primaryMetric.secondaryValue),
     cost: formatCurrency(cost),
     runtime: formatSeconds(runtime),
     latency: formatLatency(modelProfile.estimated_latency_ms),
@@ -6387,6 +6698,15 @@ function fallbackActivityFromExecutionEvent(event: ExecutionEvent): AgentActivit
       return { ...base, type: "workers.starting", title: "Workers starting", status: "active" };
     case "WORKERS_ACTIVE":
       return { ...base, type: "workers.active", severity: "success", title: "Workers active", status: "active" };
+    case "DISPATCHER_STATUS":
+      return {
+        ...base,
+        type: "dispatcher.status",
+        title: "Modal dispatcher status",
+        status: recordNumber(payload, "slot_count") === 0 ? "waiting" : "active",
+      };
+    case "DISPATCHER_IDLE_EXIT":
+      return { ...base, type: "dispatcher.idle_exit", severity: "success", title: "Modal dispatcher idle", status: "succeeded" };
     case "JOB_RETRY_QUEUED": {
       const requeued = recordBoolean(payload, "requeued");
       return {
@@ -6584,6 +6904,14 @@ function fallbackActivityMetadata(payload: Record<string, unknown>) {
     "open_job_count",
     "active_worker_count",
     "target_count",
+    "previous_slot_count",
+    "slot_count",
+    "desired_slot_count",
+    "registered_slot_count",
+    "active_slot_count",
+    "idle_seconds",
+    "idle_exit_seconds",
+    "dispatcher",
     "provider",
     "gpu_type",
     "requirement_status",
@@ -8306,7 +8634,7 @@ function buildChampionComparison(
 ): ChampionComparisonRow[] {
   const evaluationByJob = new Map(evaluations.map((evaluation) => [evaluation.job_id, evaluation]));
   const jobById = new Map(jobs.map((job) => [job.id, job]));
-  const seedVarianceBySignature = buildSeedVarianceBySignature(summaries, jobById);
+  const seedVarianceBySignature = buildSeedVarianceBySignature(summaries, jobById, evaluationByJob);
   const championJobId = champion?.job_id ?? "";
   return summaries
     .map((summary) => {
@@ -8323,9 +8651,10 @@ function buildChampionComparison(
       const signature = job ? experimentComparisonSignature(job.config) : "";
       const seedVariance = signature ? seedVarianceBySignature.get(signature) : undefined;
       const latencyMs = recordNumber(modelProfile, "estimated_latency_ms");
+      const primaryMetric = runPrimaryMetric(summary, evaluation ?? null, job ?? null);
       const rankScore = experimentRankScore({
-        macroF1: summary.best_macro_f1,
-        accuracy: summary.best_accuracy,
+        primaryMetric: primaryMetric.value,
+        secondaryMetric: primaryMetric.secondaryValue,
         costUsd: summary.estimated_cost_usd,
         runtimeSeconds: summary.runtime_seconds,
         latencyMs,
@@ -8338,8 +8667,10 @@ function buildChampionComparison(
         jobId: summary.job_id,
         model: summary.model,
         rankScore,
-        accuracy: summary.best_accuracy,
-        macroF1: summary.best_macro_f1,
+        primaryMetricLabel: primaryMetric.label,
+        primaryMetricValue: primaryMetric.value,
+        secondaryMetricLabel: primaryMetric.secondaryLabel,
+        secondaryMetricValue: primaryMetric.secondaryValue,
         runtimeSeconds: summary.runtime_seconds,
         costUsd: summary.estimated_cost_usd,
         latencyMs,
@@ -8358,7 +8689,11 @@ function buildChampionComparison(
     .slice(0, 8);
 }
 
-function buildSeedVarianceBySignature(summaries: TrainingRunSummary[], jobById: Map<string, Job>) {
+function buildSeedVarianceBySignature(
+  summaries: TrainingRunSummary[],
+  jobById: Map<string, Job>,
+  evaluationByJob: Map<string, TrainingRunEvaluation>,
+) {
   const groups = new Map<string, Array<{ seed: string; score: number }>>();
   for (const summary of summaries) {
     const job = jobById.get(summary.job_id);
@@ -8368,7 +8703,7 @@ function buildSeedVarianceBySignature(summaries: TrainingRunSummary[], jobById: 
     const seed = experimentSeed(job.config);
     if (!seed) continue;
     const rows = groups.get(signature) ?? [];
-    rows.push({ seed, score: summary.best_macro_f1 });
+    rows.push({ seed, score: runPrimaryMetric(summary, evaluationByJob.get(summary.job_id) ?? null, job).value });
     groups.set(signature, rows);
   }
 
@@ -8384,8 +8719,8 @@ function buildSeedVarianceBySignature(summaries: TrainingRunSummary[], jobById: 
 }
 
 function experimentRankScore(input: {
-  macroF1: number;
-  accuracy: number;
+  primaryMetric: number;
+  secondaryMetric: number;
   costUsd: number;
   runtimeSeconds: number;
   latencyMs: number;
@@ -8394,7 +8729,7 @@ function experimentRankScore(input: {
   divergenceStatus: string;
   seedVariance: number | null;
 }) {
-  const quality = input.macroF1 * 0.65 + input.accuracy * 0.35;
+  const quality = input.primaryMetric * 0.72 + input.secondaryMetric * 0.28;
   const latencyScore = input.latencyMs ? clamp01(1 - input.latencyMs / 160) : 0.5;
   const costScore = clamp01(1 - input.costUsd / 10);
   const runtimeScore = clamp01(1 - input.runtimeSeconds / 1800);

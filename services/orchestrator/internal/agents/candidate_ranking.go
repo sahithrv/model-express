@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -40,12 +41,15 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 	return recommendation, nil
 }
 
-func mechanismExhausted(input ExperimentPlannerInput, mechanism string) (bool, string) {
-	normalized := normalizeMechanism(mechanism)
+func mechanismExhausted(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (bool, string) {
+	normalized := normalizeMechanism(candidate.Mechanism)
 	if normalized == "" {
 		return false, ""
 	}
 	group := mechanismGroup(normalized)
+	if multiFidelityPolicyEnabled() && yoloWeakBaselineRescueAllowed(input, candidate, experiment, normalized, group) {
+		return false, ""
+	}
 
 	if blockedByRejectedStrategyMemory(input, normalized, group) {
 		return true, fmt.Sprintf("mechanism %s is blocked by rejected strategy memory", normalized)
@@ -180,10 +184,11 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 		ranking.Reasons = append(ranking.Reasons, err.Error())
 		return ranking
 	}
-	if exhausted, reason := mechanismExhausted(input, candidate.Mechanism); exhausted {
+	if exhausted, reason := mechanismExhausted(input, candidate, experiment); exhausted {
 		ranking.Rejected = true
 		ranking.Score = 0
 		ranking.Reasons = append(ranking.Reasons, reason)
+		applyMultiFidelityPolicy(input, candidate, experiment, &ranking)
 		return ranking
 	}
 	if existing[signature] {
@@ -276,6 +281,7 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	if len(ranking.Reasons) == 0 {
 		ranking.Reasons = append(ranking.Reasons, "balanced expected gain, novelty, cost, risk, diagnosis alignment, and memory fit")
 	}
+	applyMultiFidelityPolicy(input, candidate, experiment, &ranking)
 	return ranking
 }
 
@@ -355,6 +361,128 @@ func candidateMechanismScore(input ExperimentPlannerInput, candidate CandidateHy
 		reasons = append(reasons, "same mechanism only changes minor tuning knobs")
 	}
 	return score, reasons
+}
+
+func applyMultiFidelityPolicy(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment, ranking *CandidateRanking) {
+	if ranking == nil || !multiFidelityPolicyEnabled() {
+		return
+	}
+	if ranking.Rejected {
+		ranking.PromotionDecision = "reject"
+		ranking.StopReason = firstNonEmpty(ranking.Reasons...)
+		if ranking.StopReason == "" {
+			ranking.StopReason = "candidate rejected by backend preview policy"
+		}
+		return
+	}
+	if budgetStopSignalActive(input) && candidateCostPenalty(candidate.CostLevel, experiment) >= 0.14 {
+		ranking.Rejected = true
+		ranking.Score = 0
+		ranking.PromotionDecision = "reject"
+		ranking.StopReason = "budget stop signal blocks new high-cost preview scheduling"
+		ranking.Reasons = append(ranking.Reasons, ranking.StopReason)
+		return
+	}
+	if materializationStopSignalActive(input) && !candidateAddressesMaterialization(candidate, experiment) {
+		ranking.PromotionDecision = "reject"
+		ranking.StopReason = "materialization overhead stop signal requires a candidate that reduces data movement or batches compatible trials"
+		ranking.Rejected = true
+		ranking.Score = 0
+		ranking.Reasons = append(ranking.Reasons, ranking.StopReason)
+		return
+	}
+	if yoloWeakBaselineRescueAllowed(input, candidate, experiment, normalizeMechanism(candidate.Mechanism), mechanismGroup(candidate.Mechanism)) {
+		ranking.PromotionDecision = "rescue"
+		ranking.StopReason = ""
+		ranking.Reasons = append(ranking.Reasons, "rescued by multi-fidelity policy: weak YOLO11n preview does not globally block YOLO preprocessing or larger variants")
+		return
+	}
+	if ranking.Score >= 0.62 {
+		ranking.PromotionDecision = "promote"
+	} else {
+		ranking.PromotionDecision = "rescue"
+		ranking.Reasons = append(ranking.Reasons, "ambiguous preview candidate kept as rescue rather than hard knockout")
+	}
+}
+
+func multiFidelityPolicyEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_MULTI_FIDELITY_POLICY")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func budgetStopSignalActive(input ExperimentPlannerInput) bool {
+	text := strings.ToLower(strings.Join(input.StopSignals, " "))
+	return containsAnyText(text, "budget exceeded", "budget cap", "projected cost exceeds", "cost cap")
+}
+
+func materializationStopSignalActive(input ExperimentPlannerInput) bool {
+	text := strings.ToLower(strings.Join(input.StopSignals, " "))
+	return containsAnyText(text, "materialization overhead", "dataset materialization", "data movement")
+}
+
+func candidateAddressesMaterialization(candidate CandidateHypothesis, experiment plans.PlannedExperiment) bool {
+	text := candidateMechanismEvidenceText(candidate, experiment)
+	return containsAnyText(text, "batch", "materialization", "preview subset", "cache", "data movement", "shard")
+}
+
+func yoloWeakBaselineRescueAllowed(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment, mechanism string, group string) bool {
+	if !isYOLODetectorExperiment(experiment) {
+		return false
+	}
+	if !weakYOLO11nEvidence(input) {
+		return false
+	}
+	if isLargerYOLOVariant(experiment.Model) {
+		return true
+	}
+	if group == "resolution_crop" || group == "augmentation" {
+		return true
+	}
+	text := candidateMechanismEvidenceText(candidate, experiment)
+	return containsAnyText(text, "preprocess", "letterbox", "scale", "small object", "label", "bbox", "bounding box") ||
+		mechanism == "capacity_finetune"
+}
+
+func weakYOLO11nEvidence(input ExperimentPlannerInput) bool {
+	textParts := append([]string{}, input.StopSignals...)
+	for _, option := range input.RejectedStrategyMemory {
+		textParts = append(textParts, option.Option, option.Reason, option.Evidence, strings.Join(option.AppliesWhen, " "))
+	}
+	for _, memory := range input.FailedStrategyMemory {
+		textParts = append(textParts, memory.BestModel, memory.Lesson, memory.OutcomeStatus, strings.Join(memory.Tags, " "))
+	}
+	for _, scorecard := range input.StrategyScorecards {
+		textParts = append(textParts, scorecard.Lesson, scorecard.Outcome, scorecard.StrategyType, compactJSON(scorecard.ProposedChanges))
+	}
+	text := strings.ToLower(strings.Join(textParts, " "))
+	return containsAnyText(text, "yolo11n", "yolo 11n", "nano") &&
+		containsAnyText(text, "weak", "low", "failed", "no improvement", "underperform", "near zero")
+}
+
+func isYOLODetectorExperiment(experiment plans.PlannedExperiment) bool {
+	text := strings.ToLower(strings.Join([]string{experiment.Template, experiment.Model, experiment.Reason, experiment.Strategy}, " "))
+	return strings.Contains(text, "yolo")
+}
+
+func isLargerYOLOVariant(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(normalized, "yolo11s") ||
+		strings.Contains(normalized, "yolo11m") ||
+		strings.Contains(normalized, "yolo11l") ||
+		strings.Contains(normalized, "yolo11x") ||
+		strings.Contains(normalized, "yolov8s") ||
+		strings.Contains(normalized, "yolov8m") ||
+		strings.Contains(normalized, "yolov8l") ||
+		strings.Contains(normalized, "yolov8x")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func blockedByRejectedStrategyMemory(input ExperimentPlannerInput, mechanism string, group string) bool {

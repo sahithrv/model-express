@@ -79,8 +79,9 @@ type executeExperimentPlanRequest struct {
 }
 
 type executeExperimentPlanResponse struct {
-	Plan plans.ExperimentPlan `json:"plan"`
-	Jobs []jobs.ExperimentJob `json:"jobs"`
+	Plan       plans.ExperimentPlan `json:"plan"`
+	Jobs       []jobs.ExperimentJob `json:"jobs"`
+	CostPolicy map[string]any       `json:"cost_policy,omitempty"`
 }
 
 type scheduleFollowUpExperimentsResponse struct {
@@ -98,6 +99,13 @@ type reopenExperimentationResponse struct {
 	Event    execution.ExecutionEvent `json:"event"`
 }
 
+type dispatcherEventRequest struct {
+	EventType string         `json:"event_type" binding:"required"`
+	PlanID    string         `json:"plan_id"`
+	Message   string         `json:"message"`
+	Payload   map[string]any `json:"payload"`
+}
+
 type automaticExperimentReviewResult struct {
 	Decision     *decisions.AgentDecision
 	FollowUpPlan *plans.ExperimentPlan
@@ -106,6 +114,7 @@ type automaticExperimentReviewResult struct {
 
 const (
 	llmExperimentPlannerDecisionSource     = "llm_experiment_planner"
+	costPolicyChampionDecisionSource       = "cost_policy_budget_stop"
 	minLLMDecisionConfidence               = 0.50
 	maxLLMPlannerExperiments               = 5
 	plannerMinimumMeaningfulImprovement    = 0.005
@@ -1075,6 +1084,9 @@ func (s *Server) upsertTrainingRunSummary(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	if err := s.observeTrainingRunMaterialization(c.Param("id"), summary); err != nil {
+		log.Printf("training run materialization observation failed for job %s: %v", c.Param("id"), err)
+	}
 	if summary.Status == jobs.StatusSucceeded || summary.Status == jobs.StatusFailed {
 		if job, err := s.store.GetJob(c.Param("id")); err == nil {
 			if err := s.observeAutoMLTrialForJob(job); err != nil {
@@ -1094,6 +1106,108 @@ func (s *Server) getTrainingRunSummary(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, summary)
+}
+
+func (s *Server) observeTrainingRunMaterialization(jobID string, summary runs.TrainingRunSummary) error {
+	if len(summary.DatasetMaterialization) == 0 {
+		return nil
+	}
+	status := trainingRunMaterializationRequirementStatus(summary.DatasetMaterialization)
+	if status == "" {
+		return nil
+	}
+	job, err := s.store.GetJob(jobID)
+	if err != nil {
+		return err
+	}
+	if job.Template != jobs.TemplateTrainExperiment {
+		return nil
+	}
+	planID := strings.TrimSpace(summary.PlanID)
+	if planID == "" {
+		planID = jobConfigString(job.Config, "plan_id")
+	}
+	if planID == "" {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(summary.Provider))
+	if provider == "" {
+		provider = strings.ToLower(jobConfigString(job.Config, "provider"))
+	}
+	cacheKey := strings.TrimSpace(payloadString(summary.DatasetMaterialization, "dataset_materialization_cache_key"))
+	if cacheKey == "" {
+		cacheKey = strings.TrimSpace(payloadString(summary.DatasetMaterialization, "dataset_cache_key"))
+	}
+	requirements, err := s.store.ListProjectWorkerRequirements(job.ProjectID)
+	if err != nil {
+		return err
+	}
+	for _, requirement := range requirements {
+		if requirement.PlanID != planID {
+			continue
+		}
+		if provider != "" {
+			requirementProvider := strings.ToLower(strings.TrimSpace(requirement.Provider))
+			requirementGPU := strings.ToLower(strings.TrimSpace(requirement.GPUType))
+			if requirementProvider != provider && requirementGPU != provider {
+				continue
+			}
+		}
+		if cacheKey != "" && requirement.DatasetCacheKey != "" && requirement.DatasetCacheKey != cacheKey {
+			continue
+		}
+		if requirement.DatasetMaterializationStatus == status {
+			continue
+		}
+		nextStatus := status
+		if _, err := s.store.UpdateWorkerRequirement(
+			requirement.ID,
+			execution.WorkerRequirementUpdate{DatasetMaterializationStatus: &nextStatus},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func trainingRunMaterializationRequirementStatus(materialization map[string]any) string {
+	reuseStatus := strings.ToLower(strings.TrimSpace(payloadString(materialization, "dataset_prewarm_reuse_status")))
+	if strings.HasPrefix(reuseStatus, "staging_only") {
+		return execution.DatasetMaterializationStagingOnly
+	}
+	if explicitFalseBool(materialization, "dataset_prewarm_reusable_for_training") {
+		return execution.DatasetMaterializationStagingOnly
+	}
+	status := strings.ToLower(strings.TrimSpace(payloadString(materialization, "dataset_materialization_status")))
+	switch status {
+	case "hit", "hit_after_wait", "materialized":
+		return execution.DatasetMaterializationWarm
+	case "materializing", "checking":
+		return execution.DatasetMaterializationMaterializing
+	}
+	if payloadBool(materialization, "dataset_materialization_cache_hit") {
+		return execution.DatasetMaterializationWarm
+	}
+	if payloadBool(materialization, "dataset_materialization_cache_miss") {
+		return execution.DatasetMaterializationMaterializing
+	}
+	return ""
+}
+
+func explicitFalseBool(payload map[string]any, key string) bool {
+	value, ok := payload[key]
+	if !ok {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return !typed
+	case string:
+		parsed, ok := envFlagValueFromString(typed)
+		return ok && !parsed
+	default:
+		return false
+	}
 }
 
 func (s *Server) upsertTrainingRunEvaluation(c *gin.Context) {
@@ -2767,11 +2881,18 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 	if provider == "" {
 		provider = "local"
 	}
+	provider = normalizeTrainingProvider(provider)
+	if err := validateTrainingProviderConfigured(provider); err != nil {
+		return err
+	}
 	targetCount := s.targetWorkerCountForPlan(plan, openJobCount)
 	activeWorkerCount := s.activeOrStartingWorkersForProject(plan.ProjectID, provider, req.GPUType)
 	requirementPolicy, err := s.workerRequirementPolicyForPlan(plan, provider, targetCount)
 	if err != nil {
 		return err
+	}
+	if policy := costPolicyForSettings(s.currentAutomationSettings()); policy.Enabled && policy.MaxConcurrentJobs > 0 && requirementPolicy.MaxConcurrentJobs > policy.MaxConcurrentJobs {
+		requirementPolicy.MaxConcurrentJobs = policy.MaxConcurrentJobs
 	}
 
 	requirement, created, err := s.store.UpsertWorkerRequirement(
@@ -2822,6 +2943,7 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 		"cold_cache_policy":                 requirement.ColdCachePolicy,
 		"max_concurrent_jobs":               requirement.MaxConcurrentJobs,
 		"max_cold_dataset_materializations": requirement.MaxColdDatasetMaterializations,
+		"cost_policy":                       costPolicyForSettings(s.currentAutomationSettings()).Payload(),
 	}); err != nil {
 		return err
 	}
@@ -2850,6 +2972,7 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 		"cold_cache_policy":                 requirement.ColdCachePolicy,
 		"max_concurrent_jobs":               requirement.MaxConcurrentJobs,
 		"max_cold_dataset_materializations": requirement.MaxColdDatasetMaterializations,
+		"cost_policy":                       costPolicyForSettings(s.currentAutomationSettings()).Payload(),
 	})
 	return err
 }
@@ -2876,6 +2999,274 @@ func openTrainingJobCount(experimentJobs []jobs.ExperimentJob) int {
 	return count
 }
 
+type costModePolicy struct {
+	Enabled           bool
+	Mode              string
+	BudgetCapUSD      float64
+	SpentUSD          float64
+	MaxConcurrentJobs int
+	MaxPreviewTrials  int
+	MaxFullTrials     int
+	ExportPolicy      string
+	BatchMaxTrials    int
+	PreviewCount      int
+	FullCount         int
+	Skipped           []map[string]any
+}
+
+func (s *Server) costPolicyForPlan(plan plans.ExperimentPlan) (costModePolicy, error) {
+	settings := s.currentAutomationSettings()
+	policy := costPolicyForSettings(settings)
+	if !policy.Enabled {
+		return policy, nil
+	}
+	summaries, err := s.store.ListProjectTrainingRunSummaries(plan.ProjectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return costModePolicy{}, err
+	}
+	for _, summary := range summaries {
+		policy.SpentUSD += summary.EstimatedCostUSD
+	}
+	return policy, nil
+}
+
+func costPolicyForSettings(automationSettings settings.AutomationSettings) costModePolicy {
+	mode := normalizeCostMode(automationSettings.CostMode)
+	policy := costModePolicy{
+		Enabled:      costModesEnabled(),
+		Mode:         mode,
+		BudgetCapUSD: automationSettings.BudgetCapUSD,
+		ExportPolicy: "champion_only",
+	}
+	switch mode {
+	case "prototype":
+		policy.MaxConcurrentJobs = 1
+		policy.MaxPreviewTrials = 3
+		policy.MaxFullTrials = 1
+		policy.BatchMaxTrials = 3
+	case "quality":
+		policy.MaxConcurrentJobs = 4
+		policy.MaxPreviewTrials = 8
+		policy.MaxFullTrials = 4
+		policy.BatchMaxTrials = 8
+		policy.ExportPolicy = "top_candidates"
+	default:
+		policy.Mode = "balanced"
+		policy.MaxConcurrentJobs = 2
+		policy.MaxPreviewTrials = 6
+		policy.MaxFullTrials = 2
+		policy.BatchMaxTrials = 5
+		policy.ExportPolicy = "champion_plus_final_candidate"
+	}
+	if policy.BudgetCapUSD < 0 {
+		policy.BudgetCapUSD = 0
+	}
+	return policy
+}
+
+func (policy *costModePolicy) AllowTrainingJob(tier string) (bool, string) {
+	if !policy.Enabled {
+		return true, ""
+	}
+	if policy.BudgetCapUSD > 0 && policy.SpentUSD >= policy.BudgetCapUSD && tier == "full" {
+		return false, "budget_cap_reached"
+	}
+	if tier == "full" {
+		if policy.MaxFullTrials > 0 && policy.FullCount >= policy.MaxFullTrials {
+			return false, "cost_mode_full_trial_limit"
+		}
+		policy.FullCount++
+		return true, ""
+	}
+	if policy.MaxPreviewTrials > 0 && policy.PreviewCount >= policy.MaxPreviewTrials {
+		return false, "cost_mode_preview_trial_limit"
+	}
+	policy.PreviewCount++
+	return true, ""
+}
+
+func (policy *costModePolicy) Skip(index int, tier string, reason string) {
+	if policy.Skipped == nil {
+		policy.Skipped = []map[string]any{}
+	}
+	policy.Skipped = append(policy.Skipped, map[string]any{
+		"experiment_index": index,
+		"training_tier":    tier,
+		"reason":           reason,
+		"cost_mode":        policy.Mode,
+		"budget_cap_usd":   policy.BudgetCapUSD,
+		"spent_usd":        policy.SpentUSD,
+	})
+}
+
+func (policy costModePolicy) Payload() map[string]any {
+	if !policy.Enabled {
+		return nil
+	}
+	return map[string]any{
+		"enabled":             true,
+		"cost_mode":           policy.Mode,
+		"budget_cap_usd":      policy.BudgetCapUSD,
+		"spent_usd":           policy.SpentUSD,
+		"max_concurrent_jobs": policy.MaxConcurrentJobs,
+		"max_preview_trials":  policy.MaxPreviewTrials,
+		"max_full_trials":     policy.MaxFullTrials,
+		"export_policy":       policy.ExportPolicy,
+		"batch_max_trials":    policy.BatchMaxTrials,
+		"preview_count":       policy.PreviewCount,
+		"full_count":          policy.FullCount,
+		"skipped":             policy.Skipped,
+	}
+}
+
+func (s *Server) recordCostPolicySkippedJobs(plan plans.ExperimentPlan, policy costModePolicy) error {
+	if !policy.Enabled || len(policy.Skipped) == 0 {
+		return nil
+	}
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventCostBudgetBlocked, "Cost mode or budget cap blocked queued training job(s).", policy.Payload()); err != nil {
+		return err
+	}
+	_, err := s.selectBestAvailableChampionAfterCostPolicyStop(plan, policy, "queue_policy_block")
+	return err
+}
+
+func (s *Server) selectBestAvailableChampionAfterCostPolicyStop(plan plans.ExperimentPlan, policy costModePolicy, trigger string) (bool, error) {
+	if !policy.Enabled || len(policy.Skipped) == 0 {
+		return false, nil
+	}
+	return s.selectBestAvailableChampionForCostStoppedPlan(plan, policy.Payload(), trigger)
+}
+
+func (s *Server) selectBestAvailableChampionForCostStoppedPlan(plan plans.ExperimentPlan, costPolicyPayload map[string]any, trigger string) (bool, error) {
+	if plan.ID == "" {
+		return false, nil
+	}
+	if _, err := s.store.GetProjectChampion(plan.ProjectID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	decisionsForProject, err := s.store.ListProjectAgentDecisions(plan.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	for _, decision := range decisionsForProject {
+		if decision.PlanID == plan.ID && decision.Payload["decision_source"] == costPolicyChampionDecisionSource {
+			if err := s.persistProjectChampionFromDecision(plan.ProjectID, decision); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+	openJobs, err := s.hasOpenTrainingJobForPlan(plan.ProjectID, plan.ID)
+	if err != nil {
+		return false, err
+	}
+	if openJobs {
+		return false, nil
+	}
+	summaries, err := s.store.ListProjectTrainingRunSummaries(plan.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	best, ok := bestSuccessfulTrainingSummaryForObjective(plan.TargetMetric, summaries, nil, agents.ProjectObjectiveContext{})
+	if !ok {
+		_, eventErr := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventCostBudgetBlocked, "Cost policy stopped training, but no successful model is available to export yet.", map[string]any{
+			"decision_source": costPolicyChampionDecisionSource,
+			"trigger":         trigger,
+			"cost_policy":     costPolicyPayload,
+			"exportable":      false,
+		})
+		return false, eventErr
+	}
+	score := holisticRunScore(plan.TargetMetric, best, runs.TrainingRunEvaluation{}, agents.ProjectObjectiveContext{})
+	payload := map[string]any{
+		"decision_source":               costPolicyChampionDecisionSource,
+		"auto_executable":               true,
+		"target_metric":                 plan.TargetMetric,
+		"champion_job_id":               best.JobID,
+		"champion_model":                best.Model,
+		"champion_score":                roundDiagnosticFloat(score),
+		"champion_macro_f1":             roundDiagnosticFloat(best.BestMacroF1),
+		"champion_accuracy":             roundDiagnosticFloat(best.BestAccuracy),
+		"champion_estimated_cost_usd":   roundDiagnosticFloat(best.EstimatedCostUSD),
+		"champion_runtime_seconds":      roundDiagnosticFloat(best.RuntimeSeconds),
+		"budget_stop_trigger":           trigger,
+		"cost_policy":                   costPolicyPayload,
+		"selected_best_available_model": true,
+	}
+	rationale := fmt.Sprintf("Cost mode or budget cap stopped additional training for plan %s, so the backend selected the best successful model available within the budget: %s.", plan.ID, best.JobID)
+	decision, err := s.store.CreateAgentDecision(plan.ProjectID, plan.ID, decisions.TypeSelectChampion, rationale, payload)
+	if err != nil {
+		return false, err
+	}
+	if err := s.persistProjectChampionFromDecision(plan.ProjectID, decision); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Server) hasOpenTrainingJobForPlan(projectID string, planID string) (bool, error) {
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return false, err
+	}
+	for _, job := range projectJobs {
+		if job.Template != jobs.TemplateTrainExperiment {
+			continue
+		}
+		if configString(job.Config, "plan_id") != planID {
+			continue
+		}
+		switch strings.ToUpper(strings.TrimSpace(job.Status)) {
+		case jobs.StatusQueued, jobs.StatusAssigned, jobs.StatusRunning:
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Server) selectBestAvailableChampionIfCostStoppedAfterTrainingJob(job jobs.ExperimentJob) (bool, error) {
+	summary, err := s.store.GetTrainingRunSummary(job.ID)
+	if err != nil || summary.PlanID == "" {
+		return false, nil
+	}
+	plan, err := s.store.GetExperimentPlan(summary.PlanID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	payload, ok, err := s.costPolicyStopPayloadForPlan(job.ProjectID, plan.ID)
+	if err != nil || !ok {
+		return false, err
+	}
+	return s.selectBestAvailableChampionForCostStoppedPlan(plan, payload, "terminal_training_hook")
+}
+
+func (s *Server) costPolicyStopPayloadForPlan(projectID string, planID string) (map[string]any, bool, error) {
+	events, err := s.store.ListProjectExecutionEvents(projectID, 500)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, event := range events {
+		if event.PlanID != planID || event.EventType != execution.EventCostBudgetBlocked {
+			continue
+		}
+		if event.Payload["decision_source"] == costPolicyChampionDecisionSource {
+			continue
+		}
+		if skipped, ok := event.Payload["skipped"].([]map[string]any); ok && len(skipped) > 0 {
+			return event.Payload, true, nil
+		}
+		if skipped, ok := event.Payload["skipped"].([]any); ok && len(skipped) > 0 {
+			return event.Payload, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
 func (s *Server) targetWorkerCountForPlan(plan plans.ExperimentPlan, openJobCount int) int {
 	if openJobCount < 1 {
 		return 1
@@ -2889,6 +3280,9 @@ func (s *Server) targetWorkerCountForPlan(plan plans.ExperimentPlan, openJobCoun
 	}
 	if maxWorkers := maxAutoWorkersFromEnv(); maxWorkers > 0 && targetCount > maxWorkers {
 		targetCount = maxWorkers
+	}
+	if policy := costPolicyForSettings(s.currentAutomationSettings()); policy.Enabled && policy.MaxConcurrentJobs > 0 && targetCount > policy.MaxConcurrentJobs {
+		targetCount = policy.MaxConcurrentJobs
 	}
 	return targetCount
 }
@@ -2971,7 +3365,118 @@ func datasetMaterializationPolicy(dataset datasets.Dataset, provider string, max
 			policy.DatasetMaterializationStatus = execution.DatasetMaterializationCold
 		}
 	}
+	if provider == persistentGPUProviderName {
+		policy.ColdCachePolicy = execution.ColdCachePolicySingleMaterialization
+		policy.MaxColdDatasetMaterializations = 1
+		if checksum != "" || policy.DatasetCacheKey != "" {
+			policy.DatasetMaterializationStatus = execution.DatasetMaterializationCold
+		}
+	}
 	return policy
+}
+
+const persistentGPUProviderName = "persistent_gpu"
+
+func addCostPolicyConfig(config map[string]any, policy costModePolicy, tier string) {
+	if !policy.Enabled {
+		return
+	}
+	config["cost_mode"] = policy.Mode
+	config["budget_cap_usd"] = policy.BudgetCapUSD
+	config["export_policy"] = policy.ExportPolicy
+	config["cost_policy"] = map[string]any{
+		"enabled":             true,
+		"cost_mode":           policy.Mode,
+		"training_tier":       tier,
+		"budget_cap_usd":      policy.BudgetCapUSD,
+		"spent_usd":           policy.SpentUSD,
+		"max_concurrent_jobs": policy.MaxConcurrentJobs,
+		"max_preview_trials":  policy.MaxPreviewTrials,
+		"max_full_trials":     policy.MaxFullTrials,
+		"export_policy":       policy.ExportPolicy,
+		"batch_max_trials":    policy.BatchMaxTrials,
+	}
+}
+
+func addPersistentGPUConfig(config map[string]any, provider string, dataset datasets.Dataset, policy execution.WorkerRequirementPolicy) {
+	if provider != persistentGPUProviderName {
+		return
+	}
+	cacheRoot := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PERSISTENT_GPU_CACHE_ROOT"))
+	config["persistent_gpu"] = map[string]any{
+		"provider":                 persistentGPUProviderName,
+		"cache_root":               cacheRoot,
+		"dataset_cache_key":        policy.DatasetCacheKey,
+		"dataset_checksum_sha256":  policy.DatasetChecksum,
+		"storage_uri_fingerprint":  storageURIFingerprint(dataset.StorageURI),
+		"materialization_status":   policy.DatasetMaterializationStatus,
+		"cost_queue_metadata_kind": "persistent_disk_gpu_v1",
+	}
+}
+
+func trainingTierForExperiment(experiment plans.PlannedExperiment) string {
+	for _, value := range []string{experiment.Strategy, experiment.Mechanism, experiment.Intervention, experiment.Reason} {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			continue
+		}
+		if strings.Contains(normalized, "champion_validation") || strings.Contains(normalized, "champion validation") {
+			return "champion_validation"
+		}
+		if strings.Contains(normalized, "full") || strings.Contains(normalized, "promoted") || strings.Contains(normalized, "final") {
+			return "full"
+		}
+		if strings.Contains(normalized, "preview") || strings.Contains(normalized, "trial") {
+			return "preview"
+		}
+	}
+	return "preview"
+}
+
+func normalizeTrainingProvider(provider string) string {
+	normalized := strings.ToLower(strings.TrimSpace(provider))
+	switch normalized {
+	case "", "local":
+		return "local"
+	case "modal":
+		return "modal"
+	case "persistent_gpu", "persistent-gpu", "persistent_disk", "persistent-disk":
+		return persistentGPUProviderName
+	default:
+		return normalized
+	}
+}
+
+func validateTrainingProviderConfigured(provider string) error {
+	if provider != persistentGPUProviderName {
+		return nil
+	}
+	if !persistentGPUProviderEnabled() {
+		return fmt.Errorf("%w: persistent_gpu provider requires MODEL_EXPRESS_PERSISTENT_GPU_PROVIDER=1", store.ErrInvalidRequest)
+	}
+	if strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PERSISTENT_GPU_CACHE_ROOT")) == "" {
+		return fmt.Errorf("%w: persistent_gpu provider requires MODEL_EXPRESS_PERSISTENT_GPU_CACHE_ROOT", store.ErrInvalidRequest)
+	}
+	return nil
+}
+
+func persistentGPUProviderEnabled() bool {
+	return envFlag("MODEL_EXPRESS_PERSISTENT_GPU_PROVIDER", false)
+}
+
+func costModesEnabled() bool {
+	return envFlag("MODEL_EXPRESS_COST_MODES", false)
+}
+
+func normalizeCostMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "prototype", "cheap", "prototype/cheap":
+		return "prototype"
+	case "quality":
+		return "quality"
+	default:
+		return "balanced"
+	}
 }
 
 func datasetCacheKey(dataset datasets.Dataset) string {
@@ -3072,6 +3577,9 @@ func (s *Server) recordWorkerRequirementStatusEvent(requirement execution.Worker
 	case execution.WorkerRequirementActive:
 		eventType = execution.EventWorkersActive
 		message = fmt.Sprintf("%d worker(s) are active for plan %s.", requirement.TargetCount, requirement.PlanID)
+	case execution.WorkerRequirementSatisfied:
+		eventType = execution.EventWorkerScalingUpdated
+		message = fmt.Sprintf("Worker requirement satisfied for plan %s; no open training jobs remain.", requirement.PlanID)
 	case execution.WorkerRequirementFailed:
 		eventType = execution.EventExecutionFailed
 		message = fmt.Sprintf("Worker startup failed for plan %s.", requirement.PlanID)
@@ -3096,11 +3604,89 @@ func validWorkerRequirementStatus(status string) bool {
 	case execution.WorkerRequirementPending,
 		execution.WorkerRequirementStarting,
 		execution.WorkerRequirementActive,
+		execution.WorkerRequirementSatisfied,
 		execution.WorkerRequirementFailed,
 		execution.WorkerRequirementCancelled:
 		return true
 	default:
 		return false
+	}
+}
+
+func validDatasetMaterializationStatus(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case execution.DatasetMaterializationUnknown,
+		execution.DatasetMaterializationCold,
+		execution.DatasetMaterializationMaterializing,
+		execution.DatasetMaterializationWarm,
+		execution.DatasetMaterializationStagingOnly:
+		return true
+	default:
+		return false
+	}
+}
+
+func validDispatcherEventType(eventType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(eventType)) {
+	case execution.EventDispatcherStatus, execution.EventDispatcherIdleExit:
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultDispatcherEventMessage(eventType string) string {
+	switch strings.ToUpper(strings.TrimSpace(eventType)) {
+	case execution.EventDispatcherIdleExit:
+		return "Modal dispatcher exited after an idle zero-demand window."
+	default:
+		return "Modal dispatcher lifecycle status updated."
+	}
+}
+
+func dispatcherEventPayload(payload map[string]any) map[string]any {
+	out := map[string]any{"dispatcher": "modal"}
+	allowed := []string{
+		"worker_id",
+		"previous_slot_count",
+		"slot_count",
+		"desired_slot_count",
+		"registered_slot_count",
+		"active_slot_count",
+		"idle_seconds",
+		"idle_exit_seconds",
+		"reason",
+	}
+	for _, key := range allowed {
+		if value, ok := smallDispatcherPayloadValue(payload[key]); ok {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func smallDispatcherPayloadValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return nil, false
+	case string:
+		text := strings.TrimSpace(typed)
+		if text == "" {
+			return "", false
+		}
+		return activitySafeText(text, 120), true
+	case bool:
+		return typed, true
+	case int:
+		return typed, true
+	case int64:
+		return typed, true
+	case float64:
+		return typed, true
+	case float32:
+		return typed, true
+	default:
+		return nil, false
 	}
 }
 
@@ -3224,6 +3810,14 @@ func (s *Server) updateWorkerRequirement(c *gin.Context) {
 		}
 		req.Status = &normalizedStatus
 	}
+	if req.DatasetMaterializationStatus != nil {
+		normalizedStatus := strings.ToUpper(strings.TrimSpace(*req.DatasetMaterializationStatus))
+		if !validDatasetMaterializationStatus(normalizedStatus) {
+			writeStoreError(c, fmt.Errorf("%w: invalid dataset materialization status", store.ErrInvalidRequest))
+			return
+		}
+		req.DatasetMaterializationStatus = &normalizedStatus
+	}
 
 	requirement, err := s.store.UpdateWorkerRequirement(c.Param("id"), req)
 	if err != nil {
@@ -3236,6 +3830,34 @@ func (s *Server) updateWorkerRequirement(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, requirement)
+}
+
+func (s *Server) reportProjectDispatcherEvent(c *gin.Context) {
+	var req dispatcherEventRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	eventType := strings.ToUpper(strings.TrimSpace(req.EventType))
+	if !validDispatcherEventType(eventType) {
+		writeStoreError(c, fmt.Errorf("%w: invalid dispatcher event type", store.ErrInvalidRequest))
+		return
+	}
+	message := strings.TrimSpace(req.Message)
+	if message == "" {
+		message = defaultDispatcherEventMessage(eventType)
+	}
+	event, err := s.store.CreateExecutionEvent(
+		c.Param("id"),
+		strings.TrimSpace(req.PlanID),
+		eventType,
+		message,
+		dispatcherEventPayload(req.Payload),
+	)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"event": event})
 }
 
 func (s *Server) listProjectExecutionEvents(c *gin.Context) {
@@ -3458,6 +4080,7 @@ func (s *Server) completeJob(c *gin.Context) {
 		}
 		s.enqueueTrainingTerminalHooks(job)
 	}
+	s.updateWorkerRequirementDemandAfterTerminalJob(job)
 
 	c.JSON(http.StatusOK, job)
 }
@@ -3498,6 +4121,7 @@ func (s *Server) failJob(c *gin.Context) {
 			}
 			if !requeued {
 				s.enqueueTrainingTerminalHooks(job)
+				s.updateWorkerRequirementDemandAfterTerminalJob(job)
 			}
 		}
 		if !requeued && job.Template == jobs.TemplateAnalyzeDatasetVisuals && jobConfigString(job.Config, "trigger_reason") == string(datasets.VisualTriggerInitialProfile) {
@@ -3532,6 +4156,7 @@ func (s *Server) failJob(c *gin.Context) {
 			return
 		}
 		s.enqueueTrainingTerminalHooks(job)
+		s.updateWorkerRequirementDemandAfterTerminalJob(job)
 	}
 	if job.Template == jobs.TemplateAnalyzeDatasetVisuals && jobConfigString(job.Config, "trigger_reason") == string(datasets.VisualTriggerInitialProfile) {
 		if err := s.createInitialPlanForDataset(jobConfigString(job.Config, "dataset_id")); err != nil {
@@ -3566,6 +4191,96 @@ func (s *Server) recordRetryableJobFailureEvent(job jobs.ExperimentJob, requeued
 	}); err != nil {
 		log.Printf("record retryable job failure event failed: %v", err)
 	}
+}
+
+func (s *Server) updateWorkerRequirementDemandAfterTerminalJob(job jobs.ExperimentJob) {
+	if job.Template != jobs.TemplateTrainExperiment {
+		return
+	}
+	planID := strings.TrimSpace(jobConfigString(job.Config, "plan_id"))
+	if planID == "" {
+		return
+	}
+	requirements, err := s.store.ListProjectWorkerRequirements(job.ProjectID)
+	if err != nil {
+		log.Printf("worker requirement terminal refresh failed for job %s: %v", job.ID, err)
+		return
+	}
+	projectJobs, err := s.store.ListProjectJobs(job.ProjectID)
+	if err != nil {
+		log.Printf("worker requirement terminal job list failed for job %s: %v", job.ID, err)
+		return
+	}
+	for _, requirement := range requirements {
+		if requirement.PlanID != planID || !workerRequirementHasDemandStatus(requirement.Status) {
+			continue
+		}
+		if !workerRequirementMatchesJobProvider(requirement, job) {
+			continue
+		}
+		if openTrainingJobCountForRequirement(projectJobs, requirement) > 0 {
+			continue
+		}
+		status := execution.WorkerRequirementSatisfied
+		updated, updateErr := s.store.UpdateWorkerRequirement(
+			requirement.ID,
+			execution.WorkerRequirementUpdate{Status: &status},
+		)
+		if updateErr != nil {
+			log.Printf("worker requirement satisfy failed for job %s requirement %s: %v", job.ID, requirement.ID, updateErr)
+			continue
+		}
+		s.recordWorkerRequirementStatusEvent(updated)
+	}
+}
+
+func workerRequirementHasDemandStatus(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case execution.WorkerRequirementPending, execution.WorkerRequirementStarting, execution.WorkerRequirementActive:
+		return true
+	default:
+		return false
+	}
+}
+
+func openTrainingJobCountForRequirement(experimentJobs []jobs.ExperimentJob, requirement execution.WorkerRequirement) int {
+	count := 0
+	for _, job := range experimentJobs {
+		if job.Template != jobs.TemplateTrainExperiment {
+			continue
+		}
+		if strings.TrimSpace(jobConfigString(job.Config, "plan_id")) != requirement.PlanID {
+			continue
+		}
+		if !workerRequirementMatchesJobProvider(requirement, job) {
+			continue
+		}
+		switch strings.ToUpper(strings.TrimSpace(job.Status)) {
+		case jobs.StatusQueued, jobs.StatusAssigned, jobs.StatusRunning:
+			count++
+		}
+	}
+	return count
+}
+
+func workerRequirementMatchesJobProvider(requirement execution.WorkerRequirement, job jobs.ExperimentJob) bool {
+	requirementProvider := strings.ToLower(strings.TrimSpace(requirement.Provider))
+	requirementGPU := strings.ToLower(strings.TrimSpace(requirement.GPUType))
+	jobProvider := strings.ToLower(strings.TrimSpace(jobConfigString(job.Config, "provider")))
+	jobGPU := strings.ToLower(strings.TrimSpace(jobConfigString(job.Config, "gpu_type")))
+	if jobProvider != "" && requirementProvider != "" && jobProvider != requirementProvider {
+		return false
+	}
+	if jobGPU != "" && requirementGPU != "" && jobGPU != requirementGPU {
+		return false
+	}
+	if jobProvider != "" && requirementGPU != "" && jobProvider == requirementGPU {
+		return true
+	}
+	if jobGPU != "" && requirementProvider != "" && jobGPU == requirementProvider {
+		return true
+	}
+	return true
 }
 
 func (s *Server) runAutomaticExperimentReviewAfterTrainingJob(job jobs.ExperimentJob) {
@@ -3650,6 +4365,11 @@ func (s *Server) recordTrainingTerminalHookEvent(job jobs.ExperimentJob, status 
 func (s *Server) runPlanningLoopAfterTrainingJob(job jobs.ExperimentJob) {
 	if err := s.recordExperimentPlannerOutcomeAfterTrainingJob(job); err != nil {
 		log.Printf("record experiment planner outcome failed after training job %s: %v", job.ID, err)
+	}
+	if selected, err := s.selectBestAvailableChampionIfCostStoppedAfterTrainingJob(job); err != nil {
+		log.Printf("budget-stop champion selection failed after training job %s: %v", job.ID, err)
+	} else if selected {
+		return
 	}
 
 	handled, err := s.runExperimentPlannerAfterTrainingJob(job)
@@ -4930,6 +5650,7 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 	}
 
 	evaluationPayload := map[string]any{}
+	championEvaluation := runs.TrainingRunEvaluation{}
 	deploymentProfile := map[string]any{
 		"objective_context": projectObjectiveContext(goalText),
 		"target_metric":     normalizedPlannerTargetMetric(targetMetric),
@@ -4942,6 +5663,7 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		},
 	}
 	if evaluation, err := s.store.GetTrainingRunEvaluation(championJobID); err == nil {
+		championEvaluation = evaluation
 		if payload, payloadErr := mapFromStruct(evaluation); payloadErr == nil {
 			evaluationPayload = payload
 		}
@@ -5003,6 +5725,7 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		"modal_function_call_id": summary.ModalFunctionCallID,
 		"modal_input_id":         summary.ModalInputID,
 	}
+	addDetectionChampionMetrics(metrics, championEvaluation)
 	if fallbackSelection {
 		metrics["selection_source"] = "terminal_stop_best_available"
 	} else {
@@ -7617,7 +8340,7 @@ func deploymentReadinessScore(targetMetric string, summary runs.TrainingRunSumma
 }
 
 func deploymentReadinessScoreBreakdown(targetMetric string, summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, map[string]any) {
-	validationScore := validationMetricScore(targetMetric, summary)
+	validationScore := validationMetricScore(targetMetric, summary, evaluation)
 	heldoutScore, hasHeldoutScore := heldoutMetricScore(targetMetric, evaluation.ObjectiveProfile)
 	perClassScore, hasPerClassScore := perClassMetricScore(evaluation.PerClassMetrics)
 	lossScore, hasLossScore := lossHealthScore(summary, evaluation)
@@ -7675,17 +8398,81 @@ func (s weightedScore) value(fallback float64) float64 {
 	return clamp01(s.total / s.weight)
 }
 
-func validationMetricScore(targetMetric string, summary runs.TrainingRunSummary) float64 {
+func validationMetricScore(targetMetric string, summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) float64 {
 	macroF1 := clamp01(summary.BestMacroF1)
 	accuracy := clamp01(summary.BestAccuracy)
 	switch normalizedPlannerTargetMetric(targetMetric) {
 	case "accuracy":
 		return weightedMetricAverage([]metricComponent{{accuracy, 0.55}, {macroF1, 0.45}}, maxFloat(accuracy, macroF1))
 	case "map50_95", "map50", "map":
+		map50_95 := detectionMetricFromEvaluation(evaluation, "map50_95")
+		map50 := detectionMetricFromEvaluation(evaluation, "map50")
+		precision := detectionMetricFromEvaluation(evaluation, "precision")
+		recall := detectionMetricFromEvaluation(evaluation, "recall")
+		if map50_95 > 0 || map50 > 0 {
+			return weightedMetricAverage(
+				[]metricComponent{{map50_95, 0.66}, {map50, 0.20}, {recall, 0.09}, {precision, 0.05}},
+				maxFloat(map50_95, map50),
+			)
+		}
 		return weightedMetricAverage([]metricComponent{{macroF1, 0.65}, {accuracy, 0.35}}, maxFloat(macroF1, accuracy))
 	default:
 		return weightedMetricAverage([]metricComponent{{macroF1, 0.60}, {accuracy, 0.40}}, maxFloat(macroF1, accuracy))
 	}
+}
+
+func detectionMetricFromEvaluation(evaluation runs.TrainingRunEvaluation, metric string) float64 {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(metric), "-", "_"))
+	objectiveKeys := map[string][]string{
+		"map50_95":  {"heldout_test_map50_95", "heldout_test_map"},
+		"map50":     {"heldout_test_map50"},
+		"precision": {"heldout_test_precision"},
+		"recall":    {"heldout_test_recall"},
+	}
+	for _, key := range objectiveKeys[normalized] {
+		if value := payloadFloat(evaluation.ObjectiveProfile, key); value > 0 {
+			return clamp01(value)
+		}
+	}
+	detectionMetrics := payloadMap(evaluation.HolisticScores, "detection_metrics")
+	holisticKeys := map[string][]string{
+		"map50_95":  {"mAP50_95", "map50_95", "map"},
+		"map50":     {"mAP50", "map50"},
+		"precision": {"precision"},
+		"recall":    {"recall"},
+	}
+	for _, key := range holisticKeys[normalized] {
+		if value := payloadFloat(detectionMetrics, key); value > 0 {
+			return clamp01(value)
+		}
+	}
+	return 0
+}
+
+func addDetectionChampionMetrics(metrics map[string]any, evaluation runs.TrainingRunEvaluation) {
+	map50_95 := detectionMetricFromEvaluation(evaluation, "map50_95")
+	map50 := detectionMetricFromEvaluation(evaluation, "map50")
+	precision := detectionMetricFromEvaluation(evaluation, "precision")
+	recall := detectionMetricFromEvaluation(evaluation, "recall")
+	if map50_95 <= 0 && map50 <= 0 {
+		return
+	}
+	if map50_95 > 0 {
+		metrics["best_map50_95"] = map50_95
+		metrics["primary_metric_value"] = map50_95
+		metrics["primary_metric_label"] = "mAP50-95"
+	}
+	if map50 > 0 {
+		metrics["best_map50"] = map50
+	}
+	if precision > 0 {
+		metrics["best_precision"] = precision
+	}
+	if recall > 0 {
+		metrics["best_recall"] = recall
+	}
+	metrics["target_metric"] = "mAP50_95"
+	metrics["task_type"] = "object_detection"
 }
 
 func heldoutMetricScore(targetMetric string, objectiveProfile map[string]any) (float64, bool) {
@@ -7718,6 +8505,9 @@ func heldoutMetricScore(targetMetric string, objectiveProfile map[string]any) (f
 }
 
 func perClassMetricScore(metrics map[string]any) (float64, bool) {
+	if score, ok := detectionPerClassMetricScore(metrics); ok {
+		return score, true
+	}
 	worstLabel, worstRecall := worstPerClassRecall(metrics)
 	macroAvg := perClassAggregateMetric(metrics, "macro avg")
 	weightedAvg := perClassAggregateMetric(metrics, "weighted avg")
@@ -7731,6 +8521,55 @@ func perClassMetricScore(metrics map[string]any) (float64, bool) {
 	return weighted.value(maxFloat(worstRecall, macroAvg)), true
 }
 
+func detectionPerClassMetricScore(metrics map[string]any) (float64, bool) {
+	worst := 1.0
+	total := 0.0
+	count := 0
+	macroAvg := 0.0
+	for label, rawStats := range metrics {
+		normalizedLabel := strings.ToLower(strings.TrimSpace(label))
+		stats := mapFromAny(rawStats)
+		quality := detectionPerClassQuality(stats)
+		if normalizedLabel == "macro avg" {
+			macroAvg = quality
+			continue
+		}
+		if normalizedLabel == "" || normalizedLabel == "accuracy" || strings.Contains(normalizedLabel, "avg") || quality <= 0 {
+			continue
+		}
+		if quality < worst {
+			worst = quality
+		}
+		total += quality
+		count++
+	}
+	if count == 0 && macroAvg <= 0 {
+		return 0, false
+	}
+	mean := macroAvg
+	if mean <= 0 && count > 0 {
+		mean = total / float64(count)
+	}
+	weighted := weightedScore{}
+	weighted.add(worst, 0.45, count > 0)
+	weighted.add(mean, 0.55, mean > 0)
+	return weighted.value(maxFloat(worst, mean)), true
+}
+
+func detectionPerClassQuality(stats map[string]any) float64 {
+	map50_95 := firstPayloadFloat(stats, "AP50_95", "mAP50_95", "map50_95", "map")
+	map50 := firstPayloadFloat(stats, "AP50", "mAP50", "map50")
+	recall := firstPayloadFloat(stats, "recall")
+	precision := firstPayloadFloat(stats, "precision")
+	if map50_95 <= 0 && map50 <= 0 && recall <= 0 && precision <= 0 {
+		return 0
+	}
+	return weightedMetricAverage(
+		[]metricComponent{{map50_95, 0.66}, {map50, 0.20}, {recall, 0.09}, {precision, 0.05}},
+		maxFloat(map50_95, map50),
+	)
+}
+
 func perClassAggregateMetric(metrics map[string]any, key string) float64 {
 	stats := mapFromAny(metrics[key])
 	value := payloadFloat(stats, "f1-score")
@@ -7741,6 +8580,15 @@ func perClassAggregateMetric(metrics map[string]any, key string) float64 {
 		value = payloadFloat(stats, "recall")
 	}
 	return clamp01(value)
+}
+
+func firstPayloadFloat(payload map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value := payloadFloat(payload, key); value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func lossHealthScore(summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, bool) {
@@ -7882,10 +8730,18 @@ func bestSuccessfulTrainingSummaryBeforePlanForObjective(
 	return bestSuccessfulTrainingSummaryForObjective(targetMetric, priorSummaries, evaluations, objectiveContext)
 }
 
-func plannerTargetMetricValue(targetMetric string, summary runs.TrainingRunSummary) float64 {
+func plannerTargetMetricValue(targetMetric string, summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) float64 {
 	switch normalizedPlannerTargetMetric(targetMetric) {
 	case "accuracy":
 		return summary.BestAccuracy
+	case "map50_95", "map50", "map":
+		if value := detectionMetricFromEvaluation(evaluation, "map50_95"); value > 0 {
+			return value
+		}
+		if value := detectionMetricFromEvaluation(evaluation, "map50"); value > 0 {
+			return value
+		}
+		return summary.BestMacroF1
 	default:
 		return summary.BestMacroF1
 	}
@@ -8344,11 +9200,22 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	if provider == "" {
 		provider = "local"
 	}
+	provider = normalizeTrainingProvider(provider)
+	if err := validateTrainingProviderConfigured(provider); err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
 	dataset, err := s.store.GetDataset(plan.DatasetID)
 	if err != nil {
 		return executeExperimentPlanResponse{}, err
 	}
+	costPolicy, err := s.costPolicyForPlan(plan)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
 	materializationPolicy := datasetMaterializationPolicy(dataset, provider, s.targetWorkerCountForPlan(plan, len(plan.Experiments)))
+	if costPolicy.Enabled && costPolicy.MaxConcurrentJobs > 0 && materializationPolicy.MaxConcurrentJobs > costPolicy.MaxConcurrentJobs {
+		materializationPolicy.MaxConcurrentJobs = costPolicy.MaxConcurrentJobs
+	}
 
 	existingJobs, err := s.store.ListProjectJobs(plan.ProjectID)
 	if err != nil {
@@ -8393,6 +9260,14 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		}
 
 		jobTemplate := experimentExecutionTemplate(experiment)
+		tier := trainingTierForExperiment(experiment)
+		if costPolicy.Enabled && jobTemplate == jobs.TemplateTrainExperiment {
+			allowed, reason := costPolicy.AllowTrainingJob(tier)
+			if !allowed {
+				costPolicy.Skip(index, tier, reason)
+				continue
+			}
+		}
 		config := map[string]any{
 			"plan_id":             plan.ID,
 			"dataset_id":          plan.DatasetID,
@@ -8404,10 +9279,16 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		}
 		addDatasetMaterializationConfig(config, materializationPolicy)
 		if jobTemplate == jobs.TemplateTrainExperiment {
+			if costPolicy.Enabled && tier != "" {
+				config["training_tier"] = tier
+			}
 			config["model"] = experiment.Model
 			config["epochs"] = experiment.Epochs
 			config["batch_size"] = experiment.BatchSize
 			config["learning_rate"] = experiment.LearningRate
+			addCostPolicyConfig(config, costPolicy, tier)
+			addPersistentGPUConfig(config, provider, dataset, materializationPolicy)
+			addModalPreviewTrainingTierConfig(config, provider)
 			if modelSpec, ok := supportedModelSpecByName(experiment.Model); ok {
 				config["task_type"] = modelSpec.TaskType
 				config["model_kind"] = modelSpec.ModelKind
@@ -8456,9 +9337,14 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		out = append(out, job)
 	}
 
+	if err := s.recordCostPolicySkippedJobs(plan, costPolicy); err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+
 	return executeExperimentPlanResponse{
-		Plan: plan,
-		Jobs: out,
+		Plan:       plan,
+		Jobs:       out,
+		CostPolicy: costPolicy.Payload(),
 	}, nil
 }
 
@@ -9300,14 +10186,16 @@ func (s *Server) observeAutoMLTrialForJob(job jobs.ExperimentJob) error {
 	if status == "" {
 		status = job.Status
 	}
-	targetMetricScore := plannerTargetMetricValue(targetMetric, summary)
-	score := targetMetricScore
 	evaluation := runs.TrainingRunEvaluation{}
 	if storedEvaluation, err := s.store.GetTrainingRunEvaluation(job.ID); err == nil {
 		evaluation = storedEvaluation
-		score = holisticRunScore(targetMetric, summary, evaluation, agents.ProjectObjectiveContext{})
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
+	}
+	targetMetricScore := plannerTargetMetricValue(targetMetric, summary, evaluation)
+	score := targetMetricScore
+	if evaluation.JobID != "" {
+		score = holisticRunScore(targetMetric, summary, evaluation, agents.ProjectObjectiveContext{})
 	}
 	if status != jobs.StatusSucceeded {
 		score = 0
@@ -9451,6 +10339,23 @@ func addDatasetMaterializationConfig(config map[string]any, policy execution.Wor
 		"max_cold_materializations": policy.MaxColdDatasetMaterializations,
 	}
 	config["dataset_materialization"] = materialization
+}
+
+func addModalPreviewTrainingTierConfig(config map[string]any, provider string) {
+	if !modalPreviewTierMetadataEnabled() {
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(provider)) != "modal" {
+		return
+	}
+	if strings.TrimSpace(configString(config, "training_tier")) != "" {
+		return
+	}
+	config["training_tier"] = "preview"
+}
+
+func modalPreviewTierMetadataEnabled() bool {
+	return envFlag("MODEL_EXPRESS_MODAL_PREVIEW_TIER_METADATA", false)
 }
 
 func configInt(config map[string]any, key string) (int, bool) {
@@ -12134,8 +13039,10 @@ func automationSettingsFromEnv() settings.AutomationSettings {
 		AutoScheduleFollowUps:   envFlag("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", false),
 		AutoExecutePlans:        envFlag("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", os.Getenv("MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER") != ""),
 		MaxFollowUpRounds:       maxAutoFollowUpRoundsFromEnvForMode(agentMode),
-		DefaultTrainingProvider: defaultProvider,
+		DefaultTrainingProvider: normalizeTrainingProvider(defaultProvider),
 		DefaultGPUType:          os.Getenv("MODEL_EXPRESS_DEFAULT_GPU_TYPE"),
+		CostMode:                normalizeCostMode(os.Getenv("MODEL_EXPRESS_COST_MODE")),
+		BudgetCapUSD:            budgetCapUSDFromEnv(),
 		LLMEnabled:              envFlag("MODEL_EXPRESS_LLM_ENABLED", false),
 		AgentMode:               agentMode,
 		LLMProvider:             defaultLLMProviderFromEnv(),
@@ -12177,13 +13084,25 @@ func applyAutomationSettingsUpdate(current settings.AutomationSettings, update s
 		current.MaxFollowUpRounds = *update.MaxFollowUpRounds
 	}
 	if update.DefaultTrainingProvider != nil {
-		current.DefaultTrainingProvider = strings.ToLower(strings.TrimSpace(*update.DefaultTrainingProvider))
+		current.DefaultTrainingProvider = normalizeTrainingProvider(*update.DefaultTrainingProvider)
 		if current.DefaultTrainingProvider == "" {
 			current.DefaultTrainingProvider = "local"
+		}
+		if err := validateTrainingProviderConfigured(current.DefaultTrainingProvider); err != nil {
+			return settings.AutomationSettings{}, err
 		}
 	}
 	if update.DefaultGPUType != nil {
 		current.DefaultGPUType = strings.TrimSpace(*update.DefaultGPUType)
+	}
+	if update.CostMode != nil {
+		current.CostMode = normalizeCostMode(*update.CostMode)
+	}
+	if update.BudgetCapUSD != nil {
+		if *update.BudgetCapUSD < 0 {
+			return settings.AutomationSettings{}, fmt.Errorf("%w: budget_cap_usd must be at least 0", store.ErrInvalidRequest)
+		}
+		current.BudgetCapUSD = *update.BudgetCapUSD
 	}
 	if update.LLMEnabled != nil {
 		current.LLMEnabled = *update.LLMEnabled
@@ -12212,11 +13131,26 @@ func applyAutomationSettingsUpdate(current settings.AutomationSettings, update s
 	if current.AutoMLSampler == "" {
 		current.AutoMLSampler = automl.SamplerSeededRandom
 	}
+	if current.CostMode == "" {
+		current.CostMode = "balanced"
+	}
 	if _, err := automl.NewSampler(current.AutoMLSampler); err != nil {
 		return settings.AutomationSettings{}, fmt.Errorf("%w: %s", store.ErrInvalidRequest, err.Error())
 	}
 
 	return current, nil
+}
+
+func budgetCapUSDFromEnv() float64 {
+	value := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_BUDGET_CAP_USD"))
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < 0 {
+		return 0
+	}
+	return parsed
 }
 
 func (s *Server) defaultExecuteExperimentPlanRequest() executeExperimentPlanRequest {
