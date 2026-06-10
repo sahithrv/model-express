@@ -36,6 +36,11 @@ type RetryJobOptions struct {
 	ForceFail bool
 }
 
+type PageOptions struct {
+	Limit  int
+	Offset int
+}
+
 func (filter JobPollFilter) Matches(job jobs.ExperimentJob) bool {
 	templates := normalizedSet(filter.Templates)
 	if len(templates) > 0 {
@@ -89,10 +94,12 @@ type Store interface {
 	CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error)
 	GetJob(id string) (jobs.ExperimentJob, error)
 	ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error)
+	ListProjectJobsPage(projectID string, options PageOptions) ([]jobs.ExperimentJob, error)
 	UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error)
 	RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error)
 	ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error)
 	ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
+	ListJobMetricsPage(jobID string, options PageOptions) ([]jobs.EpochMetric, error)
 	CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error)
 	RetryJob(jobID string, message string, options RetryJobOptions) (jobs.ExperimentJob, bool, error)
 	FailJob(jobID string, message string) (jobs.ExperimentJob, error)
@@ -100,9 +107,11 @@ type Store interface {
 	UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error)
 	GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error)
 	ListProjectTrainingRunSummaries(projectID string) ([]runs.TrainingRunSummary, error)
+	ListProjectTrainingRunSummariesPage(projectID string, options PageOptions) ([]runs.TrainingRunSummary, error)
 	UpsertTrainingRunEvaluation(jobID string, update runs.TrainingRunEvaluationUpdate) (runs.TrainingRunEvaluation, error)
 	GetTrainingRunEvaluation(jobID string) (runs.TrainingRunEvaluation, error)
 	ListProjectTrainingRunEvaluations(projectID string) ([]runs.TrainingRunEvaluation, error)
+	ListProjectTrainingRunEvaluationsPage(projectID string, options PageOptions) ([]runs.TrainingRunEvaluation, error)
 	UpsertProjectChampion(champion runs.ProjectChampionUpsert) (runs.ProjectChampion, error)
 	GetProjectChampion(projectID string) (runs.ProjectChampion, error)
 	CreateChampionExport(export runs.ChampionExportCreate) (runs.ChampionExport, error)

@@ -7,6 +7,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
@@ -124,25 +125,28 @@ class ModalDispatcher:
             started_logged = False
             while True:
                 self._refresh_slot_target_from_requirements()
-                if self._should_hold_modal_session():
+                self._collect_finished_slots()
+                if self._should_hold_modal_session() or self._pending_claims_require_modal_session():
                     with modal_app_session():
                         if not started_logged:
                             self._log_dispatcher_started()
                             started_logged = True
                         while True:
+                            self._start_pending_claimed_slots()
                             self.run_once()
                             if self._should_exit_for_idle():
                                 return
-                            if not self._should_hold_modal_session():
+                            if not self._should_hold_modal_session() and not self._pending_claims_require_modal_session():
                                 break
                             time.sleep(self.poll_interval_seconds)
                     continue
                 if not started_logged:
                     self._log_dispatcher_started()
                     started_logged = True
-                self.register_slots()
-                self._collect_finished_slots()
-                self._heartbeat_due_slots()
+                self.run_once(start_claimed=False)
+                if self._pending_claims_require_modal_session():
+                    continue
+                self._start_pending_claimed_slots()
                 if self._should_exit_for_idle():
                     break
                 time.sleep(self.poll_interval_seconds)
@@ -158,7 +162,7 @@ class ModalDispatcher:
             idle_exit_seconds=modal_dispatcher_idle_exit_seconds() or 0,
         )
 
-    def run_once(self) -> bool:
+    def run_once(self, *, start_claimed: bool = True) -> bool:
         self._refresh_slot_target_from_requirements()
         self.register_slots()
         self._collect_finished_slots()
@@ -166,7 +170,7 @@ class ModalDispatcher:
         claimed = False
         claimed_slots: list[_DispatcherSlot] = []
         for slot in self.slots:
-            if slot.future is not None:
+            if slot.future is not None or slot.job is not None:
                 continue
             if not self._slot_in_current_target(slot):
                 continue
@@ -180,10 +184,7 @@ class ModalDispatcher:
                 continue
             slot.job = job
             slot.next_heartbeat_at = 0.0
-            if modal_batch_runner_enabled():
-                claimed_slots.append(slot)
-            else:
-                slot.future = self._executor.submit(self._run_claimed_job, slot.worker_id, job)
+            claimed_slots.append(slot)
             claimed = True
             self._last_claimed_at = time.monotonic()
             self._idle_started_at = None
@@ -196,9 +197,9 @@ class ModalDispatcher:
                 template=job.get("template"),
                 dataset_cache_key=_job_dataset_cache_key(job),
             )
-        if modal_batch_runner_enabled() and claimed_slots:
+        if start_claimed and claimed_slots:
             self._start_claimed_slots(claimed_slots)
-        return claimed or any(slot.future is not None for slot in self.slots)
+        return claimed or any(slot.future is not None or slot.job is not None for slot in self.slots)
 
     def wait_for_active_jobs(self, timeout_seconds: float | None = None) -> None:
         started_at = time.monotonic()
@@ -227,10 +228,11 @@ class ModalDispatcher:
             )
 
     def _run_claimed_job(self, worker_id: str, job: dict) -> None:
-        cache_key = _job_dataset_cache_key(job)
-        if cache_key and modal_dataset_prewarm_enabled(job):
-            self._ensure_cache_warm(cache_key, job)
-        self.job_runner(self.client, job)
+        with _client_job_context(self.client, job):
+            cache_key = _job_dataset_cache_key(job)
+            if cache_key and modal_dataset_prewarm_enabled(job):
+                self._ensure_cache_warm(cache_key, job)
+            self.job_runner(self.client, job)
 
     def _run_claimed_batch(self, worker_jobs: list[tuple[str, dict]], batch: dict) -> None:
         jobs = [job for _worker_id, job in worker_jobs]
@@ -239,10 +241,21 @@ class ModalDispatcher:
             self._ensure_cache_warm(cache_key, jobs[0])
         self.batch_runner(self.client, jobs, batch)
 
+    def _pending_claimed_slots(self) -> list[_DispatcherSlot]:
+        return [slot for slot in self.slots if slot.job is not None and slot.future is None]
+
+    def _pending_claims_require_modal_session(self) -> bool:
+        return any(_job_requires_modal_session(slot.job) for slot in self._pending_claimed_slots())
+
+    def _start_pending_claimed_slots(self) -> None:
+        pending = self._pending_claimed_slots()
+        if pending:
+            self._start_claimed_slots(pending)
+
     def _start_claimed_slots(self, claimed_slots: list[_DispatcherSlot]) -> None:
         if not modal_batch_runner_enabled():
             for slot in claimed_slots:
-                if slot.job is not None:
+                if slot.job is not None and slot.future is None:
                     slot.future = self._executor.submit(self._run_claimed_job, slot.worker_id, slot.job)
             return
 
@@ -351,7 +364,7 @@ class ModalDispatcher:
         if state.error is not None:
             if isinstance(state.error, ModalRetryableFailureReported):
                 try:
-                    self.client.fail_job(job["id"], str(state.error), retryable=True)
+                    _report_dispatcher_failure(self.client, job["id"], str(state.error), retryable=True, job=job)
                 except Exception as exc:
                     log_event(
                         "warn",
@@ -391,8 +404,16 @@ class ModalDispatcher:
             except Exception as exc:
                 job_id = str((job or {}).get("id") or "")
                 if job_id:
+                    retryable = _dispatcher_exception_retryable(exc)
                     try:
-                        self.client.fail_job(job_id, str(exc))
+                        _report_dispatcher_failure(
+                            self.client,
+                            job_id,
+                            str(exc),
+                            retryable=retryable,
+                            metadata={"failure_class": "worker_exception" if retryable else "validation"},
+                            job=job,
+                        )
                     except Exception:
                         log_event(
                             "error",
@@ -410,6 +431,7 @@ class ModalDispatcher:
                     worker_id=slot.worker_id,
                     job_id=job_id,
                     error=str(exc),
+                    retryable=_dispatcher_exception_retryable(exc),
                     traceback=traceback.format_exc(),
                 )
             finally:
@@ -502,7 +524,7 @@ class ModalDispatcher:
     def _should_hold_modal_session(self) -> bool:
         if (self._last_required_slot_count or 0) > 0:
             return True
-        if any(slot.future is not None for slot in self.slots):
+        if any(slot.future is not None and _job_requires_modal_session(slot.job) for slot in self.slots):
             return True
         with self._cache_lock:
             return bool(self._warming)
@@ -819,6 +841,55 @@ def modal_dispatcher_worker_name() -> str:
     if configured:
         return configured
     return f"modal-dispatcher-{socket.gethostname()}"
+
+
+def _job_requires_modal_session(job: dict | None) -> bool:
+    if not isinstance(job, dict):
+        return False
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    template = str(job.get("template") or "").strip()
+    provider = str(config.get("provider") or "").strip().lower()
+    if provider == "modal":
+        return True
+    if template == "train_experiment":
+        return provider in {"", "modal"}
+    if template == "profile_dataset":
+        profile_provider = os.getenv("MODEL_EXPRESS_DATASET_PROFILE_PROVIDER", "").strip().lower()
+        if profile_provider:
+            return profile_provider == "modal"
+        return os.getenv("GPU_TYPE", "").strip().lower() == "modal"
+    return modal_dataset_prewarm_enabled(job)
+
+
+def _dispatcher_exception_retryable(exc: Exception) -> bool:
+    return not isinstance(exc, (KeyError, ValueError))
+
+
+def _client_job_context(client: OrchestratorClient, job: dict):
+    context = getattr(client, "job_context", None)
+    if callable(context):
+        return context(job)
+    return nullcontext()
+
+
+def _report_dispatcher_failure(
+    client: OrchestratorClient,
+    job_id: str,
+    error: str,
+    *,
+    retryable: bool = False,
+    metadata: dict | None = None,
+    job: dict | None = None,
+):
+    try:
+        return client.fail_job(job_id, error, retryable=retryable, metadata=metadata, job=job)
+    except TypeError:
+        if metadata is not None:
+            try:
+                return client.fail_job(job_id, error, retryable=retryable, metadata=metadata)
+            except TypeError:
+                pass
+        return client.fail_job(job_id, error, retryable=retryable)
 
 
 def modal_dataset_prewarm_enabled(job: dict | None = None) -> bool:

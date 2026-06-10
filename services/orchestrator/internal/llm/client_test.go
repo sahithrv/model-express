@@ -123,6 +123,42 @@ func TestGenerateJSONWithUsageCapturesChatUsage(t *testing.T) {
 	}
 }
 
+func TestGenerateJSONChatRetriesTransientHTTPFailure(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			http.Error(w, "temporarily overloaded", http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"{\"ok\":true}"}}]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Enabled:    true,
+		Provider:   ProviderOpenAI,
+		BaseURL:    server.URL,
+		APIKey:     "test-key",
+		Model:      "test-model",
+		MaxRetries: 1,
+	})
+
+	raw, err := client.GenerateJSON(context.Background(), JSONRequest{
+		Messages: []Message{{Role: "user", Content: "Return JSON."}},
+	})
+	if err != nil {
+		t.Fatalf("GenerateJSON returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected retry after transient failure, got %d attempts", attempts)
+	}
+	if string(raw) != `{"ok":true}` {
+		t.Fatalf("expected retried content, got %s", raw)
+	}
+}
+
 func TestGenerateJSONWithUsageUsesRequestModelOverride(t *testing.T) {
 	testCases := []struct {
 		name          string
@@ -305,6 +341,47 @@ func TestGenerateJSONResponsesPathAndFinalJSONExtraction(t *testing.T) {
 	}
 	if seenPath != "/responses" {
 		t.Fatalf("expected responses path, got %q", seenPath)
+	}
+}
+
+func TestGenerateJSONResponsesRetriesTransientHTTPFailure(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			http.Error(w, "temporary upstream failure", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"resp_final",
+			"output":[{"type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}]
+		}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Enabled:         true,
+		Provider:        ProviderOpenAI,
+		BaseURL:         server.URL,
+		APIKey:          "test-key",
+		Model:           "test-model",
+		APIStyle:        APIStyleResponses,
+		StoredResponses: true,
+		MaxRetries:      1,
+	})
+
+	result, err := client.GenerateJSONWithUsage(context.Background(), JSONRequest{
+		Messages: []Message{{Role: "user", Content: "Return JSON."}},
+	})
+	if err != nil {
+		t.Fatalf("GenerateJSONWithUsage returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected retry after transient failure, got %d attempts", attempts)
+	}
+	if string(result.RawJSON) != `{"ok":true}` {
+		t.Fatalf("expected retried content, got %s", result.RawJSON)
 	}
 }
 

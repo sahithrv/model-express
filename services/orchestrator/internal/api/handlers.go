@@ -273,23 +273,25 @@ type createChampionFeedbackRequest struct {
 }
 
 type championExportResultRequest struct {
-	Status           string         `json:"status"`
-	ArtifactURI      string         `json:"artifact_uri"`
-	Metadata         map[string]any `json:"metadata"`
-	ValidationErrors []string       `json:"validation_errors"`
-	Error            string         `json:"error"`
+	Status            string         `json:"status"`
+	ArtifactURI       string         `json:"artifact_uri"`
+	Metadata          map[string]any `json:"metadata"`
+	ValidationErrors  []string       `json:"validation_errors"`
+	Error             string         `json:"error"`
+	TrainingAttemptID string         `json:"training_attempt_id"`
 }
 
 type championDemoPredictionResultRequest struct {
-	Status         string                    `json:"status"`
-	PredictedLabel string                    `json:"predicted_label"`
-	TrueLabel      string                    `json:"true_label"`
-	Confidence     *float64                  `json:"confidence"`
-	TopK           []runs.DemoPredictionTopK `json:"top_k"`
-	LatencyMS      *float64                  `json:"latency_ms"`
-	Correct        *bool                     `json:"correct"`
-	Error          string                    `json:"error"`
-	ImageMetadata  map[string]any            `json:"image_metadata"`
+	Status            string                    `json:"status"`
+	PredictedLabel    string                    `json:"predicted_label"`
+	TrueLabel         string                    `json:"true_label"`
+	Confidence        *float64                  `json:"confidence"`
+	TopK              []runs.DemoPredictionTopK `json:"top_k"`
+	LatencyMS         *float64                  `json:"latency_ms"`
+	Correct           *bool                     `json:"correct"`
+	Error             string                    `json:"error"`
+	ImageMetadata     map[string]any            `json:"image_metadata"`
+	TrainingAttemptID string                    `json:"training_attempt_id"`
 }
 
 type mergeDatasetVisualExemplarsRequest struct {
@@ -297,6 +299,17 @@ type mergeDatasetVisualExemplarsRequest struct {
 	DemoImages      []datasets.VisualExemplar `json:"demo_images"`
 	Exemplars       []datasets.VisualExemplar `json:"exemplars"`
 }
+
+const (
+	defaultProjectJobsLimit         = 100
+	maxProjectJobsLimit             = 500
+	defaultJobMetricsLimit          = 200
+	maxJobMetricsLimit              = 2000
+	defaultTrainingSummariesLimit   = 100
+	maxTrainingSummariesLimit       = 500
+	defaultTrainingEvaluationsLimit = 50
+	maxTrainingEvaluationsLimit     = 200
+)
 
 type runDatasetVisualAnalysisRequest struct {
 	TriggerReason  string         `json:"trigger_reason"`
@@ -1105,13 +1118,16 @@ func (s *Server) createJob(c *gin.Context) {
 }
 
 func (s *Server) listProjectJobs(c *gin.Context) {
-	jobs, err := s.store.ListProjectJobs(c.Param("id"))
+	limit := queryInt(c, "limit", defaultProjectJobsLimit, 1, maxProjectJobsLimit)
+	offset := queryInt(c, "offset", 0, 0, 1_000_000_000)
+	items, err := s.store.ListProjectJobsPage(c.Param("id"), store.PageOptions{Limit: limit + 1, Offset: offset})
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"jobs": jobs})
+	jobs, hasMore := pageHasMore(items, limit)
+	c.JSON(http.StatusOK, pagedListPayload("jobs", jobs, limit, offset, hasMore))
 }
 
 func (s *Server) getJob(c *gin.Context) {
@@ -1156,13 +1172,16 @@ func (s *Server) reportMetric(c *gin.Context) {
 }
 
 func (s *Server) listJobMetrics(c *gin.Context) {
-	metrics, err := s.store.ListJobMetrics(c.Param("id"))
+	limit := queryInt(c, "limit", defaultJobMetricsLimit, 1, maxJobMetricsLimit)
+	offset := queryInt(c, "offset", 0, 0, 1_000_000_000)
+	items, err := s.store.ListJobMetricsPage(c.Param("id"), store.PageOptions{Limit: limit + 1, Offset: offset})
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"metrics": metrics})
+	metrics, hasMore := pageLatestWindowHasMore(items, limit)
+	c.JSON(http.StatusOK, pagedListPayload("metrics", metrics, limit, offset, hasMore))
 }
 
 func (s *Server) upsertTrainingRunSummary(c *gin.Context) {
@@ -1364,23 +1383,32 @@ func (s *Server) getTrainingRunEvaluation(c *gin.Context) {
 }
 
 func (s *Server) listProjectTrainingRunSummaries(c *gin.Context) {
-	summaries, err := s.store.ListProjectTrainingRunSummaries(c.Param("id"))
+	limit := queryInt(c, "limit", defaultTrainingSummariesLimit, 1, maxTrainingSummariesLimit)
+	offset := queryInt(c, "offset", 0, 0, 1_000_000_000)
+	items, err := s.store.ListProjectTrainingRunSummariesPage(c.Param("id"), store.PageOptions{Limit: limit + 1, Offset: offset})
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"summaries": summaries})
+	summaries, hasMore := pageHasMore(items, limit)
+	c.JSON(http.StatusOK, pagedListPayload("summaries", summaries, limit, offset, hasMore))
 }
 
 func (s *Server) listProjectTrainingRunEvaluations(c *gin.Context) {
-	evaluations, err := s.store.ListProjectTrainingRunEvaluations(c.Param("id"))
+	limit := queryInt(c, "limit", defaultTrainingEvaluationsLimit, 1, maxTrainingEvaluationsLimit)
+	offset := queryInt(c, "offset", 0, 0, 1_000_000_000)
+	items, err := s.store.ListProjectTrainingRunEvaluationsPage(c.Param("id"), store.PageOptions{Limit: limit + 1, Offset: offset})
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"evaluations": evaluations})
+	evaluations, hasMore := pageHasMore(items, limit)
+	if queryBool(c, "compact") {
+		evaluations = compactTrainingRunEvaluations(evaluations)
+	}
+	c.JSON(http.StatusOK, pagedListPayload("evaluations", evaluations, limit, offset, hasMore))
 }
 
 func (s *Server) enrichTrainingRunEvaluationUpdate(jobID string, update runs.TrainingRunEvaluationUpdate) runs.TrainingRunEvaluationUpdate {
@@ -1669,8 +1697,8 @@ func (s *Server) ensureChampionExport(
 		return runs.ChampionExport{}, err
 	}
 	datasetID := championDatasetID(champion, championJob)
-	if datasetID != "" && sourceArtifactURI != "" && export.Status != runs.ChampionExportStatusReady {
-		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateExportChampion, map[string]any{
+	if datasetID != "" && export.Status != runs.ChampionExportStatusReady {
+		exportJobConfig := map[string]any{
 			"dataset_id":          datasetID,
 			"champion_id":         champion.ID,
 			"champion_job_id":     champion.JobID,
@@ -1679,7 +1707,8 @@ func (s *Server) ensureChampionExport(
 			"artifact_uri":        artifactURI,
 			"source_artifact_uri": sourceArtifactURI,
 			"metadata":            metadata,
-		}, func(existing jobs.ExperimentJob) bool {
+		}
+		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateExportChampion, exportJobConfig, func(existing jobs.ExperimentJob) bool {
 			return jobConfigString(existing.Config, "export_id") == export.ID
 		}); err != nil {
 			return runs.ChampionExport{}, err
@@ -4157,9 +4186,17 @@ func (s *Server) reportChampionExportResult(c *gin.Context) {
 	if !bindJSON(c, &req) {
 		return
 	}
-	job, err := s.store.GetJob(c.Param("id"))
+	job, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"champion_export_result",
+		map[string]any{"status": req.Status},
+	)
 	if err != nil {
 		writeStoreError(c, err)
+		return
+	} else if ignored {
+		c.JSON(http.StatusOK, gin.H{"status": "stale_attempt_ignored", "job": job})
 		return
 	}
 	if job.Template != jobs.TemplateExportChampion {
@@ -4213,9 +4250,17 @@ func (s *Server) reportChampionDemoPredictionResult(c *gin.Context) {
 	if !bindJSON(c, &req) {
 		return
 	}
-	job, err := s.store.GetJob(c.Param("id"))
+	job, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"champion_demo_prediction_result",
+		map[string]any{"status": req.Status},
+	)
 	if err != nil {
 		writeStoreError(c, err)
+		return
+	} else if ignored {
+		c.JSON(http.StatusOK, gin.H{"status": "stale_attempt_ignored", "job": job})
 		return
 	}
 	if job.Template != jobs.TemplateChampionDemoPrediction {
@@ -4355,8 +4400,7 @@ func (s *Server) completeJob(c *gin.Context) {
 		if _, err := s.store.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
 			Status: jobs.StatusSucceeded,
 		}); err != nil {
-			writeStoreError(c, err)
-			return
+			log.Printf("post-complete training summary update failed for job %s: %v", job.ID, err)
 		}
 		s.enqueueTrainingTerminalHooks(job)
 	}
@@ -4390,6 +4434,10 @@ func (s *Server) failJob(c *gin.Context) {
 			writeStoreError(c, err)
 			return
 		}
+		if jobStatusIsTerminal(currentJob.Status) {
+			c.JSON(http.StatusOK, currentJob)
+			return
+		}
 		retryOptions, retryDecision := s.retryOptionsForFailure(currentJob, req)
 		job, requeued, err := s.store.RetryJob(c.Param("id"), req.Error, retryOptions)
 		if err != nil {
@@ -4418,8 +4466,7 @@ func (s *Server) failJob(c *gin.Context) {
 			if _, err := s.store.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
 				Status: status,
 			}); err != nil {
-				writeStoreError(c, err)
-				return
+				log.Printf("retryable failure training summary update failed for job %s: %v", job.ID, err)
 			}
 			if !requeued {
 				s.enqueueTrainingTerminalHooks(job)
@@ -4433,6 +4480,16 @@ func (s *Server) failJob(c *gin.Context) {
 			}
 		}
 		c.JSON(http.StatusOK, job)
+		return
+	}
+
+	currentJob, err := s.store.GetJob(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if jobStatusIsTerminal(currentJob.Status) {
+		c.JSON(http.StatusOK, currentJob)
 		return
 	}
 
@@ -4454,8 +4511,7 @@ func (s *Server) failJob(c *gin.Context) {
 		if _, err := s.store.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
 			Status: jobs.StatusFailed,
 		}); err != nil {
-			writeStoreError(c, err)
-			return
+			log.Printf("failed-job training summary update failed for job %s: %v", job.ID, err)
 		}
 		s.enqueueTrainingTerminalHooks(job)
 		s.updateWorkerRequirementDemandAfterTerminalJob(job)
@@ -9641,10 +9697,14 @@ func (s *Server) pollJob(c *gin.Context) {
 			return
 		}
 	}
+	includeUnspecified := req.IncludeUnspecifiedProviderTemplates
+	if strings.TrimSpace(req.Provider) != "" && len(includeUnspecified) == 0 {
+		includeUnspecified = defaultProviderPollFallbackTemplates()
+	}
 	job, err := s.store.PollJob(c.Param("id"), store.JobPollFilter{
 		Provider:                            req.Provider,
 		Templates:                           req.Templates,
-		IncludeUnspecifiedProviderTemplates: req.IncludeUnspecifiedProviderTemplates,
+		IncludeUnspecifiedProviderTemplates: includeUnspecified,
 	})
 	if err == nil {
 		c.JSON(http.StatusOK, pollJobResponse{Job: job})
@@ -9657,6 +9717,16 @@ func (s *Server) pollJob(c *gin.Context) {
 	}
 
 	writeStoreError(c, err)
+}
+
+func defaultProviderPollFallbackTemplates() []string {
+	return []string{
+		jobs.TemplateProfileDataset,
+		jobs.TemplateAnalyzeDatasetVisuals,
+		jobs.TemplateExportChampion,
+		jobs.TemplateChampionDemoPrediction,
+		jobs.TemplateGenerateVisualExemplars,
+	}
 }
 
 func (s *Server) createExperimentPlan(c *gin.Context) {
@@ -14439,6 +14509,58 @@ func queryInt(c *gin.Context, key string, defaultValue int, minValue int, maxVal
 		return maxValue
 	}
 	return parsed
+}
+
+func queryBool(c *gin.Context, key string) bool {
+	value, ok := envFlagValueFromString(c.Query(key))
+	return ok && value
+}
+
+func pageHasMore[T any](items []T, limit int) ([]T, bool) {
+	if limit <= 0 || len(items) <= limit {
+		return items, false
+	}
+	return items[:limit], true
+}
+
+func pageLatestWindowHasMore[T any](items []T, limit int) ([]T, bool) {
+	if limit <= 0 || len(items) <= limit {
+		return items, false
+	}
+	return items[len(items)-limit:], true
+}
+
+func pagedListPayload(key string, value any, limit int, offset int, hasMore bool) gin.H {
+	payload := gin.H{
+		key:        value,
+		"limit":    limit,
+		"offset":   offset,
+		"has_more": hasMore,
+	}
+	if hasMore {
+		payload["next_offset"] = offset + limit
+	}
+	return payload
+}
+
+func compactTrainingRunEvaluations(evaluations []runs.TrainingRunEvaluation) []runs.TrainingRunEvaluation {
+	out := append([]runs.TrainingRunEvaluation(nil), evaluations...)
+	for index := range out {
+		if out[index].HolisticScores != nil {
+			out[index].HolisticScores = copyPayloadMap(out[index].HolisticScores)
+		}
+		if len(out[index].PerClassMetrics) > 20 {
+			out[index].PerClassMetrics = map[string]any{"_truncated": true, "class_count": len(out[index].PerClassMetrics)}
+		}
+		if len(out[index].ConfusionMatrix) > 20 {
+			out[index].ConfusionMatrix = nil
+			if out[index].HolisticScores == nil {
+				out[index].HolisticScores = map[string]any{}
+			}
+			out[index].HolisticScores["confusion_matrix_truncated"] = true
+		}
+	}
+	return out
 }
 
 func envFloat(name string, defaultValue float64, minValue float64, maxValue float64) float64 {

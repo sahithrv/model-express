@@ -12,9 +12,13 @@ from worker.datasets.cache import (
     dataset_archive_path,
     dataset_cache_dir,
     dataset_materialization_cache_key,
+    dataset_profile_cache_key,
     ensure_dataset_materialized,
     extract_dataset_archive,
     job_dataset_cache_root,
+    load_cached_dataset_profile,
+    prune_cache_children,
+    save_cached_dataset_profile,
     storage_uri_fingerprint,
 )
 from worker.jobs import run_profile_dataset_job
@@ -88,6 +92,41 @@ def test_materialized_dataset_cache_key_falls_back_to_storage_fingerprint_withou
     key = dataset_materialization_cache_key("", storage_uri)
 
     assert key == f"uri-{storage_uri_fingerprint(storage_uri)}"
+
+
+def test_profile_cache_round_trip_uses_checksum_and_version(monkeypatch, tmp_path):
+    monkeypatch.setenv("MODEL_EXPRESS_DATASET_CACHE_ROOT", str(tmp_path / "cache"))
+    checksum = "e" * 64
+    storage_uri = "s3://bucket/dataset.zip"
+    version = "dataset_profile_v1_test"
+
+    assert dataset_profile_cache_key(checksum, storage_uri, version) == f"{version}-sha256-{checksum}"
+    saved = save_cached_dataset_profile(
+        checksum_sha256=checksum,
+        storage_uri=storage_uri,
+        profile_cache_version=version,
+        profile={"schema_version": "dataset_profile_v1", "image_count": 2},
+    )
+    loaded = load_cached_dataset_profile(
+        checksum_sha256=checksum,
+        storage_uri=storage_uri,
+        profile_cache_version=version,
+    )
+
+    assert saved is True
+    assert loaded == {"schema_version": "dataset_profile_v1", "image_count": 2}
+
+
+def test_prune_cache_children_is_dry_run_by_default(tmp_path):
+    cache_root = tmp_path / "cache"
+    old_child = cache_root / "old"
+    old_child.mkdir(parents=True)
+    (old_child / "payload.bin").write_bytes(b"x" * 10)
+
+    result = prune_cache_children(cache_root, max_bytes=1, apply=False)
+
+    assert result["would_remove"] == [str(old_child.resolve())]
+    assert old_child.exists()
 
 
 def test_ensure_dataset_materialized_reuses_completed_cache(tmp_path):
@@ -225,3 +264,48 @@ def test_profile_dataset_uses_modal_provider_when_worker_is_modal(monkeypatch):
     run_profile_dataset_job(client, job)
 
     assert called == {"client": client, "job": job}
+
+
+def test_profile_dataset_job_uses_cached_profile(monkeypatch, tmp_path):
+    monkeypatch.setenv("MODEL_EXPRESS_DATASET_CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.delenv("MODEL_EXPRESS_PERSIST_DATASET_CACHE", raising=False)
+    checksum = "f" * 64
+    from worker.datasets.profiler import PROFILE_CACHE_VERSION
+
+    save_cached_dataset_profile(
+        checksum_sha256=checksum,
+        storage_uri="s3://bucket/dataset.zip",
+        profile_cache_version=PROFILE_CACHE_VERSION,
+        profile={"schema_version": "dataset_profile_v1", "image_count": 7},
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.profile = None
+            self.completed = ""
+
+        def get_dataset(self, dataset_id: str) -> dict:
+            return {
+                "id": dataset_id,
+                "storage_uri": "s3://bucket/dataset.zip",
+                "checksum_sha256": checksum,
+            }
+
+        def update_dataset_profile(self, dataset_id: str, profile: dict) -> None:
+            self.profile = {"dataset_id": dataset_id, "profile": profile}
+
+        def complete_job(self, job_id: str, mlflow_run_id: str = "") -> None:
+            self.completed = job_id
+
+    def fail_download(*_args, **_kwargs):
+        raise AssertionError("cached profile should skip download")
+
+    monkeypatch.setattr("worker.jobs._download_and_extract_dataset", fail_download)
+    client = FakeClient()
+
+    run_profile_dataset_job(client, {"id": "job_1", "config": {"dataset_id": "dataset_1"}})
+
+    assert client.completed == "job_1"
+    assert client.profile["dataset_id"] == "dataset_1"
+    assert client.profile["profile"]["image_count"] == 7
+    assert client.profile["profile"]["profile_timing"]["profile_cache_hit"] is True

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 
 from worker.diagnostics import log_event
 from worker.datasets.cache import (
@@ -10,9 +11,11 @@ from worker.datasets.cache import (
     dataset_archive_path,
     extract_dataset_archive,
     job_dataset_cache_root,
+    load_cached_dataset_profile,
+    save_cached_dataset_profile,
     should_persist_dataset_cache,
 )
-from worker.datasets.profiler import profile_image_folder
+from worker.datasets.profiler import PROFILE_CACHE_VERSION, profile_image_folder
 from worker.datasets.metadata_discovery import build_metadata_import_payload
 from worker.datasets.label_quality import build_label_quality_profile_patch
 from worker.datasets.storage import download_s3_uri
@@ -65,8 +68,49 @@ def run_profile_dataset_job(client: OrchestratorClient, job: dict) -> None:
     dataset = client.get_dataset(dataset_id)
 
     try:
-        dataset_dir = _download_and_extract_dataset(dataset_id, dataset["storage_uri"], cache_root)
+        storage_uri = str(dataset["storage_uri"])
+        checksum = _dataset_checksum(dataset, config=job.get("config") if isinstance(job.get("config"), dict) else {})
+        cached_profile = load_cached_dataset_profile(
+            checksum_sha256=checksum,
+            storage_uri=storage_uri,
+            profile_cache_version=PROFILE_CACHE_VERSION,
+        )
+        if cached_profile is not None:
+            log_event(
+                "info",
+                "dataset_profile_cache_hit",
+                job_id=job_id,
+                dataset_id=dataset_id,
+                profile_cache_version=PROFILE_CACHE_VERSION,
+            )
+            client.update_dataset_profile(dataset_id, _with_profile_cache_fields(cached_profile, cache_hit=True))
+            client.complete_job(job["id"], mlflow_run_id="")
+            return
+
+        dataset_dir = _download_and_extract_dataset(dataset_id, storage_uri, cache_root)
+        profile_started = time.perf_counter()
         profile = profile_image_folder(dataset_dir)
+        profile_seconds = round(time.perf_counter() - profile_started, 6)
+        profile["profile_timing"] = {
+            **(profile.get("profile_timing") if isinstance(profile.get("profile_timing"), dict) else {}),
+            "profile_scan_seconds": profile_seconds,
+        }
+        profile = _with_profile_cache_fields(profile, cache_hit=False)
+        log_event(
+            "info",
+            "dataset_profile_scan_finished",
+            job_id=job_id,
+            dataset_id=dataset_id,
+            seconds=profile_seconds,
+            image_count=profile.get("image_count"),
+            warning_count=len(profile.get("profile_warnings") or []),
+        )
+        save_cached_dataset_profile(
+            checksum_sha256=checksum,
+            storage_uri=storage_uri,
+            profile_cache_version=PROFILE_CACHE_VERSION,
+            profile=profile,
+        )
 
         _send_dataset_metadata_import(client, dataset_id, dataset_dir)
         client.update_dataset_profile(dataset_id, profile)
@@ -162,14 +206,47 @@ def _profile_provider(job: dict) -> str:
 def _download_and_extract_dataset(dataset_id: str, storage_uri: str, cache_root=None):
     archive_path = dataset_archive_path(dataset_id, cache_root)
     if not archive_path.exists():
+        download_started = time.perf_counter()
         download_s3_uri(storage_uri, archive_path)
-    return extract_dataset_archive(archive_path, dataset_id, cache_root)
+        log_event(
+            "info",
+            "dataset_archive_download_finished",
+            dataset_id=dataset_id,
+            seconds=round(time.perf_counter() - download_started, 6),
+            bytes=archive_path.stat().st_size if archive_path.exists() else 0,
+        )
+    extract_started = time.perf_counter()
+    dataset_dir = extract_dataset_archive(archive_path, dataset_id, cache_root)
+    log_event(
+        "info",
+        "dataset_archive_extract_finished",
+        dataset_id=dataset_id,
+        seconds=round(time.perf_counter() - extract_started, 6),
+        archive_cached=archive_path.exists(),
+    )
+    return dataset_dir
 
 
 def _send_dataset_metadata_import(client: OrchestratorClient, dataset_id: str, dataset_dir) -> None:
     try:
+        discovery_started = time.perf_counter()
         payload = build_metadata_import_payload(dataset_dir)
+        log_event(
+            "info",
+            "dataset_metadata_discovery_finished",
+            dataset_id=dataset_id,
+            seconds=round(time.perf_counter() - discovery_started, 6),
+            file_count_seen=(payload.get("inventory") or {}).get("file_count_seen") if isinstance(payload, dict) else None,
+            warning_count=len(payload.get("warnings") or []) if isinstance(payload, dict) else 0,
+        )
+        import_started = time.perf_counter()
         result = client.import_dataset_metadata(dataset_id, payload)
+        log_event(
+            "info",
+            "dataset_metadata_import_posted",
+            dataset_id=dataset_id,
+            seconds=round(time.perf_counter() - import_started, 6),
+        )
         if isinstance(result, dict) and result.get("status") == "unavailable":
             log_event(
                 "warn",
@@ -185,6 +262,30 @@ def _send_dataset_metadata_import(client: OrchestratorClient, dataset_id: str, d
             dataset_id=dataset_id,
             error=str(exc),
         )
+
+
+def _dataset_checksum(dataset: dict, *, config: dict | None = None) -> str:
+    config = config if isinstance(config, dict) else {}
+    for value in (
+        dataset.get("checksum_sha256") if isinstance(dataset, dict) else "",
+        config.get("dataset_checksum_sha256"),
+        config.get("checksum_sha256"),
+    ):
+        text = str(value or "").strip().lower()
+        if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
+            return text
+    return ""
+
+
+def _with_profile_cache_fields(profile: dict, *, cache_hit: bool) -> dict:
+    next_profile = dict(profile)
+    timing = next_profile.get("profile_timing") if isinstance(next_profile.get("profile_timing"), dict) else {}
+    next_profile["profile_timing"] = {
+        **timing,
+        "profile_cache_hit": cache_hit,
+        "profile_cache_version": PROFILE_CACHE_VERSION,
+    }
+    return next_profile
 
 
 def _visual_sample_caps(config: dict) -> dict:

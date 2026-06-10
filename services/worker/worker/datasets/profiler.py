@@ -1,10 +1,16 @@
 from __future__ import annotations
 import ast
+import os
 from pathlib import Path
 import re
 import statistics
 from PIL import Image, ImageStat
 
+PROFILE_SCHEMA_VERSION = "dataset_profile_v1"
+PROFILE_CACHE_VERSION = "dataset_profile_v1_bounded_v1"
+DEFAULT_PROFILE_MAX_IMAGES = 25_000
+DEFAULT_PROFILE_MAX_FILES = 25_000
+DEFAULT_PROFILE_MAX_CORRUPT_PATHS = 25
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 NON_CLASS_DIR_NAMES = {
     "annotation",
@@ -62,15 +68,82 @@ METADATA_ARTIFACT_TYPES = {
 }
 NORMALIZATION_THUMBNAIL_SIZE = 256
 
-def profile_image_folder(dataset_dir: Path) -> dict:
+
+def _profile_caps(
+    *,
+    max_images: int | None = None,
+    max_artifact_files: int | None = None,
+    max_corrupt_paths: int | None = None,
+) -> dict[str, int]:
+    return {
+        "max_images": _positive_int(max_images, "MODEL_EXPRESS_PROFILE_MAX_IMAGES", DEFAULT_PROFILE_MAX_IMAGES),
+        "max_artifact_files": _positive_int(
+            max_artifact_files,
+            "MODEL_EXPRESS_PROFILE_MAX_FILES",
+            DEFAULT_PROFILE_MAX_FILES,
+        ),
+        "max_corrupt_paths": _positive_int(
+            max_corrupt_paths,
+            "MODEL_EXPRESS_PROFILE_MAX_CORRUPT_PATHS",
+            DEFAULT_PROFILE_MAX_CORRUPT_PATHS,
+        ),
+    }
+
+
+def _positive_int(value: int | None, env_name: str, default: int) -> int:
+    if value is None:
+        raw_value = os.getenv(env_name, "").strip()
+        if raw_value:
+            try:
+                value = int(raw_value)
+            except ValueError:
+                value = default
+        else:
+            value = default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _add_profile_warning(
+    warnings: list[dict],
+    code: str,
+    message: str,
+    **fields,
+) -> None:
+    if any(warning.get("code") == code for warning in warnings):
+        return
+    warning = {"code": code, "message": message}
+    warning.update({key: value for key, value in fields.items() if value is not None})
+    warnings.append(warning)
+
+def profile_image_folder(
+    dataset_dir: Path,
+    *,
+    max_images: int | None = None,
+    max_artifact_files: int | None = None,
+    max_corrupt_paths: int | None = None,
+) -> dict:
     dataset_dir = Path(dataset_dir)
+    caps = _profile_caps(
+        max_images=max_images,
+        max_artifact_files=max_artifact_files,
+        max_corrupt_paths=max_corrupt_paths,
+    )
+    warnings: list[dict] = []
     class_root = resolve_classification_root(dataset_dir)
     class_counts: dict[str, int] = {}
     corrupt_images: list[str] = []
+    corrupt_image_count = 0
 
     widths: list[int] = []
     heights: list[int] = []
     image_paths: list[Path] = []
+    image_headers_opened = 0
+    image_file_candidates_seen = 0
+    image_header_cap_hit = False
 
     for class_dir in classification_class_dirs(class_root):
         class_name = class_dir.name
@@ -83,7 +156,13 @@ def profile_image_folder(dataset_dir: Path) -> dict:
             if image_path.suffix.lower() not in IMAGE_EXT:
                 continue
 
+            image_file_candidates_seen += 1
+            if image_headers_opened >= caps["max_images"]:
+                image_header_cap_hit = True
+                break
+
             try:
+                image_headers_opened += 1
                 with Image.open(image_path) as image:
                     width, height = image.size
                     image.verify() #image corruption check
@@ -93,9 +172,29 @@ def profile_image_folder(dataset_dir: Path) -> dict:
                 image_count += 1
                 image_paths.append(image_path)
             except Exception:
-                corrupt_images.append(str(image_path))
+                corrupt_image_count += 1
+                if len(corrupt_images) < caps["max_corrupt_paths"]:
+                    corrupt_images.append(str(image_path))
         if image_count > 0:
             class_counts[class_name] = image_count
+        if image_header_cap_hit:
+            break
+    if image_header_cap_hit:
+        _add_profile_warning(
+            warnings,
+            "profile_image_header_cap",
+            f"Dataset profiling opened the first {caps['max_images']} image header(s) and skipped the remainder.",
+            cap=caps["max_images"],
+            seen=image_file_candidates_seen,
+        )
+    if corrupt_image_count > len(corrupt_images):
+        _add_profile_warning(
+            warnings,
+            "profile_corrupt_paths_retained_cap",
+            "Only a bounded sample of corrupt image paths was retained in the profile.",
+            cap=caps["max_corrupt_paths"],
+            count=corrupt_image_count,
+        )
     
     total_images = sum(class_counts.values())
     non_empty_counts = [count for count in class_counts.values() if count > 0]
@@ -105,9 +204,15 @@ def profile_image_folder(dataset_dir: Path) -> dict:
     else:
         imbalance_ratio = 0.0
     dimension_stats = _dimension_stats(widths, heights)
-    artifacts = detect_dataset_artifacts(dataset_dir)
+    artifacts = detect_dataset_artifacts(dataset_dir, max_files=caps["max_artifact_files"], warnings=warnings)
     metadata_summary = _metadata_summary(artifacts)
-    yolo_summary = _yolo_dataset_summary(dataset_dir, artifacts)
+    yolo_summary = _yolo_dataset_summary(
+        dataset_dir,
+        artifacts,
+        max_files=caps["max_artifact_files"],
+        max_images=caps["max_images"],
+        warnings=warnings,
+    )
     yolo_available = bool(yolo_summary.get("available"))
     bbox_count = int(yolo_summary.get("bbox_count") or 0)
     bbox_per_class = yolo_summary.get("bbox_per_class") or yolo_summary.get("box_distribution") or {}
@@ -119,7 +224,7 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         metadata_summary["object_detection_available"] = True
         metadata_summary["yolo_available"] = True
     if yolo_summary.get("available"):
-        yolo_images = list(_iter_all_image_files(dataset_dir))
+        yolo_images = list(_iter_all_image_files(dataset_dir, max_images=caps["max_images"], warnings=warnings))
         if yolo_images:
             image_paths = yolo_images
             total_images = len(yolo_images)
@@ -149,7 +254,7 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         imbalance_ratio=imbalance_ratio,
         dimension_stats=dimension_stats,
         artifacts=artifacts,
-        corrupt_file_count=len(corrupt_images),
+        corrupt_file_count=corrupt_image_count,
         visual_traits=visual_traits,
         metadata_summary=metadata_summary,
     )
@@ -159,7 +264,7 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         class_names = sorted(class_counts.keys())
     
     return {
-        "schema_version": "dataset_profile_v1",
+        "schema_version": PROFILE_SCHEMA_VERSION,
         "dataset_path": str(dataset_dir),
         "image_folder_root": str(class_root),
         "layout_summary": {
@@ -182,9 +287,9 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         "bbox_count": bbox_count,
         "bbox_per_class": bbox_per_class,
         "yolo_summary": yolo_summary,
-        "corrupt_file_count": len(corrupt_images),
-        "corrupt_image_count": len(corrupt_images),
-        "corrupt_images": corrupt_images[:25],
+        "corrupt_file_count": corrupt_image_count,
+        "corrupt_image_count": corrupt_image_count,
+        "corrupt_images": corrupt_images,
         "width_min": min(widths) if widths else None,
         "width_max": max(widths) if widths else None,
         "height_min": min(heights) if heights else None,
@@ -197,6 +302,15 @@ def profile_image_folder(dataset_dir: Path) -> dict:
         "leakage_warnings": leakage_warnings,
         "dataset_traits": traits,
         "artifacts": artifacts,
+        "profile_caps": caps,
+        "profile_scan": {
+            "image_headers_opened": image_headers_opened,
+            "image_file_candidates_seen": image_file_candidates_seen,
+            "image_header_cap_hit": image_header_cap_hit,
+            "truncated": bool(warnings),
+        },
+        "profile_warnings": warnings,
+        "warnings": warnings,
     }
 
 
@@ -290,11 +404,17 @@ def _contains_image_file(directory: Path) -> bool:
         return False
 
 
-def _image_count_under(directory: Path) -> int:
+def _image_count_under(directory: Path, limit: int = 1_000) -> int:
+    count = 0
     try:
-        return sum(1 for path in directory.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXT)
+        for path in directory.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXT:
+                count += 1
+                if count >= limit:
+                    return count
     except OSError:
         return 0
+    return count
 
 
 def _safe_relative_to(root: Path, child: Path) -> str:
@@ -356,9 +476,16 @@ def _numeric_stats(values: list[float]) -> dict:
     }
 
 
-def detect_dataset_artifacts(dataset_dir: Path) -> list[dict]:
+def detect_dataset_artifacts(
+    dataset_dir: Path,
+    *,
+    max_files: int | None = None,
+    warnings: list[dict] | None = None,
+) -> list[dict]:
     """Return bounded, profile-safe artifact records detected in an image dataset."""
     dataset_dir = Path(dataset_dir)
+    file_cap = _positive_int(max_files, "MODEL_EXPRESS_PROFILE_MAX_FILES", DEFAULT_PROFILE_MAX_FILES)
+    warning_list = warnings if warnings is not None else []
     class_root = resolve_classification_root(dataset_dir)
     artifacts = [
         {
@@ -392,9 +519,20 @@ def detect_dataset_artifacts(dataset_dir: Path) -> list[dict]:
             )
 
     file_artifacts: list[dict] = []
-    for path in sorted(dataset_dir.rglob("*")):
+    files_seen = 0
+    for path in dataset_dir.rglob("*"):
         if not path.is_file():
             continue
+        files_seen += 1
+        if files_seen > file_cap:
+            _add_profile_warning(
+                warning_list,
+                "profile_artifact_file_cap",
+                f"Artifact detection inspected the first {file_cap} file(s) and skipped the remainder.",
+                cap=file_cap,
+                seen=files_seen,
+            )
+            break
         name = path.name.lower()
         suffix = path.suffix.lower()
         if name in CUB_BBOX_FILE_NAMES:
@@ -510,9 +648,27 @@ def _iter_image_files(dataset_dir: Path):
             yield image_path
 
 
-def _iter_all_image_files(dataset_dir: Path):
-    for image_path in sorted(Path(dataset_dir).rglob("*")):
+def _iter_all_image_files(
+    dataset_dir: Path,
+    *,
+    max_images: int | None = None,
+    warnings: list[dict] | None = None,
+):
+    image_cap = _positive_int(max_images, "MODEL_EXPRESS_PROFILE_MAX_IMAGES", DEFAULT_PROFILE_MAX_IMAGES)
+    yielded = 0
+    for image_path in Path(dataset_dir).rglob("*"):
         if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXT:
+            if yielded >= image_cap:
+                if warnings is not None:
+                    _add_profile_warning(
+                        warnings,
+                        "profile_all_image_file_cap",
+                        f"Profile image inventory used the first {image_cap} image file(s) and skipped the remainder.",
+                        cap=image_cap,
+                        seen=yielded + 1,
+                    )
+                break
+            yielded += 1
             yield image_path
 
 
@@ -580,15 +736,24 @@ def _parse_yolo_label_row(line: str) -> tuple[int, float, float, float, float] |
     return class_id, x_center, y_center, width, height
 
 
-def _yolo_dataset_summary(dataset_dir: Path, artifacts: list[dict]) -> dict:
+def _yolo_dataset_summary(
+    dataset_dir: Path,
+    artifacts: list[dict],
+    *,
+    max_files: int | None = None,
+    max_images: int | None = None,
+    warnings: list[dict] | None = None,
+) -> dict:
     dataset_dir = Path(dataset_dir)
+    file_cap = _positive_int(max_files, "MODEL_EXPRESS_PROFILE_MAX_FILES", DEFAULT_PROFILE_MAX_FILES)
+    image_cap = _positive_int(max_images, "MODEL_EXPRESS_PROFILE_MAX_IMAGES", DEFAULT_PROFILE_MAX_IMAGES)
     config_paths = _unique_paths(
         [
             Path(str(artifact.get("path") or ""))
             for artifact in artifacts
             if artifact.get("artifact_type") == "yolo_dataset_config"
         ]
-        + _find_yolo_config_paths(dataset_dir)
+        + _find_yolo_config_paths(dataset_dir, max_files=file_cap, warnings=warnings)
     )
     label_paths = _unique_paths(
         [
@@ -596,8 +761,15 @@ def _yolo_dataset_summary(dataset_dir: Path, artifacts: list[dict]) -> dict:
             for artifact in artifacts
             if artifact.get("artifact_type") == "yolo_label_file"
         ]
-        + _find_yolo_label_paths(dataset_dir)
-    )
+        + _find_yolo_label_paths(dataset_dir, max_files=file_cap, warnings=warnings)
+    )[:file_cap]
+    if len(label_paths) >= file_cap and warnings is not None:
+        _add_profile_warning(
+            warnings,
+            "profile_yolo_label_file_cap",
+            f"Yolo summary inspected at most {file_cap} label file(s).",
+            cap=file_cap,
+        )
     available = bool(config_paths or label_paths)
     class_names: list[str] = []
     split_hints: dict[str, str | list[str]] = {}
@@ -651,9 +823,11 @@ def _yolo_dataset_summary(dataset_dir: Path, artifacts: list[dict]) -> dict:
             split_hints=split_hints,
             label_paths=label_paths,
             parsed_label_counts_by_path=parsed_label_counts_by_path,
+            max_images=image_cap,
+            warnings=warnings,
         )
 
-    image_count = sum(1 for _ in _iter_all_image_files(dataset_dir)) if available else 0
+    image_count = sum(1 for _ in _iter_all_image_files(dataset_dir, max_images=image_cap, warnings=warnings)) if available else 0
     return {
         "available": available,
         "format": "yolo" if available else "",
@@ -675,27 +849,64 @@ def _yolo_dataset_summary(dataset_dir: Path, artifacts: list[dict]) -> dict:
     }
 
 
-def _find_yolo_config_paths(dataset_dir: Path) -> list[Path]:
+def _find_yolo_config_paths(
+    dataset_dir: Path,
+    *,
+    max_files: int | None = None,
+    warnings: list[dict] | None = None,
+) -> list[Path]:
     paths: list[Path] = []
+    file_cap = _positive_int(max_files, "MODEL_EXPRESS_PROFILE_MAX_FILES", DEFAULT_PROFILE_MAX_FILES)
+    seen = 0
     try:
-        iterator = sorted(Path(dataset_dir).rglob("*"))
+        iterator = Path(dataset_dir).rglob("*")
     except OSError:
         return paths
     for path in iterator:
+        if path.is_file():
+            seen += 1
+            if seen > file_cap:
+                if warnings is not None:
+                    _add_profile_warning(
+                        warnings,
+                        "profile_yolo_config_scan_cap",
+                        f"Yolo config discovery scanned the first {file_cap} file(s) and skipped the remainder.",
+                        cap=file_cap,
+                    )
+                break
         if path.is_file() and path.name.lower() in YOLO_CONFIG_FILE_NAMES and _looks_like_yolo_dataset_config(path):
             paths.append(path)
     return paths
 
 
-def _find_yolo_label_paths(dataset_dir: Path) -> list[Path]:
+def _find_yolo_label_paths(
+    dataset_dir: Path,
+    *,
+    max_files: int | None = None,
+    warnings: list[dict] | None = None,
+) -> list[Path]:
     paths: list[Path] = []
+    file_cap = _positive_int(max_files, "MODEL_EXPRESS_PROFILE_MAX_FILES", DEFAULT_PROFILE_MAX_FILES)
+    seen = 0
     try:
-        iterator = sorted(Path(dataset_dir).rglob("*.txt"))
+        iterator = Path(dataset_dir).rglob("*.txt")
     except OSError:
         return paths
     for path in iterator:
+        seen += 1
+        if seen > file_cap:
+            if warnings is not None:
+                _add_profile_warning(
+                    warnings,
+                    "profile_yolo_label_scan_cap",
+                    f"Yolo label discovery scanned the first {file_cap} text file(s) and skipped the remainder.",
+                    cap=file_cap,
+                )
+            break
         if path.is_file() and _is_yolo_label_file(path, dataset_dir):
             paths.append(path)
+            if len(paths) >= file_cap:
+                break
     return paths
 
 
@@ -845,6 +1056,8 @@ def _yolo_split_counts(
     split_hints: dict[str, str | list[str]],
     label_paths: list[Path],
     parsed_label_counts_by_path: dict[Path, dict[int, int]],
+    max_images: int,
+    warnings: list[dict] | None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
     image_counts: dict[str, int] = {}
     label_file_counts: dict[str, int] = {}
@@ -853,7 +1066,10 @@ def _yolo_split_counts(
 
     for split, hint in split_hints.items():
         targets = _resolve_yolo_split_targets(config_path, path_hint, hint)
-        image_counts[split] = sum(_count_yolo_images_for_target(target, config_path.parent) for target in targets)
+        image_counts[split] = sum(
+            _count_yolo_images_for_target(target, config_path.parent, max_images=max_images, warnings=warnings)
+            for target in targets
+        )
 
         split_label_paths: set[Path] = set()
         for target in targets:
@@ -919,9 +1135,28 @@ def _is_remote_yolo_path(value: str) -> bool:
     return "://" in lowered or lowered.startswith(("s3:", "gs:"))
 
 
-def _count_yolo_images_for_target(target: Path, config_base: Path) -> int:
+def _count_yolo_images_for_target(
+    target: Path,
+    config_base: Path,
+    *,
+    max_images: int,
+    warnings: list[dict] | None,
+) -> int:
     if target.is_dir():
-        return sum(1 for path in target.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXT)
+        count = 0
+        for path in target.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXT:
+                if count >= max_images:
+                    if warnings is not None:
+                        _add_profile_warning(
+                            warnings,
+                            "profile_yolo_split_image_cap",
+                            f"Yolo split image counting used at most {max_images} image file(s) per target.",
+                            cap=max_images,
+                        )
+                    break
+                count += 1
+        return count
     if target.is_file() and target.suffix.lower() in IMAGE_EXT:
         return 1
     if target.is_file() and target.suffix.lower() == ".txt":
@@ -995,10 +1230,12 @@ def _known_label_paths_under(label_dir: Path, label_lookup: dict[str, Path]) -> 
     out: set[Path] = set()
     if not label_dir.is_dir():
         return out
-    for path in sorted(label_dir.rglob("*.txt")):
+    for path in label_dir.rglob("*.txt"):
         known = label_lookup.get(_path_key(path))
         if known is not None:
             out.add(known)
+            if len(out) >= len(label_lookup):
+                break
     return out
 
 

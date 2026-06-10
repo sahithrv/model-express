@@ -75,7 +75,14 @@ import type {
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
 const jobsPerPage = 10;
-const liveRefreshIntervalMs = 10_000;
+const activeLiveRefreshIntervalMs = 10_000;
+const idleLiveRefreshIntervalMs = 30_000;
+const eventRefreshMinIntervalMs = 3_000;
+const eventRefreshDebounceMs = 750;
+const projectJobsFetchLimit = 100;
+const trainingSummariesFetchLimit = 100;
+const trainingEvaluationsFetchLimit = 50;
+const selectedJobMetricsFetchLimit = 200;
 
 type MetricKey = string;
 type ProjectTabKey = "mission" | "activity" | "results" | "export" | "developer";
@@ -859,6 +866,26 @@ type Notice = {
 type DatasetFolder = {
   path: string;
   name: string;
+  preflight?: DatasetUploadPreflight;
+};
+
+type DatasetUploadWarning = {
+  code: string;
+  message: string;
+  threshold?: number;
+  value?: number;
+};
+
+type DatasetUploadPreflight = {
+  file_count: number;
+  uncompressed_size_bytes: number;
+  archive_size_bytes: number;
+  largest_file?: {
+    path: string;
+    size_bytes: number;
+  } | null;
+  warnings: DatasetUploadWarning[];
+  errors: DatasetUploadWarning[];
 };
 
 type ScheduleFollowUpResponse = {
@@ -1035,6 +1062,9 @@ export function App() {
   const supervisingRequirements = useRef<Set<string>>(new Set());
   const activeRequirementEnsureAt = useRef<Map<string, number>>(new Map());
   const eventRefreshInFlight = useRef(false);
+  const eventRefreshTimer = useRef<number | null>(null);
+  const eventRefreshQueuedSlow = useRef(false);
+  const lastEventRefreshAt = useRef(0);
   const liveRefreshInFlight = useRef(false);
   const cachedGetRequests = useRef<Map<string, CachedGetRequest>>(new Map());
   const workerRequirementsRef = useRef<WorkerRequirement[]>([]);
@@ -1056,6 +1086,10 @@ export function App() {
   const selectedRunEvaluation = useMemo(
     () => detail.runEvaluations.find((evaluation) => evaluation.job_id === selectedJobId) ?? null,
     [detail.runEvaluations, selectedJobId],
+  );
+  const projectHasOpenWork = useMemo(
+    () => detail.jobs.some((job) => ["QUEUED", "ASSIGNED", "RUNNING"].includes(normalizedStatus(job.status))),
+    [detail.jobs],
   );
   const selectedMetricOptions = useMemo(
     () => metricTabOptions(metrics, selectedJob),
@@ -1421,9 +1455,9 @@ export function App() {
         executionEvents,
       ] = await Promise.all([
         request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
-        request<{ jobs: Job[] }>(`/projects/${projectId}/jobs`),
+        request<{ jobs: Job[] }>(`/projects/${projectId}/jobs?limit=${projectJobsFetchLimit}`),
         request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
-        request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries`),
+        request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries?limit=${trainingSummariesFetchLimit}`),
         request<{ champion: ProjectChampion | null }>(`/projects/${projectId}/champion`),
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
         request<{ requirements: WorkerRequirement[] }>(`/projects/${projectId}/worker-requirements`),
@@ -1433,16 +1467,27 @@ export function App() {
       const firstDataset = datasets.datasets[0] ?? null;
       const slowData = includeSlowData
         ? await Promise.all([
-            request<{ evaluations: TrainingRunEvaluation[] }>(`/projects/${projectId}/training-run-evaluations`, slowRequestOptions),
-            request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`, slowRequestOptions),
+            request<{ evaluations: TrainingRunEvaluation[] }>(
+              `/projects/${projectId}/training-run-evaluations?limit=${trainingEvaluationsFetchLimit}&compact=1`,
+              slowRequestOptions,
+            ).catch(
+              (): { evaluations: TrainingRunEvaluation[] } => ({ evaluations: [] }),
+            ),
+            request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`, slowRequestOptions).catch(
+              (): { decisions: AgentDecision[] } => ({ decisions: [] }),
+            ),
             request<AgentInvocationsResponse>(`/projects/${projectId}/agent-invocations?limit=8`, slowRequestOptions).catch(
               (): AgentInvocationsResponse => ({ invocations: [] }),
             ),
             request<MissionControlTelemetryResponse>(`/projects/${projectId}/telemetry-summary?limit=1000`, slowRequestOptions).catch(
               (): MissionControlTelemetryResponse => ({}),
             ),
-            request<{ records: AgentMemoryRecord[] }>(`/projects/${projectId}/agent-memory?limit=6`, slowRequestOptions),
-            request<{ scorecards: StrategyScorecard[] }>(`/projects/${projectId}/strategy-scorecards?limit=6`, slowRequestOptions),
+            request<{ records: AgentMemoryRecord[] }>(`/projects/${projectId}/agent-memory?limit=6`, slowRequestOptions).catch(
+              (): { records: AgentMemoryRecord[] } => ({ records: [] }),
+            ),
+            request<{ scorecards: StrategyScorecard[] }>(`/projects/${projectId}/strategy-scorecards?limit=6`, slowRequestOptions).catch(
+              (): { scorecards: StrategyScorecard[] } => ({ scorecards: [] }),
+            ),
             fetchLatestDatasetVisualAnalysis(firstDataset, slowRequestOptions),
             fetchLatestDatasetMetadata(firstDataset, slowRequestOptions),
           ])
@@ -1535,7 +1580,7 @@ export function App() {
       return;
     }
 
-    const response = await request<{ metrics: EpochMetric[] }>(`/jobs/${selectedJobId}/metrics`);
+    const response = await request<{ metrics: EpochMetric[] }>(`/jobs/${selectedJobId}/metrics?limit=${selectedJobMetricsFetchLimit}`);
     setMetrics(response.metrics);
   }, [request, selectedJobId]);
 
@@ -1742,12 +1787,13 @@ export function App() {
   }, [refreshSelectedJobMetrics]);
 
   useEffect(() => {
+    const interval = projectHasOpenWork ? activeLiveRefreshIntervalMs : idleLiveRefreshIntervalMs;
     const timer = window.setInterval(() => {
       refreshLive();
-    }, liveRefreshIntervalMs);
+    }, interval);
 
     return () => window.clearInterval(timer);
-  }, [refreshLive]);
+  }, [projectHasOpenWork, refreshLive]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -1763,19 +1809,27 @@ export function App() {
     setActivityStreamState("connecting");
     const streamUrl = new URL(`/projects/${selectedProjectId}/activity-stream`, baseUrl);
     streamUrl.searchParams.set("limit", "12");
-    streamUrl.searchParams.set("interval_ms", "2000");
+    streamUrl.searchParams.set("interval_ms", projectHasOpenWork ? "5000" : "10000");
     const events = new EventSource(streamUrl.toString());
     const triggerRefresh = (event: MessageEvent | Event) => {
-      if (closed || eventRefreshInFlight.current) return;
+      if (closed) return;
       const includeSlowData = eventNeedsSlowProjectRefresh(event);
-      eventRefreshInFlight.current = true;
-      window.setTimeout(() => {
-        refreshLive({ includeSlowData })
+      eventRefreshQueuedSlow.current = eventRefreshQueuedSlow.current || includeSlowData;
+      if (eventRefreshInFlight.current || eventRefreshTimer.current !== null) return;
+      const elapsed = Date.now() - lastEventRefreshAt.current;
+      const delay = Math.max(eventRefreshDebounceMs, eventRefreshMinIntervalMs - elapsed);
+      eventRefreshTimer.current = window.setTimeout(() => {
+        eventRefreshTimer.current = null;
+        eventRefreshInFlight.current = true;
+        lastEventRefreshAt.current = Date.now();
+        const shouldIncludeSlowData = eventRefreshQueuedSlow.current;
+        eventRefreshQueuedSlow.current = false;
+        refreshLive({ includeSlowData: shouldIncludeSlowData })
           .catch(() => undefined)
           .finally(() => {
             eventRefreshInFlight.current = false;
           });
-        }, 150);
+      }, delay);
     };
 
     const handleActivityEvent = (event: MessageEvent) => {
@@ -1802,9 +1856,13 @@ export function App() {
 
     return () => {
       closed = true;
+      if (eventRefreshTimer.current !== null) {
+        window.clearTimeout(eventRefreshTimer.current);
+        eventRefreshTimer.current = null;
+      }
       events.close();
     };
-  }, [baseUrl, refreshLive, selectedProjectId]);
+  }, [baseUrl, projectHasOpenWork, refreshLive, selectedProjectId]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1818,7 +1876,13 @@ export function App() {
   async function chooseNewProjectFolder() {
     const folder = await window.missionControl.selectDatasetFolder();
     if (folder) {
-      setNewProjectFolder(folder);
+      try {
+        const preflight = await window.missionControl.preflightDatasetFolder({ datasetPath: folder.path });
+        setNewProjectFolder({ ...folder, preflight });
+      } catch (error) {
+        setNewProjectFolder(folder);
+        setNotice({ kind: "error", text: errorMessage(error) });
+      }
     }
   }
 
@@ -1829,6 +1893,14 @@ export function App() {
     if (!name || !newProjectFolder) {
       setNotice({ kind: "error", text: "Project name and dataset folder are required." });
       return;
+    }
+    const uploadWarnings = newProjectFolder.preflight?.warnings ?? [];
+    if (uploadWarnings.length > 0) {
+      const summary = uploadWarnings.map((warning) => warning.message).join("\n");
+      const confirmed = window.confirm(`${summary}\n\nContinue with dataset upload?`);
+      if (!confirmed) {
+        return;
+      }
     }
 
     setLoading(true);
@@ -3571,6 +3643,17 @@ export function App() {
                 </span>
                 {newProjectFolder && <CheckCircle2 size={18} />}
               </button>
+              {newProjectFolder?.preflight && (
+                <div className={newProjectFolder.preflight.warnings.length > 0 ? "notice-inline warning" : "notice-inline"}>
+                  <small>
+                    {newProjectFolder.preflight.file_count.toLocaleString()} files,{" "}
+                    {formatBytes(newProjectFolder.preflight.uncompressed_size_bytes)} before ZIP
+                    {newProjectFolder.preflight.warnings.length > 0
+                      ? `; ${newProjectFolder.preflight.warnings[0].message}`
+                      : ""}
+                  </small>
+                </div>
+              )}
               <button className="command primary" disabled={!newProjectFolder || loading}>
                 <HardDriveUpload size={16} />
                 Create Project

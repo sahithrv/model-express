@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"model-express/services/orchestrator/internal/diagnostics"
 )
@@ -229,27 +230,11 @@ func (c OpenAICompatibleClient) generateChatJSONWithUsage(ctx context.Context, r
 		return nil, nil, fmt.Errorf("marshal llm request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.BaseURL+"/chat/completions", bytes.NewReader(encoded))
+	responseBody, err := c.postJSONWithRetry(ctx, c.config.BaseURL+"/chat/completions", encoded, APIStyleChatCompletions, map[string]any{
+		"model": body.Model,
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("build llm request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.config.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-	}
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, nil, fmt.Errorf("call llm: %w", err)
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read llm response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, nil, fmt.Errorf("llm request failed: %s: %s", resp.Status, string(responseBody))
+		return nil, nil, err
 	}
 
 	var decoded chatCompletionResponse
@@ -298,36 +283,12 @@ func (c OpenAICompatibleClient) postResponse(ctx context.Context, call responses
 		return ResponseResult{}, fmt.Errorf("marshal llm responses request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.BaseURL+"/responses", bytes.NewReader(encoded))
+	responseBody, err := c.postJSONWithRetry(ctx, c.config.BaseURL+"/responses", encoded, APIStyleResponses, map[string]any{
+		"model":      call.model,
+		"tool_count": len(call.tools),
+	})
 	if err != nil {
-		return ResponseResult{}, fmt.Errorf("build llm responses request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.config.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-	}
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return ResponseResult{}, fmt.Errorf("call llm responses: %w", err)
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ResponseResult{}, fmt.Errorf("read llm responses response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		diagnostics.Event("error", "llm_responses_http_error", map[string]any{
-			"provider":    c.config.Provider,
-			"model":       call.model,
-			"api_style":   APIStyleResponses,
-			"status":      resp.Status,
-			"status_code": resp.StatusCode,
-			"body":        string(responseBody),
-			"tool_count":  len(call.tools),
-		})
-		return ResponseResult{}, fmt.Errorf("llm responses request failed: %s: %s", resp.Status, string(responseBody))
+		return ResponseResult{}, err
 	}
 
 	var decoded responsesResponse
@@ -343,6 +304,110 @@ func (c OpenAICompatibleClient) postResponse(ctx context.Context, call responses
 		return ResponseResult{}, fmt.Errorf("llm response content was empty")
 	}
 	return result, nil
+}
+
+func (c OpenAICompatibleClient) postJSONWithRetry(ctx context.Context, url string, encoded []byte, apiStyle string, fields map[string]any) ([]byte, error) {
+	attempts := c.config.MaxRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		responseBody, status, statusCode, err := c.postJSONOnce(ctx, url, encoded)
+		if err == nil {
+			return responseBody, nil
+		}
+		lastErr = err
+		if attempt >= attempts || !retryableLLMHTTPFailure(ctx, statusCode, err) {
+			diagnostics.Event("error", "llm_http_error", mergeDiagnosticFields(fields, map[string]any{
+				"provider":     c.config.Provider,
+				"api_style":    apiStyle,
+				"status":       status,
+				"status_code":  statusCode,
+				"attempt":      attempt,
+				"max_attempts": attempts,
+				"error":        err.Error(),
+			}))
+			return nil, err
+		}
+		diagnostics.Event("warn", "llm_http_retry", mergeDiagnosticFields(fields, map[string]any{
+			"provider":     c.config.Provider,
+			"api_style":    apiStyle,
+			"status":       status,
+			"status_code":  statusCode,
+			"attempt":      attempt,
+			"max_attempts": attempts,
+			"error":        err.Error(),
+		}))
+		if err := sleepBeforeLLMRetry(ctx, attempt); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func mergeDiagnosticFields(base map[string]any, overlay map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range overlay {
+		out[key] = value
+	}
+	return out
+}
+
+func (c OpenAICompatibleClient) postJSONOnce(ctx context.Context, url string, encoded []byte) ([]byte, string, int, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("build llm request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.config.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("call llm: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.Status, resp.StatusCode, fmt.Errorf("read llm response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, resp.Status, resp.StatusCode, fmt.Errorf("llm request failed: %s: %s", resp.Status, string(responseBody))
+	}
+	return responseBody, resp.Status, resp.StatusCode, nil
+}
+
+func retryableLLMHTTPFailure(ctx context.Context, statusCode int, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if statusCode == 0 {
+		return true
+	}
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func sleepBeforeLLMRetry(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt) * 500 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c OpenAICompatibleClient) modelForRequest(req JSONRequest) (string, error) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 from PIL import Image
@@ -15,6 +16,26 @@ from worker.datasets.profiler import (
 
 
 class DatasetProfilerTests(unittest.TestCase):
+    def test_profile_image_header_cap_adds_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            for index in range(3):
+                _write_image(dataset_dir / "cat" / f"{index}.jpg", (10, 10), (index, index, index))
+
+            previous = os.environ.get("MODEL_EXPRESS_PROFILE_MAX_IMAGES")
+            os.environ["MODEL_EXPRESS_PROFILE_MAX_IMAGES"] = "2"
+            try:
+                profile = profile_image_folder(dataset_dir)
+            finally:
+                if previous is None:
+                    os.environ.pop("MODEL_EXPRESS_PROFILE_MAX_IMAGES", None)
+                else:
+                    os.environ["MODEL_EXPRESS_PROFILE_MAX_IMAGES"] = previous
+
+            self.assertEqual(profile["image_count"], 2)
+            self.assertTrue(profile["profile_scan"]["image_header_cap_hit"])
+            self.assertIn("profile_image_header_cap", {warning["code"] for warning in profile["profile_warnings"]})
+
     def test_profile_detects_artifacts_splits_and_bbox_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_dir = Path(temp_dir)

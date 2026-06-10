@@ -56,6 +56,7 @@ func TestConfigFromEnvReadsResponsesSettings(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_LLM_PLATEAU_REASONING_EFFORT", "xhigh")
 	t.Setenv("MODEL_EXPRESS_LLM_STORED_RESPONSES", "false")
 	t.Setenv("MODEL_EXPRESS_LLM_MAX_TOOL_ROUNDS", "7")
+	t.Setenv("MODEL_EXPRESS_LLM_MAX_RETRIES", "4")
 	t.Setenv("MODEL_EXPRESS_LLM_TIMEOUT_SECONDS", "240")
 
 	config := ConfigFromEnv(true, ProviderOpenAI, "test-model")
@@ -73,6 +74,9 @@ func TestConfigFromEnvReadsResponsesSettings(t *testing.T) {
 	}
 	if config.MaxToolRounds != 7 {
 		t.Fatalf("expected max tool rounds 7, got %d", config.MaxToolRounds)
+	}
+	if config.MaxRetries != 4 {
+		t.Fatalf("expected max retries 4, got %d", config.MaxRetries)
 	}
 	if config.Timeout != 240*time.Second {
 		t.Fatalf("expected timeout 240s, got %s", config.Timeout)

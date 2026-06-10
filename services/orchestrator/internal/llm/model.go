@@ -24,6 +24,7 @@ const (
 	ReasoningEffortXHigh   = "xhigh"
 
 	DefaultMaxToolRounds  = 4
+	DefaultMaxRetries     = 2
 	DefaultTimeoutSeconds = 180
 	DefaultModel          = "gpt-5.4-mini"
 
@@ -43,6 +44,7 @@ type Config struct {
 	PlateauReasoningEffort string
 	StoredResponses        bool
 	MaxToolRounds          int
+	MaxRetries             int
 }
 
 type Message struct {
@@ -135,6 +137,7 @@ func ConfigFromEnv(enabled bool, provider string, model string) Config {
 		PlateauReasoningEffort: plateauReasoningEffort,
 		StoredResponses:        envBoolDefault(true, "MODEL_EXPRESS_LLM_STORED_RESPONSES", "MODEL_EXPRESS_VISUAL_LLM_STORED_RESPONSES"),
 		MaxToolRounds:          envIntDefault(DefaultMaxToolRounds, "MODEL_EXPRESS_LLM_MAX_TOOL_ROUNDS", "MODEL_EXPRESS_VISUAL_LLM_MAX_TOOL_ROUNDS"),
+		MaxRetries:             envIntDefault(DefaultMaxRetries, "MODEL_EXPRESS_LLM_MAX_RETRIES", "MODEL_EXPRESS_VISUAL_LLM_MAX_RETRIES"),
 	}
 }
 

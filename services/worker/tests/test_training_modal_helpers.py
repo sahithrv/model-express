@@ -79,6 +79,24 @@ class ModalTrainingHelperTests(unittest.TestCase):
             "aws_default_region": "us-east-1",
         }
 
+    def test_safe_dataloader_defaults_cap_workers(self) -> None:
+        previous_safe = os.environ.get("MODEL_EXPRESS_DATALOADER_SAFE_DEFAULTS")
+        previous_workers = os.environ.get("MODEL_EXPRESS_MODAL_DATALOADER_WORKERS")
+        try:
+            os.environ["MODEL_EXPRESS_DATALOADER_SAFE_DEFAULTS"] = "true"
+            os.environ["MODEL_EXPRESS_MODAL_DATALOADER_WORKERS"] = "16"
+            self.assertEqual(self.modal_app._modal_dataloader_workers(True), 2)
+            self.assertEqual(self.modal_app._modal_dataloader_workers(False), 2)
+        finally:
+            if previous_safe is None:
+                os.environ.pop("MODEL_EXPRESS_DATALOADER_SAFE_DEFAULTS", None)
+            else:
+                os.environ["MODEL_EXPRESS_DATALOADER_SAFE_DEFAULTS"] = previous_safe
+            if previous_workers is None:
+                os.environ.pop("MODEL_EXPRESS_MODAL_DATALOADER_WORKERS", None)
+            else:
+                os.environ["MODEL_EXPRESS_MODAL_DATALOADER_WORKERS"] = previous_workers
+
     def test_modal_orchestrator_post_uses_longer_report_timeout(self) -> None:
         calls = []
 

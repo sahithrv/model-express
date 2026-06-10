@@ -8,6 +8,8 @@ const ZIP32_VERSION = 20;
 const DATA_DESCRIPTOR_FLAG = 0x08;
 const UTF8_FILE_NAME_FLAG = 0x0800;
 const GENERAL_PURPOSE_FLAGS = DATA_DESCRIPTOR_FLAG | UTF8_FILE_NAME_FLAG;
+const DEFAULT_UPLOAD_WARN_FILE_COUNT = 25_000;
+const DEFAULT_UPLOAD_WARN_BYTES = 5 * 1024 * 1024 * 1024;
 
 async function collectDatasetFiles(rootPath) {
   const root = path.resolve(rootPath);
@@ -87,6 +89,75 @@ function planZipArchive(entries) {
     needsZip64End,
     archiveSize,
   };
+}
+
+function buildDatasetUploadPreflight(entries, plan, options = {}) {
+  const fileCount = entries.length;
+  const totalBytes = entries.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
+  const largestEntry = entries.reduce((largest, entry) => {
+    if (!largest || Number(entry.size || 0) > Number(largest.size || 0)) {
+      return entry;
+    }
+    return largest;
+  }, null);
+  const warnFileCount = positiveInteger(options.warnFileCount, DEFAULT_UPLOAD_WARN_FILE_COUNT);
+  const warnBytes = positiveInteger(options.warnBytes, DEFAULT_UPLOAD_WARN_BYTES);
+  const maxFileCount = positiveInteger(options.maxFileCount, 0);
+  const maxBytes = positiveInteger(options.maxBytes, 0);
+  const warnings = [];
+  const errors = [];
+
+  if (fileCount > warnFileCount) {
+    warnings.push({
+      code: "dataset_upload_file_count_warning",
+      message: `Dataset contains ${fileCount} files; upload and profiling may be slow.`,
+      threshold: warnFileCount,
+      value: fileCount,
+    });
+  }
+  if (totalBytes > warnBytes) {
+    warnings.push({
+      code: "dataset_upload_size_warning",
+      message: `Dataset contains ${totalBytes} bytes before ZIP overhead; upload and profiling may be slow.`,
+      threshold: warnBytes,
+      value: totalBytes,
+    });
+  }
+  if (maxFileCount > 0 && fileCount > maxFileCount) {
+    errors.push({
+      code: "dataset_upload_file_count_cap",
+      message: `Dataset contains ${fileCount} files, above the configured cap of ${maxFileCount}.`,
+      threshold: maxFileCount,
+      value: fileCount,
+    });
+  }
+  if (maxBytes > 0 && totalBytes > maxBytes) {
+    errors.push({
+      code: "dataset_upload_size_cap",
+      message: `Dataset contains ${totalBytes} bytes, above the configured cap of ${maxBytes}.`,
+      threshold: maxBytes,
+      value: totalBytes,
+    });
+  }
+
+  return {
+    file_count: fileCount,
+    uncompressed_size_bytes: totalBytes,
+    archive_size_bytes: Number(plan?.archiveSize || 0),
+    largest_file: largestEntry
+      ? {
+          path: largestEntry.zipPath,
+          size_bytes: Number(largestEntry.size || 0),
+        }
+      : null,
+    warnings,
+    errors,
+  };
+}
+
+function positiveInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function createZipArchiveStream(plan) {
@@ -278,6 +349,7 @@ function buildCrc32Table() {
 const CRC32_TABLE = buildCrc32Table();
 
 module.exports = {
+  buildDatasetUploadPreflight,
   collectDatasetFiles,
   createZipArchiveStream,
   planZipArchive,

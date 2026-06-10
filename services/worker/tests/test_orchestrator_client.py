@@ -59,6 +59,32 @@ def test_fail_job_can_report_retryable_failure(monkeypatch):
     ]
 
 
+def test_job_context_attaches_training_attempt_id(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, *, json: dict | None = None, timeout: int | None = None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    job = {"id": "job_1", "config": {"active_attempt_id": "job_1_attempt_2"}}
+    with client.job_context(job):
+        client.complete_job("job_1", mlflow_run_id="run_1")
+        client.fail_job("job_1", "worker lost connection", retryable=True)
+
+    assert calls[0]["json"] == {
+        "mlflow_run_id": "run_1",
+        "training_attempt_id": "job_1_attempt_2",
+    }
+    assert calls[1]["json"] == {
+        "error": "worker lost connection",
+        "retryable": True,
+        "training_attempt_id": "job_1_attempt_2",
+    }
+
+
 def test_poll_job_keeps_short_request_timeout(monkeypatch):
     calls = []
 

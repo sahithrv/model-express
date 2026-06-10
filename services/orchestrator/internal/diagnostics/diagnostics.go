@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,8 @@ const (
 	maxLogStringLength = 1800
 	maxLogArrayItems   = 24
 	maxLogMapItems     = 80
+	defaultLogMaxBytes = 10 * 1024 * 1024
+	defaultLogMaxFiles = 5
 )
 
 var (
@@ -53,6 +56,7 @@ func Event(level string, event string, fields map[string]any) {
 
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	rotateJSONL(path)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return
@@ -188,4 +192,39 @@ func isSensitiveKey(key string) bool {
 		}
 	}
 	return false
+}
+
+func rotateJSONL(path string) {
+	maxBytes := positiveIntEnv("MODEL_EXPRESS_LOG_MAX_BYTES", defaultLogMaxBytes)
+	maxFiles := positiveIntEnv("MODEL_EXPRESS_LOG_MAX_FILES", defaultLogMaxFiles)
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < int64(maxBytes) {
+		return
+	}
+	for index := maxFiles - 1; index >= 1; index-- {
+		source := path + "." + strconv.Itoa(index)
+		destination := path + "." + strconv.Itoa(index+1)
+		if index+1 > maxFiles {
+			_ = os.Remove(source)
+			continue
+		}
+		if _, err := os.Stat(source); err == nil {
+			_ = os.Remove(destination)
+			_ = os.Rename(source, destination)
+		}
+	}
+	_ = os.Remove(path + ".1")
+	_ = os.Rename(path, path+".1")
+}
+
+func positiveIntEnv(name string, defaultValue int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
 }

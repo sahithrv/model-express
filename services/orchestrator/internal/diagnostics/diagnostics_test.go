@@ -42,6 +42,23 @@ func TestEventWritesRedactedJSONL(t *testing.T) {
 	}
 }
 
+func TestEventRotatesJSONL(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MODEL_EXPRESS_LOG_DIR", dir)
+	t.Setenv("MODEL_EXPRESS_LOG_MAX_BYTES", "1")
+	t.Setenv("MODEL_EXPRESS_LOG_MAX_FILES", "2")
+
+	Event("info", "first", map[string]any{"payload": "x"})
+	Event("info", "second", map[string]any{"payload": "y"})
+
+	if _, err := os.Stat(filepath.Join(dir, "orchestrator.jsonl")); err != nil {
+		t.Fatalf("current log missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "orchestrator.jsonl.1")); err != nil {
+		t.Fatalf("rotated log missing: %v", err)
+	}
+}
+
 func bytesTrimSpace(value []byte) []byte {
 	return []byte(strings.TrimSpace(string(value)))
 }

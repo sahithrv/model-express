@@ -90,7 +90,7 @@ def generate_visual_sample_pack(
     quality = max(35, min(95, int(quality)))
     metadata_limit = max(total_limit, int(max_metadata_images))
 
-    class_records = _class_image_records(dataset_dir)
+    class_records, inventory_truncated = _class_image_records(dataset_dir, max_records=metadata_limit)
     all_records = [record for records in class_records.values() for record in records]
     records_for_metadata = _metadata_records(class_records, all_records, metadata_limit, seed)
     candidates, skipped_corrupt = _load_candidates(
@@ -172,7 +172,7 @@ def generate_visual_sample_pack(
         classes_covered=len(per_class_counts),
         skipped_corrupt=skipped_corrupt,
         skipped_over_budget=skipped_over_budget,
-        metadata_limited=len(records_for_metadata) < len(all_records),
+        metadata_limited=len(records_for_metadata) < len(all_records) or inventory_truncated,
     )
     manifest = {
         "schema_version": "visual_sample_manifest_v1",
@@ -208,6 +208,7 @@ def generate_visual_sample_pack(
             "skipped_corrupt": skipped_corrupt,
             "skipped_over_budget": skipped_over_budget,
             "metadata_images_considered": len(records_for_metadata),
+            "inventory_truncated": inventory_truncated,
         },
     }
 
@@ -233,19 +234,28 @@ def _empty_manifest(dataset_id: str, dataset_name: str) -> dict:
     }
 
 
-def _class_image_records(dataset_dir: Path) -> dict[str, list[_ImageRecord]]:
+def _class_image_records(dataset_dir: Path, max_records: int | None = None) -> tuple[dict[str, list[_ImageRecord]], bool]:
     records: dict[str, list[_ImageRecord]] = {}
     class_root = resolve_classification_root(dataset_dir)
+    record_limit = max(0, int(max_records)) if max_records is not None else 0
+    total_records = 0
+    truncated = False
     for class_dir in classification_class_dirs(class_root):
         class_records = []
-        for image_path in sorted(class_dir.rglob("*")):
+        for image_path in class_dir.rglob("*"):
             if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXT:
                 continue
+            if record_limit and total_records >= record_limit:
+                truncated = True
+                break
             relative_key = image_path.relative_to(dataset_dir).as_posix()
             class_records.append(_ImageRecord(class_dir.name, image_path, relative_key))
+            total_records += 1
         if class_records:
             records[class_dir.name] = class_records
-    return records
+        if truncated:
+            break
+    return records, truncated
 
 
 def _metadata_records(

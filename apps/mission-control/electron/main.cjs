@@ -6,7 +6,7 @@ const path = require("path");
 const { Transform } = require("stream");
 const { fileURLToPath, pathToFileURL } = require("url");
 const { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
-const { collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
+const { buildDatasetUploadPreflight, collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
 
 let mainWindow;
 const projectWorkers = new Map();
@@ -149,6 +149,19 @@ ipcMain.handle("dataset:selectFolder", async () => {
 
 ipcMain.handle("dataset:uploadFolder", async (_event, options) => {
   return uploadDatasetFolder(options);
+});
+
+ipcMain.handle("dataset:preflightFolder", async (_event, options) => {
+  const datasetPath = String(options?.datasetPath ?? "").trim();
+  if (!datasetPath) {
+    throw new Error("Dataset folder path is required.");
+  }
+  if (!fs.existsSync(datasetPath) || !fs.statSync(datasetPath).isDirectory()) {
+    throw new Error(`Dataset folder does not exist: ${datasetPath}`);
+  }
+  const entries = await collectDatasetFiles(datasetPath);
+  const archivePlan = planZipArchive(entries);
+  return datasetUploadPreflight(entries, archivePlan, options);
 });
 
 ipcMain.handle("demo:selectImage", async () => {
@@ -666,7 +679,9 @@ function appendDiagnosticLog(logDir, level, event, fields = {}) {
       event,
       ...safeLogObject(fields),
     };
-    fs.appendFileSync(path.join(logDir, "mission-control.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+    const logPath = path.join(logDir, "mission-control.jsonl");
+    rotateJsonlLog(logPath);
+    fs.appendFileSync(logPath, `${JSON.stringify(record)}\n`, "utf8");
   } catch {
     // Diagnostics must never break the app.
   }
@@ -684,10 +699,45 @@ function appendWorkerStreamLog(logDir, stream, projectId, slot, data) {
       slot,
       message: safeLogText(data.toString().trimEnd()),
     };
-    fs.appendFileSync(path.join(logDir, "workers.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+    const logPath = path.join(logDir, "workers.jsonl");
+    rotateJsonlLog(logPath);
+    fs.appendFileSync(logPath, `${JSON.stringify(record)}\n`, "utf8");
   } catch {
     // Diagnostics must never break the app.
   }
+}
+
+function rotateJsonlLog(logPath) {
+  const maxBytes = positiveIntegerEnv("MODEL_EXPRESS_LOG_MAX_BYTES", 10 * 1024 * 1024);
+  const maxFiles = positiveIntegerEnv("MODEL_EXPRESS_LOG_MAX_FILES", 5);
+  try {
+    if (!fs.existsSync(logPath) || fs.statSync(logPath).size < maxBytes) {
+      return;
+    }
+    for (let index = maxFiles - 1; index >= 1; index -= 1) {
+      const source = `${logPath}.${index}`;
+      const destination = `${logPath}.${index + 1}`;
+      if (!fs.existsSync(source)) {
+        continue;
+      }
+      if (fs.existsSync(destination)) {
+        fs.rmSync(destination, { force: true });
+      }
+      fs.renameSync(source, destination);
+    }
+    const first = `${logPath}.1`;
+    if (fs.existsSync(first)) {
+      fs.rmSync(first, { force: true });
+    }
+    fs.renameSync(logPath, first);
+  } catch {
+    // Rotation is best-effort.
+  }
+}
+
+function positiveIntegerEnv(name, fallback) {
+  const parsed = Number.parseInt(String(process.env[name] ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function safeLogObject(value) {
@@ -792,6 +842,19 @@ async function uploadDatasetFolder(options) {
     throw new Error(`Dataset folder does not contain any files: ${datasetPath}`);
   }
   const archivePlan = planZipArchive(entries);
+  const preflight = datasetUploadPreflight(entries, archivePlan, options);
+  if (preflight.errors.length > 0) {
+    throw new Error(preflight.errors.map((item) => item.message).join(" "));
+  }
+  if (preflight.warnings.length > 0) {
+    appendDiagnosticLog(resolveLogDir(process.env.MODEL_EXPRESS_ROOT ?? path.resolve(__dirname, "..", "..", "..")), "warn", "dataset_upload_preflight_warning", {
+      project_id: projectId,
+      file_count: preflight.file_count,
+      uncompressed_size_bytes: preflight.uncompressed_size_bytes,
+      archive_size_bytes: preflight.archive_size_bytes,
+      warnings: preflight.warnings,
+    });
+  }
 
   const client = new S3Client({
     endpoint,
@@ -834,5 +897,17 @@ async function uploadDatasetFolder(options) {
     storage_uri: `s3://${bucket}/${key}`,
     checksum_sha256: checksum,
     size_bytes: archivePlan.archiveSize,
+    file_count: preflight.file_count,
+    uncompressed_size_bytes: preflight.uncompressed_size_bytes,
+    upload_warnings: preflight.warnings,
   };
+}
+
+function datasetUploadPreflight(entries, archivePlan, options = {}) {
+  return buildDatasetUploadPreflight(entries, archivePlan, {
+    warnFileCount: options.warnFileCount ?? process.env.MODEL_EXPRESS_UPLOAD_WARN_FILE_COUNT,
+    warnBytes: options.warnBytes ?? process.env.MODEL_EXPRESS_UPLOAD_WARN_BYTES,
+    maxFileCount: options.maxFileCount ?? process.env.MODEL_EXPRESS_UPLOAD_MAX_FILE_COUNT,
+    maxBytes: options.maxBytes ?? process.env.MODEL_EXPRESS_UPLOAD_MAX_BYTES,
+  });
 }

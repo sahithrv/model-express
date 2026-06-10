@@ -6,7 +6,8 @@ import os
 from pathlib import Path, PureWindowsPath
 
 
-DEFAULT_MAX_INVENTORY_FILES = 50_000
+DEFAULT_MAX_INVENTORY_FILES = 20_000
+DEFAULT_MAX_FILES_SEEN = 20_000
 DEFAULT_MAX_SOURCES = 200
 DEFAULT_MAX_SOURCE_BYTES = 1_000_000
 DEFAULT_MAX_TOTAL_SOURCE_BYTES = 5_000_000
@@ -76,6 +77,7 @@ def build_metadata_import_payload(
     max_sources: int | None = None,
     max_source_bytes: int | None = None,
     max_total_source_bytes: int | None = None,
+    max_files_seen: int | None = None,
 ) -> dict:
     """Build the bounded worker handoff for backend-owned metadata parsing."""
     root = Path(dataset_dir)
@@ -100,6 +102,11 @@ def build_metadata_import_payload(
             "MODEL_EXPRESS_METADATA_MAX_TOTAL_SOURCE_BYTES",
             DEFAULT_MAX_TOTAL_SOURCE_BYTES,
         ),
+        "max_files_seen": _positive_int(
+            max_files_seen,
+            "MODEL_EXPRESS_PROFILE_MAX_METADATA_FILES",
+            DEFAULT_MAX_FILES_SEEN,
+        ),
     }
     inventory_files: list[dict] = []
     sources: list[dict] = []
@@ -109,10 +116,14 @@ def build_metadata_import_payload(
     skipped_source_count = 0
     inlined_source_bytes = 0
 
-    for path in sorted(root.rglob("*")):
+    scan_truncated = False
+    for path in root.rglob("*"):
         if not path.is_file():
             continue
         seen_files += 1
+        if seen_files > caps["max_files_seen"]:
+            scan_truncated = True
+            break
         try:
             relative_path = safe_relative_path(root, path)
         except ValueError:
@@ -175,11 +186,19 @@ def build_metadata_import_payload(
                 "message": "One or more metadata candidates were not sent because the source count cap was reached.",
             }
         )
-    if seen_files > len(inventory_files):
+    if scan_truncated:
+        warnings.append(
+            {
+                "code": "metadata_discovery_file_scan_cap",
+                "count": caps["max_files_seen"],
+                "message": "Metadata discovery stopped at the worker file scan cap.",
+            }
+        )
+    if seen_files > len(inventory_files) or scan_truncated:
         warnings.append(
             {
                 "code": "inventory_file_count_cap",
-                "count": seen_files - len(inventory_files),
+                "count": max(0, seen_files - len(inventory_files)),
                 "message": "The dataset file inventory was truncated at the worker cap.",
             }
         )
@@ -197,7 +216,7 @@ def build_metadata_import_payload(
         "inventory": {
             "files": inventory_files,
             "file_count_seen": seen_files,
-            "truncated": seen_files > len(inventory_files),
+            "truncated": seen_files > len(inventory_files) or scan_truncated,
         },
         "worker_discovery": {
             "schema_version": "dataset_metadata_discovery_v1",

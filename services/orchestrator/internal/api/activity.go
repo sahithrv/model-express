@@ -19,12 +19,13 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/store"
 )
 
 const (
 	activityDefaultLimit      = 12
 	activityMaxLimit          = 50
-	activityDefaultIntervalMS = 2000
+	activityDefaultIntervalMS = 5000
 )
 
 type agentActivityEvent struct {
@@ -130,7 +131,7 @@ func (s *Server) listProjectActivityEvents(projectID string, limit int) ([]agent
 	if err != nil {
 		return nil, err
 	}
-	projectJobs, err := s.store.ListProjectJobs(projectID)
+	projectJobs, err := s.store.ListProjectJobsPage(projectID, store.PageOptions{Limit: sourceLimit, Offset: 0})
 	if err != nil {
 		return nil, err
 	}

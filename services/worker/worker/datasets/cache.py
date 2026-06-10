@@ -21,6 +21,7 @@ MATERIALIZED_ROOT = Path(
 LOCK_POLL_SECONDS = 0.25
 LOCK_TIMEOUT_SECONDS = 60 * 60
 LOCK_STALE_SECONDS = 60 * 60
+PROFILE_CACHE_MAX_BYTES = 1_000_000
 
 
 def dataset_cache_root(cache_root: Path | str | None = None) -> Path:
@@ -250,8 +251,161 @@ def storage_uri_fingerprint(storage_uri: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def dataset_profile_cache_key(
+    checksum_sha256: str | None,
+    storage_uri: str,
+    profile_cache_version: str,
+) -> str:
+    checksum = _normalized_checksum(checksum_sha256)
+    version = _safe_cache_component(profile_cache_version)
+    if checksum:
+        return f"{version}-sha256-{checksum[:64]}"
+    if _profile_cache_uri_fallback_enabled():
+        return f"{version}-uri-{storage_uri_fingerprint(storage_uri)}"
+    return ""
+
+
+def load_cached_dataset_profile(
+    *,
+    checksum_sha256: str | None,
+    storage_uri: str,
+    profile_cache_version: str,
+    cache_root: Path | str | None = None,
+) -> dict | None:
+    key = dataset_profile_cache_key(checksum_sha256, storage_uri, profile_cache_version)
+    if not key:
+        return None
+    path = _dataset_profile_cache_path(key, cache_root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if payload.get("profile_cache_version") != profile_cache_version:
+        return None
+    profile = payload.get("profile")
+    return profile if isinstance(profile, dict) else None
+
+
+def save_cached_dataset_profile(
+    *,
+    checksum_sha256: str | None,
+    storage_uri: str,
+    profile_cache_version: str,
+    profile: dict,
+    cache_root: Path | str | None = None,
+    max_bytes: int | None = None,
+) -> bool:
+    key = dataset_profile_cache_key(checksum_sha256, storage_uri, profile_cache_version)
+    if not key or not isinstance(profile, dict):
+        return False
+    payload = {
+        "profile_cache_version": profile_cache_version,
+        "dataset_checksum": _normalized_checksum(checksum_sha256),
+        "storage_uri_fingerprint": storage_uri_fingerprint(storage_uri),
+        "created_at_unix": time.time(),
+        "profile": profile,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    byte_limit = _positive_int_env(
+        "MODEL_EXPRESS_PROFILE_CACHE_MAX_BYTES",
+        PROFILE_CACHE_MAX_BYTES if max_bytes is None else max_bytes,
+    )
+    if len(encoded.encode("utf-8")) > byte_limit:
+        return False
+    path = _dataset_profile_cache_path(key, cache_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(encoded, encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return True
+
+
+def prune_cache_children(
+    root: Path | str,
+    *,
+    max_age_seconds: float | None = None,
+    max_bytes: int | None = None,
+    apply: bool = False,
+) -> dict:
+    root_path = Path(root)
+    try:
+        resolved_root = root_path.resolve(strict=True)
+    except OSError:
+        return {"root": str(root_path), "removed": [], "would_remove": [], "bytes_before": 0, "bytes_after": 0}
+
+    children = _cache_children(resolved_root)
+    now = time.time()
+    candidates = []
+    bytes_before = 0
+    for child in children:
+        size = _path_tree_size(child)
+        bytes_before += size
+        try:
+            mtime = child.stat().st_mtime
+        except OSError:
+            mtime = now
+        if child.name.endswith(".lock") or child.name.startswith("."):
+            continue
+        if max_age_seconds is not None and max_age_seconds >= 0 and now - mtime > max_age_seconds:
+            candidates.append((mtime, size, child))
+
+    bytes_after = bytes_before
+    if max_bytes is not None and max_bytes >= 0 and bytes_after > max_bytes:
+        by_age = sorted(((_child_mtime(child), _path_tree_size(child), child) for child in children), key=lambda item: item[0])
+        seen = {str(path) for _, _, path in candidates}
+        for item in by_age:
+            if bytes_after <= max_bytes:
+                break
+            child = item[2]
+            if child.name.endswith(".lock") or child.name.startswith(".") or str(child) in seen:
+                continue
+            candidates.append(item)
+            seen.add(str(child))
+            bytes_after -= item[1]
+
+    removed: list[str] = []
+    would_remove: list[str] = []
+    dry_removed_bytes = 0
+    for _, size, child in sorted(candidates, key=lambda item: item[0]):
+        if not _is_relative_to(child, resolved_root):
+            continue
+        if apply:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+            removed.append(str(child))
+        else:
+            would_remove.append(str(child))
+            dry_removed_bytes += size
+
+    if apply:
+        bytes_after = _path_tree_size(resolved_root)
+    else:
+        bytes_after = bytes_before - dry_removed_bytes
+    return {
+        "root": str(resolved_root),
+        "removed": removed,
+        "would_remove": would_remove,
+        "bytes_before": bytes_before,
+        "bytes_after": max(0, bytes_after),
+    }
+
+
 def _dataset_materialization_complete(extracted_dir: Path, complete_marker: Path) -> bool:
     return complete_marker.exists() and extracted_dir.is_dir()
+
+
+def _dataset_profile_cache_path(key: str, cache_root: Path | str | None = None) -> Path:
+    return dataset_cache_root(cache_root) / "_profiles" / f"{_safe_cache_component(key)}.json"
+
+
+def _profile_cache_uri_fallback_enabled() -> bool:
+    value = os.getenv("MODEL_EXPRESS_PROFILE_CACHE_URI_FALLBACK", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def cleanup_dataset_cache(dataset_id: str, cache_root: Path | str | None = None) -> None:
@@ -399,6 +553,42 @@ def _path_size(path: Path) -> int:
         return 0
 
 
+def _path_tree_size(path: Path) -> int:
+    if path.is_file():
+        return _path_size(path)
+    total = 0
+    try:
+        iterator = path.rglob("*")
+        for child in iterator:
+            if child.is_file():
+                total += _path_size(child)
+    except OSError:
+        return total
+    return total
+
+
+def _cache_children(root: Path) -> list[Path]:
+    try:
+        return [child for child in root.iterdir()]
+    except OSError:
+        return []
+
+
+def _child_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return time.time()
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def _normalized_checksum(checksum_sha256: str | None) -> str:
     value = str(checksum_sha256 or "").strip().lower()
     if len(value) == 64 and all(ch in "0123456789abcdef" for ch in value):
@@ -411,6 +601,17 @@ def _normalized_storage_uri(storage_uri: str) -> str:
     if parsed.scheme == "s3":
         return f"s3://{parsed.netloc.lower()}/{parsed.path.lstrip('/')}"
     return str(storage_uri).strip()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return max(1, int(default))
+    try:
+        parsed = int(value)
+    except ValueError:
+        return max(1, int(default))
+    return parsed if parsed > 0 else max(1, int(default))
 
 
 def _materialization_lock_timeout_seconds() -> float:

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -13,6 +17,9 @@ from worker.exporting.preprocessing import (
     normalization_values,
     prepare_image_for_inference,
 )
+
+_MODEL_CACHE_LOCK = threading.Lock()
+_MODEL_CACHE: OrderedDict[tuple, object] = OrderedDict()
 
 
 def run_demo_inference_from_manifest(
@@ -77,12 +84,11 @@ def run_demo_inference_from_manifest(
 
     try:
         load_started = time.perf_counter()
-        if runtime == "torchscript":
-            model = torch.jit.load(str(model_path), map_location="cpu")
-        else:
-            model = _load_framework_native_model(torch, model_path, metadata, class_labels)
-        model.eval()
-        model_load_ms = (time.perf_counter() - load_started) * 1000
+        model, model_cache_hit = _cached_runtime(
+            _runtime_cache_key(model_path, runtime, metadata),
+            lambda: _load_classification_runtime(torch, model_path, metadata, class_labels, runtime),
+        )
+        model_load_ms = 0.0 if model_cache_hit else (time.perf_counter() - load_started) * 1000
 
         preprocess_started = time.perf_counter()
         tensor = _image_tensor(Image, torch, image_path, metadata).unsqueeze(0)
@@ -118,6 +124,7 @@ def run_demo_inference_from_manifest(
     payload["runtime"] = runtime
     payload["latency_breakdown_ms"] = {
         "model_load": round(max(0.0, model_load_ms), 3),
+        "model_cache_hit": model_cache_hit,
         "preprocess": round(max(0.0, preprocess_ms), 3),
         "inference": round(max(0.0, inference_ms), 3),
         "postprocess": round(max(0.0, postprocess_ms), 3),
@@ -172,8 +179,11 @@ def _run_detection_inference_from_manifest(
 
     try:
         load_started = time.perf_counter()
-        session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-        model_load_ms = (time.perf_counter() - load_started) * 1000
+        session, model_cache_hit = _cached_runtime(
+            _runtime_cache_key(model_path, "onnx", metadata),
+            lambda: ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"]),
+        )
+        model_load_ms = 0.0 if model_cache_hit else (time.perf_counter() - load_started) * 1000
 
         preprocess_started = time.perf_counter()
         with Image.open(image_path) as image:
@@ -214,6 +224,7 @@ def _run_detection_inference_from_manifest(
     payload["runtime"] = "onnx"
     payload["latency_breakdown_ms"] = {
         "model_load": round(max(0.0, model_load_ms), 3),
+        "model_cache_hit": model_cache_hit,
         "preprocess": round(max(0.0, preprocess_ms), 3),
         "inference": round(max(0.0, inference_ms), 3),
         "postprocess": round(max(0.0, postprocess_ms), 3),
@@ -255,6 +266,69 @@ def _load_framework_native_model(torch, model_path: Path, metadata: dict, class_
     state_dict = _checkpoint_state_dict(checkpoint)
     model.load_state_dict(state_dict)
     return model
+
+
+def _load_classification_runtime(torch, model_path: Path, metadata: dict, class_labels: list[str], runtime: str):
+    if runtime == "torchscript":
+        model = torch.jit.load(str(model_path), map_location="cpu")
+    else:
+        model = _load_framework_native_model(torch, model_path, metadata, class_labels)
+    model.eval()
+    return model
+
+
+def _cached_runtime(key: tuple, loader):
+    cache_size = _demo_model_cache_size()
+    if cache_size <= 0:
+        return loader(), False
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_CACHE.get(key)
+        if cached is not None:
+            _MODEL_CACHE.move_to_end(key)
+            return cached, True
+    runtime = loader()
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE[key] = runtime
+        _MODEL_CACHE.move_to_end(key)
+        while len(_MODEL_CACHE) > cache_size:
+            _MODEL_CACHE.popitem(last=False)
+    return runtime, False
+
+
+def _runtime_cache_key(model_path: Path, runtime: str, metadata: dict) -> tuple:
+    try:
+        stat = model_path.stat()
+        size = int(stat.st_size)
+        mtime_ns = int(stat.st_mtime_ns)
+    except OSError:
+        size = 0
+        mtime_ns = 0
+    return (
+        str(model_path.resolve()),
+        runtime,
+        size,
+        mtime_ns,
+        _metadata_fingerprint(metadata),
+    )
+
+
+def _metadata_fingerprint(metadata: dict) -> str:
+    try:
+        payload = json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        payload = str(metadata)
+    return str(hash(payload))
+
+
+def _demo_model_cache_size() -> int:
+    value = os.getenv("MODEL_EXPRESS_DEMO_INFERENCE_MODEL_CACHE_SIZE", "").strip()
+    if not value:
+        return 2
+    try:
+        parsed = int(value)
+    except ValueError:
+        return 2
+    return max(0, min(parsed, 8))
 
 
 def _postprocess_detection_outputs(

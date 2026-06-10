@@ -29,3 +29,15 @@ def test_log_event_writes_redacted_jsonl(tmp_path, monkeypatch):
     assert record["event"] == "visual_llm_http_error"
     assert record["project_id"] == "project_1"
     assert record["body"] == '{"error":{"message":"Invalid schema"}}'
+
+
+def test_log_event_rotates_jsonl(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_EXPRESS_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MODEL_EXPRESS_LOG_MAX_BYTES", "1")
+    monkeypatch.setenv("MODEL_EXPRESS_LOG_MAX_FILES", "2")
+
+    log_event("info", "first", payload="x")
+    log_event("info", "second", payload="y")
+
+    assert (tmp_path / "worker.jsonl").exists()
+    assert (tmp_path / "worker.jsonl.1").exists()

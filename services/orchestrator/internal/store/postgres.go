@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -873,14 +874,42 @@ func (s *PostgresStore) GetWorker(workerID string) (workers.Worker, error) {
 }
 
 func (s *PostgresStore) HeartbeatWorker(id string) (workers.Worker, error) {
-	const query = `
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return workers.Worker{}, err
+	}
+	defer tx.Rollback()
+
+	worker, err := scanWorker(tx.QueryRowContext(ctx, `
 		UPDATE workers
 		SET last_heartbeat = now()
 		WHERE id = $1
 		RETURNING id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
-	`
+	`, id))
+	if err != nil {
+		return workers.Worker{}, err
+	}
 
-	return scanWorker(s.db.QueryRowContext(context.Background(), query, id))
+	if worker.CurrentJobID != "" {
+		now := worker.LastHeartbeat
+		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE experiment_jobs
+			SET lease_owner_worker_id = $1,
+				lease_last_heartbeat_at = $2,
+				lease_expires_at = $3
+			WHERE id = $4
+				AND status NOT IN ($5, $6)
+		`, worker.ID, now, leaseExpiresAt, worker.CurrentJobID, jobs.StatusSucceeded, jobs.StatusFailed); err != nil {
+			return workers.Worker{}, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return workers.Worker{}, err
+	}
+	return worker, nil
 }
 
 func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.ExperimentJob, error) {
@@ -962,13 +991,8 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 		return nil, ErrNoJob
 	}
 
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
-		FROM experiment_jobs
-		WHERE status = $1 AND project_id = $2
-		ORDER BY created_at
-		FOR UPDATE SKIP LOCKED
-	`, jobs.StatusQueued, worker.ProjectID)
+	query, args := pollJobCandidateQuery(worker.ProjectID, filter)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1010,6 +1034,19 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 
 		return nil, ErrNoJob
 	}
+	if !filter.Matches(job) {
+		if _, updateErr := tx.ExecContext(ctx, `
+			UPDATE workers
+			SET last_heartbeat = now()
+			WHERE id = $1
+		`, workerID); updateErr != nil {
+			return nil, updateErr
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return nil, commitErr
+		}
+		return nil, ErrNoJob
+	}
 
 	assignedConfig := jobConfigWithActiveAttempt(job.Config, job.ID, job.Attempt+1)
 	assignedConfigJSON, err := json.Marshal(assignedConfig)
@@ -1048,6 +1085,67 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 	}
 
 	return &assignedJob, nil
+}
+
+func pollJobCandidateQuery(projectID string, filter JobPollFilter) (string, []any) {
+	args := []any{jobs.StatusQueued, projectID}
+	clauses := []string{"status = $1", "project_id = $2"}
+
+	if templates := normalizedPollValues(filter.Templates); len(templates) > 0 {
+		placeholders := make([]string, 0, len(templates))
+		for _, template := range templates {
+			args = append(args, template)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		clauses = append(clauses, "lower(template) IN ("+strings.Join(placeholders, ",")+")")
+	}
+
+	if provider := strings.ToLower(strings.TrimSpace(filter.Provider)); provider != "" {
+		args = append(args, provider)
+		providerPlaceholder := fmt.Sprintf("$%d", len(args))
+		providerClause := "lower(coalesce(config->>'provider', '')) = " + providerPlaceholder
+		if fallbackTemplates := normalizedPollValues(filter.IncludeUnspecifiedProviderTemplates); len(fallbackTemplates) > 0 {
+			placeholders := make([]string, 0, len(fallbackTemplates))
+			for _, template := range fallbackTemplates {
+				args = append(args, template)
+				placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+			}
+			providerClause = "(" + providerClause + " OR (coalesce(config->>'provider', '') = '' AND lower(template) IN (" + strings.Join(placeholders, ",") + ")))"
+		}
+		clauses = append(clauses, providerClause)
+	}
+
+	query := `
+		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+		FROM experiment_jobs
+		WHERE ` + strings.Join(clauses, " AND ") + `
+		ORDER BY created_at
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`
+	return query, args
+}
+
+func normalizedPollValues(values []string) []string {
+	set := normalizedSet(values)
+	out := make([]string, 0, len(set))
+	for value := range set {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func postgresPageLimitOffset(options PageOptions) (int, int) {
+	limit := options.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	offset := options.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
 }
 
 func (s *PostgresStore) CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error) {
@@ -1103,6 +1201,35 @@ func (s *PostgresStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob,
 		out = append(out, job)
 	}
 
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) ListProjectJobsPage(projectID string, options PageOptions) ([]jobs.ExperimentJob, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	limit, offset := postgresPageLimitOffset(options)
+	const query = `
+		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+		FROM experiment_jobs
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []jobs.ExperimentJob{}
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, job)
+	}
 	return out, rows.Err()
 }
 
@@ -1347,6 +1474,39 @@ func (s *PostgresStore) ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) ListJobMetricsPage(jobID string, options PageOptions) ([]jobs.EpochMetric, error) {
+	if _, err := s.GetJob(jobID); err != nil {
+		return nil, err
+	}
+	limit, offset := postgresPageLimitOffset(options)
+	const query = `
+		SELECT job_id, epoch, metrics, created_at
+		FROM (
+			SELECT job_id, epoch, metrics, created_at
+			FROM epoch_metrics
+			WHERE job_id = $1
+			ORDER BY epoch DESC
+			LIMIT $2 OFFSET $3
+		) recent
+		ORDER BY epoch
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, jobID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []jobs.EpochMetric{}
+	for rows.Next() {
+		metric, err := scanMetric(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, metric)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error) {
 	job, err := s.GetJob(jobID)
 	if err != nil {
@@ -1486,6 +1646,35 @@ func (s *PostgresStore) ListProjectTrainingRunSummaries(projectID string) ([]run
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) ListProjectTrainingRunSummariesPage(projectID string, options PageOptions) ([]runs.TrainingRunSummary, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	limit, offset := postgresPageLimitOffset(options)
+	const query = `
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
+		FROM training_run_summaries
+		WHERE project_id = $1
+		ORDER BY updated_at DESC
+		LIMIT $2 OFFSET $3
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []runs.TrainingRunSummary{}
+	for rows.Next() {
+		summary, err := scanTrainingRunSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, summary)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) UpsertTrainingRunEvaluation(jobID string, update runs.TrainingRunEvaluationUpdate) (runs.TrainingRunEvaluation, error) {
 	job, err := s.GetJob(jobID)
 	if err != nil {
@@ -1563,6 +1752,35 @@ func (s *PostgresStore) ListProjectTrainingRunEvaluations(projectID string) ([]r
 		ORDER BY updated_at DESC
 	`
 	rows, err := s.db.QueryContext(context.Background(), query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []runs.TrainingRunEvaluation{}
+	for rows.Next() {
+		evaluation, err := scanTrainingRunEvaluation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, evaluation)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) ListProjectTrainingRunEvaluationsPage(projectID string, options PageOptions) ([]runs.TrainingRunEvaluation, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	limit, offset := postgresPageLimitOffset(options)
+	const query = `
+		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+		FROM training_run_evaluations
+		WHERE project_id = $1
+		ORDER BY updated_at DESC
+		LIMIT $2 OFFSET $3
+	`
+	rows, err := s.db.QueryContext(context.Background(), query, projectID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -3639,6 +3857,12 @@ func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobO
 	if err != nil {
 		return jobs.ExperimentJob{}, false, err
 	}
+	if isTerminalJobStatus(job.Status) {
+		if err := clearWorkersForJobTx(ctx, tx, job.ID); err != nil {
+			return jobs.ExperimentJob{}, false, err
+		}
+		return job, false, tx.Commit()
+	}
 	if job.MaxAttempts < 1 {
 		job.MaxAttempts = defaultJobMaxAttempts
 	}
@@ -3725,6 +3949,15 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 	if err != nil {
 		return jobs.ExperimentJob{}, err
 	}
+	if isTerminalJobStatus(current.Status) {
+		if err := clearWorkersForJobTx(ctx, tx, current.ID); err != nil {
+			return jobs.ExperimentJob{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return jobs.ExperimentJob{}, err
+		}
+		return current, nil
+	}
 	nextConfig := jobConfigWithTerminalAttempt(current.Config, current.ID, current.Attempt)
 	configJSON, err := json.Marshal(nextConfig)
 	if err != nil {
@@ -3763,6 +3996,17 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 	}
 
 	return job, nil
+}
+
+func clearWorkersForJobTx(ctx context.Context, tx *sql.Tx, jobID string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE workers
+		SET status = CASE WHEN status = $3 THEN status ELSE $1 END,
+			current_job_id = '',
+			last_heartbeat = now()
+		WHERE current_job_id = $2
+	`, workers.StatusIdle, jobID, workers.StatusOffline)
+	return err
 }
 
 func (s *PostgresStore) insertDatasetVisualAnalysis(analysis datasets.DatasetVisualAnalysis, validationStatus string) (datasets.DatasetVisualAnalysis, error) {

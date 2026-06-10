@@ -638,6 +638,17 @@ func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, e
 	return out, nil
 }
 
+func (s *MemoryStore) ListProjectJobsPage(projectID string, options PageOptions) ([]jobs.ExperimentJob, error) {
+	jobs, err := s.ListProjectJobs(projectID)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(jobs, func(i, j int) bool {
+		return jobs[i].CreatedAt.After(jobs[j].CreatedAt)
+	})
+	return pageExperimentJobs(jobs, options), nil
+}
+
 func (s *MemoryStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -757,6 +768,21 @@ func (s *MemoryStore) ListJobMetrics(jobID string) ([]jobs.EpochMetric, error) {
 	return out, nil
 }
 
+func (s *MemoryStore) ListJobMetricsPage(jobID string, options PageOptions) ([]jobs.EpochMetric, error) {
+	metrics, err := s.ListJobMetrics(jobID)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(metrics, func(i, j int) bool {
+		return metrics[i].Epoch > metrics[j].Epoch
+	})
+	metrics = pageEpochMetrics(metrics, options)
+	sort.SliceStable(metrics, func(i, j int) bool {
+		return metrics[i].Epoch < metrics[j].Epoch
+	})
+	return metrics, nil
+}
+
 func (s *MemoryStore) UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -805,6 +831,17 @@ func (s *MemoryStore) ListProjectTrainingRunSummaries(projectID string) ([]runs.
 	}
 
 	return out, nil
+}
+
+func (s *MemoryStore) ListProjectTrainingRunSummariesPage(projectID string, options PageOptions) ([]runs.TrainingRunSummary, error) {
+	summaries, err := s.ListProjectTrainingRunSummaries(projectID)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(summaries, func(i, j int) bool {
+		return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+	})
+	return pageTrainingRunSummaries(summaries, options), nil
 }
 
 func (s *MemoryStore) UpsertTrainingRunEvaluation(jobID string, update runs.TrainingRunEvaluationUpdate) (runs.TrainingRunEvaluation, error) {
@@ -865,6 +902,14 @@ func (s *MemoryStore) ListProjectTrainingRunEvaluations(projectID string) ([]run
 		return out[i].UpdatedAt.After(out[j].UpdatedAt)
 	})
 	return out, nil
+}
+
+func (s *MemoryStore) ListProjectTrainingRunEvaluationsPage(projectID string, options PageOptions) ([]runs.TrainingRunEvaluation, error) {
+	evaluations, err := s.ListProjectTrainingRunEvaluations(projectID)
+	if err != nil {
+		return nil, err
+	}
+	return pageTrainingRunEvaluations(evaluations, options), nil
 }
 
 func (s *MemoryStore) UpsertProjectChampion(champion runs.ProjectChampionUpsert) (runs.ProjectChampion, error) {
@@ -2214,6 +2259,10 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 	if !ok {
 		return jobs.ExperimentJob{}, false, ErrNotFound
 	}
+	if isTerminalJobStatus(job.Status) {
+		s.clearWorkersForJobLocked(jobID, time.Now().UTC())
+		return job, false, nil
+	}
 	if job.MaxAttempts < 1 {
 		job.MaxAttempts = defaultJobMaxAttempts
 	}
@@ -2270,6 +2319,10 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	if !ok {
 		return jobs.ExperimentJob{}, ErrNotFound
 	}
+	if isTerminalJobStatus(job.Status) {
+		s.clearWorkersForJobLocked(jobID, time.Now().UTC())
+		return job, nil
+	}
 
 	now := time.Now().UTC()
 	job.Status = status
@@ -2294,8 +2347,57 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	return job, nil
 }
 
+func (s *MemoryStore) clearWorkersForJobLocked(jobID string, heartbeatAt time.Time) {
+	for workerID, worker := range s.workers {
+		if worker.CurrentJobID != jobID {
+			continue
+		}
+		worker.CurrentJobID = ""
+		if worker.Status != workers.StatusOffline {
+			worker.Status = workers.StatusIdle
+		}
+		worker.LastHeartbeat = heartbeatAt
+		s.workers[workerID] = worker
+	}
+}
+
 func isTerminalJobStatus(status string) bool {
 	return status == jobs.StatusSucceeded || status == jobs.StatusFailed
+}
+
+func pageExperimentJobs(values []jobs.ExperimentJob, options PageOptions) []jobs.ExperimentJob {
+	start, end := pageBounds(len(values), options)
+	return append([]jobs.ExperimentJob(nil), values[start:end]...)
+}
+
+func pageEpochMetrics(values []jobs.EpochMetric, options PageOptions) []jobs.EpochMetric {
+	start, end := pageBounds(len(values), options)
+	return append([]jobs.EpochMetric(nil), values[start:end]...)
+}
+
+func pageTrainingRunSummaries(values []runs.TrainingRunSummary, options PageOptions) []runs.TrainingRunSummary {
+	start, end := pageBounds(len(values), options)
+	return append([]runs.TrainingRunSummary(nil), values[start:end]...)
+}
+
+func pageTrainingRunEvaluations(values []runs.TrainingRunEvaluation, options PageOptions) []runs.TrainingRunEvaluation {
+	start, end := pageBounds(len(values), options)
+	return append([]runs.TrainingRunEvaluation(nil), values[start:end]...)
+}
+
+func pageBounds(length int, options PageOptions) (int, int) {
+	offset := options.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > length {
+		offset = length
+	}
+	limit := options.Limit
+	if limit <= 0 || offset+limit > length {
+		limit = length - offset
+	}
+	return offset, offset + limit
 }
 
 func jobConfigWithActiveAttempt(config map[string]any, jobID string, attempt int) map[string]any {

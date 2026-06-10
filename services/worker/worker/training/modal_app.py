@@ -32,6 +32,15 @@ from worker.training.modal_resources import (
     resource_telemetry,
 )
 
+for _thread_key, _thread_value in {
+    "OMP_NUM_THREADS": "4",
+    "MKL_NUM_THREADS": "4",
+    "OPENBLAS_NUM_THREADS": "4",
+    "NUMEXPR_NUM_THREADS": "4",
+    "TOKENIZERS_PARALLELISM": "false",
+}.items():
+    os.environ.setdefault(_thread_key, _thread_value)
+
 try:
     import modal
 except Exception:  # pragma: no cover - local helper tests can run without Modal installed.
@@ -904,6 +913,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         pretrained=True,
         plots=False,
         val=True,
+        workers=_yolo_dataloader_workers(),
     )
     _modal_training_phase(job_id, "yolo_train_done", started_at)
     final_yolo_epoch_rows_posted = _post_yolo_epoch_metrics(
@@ -1960,6 +1970,7 @@ def _collect_yolo_validation_metrics(
         imgsz=image_size,
         batch=batch_size,
         plots=False,
+        workers=_yolo_dataloader_workers(),
     )
     return _yolo_metrics_from_object(metrics, class_names=class_names)
 
@@ -3189,12 +3200,26 @@ def _augmentation_from_policy(augmentation: dict, policy: str) -> dict:
 
 
 def _modal_dataloader_workers(uses_metadata_aware_dataset: bool) -> int:
+    if _safe_dataloader_defaults_enabled():
+        default = 1 if uses_metadata_aware_dataset else 0
+        return _bounded_non_negative_int_env("MODEL_EXPRESS_MODAL_DATALOADER_WORKERS", default, maximum=2)
     default = (
         DEFAULT_MODAL_METADATA_DATALOADER_WORKERS
         if uses_metadata_aware_dataset
         else DEFAULT_MODAL_IMAGEFOLDER_DATALOADER_WORKERS
     )
     return _bounded_non_negative_int_env("MODEL_EXPRESS_MODAL_DATALOADER_WORKERS", default, maximum=16)
+
+
+def _safe_dataloader_defaults_enabled() -> bool:
+    value = os.getenv("MODEL_EXPRESS_DATALOADER_SAFE_DEFAULTS", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _yolo_dataloader_workers() -> int:
+    if _safe_dataloader_defaults_enabled():
+        return _bounded_non_negative_int_env("MODEL_EXPRESS_YOLO_DATALOADER_WORKERS", 1, maximum=2)
+    return _bounded_non_negative_int_env("MODEL_EXPRESS_YOLO_DATALOADER_WORKERS", 2, maximum=16)
 
 
 def _dataloader_kwargs(loader_workers: int) -> dict:

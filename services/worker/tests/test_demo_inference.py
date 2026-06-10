@@ -95,6 +95,13 @@ class DemoInferenceTests(unittest.TestCase):
             self.assertGreater(payload["latency_breakdown_ms"]["preprocess"], 0)
             self.assertGreater(payload["latency_breakdown_ms"]["streaming_total"], 0)
 
+            cached_payload = run_demo_inference_from_manifest(
+                manifest_path=Path(manifest["manifest_path"]),
+                image_path=image_path,
+                true_label="dog",
+            )
+            self.assertTrue(cached_payload["latency_breakdown_ms"]["model_cache_hit"])
+
     def test_framework_native_checkpoint_inference_returns_ranked_payload(self) -> None:
         try:
             import torch

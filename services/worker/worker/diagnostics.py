@@ -11,6 +11,8 @@ from typing import Any
 MAX_LOG_STRING_LENGTH = 1800
 MAX_LOG_ARRAY_ITEMS = 24
 MAX_LOG_DICT_ITEMS = 80
+DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_LOG_MAX_FILES = 5
 _WRITE_LOCK = threading.Lock()
 _UNSAFE_TEXT_RE = re.compile(
     r"(data:image/[a-z0-9.+-]+;base64,|base64\s*[:=,]|bearer\s+[a-z0-9._\-]+|"
@@ -55,6 +57,7 @@ def log_event(level: str, event: str, **fields: Any) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "worker.jsonl"
         with _WRITE_LOCK:
+            _rotate_jsonl(path)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
     except Exception:
@@ -114,3 +117,36 @@ def _safe_text(value: str) -> str:
 def _sensitive_key(key: str) -> bool:
     normalized = str(key or "").strip().lower()
     return any(fragment in normalized for fragment in _SENSITIVE_KEY_FRAGMENTS)
+
+
+def _rotate_jsonl(path: Path) -> None:
+    max_bytes = _positive_int_env("MODEL_EXPRESS_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES)
+    max_files = _positive_int_env("MODEL_EXPRESS_LOG_MAX_FILES", DEFAULT_LOG_MAX_FILES)
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+        for index in range(max_files - 1, 0, -1):
+            source = path.with_name(f"{path.name}.{index}")
+            destination = path.with_name(f"{path.name}.{index + 1}")
+            if destination.exists() and index + 1 > max_files:
+                destination.unlink(missing_ok=True)
+            if source.exists():
+                if index + 1 > max_files:
+                    source.unlink(missing_ok=True)
+                else:
+                    source.replace(destination)
+        first = path.with_name(f"{path.name}.1")
+        path.replace(first)
+    except Exception:
+        return
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return int(default)
+    try:
+        parsed = int(value)
+    except ValueError:
+        return int(default)
+    return parsed if parsed > 0 else int(default)

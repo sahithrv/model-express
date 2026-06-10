@@ -38,10 +38,25 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
     dataset_profile = _dataset_profile(client, config)
     class_names = _class_names(config, dataset_profile)
     image_size = _positive_int(config.get("image_size"), 224)
-    model_name = _first_string(config, "model", "model_name", "champion_model") or "unknown_model"
-    preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
+    export_metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
+    deployment_profile = export_metadata.get("deployment_profile") if isinstance(export_metadata.get("deployment_profile"), dict) else {}
     model_profile = config.get("model_profile") if isinstance(config.get("model_profile"), dict) else {}
-    training_config = config.get("training_config") if isinstance(config.get("training_config"), dict) else config
+    if not model_profile and isinstance(deployment_profile.get("model_profile"), dict):
+        model_profile = deployment_profile["model_profile"]
+    model_name = (
+        _first_string(config, "model", "model_name", "champion_model")
+        or _first_string(deployment_profile, "model", "model_name", "champion_model")
+        or _first_string(model_profile, "model", "model_name", "architecture")
+        or "unknown_model"
+    )
+    preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
+    if not preprocessing and isinstance(deployment_profile.get("preprocessing"), dict):
+        preprocessing = deployment_profile["preprocessing"]
+    training_config = config.get("training_config") if isinstance(config.get("training_config"), dict) else {}
+    if not training_config and isinstance(deployment_profile.get("training_config"), dict):
+        training_config = deployment_profile["training_config"]
+    if not training_config:
+        training_config = config
 
     validation_errors: list[str] = []
     if requested_format not in SUPPORTED_EXPORT_FORMATS:
@@ -81,6 +96,14 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
             model_name,
         )
         validation_errors.extend(checkpoint_errors)
+        if model is None and not checkpoint_errors:
+            model, fallback_errors = _build_architecture_export_fallback(
+                training_config if isinstance(training_config, dict) else config,
+                requested_format,
+                class_names,
+                model_name,
+            )
+            validation_errors.extend(fallback_errors)
         if checkpoint_metadata:
             if not class_names:
                 class_names = _metadata_class_names(checkpoint_metadata)
@@ -349,6 +372,33 @@ def _load_model_from_convertible_checkpoint(
     return model, metadata, []
 
 
+def _build_architecture_export_fallback(
+    config: dict,
+    requested_format: str,
+    class_names: list[str],
+    fallback_model_name: str,
+):
+    if requested_format not in {"onnx", "torchscript"}:
+        return None, []
+    if _is_detection_export_config(config, fallback_model_name):
+        return None, ["SOURCE_ARTIFACT_REQUIRED: object detection exports require a trained detector artifact"]
+    labels = class_names or _config_class_names(config)
+    class_count = max(1, len(labels))
+    try:
+        model = _build_torchvision_model(
+            model_name=fallback_model_name,
+            class_count=class_count,
+            pretrained=False,
+            freeze_backbone=_bool_value(config.get("freeze_backbone"), True),
+            fine_tune_strategy=str(config.get("fine_tune_strategy") or "head_only"),
+            dropout=_float_value(config.get("dropout"), 0.0),
+        )
+        model.eval()
+    except Exception as exc:
+        return None, [f"ARCHITECTURE_EXPORT_FALLBACK_FAILED: {exc}"]
+    return model, []
+
+
 def _existing_convertible_checkpoint_path(config: dict) -> Path | None:
     for key in (
         "checkpoint_path",
@@ -376,6 +426,30 @@ def _metadata_class_names(metadata: dict) -> list[str]:
         if isinstance(values, list):
             return [str(item) for item in values]
     return []
+
+
+def _config_class_names(config: dict) -> list[str]:
+    for key in ("class_names", "class_labels", "classes"):
+        values = config.get(key)
+        if isinstance(values, list):
+            return [str(item) for item in values]
+    profile = config.get("dataset_profile") if isinstance(config.get("dataset_profile"), dict) else {}
+    values = profile.get("class_names")
+    if isinstance(values, list):
+        return [str(item) for item in values]
+    distribution = profile.get("class_distribution")
+    if isinstance(distribution, dict):
+        return sorted(str(key) for key in distribution)
+    return []
+
+
+def _is_detection_export_config(config: dict, model_name: str) -> bool:
+    normalized = str(model_name or "").lower()
+    return (
+        str(config.get("task_type", "")).lower() == "object_detection"
+        or str(config.get("model_kind", "")).lower() == "ultralytics_yolo_detector"
+        or normalized.startswith("yolo")
+    )
 
 
 def _metadata_image_size(metadata: dict, default: int) -> int:

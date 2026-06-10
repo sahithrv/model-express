@@ -1,6 +1,8 @@
 import requests
 import os
 import time
+import threading
+from contextlib import contextmanager
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_REPORT_TIMEOUT_SECONDS = 300
@@ -11,6 +13,16 @@ class OrchestratorClient:
     def __init__(self, base_url: str, timeout: int | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout if timeout is not None else request_timeout_seconds()
+        self._job_context = threading.local()
+
+    @contextmanager
+    def job_context(self, job: dict):
+        previous = getattr(self._job_context, "job", None)
+        self._job_context.job = job
+        try:
+            yield
+        finally:
+            self._job_context.job = previous
     
     def get_dataset(self, dataset_id: str) -> dict:
         response = requests.get(
@@ -172,41 +184,41 @@ class OrchestratorClient:
         return response.json()["job"]
 
 
-    def report_metric(self, job_id: str, epoch: int, metrics: dict[str, float]) -> dict:
+    def report_metric(self, job_id: str, epoch: int, metrics: dict[str, float], *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/metrics",
-            json={
+            json=self._with_callback_identity(job_id, {
                 "epoch": epoch,
                 "metrics": metrics,
-            },
+            }, job=job),
             timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
 
 
-    def report_training_run_summary(self, job_id: str, summary: dict) -> dict:
+    def report_training_run_summary(self, job_id: str, summary: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/training-run-summary",
-            json=summary,
+            json=self._with_callback_identity(job_id, summary, job=job),
             timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
 
-    def report_training_run_evaluation(self, job_id: str, evaluation: dict) -> dict:
+    def report_training_run_evaluation(self, job_id: str, evaluation: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/training-run-evaluation",
-            json=evaluation,
+            json=self._with_callback_identity(job_id, evaluation, job=job),
             timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
 
-    def report_modal_call(self, job_id: str, payload: dict) -> dict:
+    def report_modal_call(self, job_id: str, payload: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/modal-call",
-            json=payload,
+            json=self._with_callback_identity(job_id, payload, job=job),
             timeout=report_timeout_seconds(),
         )
         if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
@@ -218,19 +230,19 @@ class OrchestratorClient:
         _raise_for_status_with_body(response)
         return response.json()
 
-    def report_champion_export_result(self, job_id: str, result: dict) -> dict:
+    def report_champion_export_result(self, job_id: str, result: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/champion-export-result",
-            json=result,
+            json=self._with_callback_identity(job_id, result, job=job),
             timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
         return response.json()
 
-    def report_champion_demo_prediction_result(self, job_id: str, result: dict) -> dict:
+    def report_champion_demo_prediction_result(self, job_id: str, result: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/champion-demo-prediction-result",
-            json=result,
+            json=self._with_callback_identity(job_id, result, job=job),
             timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
@@ -254,10 +266,10 @@ class OrchestratorClient:
         _raise_for_status_with_body(response)
         return response.json()
 
-    def complete_job(self, job_id: str, mlflow_run_id: str = "") -> dict:
+    def complete_job(self, job_id: str, mlflow_run_id: str = "", *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/complete",
-            json={"mlflow_run_id": mlflow_run_id},
+            json=self._with_callback_identity(job_id, {"mlflow_run_id": mlflow_run_id}, job=job),
             timeout=report_timeout_seconds(),
         )
         response.raise_for_status()
@@ -270,6 +282,7 @@ class OrchestratorClient:
         error: str,
         retryable: bool = False,
         metadata: dict | None = None,
+        job: dict | None = None,
     ) -> dict:
         payload = {"error": error}
         if retryable:
@@ -279,6 +292,7 @@ class OrchestratorClient:
             payload["error"] = error
             if retryable:
                 payload["retryable"] = True
+        payload = self._with_callback_identity(job_id, payload, job=job)
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/fail",
             json=payload,
@@ -292,21 +306,37 @@ class OrchestratorClient:
         job_id = job["id"]
 
         try:
-            for epoch in range(1, 4):
-                metrics = {
-                    "train_loss": round(1.0 / epoch, 4),
-                    "val_loss": round(1.2 / epoch, 4),
-                    "macro_f1": round(0.2 * epoch, 4),
-                }
-                self.report_metric(job_id, epoch, metrics)
-                print(f"Reported epoch {epoch} metrics for {job_id}: {metrics}")
-                time.sleep(1)
+            with self.job_context(job):
+                for epoch in range(1, 4):
+                    metrics = {
+                        "train_loss": round(1.0 / epoch, 4),
+                        "val_loss": round(1.2 / epoch, 4),
+                        "macro_f1": round(0.2 * epoch, 4),
+                    }
+                    self.report_metric(job_id, epoch, metrics)
+                    print(f"Reported epoch {epoch} metrics for {job_id}: {metrics}")
+                    time.sleep(1)
 
-            self.complete_job(job_id, mlflow_run_id=f"fake-mlflow-run-{job_id}")
-            print(f"Completed job {job_id}")
+                self.complete_job(job_id, mlflow_run_id=f"fake-mlflow-run-{job_id}")
+                print(f"Completed job {job_id}")
         except Exception as exc:
-            self.fail_job(job_id, str(exc))
+            self.fail_job(job_id, str(exc), retryable=True, job=job)
             raise
+
+    def _with_callback_identity(self, job_id: str, payload: dict, *, job: dict | None = None) -> dict:
+        out = dict(payload)
+        if out.get("training_attempt_id"):
+            return out
+        attempt_id = _training_attempt_id(job or self._active_job_for(job_id))
+        if attempt_id:
+            out["training_attempt_id"] = attempt_id
+        return out
+
+    def _active_job_for(self, job_id: str) -> dict | None:
+        job = getattr(self._job_context, "job", None)
+        if isinstance(job, dict) and str(job.get("id") or "") == str(job_id):
+            return job
+        return None
 
 
 def request_timeout_seconds() -> int:
@@ -326,6 +356,21 @@ def _raise_for_status_with_body(response) -> None:
             body = body[:2000]
             raise requests.HTTPError(f"{exc}; response_body={body}", response=response) from exc
         raise
+
+
+def _training_attempt_id(job: dict | None) -> str:
+    if not isinstance(job, dict):
+        return ""
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    for value in (
+        job.get("training_attempt_id"),
+        config.get("active_attempt_id"),
+        config.get("training_attempt_id"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _positive_int_env(name: str, default: int) -> int:

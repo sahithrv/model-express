@@ -13,7 +13,15 @@ interface Window {
     selectDatasetFolder(): Promise<{
       path: string;
       name: string;
+      preflight?: DatasetUploadPreflight;
     } | null>;
+    preflightDatasetFolder(options: {
+      datasetPath: string;
+      warnFileCount?: number;
+      warnBytes?: number;
+      maxFileCount?: number;
+      maxBytes?: number;
+    }): Promise<DatasetUploadPreflight>;
     uploadDatasetFolder(options: {
       projectId: string;
       datasetPath: string;
@@ -27,6 +35,9 @@ interface Window {
       storage_uri: string;
       checksum_sha256: string;
       size_bytes: number;
+      file_count?: number;
+      uncompressed_size_bytes?: number;
+      upload_warnings?: DatasetUploadWarning[];
     }>;
     selectAndUploadDataset(options: {
       projectId: string;
@@ -105,4 +116,23 @@ interface Window {
       status: string;
     }>;
   };
+}
+
+interface DatasetUploadWarning {
+  code: string;
+  message: string;
+  threshold?: number;
+  value?: number;
+}
+
+interface DatasetUploadPreflight {
+  file_count: number;
+  uncompressed_size_bytes: number;
+  archive_size_bytes: number;
+  largest_file?: {
+    path: string;
+    size_bytes: number;
+  } | null;
+  warnings: DatasetUploadWarning[];
+  errors: DatasetUploadWarning[];
 }

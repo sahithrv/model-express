@@ -1639,6 +1639,44 @@ func TestStaleModalAttemptCallbacksDoNotOverwriteActiveAttempt(t *testing.T) {
 	}
 }
 
+func TestFailJobDoesNotDowngradeSucceededJob(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "local",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(job.ID, "run_1"); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", strings.NewReader(`{"error":"late failure","retryable":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected late fail status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	updated, err := memoryStore.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if updated.Status != jobs.StatusSucceeded || updated.MLflowRunID != "run_1" {
+		t.Fatalf("late fail downgraded terminal job: %#v", updated)
+	}
+}
+
 func TestCancelPlanActiveExecutionStopsJobsRequirementsAndIgnoresStaleCallbacks(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	server := newServer(memoryStore)
@@ -1874,6 +1912,175 @@ func TestPollJobFiltersModalProviderAndProfileFallback(t *testing.T) {
 	}
 	if assigned.ID != profileJob.ID {
 		t.Fatalf("expected profile fallback assignment, got %#v", assigned)
+	}
+}
+
+func TestPollJobProviderFilterDefaultsToGenericProviderlessJobs(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "modal dispatcher slot", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "local",
+	}); err != nil {
+		t.Fatalf("create local train job: %v", err)
+	}
+	profileJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateProfileDataset, map[string]any{
+		"dataset_id": dataset.ID,
+	})
+	if err != nil {
+		t.Fatalf("create profile job: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	req := httptest.NewRequest(http.MethodPost, "/workers/"+worker.ID+"/poll", strings.NewReader(`{"provider":"modal"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected poll status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var payload pollJobResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode poll response: %v", err)
+	}
+	if payload.Job == nil || payload.Job.ID != profileJob.ID {
+		t.Fatalf("expected provider-filtered poll to claim generic profile job, got %#v", payload.Job)
+	}
+}
+
+func TestListDashboardEndpointsUsePaginationDefaults(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	var firstJob jobs.ExperimentJob
+	for index := 0; index < 3; index++ {
+		job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+			"dataset_id": dataset.ID,
+			"provider":   "local",
+			"model":      "model_" + strconv.Itoa(index),
+		})
+		if err != nil {
+			t.Fatalf("create job: %v", err)
+		}
+		if index == 0 {
+			firstJob = job
+		}
+		if _, err := memoryStore.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{Status: jobs.StatusQueued}); err != nil {
+			t.Fatalf("upsert summary: %v", err)
+		}
+		if _, err := memoryStore.UpsertTrainingRunEvaluation(job.ID, runs.TrainingRunEvaluationUpdate{
+			ObjectiveProfile: map[string]any{"score": index},
+			PerClassMetrics:  map[string]any{"class": index},
+			ConfusionMatrix:  [][]int{{index}},
+		}); err != nil {
+			t.Fatalf("upsert evaluation: %v", err)
+		}
+	}
+	for epoch := 1; epoch <= 3; epoch++ {
+		if _, err := memoryStore.ReportMetric(firstJob.ID, epoch, map[string]float64{"macro_f1": float64(epoch)}); err != nil {
+			t.Fatalf("report metric: %v", err)
+		}
+	}
+
+	router := NewRouter(memoryStore)
+	assertPagedJobs(t, router, project.ID)
+	assertPagedMetrics(t, router, firstJob.ID)
+	assertPagedSummaries(t, router, project.ID)
+	assertPagedEvaluations(t, router, project.ID)
+}
+
+func assertPagedJobs(t *testing.T, router http.Handler, projectID string) {
+	t.Helper()
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/projects/"+projectID+"/jobs?limit=2", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("jobs status %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Jobs       []jobs.ExperimentJob `json:"jobs"`
+		Limit      int                  `json:"limit"`
+		HasMore    bool                 `json:"has_more"`
+		NextOffset int                  `json:"next_offset"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode jobs: %v", err)
+	}
+	if len(payload.Jobs) != 2 || payload.Limit != 2 || !payload.HasMore || payload.NextOffset != 2 {
+		t.Fatalf("unexpected jobs page: %#v", payload)
+	}
+}
+
+func assertPagedMetrics(t *testing.T, router http.Handler, jobID string) {
+	t.Helper()
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/jobs/"+jobID+"/metrics?limit=2", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("metrics status %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Metrics []jobs.EpochMetric `json:"metrics"`
+		HasMore bool               `json:"has_more"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	if len(payload.Metrics) != 2 || payload.Metrics[0].Epoch != 2 || payload.Metrics[1].Epoch != 3 || !payload.HasMore {
+		t.Fatalf("unexpected metrics page: %#v", payload)
+	}
+}
+
+func assertPagedSummaries(t *testing.T, router http.Handler, projectID string) {
+	t.Helper()
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/projects/"+projectID+"/training-run-summaries?limit=1", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("summaries status %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Summaries []runs.TrainingRunSummary `json:"summaries"`
+		HasMore   bool                      `json:"has_more"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode summaries: %v", err)
+	}
+	if len(payload.Summaries) != 1 || !payload.HasMore {
+		t.Fatalf("unexpected summaries page: %#v", payload)
+	}
+}
+
+func assertPagedEvaluations(t *testing.T, router http.Handler, projectID string) {
+	t.Helper()
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/projects/"+projectID+"/training-run-evaluations?limit=1&compact=1", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("evaluations status %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Evaluations []runs.TrainingRunEvaluation `json:"evaluations"`
+		HasMore     bool                         `json:"has_more"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode evaluations: %v", err)
+	}
+	if len(payload.Evaluations) != 1 || !payload.HasMore {
+		t.Fatalf("unexpected evaluations page: %#v", payload)
 	}
 }
 
@@ -6420,8 +6627,11 @@ func TestNearCeilingChampionBlocksPlannerFollowUpScheduling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list project jobs: %v", err)
 	}
-	if len(projectJobs) != 1 {
-		t.Fatalf("expected only the completed source job with auto execution disabled, got %d jobs", len(projectJobs))
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateTrainExperiment); got != 1 {
+		t.Fatalf("expected no follow-up training jobs with auto execution disabled, got %d training jobs", got)
+	}
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateExportChampion); got != 1 {
+		t.Fatalf("expected one queued champion export job, got %d", got)
 	}
 }
 
@@ -6612,8 +6822,11 @@ func TestPersistedChampionBlocksStaleAddDecisionBeforePlanCreation(t *testing.T)
 	if err != nil {
 		t.Fatalf("list project jobs: %v", err)
 	}
-	if len(projectJobs) != 1 {
-		t.Fatalf("expected only the completed champion job, got %d jobs", len(projectJobs))
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateTrainExperiment); got != 1 {
+		t.Fatalf("expected only the completed champion training job, got %d training jobs", got)
+	}
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateExportChampion); got != 1 {
+		t.Fatalf("expected one queued champion export job, got %d", got)
 	}
 	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
 	if err != nil {
@@ -6817,8 +7030,11 @@ func TestPostChampionExistingFollowUpPlanCannotCreateJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list project jobs: %v", err)
 	}
-	if len(projectJobs) != 1 {
-		t.Fatalf("expected no follow-up jobs after champion selection, got %d total jobs", len(projectJobs))
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateTrainExperiment); got != 1 {
+		t.Fatalf("expected no follow-up training jobs after champion selection, got %d training jobs", got)
+	}
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateExportChampion); got != 1 {
+		t.Fatalf("expected one queued champion export job, got %d", got)
 	}
 }
 
@@ -7478,6 +7694,16 @@ func createLLMAddExperimentsDecision(
 		t.Fatalf("create LLM add experiments decision: %v", err)
 	}
 	return decision
+}
+
+func countJobsByTemplate(projectJobs []jobs.ExperimentJob, template string) int {
+	count := 0
+	for _, job := range projectJobs {
+		if job.Template == template {
+			count++
+		}
+	}
+	return count
 }
 
 type capturingPlannerGenerator struct {

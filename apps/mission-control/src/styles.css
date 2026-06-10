@@ -560,6 +560,20 @@ button {
   background: rgba(255, 104, 117, 0.09);
 }
 
+.notice-inline {
+  border: 1px solid #1f332c;
+  border-radius: 8px;
+  padding: 9px 11px;
+  color: #8fa19a;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.notice-inline.warning {
+  border-color: rgba(255, 209, 102, 0.32);
+  color: #ffd166;
+  background: rgba(255, 209, 102, 0.08);
+}
+
 .section-tabs {
   position: sticky;
   top: -24px;

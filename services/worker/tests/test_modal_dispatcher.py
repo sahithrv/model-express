@@ -793,8 +793,84 @@ def test_modal_dispatcher_run_forever_zero_demand_does_not_open_modal_app(monkey
     dispatcher.run_forever()
 
     assert events == []
-    assert client.polls == []
+    assert client.polls
     assert client.requirement_polls
+    assert client.dispatcher_events[-1]["event_type"] == "DISPATCHER_IDLE_EXIT"
+
+
+def test_modal_dispatcher_run_forever_zero_demand_claims_profile_dataset(monkeypatch):
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_DISPATCHER_IDLE_EXIT_SECONDS", "0.01")
+    monkeypatch.delenv("GPU_TYPE", raising=False)
+    events = []
+
+    class FakeModalSession:
+        def __enter__(self):
+            events.append("modal_enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("modal_exit")
+            return False
+
+    monkeypatch.setattr(modal_dispatcher, "modal_app_session", lambda: FakeModalSession())
+    client = _FakeClient([_profile_job("profile_1")])
+    ran = []
+    dispatcher = ModalDispatcher(
+        client,
+        "project_1",
+        slot_count=1,
+        poll_interval_seconds=0.01,
+        heartbeat_interval_seconds=0.01,
+        requirement_refresh_seconds=0.01,
+        job_runner=lambda _client, job: ran.append(job["id"]),
+        materializer=lambda _client, _job: {},
+    )
+
+    dispatcher.run_forever()
+
+    assert ran == ["profile_1"]
+    assert client.polls
+    assert events == []
+    assert client.dispatcher_events[-1]["event_type"] == "DISPATCHER_IDLE_EXIT"
+
+
+def test_modal_dispatcher_zero_demand_modal_profile_runs_inside_modal_session(monkeypatch):
+    monkeypatch.setenv("GPU_TYPE", "modal")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_DISPATCHER_IDLE_EXIT_SECONDS", "0.01")
+    events = []
+    in_session = {"active": False}
+
+    class FakeModalSession:
+        def __enter__(self):
+            in_session["active"] = True
+            events.append("modal_enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("modal_exit")
+            in_session["active"] = False
+            return False
+
+    def runner(_client, job):
+        assert in_session["active"] is True
+        ran.append(job["id"])
+
+    monkeypatch.setattr(modal_dispatcher, "modal_app_session", lambda: FakeModalSession())
+    client = _FakeClient([_profile_job("profile_1")])
+    ran = []
+    dispatcher = ModalDispatcher(
+        client,
+        "project_1",
+        slot_count=1,
+        poll_interval_seconds=0.01,
+        heartbeat_interval_seconds=0.01,
+        requirement_refresh_seconds=0.01,
+        job_runner=runner,
+        materializer=lambda _client, _job: {},
+    )
+
+    dispatcher.run_forever()
+
+    assert ran == ["profile_1"]
+    assert events == ["modal_enter", "modal_exit"]
     assert client.dispatcher_events[-1]["event_type"] == "DISPATCHER_IDLE_EXIT"
 
 
