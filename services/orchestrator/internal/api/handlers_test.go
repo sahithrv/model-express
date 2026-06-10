@@ -1409,6 +1409,413 @@ func TestRetryableFailJobRequeuesUntilMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestRetryableOOMFailureEscalatesGpuAndBlocksRepeatedResource(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+		"gpu_type":   "T4",
+		"batch_size": 8,
+		"task_type":  "object_detection",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
+	if err != nil {
+		t.Fatalf("poll job: %v", err)
+	}
+	activeAttemptID := jobConfigString(assigned.Config, "active_attempt_id")
+	body, _ := json.Marshal(map[string]any{
+		"error":                    "CUDA out of memory",
+		"retryable":                true,
+		"training_attempt_id":      activeAttemptID,
+		"oom":                      true,
+		"failure_class":            "oom",
+		"oom_kind":                 "gpu_cuda",
+		"effective_gpu_type":       "T4",
+		"effective_batch_size":     8,
+		"memory_mb":                24576,
+		"modal_resource_signature": "gpu=T4|batch=8|memory_mb=24576",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected OOM retry status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	requeued, err := memoryStore.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get requeued job: %v", err)
+	}
+	if requeued.Status != jobs.StatusQueued || jobConfigString(requeued.Config, "gpu_type") != "L4" {
+		t.Fatalf("expected queued retry escalated to L4, got %#v", requeued)
+	}
+	history, ok := requeued.Config[modalOOMRetryHistoryKey].([]map[string]any)
+	if !ok || len(history) != 1 {
+		t.Fatalf("expected one OOM history entry, got %#v", requeued.Config[modalOOMRetryHistoryKey])
+	}
+
+	guardStore := store.NewMemoryStore()
+	guardProject, err := guardStore.CreateProject("guard demo", "")
+	if err != nil {
+		t.Fatalf("create guard project: %v", err)
+	}
+	guardDataset, err := guardStore.CreateDataset(guardProject.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create guard dataset: %v", err)
+	}
+	guardWorker, err := guardStore.RegisterWorker(guardProject.ID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register guard worker: %v", err)
+	}
+	repeatedJob, err := guardStore.CreateJob(guardProject.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": guardDataset.ID,
+		"provider":   "modal",
+		"gpu_type":   "T4",
+		"batch_size": 8,
+		"task_type":  "object_detection",
+		modalOOMRetryHistoryKey: []map[string]any{{
+			"modal_resource_signature": "gpu=T4|batch=8|memory_mb=24576",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create repeated job: %v", err)
+	}
+	guardRouter := NewRouter(guardStore)
+	assignedRepeated, err := guardStore.PollJob(guardWorker.ID, store.JobPollFilter{Provider: "modal"})
+	if err != nil {
+		t.Fatalf("poll repeated job: %v", err)
+	}
+	repeatedBody, _ := json.Marshal(map[string]any{
+		"error":                    "CUDA out of memory",
+		"retryable":                true,
+		"training_attempt_id":      jobConfigString(assignedRepeated.Config, "active_attempt_id"),
+		"oom":                      true,
+		"failure_class":            "oom",
+		"oom_kind":                 "gpu_cuda",
+		"effective_gpu_type":       "T4",
+		"effective_batch_size":     8,
+		"memory_mb":                24576,
+		"modal_resource_signature": "gpu=T4|batch=8|memory_mb=24576",
+	})
+	repeatedReq := httptest.NewRequest(http.MethodPost, "/jobs/"+repeatedJob.ID+"/fail", bytes.NewReader(repeatedBody))
+	repeatedReq.Header.Set("Content-Type", "application/json")
+	repeatedResp := httptest.NewRecorder()
+	guardRouter.ServeHTTP(repeatedResp, repeatedReq)
+	if repeatedResp.Code != http.StatusOK {
+		t.Fatalf("expected repeated OOM status %d, got %d: %s", http.StatusOK, repeatedResp.Code, repeatedResp.Body.String())
+	}
+	blocked, err := guardStore.GetJob(repeatedJob.ID)
+	if err != nil {
+		t.Fatalf("get blocked job: %v", err)
+	}
+	if blocked.Status != jobs.StatusFailed {
+		t.Fatalf("expected repeated OOM signature to fail without requeue, got %#v", blocked)
+	}
+}
+
+func TestStaleModalAttemptCallbacksDoNotOverwriteActiveAttempt(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+		"gpu_type":   "T4",
+		"batch_size": 8,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	firstAttempt, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
+	if err != nil {
+		t.Fatalf("poll first attempt: %v", err)
+	}
+	firstAttemptID := jobConfigString(firstAttempt.Config, "active_attempt_id")
+	failBody, _ := json.Marshal(map[string]any{
+		"error":                    "CUDA out of memory",
+		"retryable":                true,
+		"training_attempt_id":      firstAttemptID,
+		"oom":                      true,
+		"failure_class":            "oom",
+		"effective_gpu_type":       "T4",
+		"effective_batch_size":     8,
+		"memory_mb":                16384,
+		"modal_resource_signature": "gpu=T4|batch=8|memory_mb=16384",
+	})
+	failReq := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", bytes.NewReader(failBody))
+	failReq.Header.Set("Content-Type", "application/json")
+	failResp := httptest.NewRecorder()
+	router.ServeHTTP(failResp, failReq)
+	if failResp.Code != http.StatusOK {
+		t.Fatalf("expected fail status %d, got %d: %s", http.StatusOK, failResp.Code, failResp.Body.String())
+	}
+
+	secondAttempt, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
+	if err != nil {
+		t.Fatalf("poll second attempt: %v", err)
+	}
+	secondAttemptID := jobConfigString(secondAttempt.Config, "active_attempt_id")
+	goodSummary, _ := json.Marshal(map[string]any{
+		"training_attempt_id": secondAttemptID,
+		"status":              jobs.StatusRunning,
+		"best_macro_f1":       0.9,
+		"gpu_type":            "L4",
+	})
+	goodReq := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", bytes.NewReader(goodSummary))
+	goodReq.Header.Set("Content-Type", "application/json")
+	goodResp := httptest.NewRecorder()
+	router.ServeHTTP(goodResp, goodReq)
+	if goodResp.Code != http.StatusOK {
+		t.Fatalf("expected active summary status %d, got %d: %s", http.StatusOK, goodResp.Code, goodResp.Body.String())
+	}
+
+	staleSummary, _ := json.Marshal(map[string]any{
+		"training_attempt_id": firstAttemptID,
+		"status":              jobs.StatusSucceeded,
+		"best_macro_f1":       0.1,
+		"gpu_type":            "T4",
+	})
+	staleReq := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", bytes.NewReader(staleSummary))
+	staleReq.Header.Set("Content-Type", "application/json")
+	staleResp := httptest.NewRecorder()
+	router.ServeHTTP(staleResp, staleReq)
+	if staleResp.Code != http.StatusAccepted {
+		t.Fatalf("expected stale summary status %d, got %d: %s", http.StatusAccepted, staleResp.Code, staleResp.Body.String())
+	}
+	summary, err := memoryStore.GetTrainingRunSummary(job.ID)
+	if err != nil {
+		t.Fatalf("get summary: %v", err)
+	}
+	if summary.BestMacroF1 != 0.9 || summary.Status != jobs.StatusRunning || summary.GPUType != "L4" {
+		t.Fatalf("stale summary overwrote active summary: %#v", summary)
+	}
+
+	completeReq := httptest.NewRequest(
+		http.MethodPost,
+		"/jobs/"+job.ID+"/complete",
+		strings.NewReader(`{"training_attempt_id":"`+firstAttemptID+`","mlflow_run_id":"stale"}`),
+	)
+	completeReq.Header.Set("Content-Type", "application/json")
+	completeResp := httptest.NewRecorder()
+	router.ServeHTTP(completeResp, completeReq)
+	if completeResp.Code != http.StatusOK {
+		t.Fatalf("expected stale complete status %d, got %d: %s", http.StatusOK, completeResp.Code, completeResp.Body.String())
+	}
+	activeJob, err := memoryStore.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get active job: %v", err)
+	}
+	if activeJob.Status == jobs.StatusSucceeded || activeJob.MLflowRunID == "stale" {
+		t.Fatalf("stale completion overwrote active job: %#v", activeJob)
+	}
+}
+
+func TestCancelPlanActiveExecutionStopsJobsRequirementsAndIgnoresStaleCallbacks(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	router := NewRouter(memoryStore)
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", strings.Repeat("c", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 2, 10, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 6),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{
+		Provider:          "modal",
+		GPUType:           "T4",
+		MaxConcurrentJobs: 2,
+	})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if len(result.Jobs) != 2 || result.WorkerRequirement == nil {
+		t.Fatalf("expected two jobs and worker requirement, got %#v", result)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "modal slot", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
+	if err != nil {
+		t.Fatalf("poll job: %v", err)
+	}
+	activeAttemptID := jobConfigString(assigned.Config, "active_attempt_id")
+	if activeAttemptID == "" {
+		t.Fatalf("expected active attempt id on assigned job: %#v", assigned)
+	}
+	recordBody, _ := json.Marshal(map[string]any{
+		"training_attempt_id":           activeAttemptID,
+		"modal_function_call_object_id": "fc-active",
+		"cancel_status":                 "active",
+		"requested_gpu_type":            "T4",
+		"effective_gpu_type":            "T4",
+		"memory_mb":                     24576,
+		"requested_batch_size":          16,
+		"effective_batch_size":          16,
+		"batch_size_policy":             "preserved",
+		"modal_resource_signature":      "gpu=T4|batch=16|memory_mb=24576",
+		"modal_resources": map[string]any{
+			"effective_gpu_type":       "T4",
+			"effective_batch_size":     16,
+			"memory_mb":                24576,
+			"modal_resource_signature": "gpu=T4|batch=16|memory_mb=24576",
+		},
+	})
+	recordReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/modal-call", bytes.NewReader(recordBody))
+	recordReq.Header.Set("Content-Type", "application/json")
+	recordResp := httptest.NewRecorder()
+	router.ServeHTTP(recordResp, recordReq)
+	if recordResp.Code != http.StatusOK {
+		t.Fatalf("expected modal call record status %d, got %d: %s", http.StatusOK, recordResp.Code, recordResp.Body.String())
+	}
+
+	cancelBody, _ := json.Marshal(map[string]any{
+		"reason":                 "user_requested",
+		"promote_best_available": true,
+		"terminate_remote_work":  true,
+	})
+	cancelReq := httptest.NewRequest(http.MethodPost, "/plans/"+plan.ID+"/cancel-active-execution", bytes.NewReader(cancelBody))
+	cancelReq.Header.Set("Content-Type", "application/json")
+	cancelResp := httptest.NewRecorder()
+	router.ServeHTTP(cancelResp, cancelReq)
+	if cancelResp.Code != http.StatusOK {
+		t.Fatalf("expected cancel status %d, got %d: %s", http.StatusOK, cancelResp.Code, cancelResp.Body.String())
+	}
+	var response cancelExecutionResponse
+	if err := json.Unmarshal(cancelResp.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode cancel response: %v", err)
+	}
+	if response.Status != "CANCELLED_BY_USER" || response.QueuedJobsCancelled != 1 || response.ActiveJobsMarkedCancelling != 1 {
+		t.Fatalf("unexpected cancel response: %#v", response)
+	}
+	if len(response.ModalCalls) != 2 {
+		t.Fatalf("expected modal call rows for both open jobs, got %#v", response.ModalCalls)
+	}
+	var activeCall cancelModalCallResult
+	for _, modalCall := range response.ModalCalls {
+		if modalCall.JobID == assigned.ID {
+			activeCall = modalCall
+		}
+	}
+	if activeCall.ModalFunctionCallObjectID != "fc-active" || activeCall.CancelStatus != "cancel_requested" {
+		t.Fatalf("expected active Modal call cancellation request, got %#v", activeCall)
+	}
+	if len(response.WorkerRequirements) != 1 || response.WorkerRequirements[0].Status != execution.WorkerRequirementCancelled {
+		t.Fatalf("expected cancelled worker requirement, got %#v", response.WorkerRequirements)
+	}
+	if response.BestAvailableModel.Exportable || response.BestAvailableModel.Reason != "no_successful_completed_model" {
+		t.Fatalf("expected no exportable model result, got %#v", response.BestAvailableModel)
+	}
+
+	latestAssigned, err := memoryStore.GetJob(assigned.ID)
+	if err != nil {
+		t.Fatalf("get assigned after cancel: %v", err)
+	}
+	cancelRequested, _ := latestAssigned.Config["cancel_requested"].(bool)
+	if latestAssigned.Status != jobs.StatusFailed ||
+		!cancelRequested ||
+		jobConfigString(latestAssigned.Config, "failure_class") != "cancelled" ||
+		jobConfigString(latestAssigned.Config, "modal_function_call_object_id") != "fc-active" {
+		t.Fatalf("expected assigned job to be cancelled with Modal call metadata, got %#v", latestAssigned)
+	}
+	for _, job := range result.Jobs {
+		updated, err := memoryStore.GetJob(job.ID)
+		if err != nil {
+			t.Fatalf("get job after cancel: %v", err)
+		}
+		if updated.Status != jobs.StatusFailed {
+			t.Fatalf("expected cancelled job %s to be failed for compatibility, got %#v", updated.ID, updated)
+		}
+	}
+
+	lateModalBody, _ := json.Marshal(map[string]any{
+		"training_attempt_id":           activeAttemptID,
+		"modal_function_call_object_id": "fc-late",
+		"cancel_status":                 "active",
+	})
+	lateModalReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/modal-call", bytes.NewReader(lateModalBody))
+	lateModalReq.Header.Set("Content-Type", "application/json")
+	lateModalResp := httptest.NewRecorder()
+	router.ServeHTTP(lateModalResp, lateModalReq)
+	if lateModalResp.Code != http.StatusAccepted {
+		t.Fatalf("expected late modal call to be ignored with %d, got %d: %s", http.StatusAccepted, lateModalResp.Code, lateModalResp.Body.String())
+	}
+	afterLateModal, err := memoryStore.GetJob(assigned.ID)
+	if err != nil {
+		t.Fatalf("get job after late modal callback: %v", err)
+	}
+	if jobConfigString(afterLateModal.Config, "modal_function_call_object_id") != "fc-active" {
+		t.Fatalf("late modal callback overwrote active call id: %#v", afterLateModal.Config)
+	}
+
+	completeReq := httptest.NewRequest(
+		http.MethodPost,
+		"/jobs/"+assigned.ID+"/complete",
+		strings.NewReader(`{"training_attempt_id":"`+activeAttemptID+`","mlflow_run_id":"stale"}`),
+	)
+	completeReq.Header.Set("Content-Type", "application/json")
+	completeResp := httptest.NewRecorder()
+	router.ServeHTTP(completeResp, completeReq)
+	if completeResp.Code != http.StatusOK {
+		t.Fatalf("expected stale complete status %d, got %d: %s", http.StatusOK, completeResp.Code, completeResp.Body.String())
+	}
+	afterComplete, err := memoryStore.GetJob(assigned.ID)
+	if err != nil {
+		t.Fatalf("get job after stale complete: %v", err)
+	}
+	if afterComplete.Status != jobs.StatusFailed || afterComplete.MLflowRunID == "stale" {
+		t.Fatalf("stale completion overwrote cancelled job: %#v", afterComplete)
+	}
+	events, err := memoryStore.ListProjectExecutionEvents(project.ID, 20)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasExecutionEvent(events, execution.EventExecutionCancellationRequested) ||
+		!hasExecutionEvent(events, execution.EventExecutionCancelled) ||
+		!hasExecutionEvent(events, execution.EventJobStaleCallbackIgnored) {
+		t.Fatalf("expected cancellation and stale callback events, got %#v", events)
+	}
+}
+
 func TestPollJobFiltersModalProviderAndProfileFallback(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
@@ -1710,6 +2117,57 @@ func TestAutomaticExecutionWorkerRequirementScalesToQueuedJobs(t *testing.T) {
 	}
 }
 
+func TestManualModalExecutionRequestedConcurrencyOverridesBalancedDefault(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
+	t.Setenv("MODEL_EXPRESS_MAX_AUTO_WORKERS", "8")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	current := server.currentAutomationSettings()
+	current.CostMode = "balanced"
+	server.setAutomationSettings(current)
+
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("a", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 4, 10, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 6),
+		testExperiment("regnet_y_400mf", 6),
+		testExperiment("convnext_tiny", 6),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{
+		Provider:          "modal",
+		GPUType:           "T4",
+		MaxConcurrentJobs: 4,
+	})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if result.WorkerRequirement == nil {
+		t.Fatal("expected worker requirement in execute response")
+	}
+	if result.WorkerRequirement.TargetCount != 4 || result.WorkerRequirement.MaxConcurrentJobs != 4 {
+		t.Fatalf("expected explicit concurrency 4 to drive requirement, got %#v", result.WorkerRequirement)
+	}
+	requirements, err := memoryStore.ListProjectWorkerRequirements(project.ID)
+	if err != nil {
+		t.Fatalf("list requirements: %v", err)
+	}
+	if len(requirements) != 1 || requirements[0].TargetCount != 4 || requirements[0].MaxConcurrentJobs != 4 {
+		t.Fatalf("expected persisted requirement concurrency 4, got %#v", requirements)
+	}
+}
+
 func TestExecuteModalPlanAddsPreviewTrainingTierBehindFlag(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_MODAL_PREVIEW_TIER_METADATA", "1")
 
@@ -1892,9 +2350,18 @@ func TestBudgetCapBlocksQueuedFullTrainClearly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
-	if len(events) != 1 || events[0].EventType != execution.EventCostBudgetBlocked {
+	if !executionEventsContainType(events, execution.EventCostBudgetBlocked) {
 		t.Fatalf("expected budget blocked event, got %#v", events)
 	}
+}
+
+func executionEventsContainType(events []execution.ExecutionEvent, eventType string) bool {
+	for _, event := range events {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBudgetCapSelectsBestAvailableChampionWhenAllQueuedFullTrainIsBlocked(t *testing.T) {

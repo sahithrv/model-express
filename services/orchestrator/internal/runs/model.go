@@ -47,6 +47,14 @@ type TrainingRunSummary struct {
 }
 
 type TrainingRunSummaryUpdate struct {
+	TrainingAttemptID      string         `json:"training_attempt_id"`
+	RequestedGPUType       string         `json:"requested_gpu_type,omitempty"`
+	EffectiveGPUType       string         `json:"effective_gpu_type,omitempty"`
+	MemoryMB               int            `json:"memory_mb,omitempty"`
+	RequestedBatchSize     int            `json:"requested_batch_size,omitempty"`
+	EffectiveBatchSize     int            `json:"effective_batch_size,omitempty"`
+	BatchSizePolicy        string         `json:"batch_size_policy,omitempty"`
+	ModalResourceSignature string         `json:"modal_resource_signature,omitempty"`
 	Model                  string         `json:"model"`
 	Provider               string         `json:"provider"`
 	GPUType                string         `json:"gpu_type"`
@@ -80,12 +88,20 @@ type TrainingRunEvaluation struct {
 }
 
 type TrainingRunEvaluationUpdate struct {
-	ObjectiveProfile      map[string]any `json:"objective_profile"`
-	PerClassMetrics       map[string]any `json:"per_class_metrics"`
-	ConfusionMatrix       [][]int        `json:"confusion_matrix"`
-	ModelProfile          map[string]any `json:"model_profile"`
-	HolisticScores        map[string]any `json:"holistic_scores"`
-	RecommendationSummary string         `json:"recommendation_summary"`
+	TrainingAttemptID      string         `json:"training_attempt_id"`
+	RequestedGPUType       string         `json:"requested_gpu_type,omitempty"`
+	EffectiveGPUType       string         `json:"effective_gpu_type,omitempty"`
+	MemoryMB               int            `json:"memory_mb,omitempty"`
+	RequestedBatchSize     int            `json:"requested_batch_size,omitempty"`
+	EffectiveBatchSize     int            `json:"effective_batch_size,omitempty"`
+	BatchSizePolicy        string         `json:"batch_size_policy,omitempty"`
+	ModalResourceSignature string         `json:"modal_resource_signature,omitempty"`
+	ObjectiveProfile       map[string]any `json:"objective_profile"`
+	PerClassMetrics        map[string]any `json:"per_class_metrics"`
+	ConfusionMatrix        [][]int        `json:"confusion_matrix"`
+	ModelProfile           map[string]any `json:"model_profile"`
+	HolisticScores         map[string]any `json:"holistic_scores"`
+	RecommendationSummary  string         `json:"recommendation_summary"`
 }
 
 type ProjectChampion struct {

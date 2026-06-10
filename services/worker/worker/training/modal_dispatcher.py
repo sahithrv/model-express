@@ -121,22 +121,42 @@ class ModalDispatcher:
 
     def run_forever(self) -> None:
         try:
-            with modal_app_session():
+            started_logged = False
+            while True:
+                self._refresh_slot_target_from_requirements()
+                if self._should_hold_modal_session():
+                    with modal_app_session():
+                        if not started_logged:
+                            self._log_dispatcher_started()
+                            started_logged = True
+                        while True:
+                            self.run_once()
+                            if self._should_exit_for_idle():
+                                return
+                            if not self._should_hold_modal_session():
+                                break
+                            time.sleep(self.poll_interval_seconds)
+                    continue
+                if not started_logged:
+                    self._log_dispatcher_started()
+                    started_logged = True
                 self.register_slots()
-                log_event(
-                    "info",
-                    "modal_dispatcher_started",
-                    project_id=self.project_id,
-                    slot_count=self.slot_count,
-                    idle_exit_seconds=modal_dispatcher_idle_exit_seconds() or 0,
-                )
-                while True:
-                    self.run_once()
-                    if self._should_exit_for_idle():
-                        break
-                    time.sleep(self.poll_interval_seconds)
+                self._collect_finished_slots()
+                self._heartbeat_due_slots()
+                if self._should_exit_for_idle():
+                    break
+                time.sleep(self.poll_interval_seconds)
         finally:
             self._executor.shutdown(wait=False, cancel_futures=False)
+
+    def _log_dispatcher_started(self) -> None:
+        log_event(
+            "info",
+            "modal_dispatcher_started",
+            project_id=self.project_id,
+            slot_count=self.slot_count,
+            idle_exit_seconds=modal_dispatcher_idle_exit_seconds() or 0,
+        )
 
     def run_once(self) -> bool:
         self._refresh_slot_target_from_requirements()
@@ -478,6 +498,14 @@ class ModalDispatcher:
 
     def _active_slot_count(self) -> int:
         return sum(1 for slot in self.slots if slot.future is not None)
+
+    def _should_hold_modal_session(self) -> bool:
+        if (self._last_required_slot_count or 0) > 0:
+            return True
+        if any(slot.future is not None for slot in self.slots):
+            return True
+        with self._cache_lock:
+            return bool(self._warming)
 
     def _poll_templates(self) -> list[str]:
         if (self._last_required_slot_count or 0) > 0:

@@ -558,6 +558,7 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		job.Status = jobs.StatusAssigned
 		job.Error = ""
 		job.Attempt++
+		job.Config = jobConfigWithActiveAttempt(job.Config, job.ID, job.Attempt)
 		if job.MaxAttempts < 1 {
 			job.MaxAttempts = defaultJobMaxAttempts
 		}
@@ -637,6 +638,26 @@ func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, e
 	return out, nil
 }
 
+func (s *MemoryStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return jobs.ExperimentJob{}, ErrNotFound
+	}
+	next := copyAnyMap(job.Config)
+	if next == nil {
+		next = map[string]any{}
+	}
+	for key, value := range patch {
+		next[key] = value
+	}
+	job.Config = next
+	s.jobs[jobID] = job
+	return job, nil
+}
+
 func (s *MemoryStore) RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -661,11 +682,13 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 			job.Error = "job lease expired after maximum attempts"
 			completedAt := now
 			job.CompletedAt = &completedAt
+			job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
 		} else {
 			job.Status = jobs.StatusQueued
 			job.Error = ""
 			job.WorkerID = ""
 			job.StartedAt = nil
+			job.Config = jobConfigWithPendingAttempt(job.Config, job.ID, job.Attempt+1)
 		}
 		job.LeaseOwnerWorkerID = ""
 		job.LeaseExpiresAt = nil
@@ -2183,7 +2206,7 @@ func (s *MemoryStore) CompleteJob(jobID string, mlflowRunID string) (jobs.Experi
 	return s.finishJob(jobID, jobs.StatusSucceeded, mlflowRunID, "")
 }
 
-func (s *MemoryStore) RetryJob(jobID string, message string) (jobs.ExperimentJob, bool, error) {
+func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOptions) (jobs.ExperimentJob, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2196,7 +2219,11 @@ func (s *MemoryStore) RetryJob(jobID string, message string) (jobs.ExperimentJob
 	}
 
 	now := time.Now().UTC()
-	requeued := job.Attempt < job.MaxAttempts
+	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
+	nextConfig := copyAnyMap(job.Config)
+	if options.Config != nil {
+		nextConfig = copyAnyMap(options.Config)
+	}
 	if requeued {
 		job.Status = jobs.StatusQueued
 		job.Error = message
@@ -2204,10 +2231,12 @@ func (s *MemoryStore) RetryJob(jobID string, message string) (jobs.ExperimentJob
 		job.StartedAt = nil
 		job.CompletedAt = nil
 		job.MLflowRunID = ""
+		job.Config = jobConfigWithPendingAttempt(nextConfig, job.ID, job.Attempt+1)
 	} else {
 		job.Status = jobs.StatusFailed
 		job.Error = message
 		job.CompletedAt = &now
+		job.Config = jobConfigWithTerminalAttempt(nextConfig, job.ID, job.Attempt)
 	}
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
@@ -2247,6 +2276,7 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	job.MLflowRunID = mlflowRunID
 	job.Error = message
 	job.CompletedAt = &now
+	job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
 	job.LeaseLastHeartbeatAt = nil
@@ -2266,6 +2296,41 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 
 func isTerminalJobStatus(status string) bool {
 	return status == jobs.StatusSucceeded || status == jobs.StatusFailed
+}
+
+func jobConfigWithActiveAttempt(config map[string]any, jobID string, attempt int) map[string]any {
+	next := copyAnyMap(config)
+	if next == nil {
+		next = map[string]any{}
+	}
+	next["active_attempt_id"] = jobAttemptID(jobID, attempt)
+	next["active_attempt_number"] = attempt
+	return next
+}
+
+func jobConfigWithPendingAttempt(config map[string]any, jobID string, nextAttempt int) map[string]any {
+	next := copyAnyMap(config)
+	if next == nil {
+		next = map[string]any{}
+	}
+	next["active_attempt_id"] = fmt.Sprintf("%s:pending-attempt-%d", jobID, nextAttempt)
+	next["active_attempt_number"] = nextAttempt
+	next["previous_attempt_superseded"] = true
+	return next
+}
+
+func jobConfigWithTerminalAttempt(config map[string]any, jobID string, attempt int) map[string]any {
+	next := copyAnyMap(config)
+	if next == nil {
+		next = map[string]any{}
+	}
+	next["active_attempt_id"] = fmt.Sprintf("%s:terminal-after-attempt-%d", jobID, attempt)
+	next["active_attempt_number"] = attempt
+	return next
+}
+
+func jobAttemptID(jobID string, attempt int) string {
+	return fmt.Sprintf("%s:attempt-%d", jobID, attempt)
 }
 
 func (s *MemoryStore) newID(prefix string) string {

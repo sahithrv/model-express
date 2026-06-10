@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
+from worker.training import modal_dispatcher
 from worker.training.modal_dispatcher import ModalDispatcher, MAX_DISPATCHER_SLOTS
 from worker.training.modal_provider import ModalRetryableFailureReported
 
@@ -761,6 +762,39 @@ def test_modal_dispatcher_idle_exit_waits_for_zero_demand_refresh(monkeypatch):
     dispatcher.run_once()
 
     assert dispatcher._should_exit_for_idle() is True
+    assert client.dispatcher_events[-1]["event_type"] == "DISPATCHER_IDLE_EXIT"
+
+
+def test_modal_dispatcher_run_forever_zero_demand_does_not_open_modal_app(monkeypatch):
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_DISPATCHER_IDLE_EXIT_SECONDS", "0.01")
+    events = []
+
+    class FakeModalSession:
+        def __enter__(self):
+            events.append("modal_enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("modal_exit")
+            return False
+
+    monkeypatch.setattr(modal_dispatcher, "modal_app_session", lambda: FakeModalSession())
+    client = _FakeClient([])
+    dispatcher = ModalDispatcher(
+        client,
+        "project_1",
+        slot_count=1,
+        poll_interval_seconds=0.01,
+        heartbeat_interval_seconds=0.01,
+        requirement_refresh_seconds=0.01,
+        job_runner=lambda _client, _job: None,
+        materializer=lambda _client, _job: {},
+    )
+
+    dispatcher.run_forever()
+
+    assert events == []
+    assert client.polls == []
+    assert client.requirement_polls
     assert client.dispatcher_events[-1]["event_type"] == "DISPATCHER_IDLE_EXIT"
 
 

@@ -1011,6 +1011,12 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 		return nil, ErrNoJob
 	}
 
+	assignedConfig := jobConfigWithActiveAttempt(job.Config, job.ID, job.Attempt+1)
+	assignedConfigJSON, err := json.Marshal(assignedConfig)
+	if err != nil {
+		return nil, fmt.Errorf("marshal active attempt job config: %w", err)
+	}
+
 	assignedJob, err := scanJob(tx.QueryRowContext(ctx, `
 		UPDATE experiment_jobs
 		SET worker_id = $1,
@@ -1018,12 +1024,13 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 			error = '',
 			started_at = now(),
 			attempt = attempt + 1,
+			config = $5,
 			lease_owner_worker_id = $1,
 			lease_last_heartbeat_at = now(),
 			lease_expires_at = $4
 		WHERE id = $3
 		RETURNING `+jobSelectColumns()+`
-	`, workerID, jobs.StatusAssigned, job.ID, now.Add(defaultJobLeaseDuration)))
+	`, workerID, jobs.StatusAssigned, job.ID, now.Add(defaultJobLeaseDuration), assignedConfigJSON))
 	if err != nil {
 		return nil, err
 	}
@@ -1099,6 +1106,44 @@ func (s *PostgresStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob,
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	defer tx.Rollback()
+
+	job, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id")+" FOR UPDATE", jobID))
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	next := copyAnyMap(job.Config)
+	if next == nil {
+		next = map[string]any{}
+	}
+	for key, value := range patch {
+		next[key] = value
+	}
+	configJSON, err := json.Marshal(next)
+	if err != nil {
+		return jobs.ExperimentJob{}, fmt.Errorf("marshal patched job config: %w", err)
+	}
+	updated, err := scanJob(tx.QueryRowContext(ctx, `
+		UPDATE experiment_jobs
+		SET config = $1
+		WHERE id = $2
+		RETURNING `+jobSelectColumns()+`
+	`, configJSON, jobID))
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	return updated, nil
+}
+
 func (s *PostgresStore) RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error) {
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1151,31 +1196,43 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 		}
 		var updated jobs.ExperimentJob
 		if job.Attempt >= job.MaxAttempts {
+			nextConfig := jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
+			configJSON, marshalErr := json.Marshal(nextConfig)
+			if marshalErr != nil {
+				return nil, fmt.Errorf("marshal expired terminal job config: %w", marshalErr)
+			}
 			updated, err = scanJob(tx.QueryRowContext(ctx, `
 				UPDATE experiment_jobs
 				SET status = $1,
 					error = $2,
 					worker_id = '',
+					config = $5,
 					completed_at = $3,
 					lease_owner_worker_id = '',
 					lease_expires_at = NULL,
 					lease_last_heartbeat_at = NULL
 				WHERE id = $4
 				RETURNING `+jobSelectColumns()+`
-			`, jobs.StatusFailed, "job lease expired after maximum attempts", now, job.ID))
+			`, jobs.StatusFailed, "job lease expired after maximum attempts", now, job.ID, configJSON))
 		} else {
+			nextConfig := jobConfigWithPendingAttempt(job.Config, job.ID, job.Attempt+1)
+			configJSON, marshalErr := json.Marshal(nextConfig)
+			if marshalErr != nil {
+				return nil, fmt.Errorf("marshal expired retry job config: %w", marshalErr)
+			}
 			updated, err = scanJob(tx.QueryRowContext(ctx, `
 				UPDATE experiment_jobs
 				SET status = $1,
 					error = '',
 					worker_id = '',
+					config = $3,
 					started_at = NULL,
 					lease_owner_worker_id = '',
 					lease_expires_at = NULL,
 					lease_last_heartbeat_at = NULL
 				WHERE id = $2
 				RETURNING `+jobSelectColumns()+`
-			`, jobs.StatusQueued, job.ID))
+			`, jobs.StatusQueued, job.ID, configJSON))
 		}
 		if err != nil {
 			return nil, err
@@ -3570,7 +3627,7 @@ func (s *PostgresStore) CompleteJob(jobID string, mlflowRunID string) (jobs.Expe
 	return s.finishJob(jobID, jobs.StatusSucceeded, mlflowRunID, "")
 }
 
-func (s *PostgresStore) RetryJob(jobID string, message string) (jobs.ExperimentJob, bool, error) {
+func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobOptions) (jobs.ExperimentJob, bool, error) {
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -3586,14 +3643,24 @@ func (s *PostgresStore) RetryJob(jobID string, message string) (jobs.ExperimentJ
 		job.MaxAttempts = defaultJobMaxAttempts
 	}
 
-	requeued := job.Attempt < job.MaxAttempts
+	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
+	nextConfig := copyAnyMap(job.Config)
+	if options.Config != nil {
+		nextConfig = copyAnyMap(options.Config)
+	}
 	if requeued {
+		nextConfig = jobConfigWithPendingAttempt(nextConfig, job.ID, job.Attempt+1)
+		configJSON, marshalErr := json.Marshal(nextConfig)
+		if marshalErr != nil {
+			return jobs.ExperimentJob{}, false, fmt.Errorf("marshal retry job config: %w", marshalErr)
+		}
 		job, err = scanJob(tx.QueryRowContext(ctx, `
 			UPDATE experiment_jobs
 			SET status = $1,
 				error = $2,
 				worker_id = '',
 				mlflow_run_id = '',
+				config = $4,
 				started_at = NULL,
 				completed_at = NULL,
 				lease_owner_worker_id = '',
@@ -3601,19 +3668,25 @@ func (s *PostgresStore) RetryJob(jobID string, message string) (jobs.ExperimentJ
 				lease_last_heartbeat_at = NULL
 			WHERE id = $3
 			RETURNING `+jobSelectColumns()+`
-		`, jobs.StatusQueued, message, jobID))
+		`, jobs.StatusQueued, message, jobID, configJSON))
 	} else {
+		nextConfig = jobConfigWithTerminalAttempt(nextConfig, job.ID, job.Attempt)
+		configJSON, marshalErr := json.Marshal(nextConfig)
+		if marshalErr != nil {
+			return jobs.ExperimentJob{}, false, fmt.Errorf("marshal terminal retry job config: %w", marshalErr)
+		}
 		job, err = scanJob(tx.QueryRowContext(ctx, `
 			UPDATE experiment_jobs
 			SET status = $1,
 				error = $2,
+				config = $4,
 				completed_at = now(),
 				lease_owner_worker_id = '',
 				lease_expires_at = NULL,
 				lease_last_heartbeat_at = NULL
 			WHERE id = $3
 			RETURNING `+jobSelectColumns()+`
-		`, jobs.StatusFailed, message, jobID))
+		`, jobs.StatusFailed, message, jobID, configJSON))
 	}
 	if err != nil {
 		return jobs.ExperimentJob{}, false, err
@@ -3648,18 +3721,29 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 	}
 	defer tx.Rollback()
 
+	current, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id")+" FOR UPDATE", jobID))
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	nextConfig := jobConfigWithTerminalAttempt(current.Config, current.ID, current.Attempt)
+	configJSON, err := json.Marshal(nextConfig)
+	if err != nil {
+		return jobs.ExperimentJob{}, fmt.Errorf("marshal terminal job config: %w", err)
+	}
+
 	job, err := scanJob(tx.QueryRowContext(ctx, `
 		UPDATE experiment_jobs
 		SET status = $1,
 			mlflow_run_id = $2,
 			error = $3,
+			config = $5,
 			completed_at = now(),
 			lease_owner_worker_id = '',
 			lease_expires_at = NULL,
 			lease_last_heartbeat_at = NULL
 		WHERE id = $4
 		RETURNING `+jobSelectColumns()+`
-	`, status, mlflowRunID, message, jobID))
+	`, status, mlflowRunID, message, jobID, configJSON))
 	if err != nil {
 		return jobs.ExperimentJob{}, err
 	}

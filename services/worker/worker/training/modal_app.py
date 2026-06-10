@@ -25,6 +25,12 @@ from worker.training.preprocessing_registry import (
     normalization_values,
     resize_with_padding,
 )
+from worker.training.modal_resources import (
+    callback_identity,
+    failure_callback_payload,
+    modal_resources_from_payload,
+    resource_telemetry,
+)
 
 try:
     import modal
@@ -355,8 +361,9 @@ def _train_image_classifier_impl(payload: dict) -> dict:
 
     job_id = job["id"]
     dataset_id = dataset["id"]
+    modal_resources = modal_resources_from_payload(payload, config, detection_job=False)
     epochs = _positive_int(config.get("epochs"), default=5)
-    batch_size = _positive_int(config.get("batch_size"), default=16)
+    batch_size = _positive_int(modal_resources.get("effective_batch_size"), default=16)
     learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
     image_size = _bounded_int(config.get("image_size"), default=224, minimum=96, maximum=384)
     optimizer_name = str(config.get("optimizer", "adamw")).lower()
@@ -382,8 +389,13 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     pretrained = _bool(config.get("pretrained"), default=True)
     freeze_backbone = _bool(config.get("freeze_backbone"), default=True)
     fine_tune_strategy = str(config.get("fine_tune_strategy", "head_only")).lower()
-    gpu_type = str(config.get("gpu_type") or os.getenv("MODAL_GPU_TYPE", "T4"))
+    gpu_type = str(modal_resources.get("effective_gpu_type") or config.get("gpu_type") or "T4")
     modal_function_call_id, modal_input_id = _modal_identifiers()
+    modal_resources = {
+        **modal_resources,
+        "modal_function_call_id": modal_function_call_id,
+        "modal_input_id": modal_input_id,
+    }
 
     _modal_training_phase(job_id, "storage_configured", started_at)
     _modal_training_phase(job_id, "torch_cache_reload_start", started_at)
@@ -428,6 +440,11 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     subset_manifest = execution_metadata.get("dataset_tier", {}).get("subset_manifest")
     if isinstance(subset_manifest, dict):
         dataset_materialization["subset_manifest"] = subset_manifest
+    effective_batch_size = _positive_int(getattr(train_loader, "batch_size", None), default=batch_size)
+    modal_resource_telemetry = resource_telemetry(
+        modal_resources,
+        effective_batch_size=effective_batch_size,
+    )
     _modal_training_phase(
         job_id,
         "data_load_done",
@@ -505,8 +522,10 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         runtime_seconds = time.time() - started_at
         estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
 
-        _post_json(
-            f"{orchestrator_url}/jobs/{job_id}/metrics",
+        _post_job_json(
+            orchestrator_url,
+            job,
+            "metrics",
             {
                 "epoch": epoch,
                 "metrics": {
@@ -527,6 +546,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                     "gradient_clip_norm": gradient_clip_norm,
                 },
             },
+            modal_resources=modal_resources,
         )
         _post_training_run_summary(
             orchestrator_url,
@@ -552,8 +572,11 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                     stage_events,
                     dataset_materialization,
                     gpu_type,
+                    modal_resources=modal_resource_telemetry,
                 ),
             },
+            job=job,
+            modal_resources=modal_resources,
         )
         if _should_stop_training_early(
             epoch=epoch,
@@ -627,6 +650,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         "export_manifest_uri": export_bundle.get("manifest_uri", ""),
         "export_manifest": export_bundle.get("manifest", {}),
         "export_validation_errors": export_bundle.get("validation_errors", []),
+        "modal_resources": modal_resource_telemetry,
     }
     _post_training_run_summary(
         orchestrator_url,
@@ -652,8 +676,11 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 stage_events,
                 dataset_materialization,
                 gpu_type,
+                modal_resources=modal_resource_telemetry,
             ),
         },
+        job=job,
+        modal_resources=modal_resources,
     )
     _post_training_run_evaluation(
         orchestrator_url,
@@ -667,6 +694,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "heldout_test_macro_f1": round(test_macro_f1, 6),
                 "heldout_test_loss": round(test_loss, 6),
                 "heldout_demo_images": demo_images,
+                "modal_resources": modal_resource_telemetry,
             },
             "per_class_metrics": final_eval_details.get("per_class_metrics", {}),
             "confusion_matrix": final_eval_details.get("confusion_matrix", []),
@@ -676,8 +704,18 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "freeze_backbone": freeze_backbone,
                 "fine_tune_strategy": fine_tune_strategy,
                 "dropout": dropout,
+                "modal_resources": modal_resource_telemetry,
             },
-            "holistic_scores": _holistic_scores(best_macro_f1, best_accuracy, estimated_cost_usd, runtime_seconds, model_profile),
+            "holistic_scores": {
+                **_holistic_scores(
+                    best_macro_f1,
+                    best_accuracy,
+                    estimated_cost_usd,
+                    runtime_seconds,
+                    model_profile,
+                ),
+                "modal_resources": modal_resource_telemetry,
+            },
             "preprocessing_summary": {
                 "augmentation_policy": str(config.get("augmentation_policy", "")),
                 "augmentation_policy_config": config.get("augmentation_policy_config")
@@ -700,6 +738,9 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                     "scheduler_gamma": scheduler_gamma if scheduler_name == "step" else 0,
                     "label_smoothing": label_smoothing,
                     "gradient_clip_norm": gradient_clip_norm,
+                    "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
+                    "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
+                    "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
                     "focal_loss_gamma": _bounded_float(
                         class_balancing_config.get("focal_loss_gamma"),
                         default=2.0,
@@ -718,11 +759,16 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
             ),
         },
+        job=job,
+        modal_resources=modal_resources,
     )
 
-    _post_json(
-        f"{orchestrator_url}/jobs/{job_id}/complete",
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "complete",
         {"mlflow_run_id": f"modal-{job_id}"},
+        modal_resources=modal_resources,
     )
 
     return {
@@ -778,14 +824,21 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     job_id = job["id"]
     dataset_id = dataset["id"]
     model_name = str(config.get("model") or config.get("pretrained_weights") or "yolo11n.pt")
+    modal_resources = modal_resources_from_payload(payload, config, detection_job=True)
     epochs = _positive_int(config.get("epochs"), default=8)
-    batch_size = _positive_int(config.get("batch_size"), default=8)
+    batch_size = _positive_int(modal_resources.get("effective_batch_size"), default=8)
     image_size = _bounded_int(config.get("image_size"), default=640, minimum=160, maximum=1280)
     learning_rate = _positive_float(config.get("learning_rate"), default=0.001)
     confidence_threshold = _bounded_float(config.get("confidence_threshold"), default=0.25, minimum=0.01, maximum=0.99)
     iou_threshold = _bounded_float(config.get("iou_threshold"), default=0.7, minimum=0.1, maximum=0.99)
-    gpu_type = str(config.get("gpu_type") or os.getenv("MODAL_GPU_TYPE", "T4"))
+    gpu_type = str(modal_resources.get("effective_gpu_type") or config.get("gpu_type") or "T4")
     modal_function_call_id, modal_input_id = _modal_identifiers()
+    modal_resources = {
+        **modal_resources,
+        "modal_function_call_id": modal_function_call_id,
+        "modal_input_id": modal_input_id,
+    }
+    modal_resource_telemetry = resource_telemetry(modal_resources, effective_batch_size=batch_size)
 
     _modal_training_phase(job_id, "storage_configured", started_at)
     dataset_dir, dataset_materialization = _modal_training_dataset_for_job(
@@ -837,6 +890,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         learning_rate=learning_rate,
         image_size=image_size,
         posted_epochs=posted_yolo_epochs,
+        callback_identity=callback_identity(job, modal_resources),
     )
     detector.train(
         data=str(data_config_path),
@@ -859,6 +913,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         learning_rate=learning_rate,
         image_size=image_size,
         posted_epochs=posted_yolo_epochs,
+        callback_identity=callback_identity(job, modal_resources),
     )
     yolo_epoch_rows_posted = len(posted_yolo_epochs) or final_yolo_epoch_rows_posted
 
@@ -930,8 +985,10 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     model_profile["export_validation_errors"] = export_bundle.get("validation_errors", [])
 
     if yolo_epoch_rows_posted == 0:
-        _post_json(
-            f"{orchestrator_url}/jobs/{job_id}/metrics",
+        _post_job_json(
+            orchestrator_url,
+            job,
+            "metrics",
             {
                 "epoch": max(1, epochs),
                 "metrics": {
@@ -950,6 +1007,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                     "image_size": image_size,
                 },
             },
+            modal_resources=modal_resources,
         )
     _post_training_run_summary(
         orchestrator_url,
@@ -980,8 +1038,11 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 stage_events,
                 dataset_materialization,
                 gpu_type,
+                modal_resources=modal_resource_telemetry,
             ),
         },
+        job=job,
+        modal_resources=modal_resources,
     )
     _post_training_run_evaluation(
         orchestrator_url,
@@ -1000,22 +1061,29 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 "heldout_test_box_loss": round(box_loss, 6),
                 "heldout_test_cls_loss": round(cls_loss, 6),
                 "heldout_test_dfl_loss": round(dfl_loss, 6),
+                "modal_resources": modal_resource_telemetry,
             },
             "per_class_metrics": _yolo_per_class_metrics(class_names, final_metrics),
             "confusion_matrix": [],
-            "model_profile": model_profile,
-            "holistic_scores": _detection_holistic_scores(
-                map50_95=map50_95,
-                map50=map50,
-                precision=precision,
-                recall=recall,
-                box_loss=box_loss,
-                cls_loss=cls_loss,
-                dfl_loss=dfl_loss,
-                estimated_cost_usd=estimated_cost_usd,
-                runtime_seconds=runtime_seconds,
-                model_profile=model_profile,
-            ),
+            "model_profile": {
+                **model_profile,
+                "modal_resources": modal_resource_telemetry,
+            },
+            "holistic_scores": {
+                **_detection_holistic_scores(
+                    map50_95=map50_95,
+                    map50=map50,
+                    precision=precision,
+                    recall=recall,
+                    box_loss=box_loss,
+                    cls_loss=cls_loss,
+                    dfl_loss=dfl_loss,
+                    estimated_cost_usd=estimated_cost_usd,
+                    runtime_seconds=runtime_seconds,
+                    model_profile=model_profile,
+                ),
+                "modal_resources": modal_resource_telemetry,
+            },
             "preprocessing_summary": {
                 "task_type": "object_detection",
                 "preserved_yolo_config": str(data_config_path),
@@ -1024,6 +1092,9 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 "training_hyperparameters": {
                     "learning_rate": learning_rate,
                     "batch_size": batch_size,
+                    "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
+                    "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
+                    "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
                     "epochs": epochs,
                     "image_size": image_size,
                 },
@@ -1035,8 +1106,16 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
             ),
         },
+        job=job,
+        modal_resources=modal_resources,
     )
-    _post_json(f"{orchestrator_url}/jobs/{job_id}/complete", {"mlflow_run_id": f"modal-yolo-{job_id}"})
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "complete",
+        {"mlflow_run_id": f"modal-yolo-{job_id}"},
+        modal_resources=modal_resources,
+    )
     return {
         "job_id": job_id,
         "model": model_name,
@@ -1938,6 +2017,7 @@ def _install_yolo_epoch_metrics_callback(
     learning_rate: float,
     image_size: int,
     posted_epochs: set[int],
+    callback_identity: dict | None = None,
 ) -> None:
     def post_epoch_metrics(_trainer=None) -> None:
         _post_yolo_epoch_metrics(
@@ -1947,6 +2027,7 @@ def _install_yolo_epoch_metrics_callback(
             learning_rate=learning_rate,
             image_size=image_size,
             posted_epochs=posted_epochs,
+            callback_identity=callback_identity,
         )
 
     add_callback = getattr(detector, "add_callback", None)
@@ -1967,6 +2048,7 @@ def _post_yolo_epoch_metrics(
     learning_rate: float,
     image_size: int,
     posted_epochs: set[int] | None = None,
+    callback_identity: dict | None = None,
 ) -> int:
     results_path = _find_yolo_results_csv(run_root)
     if results_path is None:
@@ -1982,11 +2064,13 @@ def _post_yolo_epoch_metrics(
                 normalized_epoch = max(1, epoch)
                 if posted_epochs is not None and normalized_epoch in posted_epochs:
                     continue
+                identity = callback_identity if isinstance(callback_identity, dict) else {}
                 _post_json(
                     f"{orchestrator_url}/jobs/{job_id}/metrics",
                     {
                         "epoch": normalized_epoch,
                         "metrics": metrics,
+                        **identity,
                     },
                 )
                 if posted_epochs is not None:
@@ -2676,9 +2760,28 @@ def _modal_stage_telemetry_payload(
     stage_events: list[dict],
     dataset_materialization: dict,
     gpu_type: str,
+    *,
+    modal_resources: dict | None = None,
 ) -> dict:
+    resources = (
+        modal_resources
+        if isinstance(modal_resources, dict)
+        else resource_telemetry({"effective_gpu_type": gpu_type})
+    )
     if not _modal_stage_telemetry_enabled():
-        return {}
+        return {
+            "schema_version": "remote_gpu_stage_telemetry_v1",
+            "gpu_type": gpu_type,
+            "modal_resources": resources,
+            "requested_gpu_type": resources.get("requested_gpu_type", ""),
+            "effective_gpu_type": resources.get("effective_gpu_type", gpu_type),
+            "memory_mb": resources.get("memory_mb", 0),
+            "requested_batch_size": resources.get("requested_batch_size", 0),
+            "effective_batch_size": resources.get("effective_batch_size", 0),
+            "batch_size_policy": resources.get("batch_size_policy", ""),
+            "resource_signature": resources.get("resource_signature", ""),
+            "warm_container_policy": _modal_warm_container_policy(),
+        }
     materialization_seconds = _stage_duration(
         stage_events,
         "dataset_local_materialization_start",
@@ -2722,6 +2825,14 @@ def _modal_stage_telemetry_payload(
         "idle_wait_seconds": round(max(0.0, runtime_seconds - known_seconds), 6),
         "runtime_seconds": round(max(0.0, runtime_seconds), 6),
         "gpu_type": gpu_type,
+        "modal_resources": resources,
+        "requested_gpu_type": resources.get("requested_gpu_type", ""),
+        "effective_gpu_type": resources.get("effective_gpu_type", gpu_type),
+        "memory_mb": resources.get("memory_mb", 0),
+        "requested_batch_size": resources.get("requested_batch_size", 0),
+        "effective_batch_size": resources.get("effective_batch_size", 0),
+        "batch_size_policy": resources.get("batch_size_policy", ""),
+        "resource_signature": resources.get("resource_signature", ""),
         "warm_container_policy": _modal_warm_container_policy(),
     }
     return payload
@@ -4698,13 +4809,20 @@ def _post_json(url: str, payload: dict) -> None:
 def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> bool:
     job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
     job_id = str(job.get("id") or "")
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
     orchestrator_url = str(payload.get("orchestrator_url") or "").rstrip("/")
     if not job_id or not orchestrator_url:
         return False
+    message = _modal_training_error_message(exc)
+    modal_resources = modal_resources_from_payload(
+        payload,
+        config,
+        detection_job=_modal_failure_detection_job(config),
+    )
     try:
         _post_json(
             f"{orchestrator_url}/jobs/{job_id}/fail",
-            {"error": _modal_training_error_message(exc), "retryable": True},
+            failure_callback_payload(job, message, modal_resources),
         )
         return True
     except Exception:
@@ -4725,12 +4843,57 @@ def _orchestrator_report_timeout_seconds() -> int:
     )
 
 
-def _post_training_run_summary(orchestrator_url: str, job_id: str, payload: dict) -> None:
+def _post_job_json(
+    orchestrator_url: str,
+    job: dict,
+    endpoint: str,
+    payload: dict,
+    *,
+    modal_resources: dict | None = None,
+) -> None:
+    job_id = str(job.get("id") or "")
+    _post_json(
+        f"{orchestrator_url}/jobs/{job_id}/{endpoint}",
+        {
+            **payload,
+            **callback_identity(job, modal_resources),
+        },
+    )
+
+
+def _post_training_run_summary(
+    orchestrator_url: str,
+    job_id: str,
+    payload: dict,
+    *,
+    job: dict | None = None,
+    modal_resources: dict | None = None,
+) -> None:
+    if isinstance(job, dict):
+        payload = {**payload, **callback_identity(job, modal_resources)}
     _post_json(f"{orchestrator_url}/jobs/{job_id}/training-run-summary", payload)
 
 
-def _post_training_run_evaluation(orchestrator_url: str, job_id: str, payload: dict) -> None:
+def _post_training_run_evaluation(
+    orchestrator_url: str,
+    job_id: str,
+    payload: dict,
+    *,
+    job: dict | None = None,
+    modal_resources: dict | None = None,
+) -> None:
+    if isinstance(job, dict):
+        payload = {**payload, **callback_identity(job, modal_resources)}
     _post_json(f"{orchestrator_url}/jobs/{job_id}/training-run-evaluation", payload)
+
+
+def _modal_failure_detection_job(config: dict) -> bool:
+    model = str(config.get("model", "")).lower()
+    return (
+        str(config.get("task_type", "")).lower() == "object_detection"
+        or str(config.get("model_kind", "")).lower() == "ultralytics_yolo_detector"
+        or model.startswith("yolo")
+    )
 
 
 def _modal_gpu_price_per_second(gpu_type: str) -> float:

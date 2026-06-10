@@ -95,5 +95,14 @@ interface Window {
       dispatcher?: boolean;
       status: string;
     }>;
+    stopProjectWorker(options: {
+      projectId: string;
+    }): Promise<{
+      project_id: string;
+      stopped_count: number;
+      stopped_pids: number[];
+      already_stopped_count: number;
+      status: string;
+    }>;
   };
 }

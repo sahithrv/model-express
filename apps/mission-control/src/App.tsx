@@ -78,7 +78,10 @@ const jobsPerPage = 10;
 const liveRefreshIntervalMs = 10_000;
 
 type MetricKey = string;
-type ProjectTabKey = "overview" | "data" | "experiments" | "agents" | "operations" | "export";
+type ProjectTabKey = "mission" | "activity" | "results" | "export" | "developer";
+type LegacyProjectTabKey = "overview" | "data" | "experiments" | "agents" | "operations";
+type ProjectTabTarget = ProjectTabKey | LegacyProjectTabKey;
+type ActivityFilterKey = "all" | "decisions" | "experiments" | "results" | "blockers";
 
 const classificationMetricPriority = ["macro_f1", "accuracy", "train_loss", "val_loss"];
 const detectionMetricPriority = [
@@ -98,11 +101,9 @@ const detectionMetricAliases: Record<string, string[]> = {
 };
 
 const projectTabs: Array<{ key: ProjectTabKey; label: string }> = [
-	{ key: "overview", label: "Overview" },
-	{ key: "data", label: "Data" },
-	{ key: "experiments", label: "Experiments" },
-	{ key: "agents", label: "Agents" },
-	{ key: "operations", label: "Operations" },
+	{ key: "mission", label: "Mission" },
+	{ key: "activity", label: "Activity" },
+	{ key: "results", label: "Results" },
 	{ key: "export", label: "Export" },
 ];
 
@@ -284,6 +285,28 @@ type ProjectDetail = {
   strategyScorecards: StrategyScorecard[];
 };
 
+type CancelExecutionResponse = {
+  execution_id: string;
+  status: string;
+  message?: string;
+  queued_jobs_cancelled: number;
+  active_jobs_marked_cancelling: number;
+  already_terminal_jobs?: number;
+  modal_calls?: Array<{
+    job_id: string;
+    training_attempt_id?: string;
+    modal_function_call_object_id?: string;
+    cancel_status: string;
+  }>;
+  worker_requirements?: WorkerRequirement[];
+  best_available_model?: {
+    job_id?: string;
+    exportable?: boolean;
+    reason?: string;
+    champion_selection_source?: string;
+  };
+};
+
 type MissionDigestState =
   | "empty"
   | "dataset_needed"
@@ -302,7 +325,7 @@ type MissionHealthItem = {
   label: string;
   value: string;
   tone: MissionTone;
-  targetTab?: ProjectTabKey;
+  targetTab?: ProjectTabTarget;
   targetId?: string;
 };
 
@@ -321,7 +344,7 @@ type MissionNextAction = {
   priority: "primary" | "secondary";
   disabled?: boolean;
   actionKey?: MissionActionKey;
-  targetTab?: ProjectTabKey;
+  targetTab?: ProjectTabTarget;
   targetId?: string;
 };
 
@@ -335,7 +358,7 @@ type MissionLiveActivity = {
     label: string;
     status: "active" | "waiting" | "succeeded" | "failed" | "blocked";
     timestamp?: string;
-    targetTab?: ProjectTabKey;
+    targetTab?: ProjectTabTarget;
     targetId?: string;
   }>;
 };
@@ -346,7 +369,7 @@ type MissionSignal = {
   detail: string;
   tone: MissionTone;
   timestamp?: string;
-  targetTab?: ProjectTabKey;
+  targetTab?: ProjectTabTarget;
   targetId?: string;
 };
 
@@ -375,6 +398,98 @@ type MissionDigest = {
   liveActivity: MissionLiveActivity;
   recentSignals: MissionSignal[];
   champion?: MissionChampionSummary;
+};
+
+type MissionBrief = {
+  id: string;
+  title: string;
+  goal: string;
+  statusLabel: string;
+  progressLabel: string;
+  completedExperiments: number;
+  totalExperiments: number;
+  bestMetricLabel: string;
+  bestMetricValue: string;
+  etaLabel: string;
+  primaryAction: string;
+  blocker: string;
+  updatedAt: string;
+};
+
+type AIThinking = {
+  state: string;
+  observation: string;
+  reasoning: string;
+  decision: string;
+  expectedOutcome: string;
+  confidenceLabel: string;
+  updatedAt: string;
+};
+
+type MissionStage = {
+  id: string;
+  label: string;
+  detail: string;
+  status: "done" | "active" | "waiting" | "blocked";
+  timestamp?: string;
+  evidence?: string;
+};
+
+type ActivityCardType = "mission" | "observation" | "decision" | "experiment" | "result" | "blocker" | "export";
+
+type ActivityCardModel = {
+  id: string;
+  type: ActivityCardType;
+  title: string;
+  summary: string;
+  timestamp: string;
+  status: "active" | "waiting" | "succeeded" | "failed" | "blocked";
+  evidenceSummary: string;
+  resultSummary: string;
+  technicalSource: string;
+  developerPayloadRef: string;
+};
+
+type ResultsCandidate = {
+  rank: number;
+  model: string;
+  metricLabel: string;
+  metricValue: string;
+  status: string;
+  why: string;
+  jobId: string;
+};
+
+type ResultsSummary = {
+  hasResults: boolean;
+  championModel: string;
+  primaryMetricLabel: string;
+  primaryMetricValue: string;
+  improvementLabel: string;
+  exportStatus: string;
+  whyItWon: string;
+  learningSummary: string[];
+  remainingRisks: string[];
+  topCandidates: ResultsCandidate[];
+};
+
+type ExportSummary = {
+  hasChampion: boolean;
+  title: string;
+  statusLabel: string;
+  readinessLabel: string;
+  primaryFormat: string;
+  validationStatus: string;
+  demoStatus: string;
+  includes: string[];
+  useCases: string[];
+  limitations: string[];
+  manifestAvailable: boolean;
+};
+
+type DeveloperDiagnostics = {
+  counts: Array<{ label: string; value: string }>;
+  summary: string;
 };
 
 type VisualAnalysisDetail = {
@@ -895,7 +1010,8 @@ export function App() {
   const [newProjectFolder, setNewProjectFolder] = useState<DatasetFolder | null>(null);
 	const [jobPage, setJobPage] = useState(0);
 	const [selectedMetricKey, setSelectedMetricKey] = useState<MetricKey>("macro_f1");
-	const [activeProjectTab, setActiveProjectTab] = useState<ProjectTabKey>("overview");
+	const [activeProjectTab, setActiveProjectTab] = useState<ProjectTabKey>("mission");
+  const [activityFilter, setActivityFilter] = useState<ActivityFilterKey>("all");
 	const [demoPrediction, setDemoPrediction] = useState<ChampionDemoPrediction | null>(null);
   const [demoPredictionError, setDemoPredictionError] = useState("");
   const [demoPredictionLoading, setDemoPredictionLoading] = useState(false);
@@ -956,6 +1072,23 @@ export function App() {
   }, [selectedMetricKey, selectedMetricOptions]);
 
   const latestPlan = detail.plans[0] ?? null;
+  const stoppablePlan = useMemo(() => {
+    const activePlanIds = new Set<string>();
+    detail.jobs.forEach((job) => {
+      const status = normalizedStatus(job.status);
+      if (!["QUEUED", "ASSIGNED", "RUNNING"].includes(status)) return;
+      const planId = recordString(job.config, "plan_id");
+      if (planId) activePlanIds.add(planId);
+    });
+    detail.workerRequirements.forEach((requirement) => {
+      if (!["PENDING", "STARTING", "ACTIVE"].includes(normalizedStatus(requirement.status))) return;
+      if (requirement.plan_id) activePlanIds.add(requirement.plan_id);
+    });
+    if (latestPlan && activePlanIds.has(latestPlan.id)) {
+      return latestPlan;
+    }
+    return detail.plans.find((plan) => activePlanIds.has(plan.id)) ?? null;
+  }, [detail.jobs, detail.plans, detail.workerRequirements, latestPlan]);
   const latestDecision = detail.decisions[0] ?? null;
   const latestDecisionHasFollowUpPlan = latestDecision
     ? detail.plans.some((plan) => plan.source_decision_id === latestDecision.id)
@@ -1008,6 +1141,34 @@ export function App() {
     [detail.champion, detail.jobs, detail.runEvaluations, detail.runSummaries],
   );
   const championExportDemo = useMemo(() => buildChampionExportDemo(detail), [detail]);
+  const missionBrief = useMemo(
+    () => buildMissionBrief(selectedProject, detail, missionDigest, automationSettings),
+    [automationSettings, detail, missionDigest, selectedProject],
+  );
+  const currentThinking = useMemo(
+    () => buildCurrentThinking(selectedProject, detail, missionDigest),
+    [detail, missionDigest, selectedProject],
+  );
+  const missionStages = useMemo(
+    () => buildMissionStages(selectedProject, detail, missionDigest, championExportDemo),
+    [championExportDemo, detail, missionDigest, selectedProject],
+  );
+  const activityFeed = useMemo(
+    () => buildActivityFeed(selectedProject, detail, visibleActivityEvents, championExportDemo),
+    [championExportDemo, detail, selectedProject, visibleActivityEvents],
+  );
+  const resultsSummary = useMemo(
+    () => buildResultsSummary(detail, championComparison, championExportDemo),
+    [championComparison, championExportDemo, detail],
+  );
+  const exportSummary = useMemo(
+    () => buildExportSummary(detail, championExportDemo),
+    [championExportDemo, detail],
+  );
+  const developerDiagnostics = useMemo(
+    () => buildDeveloperDiagnostics(detail, visibleActivityEvents),
+    [detail, visibleActivityEvents],
+  );
   const championDetectionDefaults = useMemo(() => detectionDefaultsFromChampionExportDemo(championExportDemo), [championExportDemo]);
   const reviewState = automationReviewState(automationSettings);
 
@@ -1427,7 +1588,8 @@ export function App() {
     if (!selectedProjectId) return;
 
     const actionable = workerRequirementsRef.current.filter((requirement) =>
-      requirement.status === "PENDING" || requirement.status === "STARTING" || requirement.status === "ACTIVE",
+      (requirement.status === "PENDING" || requirement.status === "STARTING" || requirement.status === "ACTIVE") &&
+      workerRequirementHasOpenWork(requirement, detail.jobs),
     );
     const now = Date.now();
 
@@ -1477,7 +1639,7 @@ export function App() {
         refreshProjectDetail(selectedProjectId, { includeSlowData: false }).catch(() => undefined);
       }
     }
-  }, [baseUrl, refreshProjectDetail, request, selectedProjectId]);
+  }, [baseUrl, detail.jobs, refreshProjectDetail, request, selectedProjectId]);
 
   useEffect(() => {
     localStorage.setItem("orchestratorUrl", baseUrl);
@@ -1792,17 +1954,19 @@ export function App() {
         1,
         Math.min(plan?.recommended_workers ?? 1, plan?.experiments.length || 1),
       );
+
+      const response = await request<{ jobs: Job[]; worker_requirement?: WorkerRequirement }>(`/plans/${planId}/execute`, {
+        method: "POST",
+        body: { provider: "modal", gpu_type: "T4", max_concurrent_jobs: workerCount },
+      });
+
+      const targetCount = Math.max(1, response.worker_requirement?.target_count ?? workerCount);
       const workerPool = await window.missionControl.ensureProjectWorker({
         projectId: selectedProjectId,
         baseUrl,
         name: `modal-worker-${selectedProjectId}`,
         gpuType: "modal",
-        count: workerCount,
-      });
-
-      const response = await request<{ jobs: Job[] }>(`/plans/${planId}/execute`, {
-        method: "POST",
-        body: { provider: "modal", gpu_type: "T4" },
+        count: targetCount,
       });
 
       await refreshProjectDetail(selectedProjectId, { includeSlowData: false });
@@ -1812,6 +1976,34 @@ export function App() {
       });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function stopActiveRun() {
+    if (!selectedProjectId || !stoppablePlan) return;
+    const confirmed = window.confirm(`Stop active run for ${stoppablePlan.id}? Queued and active work will be cancelled.`);
+    if (!confirmed) return;
+
+    setLoading(true);
+    setNotice(null);
+    try {
+      const response = await request<CancelExecutionResponse>(`/plans/${stoppablePlan.id}/cancel-active-execution`, {
+        method: "POST",
+        body: {
+          reason: "user_requested",
+          promote_best_available: true,
+          terminate_remote_work: true,
+        },
+      });
+      await window.missionControl.stopProjectWorker({ projectId: selectedProjectId }).catch(() => undefined);
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
+      const cancelled = (response.queued_jobs_cancelled ?? 0) + (response.active_jobs_marked_cancelling ?? 0);
+      const best = response.best_available_model?.exportable ? " Best completed model was selected." : "";
+      setNotice({ kind: "info", text: `Stopped run ${stoppablePlan.id}; ${cancelled} job(s) cancelled.${best}` });
+    } catch (error) {
+      setNotice({ kind: "error", text: errorMessage(error) });
     } finally {
       setLoading(false);
     }
@@ -1859,17 +2051,18 @@ export function App() {
 
       const plan = response.follow_up_plan;
       const workerCount = Math.max(1, Math.min(plan.recommended_workers, plan.experiments.length || 1));
+      const execution = await request<{ jobs: Job[]; worker_requirement?: WorkerRequirement }>(`/plans/${plan.id}/execute`, {
+        method: "POST",
+        body: { provider: "modal", gpu_type: "T4", max_concurrent_jobs: workerCount },
+      });
+
+      const targetCount = Math.max(1, execution.worker_requirement?.target_count ?? workerCount);
       const workerPool = await window.missionControl.ensureProjectWorker({
         projectId: selectedProjectId,
         baseUrl,
         name: `modal-worker-${selectedProjectId}`,
         gpuType: "modal",
-        count: workerCount,
-      });
-
-      const execution = await request<{ jobs: Job[] }>(`/plans/${plan.id}/execute`, {
-        method: "POST",
-        body: { provider: "modal", gpu_type: "T4" },
+        count: targetCount,
       });
 
       await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
@@ -2143,8 +2336,8 @@ export function App() {
     }
   }
 
-  function openProjectTab(tab: ProjectTabKey, targetId?: string) {
-    setActiveProjectTab(tab);
+  function openProjectTab(tab: ProjectTabTarget, targetId?: string) {
+    setActiveProjectTab(projectTabFromTarget(tab));
     if (!targetId) return;
     window.requestAnimationFrame(() => {
       document.getElementById(targetId)?.scrollIntoView({ block: "start" });
@@ -2205,24 +2398,24 @@ export function App() {
           </span>
           <span>
             <strong>Model Express</strong>
-            <small>Agentic vision training control plane</small>
+            <small>Autonomous ML engineer</small>
           </span>
         </div>
         <div className="chrome-right">
-          <span>{health?.status === "ok" ? "Orchestrator online" : "Orchestrator offline"}</span>
+          <span>{health?.status === "ok" ? "AI engine ready" : "AI engine offline"}</span>
         </div>
       </header>
 
       <aside className="sidebar">
         <label className="field compact">
-          <span>Orchestrator</span>
+          <span>Engine URL</span>
           <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
         </label>
 
         <div className="sidebar-actions">
           <button className="command primary" onClick={() => setNewProjectOpen(true)} disabled={loading}>
             <Plus size={16} />
-            New Project
+            New Mission
           </button>
           <button className="icon-command" onClick={refreshAll} disabled={loading} title="Refresh now">
             <RefreshCcw size={16} />
@@ -2232,7 +2425,7 @@ export function App() {
         <section className="nav-section">
           <div className="section-title">
             <Database size={15} />
-            Projects
+            Missions
           </div>
           <div className="project-list">
             {projects.map((project) => (
@@ -2242,7 +2435,7 @@ export function App() {
                 onClick={() => setSelectedProjectId(project.id)}
               >
                 <span>{project.name}</span>
-                <small>{project.id}</small>
+                <small>{project.goal || missionStateLabelFromProject(project)}</small>
               </button>
             ))}
           </div>
@@ -2252,12 +2445,27 @@ export function App() {
 			<section className="workspace" data-active-tab={activeProjectTab}>
         <header className="topbar">
           <div>
-            <div className="eyebrow">Control Plane</div>
-            <h2>{selectedProject ? selectedProject.name : "No Project Selected"}</h2>
+            <div className="eyebrow">{activeProjectTab === "developer" ? "Developer View" : "Mission"}</div>
+            <h2>{selectedProject ? selectedProject.name : "No Mission Selected"}</h2>
           </div>
-          <div className={health?.status === "ok" ? "status ok" : "status bad"}>
-            <Server size={16} />
-            {health?.status ?? "offline"}
+          <div className="topbar-actions">
+            {stoppablePlan && (
+              <button className="command compact danger" type="button" onClick={stopActiveRun} disabled={loading}>
+                <X size={15} />
+                Stop Run
+              </button>
+            )}
+            <button
+              className="command compact"
+              type="button"
+              onClick={() => setActiveProjectTab(activeProjectTab === "developer" ? "mission" : "developer")}
+            >
+              {activeProjectTab === "developer" ? "Back to Mission" : "Developer View"}
+            </button>
+            <div className={health?.status === "ok" ? "status ok" : "status bad"}>
+              <Server size={16} />
+              {health?.status === "ok" ? "ready" : "offline"}
+            </div>
           </div>
         </header>
 
@@ -2278,12 +2486,95 @@ export function App() {
 					))}
 				</nav>
 
-				<section className="mission-overview-shell" id="overview" data-project-tab="overview">
-          <MissionOverview digest={missionDigest} onAction={handleMissionAction} onOpenTab={openProjectTab} />
+				<section className="mission-route" id="mission" data-project-tab="mission">
+          <MissionRoute
+            brief={missionBrief}
+            thinking={currentThinking}
+            stages={missionStages}
+            activity={activityFeed}
+            results={resultsSummary}
+            exportSummary={exportSummary}
+            actions={missionDigest.nextActions}
+            onAction={handleMissionAction}
+            onOpenTab={openProjectTab}
+          />
         </section>
 
-				<section className="content-grid mission-grid">
-					<Panel title="Dataset Intelligence" icon={<BarChart3 size={17} />} wide id="data" tab="data">
+        <section className="activity-route" id="activity" data-project-tab="activity">
+          <ActivityRoute
+            cards={activityFeed}
+            filter={activityFilter}
+            onFilterChange={setActivityFilter}
+            onOpenDeveloper={() => openProjectTab("developer", "developer-raw-events")}
+          />
+        </section>
+
+        <section className="results-route" id="results" data-project-tab="results">
+          <ResultsRoute
+            summary={resultsSummary}
+            onSelectCandidate={setSelectedJobId}
+            onOpenExport={() => openProjectTab("export", "export-package")}
+            onOpenDeveloper={() => openProjectTab("developer", "champion-comparison")}
+          />
+        </section>
+
+        <section className="export-route" id="export" data-project-tab="export">
+          <ExportRoute
+            summary={exportSummary}
+            data={championExportDemo}
+            prediction={demoPrediction}
+            predictionError={demoPredictionError}
+            predictionLoading={demoPredictionLoading}
+            selectedImageIndex={selectedDemoImageIndex}
+            customImage={customDemoImage}
+            customImageURI={customDemoImageURI}
+            customTrueLabel={customDemoTrueLabel}
+            localInferenceStatus={localInferenceStatus}
+            localInferenceError={localInferenceError}
+            slideshowEnabled={demoSlideshowEnabled}
+            slideshowIntervalMs={demoSlideshowIntervalMs}
+            detectionConfidenceThreshold={detectionConfidenceThreshold}
+            detectionIouThreshold={detectionIouThreshold}
+            onCustomImageURIChange={setCustomDemoImageURI}
+            onCustomTrueLabelChange={setCustomDemoTrueLabel}
+            onChooseCustomImage={chooseChampionDemoImage}
+            onRunCustomPrediction={runCustomChampionDemoPrediction}
+            onToggleSlideshow={() => setDemoSlideshowEnabled((enabled) => !enabled)}
+            onSelectImage={(index) => {
+              setSelectedDemoImageIndex(index);
+              setCustomDemoImage(null);
+              setCustomDemoImageURI("");
+              setCustomDemoTrueLabel("");
+              setDemoSlideshowEnabled(false);
+            }}
+            onNextImage={() => {
+              setCustomDemoImage(null);
+              setCustomDemoImageURI("");
+              setCustomDemoTrueLabel("");
+              setSelectedDemoImageIndex((index) => nextDemoImageIndex(index, championExportDemo.demoImages.length));
+            }}
+            onRandomImage={() => {
+              setCustomDemoImage(null);
+              setCustomDemoImageURI("");
+              setCustomDemoTrueLabel("");
+              setSelectedDemoImageIndex((index) => randomDemoImageIndex(index, championExportDemo.demoImages.length));
+            }}
+            onRequestExport={() => requestChampionExport("onnx")}
+            onRunPrediction={runChampionDemoPrediction}
+            onOpenFeedback={openChampionFeedback}
+            onSlideshowIntervalChange={setDemoSlideshowIntervalMs}
+            onDetectionConfidenceThresholdChange={setDetectionConfidenceThreshold}
+            onDetectionIouThresholdChange={setDetectionIouThreshold}
+            onOpenDeveloper={() => openProjectTab("developer", "export-demo")}
+          />
+        </section>
+
+        <section className="developer-route" id="developer" data-project-tab="developer">
+          <DeveloperRoute diagnostics={developerDiagnostics} onBack={() => setActiveProjectTab("mission")} />
+        </section>
+
+				<section className="content-grid developer-grid">
+					<Panel title="Dataset Intelligence" icon={<BarChart3 size={17} />} wide id="data" tab="developer">
             {datasetIntelligence.dataset ? (
               <div className="dataset-intelligence">
                 <div className="insight-grid">
@@ -2421,7 +2712,7 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Visual Dataset Analysis" icon={<Eye size={17} />} wide tab="data">
+					<Panel title="Visual Dataset Analysis" icon={<Eye size={17} />} wide tab="developer">
             <VisualAnalysisPanel
               dataset={detail.datasets[0] ?? null}
               jobs={detail.jobs}
@@ -2433,7 +2724,7 @@ export function App() {
         </section>
 
         <section className="content-grid">
-					<Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide id="experiment-timeline" tab="operations">
+					<Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide id="experiment-timeline" tab="developer">
             <div className="timeline">
               {timelineItems.map((item) => (
                 <div className={`timeline-item ${item.status}`} key={item.label}>
@@ -2449,7 +2740,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide id="operations" tab="operations">
+					<Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide id="operations" tab="developer">
             <div className="settings-panel">
               <div className="settings-grid">
                 <label className="toggle-row">
@@ -2620,7 +2911,7 @@ export function App() {
           </Panel>
 
           {detail.champion && (
-						<Panel title="Champion Details" icon={<Trophy size={17} />} wide id="champion-detail" tab="export">
+						<Panel title="Champion Details" icon={<Trophy size={17} />} wide id="champion-detail" tab="developer">
               <div className="champion-panel">
                 <div className="champion-head">
                   <span>
@@ -2675,7 +2966,7 @@ export function App() {
             </Panel>
           )}
 
-					<Panel title="Champion Export / Demo" icon={<Trophy size={17} />} wide id="export-demo" tab="export">
+					<Panel title="Champion Export / Demo" icon={<Trophy size={17} />} wide id="export-demo" tab="developer">
             <ChampionExportDemoPanel
               data={championExportDemo}
               prediction={demoPrediction}
@@ -2724,7 +3015,7 @@ export function App() {
             />
           </Panel>
 
-					<Panel title="Training Run Summary" icon={<Trophy size={17} />} wide id="runs" tab="experiments">
+					<Panel title="Training Run Summary" icon={<Trophy size={17} />} wide id="runs" tab="developer">
             <div className="run-summary">
               <div className="run-overview">
                 <div>
@@ -2785,7 +3076,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Champion Comparison" icon={<Trophy size={17} />} wide id="champion-comparison" tab="experiments">
+					<Panel title="Champion Comparison" icon={<Trophy size={17} />} wide id="champion-comparison" tab="developer">
             {championComparison.length > 0 ? (
               <div className="comparison-table">
                 <div className="comparison-row comparison-head">
@@ -2827,11 +3118,11 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Live Agent Activity" icon={<Activity size={17} />} wide id="agent-activity" tab="agents">
+					<Panel title="Live Agent Activity" icon={<Activity size={17} />} wide id="agent-activity" tab="developer">
             <AgentActivityPanel events={visibleActivityEvents} streamState={activityStreamState} detail={detail} />
           </Panel>
 
-					<Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agent-decisions" tab="agents">
+					<Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agent-decisions" tab="developer">
             <div className="decision-panel">
               <div className="decision-actions">
                 <div>
@@ -2860,15 +3151,15 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Decision Quality" icon={<BarChart3 size={17} />} wide tab="agents">
+					<Panel title="Decision Quality" icon={<BarChart3 size={17} />} wide tab="developer">
             <DecisionQualityPanel decisions={detail.decisions} invocations={detail.agentInvocations} />
           </Panel>
 
-					<Panel title="Mission Control Telemetry" icon={<Activity size={17} />} wide tab="agents">
+					<Panel title="Mission Control Telemetry" icon={<Activity size={17} />} wide tab="developer">
             <MissionControlTelemetryPanel telemetry={detail.telemetry} fallbackInvocations={detail.agentInvocations} />
           </Panel>
 
-					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide id="automation-timeline" tab="operations">
+					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide id="automation-timeline" tab="developer">
             <div className="automation-grid">
               <div className="automation-block">
                 <strong>Worker Requirements</strong>
@@ -2913,15 +3204,15 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Agent Invocation Audit" icon={<SquareTerminal size={17} />} wide tab="agents">
+					<Panel title="Agent Invocation Audit" icon={<SquareTerminal size={17} />} wide tab="developer">
             <AgentInvocationAuditPanel invocations={detail.agentInvocations} decisions={detail.decisions} />
           </Panel>
 
-					<Panel title="Memory Retrieval Probe" icon={<BrainCircuit size={17} />} wide id="memory-retrieval-probe" tab="agents">
+					<Panel title="Memory Retrieval Probe" icon={<BrainCircuit size={17} />} wide id="memory-retrieval-probe" tab="developer">
             <MemoryRetrievalProbePanel snapshots={memoryRetrievalProbe} />
           </Panel>
 
-					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide id="agent-memory" tab="agents">
+					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide id="agent-memory" tab="developer">
             {detail.agentMemory.length > 0 ? (
               <div className="memory-list">
                 {detail.agentMemory.map((record) => (
@@ -2947,7 +3238,7 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide id="plans" tab="experiments">
+					<Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide id="plans" tab="developer">
             {latestPlan ? (
               <div className="plan-card">
                 <div className="plan-actions">
@@ -2959,6 +3250,12 @@ export function App() {
                     <Play size={16} />
                     Execute Plan
                   </button>
+                  {stoppablePlan?.id === latestPlan.id && (
+                    <button className="command danger" type="button" onClick={stopActiveRun} disabled={loading}>
+                      <X size={16} />
+                      Stop Run
+                    </button>
+                  )}
                 </div>
                 <div className="plan-overview">
                   <div>
@@ -3074,7 +3371,7 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Manual Job Queue" icon={<Play size={17} />} wide id="manual-job-queue" tab="operations">
+					<Panel title="Manual Job Queue" icon={<Play size={17} />} wide id="manual-job-queue" tab="developer">
             <form
               className="job-create-grid"
               onSubmit={(event) => {
@@ -3101,7 +3398,7 @@ export function App() {
             </form>
           </Panel>
 
-					<Panel title="Workers" icon={<MonitorDot size={17} />} wide id="workers" tab="operations">
+					<Panel title="Workers" icon={<MonitorDot size={17} />} wide id="workers" tab="developer">
             <div className="table">
               <div className="table-row table-head">
                 <span>Name</span>
@@ -3123,7 +3420,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Datasets" icon={<Database size={17} />} wide tab="data">
+					<Panel title="Datasets" icon={<Database size={17} />} wide tab="developer">
             <div className="table">
               <div className="table-row table-head">
                 <span>Name</span>
@@ -3145,7 +3442,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide id="recent-jobs" tab="experiments">
+					<Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide id="recent-jobs" tab="developer">
             <div className="job-panel-head">
               <span>
                 Showing {visibleJobs.length} of {detail.jobs.length}
@@ -3191,7 +3488,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Run Metrics" icon={<Activity size={17} />} wide id="run-metrics" tab="experiments">
+					<Panel title="Run Metrics" icon={<Activity size={17} />} wide id="run-metrics" tab="developer">
             {selectedJob ? (
               <div className="metric-area">
                 <div className="selected-job">
@@ -3348,6 +3645,575 @@ function Panel({
   );
 }
 
+function MissionRoute({
+  brief,
+  thinking,
+  stages,
+  activity,
+  results,
+  exportSummary,
+  actions,
+  onAction,
+  onOpenTab,
+}: {
+  brief: MissionBrief;
+  thinking: AIThinking;
+  stages: MissionStage[];
+  activity: ActivityCardModel[];
+  results: ResultsSummary;
+  exportSummary: ExportSummary;
+  actions: MissionNextAction[];
+  onAction: (action: MissionNextAction) => void;
+  onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
+}) {
+  const primaryAction = actions.find((action) => action.priority === "primary") ?? actions[0];
+  const latestActivity = activity[0] ?? null;
+
+  return (
+    <div className="mission-workspace">
+      <section className="mission-card">
+        <div className="mission-card-head">
+          <div>
+            <div className="eyebrow">Mission</div>
+            <h3>{brief.title}</h3>
+            <p>{brief.goal}</p>
+          </div>
+          <Badge value={brief.statusLabel} />
+        </div>
+        <div className="mission-card-metrics">
+          <span>
+            <small>Progress</small>
+            <strong>{brief.progressLabel}</strong>
+          </span>
+          <span>
+            <small>{brief.bestMetricLabel}</small>
+            <strong>{brief.bestMetricValue}</strong>
+          </span>
+          <span>
+            <small>ETA</small>
+            <strong>{brief.etaLabel}</strong>
+          </span>
+        </div>
+        {brief.blocker && (
+          <div className="mission-blocker">
+            <AlertTriangle size={15} />
+            <span>{brief.blocker}</span>
+          </div>
+        )}
+      </section>
+
+      <section className="ai-thinking-card">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">What the AI is doing</div>
+            <strong>{thinking.state}</strong>
+          </div>
+          <small>{thinking.updatedAt ? formatRelativeTime(thinking.updatedAt) : thinking.confidenceLabel}</small>
+        </div>
+        <div className="thinking-grid">
+          <ThinkingRow label="Observation" value={thinking.observation} />
+          <ThinkingRow label="Reasoning" value={thinking.reasoning} />
+          <ThinkingRow label="Decision" value={thinking.decision} />
+          <ThinkingRow label="Expected outcome" value={thinking.expectedOutcome} />
+        </div>
+      </section>
+
+      <section className="mission-stage-panel">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">Progress stage</div>
+            <strong>{brief.progressLabel}</strong>
+          </div>
+          <button className="mission-link-button" type="button" onClick={() => onOpenTab("activity", "activity")}>
+            Open journal
+          </button>
+        </div>
+        <MissionStageTimeline stages={stages} />
+      </section>
+
+      <aside className="mission-inspector">
+        <section className="result-snapshot-card">
+          <div className="mission-section-head">
+            <div>
+              <div className="eyebrow">Best result</div>
+              <strong>{results.championModel}</strong>
+            </div>
+            <Badge value={exportSummary.statusLabel} />
+          </div>
+          <div className="champion-outcome-primary">
+            <small>{results.primaryMetricLabel}</small>
+            <strong>{results.primaryMetricValue}</strong>
+          </div>
+          <p>{results.whyItWon}</p>
+          <button className="command compact" type="button" onClick={() => onOpenTab("results", "results")}>
+            View results
+          </button>
+        </section>
+
+        <section className="next-action-card">
+          <div className="eyebrow">Next action</div>
+          {primaryAction ? (
+            <button
+              className="mission-primary-action"
+              type="button"
+              onClick={() => onAction(primaryAction)}
+              disabled={primaryAction.disabled}
+            >
+              <span>
+                <strong>{userFacingActionLabel(primaryAction.label)}</strong>
+                <small>{userFacingActivityText(primaryAction.reason, 140)}</small>
+              </span>
+              <StepForward size={17} />
+            </button>
+          ) : (
+            <div className="empty compact">No action is needed right now.</div>
+          )}
+        </section>
+
+        <section className="activity-snapshot-card">
+          <div className="eyebrow">Latest update</div>
+          {latestActivity ? (
+            <button className="mission-signal info" type="button" onClick={() => onOpenTab("activity", "activity")}>
+              <span>
+                <strong>{latestActivity.title}</strong>
+                <small>{latestActivity.summary}</small>
+              </span>
+              <small>{formatRelativeTime(latestActivity.timestamp)}</small>
+            </button>
+          ) : (
+            <div className="empty compact">The work journal will fill in as the mission starts.</div>
+          )}
+        </section>
+      </aside>
+    </div>
+  );
+}
+
+function ThinkingRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="thinking-row">
+      <small>{label}</small>
+      <p>{value}</p>
+    </div>
+  );
+}
+
+function MissionStageTimeline({ stages }: { stages: MissionStage[] }) {
+  return (
+    <div className="mission-stage-timeline">
+      {stages.map((stage) => (
+        <div className={`mission-stage ${stage.status}`} key={stage.id}>
+          <span className="timeline-dot" />
+          <div>
+            <strong>{stage.label}</strong>
+            <small>{stage.detail}</small>
+          </div>
+          <Badge value={stage.status} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ActivityRoute({
+  cards,
+  filter,
+  onFilterChange,
+  onOpenDeveloper,
+}: {
+  cards: ActivityCardModel[];
+  filter: ActivityFilterKey;
+  onFilterChange: (filter: ActivityFilterKey) => void;
+  onOpenDeveloper: () => void;
+}) {
+  const filters: Array<{ key: ActivityFilterKey; label: string }> = [
+    { key: "all", label: "All" },
+    { key: "decisions", label: "Decisions" },
+    { key: "experiments", label: "Experiments" },
+    { key: "results", label: "Results" },
+    { key: "blockers", label: "Blockers" },
+  ];
+  const visibleCards = cards.filter((card) => activityCardMatchesFilter(card, filter));
+
+  return (
+    <div className="activity-journal">
+      <header className="route-heading">
+        <div>
+          <div className="eyebrow">AI work journal</div>
+          <h3>Activity</h3>
+          <p>Readable updates from the mission, summarized from project events, decisions, experiments, and results.</p>
+        </div>
+        <button className="command compact" type="button" onClick={onOpenDeveloper}>
+          Developer View
+        </button>
+      </header>
+      <div className="activity-filter-bar" role="tablist" aria-label="Activity filters">
+        {filters.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            className={filter === item.key ? "active" : ""}
+            onClick={() => onFilterChange(item.key)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      <div className="activity-card-list">
+        {visibleCards.length > 0 ? (
+          visibleCards.map((card) => <ActivityCard key={card.id} card={card} onOpenDeveloper={onOpenDeveloper} />)
+        ) : (
+          <div className="empty">No journal entries match this filter yet.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ActivityCard({ card, onOpenDeveloper }: { card: ActivityCardModel; onOpenDeveloper: () => void }) {
+  return (
+    <article className={`activity-card ${card.type} ${card.status}`}>
+      <div className="activity-card-icon">
+        {card.type === "decision" ? <BrainCircuit size={16} /> : card.type === "result" ? <Trophy size={16} /> : <Activity size={16} />}
+      </div>
+      <div className="activity-card-body">
+        <header>
+          <span>
+            <small>{new Date(card.timestamp).toLocaleTimeString()}</small>
+            <strong>{card.title}</strong>
+          </span>
+          <Badge value={card.status} />
+        </header>
+        <p>{card.summary}</p>
+        {(card.evidenceSummary || card.resultSummary) && (
+          <div className="activity-card-facts">
+            {card.evidenceSummary && (
+              <span>
+                <small>Evidence</small>
+                <strong>{card.evidenceSummary}</strong>
+              </span>
+            )}
+            {card.resultSummary && (
+              <span>
+                <small>Result</small>
+                <strong>{card.resultSummary}</strong>
+              </span>
+            )}
+          </div>
+        )}
+        <details className="activity-details">
+          <summary>Technical details</summary>
+          <div className="activity-metadata">
+            <span>
+              <small>Source</small>
+              <strong>{card.technicalSource}</strong>
+            </span>
+            <span>
+              <small>Raw payload</small>
+              <strong>Available in Developer View</strong>
+            </span>
+          </div>
+          <button className="mission-link-button" type="button" onClick={onOpenDeveloper}>
+            Open Developer View
+          </button>
+        </details>
+      </div>
+    </article>
+  );
+}
+
+function ResultsRoute({
+  summary,
+  onSelectCandidate,
+  onOpenExport,
+  onOpenDeveloper,
+}: {
+  summary: ResultsSummary;
+  onSelectCandidate: (jobId: string) => void;
+  onOpenExport: () => void;
+  onOpenDeveloper: () => void;
+}) {
+  return (
+    <div className="results-page">
+      <section className="results-hero">
+        <div>
+          <div className="eyebrow">Current champion</div>
+          <h3>{summary.championModel}</h3>
+          <p>{summary.whyItWon}</p>
+        </div>
+        <div className="results-primary-metric">
+          <small>{summary.primaryMetricLabel}</small>
+          <strong>{summary.primaryMetricValue}</strong>
+          <span>{summary.improvementLabel}</span>
+        </div>
+      </section>
+
+      <section className="results-grid">
+        <div className="results-section">
+          <div className="mission-section-head">
+            <div>
+              <div className="eyebrow">Why it won</div>
+              <strong>Champion explanation</strong>
+            </div>
+            <Badge value={summary.exportStatus} />
+          </div>
+          <p>{summary.whyItWon}</p>
+          <button className="command compact" type="button" onClick={onOpenExport}>
+            Open export
+          </button>
+        </div>
+
+        <div className="results-section">
+          <div className="eyebrow">Learning summary</div>
+          <div className="result-list">
+            {summary.learningSummary.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
+          </div>
+        </div>
+
+        <div className="results-section">
+          <div className="eyebrow">Remaining risks</div>
+          <div className="result-list warning">
+            {summary.remainingRisks.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section className="candidate-section">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">Top candidates</div>
+            <strong>Best three by mission fit</strong>
+          </div>
+          <button className="command compact" type="button" onClick={onOpenDeveloper}>
+            Full comparison
+          </button>
+        </div>
+        <div className="candidate-list">
+          {summary.topCandidates.length > 0 ? (
+            summary.topCandidates.map((candidate) => (
+              <button
+                className="candidate-card"
+                key={`${candidate.rank}-${candidate.jobId || candidate.model}`}
+                type="button"
+                onClick={() => candidate.jobId && onSelectCandidate(candidate.jobId)}
+              >
+                <span>
+                  <small>#{candidate.rank}</small>
+                  <strong>{candidate.model}</strong>
+                  <p>{candidate.why}</p>
+                </span>
+                <span>
+                  <small>{candidate.metricLabel}</small>
+                  <strong>{candidate.metricValue}</strong>
+                  <Badge value={candidate.status} />
+                </span>
+              </button>
+            ))
+          ) : (
+            <div className="empty">Results will appear after experiments report metrics.</div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ExportRoute({
+  summary,
+  data,
+  prediction,
+  predictionError,
+  predictionLoading,
+  selectedImageIndex,
+  onNextImage,
+  onRandomImage,
+  onRequestExport,
+  onRunPrediction,
+  onOpenDeveloper,
+}: {
+  summary: ExportSummary;
+  data: ChampionExportDemo;
+  prediction: ChampionDemoPrediction | null;
+  predictionError: string;
+  predictionLoading: boolean;
+  selectedImageIndex: number;
+  customImage: ChampionDemoImage | null;
+  customImageURI: string;
+  customTrueLabel: string;
+  localInferenceStatus: string;
+  localInferenceError: string;
+  slideshowEnabled: boolean;
+  slideshowIntervalMs: number;
+  detectionConfidenceThreshold: number;
+  detectionIouThreshold: number;
+  onCustomImageURIChange: (value: string) => void;
+  onCustomTrueLabelChange: (value: string) => void;
+  onChooseCustomImage: () => void;
+  onRunCustomPrediction: () => void;
+  onToggleSlideshow: () => void;
+  onSelectImage: (index: number) => void;
+  onNextImage: () => void;
+  onRandomImage: () => void;
+  onRequestExport: () => void;
+  onRunPrediction: (image: ChampionDemoImage) => void;
+  onOpenFeedback: (rating: ChampionFeedbackRating) => void;
+  onSlideshowIntervalChange: (value: number) => void;
+  onDetectionConfidenceThresholdChange: (value: number) => void;
+  onDetectionIouThresholdChange: (value: number) => void;
+  onOpenDeveloper: () => void;
+}) {
+  const selectedImage = data.demoImages[selectedImageIndex] ?? data.demoImages[0] ?? null;
+  const previewURI = demoImagePreviewURI(selectedImage);
+  const predictionStatus = prediction ? normalizedStatus(prediction.status || "PENDING") : "";
+  const confidence = prediction ? numericValue(prediction.confidence) : 0;
+
+  return (
+    <div className="export-page" id="export-package">
+      <section className="export-package-card">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">Export package</div>
+            <h3>{summary.title}</h3>
+            <p>{summary.readinessLabel}</p>
+          </div>
+          <Badge value={summary.statusLabel} />
+        </div>
+        <div className="export-summary-grid">
+          <span>
+            <small>Format</small>
+            <strong>{summary.primaryFormat}</strong>
+          </span>
+          <span>
+            <small>Validation</small>
+            <strong>{summary.validationStatus}</strong>
+          </span>
+          <span>
+            <small>Demo</small>
+            <strong>{summary.demoStatus}</strong>
+          </span>
+        </div>
+        <div className="export-actions">
+          <button className="command primary" type="button" onClick={onRequestExport} disabled={!summary.hasChampion}>
+            <HardDriveUpload size={16} />
+            Prepare ONNX
+          </button>
+          <button className="command" type="button" onClick={onOpenDeveloper}>
+            Open technical manifest
+          </button>
+        </div>
+      </section>
+
+      <section className="handoff-grid">
+        <div className="handoff-section">
+          <div className="eyebrow">Includes</div>
+          <div className="result-list">
+            {summary.includes.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
+          </div>
+        </div>
+        <div className="handoff-section">
+          <div className="eyebrow">Use this when</div>
+          <div className="result-list">
+            {summary.useCases.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
+          </div>
+        </div>
+        <div className="handoff-section">
+          <div className="eyebrow">Known limitations</div>
+          <div className="result-list warning">
+            {summary.limitations.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section className="export-demo-simple">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">Demo image</div>
+            <strong>{demoImageLabel(selectedImage) || "Held-out image"}</strong>
+          </div>
+          <span>
+            <button className="icon-command" type="button" onClick={onRandomImage} disabled={data.demoImages.length < 2} title="Random held-out image">
+              <Shuffle size={14} />
+            </button>
+            <button className="icon-command" type="button" onClick={onNextImage} disabled={data.demoImages.length < 2} title="Next held-out image">
+              <StepForward size={14} />
+            </button>
+            <button
+              className="command compact"
+              type="button"
+              onClick={() => selectedImage && onRunPrediction(selectedImage)}
+              disabled={!selectedImage || predictionLoading}
+            >
+              <Play size={15} />
+              Run demo
+            </button>
+          </span>
+        </div>
+        <div className="demo-simple-grid">
+          <div className="test-image-frame">
+            {previewURI ? <img src={previewURI} alt={demoImageLabel(selectedImage) || "demo image"} /> : <div className="test-image-placeholder">No image</div>}
+            {prediction && detectionBoxesFromPrediction(prediction).length > 0 && <DetectionOverlay detections={detectionBoxesFromPrediction(prediction)} />}
+          </div>
+          <div className="demo-result-summary">
+            {predictionLoading && <Badge value="RUNNING" />}
+            {predictionError && <div className="mission-blocker"><AlertTriangle size={15} /><span>{userFacingActivityText(predictionError, 140)}</span></div>}
+            {prediction ? (
+              <>
+                <span>
+                  <small>Prediction</small>
+                  <strong>{prediction.predicted_label || predictionStatusMessage(predictionStatus)}</strong>
+                </span>
+                <span>
+                  <small>Confidence</small>
+                  <strong>{confidence ? formatTopKScore(confidence) : "-"}</strong>
+                </span>
+                <span>
+                  <small>Latency</small>
+                  <strong>{typeof prediction.latency_ms === "number" ? formatLatency(prediction.latency_ms) : "-"}</strong>
+                </span>
+              </>
+            ) : (
+              <div className="empty compact">Run a demo image after the package is ready.</div>
+            )}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DeveloperRoute({ diagnostics, onBack }: { diagnostics: DeveloperDiagnostics; onBack: () => void }) {
+  return (
+    <section className="developer-intro" id="developer-raw-events">
+      <div>
+        <div className="eyebrow">Developer View</div>
+        <h3>Technical audit trail</h3>
+        <p>{diagnostics.summary}</p>
+      </div>
+      <div className="developer-counts">
+        {diagnostics.counts.map((item) => (
+          <span key={item.label}>
+            <small>{item.label}</small>
+            <strong>{item.value}</strong>
+          </span>
+        ))}
+      </div>
+      <button className="command primary compact" type="button" onClick={onBack}>
+        Back to Mission
+      </button>
+    </section>
+  );
+}
+
 function MissionOverview({
   digest,
   onAction,
@@ -3355,7 +4221,7 @@ function MissionOverview({
 }: {
   digest: MissionDigest;
   onAction: (action: MissionNextAction) => void;
-  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+  onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
 }) {
   return (
     <div className={`mission-overview mission-state-${digest.state}`}>
@@ -3400,7 +4266,7 @@ function MissionHealthStrip({
   onOpenTab,
 }: {
   items: MissionHealthItem[];
-  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+  onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
 }) {
   return (
     <section className="mission-health-strip" aria-label="Mission health">
@@ -3478,7 +4344,7 @@ function LiveAgentActivity({
   onOpenTab,
 }: {
   activity: MissionLiveActivity;
-  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+  onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
 }) {
   const moving = ["active", "waiting"].includes(activity.status) || ["connecting", "reconnecting", "fallback"].includes(activity.streamState);
 
@@ -3520,7 +4386,7 @@ function MissionSignals({
   onOpenTab,
 }: {
   signals: MissionSignal[];
-  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+  onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
 }) {
   return (
     <section className="mission-signals">
@@ -3559,7 +4425,7 @@ function ChampionOutcomeSummary({
   onOpenTab,
 }: {
   champion: MissionChampionSummary;
-  onOpenTab: (tab: ProjectTabKey, targetId?: string) => void;
+  onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
 }) {
   const extraFacts = [
     { label: champion.secondaryMetricLabel, value: champion.secondaryMetricValue },
@@ -5527,12 +6393,689 @@ function workerRequirementMaterializationSummary(requirement: WorkerRequirement)
   return parts.join(" / ");
 }
 
+function workerRequirementHasOpenWork(requirement: WorkerRequirement, jobs: Job[]) {
+  return jobs.some((job) => {
+    const status = normalizedStatus(job.status);
+    if (!["QUEUED", "ASSIGNED", "RUNNING"].includes(status)) return false;
+    const planId = recordString(job.config, "plan_id");
+    if (requirement.plan_id && planId !== requirement.plan_id) return false;
+    const provider = recordString(job.config, "provider");
+    if (requirement.provider && provider && provider !== requirement.provider) return false;
+    return true;
+  });
+}
+
 function shortCacheKey(value: string) {
   const text = String(value || "").trim();
   if (text.length <= 18) return text;
   const [prefix, rest] = text.split("-", 2);
   if (prefix && rest) return `${prefix}-${rest.slice(0, 8)}`;
   return text.slice(0, 12);
+}
+
+function projectTabFromTarget(tab: ProjectTabTarget): ProjectTabKey {
+  if (tab === "overview") return "mission";
+  if (tab === "agents") return "activity";
+  if (tab === "experiments") return "results";
+  if (tab === "data" || tab === "operations") return "developer";
+  return tab;
+}
+
+function missionStateLabelFromProject(project: Project) {
+  const status = normalizedStatus(project.status || "");
+  if (status === "COMPLETED") return "Completed";
+  if (status === "FAILED" || status === "BLOCKED") return "Needs input";
+  if (status === "RUNNING" || status === "ACTIVE") return "In progress";
+  return "Ready";
+}
+
+function buildMissionBrief(
+  project: Project | null,
+  detail: ProjectDetail,
+  digest: MissionDigest,
+  automationSettings: AutomationSettings,
+): MissionBrief {
+  const counts = jobStatusCounts(detail.jobs);
+  const completedExperiments = counts.SUCCEEDED + counts.FAILED;
+  const latestPlan = detail.plans[0] ?? null;
+  const plannedExperiments = latestPlan?.experiments.length ?? 0;
+  const totalExperiments = Math.max(detail.jobs.length, plannedExperiments, completedExperiments);
+  const runTotals = summarizeTrainingRuns(detail.runSummaries, detail.runEvaluations, detail.jobs);
+  const championSummary = detail.champion ? buildMissionChampionSummary(detail) : undefined;
+  const bestMetricLabel = championSummary?.primaryMetricLabel || runTotals.bestPrimaryMetricLabel || "Best result";
+  const bestMetricValue =
+    championSummary?.primaryMetricValue ||
+    (runTotals.bestPrimaryMetricValue > 0 ? formatMaybeMetric(runTotals.bestPrimaryMetricValue) : "Pending");
+  const activeOrQueued = counts.QUEUED + counts.ASSIGNED + counts.RUNNING;
+  const etaLabel =
+    activeOrQueued > 0 && latestPlan?.estimated_minutes
+      ? `${latestPlan.estimated_minutes} min estimate`
+      : detail.champion
+        ? "Export handoff ready"
+        : automationSettings.auto_execute_plans
+          ? "Working automatically"
+          : "Waiting for approval";
+  const primaryAction = digest.nextActions.find((action) => action.priority === "primary")?.label || "Watch progress";
+  const blocker = digest.state === "blocked" ? userFacingActivityText(digest.detail, 160) : "";
+
+  return {
+    id: project?.id || "no-mission",
+    title: project?.name || "Waiting for a mission",
+    goal:
+      project?.goal ||
+      "Give Model Express a dataset and goal. It will train, compare, refine, and prepare the best model.",
+    statusLabel: digest.stateLabel,
+    progressLabel:
+      totalExperiments > 0
+        ? `${completedExperiments}/${totalExperiments} experiments complete`
+        : project
+          ? "Preparing first experiment"
+          : "No mission yet",
+    completedExperiments,
+    totalExperiments,
+    bestMetricLabel,
+    bestMetricValue,
+    etaLabel,
+    primaryAction,
+    blocker,
+    updatedAt: project?.updated_at || "",
+  };
+}
+
+function buildCurrentThinking(project: Project | null, detail: ProjectDetail, digest: MissionDigest): AIThinking {
+  const dataset = detail.datasets[0] ?? null;
+  const latestPlan = detail.plans[0] ?? null;
+  const latestDecision = detail.decisions[0] ?? null;
+  const counts = jobStatusCounts(detail.jobs);
+  const activeExperiments = counts.QUEUED + counts.ASSIGNED + counts.RUNNING;
+  const latestExperiment = latestPlan?.experiments[0] ?? null;
+  const latestActivity = digest.liveActivity;
+
+  if (!project) {
+    return {
+      state: "Waiting for a mission",
+      observation: "No mission is selected yet.",
+      reasoning: "Model Express needs a goal and dataset before it can choose experiments.",
+      decision: "Create or select a mission.",
+      expectedOutcome: "The mission workspace will show progress as soon as setup starts.",
+      confidenceLabel: "Ready",
+      updatedAt: "",
+    };
+  }
+
+  if (!dataset) {
+    return {
+      state: "Waiting for dataset",
+      observation: "The mission has a goal but no dataset attached.",
+      reasoning: "A dataset review is required before Model Express can choose a training path.",
+      decision: "Attach an image dataset to begin.",
+      expectedOutcome: "The AI will inspect classes, examples, and label coverage.",
+      confidenceLabel: "Needs input",
+      updatedAt: project.updated_at,
+    };
+  }
+
+  if (digest.state === "blocked") {
+    return {
+      state: "Needs your input",
+      observation: userFacingActivityText(digest.headline, 140),
+      reasoning: userFacingActivityText(digest.detail, 180),
+      decision: "Pause new work until the blocker is resolved.",
+      expectedOutcome: "Once resolved, Model Express can continue the mission from the latest safe point.",
+      confidenceLabel: "Blocked",
+      updatedAt: latestDecision?.created_at || latestActivity.steps[0]?.timestamp || project.updated_at,
+    };
+  }
+
+  if (detail.champion) {
+    const champion = buildMissionChampionSummary(detail);
+    return {
+      state: "Preparing handoff",
+      observation: `${champion?.model || "The selected model"} is currently leading the mission.`,
+      reasoning: "The completed evidence supports using this model as the best available candidate.",
+      decision: "Prepare the export package and demo validation.",
+      expectedOutcome: "You can hand off an export-ready model with an explanation of why it won.",
+      confidenceLabel: "Champion selected",
+      updatedAt: detail.champion.updated_at || detail.champion.created_at,
+    };
+  }
+
+  if (latestDecision) {
+    const payload = latestDecision.payload ?? {};
+    const proposed = firstProposedExperiment(payload);
+    const expectedEffect =
+      recordFirstString(proposed, ["expected_effect", "expected_metric_effect"]) ||
+      recordFirstString(payload, ["expected_effect", "expected_metric_effect", "why_can_beat_champion"]);
+    const observation =
+      recordFirstString(payload, ["observation", "summary", "diagnosis", "recommendation_summary"]) ||
+      latestDecision.rationale ||
+      "The AI reviewed the latest experiment evidence.";
+    const decision = missionDecisionToUserText(latestDecision, proposed);
+    return {
+      state: latestActivity.label === "Idle" ? "Reviewing evidence" : latestActivity.label,
+      observation: userFacingActivityText(observation, 170),
+      reasoning: userFacingActivityText(decisionRationaleSummary(latestDecision), 190),
+      decision,
+      expectedOutcome: userFacingActivityText(expectedEffect || "Improve the mission metric without losing deployment readiness.", 170),
+      confidenceLabel: "Evidence-backed",
+      updatedAt: latestDecision.created_at,
+    };
+  }
+
+  if (activeExperiments > 0) {
+    return {
+      state: "Running experiments",
+      observation: `${activeExperiments} experiment${activeExperiments === 1 ? "" : "s"} are in progress or waiting to start.`,
+      reasoning: "Model Express is collecting comparable evidence before choosing a refinement or champion.",
+      decision: "Wait for the current experiments to report results.",
+      expectedOutcome: "Completed runs will reveal the strongest candidate and the next improvement target.",
+      confidenceLabel: "In progress",
+      updatedAt: detail.jobs[0]?.completed_at || detail.jobs[0]?.started_at || detail.jobs[0]?.created_at || project.updated_at,
+    };
+  }
+
+  if (latestPlan && latestExperiment) {
+    return {
+      state: "Planning first experiments",
+      observation: `${latestPlan.experiments.length} experiment${latestPlan.experiments.length === 1 ? "" : "s"} are ready.`,
+      reasoning: "The initial batch establishes a baseline and tests the most likely model family for the goal.",
+      decision: `Start ${latestExperiment.model || "the first experiment"}.`,
+      expectedOutcome: "Produce the first comparable metrics for champion selection.",
+      confidenceLabel: "Plan ready",
+      updatedAt: latestPlan.created_at,
+    };
+  }
+
+  return {
+    state: missionDatasetProfiled(dataset) ? "Reviewing dataset" : "Profiling dataset",
+    observation: missionDatasetProfiled(dataset)
+      ? "Dataset structure and label coverage are available."
+      : "Model Express is checking the dataset before planning experiments.",
+    reasoning: "A dataset review prevents random trials and makes the first experiments evidence-driven.",
+    decision: missionDatasetProfiled(dataset) ? "Create the first experiment plan." : "Finish dataset review.",
+    expectedOutcome: "The next step will choose experiments that match the mission goal.",
+    confidenceLabel: "Reviewing",
+    updatedAt: dataset.profiled_at || dataset.created_at || project.updated_at,
+  };
+}
+
+function buildMissionStages(
+  project: Project | null,
+  detail: ProjectDetail,
+  digest: MissionDigest,
+  exportDemo: ChampionExportDemo,
+): MissionStage[] {
+  const dataset = detail.datasets[0] ?? null;
+  const latestPlan = detail.plans[0] ?? null;
+  const latestDecision = detail.decisions[0] ?? null;
+  const counts = jobStatusCounts(detail.jobs);
+  const completed = counts.SUCCEEDED + counts.FAILED;
+  const active = counts.QUEUED + counts.ASSIGNED + counts.RUNNING;
+  const evaluationDone = detail.runEvaluations.length > 0 || detail.agentMemory.some((record) => record.kind === "training_evaluation");
+  const followUpPlan = latestDecision ? detail.plans.find((plan) => plan.source_decision_id === latestDecision.id) : null;
+  const exportReady = Boolean(readyONNXExport(exportDemo.exports));
+  const demoValidated = exportDemo.demoPredictions.some((prediction) => normalizedStatus(prediction.status || "") === "SUCCEEDED");
+  const blocked = digest.state === "blocked";
+
+  const status = (done: boolean, activeNow: boolean): MissionStage["status"] =>
+    blocked && activeNow ? "blocked" : done ? "done" : activeNow ? "active" : "waiting";
+
+  return [
+    {
+      id: "created",
+      label: "Mission Created",
+      detail: project ? "Goal captured and ready for autonomous work." : "Create a mission to begin.",
+      status: project ? "done" : "waiting",
+      timestamp: project?.created_at,
+    },
+    {
+      id: "dataset",
+      label: "Dataset Reviewed",
+      detail: dataset
+        ? missionDatasetProfiled(dataset)
+          ? datasetReviewSummary(dataset)
+          : "Checking labels, image counts, and readiness."
+        : "Waiting for an image dataset.",
+      status: status(Boolean(dataset && missionDatasetProfiled(dataset)), Boolean(dataset && !missionDatasetProfiled(dataset))),
+      timestamp: dataset?.profiled_at || dataset?.created_at,
+    },
+    {
+      id: "plan",
+      label: "Initial Plan Created",
+      detail: latestPlan ? `${latestPlan.experiments.length} experiments selected for the first pass.` : "Starts after dataset review.",
+      status: status(Boolean(latestPlan), Boolean(dataset && missionDatasetProfiled(dataset) && !latestPlan)),
+      timestamp: latestPlan?.created_at,
+    },
+    {
+      id: "experiments",
+      label: "Initial Experiments",
+      detail:
+        detail.jobs.length > 0
+          ? `${completed}/${detail.jobs.length} experiments complete${active > 0 ? `, ${active} still running.` : "."}`
+          : "Experiments start after the plan is approved or auto-run.",
+      status: status(detail.jobs.length > 0 && active === 0, active > 0 || Boolean(latestPlan && detail.jobs.length === 0)),
+      timestamp: detail.jobs[0]?.created_at,
+    },
+    {
+      id: "evaluation",
+      label: "Evaluation",
+      detail: evaluationDone ? "Completed runs have comparable evidence." : "Evaluation begins when experiments finish.",
+      status: status(evaluationDone, completed > 0 && !evaluationDone),
+      timestamp: detail.runEvaluations[0]?.created_at,
+    },
+    {
+      id: "refinement",
+      label: "Refinement",
+      detail: followUpPlan
+        ? `${followUpPlan.experiments.length} targeted follow-up experiment${followUpPlan.experiments.length === 1 ? "" : "s"} prepared.`
+        : latestDecision
+          ? userFacingActivityText(missionDecisionToUserText(latestDecision), 120)
+          : "Starts when evaluation reveals a useful improvement target.",
+      status: status(Boolean(followUpPlan), Boolean(latestDecision && latestDecision.decision_type === "ADD_EXPERIMENTS" && !followUpPlan)),
+      timestamp: followUpPlan?.created_at || latestDecision?.created_at,
+    },
+    {
+      id: "champion",
+      label: "Champion Selection",
+      detail: detail.champion ? "Best candidate selected for handoff." : "Starts after enough evidence is available.",
+      status: status(Boolean(detail.champion), evaluationDone && !detail.champion),
+      timestamp: detail.champion?.created_at,
+    },
+    {
+      id: "export",
+      label: "Export",
+      detail: exportReady ? "ONNX handoff package is ready." : detail.champion ? "Preparing model handoff package." : "Waiting for champion selection.",
+      status: status(exportReady, Boolean(detail.champion && !exportReady)),
+      timestamp: readyONNXExport(exportDemo.exports)?.completed_at || readyONNXExport(exportDemo.exports)?.updated_at,
+    },
+    {
+      id: "demo",
+      label: "Demo Validation",
+      detail: demoValidated ? "A demo image has been tested." : "Run a demo image after export readiness.",
+      status: status(demoValidated, exportReady && !demoValidated),
+      timestamp: exportDemo.demoPredictions[0]?.completed_at || exportDemo.demoPredictions[0]?.created_at,
+    },
+  ];
+}
+
+function buildActivityFeed(
+  project: Project | null,
+  detail: ProjectDetail,
+  events: AgentActivityEvent[],
+  exportDemo: ChampionExportDemo,
+): ActivityCardModel[] {
+  const cards: ActivityCardModel[] = [];
+  const push = (card: ActivityCardModel | null) => {
+    if (card) cards.push(card);
+  };
+
+  if (project) {
+    push({
+      id: `mission-${project.id}`,
+      type: "mission",
+      title: "Mission started",
+      summary: project.goal || "Model Express received the mission goal.",
+      timestamp: project.created_at,
+      status: "succeeded",
+      evidenceSummary: "Goal and dataset setup are tracked in the mission workspace.",
+      resultSummary: "",
+      technicalSource: "Project record",
+      developerPayloadRef: project.id,
+    });
+  }
+
+  for (const event of events) push(activityCardFromEvent(event));
+  for (const decision of detail.decisions.slice(0, 8)) push(activityCardFromDecision(decision));
+  for (const summary of detail.runSummaries.slice(0, 10)) {
+    const job = detail.jobs.find((item) => item.id === summary.job_id) ?? null;
+    const evaluation = detail.runEvaluations.find((item) => item.job_id === summary.job_id) ?? null;
+    push(activityCardFromRun(summary, evaluation, job));
+  }
+  if (detail.champion) {
+    const champion = buildMissionChampionSummary(detail);
+    push({
+      id: `champion-${detail.champion.id}`,
+      type: "result",
+      title: "Best model selected",
+      summary: `${champion?.model || "The champion"} leads with ${champion?.primaryMetricValue || "the best current score"} ${champion?.primaryMetricLabel || ""}.`.trim(),
+      timestamp: detail.champion.created_at,
+      status: "succeeded",
+      evidenceSummary: userFacingActivityText(detail.champion.selection_reason || "Selected from completed experiment evidence.", 180),
+      resultSummary: "Ready for results review and export preparation.",
+      technicalSource: "Champion record",
+      developerPayloadRef: detail.champion.id,
+    });
+  }
+  const exportRecord = readyONNXExport(exportDemo.exports);
+  if (exportRecord) {
+    push({
+      id: `export-${exportRecord.id || exportRecord.artifact_uri || "ready"}`,
+      type: "export",
+      title: "Export package prepared",
+      summary: "The handoff package is ready for validation and use.",
+      timestamp: exportRecord.completed_at || exportRecord.updated_at || exportRecord.created_at || new Date().toISOString(),
+      status: "succeeded",
+      evidenceSummary: "ONNX artifact readiness was reported.",
+      resultSummary: "Open Export to run a demo image or inspect the handoff package.",
+      technicalSource: "Export record",
+      developerPayloadRef: exportRecord.id || exportRecord.artifact_uri || "",
+    });
+  }
+
+  return uniqueBy(
+    cards
+      .filter((card) => Boolean(card.timestamp))
+      .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp)),
+    (card) => `${card.type}-${card.title}-${card.timestamp}`,
+  ).slice(0, 30);
+}
+
+function buildResultsSummary(
+  detail: ProjectDetail,
+  comparison: ChampionComparisonRow[],
+  exportDemo: ChampionExportDemo,
+): ResultsSummary {
+  const runTotals = summarizeTrainingRuns(detail.runSummaries, detail.runEvaluations, detail.jobs);
+  const champion = detail.champion ? buildMissionChampionSummary(detail) : undefined;
+  const championRow = comparison.find((row) => row.isChampion) ?? comparison[0] ?? null;
+  const baselineRow = comparison.find((row) => !row.isChampion) ?? comparison[comparison.length - 1] ?? null;
+  const improvement =
+    championRow && baselineRow && championRow.jobId !== baselineRow.jobId
+      ? championRow.primaryMetricValue - baselineRow.primaryMetricValue
+      : 0;
+  const exportReady = Boolean(readyONNXExport(exportDemo.exports));
+  const topCandidates = comparison
+    .slice()
+    .sort((left, right) => right.rankScore - left.rankScore)
+    .slice(0, 3)
+    .map((row, index) => ({
+      rank: index + 1,
+      model: row.model || `Candidate ${index + 1}`,
+      metricLabel: row.primaryMetricLabel,
+      metricValue: formatMaybeMetric(row.primaryMetricValue),
+      status: row.isChampion ? "Champion" : row.divergenceStatus || "Candidate",
+      why: row.isChampion
+        ? "Best balance of mission score and deployment fit."
+        : candidateWhyText(row),
+      jobId: row.jobId,
+    }));
+  const learningSummary = resultsLearningSummary(detail);
+  const remainingRisks = resultsRemainingRisks(detail, exportDemo);
+
+  return {
+    hasResults: detail.runSummaries.length > 0 || Boolean(detail.champion),
+    championModel: champion?.model || championRow?.model || (runTotals.bestPrimaryMetricValue > 0 ? "Best candidate emerging" : "No champion yet"),
+    primaryMetricLabel: champion?.primaryMetricLabel || championRow?.primaryMetricLabel || runTotals.bestPrimaryMetricLabel,
+    primaryMetricValue:
+      champion?.primaryMetricValue ||
+      (championRow ? formatMaybeMetric(championRow.primaryMetricValue) : runTotals.bestPrimaryMetricValue > 0 ? formatMaybeMetric(runTotals.bestPrimaryMetricValue) : "Pending"),
+    improvementLabel:
+      improvement > 0
+        ? `+${improvement.toFixed(3)} over nearest baseline`
+        : detail.runSummaries.length > 1
+          ? "Baseline comparison available"
+          : "Baseline pending",
+    exportStatus: exportReady ? "Export ready" : detail.champion ? "Preparing export" : "Waiting",
+    whyItWon:
+      detail.champion?.selection_reason
+        ? userFacingActivityText(detail.champion.selection_reason, 220)
+        : championRow
+          ? "This candidate currently has the strongest mission score among completed experiments."
+          : "Model Express is still collecting evidence before choosing a champion.",
+    learningSummary,
+    remainingRisks,
+    topCandidates,
+  };
+}
+
+function buildExportSummary(detail: ProjectDetail, exportDemo: ChampionExportDemo): ExportSummary {
+  const readyExport = readyONNXExport(exportDemo.exports);
+  const hasChampion = Boolean(detail.champion);
+  const validationErrors = exportDemo.exports.flatMap((item) => item.validation_errors ?? []);
+  const demoSucceeded = exportDemo.demoPredictions.some((prediction) => normalizedStatus(prediction.status || "") === "SUCCEEDED");
+  const includes = [
+    readyExport ? "ONNX model" : "ONNX model request",
+    "Preprocessing contract",
+    "Label map",
+    "Model card",
+    exportDemo.demoImages.length > 0 ? "Held-out demo images" : "Demo image slot",
+  ];
+  return {
+    hasChampion,
+    title: hasChampion ? "Model handoff package" : "Waiting for champion",
+    statusLabel: readyExport ? "Ready" : hasChampion ? "Preparing" : "Pending",
+    readinessLabel: readyExport
+      ? "The package has a ready ONNX artifact and can be validated with a demo image."
+      : hasChampion
+        ? "The champion is selected; prepare the ONNX package when you are ready."
+        : "Export begins after Model Express selects the best model.",
+    primaryFormat: readyExport?.format?.toUpperCase() || "ONNX",
+    validationStatus: validationErrors.length > 0 ? "Needs review" : readyExport ? "Passed" : "Not run",
+    demoStatus: demoSucceeded ? "Demo passed" : exportDemo.demoImages.length > 0 ? "Demo available" : "Waiting for image",
+    includes,
+    useCases: exportDemo.useCases.length > 0 ? exportDemo.useCases.map((item) => userFacingActivityText(item, 140)) : ["Production or prototype inference handoff."],
+    limitations: exportDemo.limitations.length > 0 ? exportDemo.limitations.map((item) => userFacingActivityText(item, 140)) : ["Validate on your deployment data before broad rollout."],
+    manifestAvailable: exportDemo.exports.some((item) => Object.keys(recordObject(recordObject(item.metadata).manifest)).length > 0),
+  };
+}
+
+function buildDeveloperDiagnostics(detail: ProjectDetail, events: AgentActivityEvent[]): DeveloperDiagnostics {
+  return {
+    summary: "Raw operational detail is preserved here for debugging, audit, and demo backup.",
+    counts: [
+      { label: "Invocations", value: String(detail.agentInvocations.length) },
+      { label: "Memory records", value: String(detail.agentMemory.length) },
+      { label: "Validation events", value: String(detail.executionEvents.length) },
+      { label: "Workers", value: String(detail.workers.length) },
+      { label: "Telemetry", value: detail.telemetry ? "Loaded" : "Empty" },
+      { label: "Raw events", value: String(events.length) },
+    ],
+  };
+}
+
+function userFacingActivityText(value: string, maxLength = 180) {
+  const text = activitySafeDisplayText(value, maxLength)
+    .replace(/\borchestrator\b/gi, "AI engine")
+    .replace(/\bcontrol plane\b/gi, "mission workspace")
+    .replace(/\bplanner\b/gi, "AI")
+    .replace(/\bagents?\b/gi, "AI")
+    .replace(/\bLLM\b/g, "AI")
+    .replace(/\bmemory retrieval\b/gi, "review of previous experiments")
+    .replace(/\bmemory\b/gi, "prior evidence")
+    .replace(/\binvocations?\b/gi, "model calls")
+    .replace(/\btelemetry\b/gi, "usage details")
+    .replace(/\bworkers?\b/gi, "training capacity")
+    .replace(/\bjobs?\b/gi, "experiments")
+    .replace(/\bbackend gate\b/gi, "safety check")
+    .replace(/\bbackend\b/gi, "system");
+  return text || "Model Express is updating the mission.";
+}
+
+function userFacingActionLabel(value: string) {
+  return value
+    .replace(/\bOpen Workers\b/gi, "Review training capacity")
+    .replace(/\bOpen Agents\b/gi, "Review AI work")
+    .replace(/\bOpen Operations\b/gi, "View technical details")
+    .replace(/\bOpen Runs\b/gi, "View results")
+    .replace(/\bOpen Experiments\b/gi, "Review experiments");
+}
+
+function firstProposedExperiment(payload: Record<string, unknown>): Record<string, unknown> {
+  const proposed =
+    Array.isArray(payload.proposed_experiments) ? payload.proposed_experiments :
+    Array.isArray(payload.proposedExperiments) ? payload.proposedExperiments :
+    [];
+  return recordObject(proposed[0]);
+}
+
+function missionDecisionToUserText(decision: AgentDecision, proposed = firstProposedExperiment(decision.payload ?? {})) {
+  const decisionType = normalizedStatus(decision.decision_type);
+  const model = recordString(proposed, "model");
+  const mechanism = recordFirstString(proposed, ["mechanism", "selected_mechanism", "strategy"]);
+  const intervention = recordString(proposed, "intervention");
+  const imageSize = recordNumber(proposed, "image_size");
+  if (decisionType === "ADD_EXPERIMENTS") {
+    const pieces = [
+      "Test",
+      model || "a follow-up experiment",
+      imageSize ? `at ${imageSize}px` : "",
+      intervention || mechanism ? `for ${intervention || mechanism}` : "",
+    ].filter(Boolean);
+    return userFacingActivityText(pieces.join(" "), 150);
+  }
+  if (decisionType.includes("CHAMPION")) return "Select the strongest completed model as champion.";
+  if (decisionType.includes("STOP")) return "Stop additional experiments and prepare the result.";
+  if (decisionType.includes("WAIT")) return "Wait for more experiment evidence before changing course.";
+  return userFacingActivityText(decisionHistorySummary(decision), 150);
+}
+
+function decisionRationaleSummary(decision: AgentDecision) {
+  const payload = decision.payload ?? {};
+  return (
+    recordFirstString(payload, [
+      "rationale",
+      "reason",
+      "summary",
+      "why_can_beat_champion",
+      "deterministic_diagnosis_used",
+      "recommendation_summary",
+    ]) ||
+    decision.rationale ||
+    "The AI compared current evidence against the mission goal and selected the next useful step."
+  );
+}
+
+function datasetReviewSummary(dataset: Dataset) {
+  const profile = recordObject(dataset.profile);
+  const totalImages = recordNumber(profile, "total_images");
+  const classCount = recordNumber(profile, "class_count");
+  const pieces = [
+    totalImages ? `${totalImages} images` : "",
+    classCount ? `${classCount} classes` : "",
+    "ready for experiment planning",
+  ].filter(Boolean);
+  return pieces.join(", ");
+}
+
+function activityCardFromEvent(event: AgentActivityEvent): ActivityCardModel {
+  const text = `${event.type} ${event.title} ${event.message}`.toLowerCase();
+  const status = activityStatus(event.status) as ActivityCardModel["status"];
+  let type: ActivityCardType = "mission";
+  let title = "Mission update";
+  if (text.includes("champion")) {
+    type = "result";
+    title = "Best model selected";
+  } else if (text.includes("export")) {
+    type = "export";
+    title = "Export prepared";
+  } else if (text.includes("blocked") || text.includes("rejected") || text.includes("failed")) {
+    type = "blocker";
+    title = "Proposed work was blocked";
+  } else if (text.includes("decision") || text.includes("recommendation") || text.includes("plan")) {
+    type = "decision";
+    title = "Decision recorded";
+  } else if (text.includes("training") || text.includes("job") || text.includes("run") || text.includes("queued")) {
+    type = "experiment";
+    title = status === "succeeded" ? "Experiment finished" : "Experiment started";
+  } else if (text.includes("dataset") || text.includes("profile") || text.includes("memory") || text.includes("retrieval")) {
+    type = "observation";
+    title = text.includes("dataset") ? "Dataset observation" : "AI reviewed previous experiments";
+  }
+  return {
+    id: `event-${event.id}`,
+    type,
+    title,
+    summary: userFacingActivityText(event.message || event.title || title, 220),
+    timestamp: event.created_at,
+    status,
+    evidenceSummary: `Updated ${formatRelativeTime(event.created_at)}`,
+    resultSummary: status === "succeeded" ? "Completed" : status === "blocked" || status === "failed" ? "Needs review" : "In progress",
+    technicalSource: "Project event",
+    developerPayloadRef: event.id,
+  };
+}
+
+function activityCardFromDecision(decision: AgentDecision): ActivityCardModel {
+  const rejections = decisionRejections(decision);
+  const blocked = rejections.length > 0;
+  return {
+    id: `decision-${decision.id}`,
+    type: blocked ? "blocker" : "decision",
+    title: blocked ? "Proposed experiment was blocked" : "Decision recorded",
+    summary: missionDecisionToUserText(decision),
+    timestamp: decision.created_at,
+    status: blocked ? "blocked" : "succeeded",
+    evidenceSummary: userFacingActivityText(decisionRationaleSummary(decision), 160),
+    resultSummary: blocked ? userFacingActivityText(rejections[0]?.text || "The proposal did not pass safety checks.", 140) : "Next step is stored for the mission.",
+    technicalSource: "AI decision",
+    developerPayloadRef: decision.id,
+  };
+}
+
+function activityCardFromRun(
+  summary: TrainingRunSummary,
+  evaluation: TrainingRunEvaluation | null,
+  job: Job | null,
+): ActivityCardModel {
+  const status = activityStatus(summary.status);
+  const primary = runPrimaryMetric(summary, evaluation, job);
+  const terminal = ["SUCCEEDED", "FAILED"].includes(normalizedStatus(summary.status));
+  return {
+    id: `run-${summary.job_id}`,
+    type: terminal ? "result" : "experiment",
+    title: terminal ? "Experiment finished" : "Experiment started",
+    summary: `${summary.model || "Candidate model"} ${terminal ? "finished" : "is running"} with ${primary.label} ${formatMaybeMetric(primary.value)}.`,
+    timestamp: summary.updated_at || summary.created_at,
+    status: status as ActivityCardModel["status"],
+    evidenceSummary: `${summary.epochs_completed} epochs completed`,
+    resultSummary: primary.value > 0 ? `${formatMaybeMetric(primary.value)} ${primary.label}` : "Metric pending",
+    technicalSource: "Training result",
+    developerPayloadRef: summary.job_id,
+  };
+}
+
+function activityCardMatchesFilter(card: ActivityCardModel, filter: ActivityFilterKey) {
+  if (filter === "all") return true;
+  if (filter === "decisions") return card.type === "decision";
+  if (filter === "experiments") return card.type === "experiment";
+  if (filter === "results") return card.type === "result" || card.type === "export";
+  if (filter === "blockers") return card.type === "blocker" || card.status === "blocked" || card.status === "failed";
+  return true;
+}
+
+function candidateWhyText(row: ChampionComparisonRow) {
+  const details = [
+    row.latencyMs > 0 ? `${formatLatency(row.latencyMs)} latency` : "",
+    row.costUsd > 0 ? `${formatCurrency(row.costUsd)} cost` : "",
+    row.objectiveFit > 0 ? `${formatMaybeMetric(row.objectiveFit)} mission fit` : "",
+  ].filter(Boolean);
+  return details.length > 0 ? `Strong candidate with ${details.join(", ")}.` : "Comparable result from a completed experiment.";
+}
+
+function resultsLearningSummary(detail: ProjectDetail) {
+  const latestDecision = detail.decisions[0] ?? null;
+  const latestEvaluation = detail.runEvaluations[0] ?? null;
+  const latestMemory = detail.agentMemory[0] ?? null;
+  const items = uniqueStrings([
+    latestDecision ? userFacingActivityText(decisionRationaleSummary(latestDecision), 160) : "",
+    latestEvaluation?.recommendation_summary ? userFacingActivityText(latestEvaluation.recommendation_summary, 160) : "",
+    latestMemory?.summary ? userFacingActivityText(latestMemory.summary, 160) : "",
+    detail.runSummaries.length > 0 ? `${detail.runSummaries.length} experiment${detail.runSummaries.length === 1 ? "" : "s"} produced comparable evidence.` : "",
+  ]);
+  return items.length > 0 ? items.slice(0, 4) : ["Learning summary will appear after the first completed experiment."];
+}
+
+function resultsRemainingRisks(detail: ProjectDetail, exportDemo: ChampionExportDemo) {
+  const latestDecision = detail.decisions[0] ?? null;
+  const risks = uniqueStrings([
+    ...exportDemo.limitations.map((item) => userFacingActivityText(item, 140)),
+    ...stringArrayPayload(latestDecision?.payload.risks).map((item) => userFacingActivityText(item, 140)),
+    detail.jobs.some((job) => normalizedStatus(job.status) === "FAILED")
+      ? "Some experiments failed and should be reviewed before relying on the result."
+      : "",
+    exportDemo.demoPredictions.length === 0 ? "Run a demo image before deployment handoff." : "",
+  ]);
+  return risks.length > 0 ? risks.slice(0, 4) : ["No major risk has been summarized yet; validate on real deployment data."];
 }
 
 function buildMissionDigest({

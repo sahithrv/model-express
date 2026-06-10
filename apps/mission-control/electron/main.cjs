@@ -209,6 +209,10 @@ ipcMain.handle("worker:ensureProjectWorker", async (_event, options) => {
   return ensureProjectWorker(options);
 });
 
+ipcMain.handle("worker:stopProjectWorker", async (_event, options) => {
+  return stopProjectWorker(options);
+});
+
 function demoImagePreviewURI(imagePath, fallbackURI, sizeBytes) {
   const maxInlinePreviewBytes = 8 * 1024 * 1024;
   if (sizeBytes > maxInlinePreviewBytes) {
@@ -507,6 +511,34 @@ function ensureProjectWorker(options) {
     process_count: pids.length,
     dispatcher: useModalDispatcher,
     status: startedCount > 0 ? "started" : "already_running",
+  };
+}
+
+function stopProjectWorker(options = {}) {
+  const projectId = String(options.projectId ?? "").trim();
+  if (!projectId) {
+    throw new Error("Project id is required before stopping workers.");
+  }
+  const stopped = [];
+  const alreadyStopped = [];
+  for (const [key, worker] of projectWorkers.entries()) {
+    if (!key.startsWith(`${projectId}:`)) {
+      continue;
+    }
+    if (isWorkerRunning(worker)) {
+      worker.kill();
+      stopped.push(worker.pid);
+    } else {
+      alreadyStopped.push(worker.pid ?? 0);
+    }
+    projectWorkers.delete(key);
+  }
+  return {
+    project_id: projectId,
+    stopped_count: stopped.length,
+    stopped_pids: stopped,
+    already_stopped_count: alreadyStopped.length,
+    status: stopped.length > 0 ? "stopped" : "not_running",
   };
 }
 

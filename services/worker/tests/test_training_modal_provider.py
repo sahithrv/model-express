@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+import os
 
 import pytest
 
@@ -14,6 +15,7 @@ from worker.training.modal_provider import (
     run_modal_training,
     run_modal_training_batch,
 )
+from worker.training.modal_resources import classify_oom_failure
 
 
 class _FakeModalApp:
@@ -63,17 +65,82 @@ class _FakeStream:
             self.errors = kwargs["errors"]
 
 
+class _FakeModalFunction:
+    def __init__(self, remote):
+        self.remote = remote
+        self.options_calls = []
+
+    def with_options(self, **kwargs):
+        self.options_calls.append(kwargs)
+        return self
+
+
+class _FakeFunctionCall:
+    def __init__(self, *, object_id: str = "fc-1", result: dict | None = None, errors: list[Exception] | None = None):
+        self.object_id = object_id
+        self.result = result or {}
+        self.errors = list(errors or [])
+        self.get_timeouts = []
+        self.cancel_calls = []
+
+    def get(self, *, timeout=None):
+        self.get_timeouts.append(timeout)
+        if self.errors:
+            raise self.errors.pop(0)
+        return self.result
+
+    def cancel(self, *, terminate_containers: bool = False):
+        self.cancel_calls.append({"terminate_containers": terminate_containers})
+
+
+class _FakeSpawnModalFunction(_FakeModalFunction):
+    def __init__(self, call: _FakeFunctionCall):
+        def remote(_payload: dict):
+            raise AssertionError("remote should not be used when spawn is available")
+
+        super().__init__(remote)
+        self.call = call
+        self.spawn_payloads = []
+
+    def spawn(self, payload: dict):
+        self.spawn_payloads.append(payload)
+        return self.call
+
+
 class _FakeClient:
     base_url = "https://orchestrator.test"
 
     def __init__(self):
         self.failures = []
+        self.modal_calls = []
+        self.job_reads = []
+        self.jobs_by_id = {}
 
     def get_dataset(self, dataset_id: str) -> dict:
         return {"id": dataset_id, "storage_uri": "s3://bucket/dataset.zip"}
 
-    def fail_job(self, job_id: str, error: str, retryable: bool = False) -> dict:
-        self.failures.append({"job_id": job_id, "error": error, "retryable": retryable})
+    def get_job(self, job_id: str) -> dict:
+        self.job_reads.append(job_id)
+        return self.jobs_by_id.get(job_id, {"id": job_id, "status": "RUNNING", "config": {}})
+
+    def report_modal_call(self, job_id: str, payload: dict) -> dict:
+        self.modal_calls.append({"job_id": job_id, "payload": payload})
+        return {"job_id": job_id}
+
+    def fail_job(
+        self,
+        job_id: str,
+        error: str,
+        retryable: bool = False,
+        metadata: dict | None = None,
+    ) -> dict:
+        payload = {"job_id": job_id, "error": error, "retryable": retryable}
+        if isinstance(metadata, dict):
+            payload.update(metadata)
+            payload["job_id"] = job_id
+            payload["error"] = error
+            payload["retryable"] = retryable
+        self.failures.append(payload)
         return {"ok": True}
 
 
@@ -158,6 +225,194 @@ def test_modal_training_reuses_existing_modal_app_session(monkeypatch):
     assert fake_modal_app.app.exit_count == 1
     assert remote_calls == ["job_1", "job_2"]
     assert client.failures == []
+
+
+def test_modal_training_uses_with_options_for_per_job_gpu_and_memory(monkeypatch):
+    remote_payloads = []
+
+    def remote(payload: dict):
+        remote_payloads.append(payload)
+        return {}
+
+    fake_function = _FakeModalFunction(remote)
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = fake_function
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("MODAL_GPU_TYPE", "T4")
+
+    client = _FakeClient()
+    run_modal_training(
+        client,
+        {
+            "id": "job_1",
+            "project_id": "project_1",
+            "attempt": 2,
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "gpu_type": "A10",
+                "batch_size": 12,
+                "memory_mb": 49152,
+                "active_attempt_id": "job_1:attempt-2",
+            },
+        },
+    )
+
+    assert fake_function.options_calls == [{"gpu": "A10", "memory": 49152}]
+    assert remote_payloads[0]["modal_resources"]["effective_gpu_type"] == "A10"
+    assert remote_payloads[0]["modal_resources"]["effective_batch_size"] == 12
+    assert remote_payloads[0]["job"]["config"]["modal_resources"]["memory_mb"] == 49152
+    assert remote_payloads[0]["job"]["config"]["active_attempt_id"] == "job_1:attempt-2"
+    assert client.failures == []
+    assert sys.modules["worker.training.modal_app"].train_image_classifier.options_calls[0]["gpu"] == "A10"
+    assert os.environ["MODAL_GPU_TYPE"] == "T4"
+
+
+def test_modal_training_spawn_reports_function_call_object_id(monkeypatch):
+    call = _FakeFunctionCall(object_id="fc-spawn", result={"status": "succeeded"})
+    fake_function = _FakeSpawnModalFunction(call)
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = fake_function
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_USE_SPAWN", "1")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_CALL_POLL_SECONDS", "0.25")
+
+    client = _FakeClient()
+    run_modal_training(
+        client,
+        {
+            "id": "job_spawn",
+            "project_id": "project_1",
+            "attempt": 1,
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "gpu_type": "L4",
+                "batch_size": 8,
+                "memory_mb": 32768,
+                "active_attempt_id": "job_spawn:attempt-1",
+            },
+        },
+    )
+
+    assert fake_function.options_calls == [{"gpu": "L4", "memory": 32768}]
+    assert len(fake_function.spawn_payloads) == 1
+    assert call.get_timeouts == [0.25]
+    assert call.cancel_calls == []
+    assert client.failures == []
+    assert len(client.modal_calls) == 1
+    modal_call = client.modal_calls[0]
+    assert modal_call["job_id"] == "job_spawn"
+    assert modal_call["payload"]["training_attempt_id"] == "job_spawn:attempt-1"
+    assert modal_call["payload"]["modal_function_call_object_id"] == "fc-spawn"
+    assert modal_call["payload"]["cancel_status"] == "active"
+    assert modal_call["payload"]["requested_gpu_type"] == "L4"
+    assert modal_call["payload"]["effective_gpu_type"] == "L4"
+    assert modal_call["payload"]["memory_mb"] == 32768
+    assert modal_call["payload"]["modal_resource_signature"] == "gpu=L4|batch=8|memory_mb=32768"
+    assert modal_call["payload"]["modal_resources"]["modal_function_options"] == {"gpu": "L4", "memory": 32768}
+    assert modal_call["payload"]["modal_resources"]["modal_call_cancel_status"] == "active"
+
+
+def test_modal_training_spawn_cancels_when_backend_attempt_is_terminal(monkeypatch):
+    call = _FakeFunctionCall(object_id="fc-cancel", errors=[TimeoutError("timed out")])
+    fake_function = _FakeSpawnModalFunction(call)
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = fake_function
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_USE_SPAWN", "1")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_CALL_POLL_SECONDS", "0.25")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_CANCEL_TERMINATE_CONTAINERS", "1")
+
+    client = _FakeClient()
+    client.jobs_by_id["job_cancel"] = {
+        "id": "job_cancel",
+        "status": "FAILED",
+        "config": {"active_attempt_id": "job_cancel:attempt-1"},
+    }
+    run_modal_training(
+        client,
+        {
+            "id": "job_cancel",
+            "project_id": "project_1",
+            "attempt": 1,
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "gpu_type": "T4",
+                "batch_size": 16,
+                "memory_mb": 24576,
+                "active_attempt_id": "job_cancel:attempt-1",
+            },
+        },
+    )
+
+    assert fake_function.spawn_payloads
+    assert call.cancel_calls == [{"terminate_containers": True}]
+    assert client.job_reads == ["job_cancel"]
+    assert client.failures == []
+    assert [entry["payload"]["cancel_status"] for entry in client.modal_calls] == ["active", "cancel_requested"]
+    assert all(entry["payload"]["modal_function_call_object_id"] == "fc-cancel" for entry in client.modal_calls)
+
+
+def test_modal_training_invocation_oom_failure_reports_resource_metadata(monkeypatch):
+    def remote(_payload: dict):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = _FakeModalFunction(remote)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+
+    client = _FakeClient()
+    run_modal_training(
+        client,
+        {
+            "id": "job_oom",
+            "project_id": "project_1",
+            "attempt": 1,
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "gpu_type": "T4",
+                "batch_size": 16,
+                "active_attempt_id": "job_oom:attempt-1",
+            },
+        },
+    )
+
+    assert len(client.failures) == 1
+    failure = client.failures[0]
+    assert failure["retryable"] is True
+    assert failure["training_attempt_id"] == "job_oom:attempt-1"
+    assert failure["failure_class"] == "oom"
+    assert failure["oom"] is True
+    assert failure["oom_kind"] == "gpu_cuda"
+    assert failure["effective_gpu_type"] == "T4"
+    assert failure["effective_batch_size"] == 16
+    assert failure["modal_resource_signature"].startswith("gpu=T4|batch=16|memory_mb=")
+
+
+def test_modal_oom_classifier_distinguishes_memory_failures():
+    assert classify_oom_failure("CUDA out of memory") == {
+        "is_oom": True,
+        "failure_class": "oom",
+        "oom_kind": "gpu_cuda",
+        "retryable": True,
+    }
+    assert classify_oom_failure("container exited with exit code 137")["oom_kind"] == "system_memory"
+    assert classify_oom_failure("training room validation failed")["is_oom"] is False
 
 
 def test_modal_training_dispatches_detection_jobs_to_yolo_remote(monkeypatch):

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -74,19 +75,77 @@ type createExperimentPlanRequest struct {
 }
 
 type executeExperimentPlanRequest struct {
-	Provider string `json:"provider"`
-	GPUType  string `json:"gpu_type"`
+	Provider          string `json:"provider"`
+	GPUType           string `json:"gpu_type"`
+	MaxConcurrentJobs int    `json:"max_concurrent_jobs"`
 }
 
 type executeExperimentPlanResponse struct {
-	Plan       plans.ExperimentPlan `json:"plan"`
-	Jobs       []jobs.ExperimentJob `json:"jobs"`
-	CostPolicy map[string]any       `json:"cost_policy,omitempty"`
+	Plan              plans.ExperimentPlan         `json:"plan"`
+	Jobs              []jobs.ExperimentJob         `json:"jobs"`
+	CostPolicy        map[string]any               `json:"cost_policy,omitempty"`
+	WorkerRequirement *execution.WorkerRequirement `json:"worker_requirement,omitempty"`
 }
 
 type scheduleFollowUpExperimentsResponse struct {
 	Decision     decisions.AgentDecision `json:"decision"`
 	FollowUpPlan *plans.ExperimentPlan   `json:"follow_up_plan,omitempty"`
+}
+
+type cancelExecutionRequest struct {
+	Reason               string `json:"reason"`
+	PromoteBestAvailable bool   `json:"promote_best_available"`
+	TerminateRemoteWork  bool   `json:"terminate_remote_work"`
+}
+
+type cancelModalCallResult struct {
+	JobID                     string `json:"job_id"`
+	TrainingAttemptID         string `json:"training_attempt_id,omitempty"`
+	ModalFunctionCallObjectID string `json:"modal_function_call_object_id,omitempty"`
+	ModalFunctionCallID       string `json:"modal_function_call_id,omitempty"`
+	ModalInputID              string `json:"modal_input_id,omitempty"`
+	CancelStatus              string `json:"cancel_status"`
+}
+
+type cancelBestAvailableModel struct {
+	JobID                   string  `json:"job_id,omitempty"`
+	Exportable              bool    `json:"exportable"`
+	ChampionSelectionSource string  `json:"champion_selection_source,omitempty"`
+	Model                   string  `json:"model,omitempty"`
+	Score                   float64 `json:"score,omitempty"`
+	Reason                  string  `json:"reason,omitempty"`
+}
+
+type cancelExecutionResponse struct {
+	ExecutionID                string                        `json:"execution_id"`
+	Target                     map[string]string             `json:"target"`
+	Status                     string                        `json:"status"`
+	Message                    string                        `json:"message"`
+	QueuedJobsCancelled        int                           `json:"queued_jobs_cancelled"`
+	ActiveJobsMarkedCancelling int                           `json:"active_jobs_marked_cancelling"`
+	AlreadyTerminalJobs        int                           `json:"already_terminal_jobs"`
+	ModalCalls                 []cancelModalCallResult       `json:"modal_calls"`
+	WorkerRequirements         []execution.WorkerRequirement `json:"worker_requirements"`
+	BestAvailableModel         cancelBestAvailableModel      `json:"best_available_model"`
+	Compatibility              map[string]bool               `json:"compatibility"`
+	Jobs                       []jobs.ExperimentJob          `json:"jobs,omitempty"`
+	Plans                      []cancelExecutionResponse     `json:"plans,omitempty"`
+}
+
+type recordModalCallRequest struct {
+	TrainingAttemptID         string         `json:"training_attempt_id"`
+	ModalFunctionCallObjectID string         `json:"modal_function_call_object_id"`
+	ModalFunctionCallID       string         `json:"modal_function_call_id"`
+	ModalInputID              string         `json:"modal_input_id"`
+	CancelStatus              string         `json:"cancel_status"`
+	RequestedGPUType          string         `json:"requested_gpu_type"`
+	EffectiveGPUType          string         `json:"effective_gpu_type"`
+	MemoryMB                  int            `json:"memory_mb"`
+	RequestedBatchSize        int            `json:"requested_batch_size"`
+	EffectiveBatchSize        int            `json:"effective_batch_size"`
+	BatchSizePolicy           string         `json:"batch_size_policy"`
+	ModalResourceSignature    string         `json:"modal_resource_signature"`
+	ModalResources            map[string]any `json:"modal_resources"`
 }
 
 type reopenExperimentationRequest struct {
@@ -115,6 +174,7 @@ type automaticExperimentReviewResult struct {
 const (
 	llmExperimentPlannerDecisionSource     = "llm_experiment_planner"
 	costPolicyChampionDecisionSource       = "cost_policy_budget_stop"
+	userCancelChampionDecisionSource       = "user_cancel_best_available"
 	minLLMDecisionConfidence               = 0.50
 	maxLLMPlannerExperiments               = 5
 	plannerMinimumMeaningfulImprovement    = 0.005
@@ -125,6 +185,8 @@ const (
 	plannerAutonomousMaxFollowUpRounds     = 3
 	plannerBackendValidationRetryLimit     = 1
 	plannerDefaultMaxToolRounds            = 10
+
+	modalOOMRetryHistoryKey = "modal_oom_retry_history"
 
 	visualAnalysisDefaultCooldownMinutes      = 360
 	visualAnalysisDefaultMaxRunsPerProfile    = 3
@@ -142,6 +204,7 @@ const (
 var (
 	errNoNovelFollowUpExperiments      = fmt.Errorf("%w: no novel follow-up experiments", store.ErrInvalidRequest)
 	errChampionSelectedFollowUpBlocked = fmt.Errorf("%w: champion selected guard", errNoNovelFollowUpExperiments)
+	modalGPUEscalationLadder           = []string{"T4", "L4", "A10", "L40S", "A100-40GB", "A100-80GB"}
 )
 
 type updateDatasetProfileRequest struct {
@@ -176,8 +239,9 @@ type datasetMetadataSourceRequest struct {
 }
 
 type reportMetricRequest struct {
-	Epoch   int                `json:"epoch" binding:"required"`
-	Metrics map[string]float64 `json:"metrics" binding:"required"`
+	Epoch             int                `json:"epoch" binding:"required"`
+	Metrics           map[string]float64 `json:"metrics" binding:"required"`
+	TrainingAttemptID string             `json:"training_attempt_id"`
 }
 
 type createChampionExportRequest struct {
@@ -285,12 +349,28 @@ type reportTrainingRunSummaryRequest = runs.TrainingRunSummaryUpdate
 type reportTrainingRunEvaluationRequest = runs.TrainingRunEvaluationUpdate
 
 type completeJobRequest struct {
-	MLflowRunID string `json:"mlflow_run_id"`
+	MLflowRunID       string `json:"mlflow_run_id"`
+	TrainingAttemptID string `json:"training_attempt_id"`
 }
 
 type failJobRequest struct {
-	Error     string `json:"error" binding:"required"`
-	Retryable bool   `json:"retryable"`
+	Error                  string         `json:"error" binding:"required"`
+	Retryable              bool           `json:"retryable"`
+	TrainingAttemptID      string         `json:"training_attempt_id"`
+	FailureClass           string         `json:"failure_class"`
+	FailureType            string         `json:"failure_type"`
+	OOM                    bool           `json:"oom"`
+	OOMKind                string         `json:"oom_kind"`
+	RequestedGPUType       string         `json:"requested_gpu_type"`
+	EffectiveGPUType       string         `json:"effective_gpu_type"`
+	MemoryMB               int            `json:"memory_mb"`
+	RequestedBatchSize     int            `json:"requested_batch_size"`
+	EffectiveBatchSize     int            `json:"effective_batch_size"`
+	BatchSizePolicy        string         `json:"batch_size_policy"`
+	ModalResourceSignature string         `json:"modal_resource_signature"`
+	ModalFunctionCallID    string         `json:"modal_function_call_id"`
+	ModalInputID           string         `json:"modal_input_id"`
+	ModalResources         map[string]any `json:"modal_resources"`
 }
 
 type pollJobRequest struct {
@@ -1053,6 +1133,18 @@ func (s *Server) reportMetric(c *gin.Context) {
 		writeStoreError(c, fmt.Errorf("%w: epoch must be positive", store.ErrInvalidRequest))
 		return
 	}
+	if job, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"metrics",
+		map[string]any{"epoch": req.Epoch},
+	); err != nil {
+		writeStoreError(c, err)
+		return
+	} else if ignored {
+		c.JSON(http.StatusAccepted, gin.H{"status": "stale_attempt_ignored", "job": job})
+		return
+	}
 
 	metric, err := s.store.ReportMetric(c.Param("id"), req.Epoch, req.Metrics)
 	if err != nil {
@@ -1076,6 +1168,22 @@ func (s *Server) listJobMetrics(c *gin.Context) {
 func (s *Server) upsertTrainingRunSummary(c *gin.Context) {
 	var req reportTrainingRunSummaryRequest
 	if !bindJSON(c, &req) {
+		return
+	}
+	if _, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"training_run_summary",
+		trainingResourcePayload(req.TrainingAttemptID, req.RequestedGPUType, req.EffectiveGPUType, req.ModalResourceSignature),
+	); err != nil {
+		writeStoreError(c, err)
+		return
+	} else if ignored {
+		if summary, getErr := s.store.GetTrainingRunSummary(c.Param("id")); getErr == nil {
+			c.JSON(http.StatusAccepted, summary)
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"status": "stale_attempt_ignored"})
 		return
 	}
 
@@ -1213,6 +1321,22 @@ func explicitFalseBool(payload map[string]any, key string) bool {
 func (s *Server) upsertTrainingRunEvaluation(c *gin.Context) {
 	var req reportTrainingRunEvaluationRequest
 	if !bindJSON(c, &req) {
+		return
+	}
+	if _, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"training_run_evaluation",
+		trainingResourcePayload(req.TrainingAttemptID, req.RequestedGPUType, req.EffectiveGPUType, req.ModalResourceSignature),
+	); err != nil {
+		writeStoreError(c, err)
+		return
+	} else if ignored {
+		if evaluation, getErr := s.store.GetTrainingRunEvaluation(c.Param("id")); getErr == nil {
+			c.JSON(http.StatusAccepted, evaluation)
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"status": "stale_attempt_ignored"})
 		return
 	}
 
@@ -2977,6 +3101,83 @@ func (s *Server) recordAutomaticExecutionQueued(plan plans.ExperimentPlan, req e
 	return err
 }
 
+func (s *Server) ensureWorkerRequirementForPlanJobs(
+	plan plans.ExperimentPlan,
+	provider string,
+	gpuType string,
+	queuedJobs []jobs.ExperimentJob,
+	source string,
+	requestedMaxConcurrentJobs int,
+) (*execution.WorkerRequirement, error) {
+	openJobCount := openTrainingJobCount(queuedJobs)
+	if openJobCount == 0 {
+		return nil, nil
+	}
+	if provider == "" {
+		provider = "local"
+	}
+	provider = normalizeTrainingProvider(provider)
+	targetCount := s.targetWorkerCountForPlanExecution(plan, openJobCount, requestedMaxConcurrentJobs)
+	activeWorkerCount := s.activeOrStartingWorkersForProject(plan.ProjectID, provider, gpuType)
+	requirementPolicy, err := s.workerRequirementPolicyForPlan(plan, provider, targetCount)
+	if err != nil {
+		return nil, err
+	}
+	if requestedMaxConcurrentJobs > 0 {
+		requirementPolicy.MaxConcurrentJobs = targetCount
+	}
+	if requestedMaxConcurrentJobs <= 0 {
+		if policy := costPolicyForSettings(s.currentAutomationSettings()); policy.Enabled && policy.MaxConcurrentJobs > 0 && requirementPolicy.MaxConcurrentJobs > policy.MaxConcurrentJobs {
+			requirementPolicy.MaxConcurrentJobs = policy.MaxConcurrentJobs
+		}
+	}
+	requirement, created, err := s.store.UpsertWorkerRequirement(
+		plan.ProjectID,
+		plan.ID,
+		provider,
+		gpuType,
+		targetCount,
+		source,
+		requirementPolicy,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if activeWorkerCount >= requirement.TargetCount {
+		active := execution.WorkerRequirementActive
+		updated, updateErr := s.store.UpdateWorkerRequirement(requirement.ID, execution.WorkerRequirementUpdate{Status: &active})
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		requirement = updated
+	} else if requirement.Status == execution.WorkerRequirementActive {
+		pending := execution.WorkerRequirementPending
+		updated, updateErr := s.store.UpdateWorkerRequirement(requirement.ID, execution.WorkerRequirementUpdate{Status: &pending})
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		requirement = updated
+	}
+	eventType := execution.EventWorkersRequired
+	if !created {
+		eventType = execution.EventWorkerScalingUpdated
+	}
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, eventType, fmt.Sprintf("Execution targets %d worker(s) for %d open job(s).", requirement.TargetCount, openJobCount), map[string]any{
+		"worker_requirement_id":         requirement.ID,
+		"target_count":                  requirement.TargetCount,
+		"open_job_count":                openJobCount,
+		"active_worker_count":           activeWorkerCount,
+		"provider":                      requirement.Provider,
+		"gpu_type":                      requirement.GPUType,
+		"source":                        source,
+		"requested_max_concurrent_jobs": requestedMaxConcurrentJobs,
+		"max_concurrent_jobs":           requirement.MaxConcurrentJobs,
+	}); err != nil {
+		return nil, err
+	}
+	return &requirement, nil
+}
+
 func experimentJobIDs(experimentJobs []jobs.ExperimentJob) []string {
 	out := make([]string, 0, len(experimentJobs))
 	for _, job := range experimentJobs {
@@ -3268,6 +3469,10 @@ func (s *Server) costPolicyStopPayloadForPlan(projectID string, planID string) (
 }
 
 func (s *Server) targetWorkerCountForPlan(plan plans.ExperimentPlan, openJobCount int) int {
+	return s.targetWorkerCountForPlanExecution(plan, openJobCount, 0)
+}
+
+func (s *Server) targetWorkerCountForPlanExecution(plan plans.ExperimentPlan, openJobCount int, requestedMaxConcurrentJobs int) int {
 	if openJobCount < 1 {
 		return 1
 	}
@@ -3280,6 +3485,12 @@ func (s *Server) targetWorkerCountForPlan(plan plans.ExperimentPlan, openJobCoun
 	}
 	if maxWorkers := maxAutoWorkersFromEnv(); maxWorkers > 0 && targetCount > maxWorkers {
 		targetCount = maxWorkers
+	}
+	if requestedMaxConcurrentJobs > 0 {
+		if targetCount > requestedMaxConcurrentJobs {
+			targetCount = requestedMaxConcurrentJobs
+		}
+		return targetCount
 	}
 	if policy := costPolicyForSettings(s.currentAutomationSettings()); policy.Enabled && policy.MaxConcurrentJobs > 0 && targetCount > policy.MaxConcurrentJobs {
 		targetCount = policy.MaxConcurrentJobs
@@ -4059,9 +4270,78 @@ func (s *Server) reportChampionDemoPredictionResult(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"prediction": prediction, "job": job})
 }
 
+func (s *Server) recordJobModalCall(c *gin.Context) {
+	var req recordModalCallRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	payload := trainingResourcePayload(req.TrainingAttemptID, req.RequestedGPUType, req.EffectiveGPUType, req.ModalResourceSignature)
+	payload["modal_function_call_object_id"] = strings.TrimSpace(req.ModalFunctionCallObjectID)
+	payload["modal_function_call_id"] = strings.TrimSpace(req.ModalFunctionCallID)
+	payload["modal_input_id"] = strings.TrimSpace(req.ModalInputID)
+	payload["cancel_status"] = strings.TrimSpace(req.CancelStatus)
+	if job, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"modal_call",
+		payload,
+	); err != nil {
+		writeStoreError(c, err)
+		return
+	} else if ignored {
+		c.JSON(http.StatusAccepted, gin.H{"status": "stale_attempt_ignored", "job": job})
+		return
+	}
+	patch := map[string]any{
+		"modal_function_call_object_id": strings.TrimSpace(req.ModalFunctionCallObjectID),
+		"modal_function_call_id":        strings.TrimSpace(req.ModalFunctionCallID),
+		"modal_input_id":                strings.TrimSpace(req.ModalInputID),
+		"modal_call_cancel_status":      firstNonEmptyString(req.CancelStatus, "active"),
+		"modal_call_recorded_at":        time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if req.TrainingAttemptID != "" {
+		patch["training_attempt_id"] = strings.TrimSpace(req.TrainingAttemptID)
+	}
+	if req.RequestedGPUType != "" {
+		patch["requested_gpu_type"] = strings.TrimSpace(req.RequestedGPUType)
+	}
+	if req.EffectiveGPUType != "" {
+		patch["effective_gpu_type"] = strings.TrimSpace(req.EffectiveGPUType)
+	}
+	if req.ModalResourceSignature != "" {
+		patch["modal_resource_signature"] = strings.TrimSpace(req.ModalResourceSignature)
+	}
+	if len(req.ModalResources) > 0 {
+		patch["modal_resources"] = mergePayloadMap(req.ModalResources, map[string]any{
+			"modal_function_call_object_id": strings.TrimSpace(req.ModalFunctionCallObjectID),
+			"modal_function_call_id":        strings.TrimSpace(req.ModalFunctionCallID),
+			"modal_input_id":                strings.TrimSpace(req.ModalInputID),
+			"modal_call_cancel_status":      firstNonEmptyString(req.CancelStatus, "active"),
+		})
+	}
+	job, err := s.store.UpdateJobConfig(c.Param("id"), patch)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, job)
+}
+
 func (s *Server) completeJob(c *gin.Context) {
 	var req completeJobRequest
 	if !bindJSON(c, &req) {
+		return
+	}
+	if job, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"complete",
+		map[string]any{"mlflow_run_id": req.MLflowRunID},
+	); err != nil {
+		writeStoreError(c, err)
+		return
+	} else if ignored {
+		c.JSON(http.StatusOK, job)
 		return
 	}
 
@@ -4090,24 +4370,46 @@ func (s *Server) failJob(c *gin.Context) {
 	if !bindJSON(c, &req) {
 		return
 	}
+	callbackPayload := failureCallbackEventPayload(req)
+	if job, ignored, err := s.ignoreStaleJobCallback(
+		c.Param("id"),
+		req.TrainingAttemptID,
+		"fail",
+		callbackPayload,
+	); err != nil {
+		writeStoreError(c, err)
+		return
+	} else if ignored {
+		c.JSON(http.StatusOK, job)
+		return
+	}
 
 	if req.Retryable {
-		job, requeued, err := s.store.RetryJob(c.Param("id"), req.Error)
+		currentJob, err := s.store.GetJob(c.Param("id"))
+		if err != nil {
+			writeStoreError(c, err)
+			return
+		}
+		retryOptions, retryDecision := s.retryOptionsForFailure(currentJob, req)
+		job, requeued, err := s.store.RetryJob(c.Param("id"), req.Error, retryOptions)
 		if err != nil {
 			writeStoreError(c, err)
 			return
 		}
 		diagnostics.Event("warn", "job_retryable_failure", map[string]any{
-			"job_id":       job.ID,
-			"project_id":   job.ProjectID,
-			"worker_id":    job.WorkerID,
-			"template":     job.Template,
-			"attempt":      job.Attempt,
-			"max_attempts": job.MaxAttempts,
-			"requeued":     requeued,
-			"error":        req.Error,
+			"job_id":        job.ID,
+			"project_id":    job.ProjectID,
+			"worker_id":     job.WorkerID,
+			"template":      job.Template,
+			"attempt":       job.Attempt,
+			"max_attempts":  job.MaxAttempts,
+			"requeued":      requeued,
+			"error":         req.Error,
+			"failure_class": req.FailureClass,
+			"oom_kind":      req.OOMKind,
+			"retry_guard":   retryDecision.Status,
 		})
-		s.recordRetryableJobFailureEvent(job, requeued, req.Error)
+		s.recordRetryableJobFailureEvent(job, requeued, req.Error, retryDecision)
 		if job.Template == jobs.TemplateTrainExperiment {
 			status := jobs.StatusQueued
 			if !requeued {
@@ -4168,7 +4470,348 @@ func (s *Server) failJob(c *gin.Context) {
 	c.JSON(http.StatusOK, job)
 }
 
-func (s *Server) recordRetryableJobFailureEvent(job jobs.ExperimentJob, requeued bool, message string) {
+type retryFailureDecision struct {
+	Status              string
+	Reason              string
+	FailureClass        string
+	OOMKind             string
+	ResourceSignature   string
+	PreviousGPUType     string
+	NextGPUType         string
+	EffectiveBatchSize  int
+	MemoryMB            int
+	RepeatedSignature   bool
+	EscalationExhausted bool
+}
+
+func (s *Server) ignoreStaleJobCallback(jobID string, trainingAttemptID string, callbackType string, payload map[string]any) (jobs.ExperimentJob, bool, error) {
+	job, err := s.store.GetJob(jobID)
+	if err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
+	attemptID := strings.TrimSpace(trainingAttemptID)
+	if attemptID == "" {
+		return job, false, nil
+	}
+	activeAttemptID := strings.TrimSpace(jobConfigString(job.Config, "active_attempt_id"))
+	if !jobStatusIsTerminal(job.Status) && (activeAttemptID == "" || activeAttemptID == attemptID) {
+		return job, false, nil
+	}
+
+	eventPayload := copyPayloadMap(payload)
+	eventPayload["job_id"] = job.ID
+	eventPayload["callback_type"] = callbackType
+	eventPayload["training_attempt_id"] = attemptID
+	eventPayload["active_attempt_id"] = activeAttemptID
+	eventPayload["job_status"] = job.Status
+	eventPayload["job_attempt"] = job.Attempt
+	planID := jobConfigString(job.Config, "plan_id")
+	if _, eventErr := s.store.CreateExecutionEvent(
+		job.ProjectID,
+		planID,
+		execution.EventJobStaleCallbackIgnored,
+		fmt.Sprintf("Ignored stale %s callback for job %s.", callbackType, job.ID),
+		eventPayload,
+	); eventErr != nil {
+		log.Printf("record stale job callback event failed: %v", eventErr)
+	}
+	diagnostics.Event("warn", "job_stale_callback_ignored", eventPayload)
+	return job, true, nil
+}
+
+func jobStatusIsTerminal(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case jobs.StatusSucceeded, jobs.StatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func trainingResourcePayload(trainingAttemptID string, requestedGPU string, effectiveGPU string, signature string) map[string]any {
+	payload := map[string]any{}
+	if strings.TrimSpace(trainingAttemptID) != "" {
+		payload["training_attempt_id"] = strings.TrimSpace(trainingAttemptID)
+	}
+	if strings.TrimSpace(requestedGPU) != "" {
+		payload["requested_gpu_type"] = strings.TrimSpace(requestedGPU)
+	}
+	if strings.TrimSpace(effectiveGPU) != "" {
+		payload["effective_gpu_type"] = strings.TrimSpace(effectiveGPU)
+	}
+	if strings.TrimSpace(signature) != "" {
+		payload["modal_resource_signature"] = strings.TrimSpace(signature)
+	}
+	return payload
+}
+
+func failureCallbackEventPayload(req failJobRequest) map[string]any {
+	payload := trainingResourcePayload(req.TrainingAttemptID, req.RequestedGPUType, req.EffectiveGPUType, req.ModalResourceSignature)
+	payload["retryable"] = req.Retryable
+	payload["failure_class"] = strings.TrimSpace(req.FailureClass)
+	payload["failure_type"] = strings.TrimSpace(req.FailureType)
+	payload["oom"] = req.OOM
+	payload["oom_kind"] = strings.TrimSpace(req.OOMKind)
+	payload["requested_batch_size"] = req.RequestedBatchSize
+	payload["effective_batch_size"] = req.EffectiveBatchSize
+	payload["memory_mb"] = req.MemoryMB
+	payload["modal_function_call_id"] = strings.TrimSpace(req.ModalFunctionCallID)
+	payload["modal_input_id"] = strings.TrimSpace(req.ModalInputID)
+	return payload
+}
+
+func (s *Server) retryOptionsForFailure(job jobs.ExperimentJob, req failJobRequest) (store.RetryJobOptions, retryFailureDecision) {
+	decision := retryFailureDecision{
+		Status:             "standard_retry",
+		FailureClass:       strings.ToLower(strings.TrimSpace(firstNonEmptyString(req.FailureClass, req.FailureType))),
+		OOMKind:            strings.TrimSpace(req.OOMKind),
+		ResourceSignature:  modalFailureResourceSignature(job, req),
+		PreviousGPUType:    normalizeModalGPUType(firstNonEmptyString(req.EffectiveGPUType, req.RequestedGPUType, jobConfigString(job.Config, "gpu_type"))),
+		EffectiveBatchSize: firstPositiveInt(req.EffectiveBatchSize, req.RequestedBatchSize, jobConfigInt(job.Config, "batch_size")),
+		MemoryMB:           firstPositiveInt(req.MemoryMB, modalDefaultMemoryMB(firstNonEmptyString(req.EffectiveGPUType, req.RequestedGPUType, jobConfigString(job.Config, "gpu_type")), modalJobIsDetection(job.Config))),
+	}
+	if !confirmedOOMFailure(req) {
+		return store.RetryJobOptions{}, decision
+	}
+
+	config := copyPayloadMap(job.Config)
+	if config == nil {
+		config = map[string]any{}
+	}
+	history := modalOOMRetryHistory(config)
+	decision.FailureClass = "oom"
+	decision.Status = "oom_gpu_escalation_pending"
+	decision.RepeatedSignature = modalOOMHistoryContains(history, decision.ResourceSignature)
+	history = append(history, map[string]any{
+		"attempt":                  job.Attempt,
+		"training_attempt_id":      strings.TrimSpace(req.TrainingAttemptID),
+		"modal_resource_signature": decision.ResourceSignature,
+		"effective_gpu_type":       decision.PreviousGPUType,
+		"effective_batch_size":     decision.EffectiveBatchSize,
+		"memory_mb":                decision.MemoryMB,
+		"oom_kind":                 strings.TrimSpace(req.OOMKind),
+		"modal_function_call_id":   strings.TrimSpace(req.ModalFunctionCallID),
+		"modal_input_id":           strings.TrimSpace(req.ModalInputID),
+		"recorded_at":              time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	config[modalOOMRetryHistoryKey] = history
+
+	if decision.RepeatedSignature {
+		decision.Status = "oom_retry_blocked_same_resource"
+		decision.Reason = "confirmed OOM already recorded for this GPU/batch/memory signature"
+		return store.RetryJobOptions{Config: config, ForceFail: true}, decision
+	}
+
+	nextGPU, nextMemory := nextModalGPUForOOM(decision.PreviousGPUType, decision.EffectiveBatchSize, history, modalJobIsDetection(job.Config))
+	if nextGPU == "" {
+		decision.Status = "oom_escalation_exhausted"
+		decision.Reason = "no untried GPU tier remains for the confirmed OOM batch signature"
+		decision.EscalationExhausted = true
+		return store.RetryJobOptions{Config: config, ForceFail: true}, decision
+	}
+
+	decision.NextGPUType = nextGPU
+	decision.MemoryMB = nextMemory
+	config["gpu_type"] = nextGPU
+	config["resource_attempt"] = len(history) + 1
+	config["modal_retry"] = map[string]any{
+		"reason":                      "confirmed_oom_gpu_escalation",
+		"previous_gpu_type":           decision.PreviousGPUType,
+		"next_gpu_type":               nextGPU,
+		"preserved_batch_size":        decision.EffectiveBatchSize,
+		"previous_resource_signature": decision.ResourceSignature,
+	}
+	config["modal_resources"] = mergePayloadMap(payloadMap(config, "modal_resources"), map[string]any{
+		"requested_gpu_type":       nextGPU,
+		"effective_gpu_type":       nextGPU,
+		"memory_mb":                nextMemory,
+		"requested_batch_size":     decision.EffectiveBatchSize,
+		"effective_batch_size":     decision.EffectiveBatchSize,
+		"batch_size_policy":        "preserved",
+		"resource_attempt":         len(history) + 1,
+		"previous_oom_signature":   decision.ResourceSignature,
+		"retry_reason":             "confirmed_oom_gpu_escalation",
+		"modal_function_options":   map[string]any{"gpu": nextGPU, "memory": nextMemory},
+		"modal_resource_signature": modalResourceSignature(nextGPU, decision.EffectiveBatchSize, nextMemory),
+	})
+	decision.Status = "oom_gpu_escalated"
+	decision.Reason = "confirmed OOM escalated to next untried Modal GPU tier"
+	return store.RetryJobOptions{Config: config}, decision
+}
+
+func confirmedOOMFailure(req failJobRequest) bool {
+	if req.OOM {
+		return true
+	}
+	failureClass := strings.ToLower(strings.TrimSpace(firstNonEmptyString(req.FailureClass, req.FailureType)))
+	if failureClass == "oom" || failureClass == "out_of_memory" {
+		return true
+	}
+	message := strings.ToLower(req.Error)
+	return strings.Contains(message, "cuda out of memory") ||
+		strings.Contains(message, "outofmemoryerror") ||
+		strings.Contains(message, "out of memory") ||
+		strings.Contains(message, "exit code 137") ||
+		strings.Contains(message, "oom killed")
+}
+
+func modalFailureResourceSignature(job jobs.ExperimentJob, req failJobRequest) string {
+	if signature := strings.TrimSpace(req.ModalResourceSignature); signature != "" {
+		return signature
+	}
+	gpuType := firstNonEmptyString(req.EffectiveGPUType, req.RequestedGPUType, jobConfigString(job.Config, "gpu_type"), "T4")
+	batchSize := firstPositiveInt(req.EffectiveBatchSize, req.RequestedBatchSize, jobConfigInt(job.Config, "batch_size"))
+	memoryMB := firstPositiveInt(req.MemoryMB, modalDefaultMemoryMB(gpuType, modalJobIsDetection(job.Config)))
+	return modalResourceSignature(gpuType, batchSize, memoryMB)
+}
+
+func modalOOMRetryHistory(config map[string]any) []map[string]any {
+	raw, ok := config[modalOOMRetryHistoryKey].([]any)
+	if !ok {
+		if typed, typedOK := config[modalOOMRetryHistoryKey].([]map[string]any); typedOK {
+			return append([]map[string]any(nil), typed...)
+		}
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if typed := mapFromAny(item); len(typed) > 0 {
+			out = append(out, typed)
+		}
+	}
+	return out
+}
+
+func modalOOMHistoryContains(history []map[string]any, signature string) bool {
+	signature = strings.TrimSpace(signature)
+	if signature == "" {
+		return false
+	}
+	for _, item := range history {
+		if strings.TrimSpace(payloadString(item, "modal_resource_signature")) == signature ||
+			strings.TrimSpace(payloadString(item, "resource_signature")) == signature {
+			return true
+		}
+	}
+	return false
+}
+
+func nextModalGPUForOOM(currentGPU string, batchSize int, history []map[string]any, detectionJob bool) (string, int) {
+	current := normalizeModalGPUType(currentGPU)
+	start := -1
+	for index, candidate := range modalGPUEscalationLadder {
+		if normalizeModalGPUType(candidate) == current {
+			start = index
+			break
+		}
+	}
+	for _, candidate := range modalGPUEscalationLadder[start+1:] {
+		memoryMB := modalDefaultMemoryMB(candidate, detectionJob)
+		signature := modalResourceSignature(candidate, batchSize, memoryMB)
+		if modalOOMHistoryContains(history, signature) {
+			continue
+		}
+		return candidate, memoryMB
+	}
+	return "", 0
+}
+
+func modalResourceSignature(gpuType string, batchSize int, memoryMB int) string {
+	return fmt.Sprintf(
+		"gpu=%s|batch=%d|memory_mb=%d",
+		normalizeModalGPUType(gpuType),
+		maxInt(batchSize, 0),
+		maxInt(memoryMB, 0),
+	)
+}
+
+func normalizeModalGPUType(value string) string {
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(value), "_", "-"))
+	switch normalized {
+	case "A100-40G":
+		return "A100-40GB"
+	case "A100-80G":
+		return "A100-80GB"
+	case "":
+		return "T4"
+	default:
+		return normalized
+	}
+}
+
+func modalDefaultMemoryMB(gpuType string, detectionJob bool) int {
+	defaults := map[string]int{
+		"T4":        16384,
+		"L4":        24576,
+		"A10":       32768,
+		"L40S":      65536,
+		"A100":      65536,
+		"A100-40GB": 65536,
+		"A100-80GB": 98304,
+	}
+	memoryMB := defaults[normalizeModalGPUType(gpuType)]
+	if memoryMB == 0 {
+		memoryMB = 24576
+	}
+	if detectionJob && memoryMB < 24576 {
+		return 24576
+	}
+	return memoryMB
+}
+
+func modalJobIsDetection(config map[string]any) bool {
+	model := strings.ToLower(strings.TrimSpace(jobConfigString(config, "model")))
+	return strings.ToLower(strings.TrimSpace(jobConfigString(config, "task_type"))) == "object_detection" ||
+		strings.ToLower(strings.TrimSpace(jobConfigString(config, "model_kind"))) == "ultralytics_yolo_detector" ||
+		strings.HasPrefix(model, "yolo")
+}
+
+func jobConfigInt(config map[string]any, key string) int {
+	switch value := config[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case string:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(value))
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func firstPositiveInt(values ...int) int {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func mergePayloadMap(base map[string]any, overlay map[string]any) map[string]any {
+	out := copyPayloadMap(base)
+	if out == nil {
+		out = map[string]any{}
+	}
+	for key, value := range overlay {
+		out[key] = value
+	}
+	return out
+}
+
+func (s *Server) recordRetryableJobFailureEvent(job jobs.ExperimentJob, requeued bool, message string, retryDecision retryFailureDecision) {
 	planID := jobConfigString(job.Config, "plan_id")
 	nextAttempt := job.Attempt + 1
 	if nextAttempt > job.MaxAttempts {
@@ -4188,6 +4831,20 @@ func (s *Server) recordRetryableJobFailureEvent(job jobs.ExperimentJob, requeued
 		"max_attempts": job.MaxAttempts,
 		"requeued":     requeued,
 		"error":        message,
+		"retry_guard": map[string]any{
+			"status":                   retryDecision.Status,
+			"reason":                   retryDecision.Reason,
+			"failure_class":            retryDecision.FailureClass,
+			"oom_kind":                 retryDecision.OOMKind,
+			"resource_signature":       retryDecision.ResourceSignature,
+			"previous_gpu_type":        retryDecision.PreviousGPUType,
+			"next_gpu_type":            retryDecision.NextGPUType,
+			"effective_batch_size":     retryDecision.EffectiveBatchSize,
+			"memory_mb":                retryDecision.MemoryMB,
+			"repeated_signature":       retryDecision.RepeatedSignature,
+			"escalation_exhausted":     retryDecision.EscalationExhausted,
+			"same_combo_retry_blocked": retryDecision.Status == "oom_retry_blocked_same_resource",
+		},
 	}); err != nil {
 		log.Printf("record retryable job failure event failed: %v", err)
 	}
@@ -4270,6 +4927,9 @@ func workerRequirementMatchesJobProvider(requirement execution.WorkerRequirement
 	jobGPU := strings.ToLower(strings.TrimSpace(jobConfigString(job.Config, "gpu_type")))
 	if jobProvider != "" && requirementProvider != "" && jobProvider != requirementProvider {
 		return false
+	}
+	if jobProvider == "modal" && requirementProvider == "modal" {
+		return true
 	}
 	if jobGPU != "" && requirementGPU != "" && jobGPU != requirementGPU {
 		return false
@@ -9113,6 +9773,393 @@ func (s *Server) executeExperimentPlan(c *gin.Context) {
 	c.JSON(http.StatusCreated, response)
 }
 
+func (s *Server) cancelPlanActiveExecution(c *gin.Context) {
+	var req cancelExecutionRequest
+	if !bindOptionalJSON(c, &req) {
+		return
+	}
+	response, err := s.cancelPlanActiveExecutionByID(c.Param("id"), req)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (s *Server) cancelProjectActiveExecutions(c *gin.Context) {
+	var req cancelExecutionRequest
+	if !bindOptionalJSON(c, &req) {
+		return
+	}
+	projectID := c.Param("id")
+	if _, err := s.store.GetProject(projectID); err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	planIDs, err := s.activePlanIDsForProject(projectID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	response := cancelExecutionResponse{
+		ExecutionID: "project:" + projectID,
+		Target: map[string]string{
+			"project_id": projectID,
+		},
+		Status:        "CANCELLED_BY_USER",
+		Message:       "No active executions matched this project.",
+		ModalCalls:    []cancelModalCallResult{},
+		Compatibility: cancellationCompatibility(),
+		Plans:         []cancelExecutionResponse{},
+	}
+	for _, planID := range planIDs {
+		planResponse, cancelErr := s.cancelPlanActiveExecutionByID(planID, req)
+		if cancelErr != nil {
+			writeStoreError(c, cancelErr)
+			return
+		}
+		response.Plans = append(response.Plans, planResponse)
+		response.QueuedJobsCancelled += planResponse.QueuedJobsCancelled
+		response.ActiveJobsMarkedCancelling += planResponse.ActiveJobsMarkedCancelling
+		response.AlreadyTerminalJobs += planResponse.AlreadyTerminalJobs
+		response.ModalCalls = append(response.ModalCalls, planResponse.ModalCalls...)
+		response.WorkerRequirements = append(response.WorkerRequirements, planResponse.WorkerRequirements...)
+		response.Jobs = append(response.Jobs, planResponse.Jobs...)
+		if planResponse.BestAvailableModel.Exportable && !response.BestAvailableModel.Exportable {
+			response.BestAvailableModel = planResponse.BestAvailableModel
+		}
+	}
+	if len(response.Plans) > 0 {
+		response.Message = fmt.Sprintf("Cancelled %d active execution(s) for project %s.", len(response.Plans), projectID)
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (s *Server) cancelPlanActiveExecutionByID(planID string, req cancelExecutionRequest) (cancelExecutionResponse, error) {
+	plan, err := s.store.GetExperimentPlan(planID)
+	if err != nil {
+		return cancelExecutionResponse{}, err
+	}
+	reason := cancellationReason(req.Reason)
+	response := cancelExecutionResponse{
+		ExecutionID: "plan:" + plan.ID,
+		Target: map[string]string{
+			"project_id": plan.ProjectID,
+			"plan_id":    plan.ID,
+		},
+		Status:        "CANCELLING_BY_USER",
+		Message:       fmt.Sprintf("Cancellation requested for plan %s.", plan.ID),
+		ModalCalls:    []cancelModalCallResult{},
+		Compatibility: cancellationCompatibility(),
+	}
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventExecutionCancellationRequested, response.Message, map[string]any{
+		"reason":                 reason,
+		"promote_best_available": req.PromoteBestAvailable,
+		"terminate_remote_work":  req.TerminateRemoteWork,
+	}); err != nil {
+		return cancelExecutionResponse{}, err
+	}
+
+	projectJobs, err := s.store.ListProjectJobs(plan.ProjectID)
+	if err != nil {
+		return cancelExecutionResponse{}, err
+	}
+	cancelMessage := fmt.Sprintf("cancelled by user: %s", reason)
+	for _, job := range projectJobs {
+		if strings.TrimSpace(jobConfigString(job.Config, "plan_id")) != plan.ID {
+			continue
+		}
+		if jobStatusIsTerminal(job.Status) {
+			response.AlreadyTerminalJobs++
+			continue
+		}
+		modalCall := modalCallCancelResultForJob(job, req.TerminateRemoteWork)
+		response.ModalCalls = append(response.ModalCalls, modalCall)
+		if req.TerminateRemoteWork && modalCall.ModalFunctionCallObjectID != "" {
+			if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventRemoteWorkCancelRequested, fmt.Sprintf("Requested Modal cancellation for job %s.", job.ID), map[string]any{
+				"job_id":                        job.ID,
+				"training_attempt_id":           modalCall.TrainingAttemptID,
+				"modal_function_call_object_id": modalCall.ModalFunctionCallObjectID,
+				"modal_function_call_id":        modalCall.ModalFunctionCallID,
+				"modal_input_id":                modalCall.ModalInputID,
+				"terminate_remote_work":         true,
+			}); err != nil {
+				return cancelExecutionResponse{}, err
+			}
+		}
+		if strings.ToUpper(strings.TrimSpace(job.Status)) == jobs.StatusQueued {
+			response.QueuedJobsCancelled++
+		} else {
+			response.ActiveJobsMarkedCancelling++
+		}
+		cancelledJob, err := s.store.FailJob(job.ID, cancelMessage)
+		if err != nil {
+			return cancelExecutionResponse{}, err
+		}
+		cancelledJob, err = s.store.UpdateJobConfig(cancelledJob.ID, cancellationJobConfigPatch(reason, modalCall, req.TerminateRemoteWork))
+		if err != nil {
+			return cancelExecutionResponse{}, err
+		}
+		if cancelledJob.Template == jobs.TemplateTrainExperiment {
+			if _, err := s.store.UpsertTrainingRunSummary(cancelledJob.ID, runs.TrainingRunSummaryUpdate{
+				Status: jobs.StatusFailed,
+			}); err != nil {
+				return cancelExecutionResponse{}, err
+			}
+		}
+		response.Jobs = append(response.Jobs, cancelledJob)
+	}
+
+	updatedRequirements, err := s.cancelPlanWorkerRequirements(plan, reason)
+	if err != nil {
+		return cancelExecutionResponse{}, err
+	}
+	response.WorkerRequirements = updatedRequirements
+	if req.PromoteBestAvailable {
+		best, err := s.selectBestAvailableChampionForUserCancelledPlan(plan, reason)
+		if err != nil {
+			return cancelExecutionResponse{}, err
+		}
+		response.BestAvailableModel = best
+	} else {
+		response.BestAvailableModel = cancelBestAvailableModel{
+			Exportable: false,
+			Reason:     "best_available_promotion_disabled",
+		}
+	}
+	response.Status = "CANCELLED_BY_USER"
+	response.Message = fmt.Sprintf("Cancelled plan %s: %d queued job(s), %d active job(s), %d worker requirement(s).", plan.ID, response.QueuedJobsCancelled, response.ActiveJobsMarkedCancelling, len(response.WorkerRequirements))
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventExecutionCancelled, response.Message, map[string]any{
+		"reason":                               reason,
+		"queued_jobs_cancelled":                response.QueuedJobsCancelled,
+		"active_jobs_marked_cancelling":        response.ActiveJobsMarkedCancelling,
+		"already_terminal_jobs":                response.AlreadyTerminalJobs,
+		"worker_requirement_ids":               workerRequirementIDs(response.WorkerRequirements),
+		"modal_calls":                          response.ModalCalls,
+		"best_available_model":                 response.BestAvailableModel,
+		"job_cancelled_status_enabled":         false,
+		"late_callbacks_ignored_by_attempt_id": true,
+	}); err != nil {
+		return cancelExecutionResponse{}, err
+	}
+	return response, nil
+}
+
+func (s *Server) activePlanIDsForProject(projectID string) ([]string, error) {
+	seen := map[string]bool{}
+	out := []string{}
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return nil, err
+	}
+	for _, job := range projectJobs {
+		if jobStatusIsTerminal(job.Status) {
+			continue
+		}
+		planID := strings.TrimSpace(jobConfigString(job.Config, "plan_id"))
+		if planID == "" || seen[planID] {
+			continue
+		}
+		seen[planID] = true
+		out = append(out, planID)
+	}
+	requirements, err := s.store.ListProjectWorkerRequirements(projectID)
+	if err != nil {
+		return nil, err
+	}
+	for _, requirement := range requirements {
+		if !workerRequirementHasDemandStatus(requirement.Status) {
+			continue
+		}
+		planID := strings.TrimSpace(requirement.PlanID)
+		if planID == "" || seen[planID] {
+			continue
+		}
+		seen[planID] = true
+		out = append(out, planID)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (s *Server) cancelPlanWorkerRequirements(plan plans.ExperimentPlan, reason string) ([]execution.WorkerRequirement, error) {
+	requirements, err := s.store.ListProjectWorkerRequirements(plan.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	out := []execution.WorkerRequirement{}
+	cancelled := execution.WorkerRequirementCancelled
+	message := fmt.Sprintf("cancelled by user: %s", reason)
+	for _, requirement := range requirements {
+		if requirement.PlanID != plan.ID || !workerRequirementHasDemandStatus(requirement.Status) {
+			continue
+		}
+		updated, err := s.store.UpdateWorkerRequirement(requirement.ID, execution.WorkerRequirementUpdate{
+			Status:    &cancelled,
+			LastError: &message,
+		})
+		if err != nil {
+			return nil, err
+		}
+		s.recordWorkerRequirementStatusEvent(updated)
+		out = append(out, updated)
+	}
+	return out, nil
+}
+
+func cancellationCompatibility() map[string]bool {
+	return map[string]bool{
+		"job_cancelled_status_enabled":         false,
+		"late_callbacks_ignored_by_attempt_id": true,
+	}
+}
+
+func cancellationReason(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return "user_requested"
+	}
+	return reason
+}
+
+func modalCallCancelResultForJob(job jobs.ExperimentJob, terminateRemoteWork bool) cancelModalCallResult {
+	status := "not_started"
+	if strings.ToUpper(strings.TrimSpace(job.Status)) != jobs.StatusQueued {
+		status = "call_id_not_recorded"
+	}
+	objectID := firstNonEmptyString(
+		jobConfigString(job.Config, "modal_function_call_object_id"),
+		payloadString(payloadMap(job.Config, "modal_resources"), "modal_function_call_object_id"),
+	)
+	if objectID != "" {
+		if terminateRemoteWork {
+			status = "cancel_requested"
+		} else {
+			status = "recorded_not_cancelled"
+		}
+	}
+	return cancelModalCallResult{
+		JobID:                     job.ID,
+		TrainingAttemptID:         jobConfigString(job.Config, "active_attempt_id"),
+		ModalFunctionCallObjectID: objectID,
+		ModalFunctionCallID: firstNonEmptyString(
+			jobConfigString(job.Config, "modal_function_call_id"),
+			payloadString(payloadMap(job.Config, "modal_resources"), "modal_function_call_id"),
+		),
+		ModalInputID: firstNonEmptyString(
+			jobConfigString(job.Config, "modal_input_id"),
+			payloadString(payloadMap(job.Config, "modal_resources"), "modal_input_id"),
+		),
+		CancelStatus: status,
+	}
+}
+
+func cancellationJobConfigPatch(reason string, modalCall cancelModalCallResult, terminateRemoteWork bool) map[string]any {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	patch := map[string]any{
+		"cancel_requested":      true,
+		"cancel_requested_at":   now,
+		"cancel_reason":         reason,
+		"failure_class":         "cancelled",
+		"modal_cancel_status":   modalCall.CancelStatus,
+		"terminate_remote_work": terminateRemoteWork,
+		"worker_stop_requested": true,
+	}
+	if modalCall.ModalFunctionCallObjectID != "" {
+		patch["modal_function_call_object_id"] = modalCall.ModalFunctionCallObjectID
+	}
+	if modalCall.ModalFunctionCallID != "" {
+		patch["modal_function_call_id"] = modalCall.ModalFunctionCallID
+	}
+	if modalCall.ModalInputID != "" {
+		patch["modal_input_id"] = modalCall.ModalInputID
+	}
+	if modalCall.TrainingAttemptID != "" {
+		patch["cancelled_training_attempt_id"] = modalCall.TrainingAttemptID
+	}
+	return patch
+}
+
+func workerRequirementIDs(requirements []execution.WorkerRequirement) []string {
+	out := make([]string, 0, len(requirements))
+	for _, requirement := range requirements {
+		out = append(out, requirement.ID)
+	}
+	return out
+}
+
+func (s *Server) selectBestAvailableChampionForUserCancelledPlan(plan plans.ExperimentPlan, reason string) (cancelBestAvailableModel, error) {
+	if champion, err := s.store.GetProjectChampion(plan.ProjectID); err == nil {
+		return cancelBestAvailableModel{
+			JobID:                   champion.JobID,
+			Exportable:              true,
+			ChampionSelectionSource: userCancelChampionDecisionSource,
+			Score:                   payloadFloat(champion.Metrics, "selection_score"),
+			Reason:                  "existing_champion_available",
+		}, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return cancelBestAvailableModel{}, err
+	}
+	summaries, err := s.store.ListProjectTrainingRunSummaries(plan.ProjectID)
+	if err != nil {
+		return cancelBestAvailableModel{}, err
+	}
+	planSummaries := []runs.TrainingRunSummary{}
+	for _, summary := range summaries {
+		if summary.PlanID == plan.ID {
+			planSummaries = append(planSummaries, summary)
+		}
+	}
+	best, ok := bestSuccessfulTrainingSummaryForObjective(plan.TargetMetric, planSummaries, nil, agents.ProjectObjectiveContext{})
+	if !ok {
+		if _, eventErr := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventExecutionCancelled, "Run stopped; no exportable completed model is available yet.", map[string]any{
+			"decision_source": userCancelChampionDecisionSource,
+			"reason":          reason,
+			"exportable":      false,
+		}); eventErr != nil {
+			return cancelBestAvailableModel{}, eventErr
+		}
+		return cancelBestAvailableModel{
+			Exportable: false,
+			Reason:     "no_successful_completed_model",
+		}, nil
+	}
+	score := holisticRunScore(plan.TargetMetric, best, runs.TrainingRunEvaluation{}, agents.ProjectObjectiveContext{})
+	decision, err := s.store.CreateAgentDecision(
+		plan.ProjectID,
+		plan.ID,
+		decisions.TypeSelectChampion,
+		fmt.Sprintf("User stopped plan %s, so the backend selected the best completed model available before cancellation: %s.", plan.ID, best.JobID),
+		map[string]any{
+			"decision_source":               userCancelChampionDecisionSource,
+			"target_metric":                 plan.TargetMetric,
+			"champion_job_id":               best.JobID,
+			"champion_model":                best.Model,
+			"champion_score":                roundDiagnosticFloat(score),
+			"champion_macro_f1":             roundDiagnosticFloat(best.BestMacroF1),
+			"champion_accuracy":             roundDiagnosticFloat(best.BestAccuracy),
+			"champion_estimated_cost_usd":   roundDiagnosticFloat(best.EstimatedCostUSD),
+			"champion_runtime_seconds":      roundDiagnosticFloat(best.RuntimeSeconds),
+			"selected_best_available_model": true,
+			"user_cancel_reason":            reason,
+		},
+	)
+	if err != nil {
+		return cancelBestAvailableModel{}, err
+	}
+	if err := s.persistProjectChampionFromDecision(plan.ProjectID, decision); err != nil {
+		return cancelBestAvailableModel{}, err
+	}
+	return cancelBestAvailableModel{
+		JobID:                   best.JobID,
+		Exportable:              true,
+		ChampionSelectionSource: userCancelChampionDecisionSource,
+		Model:                   best.Model,
+		Score:                   roundDiagnosticFloat(score),
+		Reason:                  "selected_best_completed_model",
+	}, nil
+}
+
 func (s *Server) createInitialPlanForDataset(datasetID string) error {
 	dataset, err := s.store.GetDataset(datasetID)
 	if err != nil {
@@ -9212,7 +10259,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	if err != nil {
 		return executeExperimentPlanResponse{}, err
 	}
-	materializationPolicy := datasetMaterializationPolicy(dataset, provider, s.targetWorkerCountForPlan(plan, len(plan.Experiments)))
+	materializationPolicy := datasetMaterializationPolicy(dataset, provider, s.targetWorkerCountForPlanExecution(plan, len(plan.Experiments), req.MaxConcurrentJobs))
 	if costPolicy.Enabled && costPolicy.MaxConcurrentJobs > 0 && materializationPolicy.MaxConcurrentJobs > costPolicy.MaxConcurrentJobs {
 		materializationPolicy.MaxConcurrentJobs = costPolicy.MaxConcurrentJobs
 	}
@@ -9337,14 +10384,19 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		out = append(out, job)
 	}
 
+	workerRequirement, err := s.ensureWorkerRequirementForPlanJobs(plan, provider, req.GPUType, out, "plan_execution", req.MaxConcurrentJobs)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
 	if err := s.recordCostPolicySkippedJobs(plan, costPolicy); err != nil {
 		return executeExperimentPlanResponse{}, err
 	}
 
 	return executeExperimentPlanResponse{
-		Plan:       plan,
-		Jobs:       out,
-		CostPolicy: costPolicy.Payload(),
+		Plan:              plan,
+		Jobs:              out,
+		CostPolicy:        costPolicy.Payload(),
+		WorkerRequirement: workerRequirement,
 	}, nil
 }
 
@@ -13413,6 +14465,20 @@ func bindJSON(c *gin.Context, value any) bool {
 		return false
 	}
 
+	return true
+}
+
+func bindOptionalJSON(c *gin.Context, value any) bool {
+	if c.Request.Body == nil {
+		return true
+	}
+	if err := c.ShouldBindJSON(value); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return false
+	}
 	return true
 }
 

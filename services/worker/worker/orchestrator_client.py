@@ -18,6 +18,13 @@ class OrchestratorClient:
         )
         response.raise_for_status()
         return response.json()
+
+    def get_job(self, job_id: str) -> dict:
+        response = requests.get(
+            f"{self.base_url}/jobs/{job_id}", timeout=request_timeout_seconds()
+        )
+        response.raise_for_status()
+        return response.json()
     
     def update_dataset_profile(self, dataset_id: str, profile: dict) -> dict:
         response = requests.post(
@@ -196,6 +203,21 @@ class OrchestratorClient:
         response.raise_for_status()
         return response.json()
 
+    def report_modal_call(self, job_id: str, payload: dict) -> dict:
+        response = requests.post(
+            f"{self.base_url}/jobs/{job_id}/modal-call",
+            json=payload,
+            timeout=report_timeout_seconds(),
+        )
+        if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
+            return {
+                "status": "unavailable",
+                "reason": "modal_call_endpoint_unavailable",
+                "status_code": response.status_code,
+            }
+        _raise_for_status_with_body(response)
+        return response.json()
+
     def report_champion_export_result(self, job_id: str, result: dict) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/champion-export-result",
@@ -242,10 +264,21 @@ class OrchestratorClient:
         return response.json()
 
 
-    def fail_job(self, job_id: str, error: str, retryable: bool = False) -> dict:
+    def fail_job(
+        self,
+        job_id: str,
+        error: str,
+        retryable: bool = False,
+        metadata: dict | None = None,
+    ) -> dict:
         payload = {"error": error}
         if retryable:
             payload["retryable"] = True
+        if isinstance(metadata, dict):
+            payload.update(metadata)
+            payload["error"] = error
+            if retryable:
+                payload["retryable"] = True
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/fail",
             json=payload,

@@ -31,6 +31,11 @@ type JobPollFilter struct {
 	IncludeUnspecifiedProviderTemplates []string
 }
 
+type RetryJobOptions struct {
+	Config    map[string]any
+	ForceFail bool
+}
+
 func (filter JobPollFilter) Matches(job jobs.ExperimentJob) bool {
 	templates := normalizedSet(filter.Templates)
 	if len(templates) > 0 {
@@ -84,11 +89,12 @@ type Store interface {
 	CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error)
 	GetJob(id string) (jobs.ExperimentJob, error)
 	ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error)
+	UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error)
 	RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error)
 	ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error)
 	ListJobMetrics(jobID string) ([]jobs.EpochMetric, error)
 	CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error)
-	RetryJob(jobID string, message string) (jobs.ExperimentJob, bool, error)
+	RetryJob(jobID string, message string, options RetryJobOptions) (jobs.ExperimentJob, bool, error)
 	FailJob(jobID string, message string) (jobs.ExperimentJob, error)
 
 	UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error)

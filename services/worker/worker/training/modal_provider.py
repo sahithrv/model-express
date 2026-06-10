@@ -8,9 +8,20 @@ from urllib.parse import urlparse
 
 from worker.diagnostics import log_event
 from worker.orchestrator_client import OrchestratorClient
+from worker.training.modal_resources import (
+    callback_identity,
+    failure_callback_payload,
+    job_with_modal_resources,
+    resource_telemetry,
+    resolve_modal_resources,
+)
 
 
 class ModalRetryableFailureReported(RuntimeError):
+    pass
+
+
+class ModalJobCancelled(RuntimeError):
     pass
 
 
@@ -59,10 +70,9 @@ def modal_app_session():
 
 def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     config = job["config"]
-    if config.get("gpu_type"):
-        os.environ["MODAL_GPU_TYPE"] = str(config["gpu_type"])
-
     detection_job = _is_detection_training_config(config)
+    modal_resources = resolve_modal_resources(config, detection_job=detection_job)
+    job_payload = job_with_modal_resources(job, modal_resources)
     try:
         if detection_job:
             from worker.training.modal_app import app, train_yolo_detector as training_function
@@ -84,8 +94,9 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
 
     payload = {
-        "job": job,
+        "job": job_payload,
         "dataset": dataset,
+        "modal_resources": modal_resources,
         "orchestrator_url": orchestrator_url,
         "s3_endpoint_url": s3_endpoint_url,
         "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
@@ -95,21 +106,44 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
 
     print(
         "Submitting Modal training job "
-        f"{job['id']} model={config.get('model')} gpu={config.get('gpu_type') or os.getenv('MODAL_GPU_TYPE', 'T4')}"
+        f"{job['id']} model={config.get('model')} "
+        f"requested_gpu={modal_resources['requested_gpu_type']} "
+        f"effective_gpu={modal_resources['effective_gpu_type']} "
+        f"memory_mb={modal_resources['memory_mb']} "
+        f"batch={modal_resources['effective_batch_size']}"
     )
 
     try:
         with _modal_invocation_context(app):
-            result = _remote_function(training_function)(payload)
+            configured_function = _function_with_modal_options(training_function, modal_resources)
+            result = _invoke_modal_function(configured_function, payload, client, job_payload, modal_resources)
+    except ModalJobCancelled as exc:
+        log_event(
+            "info",
+            "modal_training_cancelled",
+            job_id=job["id"],
+            project_id=job.get("project_id", ""),
+            reason=str(exc),
+            modal_resource_signature=modal_resources.get("resource_signature", ""),
+        )
+        print(f"Modal training cancelled for {job['id']}: {exc}")
+        return
     except Exception as exc:
         message = _modal_training_error_message(exc)
-        client.fail_job(job["id"], message, retryable=True)
+        client.fail_job(
+            job["id"],
+            message,
+            retryable=True,
+            metadata=failure_callback_payload(job_payload, message, modal_resources),
+        )
         log_event(
             "warn",
             "modal_training_retry_queued",
             job_id=job["id"],
             project_id=job.get("project_id", ""),
             error=message,
+            failure_class=failure_callback_payload(job_payload, message, modal_resources).get("failure_class"),
+            modal_resource_signature=modal_resources.get("resource_signature", ""),
         )
         print(f"Modal training reported retryable failure for {job['id']}: {message}")
         return
@@ -165,10 +199,23 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
         s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
         _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
         _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+        tagged_jobs = _jobs_with_modal_batch_metadata(jobs, batch, "remote_batch_submitted")
+        enriched_jobs = []
+        resources_by_job = {}
+        for tagged_job in tagged_jobs:
+            tagged_config = tagged_job.get("config") if isinstance(tagged_job.get("config"), dict) else {}
+            tagged_resources = resolve_modal_resources(
+                tagged_config,
+                detection_job=_is_detection_training_config(tagged_config),
+            )
+            resources_by_job[str(tagged_job.get("id") or "")] = tagged_resources
+            enriched_jobs.append(job_with_modal_resources(tagged_job, tagged_resources))
+        batch_resources = _modal_batch_invocation_resources(enriched_jobs, resources_by_job)
         payload = {
             "batch": batch,
-            "jobs": _jobs_with_modal_batch_metadata(jobs, batch, "remote_batch_submitted"),
+            "jobs": enriched_jobs,
             "dataset": dataset,
+            "modal_resources": batch_resources,
             "orchestrator_url": orchestrator_url,
             "s3_endpoint_url": s3_endpoint_url,
             "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
@@ -176,7 +223,8 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
             "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
         }
         with _modal_invocation_context(app):
-            result = _remote_function(train_modal_preview_batch)(payload)
+            configured_function = _function_with_modal_options(train_modal_preview_batch, batch_resources)
+            result = _remote_function(configured_function)(payload)
     except Exception as exc:
         message = _modal_training_batch_error_message(exc)
         log_event(
@@ -225,6 +273,22 @@ def _jobs_with_modal_batch_metadata(jobs: list[dict], batch: dict, remote_status
             }
         )
     return tagged_jobs
+
+
+def _modal_batch_invocation_resources(enriched_jobs: list[dict], resources_by_job: dict[str, dict]) -> dict:
+    if not enriched_jobs:
+        return resolve_modal_resources({}, detection_job=False)
+    first_job = enriched_jobs[0]
+    first_id = str(first_job.get("id") or "")
+    selected = resources_by_job.get(first_id)
+    if not selected:
+        config = first_job.get("config") if isinstance(first_job.get("config"), dict) else {}
+        selected = resolve_modal_resources(config, detection_job=_is_detection_training_config(config))
+    return {
+        **selected,
+        "batch_job_count": len(enriched_jobs),
+        "batch_job_ids": [str(job.get("id") or "") for job in enriched_jobs],
+    }
 
 
 def _remote_modal_training_batch_completed(result: dict) -> bool:
@@ -406,6 +470,154 @@ def _remote_function(function):
     return remote
 
 
+def _invoke_modal_function(function, payload: dict, client: OrchestratorClient, job: dict, modal_resources: dict):
+    spawn = getattr(function, "spawn", None)
+    if not modal_spawn_invocation_enabled() or not callable(spawn):
+        return _remote_function(function)(payload)
+    call = spawn(payload)
+    call_object_id = _modal_function_call_object_id(call)
+    if call_object_id:
+        _report_modal_call(client, job, modal_resources, call_object_id, "active")
+    return _wait_for_modal_function_call(call, client, job, modal_resources, call_object_id)
+
+
+def _wait_for_modal_function_call(call, client: OrchestratorClient, job: dict, modal_resources: dict, call_object_id: str):
+    get = getattr(call, "get", None)
+    if not callable(get):
+        raise RuntimeError("Modal Function.spawn() did not return a FunctionCall with get().")
+    poll_seconds = modal_call_poll_seconds()
+    while True:
+        try:
+            return get(timeout=poll_seconds)
+        except Exception as exc:
+            if not _is_modal_get_timeout(exc):
+                raise
+            if not _job_attempt_no_longer_active(client, job):
+                continue
+            cancel_status = _cancel_modal_function_call(call)
+            if call_object_id:
+                _report_modal_call(client, job, modal_resources, call_object_id, cancel_status)
+            raise ModalJobCancelled("backend marked this attempt stale or terminal") from exc
+
+
+def _modal_function_call_object_id(call) -> str:
+    for attr in ("object_id", "id"):
+        value = str(getattr(call, attr, "") or "").strip()
+        if value:
+            return value
+    hydrate = getattr(call, "hydrate", None)
+    if callable(hydrate):
+        try:
+            hydrate()
+        except Exception:
+            return ""
+        for attr in ("object_id", "id"):
+            value = str(getattr(call, attr, "") or "").strip()
+            if value:
+                return value
+    return str(getattr(call, "_object_id", "") or "").strip()
+
+
+def _report_modal_call(
+    client: OrchestratorClient,
+    job: dict,
+    modal_resources: dict,
+    call_object_id: str,
+    cancel_status: str,
+) -> None:
+    reporter = getattr(client, "report_modal_call", None)
+    if not callable(reporter):
+        return
+    telemetry = resource_telemetry(modal_resources)
+    payload = {
+        **callback_identity(job, modal_resources),
+        "modal_function_call_object_id": call_object_id,
+        "cancel_status": cancel_status,
+        "modal_resources": {
+            **telemetry,
+            "modal_function_call_object_id": call_object_id,
+            "modal_call_cancel_status": cancel_status,
+        },
+    }
+    try:
+        reporter(str(job.get("id") or ""), payload)
+    except Exception as exc:
+        log_event(
+            "warn",
+            "modal_function_call_report_failed",
+            job_id=job.get("id", ""),
+            project_id=job.get("project_id", ""),
+            modal_function_call_object_id=call_object_id,
+            error=str(exc),
+        )
+
+
+def _job_attempt_no_longer_active(client: OrchestratorClient, job: dict) -> bool:
+    getter = getattr(client, "get_job", None)
+    if not callable(getter):
+        return False
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return False
+    try:
+        latest = getter(job_id)
+    except Exception as exc:
+        log_event(
+            "warn",
+            "modal_attempt_status_check_failed",
+            job_id=job_id,
+            project_id=job.get("project_id", ""),
+            error=str(exc),
+        )
+        return False
+    latest_status = str(latest.get("status") or "").strip().upper()
+    if latest_status in {"FAILED", "SUCCEEDED", "CANCELLED"}:
+        return True
+    latest_config = latest.get("config") if isinstance(latest.get("config"), dict) else {}
+    expected_attempt = callback_identity(job, modal_resources=None).get("training_attempt_id", "")
+    active_attempt = str(latest_config.get("active_attempt_id") or "").strip()
+    return bool(expected_attempt and active_attempt and active_attempt != expected_attempt)
+
+
+def _cancel_modal_function_call(call) -> str:
+    cancel = getattr(call, "cancel", None)
+    if not callable(cancel):
+        return "cancel_unavailable"
+    try:
+        cancel(terminate_containers=modal_cancel_terminate_containers())
+        return "cancel_requested"
+    except TypeError:
+        cancel()
+        return "cancel_requested"
+    except Exception as exc:
+        log_event("warn", "modal_function_call_cancel_failed", error=str(exc))
+        return "cancel_failed"
+
+
+def _is_modal_get_timeout(exc: Exception) -> bool:
+    name = exc.__class__.__name__.lower()
+    if isinstance(exc, TimeoutError) or "timeout" in name:
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _function_with_modal_options(function, modal_resources: dict):
+    options = modal_resources.get("modal_function_options")
+    if not isinstance(options, dict):
+        options = {}
+    options = {
+        key: value
+        for key, value in options.items()
+        if key in {"gpu", "memory"} and value not in ("", None, 0)
+    }
+    if not options:
+        return function
+    with_options = getattr(function, "with_options", None)
+    if not callable(with_options):
+        return function
+    return with_options(**options)
+
+
 @contextmanager
 def _modal_invocation_context(app):
     if _modal_app_session_active():
@@ -555,3 +767,29 @@ def _send_dataset_metadata_import(client: OrchestratorClient, dataset_id: str, p
             dataset_id=dataset_id,
             error=str(exc),
         )
+
+
+def modal_spawn_invocation_enabled() -> bool:
+    return _env_flag("MODEL_EXPRESS_MODAL_USE_SPAWN", True)
+
+
+def modal_cancel_terminate_containers() -> bool:
+    return _env_flag("MODEL_EXPRESS_MODAL_CANCEL_TERMINATE_CONTAINERS", True)
+
+
+def modal_call_poll_seconds() -> float:
+    value = os.getenv("MODEL_EXPRESS_MODAL_CALL_POLL_SECONDS", "").strip()
+    if not value:
+        return 5.0
+    try:
+        parsed = float(value)
+    except ValueError:
+        return 5.0
+    return max(0.25, min(parsed, 60.0))
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
