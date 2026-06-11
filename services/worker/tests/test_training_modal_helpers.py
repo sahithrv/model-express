@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import tempfile
 import unittest
@@ -77,6 +78,12 @@ class ModalTrainingHelperTests(unittest.TestCase):
             "aws_access_key_id": "key",
             "aws_secret_access_key": "secret",
             "aws_default_region": "us-east-1",
+            "storage_scope": {
+                "token": "scope-token",
+                "buckets": ["bucket"],
+                "read_keys": ["datasets/project_1/data.zip"],
+                "write_prefixes": ["model-express/artifacts/job_1/"],
+            },
         }
 
     def test_safe_dataloader_defaults_cap_workers(self) -> None:
@@ -104,8 +111,8 @@ class ModalTrainingHelperTests(unittest.TestCase):
             def raise_for_status(self) -> None:
                 return None
 
-        def fake_post(url: str, *, json: dict, timeout: int):
-            calls.append({"url": url, "json": json, "timeout": timeout})
+        def fake_post(url: str, *, json: dict, timeout: int, headers: dict | None = None):
+            calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
             return Response()
 
         with patch.dict("os.environ", {"MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS": "240"}):
@@ -113,6 +120,103 @@ class ModalTrainingHelperTests(unittest.TestCase):
                 self.modal_app._post_json("http://orchestrator.test/jobs/job_1/complete", {"mlflow_run_id": "run_1"})
 
         self.assertEqual(calls[0]["timeout"], 240)
+        self.assertIsNone(calls[0]["headers"])
+
+    def test_modal_orchestrator_post_uses_callback_token_header(self) -> None:
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_post(url: str, *, json: dict, timeout: int, headers: dict | None = None):
+            calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+            return Response()
+
+        with patch("requests.post", fake_post):
+            self.modal_app._post_json(
+                "http://orchestrator.test/jobs/job_1/complete",
+                {"mlflow_run_id": "run_1"},
+                callback_token="callback-secret",
+            )
+
+        self.assertEqual(calls[0]["headers"], {"Authorization": "Bearer callback-secret"})
+
+    def test_modal_job_callbacks_use_callback_token_and_active_attempt(self) -> None:
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_post(url: str, *, json: dict, timeout: int, headers: dict | None = None):
+            calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+            return Response()
+
+        job = {
+            "id": "job_1",
+            "training_attempt_id": "stale-top-level",
+            "config": {
+                "active_attempt_id": "job_1:attempt-2",
+                "callback_token": "callback-secret",
+            },
+        }
+
+        with patch("requests.post", fake_post):
+            self.modal_app._post_job_json(
+                "https://orchestrator.test",
+                job,
+                "complete",
+                {"mlflow_run_id": "run_1"},
+            )
+            self.modal_app._post_training_run_summary(
+                "https://orchestrator.test",
+                "job_1",
+                {"status": "RUNNING"},
+                job=job,
+            )
+            self.modal_app._post_training_run_evaluation(
+                "https://orchestrator.test",
+                "job_1",
+                {"objective_profile": {}},
+                job=job,
+            )
+
+        self.assertEqual([call["json"]["training_attempt_id"] for call in calls], ["job_1:attempt-2"] * 3)
+        self.assertTrue(all(call["headers"] == {"Authorization": "Bearer callback-secret"} for call in calls))
+
+    def test_modal_failure_callback_uses_callback_token_and_active_attempt(self) -> None:
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_post(url: str, *, json: dict, timeout: int, headers: dict | None = None):
+            calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+            return Response()
+
+        payload = {
+            "job": {
+                "id": "job_1",
+                "config": {
+                    "active_attempt_id": "job_1:attempt-2",
+                    "callback_token": "callback-secret",
+                },
+            },
+            "orchestrator_url": "https://orchestrator.test",
+        }
+
+        with patch("requests.post", fake_post):
+            reported = self.modal_app._report_modal_training_retryable_failure(
+                payload,
+                RuntimeError("container exited unexpectedly"),
+            )
+
+        self.assertTrue(reported)
+        self.assertEqual(calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
+        self.assertEqual(calls[0]["json"]["training_attempt_id"], "job_1:attempt-2")
+        self.assertEqual(calls[0]["headers"], {"Authorization": "Bearer callback-secret"})
 
     def test_modal_dataset_timeouts_are_configurable(self) -> None:
         with patch.dict(
@@ -197,6 +301,12 @@ class ModalTrainingHelperTests(unittest.TestCase):
             "aws_access_key_id": "key",
             "aws_secret_access_key": "secret",
             "aws_default_region": "us-east-1",
+            "storage_scope": {
+                "token": "scope-token",
+                "buckets": ["bucket"],
+                "read_keys": ["datasets/project_1/data.zip"],
+                "write_prefixes": ["model-express/artifacts/job_1/"],
+            },
         }
         with patch.dict("os.environ", {}, clear=True):
             self.modal_app._configure_storage_env(payload)
@@ -372,6 +482,120 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(second_count, 0)
         self.assertEqual(posted_epochs, {1, 2})
         self.assertEqual(len(calls), 2)
+
+    def test_yolo_epoch_metric_callbacks_use_callback_token_header(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir)
+            results_path = run_root / "train" / "results.csv"
+            results_path.parent.mkdir(parents=True, exist_ok=True)
+            results_path.write_text(
+                "\n".join(
+                    [
+                        "epoch,metrics/mAP50-95(B),metrics/mAP50(B),metrics/precision(B),metrics/recall(B),val/box_loss,val/cls_loss,val/dfl_loss",
+                        "1,0.2,0.4,0.5,0.6,0.7,0.8,0.9",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            class Response:
+                def raise_for_status(self) -> None:
+                    return None
+
+            def fake_post(url: str, *, json: dict, timeout: int, headers: dict | None = None):
+                calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+                return Response()
+
+            with patch("requests.post", fake_post):
+                posted_count = self.modal_app._post_yolo_epoch_metrics(
+                    "https://orchestrator.test",
+                    "job_1",
+                    run_root,
+                    learning_rate=0.01,
+                    image_size=640,
+                    callback_identity={"training_attempt_id": "job_1:attempt-2"},
+                    callback_auth_token="callback-secret",
+                )
+
+        self.assertEqual(posted_count, 1)
+        self.assertEqual(calls[0]["json"]["training_attempt_id"], "job_1:attempt-2")
+        self.assertEqual(calls[0]["headers"], {"Authorization": "Bearer callback-secret"})
+
+    def test_modal_payload_configures_callback_env_and_clears_stale_values(self) -> None:
+        payload = {
+            "job": {
+                "id": "job_1",
+                "config": {
+                    "active_attempt_id": "job_1:attempt-2",
+                    "callback_token": "callback-secret",
+                },
+            },
+            "s3_endpoint_url": "https://s3.test",
+            "aws_access_key_id": "key",
+            "aws_secret_access_key": "secret",
+            "aws_default_region": "us-east-1",
+            "storage_scope": {
+                "token": "scope-token",
+                "buckets": ["bucket"],
+                "read_keys": ["datasets/project_1/data.zip"],
+                "write_prefixes": ["model-express/artifacts/job_1/"],
+            },
+        }
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_EXPRESS_CALLBACK_TOKEN": "stale-token",
+                "MODEL_EXPRESS_TRAINING_ATTEMPT_ID": "stale-attempt",
+            },
+            clear=False,
+        ):
+            self.modal_app._configure_storage_env(payload)
+            self.assertEqual(os.environ["MODEL_EXPRESS_CALLBACK_TOKEN"], "callback-secret")
+            self.assertEqual(os.environ["MODEL_EXPRESS_TRAINING_ATTEMPT_ID"], "job_1:attempt-2")
+            self.assertEqual(os.environ["MODEL_EXPRESS_STORAGE_SCOPE_TOKEN"], "scope-token")
+            self.assertEqual(os.environ["MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE"], "true")
+            self.assertEqual(json.loads(os.environ["MODEL_EXPRESS_STORAGE_SCOPE"])["write_prefixes"], ["model-express/artifacts/job_1/"])
+
+            self.modal_app._configure_storage_env(
+                {
+                    "job": {"id": "job_2", "config": {}},
+                    "s3_endpoint_url": "https://s3.test",
+                    "aws_access_key_id": "key",
+                    "aws_secret_access_key": "secret",
+                    "aws_default_region": "us-east-1",
+                }
+            )
+            self.assertNotIn("MODEL_EXPRESS_CALLBACK_TOKEN", os.environ)
+            self.assertNotIn("MODEL_EXPRESS_TRAINING_ATTEMPT_ID", os.environ)
+            self.assertNotIn("MODEL_EXPRESS_STORAGE_SCOPE", os.environ)
+            self.assertNotIn("MODEL_EXPRESS_STORAGE_SCOPE_TOKEN", os.environ)
+            self.assertNotIn("MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE", os.environ)
+
+    def test_modal_storage_scope_limits_s3_keys(self) -> None:
+        from worker.datasets import storage
+
+        scope = {
+            "token": "scope-token",
+            "buckets": ["bucket"],
+            "read_keys": ["datasets/project_1/data.zip"],
+            "write_prefixes": ["model-express/artifacts/job_1/"],
+        }
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_EXPRESS_STORAGE_SCOPE": json.dumps(scope),
+                "MODEL_EXPRESS_STORAGE_SCOPE_TOKEN": "scope-token",
+                "MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE": "true",
+            },
+            clear=True,
+        ):
+            storage.enforce_storage_scope("read", "bucket", "datasets/project_1/data.zip")
+            storage.enforce_storage_scope("write", "bucket", "model-express/artifacts/job_1/model.onnx")
+            with self.assertRaisesRegex(ValueError, "outside the remote storage scope"):
+                storage.enforce_storage_scope("read", "bucket", "datasets/project_2/data.zip")
+            with self.assertRaisesRegex(ValueError, "outside the remote storage scope"):
+                storage.enforce_storage_scope("write", "bucket", "model-express/artifacts/job_2/model.onnx")
 
     def test_modal_training_failure_report_marks_retryable(self) -> None:
         calls = []

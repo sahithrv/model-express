@@ -47,8 +47,44 @@ class ChampionJobTests(unittest.TestCase):
     def test_export_reports_ready_only_when_existing_artifact_is_copied(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            source = root / "source.onnx"
+            export_root = root / "exports"
+            source = export_root / "controlled" / "source.onnx"
+            source.parent.mkdir(parents=True)
             source.write_bytes(b"real onnx bytes")
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "onnx",
+                    "champion_job_id": "train_1",
+                    "artifact_path": str(source),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 64,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(export_root)}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "READY")
+            self.assertEqual(result["format"], "onnx")
+            self.assertTrue(result["artifact_uri"].startswith("file://"))
+            self.assertTrue((export_root / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
+            manifest = result["metadata"]["manifest"]
+            self.assertEqual(manifest["metadata"]["provenance"]["schema_version"], "worker_artifact_provenance_v1")
+            self.assertEqual(manifest["artifacts"][0]["provenance"]["source"], "worker_controlled_copy")
+            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.failed, [])
+
+    def test_export_rejects_absolute_artifact_path_outside_worker_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "outside" / "source.onnx"
+            source.parent.mkdir()
+            source.write_bytes(b"not worker owned")
             client = FakeClient()
             job = {
                 "id": "job_export",
@@ -67,12 +103,40 @@ class ChampionJobTests(unittest.TestCase):
                 run_export_champion_job(client, job)
 
             _, result = client.export_results[0]
-            self.assertEqual(result["status"], "READY")
-            self.assertEqual(result["format"], "onnx")
-            self.assertTrue(result["artifact_uri"].startswith("file://"))
-            self.assertTrue((root / "exports" / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
-            self.assertEqual(client.completed, ["job_export"])
-            self.assertEqual(client.failed, [])
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["artifact_uri"], "")
+            self.assertIn("ARTIFACT_SOURCE_REJECTED", result["error"])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed[0][0], "job_export")
+
+    def test_export_rejects_file_checkpoint_uri_outside_worker_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint = root / "outside" / "source.pt"
+            checkpoint.parent.mkdir()
+            checkpoint.write_bytes(b"checkpoint bytes")
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "torchscript",
+                    "checkpoint_uri": checkpoint.resolve().as_uri(),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 64,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(root / "exports")}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["artifact_uri"], "")
+            self.assertIn("ARTIFACT_SOURCE_REJECTED", result["error"])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed[0][0], "job_export")
 
     def test_onnx_export_does_not_relabel_checkpoint_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -97,13 +161,13 @@ class ChampionJobTests(unittest.TestCase):
                 run_export_champion_job(client, job)
 
             _, result = client.export_results[0]
-            self.assertEqual(result["status"], "PENDING_ARTIFACT")
+            self.assertEqual(result["status"], "FAILED")
             self.assertEqual(result["format"], "onnx")
             self.assertEqual(result["artifact_uri"], "")
-            self.assertIn("MODEL_UNAVAILABLE", result["error"])
+            self.assertIn("ARTIFACT_SOURCE_REJECTED", result["error"])
             self.assertFalse((root / "exports" / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
-            self.assertEqual(client.completed, ["job_export"])
-            self.assertEqual(client.failed, [])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed[0][0], "job_export")
 
     def test_onnx_export_converts_framework_checkpoint_when_available(self) -> None:
         try:
@@ -114,6 +178,7 @@ class ChampionJobTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            export_root = root / "exports"
             model = _build_torchvision_model(
                 model_name="mobilenet_v3_small",
                 class_count=2,
@@ -122,7 +187,8 @@ class ChampionJobTests(unittest.TestCase):
                 fine_tune_strategy="head_only",
                 dropout=0.0,
             )
-            checkpoint = root / "source.pt"
+            checkpoint = export_root / "checkpoints" / "source.pt"
+            checkpoint.parent.mkdir(parents=True)
             torch.save(
                 {
                     "state_dict": model.state_dict(),
@@ -152,15 +218,59 @@ class ChampionJobTests(unittest.TestCase):
                 },
             }
 
-            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(root / "exports")}):
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(export_root)}):
                 run_export_champion_job(client, job)
 
             _, result = client.export_results[0]
             self.assertEqual(result["status"], "READY")
             self.assertEqual(result["format"], "onnx")
-            self.assertTrue((root / "exports" / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
+            self.assertTrue((export_root / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
             self.assertEqual(client.completed, ["job_export"])
             self.assertEqual(client.failed, [])
+
+    def test_export_rejects_unsafe_pickle_checkpoint_without_execution(self) -> None:
+        try:
+            import torch
+        except Exception as exc:  # pragma: no cover - depends on optional local deps
+            raise unittest.SkipTest(f"torch is unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_root = root / "exports"
+            checkpoint = export_root / "checkpoints" / "unsafe.pt"
+            marker = root / "unsafe_executed.txt"
+            checkpoint.parent.mkdir(parents=True)
+
+            class UnsafePayload:
+                def __reduce__(self):
+                    return (
+                        eval,
+                        (f"__import__('pathlib').Path({str(marker)!r}).write_text('executed')",),
+                    )
+
+            torch.save({"state_dict": UnsafePayload()}, checkpoint)
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "torchscript",
+                    "checkpoint_path": str(checkpoint),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 32,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(export_root)}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "FAILED")
+            self.assertIn("CHECKPOINT_UNSAFE_PICKLE_REJECTED", result["error"])
+            self.assertFalse(marker.exists())
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed[0][0], "job_export")
 
     def test_export_without_artifact_reports_pending_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

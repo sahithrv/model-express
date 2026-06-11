@@ -234,8 +234,8 @@ def failure_callback_payload(job: dict, error: str, modal_resources: dict | None
 def training_attempt_id(job: dict) -> str:
     config = job.get("config") if isinstance(job.get("config"), dict) else {}
     for value in (
-        job.get("training_attempt_id"),
         config.get("active_attempt_id"),
+        job.get("training_attempt_id"),
         config.get("training_attempt_id"),
     ):
         text = str(value or "").strip()
@@ -265,6 +265,50 @@ def callback_identity(job: dict, modal_resources: dict | None = None) -> dict:
             }
         )
     return {key: value for key, value in identity.items() if value not in ("", None, 0)}
+
+
+def callback_token(job: dict | None) -> str:
+    if not isinstance(job, dict):
+        return ""
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    session = remote_training_session_metadata(job)
+    for value in (
+        config.get("callback_token"),
+        job.get("callback_token"),
+        session.get("callback_token"),
+        session.get("token"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def remote_training_session_metadata(job: dict | None) -> dict:
+    if not isinstance(job, dict):
+        return {}
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    for key in ("remote_training_session", "remoteTrainingSession", "RemoteTrainingSession"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            return deepcopy(value)
+    return {}
+
+
+def modal_callback_metadata(job: dict | None) -> dict:
+    metadata: dict = {}
+    if not isinstance(job, dict):
+        return metadata
+    attempt_id = training_attempt_id(job)
+    if attempt_id:
+        metadata["training_attempt_id"] = attempt_id
+    token = callback_token(job)
+    if token:
+        metadata["callback_token"] = token
+    session = remote_training_session_metadata(job)
+    if session:
+        metadata["remote_training_session"] = session
+    return metadata
 
 
 def normalize_gpu_type(value: object) -> str:

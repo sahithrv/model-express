@@ -1,7 +1,14 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu } = require("electron");
+let electron = {};
+try {
+  electron = require("electron");
+} catch {
+  electron = {};
+}
+const { app, BrowserWindow, dialog, ipcMain, Menu } = electron;
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { Transform } = require("stream");
 const { fileURLToPath, pathToFileURL } = require("url");
@@ -10,6 +17,17 @@ const { buildDatasetUploadPreflight, collectDatasetFiles, createZipArchiveStream
 
 let mainWindow;
 const projectWorkers = new Map();
+const projectTunnels = new Map();
+const selectedDatasetFolders = new Map();
+
+const DEFAULT_ORCHESTRATOR_URL = "http://127.0.0.1:8080";
+const DEFAULT_S3_ENDPOINT_URL = "http://127.0.0.1:9000";
+const ALLOWED_ORCHESTRATOR_METHODS = new Set(["GET", "POST", "PATCH", "DELETE"]);
+const DEFAULT_JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
+const DATASET_SELECTION_TTL_MS = 4 * 60 * 60 * 1000;
+const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
+const DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+const electronRuntimeAvailable = Boolean(app && BrowserWindow && dialog && ipcMain && Menu);
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -42,189 +60,633 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(() => {
-  Menu.setApplicationMenu(null);
-  createWindow();
-
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
-  });
-});
-
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
+function validateOrchestratorRequest(request = {}) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new Error("Orchestrator request must be an object.");
   }
-});
-
-app.on("before-quit", () => {
-  for (const worker of projectWorkers.values()) {
-    if (worker.exitCode === null && !worker.killed) {
-      worker.kill();
-    }
-  }
-  projectWorkers.clear();
-});
-
-ipcMain.handle("orchestrator:request", async (_event, request) => {
-  const { baseUrl, method = "GET", path: requestPath, body } = request;
-  const url = new URL(requestPath, baseUrl);
-
-  const response = await fetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-
-  const text = await response.text();
-  let payload = null;
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = text;
-    }
-  }
-
-  if (!response.ok) {
-    const message =
-      payload && typeof payload === "object" && payload.error
-        ? payload.error
-        : text || response.statusText;
-    return {
-      __mission_control_http_error: true,
-      status: response.status,
-      statusText: response.statusText,
-      message,
-      path: requestPath,
-      url: url.toString(),
-      payload,
-    };
-  }
-
-  return payload;
-});
-
-ipcMain.handle("dataset:selectAndUpload", async (_event, options) => {
-  const { projectId } = options;
-  if (!projectId) {
-    throw new Error("Select a project before uploading a dataset.");
-  }
-
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Select image dataset folder",
-    properties: ["openDirectory"],
-  });
-
-  if (result.canceled || result.filePaths.length === 0) {
-    return null;
-  }
-
-  return uploadDatasetFolder({
-    ...options,
-    datasetPath: result.filePaths[0],
-  });
-});
-
-ipcMain.handle("dataset:selectFolder", async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Select image dataset folder",
-    properties: ["openDirectory"],
-  });
-
-  if (result.canceled || result.filePaths.length === 0) {
-    return null;
-  }
-
-  const datasetPath = result.filePaths[0];
+  const method = validateOrchestratorMethod(request.method);
+  const baseUrl = validateOrchestratorBaseUrl(request.baseUrl ?? DEFAULT_ORCHESTRATOR_URL);
+  const requestPath = validateAppRequestPath(request.path);
+  const bodyText = serializeJsonRequestBody(method, request.body);
+  const url = new URL(requestPath, baseUrl).toString();
   return {
-    path: datasetPath,
-    name: path.basename(datasetPath),
+    method,
+    baseUrl,
+    path: requestPath,
+    url,
+    bodyText,
   };
-});
+}
 
-ipcMain.handle("dataset:uploadFolder", async (_event, options) => {
-  return uploadDatasetFolder(options);
-});
+function validateOrchestratorMethod(method = "GET") {
+  const value = String(method ?? "GET").trim().toUpperCase();
+  if (!ALLOWED_ORCHESTRATOR_METHODS.has(value)) {
+    throw new Error(`Unsupported orchestrator request method: ${value || "(empty)"}`);
+  }
+  return value;
+}
 
-ipcMain.handle("dataset:preflightFolder", async (_event, options) => {
+function validateAppRequestPath(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    throw new Error("Orchestrator request path is required.");
+  }
+  if (!text.startsWith("/") || text.startsWith("//")) {
+    throw new Error("Orchestrator request path must be an absolute app path.");
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(text) || /[\u0000-\u001f\\]/.test(text)) {
+    throw new Error("Orchestrator request path must not include a protocol or control characters.");
+  }
+  const parsed = new URL(text, DEFAULT_ORCHESTRATOR_URL);
+  if (parsed.hash) {
+    throw new Error("Orchestrator request path must not include a URL fragment.");
+  }
+  const decodedParts = parsed.pathname.split("/").map((part) => safeDecodeURIComponent(part));
+  if (decodedParts.some((part) => part === "..")) {
+    throw new Error("Orchestrator request path must not contain parent directory segments.");
+  }
+  return `${parsed.pathname}${parsed.search}`;
+}
+
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function serializeJsonRequestBody(method, body) {
+  if (body === undefined) {
+    return undefined;
+  }
+  if (method === "GET") {
+    throw new Error("GET orchestrator requests must not include a request body.");
+  }
+  const json = JSON.stringify(body);
+  if (json === undefined) {
+    throw new Error("Orchestrator request body must be JSON serializable.");
+  }
+  const maxBytes = positiveIntegerEnv("MODEL_EXPRESS_IPC_JSON_MAX_BYTES", DEFAULT_JSON_BODY_MAX_BYTES);
+  if (Buffer.byteLength(json, "utf8") > maxBytes) {
+    throw new Error(`Orchestrator request body exceeds ${maxBytes} bytes.`);
+  }
+  return json;
+}
+
+function validateOrchestratorBaseUrl(value, env = process.env) {
+  const parsed = parseHttpOrigin(value || DEFAULT_ORCHESTRATOR_URL, "Orchestrator URL");
+  if (isLoopbackHostname(parsed.hostname)) {
+    return parsed.origin;
+  }
+  if (allowedOriginsFromEnv(["MODEL_EXPRESS_ALLOWED_ORCHESTRATOR_ORIGINS"], env).has(parsed.origin)) {
+    return parsed.origin;
+  }
+  const tunnelOrigins = envFlagFrom(env, "MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE", false)
+    ? allowedOriginsFromValues([env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL])
+    : new Set();
+  if (tunnelOrigins.has(parsed.origin)) {
+    return parsed.origin;
+  }
+  throw new Error("Non-loopback orchestrator URLs require MODEL_EXPRESS_ALLOWED_ORCHESTRATOR_ORIGINS.");
+}
+
+function parseHttpOrigin(value, label) {
+  let parsed;
+  try {
+    parsed = new URL(String(value ?? "").trim());
+  } catch {
+    throw new Error(`${label} must be a valid HTTP(S) URL.`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`${label} must use http or https.`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${label} must not contain embedded credentials.`);
+  }
+  if ((parsed.pathname && parsed.pathname !== "/") || parsed.search || parsed.hash) {
+    throw new Error(`${label} must be an origin without a path, query, or fragment.`);
+  }
+  return parsed;
+}
+
+function isLoopbackHostname(hostname) {
+  const host = String(hostname ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return (
+    host === "localhost" ||
+    host === "ip6-localhost" ||
+    host === "::1" ||
+    host === "0:0:0:0:0:0:0:1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(host)
+  );
+}
+
+function allowedOriginsFromEnv(names, env = process.env) {
+  return allowedOriginsFromValues(names.flatMap((name) => splitEnvList(env[name])));
+}
+
+function allowedOriginsFromValues(values) {
+  const origins = new Set();
+  for (const value of values) {
+    const normalized = normalizeOrigin(value);
+    if (normalized) {
+      origins.add(normalized);
+    }
+  }
+  return origins;
+}
+
+function normalizeOrigin(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "";
+  }
+  try {
+    return parseHttpOrigin(text, "Allowed origin").origin;
+  } catch {
+    return "";
+  }
+}
+
+function splitEnvList(value) {
+  return String(value ?? "")
+    .split(/[,\s;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function envFlagFrom(env, name, fallback = false) {
+  const value = String(env?.[name] ?? "").trim().toLowerCase();
+  if (!value) {
+    return fallback;
+  }
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
+function apiTokenHeaders(env = process.env) {
+  const token = String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim();
+  if (!token) {
+    return {};
+  }
+  return {
+    Authorization: `Bearer ${token}`,
+    "X-Model-Express-API-Token": token,
+  };
+}
+
+function requireAuthenticatedOrchestratorExposure(env = process.env) {
+  const token = String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim();
+  if (!token || !envFlagFrom(env, "MODEL_EXPRESS_ALLOW_LAN", false)) {
+    throw new Error(
+      "Modal orchestrator tunnels require MODEL_EXPRESS_ALLOW_LAN=true and MODEL_EXPRESS_API_TOKEN so the public callback URL is authenticated.",
+    );
+  }
+}
+
+function rememberDatasetFolder(datasetPath) {
+  const folder = validateDatasetDirectory(datasetPath);
+  pruneDatasetSelections();
+  const token = crypto.randomUUID();
+  selectedDatasetFolders.set(token, {
+    token,
+    path: folder.path,
+    name: folder.name,
+    createdAt: Date.now(),
+  });
+  return {
+    token,
+    path: folder.path,
+    name: folder.name,
+  };
+}
+
+function resolveDatasetFolderOption(options = {}) {
+  const token = String(options?.datasetToken ?? options?.token ?? "").trim();
+  if (token) {
+    pruneDatasetSelections();
+    const selected = selectedDatasetFolders.get(token);
+    if (!selected) {
+      throw new Error("Dataset folder selection has expired. Choose the folder again.");
+    }
+    return validateDatasetDirectory(selected.path);
+  }
+
   const datasetPath = String(options?.datasetPath ?? "").trim();
-  if (!datasetPath) {
+  if (datasetPath) {
+    const folder = validateDatasetDirectory(datasetPath);
+    for (const selected of selectedDatasetFolders.values()) {
+      if (pathKey(selected.path) === pathKey(folder.path)) {
+        return folder;
+      }
+    }
+  }
+
+  throw new Error("Dataset folder must be selected in Mission Control before preflight or upload.");
+}
+
+function validateDatasetDirectory(datasetPath) {
+  const raw = String(datasetPath ?? "").trim();
+  if (!raw) {
     throw new Error("Dataset folder path is required.");
   }
-  if (!fs.existsSync(datasetPath) || !fs.statSync(datasetPath).isDirectory()) {
-    throw new Error(`Dataset folder does not exist: ${datasetPath}`);
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    throw new Error("Dataset folder must be a local folder selected with the picker.");
   }
-  const entries = await collectDatasetFiles(datasetPath);
-  const archivePlan = planZipArchive(entries);
-  return datasetUploadPreflight(entries, archivePlan, options);
-});
+  const realPath = fs.realpathSync.native(raw);
+  const stat = fs.statSync(realPath);
+  if (!stat.isDirectory()) {
+    throw new Error(`Dataset folder is not a directory: ${realPath}`);
+  }
+  if (isDangerousDatasetDirectory(realPath)) {
+    throw new Error("Refusing to upload a filesystem root, home folder, or system directory as a dataset.");
+  }
+  return {
+    path: realPath,
+    name: path.basename(realPath),
+  };
+}
 
-ipcMain.handle("demo:selectImage", async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Select image for champion test",
-    properties: ["openFile"],
-    filters: [
-      { name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "bmp"] },
-      { name: "All files", extensions: ["*"] },
-    ],
+function isDangerousDatasetDirectory(datasetPath) {
+  const root = path.parse(datasetPath).root;
+  if (pathKey(datasetPath) === pathKey(root)) {
+    return true;
+  }
+  const home = safeRealpath(os.homedir());
+  if (home && pathKey(datasetPath) === pathKey(home)) {
+    return true;
+  }
+  const systemRoots = [
+    process.env.SystemRoot,
+    process.env.WINDIR,
+    process.env.ProgramFiles,
+    process.env["ProgramFiles(x86)"],
+  ].map((item) => safeRealpath(item)).filter(Boolean);
+  return systemRoots.some((systemRoot) => isPathInsideOrEqual(datasetPath, systemRoot));
+}
+
+function pruneDatasetSelections(now = Date.now()) {
+  for (const [token, selected] of selectedDatasetFolders.entries()) {
+    if (!selected?.createdAt || now - selected.createdAt > DATASET_SELECTION_TTL_MS) {
+      selectedDatasetFolders.delete(token);
+    }
+  }
+}
+
+function validateUploadEndpoint(value, env = process.env) {
+  const configuredEndpoint = env.S3_ENDPOINT_URL || DEFAULT_S3_ENDPOINT_URL;
+  const endpoint = parseHttpOrigin(value || configuredEndpoint, "Dataset upload endpoint");
+  if (endpoint.port === "9001") {
+    throw new Error("Dataset upload endpoint must use the MinIO API port, not the console port.");
+  }
+  const configuredOrigin = normalizeOrigin(configuredEndpoint);
+  if (isLoopbackHostname(endpoint.hostname) || endpoint.origin === configuredOrigin) {
+    return endpoint.origin;
+  }
+  if (allowedOriginsFromEnv(["MODEL_EXPRESS_ALLOWED_UPLOAD_ORIGINS", "MODEL_EXPRESS_ALLOWED_STORAGE_ORIGINS"], env).has(endpoint.origin)) {
+    return endpoint.origin;
+  }
+  throw new Error("Remote dataset upload endpoints require MODEL_EXPRESS_ALLOWED_UPLOAD_ORIGINS.");
+}
+
+function resolveS3Endpoint(options = {}, purpose = "storage", env = process.env) {
+  const configuredEndpoint = env.S3_ENDPOINT_URL || DEFAULT_S3_ENDPOINT_URL;
+  const configuredOrigin = normalizeOrigin(configuredEndpoint);
+  const provided = String(options?.endpoint ?? "").trim();
+  const endpoint = parseHttpOrigin(provided || configuredEndpoint, "S3 endpoint");
+  if (endpoint.port === "9001") {
+    throw new Error("S3 endpoint must use the MinIO API port, not the console port.");
+  }
+  if (!provided || endpoint.origin === configuredOrigin) {
+    return endpoint.origin;
+  }
+  if (purpose === "artifact") {
+    if (allowedOriginsFromEnv(["MODEL_EXPRESS_ALLOWED_STORAGE_ORIGINS"], env).has(endpoint.origin)) {
+      return endpoint.origin;
+    }
+    throw new Error("S3 artifact loading must use the configured S3 endpoint or MODEL_EXPRESS_ALLOWED_STORAGE_ORIGINS.");
+  }
+  if (isLoopbackHostname(endpoint.hostname) || allowedOriginsFromEnv(["MODEL_EXPRESS_ALLOWED_STORAGE_ORIGINS"], env).has(endpoint.origin)) {
+    return endpoint.origin;
+  }
+  throw new Error("Remote S3 endpoints require MODEL_EXPRESS_ALLOWED_STORAGE_ORIGINS.");
+}
+
+function repoRoot(env = process.env) {
+  return path.resolve(env.MODEL_EXPRESS_ROOT || path.resolve(__dirname, "..", "..", ".."));
+}
+
+function workerRoot(root = repoRoot()) {
+  return path.join(root, "services", "worker");
+}
+
+function configuredLocalArtifactRoots(env = process.env) {
+  const root = repoRoot(env);
+  const worker = workerRoot(root);
+  const roots = [
+    path.join(root, "artifacts"),
+    path.join(root, "exports"),
+    path.join(worker, ".cache", "exports"),
+    path.join(worker, ".cache", "champion_exports"),
+    path.join(worker, ".cache", "artifacts"),
+  ];
+
+  for (const name of ["WORKER_EXPORT_ROOT", "WORKER_CHAMPION_EXPORT_ROOT", "WORKER_ARTIFACT_DOWNLOAD_ROOT"]) {
+    const value = String(env[name] ?? "").trim();
+    if (value) {
+      roots.push(path.isAbsolute(value) ? value : path.resolve(worker, value));
+    }
+  }
+
+  for (const value of [
+    ...splitPathList(env.MODEL_EXPRESS_ALLOWED_ARTIFACT_ROOTS),
+    ...splitPathList(env.MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS),
+  ]) {
+    roots.push(path.isAbsolute(value) ? value : path.resolve(root, value));
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const item of roots) {
+    const normalized = safeRealpath(item) || path.resolve(item);
+    const key = pathKey(normalized);
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(normalized);
+    }
+  }
+  return unique;
+}
+
+function validateLocalArtifactPath(artifactUri, env = process.env) {
+  const localPath = localPathFromURI(String(artifactUri ?? "").trim());
+  if (!localPath) {
+    throw new Error(`Unsupported model artifact URI: ${artifactUri}`);
+  }
+  const candidate = path.isAbsolute(localPath) ? localPath : path.resolve(repoRoot(env), localPath);
+  if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+    throw new Error(`Model artifact does not exist: ${redactPathForError(candidate)}`);
+  }
+  const realCandidate = fs.realpathSync.native(candidate);
+  const allowed = configuredLocalArtifactRoots(env).some((rootPath) => isPathInsideOrEqual(realCandidate, rootPath));
+  if (!allowed) {
+    throw new Error("Model artifact must be under a configured Model Express artifact or export root.");
+  }
+  return realCandidate;
+}
+
+function validateExternalDataLocalPath(sourcePath, artifactDir, mountPath, explicit) {
+  const resolvedSource = path.resolve(sourcePath);
+  const resolvedArtifactDir = safeRealpath(artifactDir) || path.resolve(artifactDir);
+  if (!isPathInsideOrEqual(resolvedSource, resolvedArtifactDir)) {
+    if (explicit) {
+      throw new Error(`ONNX external data file must stay next to the artifact: ${mountPath}`);
+    }
+    return "";
+  }
+  if (!fs.existsSync(resolvedSource) || !fs.statSync(resolvedSource).isFile()) {
+    if (explicit) {
+      throw new Error(`Unable to load ONNX external data file: ${mountPath}`);
+    }
+    return "";
+  }
+  const realSource = fs.realpathSync.native(resolvedSource);
+  if (!isPathInsideOrEqual(realSource, resolvedArtifactDir)) {
+    throw new Error(`ONNX external data file must stay next to the artifact: ${mountPath}`);
+  }
+  return realSource;
+}
+
+function splitPathList(value) {
+  return String(value ?? "")
+    .split(/[;\n\r]+/)
+    .flatMap((item) => item.split(process.platform === "win32" ? "\n" : ":"))
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function isPathInsideOrEqual(candidate, rootPath) {
+  const resolvedCandidate = path.resolve(candidate);
+  const resolvedRoot = path.resolve(rootPath);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function pathKey(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function safeRealpath(value) {
+  if (!value) {
+    return "";
+  }
+  try {
+    return fs.realpathSync.native(value);
+  } catch {
+    return "";
+  }
+}
+
+function redactPathForError(value) {
+  const text = String(value ?? "");
+  const root = repoRoot();
+  if (isPathInsideOrEqual(text, root)) {
+    return path.relative(root, text) || ".";
+  }
+  return path.basename(text) || "[path]";
+}
+
+function redactUrlForLog(value) {
+  const text = String(value ?? "");
+  try {
+    const parsed = new URL(text);
+    if (!isLoopbackHostname(parsed.hostname) || /trycloudflare\.com$/i.test(parsed.hostname)) {
+      return `${parsed.protocol}//[redacted-host]`;
+    }
+    parsed.search = parsed.search ? "?[redacted]" : "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return safeLogText(text);
+  }
+}
+
+if (electronRuntimeAvailable) {
+  app.whenReady().then(() => {
+    Menu.setApplicationMenu(null);
+    createWindow();
+
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
   });
 
-  if (result.canceled || result.filePaths.length === 0) {
-    return null;
-  }
+  app.on("window-all-closed", () => {
+    if (process.platform !== "darwin") {
+      app.quit();
+    }
+  });
 
-  const imagePath = result.filePaths[0];
-  const stats = fs.statSync(imagePath);
-  const imageURI = pathToFileURL(imagePath).toString();
+  app.on("before-quit", () => {
+    for (const worker of projectWorkers.values()) {
+      if (worker.exitCode === null && !worker.killed) {
+        worker.kill();
+      }
+    }
+    projectWorkers.clear();
+    stopAllProjectTunnels();
+  });
 
-  return {
-    path: imagePath,
-    name: path.basename(imagePath),
-    uri: imageURI,
-    image_uri: imageURI,
-    image_id: path.basename(imagePath),
-    thumbnail_uri: demoImagePreviewURI(imagePath, imageURI, stats.size),
-    split: "custom",
-    size_bytes: stats.size,
-    metadata: {
-      source: "local_file",
-      file_name: path.basename(imagePath),
+  ipcMain.handle("orchestrator:request", async (_event, request) => {
+    const validated = validateOrchestratorRequest(request);
+    const response = await fetch(validated.url, {
+      method: validated.method,
+      headers: {
+        "Content-Type": "application/json",
+        ...apiTokenHeaders(),
+      },
+      body: validated.bodyText,
+    });
+
+    const text = await response.text();
+    let payload = null;
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = text;
+      }
+    }
+
+    if (!response.ok) {
+      const message =
+        payload && typeof payload === "object" && payload.error
+          ? payload.error
+          : text || response.statusText;
+      return {
+        __mission_control_http_error: true,
+        status: response.status,
+        statusText: response.statusText,
+        message,
+        path: validated.path,
+        url: redactUrlForLog(validated.url),
+        payload,
+      };
+    }
+
+    return payload;
+  });
+
+  ipcMain.handle("dataset:selectAndUpload", async (_event, options) => {
+    const { projectId } = options;
+    if (!projectId) {
+      throw new Error("Select a project before uploading a dataset.");
+    }
+
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "Select image dataset folder",
+      properties: ["openDirectory"],
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return null;
+    }
+
+    const folder = rememberDatasetFolder(result.filePaths[0]);
+    return uploadDatasetFolder({
+      ...options,
+      datasetToken: folder.token,
+    });
+  });
+
+  ipcMain.handle("dataset:selectFolder", async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "Select image dataset folder",
+      properties: ["openDirectory"],
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return null;
+    }
+
+    return rememberDatasetFolder(result.filePaths[0]);
+  });
+
+  ipcMain.handle("dataset:uploadFolder", async (_event, options) => {
+    return uploadDatasetFolder(options);
+  });
+
+  ipcMain.handle("dataset:preflightFolder", async (_event, options) => {
+    const { datasetPath } = resolveDatasetFolderOption(options);
+    const entries = await collectDatasetFiles(datasetPath);
+    const archivePlan = planZipArchive(entries);
+    return datasetUploadPreflight(entries, archivePlan, options);
+  });
+
+  ipcMain.handle("demo:selectImage", async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "Select image for champion test",
+      properties: ["openFile"],
+      filters: [
+        { name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "bmp"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return null;
+    }
+
+    const imagePath = result.filePaths[0];
+    const stats = fs.statSync(imagePath);
+    const imageURI = pathToFileURL(imagePath).toString();
+
+    return {
+      path: imagePath,
+      name: path.basename(imagePath),
+      uri: imageURI,
+      image_uri: imageURI,
+      image_id: path.basename(imagePath),
+      thumbnail_uri: demoImagePreviewURI(imagePath, imageURI, stats.size),
+      split: "custom",
       size_bytes: stats.size,
-    },
-  };
-});
+      metadata: {
+        source: "local_file",
+        file_name: path.basename(imagePath),
+        size_bytes: stats.size,
+      },
+    };
+  });
 
-ipcMain.handle("artifact:loadModel", async (_event, request) => {
-  const artifactUri = String(request?.artifactUri ?? "").trim();
-  if (!artifactUri) {
-    throw new Error("artifactUri is required.");
-  }
-  const buffer = artifactUri.startsWith("s3://")
-    ? await readS3ObjectBuffer(artifactUri, request)
-    : readLocalArtifactBuffer(artifactUri);
-  const externalData = artifactUri.startsWith("s3://")
-    ? await readS3ExternalDataFiles(artifactUri, request)
-    : readLocalExternalDataFiles(artifactUri, request);
-  return {
-    artifact_uri: artifactUri,
-    size_bytes: buffer.byteLength,
-    bytes: bufferToArrayBuffer(buffer),
-    external_data: externalData,
-  };
-});
+  ipcMain.handle("artifact:loadModel", async (_event, request) => {
+    const artifactUri = String(request?.artifactUri ?? "").trim();
+    if (!artifactUri) {
+      throw new Error("artifactUri is required.");
+    }
+    const buffer = artifactUri.startsWith("s3://")
+      ? await readS3ObjectBuffer(artifactUri, request, "artifact")
+      : readLocalArtifactBuffer(artifactUri);
+    const externalData = artifactUri.startsWith("s3://")
+      ? await readS3ExternalDataFiles(artifactUri, request)
+      : readLocalExternalDataFiles(artifactUri, request);
+    return {
+      artifact_uri: artifactUri,
+      size_bytes: buffer.byteLength,
+      bytes: bufferToArrayBuffer(buffer),
+      external_data: externalData,
+    };
+  });
 
-ipcMain.handle("worker:ensureProjectWorker", async (_event, options) => {
-  return ensureProjectWorker(options);
-});
+  ipcMain.handle("worker:ensureProjectWorker", async (_event, options) => {
+    return ensureProjectWorker(options);
+  });
 
-ipcMain.handle("worker:stopProjectWorker", async (_event, options) => {
-  return stopProjectWorker(options);
-});
+  ipcMain.handle("worker:stopProjectWorker", async (_event, options) => {
+    return stopProjectWorker(options);
+  });
+}
 
 function demoImagePreviewURI(imagePath, fallbackURI, sizeBytes) {
   const maxInlinePreviewBytes = 8 * 1024 * 1024;
@@ -256,18 +718,12 @@ function imageMimeType(imagePath) {
 }
 
 function readLocalArtifactBuffer(artifactUri) {
-  const artifactPath = localPathFromURI(artifactUri);
-  if (!artifactPath) {
-    throw new Error(`Unsupported model artifact URI: ${artifactUri}`);
-  }
+  const artifactPath = validateLocalArtifactPath(artifactUri);
   return fs.readFileSync(artifactPath);
 }
 
 function readLocalExternalDataFiles(artifactUri, request = {}) {
-  const artifactPath = localPathFromURI(artifactUri);
-  if (!artifactPath) {
-    return [];
-  }
+  const artifactPath = validateLocalArtifactPath(artifactUri);
   const artifactDir = path.dirname(artifactPath);
   const out = [];
   const seen = new Set();
@@ -277,10 +733,7 @@ function readLocalExternalDataFiles(artifactUri, request = {}) {
       continue;
     }
     const sourcePath = externalDataLocalPath(candidate, artifactDir, mountPath);
-    if (!sourcePath || !fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
-      if (candidate.explicit) {
-        throw new Error(`Unable to load ONNX external data file: ${mountPath}`);
-      }
+    if (!sourcePath) {
       continue;
     }
     const buffer = fs.readFileSync(sourcePath);
@@ -305,10 +758,13 @@ async function readS3ExternalDataFiles(artifactUri, request = {}) {
     }
     const sidecarUri = externalDataS3URI(artifactUri, candidate, mountPath);
     if (!sidecarUri) {
+      if (candidate.explicit) {
+        throw new Error(`ONNX external data file must stay next to the artifact: ${mountPath}`);
+      }
       continue;
     }
     try {
-      const buffer = await readS3ObjectBuffer(sidecarUri, request);
+      const buffer = await readS3ObjectBuffer(sidecarUri, request, "artifact");
       seen.add(mountPath);
       out.push({
         path: mountPath,
@@ -339,6 +795,7 @@ function localPathFromURI(value) {
 }
 
 function externalDataLocalPath(candidate, artifactDir, mountPath) {
+  let selectedPath = "";
   for (const key of ["uri", "artifact_uri", "artifactPath", "artifact_path", "localPath", "local_path"]) {
     const value = String(candidate[key] ?? "").trim();
     if (!value) {
@@ -348,9 +805,11 @@ function externalDataLocalPath(candidate, artifactDir, mountPath) {
     if (!localPath) {
       continue;
     }
-    return path.isAbsolute(localPath) ? localPath : path.resolve(artifactDir, localPath);
+    selectedPath = path.isAbsolute(localPath) ? localPath : path.resolve(artifactDir, localPath);
+    break;
   }
-  return path.resolve(artifactDir, storageRelativePath(mountPath));
+  const sourcePath = selectedPath || path.resolve(artifactDir, storageRelativePath(mountPath));
+  return validateExternalDataLocalPath(sourcePath, artifactDir, mountPath, candidate.explicit);
 }
 
 function externalDataCandidates(artifactUri, externalData) {
@@ -398,37 +857,49 @@ function storageRelativePath(value) {
 }
 
 function externalDataS3URI(artifactUri, candidate, mountPath) {
-  for (const key of ["uri", "artifact_uri", "artifactPath", "artifact_path"]) {
-    const value = String(candidate[key] ?? "").trim();
-    if (value.startsWith("s3://")) {
-      return value;
-    }
-  }
   const parsed = new URL(artifactUri);
   const baseDir = path.posix.dirname(parsed.pathname.replace(/^\/+/, ""));
   const key = path.posix.join(baseDir === "." ? "" : baseDir, storageRelativePath(mountPath));
-  return `s3://${parsed.hostname}/${key}`;
+  const expectedUri = `s3://${parsed.hostname}/${key}`;
+  for (const key of ["uri", "artifact_uri", "artifactPath", "artifact_path"]) {
+    const value = String(candidate[key] ?? "").trim();
+    if (value.startsWith("s3://")) {
+      const explicit = normalizeS3ObjectURI(value);
+      return explicit === expectedUri ? value : "";
+    }
+  }
+  return expectedUri;
+}
+
+function normalizeS3ObjectURI(value) {
+  try {
+    const parsed = new URL(value);
+    const key = storageRelativePath(parsed.pathname.replace(/^\/+/, ""));
+    return `s3://${parsed.hostname}/${key}`;
+  } catch {
+    return "";
+  }
 }
 
 function bufferToArrayBuffer(buffer) {
   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 }
 
-async function readS3ObjectBuffer(artifactUri, options = {}) {
+async function readS3ObjectBuffer(artifactUri, options = {}, purpose = "storage") {
   const parsed = new URL(artifactUri);
   const bucket = parsed.hostname;
   const key = parsed.pathname.replace(/^\/+/, "");
   if (!bucket || !key) {
     throw new Error(`Invalid S3 model artifact URI: ${artifactUri}`);
   }
-  const client = createS3Client(options);
+  const client = createS3Client(options, { purpose });
   const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   return streamToBuffer(response.Body);
 }
 
-function createS3Client(options = {}) {
+function createS3Client(options = {}, { purpose = "storage" } = {}) {
   return new S3Client({
-    endpoint: options.endpoint ?? process.env.S3_ENDPOINT_URL ?? "http://localhost:9000",
+    endpoint: resolveS3Endpoint(options, purpose),
     region: options.region ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1",
     forcePathStyle: true,
     credentials: {
@@ -447,14 +918,12 @@ async function streamToBuffer(stream) {
   return Buffer.concat(chunks);
 }
 
-function ensureProjectWorker(options) {
-  const { projectId, baseUrl } = options;
+async function ensureProjectWorker(options = {}) {
+  const projectId = String(options.projectId ?? "").trim();
   if (!projectId) {
     throw new Error("Project id is required before starting a worker.");
   }
-  if (!baseUrl) {
-    throw new Error("Orchestrator URL is required before starting a worker.");
-  }
+  const baseUrl = validateOrchestratorBaseUrl(options.baseUrl || DEFAULT_ORCHESTRATOR_URL);
 
   const repoRoot = process.env.MODEL_EXPRESS_ROOT ?? path.resolve(__dirname, "..", "..", "..");
   const workerDir = path.join(repoRoot, "services", "worker");
@@ -462,14 +931,15 @@ function ensureProjectWorker(options) {
     throw new Error(`Worker directory does not exist: ${workerDir}`);
   }
 
+  const repoEnv = loadRepoEnv(repoRoot);
   const logDir = resolveLogDir(repoRoot);
   fs.mkdirSync(logDir, { recursive: true });
   const targetCount = normalizeWorkerCount(options.count);
   const useModalDispatcher = shouldUseModalDispatcher(options);
   const processCount = useModalDispatcher ? 1 : targetCount;
-  const repoEnv = loadRepoEnv(repoRoot);
   const pids = [];
   let startedCount = 0;
+  let modalSession = null;
 
   for (let slot = 1; slot <= processCount; slot += 1) {
     const key = projectWorkerKey(
@@ -481,6 +951,15 @@ function ensureProjectWorker(options) {
     if (isWorkerRunning(existing)) {
       pids.push(existing.pid);
       continue;
+    }
+
+    if (useModalDispatcher && !modalSession) {
+      modalSession = await ensureRemoteTrainingSession({
+        projectId,
+        baseUrl,
+        repoEnv,
+        logDir,
+      });
     }
 
     const workerName = options.name
@@ -500,15 +979,25 @@ function ensureProjectWorker(options) {
     if (useModalDispatcher) {
       childEnv.MODEL_EXPRESS_MODAL_DISPATCHER = "true";
       childEnv.MODEL_EXPRESS_MODAL_DISPATCHER_SLOTS = String(targetCount);
+      Object.assign(childEnv, modalSession?.env ?? {});
     }
 
-    const child = startProjectWorker({
-      projectId,
-      slot,
-      key,
-      workerDir,
-      childEnv,
-    });
+    let child;
+    try {
+      child = startProjectWorker({
+        projectId,
+        slot,
+        key,
+        workerDir,
+        childEnv,
+        tunnelSession: modalSession,
+      });
+    } catch (error) {
+      if (useModalDispatcher) {
+        stopProjectTunnels(projectId);
+      }
+      throw error;
+    }
 
     pids.push(child.pid);
     startedCount += 1;
@@ -546,6 +1035,7 @@ function stopProjectWorker(options = {}) {
     }
     projectWorkers.delete(key);
   }
+  stopProjectTunnels(projectId);
   return {
     project_id: projectId,
     stopped_count: stopped.length,
@@ -555,7 +1045,239 @@ function stopProjectWorker(options = {}) {
   };
 }
 
-function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
+async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, logDir }) {
+  const existing = projectTunnels.get(projectId);
+  if (existing && remoteTrainingSessionActive(existing)) {
+    return existing;
+  }
+  stopProjectTunnels(projectId);
+
+  const env = { ...process.env, ...repoEnv };
+  const childEnv = {};
+  const processes = [];
+
+  const configuredOrchestrator = firstNonEmpty(env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL);
+  if (configuredOrchestrator) {
+    requireAuthenticatedOrchestratorExposure(env);
+    childEnv.MODAL_ORCHESTRATOR_URL = validateRemoteModalUrl(configuredOrchestrator, "MODAL_ORCHESTRATOR_URL");
+  } else if (!isLoopbackHostname(new URL(baseUrl).hostname)) {
+    requireAuthenticatedOrchestratorExposure(env);
+    childEnv.MODAL_ORCHESTRATOR_URL = validateRemoteModalUrl(baseUrl, "MODAL_ORCHESTRATOR_URL");
+  } else {
+    requireAuthenticatedOrchestratorExposure(env);
+    const orchestratorTunnel = await startCloudflaredTunnel({
+      projectId,
+      label: "orchestrator",
+      targetUrl: baseUrl,
+      logDir,
+      env,
+    });
+    childEnv.MODAL_ORCHESTRATOR_URL = orchestratorTunnel.url;
+    processes.push(orchestratorTunnel.child);
+  }
+
+  const configuredModalS3 = firstNonEmpty(env.MODAL_S3_ENDPOINT_URL, env.MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL);
+  if (configuredModalS3) {
+    childEnv.MODAL_S3_ENDPOINT_URL = validateRemoteModalUrl(configuredModalS3, "MODAL_S3_ENDPOINT_URL");
+  } else {
+    const configuredS3Endpoint = firstNonEmpty(env.S3_ENDPOINT_URL, "");
+    const s3Endpoint = configuredS3Endpoint ? parseHttpOrigin(configuredS3Endpoint, "S3 endpoint") : null;
+    if (s3Endpoint && !isLoopbackHostname(s3Endpoint.hostname)) {
+      if (s3Endpoint.port === "9001") {
+        throw new Error("MODAL_S3_ENDPOINT_URL must not point at the MinIO console port.");
+      }
+      childEnv.MODAL_S3_ENDPOINT_URL = s3Endpoint.origin;
+    } else if (envFlagFrom(env, "MODEL_EXPRESS_MODAL_TUNNEL_S3", false) || envFlagFrom(env, "MODEL_EXPRESS_ALLOW_MODAL_MINIO_TUNNEL", false)) {
+      const targetUrl = s3Endpoint ? s3Endpoint.origin : DEFAULT_S3_ENDPOINT_URL;
+      validateCloudflaredTarget(targetUrl, "s3");
+      const s3Tunnel = await startCloudflaredTunnel({
+        projectId,
+        label: "s3",
+        targetUrl,
+        logDir,
+        env,
+      });
+      childEnv.MODAL_S3_ENDPOINT_URL = s3Tunnel.url;
+      processes.push(s3Tunnel.child);
+    } else {
+      throw new Error(
+        "Modal workers require MODAL_S3_ENDPOINT_URL, a remote S3_ENDPOINT_URL, or MODEL_EXPRESS_MODAL_TUNNEL_S3=1 for local MinIO API tunneling.",
+      );
+    }
+  }
+
+  const session = {
+    projectId,
+    env: childEnv,
+    processes,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + remoteTrainingSessionTtlMs(env),
+    ttlTimer: null,
+  };
+  session.ttlTimer = setTimeout(() => {
+    appendDiagnosticLog(logDir, "info", "remote_training_session_expired", {
+      project_id: projectId,
+      managed_tunnel_count: processes.length,
+    });
+    stopProjectTunnels(projectId);
+  }, Math.max(1, session.expiresAt - Date.now()));
+  if (typeof session.ttlTimer.unref === "function") {
+    session.ttlTimer.unref();
+  }
+  projectTunnels.set(projectId, session);
+  appendDiagnosticLog(logDir, "info", "remote_training_session_ready", {
+    project_id: projectId,
+    orchestrator_url: childEnv.MODAL_ORCHESTRATOR_URL,
+    s3_endpoint_url: childEnv.MODAL_S3_ENDPOINT_URL,
+    managed_tunnel_count: processes.length,
+    expires_at: new Date(session.expiresAt).toISOString(),
+  });
+  return session;
+}
+
+function remoteTrainingSessionActive(session) {
+  return Boolean(
+    session &&
+    (!Number.isFinite(session.expiresAt) || Date.now() < session.expiresAt) &&
+    Array.isArray(session.processes) &&
+    session.processes.every((child) => isWorkerRunning(child))
+  );
+}
+
+function remoteTrainingSessionTtlMs(env = process.env) {
+  const seconds = Number.parseInt(String(env.MODEL_EXPRESS_REMOTE_TRAINING_SESSION_TTL_SECONDS ?? ""), 10);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS;
+  }
+  const ttlMs = seconds * 1000;
+  return Math.max(5 * 60 * 1000, Math.min(ttlMs, 24 * 60 * 60 * 1000));
+}
+
+function firstNonEmpty(...values) {
+  return values.map((value) => String(value ?? "").trim()).find(Boolean) || "";
+}
+
+function validateRemoteModalUrl(value, label) {
+  const parsed = parseHttpOrigin(value, label);
+  if (isLoopbackHostname(parsed.hostname)) {
+    throw new Error(`${label} must be remotely reachable for Modal workers.`);
+  }
+  if (parsed.port === "5432" || parsed.port === "5000" || parsed.port === "9001") {
+    throw new Error(`${label} must not expose Postgres, MLflow, or the MinIO console.`);
+  }
+  return parsed.origin;
+}
+
+function validateCloudflaredTarget(value, label) {
+  const parsed = parseHttpOrigin(value, `${label} tunnel target`);
+  if (!isLoopbackHostname(parsed.hostname)) {
+    throw new Error(`${label} tunnel target must be loopback.`);
+  }
+  if (parsed.port === "5432" || parsed.port === "5000" || parsed.port === "9001") {
+    throw new Error(`${label} tunnel target must not be Postgres, MLflow, or the MinIO console.`);
+  }
+  return parsed.origin;
+}
+
+function startCloudflaredTunnel({ projectId, label, targetUrl, logDir, env = process.env }) {
+  if (envFlagFrom(env, "MODEL_EXPRESS_DISABLE_AUTO_TUNNELS", false)) {
+    throw new Error("Automatic tunnel management is disabled by MODEL_EXPRESS_DISABLE_AUTO_TUNNELS.");
+  }
+  const target = validateCloudflaredTarget(targetUrl, label);
+  const command = env.MODEL_EXPRESS_CLOUDFLARED_PATH || env.CLOUDFLARED_PATH || "cloudflared";
+  const child = spawn(command, ["tunnel", "--url", target, "--no-autoupdate"], {
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      stopTunnelProcess(child);
+      reject(new Error(`Timed out waiting for cloudflared ${label} tunnel URL.`));
+    }, CLOUDFLARED_URL_TIMEOUT_MS);
+
+    const finish = (url) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      appendDiagnosticLog(logDir, "info", "cloudflared_tunnel_ready", {
+        project_id: projectId,
+        label,
+        url,
+      });
+      resolve({ url, child });
+    };
+
+    const onData = (streamName, data) => {
+      const text = data.toString();
+      const safeText = safeLogText(text.trimEnd());
+      if (safeText) {
+        console.log(`[tunnel:${projectId}:${label}:${streamName}] ${safeText}`);
+      }
+      const url = parseCloudflaredTunnelUrl(text);
+      if (url) {
+        finish(url);
+      }
+    };
+
+    child.stdout.on("data", (data) => onData("stdout", data));
+    child.stderr.on("data", (data) => onData("stderr", data));
+    child.on("error", (error) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(`Unable to start cloudflared for ${label}: ${error.message}`));
+      }
+    });
+    child.on("exit", (code, signal) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(`cloudflared ${label} tunnel exited before publishing a URL (code=${code}, signal=${signal}).`));
+      }
+    });
+  });
+}
+
+function parseCloudflaredTunnelUrl(value) {
+  const match = String(value ?? "").match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i);
+  return match ? match[0] : "";
+}
+
+function stopAllProjectTunnels() {
+  for (const projectId of Array.from(projectTunnels.keys())) {
+    stopProjectTunnels(projectId);
+  }
+}
+
+function stopProjectTunnels(projectId) {
+  const session = projectTunnels.get(projectId);
+  if (!session) {
+    return;
+  }
+  for (const child of session.processes ?? []) {
+    stopTunnelProcess(child);
+  }
+  if (session.ttlTimer) {
+    clearTimeout(session.ttlTimer);
+  }
+  projectTunnels.delete(projectId);
+}
+
+function stopTunnelProcess(child) {
+  if (child && child.exitCode === null && !child.killed) {
+    child.kill();
+  }
+}
+
+function startProjectWorker({ projectId, slot, key, workerDir, childEnv, tunnelSession }) {
   const python = resolveWorkerPython(workerDir, childEnv);
   console.log(`[worker:${projectId}:${slot}] starting with python=${python}`);
   appendDiagnosticLog(childEnv.MODEL_EXPRESS_LOG_DIR, "info", "worker_process_starting", {
@@ -566,8 +1288,8 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
     python,
   });
   console.log(
-    `[worker:${projectId}:${slot}] modal env orchestrator=${childEnv.MODAL_ORCHESTRATOR_URL ?? "(unset)"} ` +
-    `s3=${childEnv.MODAL_S3_ENDPOINT_URL ?? "(unset)"}`,
+    `[worker:${projectId}:${slot}] modal env orchestrator=${redactUrlForLog(childEnv.MODAL_ORCHESTRATOR_URL ?? "(unset)")} ` +
+    `s3=${redactUrlForLog(childEnv.MODAL_S3_ENDPOINT_URL ?? "(unset)")}`,
   );
 
   const child = spawn(python, ["-m", "worker.main"], {
@@ -580,12 +1302,12 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
   projectWorkers.set(key, child);
 
   child.stdout.on("data", (data) => {
-    console.log(`[worker:${projectId}:${slot}] ${data.toString().trimEnd()}`);
+    console.log(`[worker:${projectId}:${slot}] ${safeLogText(data.toString().trimEnd())}`);
     appendWorkerStreamLog(childEnv.MODEL_EXPRESS_LOG_DIR, "stdout", projectId, slot, data);
   });
 
   child.stderr.on("data", (data) => {
-    console.error(`[worker:${projectId}:${slot}] ${data.toString().trimEnd()}`);
+    console.error(`[worker:${projectId}:${slot}] ${safeLogText(data.toString().trimEnd())}`);
     appendWorkerStreamLog(childEnv.MODEL_EXPRESS_LOG_DIR, "stderr", projectId, slot, data);
   });
 
@@ -593,6 +1315,9 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
     const current = projectWorkers.get(key);
     if (current === child) {
       projectWorkers.delete(key);
+    }
+    if (tunnelSession) {
+      stopProjectTunnels(projectId);
     }
     console.log(`[worker:${projectId}:${slot}] exited code=${code} signal=${signal}`);
     appendDiagnosticLog(childEnv.MODEL_EXPRESS_LOG_DIR, "warn", "worker_process_exited", {
@@ -607,6 +1332,9 @@ function startProjectWorker({ projectId, slot, key, workerDir, childEnv }) {
     const current = projectWorkers.get(key);
     if (current === child) {
       projectWorkers.delete(key);
+    }
+    if (tunnelSession) {
+      stopProjectTunnels(projectId);
     }
     console.error(`[worker:${projectId}:${slot}] failed to start: ${error.message}`);
     appendDiagnosticLog(childEnv.MODEL_EXPRESS_LOG_DIR, "error", "worker_process_start_failed", {
@@ -764,6 +1492,8 @@ function safeLogValue(value) {
 function safeLogText(value) {
   const redacted = String(value ?? "")
     .replace(/data:image\/[a-z0-9.+-]+;base64,[^\s"]+/gi, "[redacted]")
+    .replace(/https?:\/\/[^\s"]*trycloudflare\.com[^\s"]*/gi, "[redacted-url]")
+    .replace(/https?:\/\/[^\s"]*(?:token|secret|signature|x-amz-signature|authorization)=[^\s"]*/gi, "[redacted-url]")
     .replace(/bearer\s+[a-z0-9._-]+/gi, "Bearer [redacted]")
     .replace(/(aws_access_key|api[_-]?key|secret|token|password)\s*[:=]\s*[^\s"]+/gi, "$1=[redacted]");
   return redacted.length > 1800 ? `${redacted.slice(0, 1799).trimEnd()}...` : redacted;
@@ -818,21 +1548,16 @@ function loadRepoEnv(repoRoot) {
 }
 
 async function uploadDatasetFolder(options) {
-  const { projectId, datasetPath } = options;
+  const { projectId } = options;
   if (!projectId) {
     throw new Error("Project id is required before uploading a dataset.");
   }
-  if (!datasetPath) {
-    throw new Error("Dataset folder path is required.");
-  }
-  if (!fs.existsSync(datasetPath) || !fs.statSync(datasetPath).isDirectory()) {
-    throw new Error(`Dataset folder does not exist: ${datasetPath}`);
-  }
+  const { datasetPath } = resolveDatasetFolderOption(options);
 
   const datasetName = path.basename(datasetPath);
   const safeName = datasetName.replace(/[^a-zA-Z0-9._-]/g, "-");
   const bucket = options.bucket ?? "model-express";
-  const endpoint = options.endpoint ?? "http://localhost:9000";
+  const endpoint = validateUploadEndpoint(options.endpoint);
   const accessKeyId = options.accessKeyId ?? "model_express";
   const secretAccessKey = options.secretAccessKey ?? "model_express_password";
   const region = options.region ?? "us-east-1";
@@ -911,3 +1636,26 @@ function datasetUploadPreflight(entries, archivePlan, options = {}) {
     maxBytes: options.maxBytes ?? process.env.MODEL_EXPRESS_UPLOAD_MAX_BYTES,
   });
 }
+
+module.exports = {
+  __test: {
+    apiTokenHeaders,
+    configuredLocalArtifactRoots,
+    externalDataMountPath,
+    isLoopbackHostname,
+    parseCloudflaredTunnelUrl,
+    rememberDatasetFolder,
+    requireAuthenticatedOrchestratorExposure,
+    remoteTrainingSessionActive,
+    remoteTrainingSessionTtlMs,
+    resolveDatasetFolderOption,
+    resolveS3Endpoint,
+    safeLogText,
+    selectedDatasetFolders,
+    validateAppRequestPath,
+    validateLocalArtifactPath,
+    validateOrchestratorBaseUrl,
+    validateOrchestratorRequest,
+    validateUploadEndpoint,
+  },
+};

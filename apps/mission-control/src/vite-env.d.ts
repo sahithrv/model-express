@@ -11,12 +11,14 @@ interface Window {
   missionControl: {
     request<T>(request: OrchestratorRequest): Promise<T>;
     selectDatasetFolder(): Promise<{
+      token: string;
       path: string;
       name: string;
       preflight?: DatasetUploadPreflight;
     } | null>;
     preflightDatasetFolder(options: {
-      datasetPath: string;
+      datasetToken: string;
+      datasetPath?: string;
       warnFileCount?: number;
       warnBytes?: number;
       maxFileCount?: number;
@@ -24,7 +26,8 @@ interface Window {
     }): Promise<DatasetUploadPreflight>;
     uploadDatasetFolder(options: {
       projectId: string;
-      datasetPath: string;
+      datasetToken: string;
+      datasetPath?: string;
       endpoint?: string;
       bucket?: string;
       accessKeyId?: string;

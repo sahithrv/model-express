@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import secrets
 import sys
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from worker.diagnostics import log_event
@@ -12,6 +14,7 @@ from worker.training.modal_resources import (
     callback_identity,
     failure_callback_payload,
     job_with_modal_resources,
+    modal_callback_metadata,
     resource_telemetry,
     resolve_modal_resources,
 )
@@ -87,21 +90,15 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
 
     dataset = client.get_dataset(str(config["dataset_id"]))
 
-    orchestrator_url = os.getenv("MODAL_ORCHESTRATOR_URL", client.base_url)
-    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
-
-    _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
-    _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+    orchestrator_url = _modal_orchestrator_url(client)
 
     payload = {
         "job": job_payload,
         "dataset": dataset,
         "modal_resources": modal_resources,
         "orchestrator_url": orchestrator_url,
-        "s3_endpoint_url": s3_endpoint_url,
-        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
-        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
-        "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        **_modal_storage_payload(job_payload, dataset),
+        **modal_callback_metadata(job_payload),
     }
 
     print(
@@ -135,6 +132,7 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
             message,
             retryable=True,
             metadata=failure_callback_payload(job_payload, message, modal_resources),
+            job=job_payload,
         )
         log_event(
             "warn",
@@ -195,10 +193,7 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
 
     try:
         dataset = client.get_dataset(str(batch["dataset_id"]))
-        orchestrator_url = os.getenv("MODAL_ORCHESTRATOR_URL", client.base_url)
-        s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
-        _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
-        _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+        orchestrator_url = _modal_orchestrator_url(client)
         tagged_jobs = _jobs_with_modal_batch_metadata(jobs, batch, "remote_batch_submitted")
         enriched_jobs = []
         resources_by_job = {}
@@ -217,11 +212,16 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
             "dataset": dataset,
             "modal_resources": batch_resources,
             "orchestrator_url": orchestrator_url,
-            "s3_endpoint_url": s3_endpoint_url,
-            "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
-            "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
-            "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+            **_modal_storage_payload_for_jobs(enriched_jobs, dataset),
         }
+        job_callback_metadata = {
+            str(job.get("id") or ""): metadata
+            for job in enriched_jobs
+            for metadata in (modal_callback_metadata(job),)
+            if str(job.get("id") or "") and metadata
+        }
+        if job_callback_metadata:
+            payload["job_callback_metadata"] = job_callback_metadata
         with _modal_invocation_context(app):
             configured_function = _function_with_modal_options(train_modal_preview_batch, batch_resources)
             result = _remote_function(configured_function)(payload)
@@ -372,16 +372,12 @@ def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:
         raise
 
     dataset = client.get_dataset(dataset_id)
-    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
-    _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
 
     payload = {
         "job": job,
         "dataset": dataset,
-        "s3_endpoint_url": s3_endpoint_url,
-        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
-        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
-        "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        **_modal_storage_payload(job, dataset),
+        **modal_callback_metadata(job),
     }
 
     print(f"Submitting Modal dataset profile job dataset={dataset_id}")
@@ -390,7 +386,7 @@ def run_modal_dataset_profile(client: OrchestratorClient, job: dict) -> None:
             result = _remote_function(profile_image_dataset)(payload)
     except Exception as exc:
         message = _modal_dataset_profile_error_message(exc)
-        client.fail_job(job["id"], message, retryable=True)
+        client.fail_job(job["id"], message, retryable=True, job=job)
         log_event(
             "warn",
             "modal_dataset_profile_retry_queued",
@@ -428,16 +424,12 @@ def run_modal_dataset_materialization(client: OrchestratorClient, job: dict) -> 
         raise
 
     dataset = client.get_dataset(dataset_id)
-    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
-    _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
 
     payload = {
         "job": job,
         "dataset": dataset,
-        "s3_endpoint_url": s3_endpoint_url,
-        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "model_express"),
-        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "model_express_password"),
-        "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        **_modal_storage_payload(job, dataset),
+        **modal_callback_metadata(job),
     }
 
     print(f"Pre-warming Modal dataset materialization dataset={dataset_id}")
@@ -446,7 +438,7 @@ def run_modal_dataset_materialization(client: OrchestratorClient, job: dict) -> 
             result = _remote_function(materialize_image_dataset)(payload)
     except Exception as exc:
         message = _modal_dataset_materialization_error_message(exc)
-        client.fail_job(job["id"], message, retryable=True)
+        client.fail_job(job["id"], message, retryable=True, job=job)
         log_event(
             "warn",
             "modal_dataset_materialization_retry_queued",
@@ -458,6 +450,117 @@ def run_modal_dataset_materialization(client: OrchestratorClient, job: dict) -> 
         raise ModalRetryableFailureReported(message) from exc
     _log_dataset_materialization(job.get("id", ""), job.get("project_id", ""), result)
     return result
+
+
+def _modal_orchestrator_url(client: OrchestratorClient) -> str:
+    orchestrator_url = os.getenv("MODAL_ORCHESTRATOR_URL", client.base_url)
+    _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
+    return orchestrator_url
+
+
+def _modal_storage_payload(job: dict, dataset: dict) -> dict:
+    return _modal_storage_payload_for_jobs([job], dataset)
+
+
+def _modal_storage_payload_for_jobs(jobs: list[dict], dataset: dict) -> dict:
+    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
+    _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
+    credentials = _modal_storage_credentials()
+    scope = _modal_storage_scope(jobs, dataset)
+    return {
+        "s3_endpoint_url": s3_endpoint_url,
+        **credentials,
+        "storage_scope": scope,
+    }
+
+
+def _modal_storage_credentials() -> dict:
+    access_key = (
+        os.getenv("MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID", "").strip()
+        or os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+    )
+    secret_key = (
+        os.getenv("MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY", "").strip()
+        or os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+    )
+    if not access_key or not secret_key:
+        raise ValueError("Modal storage requires explicit scoped S3 credentials.")
+    if (
+        access_key == "model_express"
+        and secret_key == "model_express_password"
+        and not _env_flag("MODEL_EXPRESS_ALLOW_MODAL_ROOT_STORAGE", False)
+    ):
+        raise ValueError(
+            "Modal storage refuses the default local MinIO root credentials; configure scoped credentials or presigned storage."
+        )
+    return {
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+        "aws_default_region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    }
+
+
+def _modal_storage_scope(jobs: list[dict], dataset: dict) -> dict:
+    bucket, dataset_key = _dataset_storage_bucket_key(dataset)
+    write_prefixes = []
+    for job in jobs:
+        prefix = _job_storage_prefix(job)
+        if prefix:
+            write_prefixes.append(prefix + "/")
+    write_prefixes = sorted(set(write_prefixes))
+    expires_at = _modal_storage_expires_at(jobs)
+    return {
+        "token": secrets.token_urlsafe(24),
+        "buckets": [bucket],
+        "read_keys": [dataset_key],
+        "read_prefixes": write_prefixes,
+        "write_prefixes": write_prefixes,
+        "expires_at": expires_at,
+    }
+
+
+def _dataset_storage_bucket_key(dataset: dict) -> tuple[str, str]:
+    storage_uri = str(dataset.get("storage_uri") or "").strip()
+    parsed = urlparse(storage_uri)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+        raise ValueError("Modal storage scope requires an s3:// dataset storage_uri.")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _job_storage_prefix(job: dict) -> str:
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    session = config.get("remote_training_session") if isinstance(config.get("remote_training_session"), dict) else {}
+    prefix = str(session.get("storage_prefix") or "").strip().strip("/")
+    if prefix:
+        return prefix
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return ""
+    return f"model-express/artifacts/{_safe_storage_part(job_id)}"
+
+
+def _modal_storage_expires_at(jobs: list[dict]) -> str:
+    for job in jobs:
+        config = job.get("config") if isinstance(job.get("config"), dict) else {}
+        session = config.get("remote_training_session") if isinstance(config.get("remote_training_session"), dict) else {}
+        expires_at = str(session.get("expires_at") or "").strip()
+        if expires_at:
+            return expires_at
+    return (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+
+
+def _safe_storage_part(value: str) -> str:
+    out = []
+    last_dash = False
+    for char in value.strip():
+        if char.isalnum() or char in {"_", "-", "."}:
+            out.append(char)
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    text = "".join(out).strip("-.")
+    return text or "unknown"
 
 
 def _remote_function(function):
@@ -540,7 +643,10 @@ def _report_modal_call(
         },
     }
     try:
-        reporter(str(job.get("id") or ""), payload)
+        try:
+            reporter(str(job.get("id") or ""), payload, job=job)
+        except TypeError:
+            reporter(str(job.get("id") or ""), payload)
     except Exception as exc:
         log_event(
             "warn",

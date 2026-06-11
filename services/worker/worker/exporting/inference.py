@@ -6,10 +6,16 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 from worker.datasets.storage import download_s3_uri
-from worker.exporting.artifacts import load_export_manifest
+from worker.exporting.artifacts import (
+    ArtifactPathValidationError,
+    load_export_manifest,
+    resolve_controlled_artifact_reference,
+    safe_torch_load_checkpoint,
+    validate_controlled_artifact_path,
+)
 from worker.exporting.metadata import build_demo_detection_payload, build_demo_prediction_payload
 from worker.exporting.preprocessing import (
     image_size_from_metadata,
@@ -262,7 +268,7 @@ def _load_framework_native_model(torch, model_path: Path, metadata: dict, class_
         fine_tune_strategy=str(training_config.get("fine_tune_strategy") or "full"),
         dropout=_float_value(training_config.get("dropout"), default=0.0),
     )
-    checkpoint = torch.load(str(model_path), map_location="cpu")
+    checkpoint = safe_torch_load_checkpoint(torch, model_path)
     state_dict = _checkpoint_state_dict(checkpoint)
     model.load_state_dict(state_dict)
     return model
@@ -693,10 +699,20 @@ def _checkpoint_state_dict(checkpoint: object) -> dict:
         for key in ("state_dict", "model_state_dict"):
             value = checkpoint.get(key)
             if isinstance(value, dict):
-                return _strip_module_prefix(value)
+                return _validated_state_dict(value)
         if all(isinstance(key, str) for key in checkpoint.keys()):
-            return _strip_module_prefix(checkpoint)
+            return _validated_state_dict(checkpoint)
     raise ValueError("framework-native checkpoint does not contain a state_dict.")
+
+
+def _validated_state_dict(state_dict: dict) -> dict:
+    if not all(isinstance(key, str) and _looks_like_tensor(value) for key, value in state_dict.items()):
+        raise ValueError("framework-native checkpoint state_dict contains non-tensor entries.")
+    return _strip_module_prefix(state_dict)
+
+
+def _looks_like_tensor(value: object) -> bool:
+    return hasattr(value, "detach") and hasattr(value, "shape")
 
 
 def _strip_module_prefix(state_dict: dict) -> dict:
@@ -760,26 +776,33 @@ def _resolve_artifact_path(manifest_path: Path | None, path_value: object) -> Pa
     if not path_value:
         return None
     value = str(path_value)
+    export_dir = manifest_path.parent if manifest_path is not None else None
     if value.startswith("s3://"):
         parsed = urlparse(value)
         filename = Path(parsed.path).name or "model.torchscript.pt"
         destination = Path(".cache/artifacts") / _safe_path_part(parsed.netloc) / _safe_path_part(filename)
         try:
-            return download_s3_uri(value, destination)
+            downloaded = download_s3_uri(value, destination)
+            return validate_controlled_artifact_path(downloaded, export_dir=destination.parent)
         except Exception:
             return None
-    if value.startswith("file://"):
-        parsed = urlparse(value)
-        path_value = unquote(parsed.path)
-        if len(path_value) > 2 and path_value[0] == "/" and path_value[2] == ":":
-            path_value = path_value[1:]
-        return Path(path_value)
+    try:
+        if value.startswith("file://"):
+            return resolve_controlled_artifact_reference(value, export_dir=export_dir)
+    except ArtifactPathValidationError:
+        return None
     path = Path(value)
-    if path.is_absolute():
-        return path
     if manifest_path is None:
-        return path
-    return manifest_path.parent / path
+        try:
+            return resolve_controlled_artifact_reference(value)
+        except ArtifactPathValidationError:
+            return None
+    try:
+        if path.is_absolute():
+            return validate_controlled_artifact_path(path, export_dir=export_dir)
+        return validate_controlled_artifact_path(manifest_path.parent / path, export_dir=export_dir)
+    except ArtifactPathValidationError:
+        return None
 
 
 def _safe_path_part(value: str) -> str:

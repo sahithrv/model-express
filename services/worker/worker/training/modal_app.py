@@ -27,9 +27,11 @@ from worker.training.preprocessing_registry import (
 )
 from worker.training.modal_resources import (
     callback_identity,
+    callback_token,
     failure_callback_payload,
     modal_resources_from_payload,
     resource_telemetry,
+    training_attempt_id,
 )
 
 for _thread_key, _thread_value in {
@@ -900,6 +902,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         image_size=image_size,
         posted_epochs=posted_yolo_epochs,
         callback_identity=callback_identity(job, modal_resources),
+        callback_auth_token=callback_token(job),
     )
     detector.train(
         data=str(data_config_path),
@@ -924,6 +927,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         image_size=image_size,
         posted_epochs=posted_yolo_epochs,
         callback_identity=callback_identity(job, modal_resources),
+        callback_auth_token=callback_token(job),
     )
     yolo_epoch_rows_posted = len(posted_yolo_epochs) or final_yolo_epoch_rows_posted
 
@@ -2029,6 +2033,7 @@ def _install_yolo_epoch_metrics_callback(
     image_size: int,
     posted_epochs: set[int],
     callback_identity: dict | None = None,
+    callback_auth_token: str = "",
 ) -> None:
     def post_epoch_metrics(_trainer=None) -> None:
         _post_yolo_epoch_metrics(
@@ -2039,6 +2044,7 @@ def _install_yolo_epoch_metrics_callback(
             image_size=image_size,
             posted_epochs=posted_epochs,
             callback_identity=callback_identity,
+            callback_auth_token=callback_auth_token,
         )
 
     add_callback = getattr(detector, "add_callback", None)
@@ -2060,6 +2066,7 @@ def _post_yolo_epoch_metrics(
     image_size: int,
     posted_epochs: set[int] | None = None,
     callback_identity: dict | None = None,
+    callback_auth_token: str = "",
 ) -> int:
     results_path = _find_yolo_results_csv(run_root)
     if results_path is None:
@@ -2076,13 +2083,14 @@ def _post_yolo_epoch_metrics(
                 if posted_epochs is not None and normalized_epoch in posted_epochs:
                     continue
                 identity = callback_identity if isinstance(callback_identity, dict) else {}
-                _post_json(
+                _post_callback_json(
                     f"{orchestrator_url}/jobs/{job_id}/metrics",
                     {
                         "epoch": normalized_epoch,
                         "metrics": metrics,
                         **identity,
                     },
+                    callback_auth_token,
                 )
                 if posted_epochs is not None:
                     posted_epochs.add(normalized_epoch)
@@ -2614,7 +2622,37 @@ def _configure_storage_env(payload: dict) -> None:
     os.environ["AWS_ACCESS_KEY_ID"] = payload["aws_access_key_id"]
     os.environ["AWS_SECRET_ACCESS_KEY"] = payload["aws_secret_access_key"]
     os.environ["AWS_DEFAULT_REGION"] = payload["aws_default_region"]
+    _configure_storage_scope_env(payload)
     os.environ.setdefault("TORCH_HOME", str(TORCH_CACHE_ROOT))
+    _configure_callback_env(payload)
+
+
+def _configure_storage_scope_env(payload: dict) -> None:
+    scope = payload.get("storage_scope") if isinstance(payload.get("storage_scope"), dict) else {}
+    if scope:
+        token = str(scope.get("token") or "").strip()
+        os.environ["MODEL_EXPRESS_STORAGE_SCOPE"] = json.dumps(scope, sort_keys=True)
+        os.environ["MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE"] = "true"
+        _set_or_clear_env("MODEL_EXPRESS_STORAGE_SCOPE_TOKEN", token)
+        return
+    os.environ.pop("MODEL_EXPRESS_STORAGE_SCOPE", None)
+    os.environ.pop("MODEL_EXPRESS_STORAGE_SCOPE_TOKEN", None)
+    os.environ.pop("MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE", None)
+
+
+def _configure_callback_env(payload: dict) -> None:
+    job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+    token = str(payload.get("callback_token") or "").strip() or callback_token(job)
+    attempt_id = str(payload.get("training_attempt_id") or "").strip() or training_attempt_id(job)
+    _set_or_clear_env("MODEL_EXPRESS_CALLBACK_TOKEN", token)
+    _set_or_clear_env("MODEL_EXPRESS_TRAINING_ATTEMPT_ID", attempt_id)
+
+
+def _set_or_clear_env(name: str, value: str) -> None:
+    if value:
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
 
 
 def _dataset_checksum(dataset: dict, config: dict | None = None) -> str:
@@ -4824,11 +4862,23 @@ def _fallback_latency_ms(model_name: str, image_size: int) -> float:
     return base * max(0.5, (image_size / 224) ** 2)
 
 
-def _post_json(url: str, payload: dict) -> None:
+def _post_json(url: str, payload: dict, *, callback_token: str = "") -> None:
     import requests
 
-    response = requests.post(url, json=payload, timeout=_orchestrator_report_timeout_seconds())
+    kwargs = {"json": payload, "timeout": _orchestrator_report_timeout_seconds()}
+    token = str(callback_token or "").strip()
+    if token:
+        kwargs["headers"] = {"Authorization": f"Bearer {token}"}
+    response = requests.post(url, **kwargs)
     response.raise_for_status()
+
+
+def _post_callback_json(url: str, payload: dict, callback_auth_token: str) -> None:
+    token = str(callback_auth_token or "").strip()
+    if token:
+        _post_json(url, payload, callback_token=token)
+        return
+    _post_json(url, payload)
 
 
 def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> bool:
@@ -4845,9 +4895,10 @@ def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> b
         detection_job=_modal_failure_detection_job(config),
     )
     try:
-        _post_json(
+        _post_callback_json(
             f"{orchestrator_url}/jobs/{job_id}/fail",
             failure_callback_payload(job, message, modal_resources),
+            callback_token(job),
         )
         return True
     except Exception:
@@ -4877,12 +4928,13 @@ def _post_job_json(
     modal_resources: dict | None = None,
 ) -> None:
     job_id = str(job.get("id") or "")
-    _post_json(
+    _post_callback_json(
         f"{orchestrator_url}/jobs/{job_id}/{endpoint}",
         {
             **payload,
             **callback_identity(job, modal_resources),
         },
+        callback_token(job),
     )
 
 
@@ -4896,7 +4948,11 @@ def _post_training_run_summary(
 ) -> None:
     if isinstance(job, dict):
         payload = {**payload, **callback_identity(job, modal_resources)}
-    _post_json(f"{orchestrator_url}/jobs/{job_id}/training-run-summary", payload)
+    _post_callback_json(
+        f"{orchestrator_url}/jobs/{job_id}/training-run-summary",
+        payload,
+        callback_token(job),
+    )
 
 
 def _post_training_run_evaluation(
@@ -4909,7 +4965,11 @@ def _post_training_run_evaluation(
 ) -> None:
     if isinstance(job, dict):
         payload = {**payload, **callback_identity(job, modal_resources)}
-    _post_json(f"{orchestrator_url}/jobs/{job_id}/training-run-evaluation", payload)
+    _post_callback_json(
+        f"{orchestrator_url}/jobs/{job_id}/training-run-evaluation",
+        payload,
+        callback_token(job),
+    )
 
 
 def _modal_failure_detection_job(config: dict) -> bool:

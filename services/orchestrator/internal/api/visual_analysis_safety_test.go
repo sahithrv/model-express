@@ -777,7 +777,15 @@ func TestTrainingRunEvaluationQueuesDeficiencyVisualReanalysis(t *testing.T) {
 		t.Fatalf("upsert summary: %v", err)
 	}
 
+	router := NewRouter(memoryStore)
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
+
 	body := `{
+		"training_attempt_id":"` + callbackAttemptID(t, assigned) + `",
 		"objective_profile":{"target_metric":"macro_f1"},
 		"per_class_metrics":{"rare":{"recall":0.18,"f1-score":0.16},"common":{"recall":0.91,"f1-score":0.88}},
 		"confusion_matrix":[[12,18],[2,30]],
@@ -787,8 +795,9 @@ func TestTrainingRunEvaluationQueuesDeficiencyVisualReanalysis(t *testing.T) {
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-evaluation", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
-	NewRouter(memoryStore).ServeHTTP(resp, req)
+	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected evaluation accepted, got %d: %s", resp.Code, resp.Body.String())
 	}
@@ -965,10 +974,18 @@ func TestInitialVisualAnalysisFailureFallsBackToInitialPlan(t *testing.T) {
 		t.Fatalf("expected visual job, got %#v", projectJobs)
 	}
 
-	req = httptest.NewRequest(http.MethodPost, "/jobs/"+visualJob.ID+"/fail", strings.NewReader(`{"error":"visual llm unavailable"}`))
+	router := NewRouter(memoryStore)
+	worker, err := memoryStore.RegisterWorker(project.ID, "visual worker", "")
+	if err != nil {
+		t.Fatalf("register visual worker: %v", err)
+	}
+	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
+
+	req = httptest.NewRequest(http.MethodPost, "/jobs/"+visualJob.ID+"/fail", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assigned)+`","error":"visual llm unavailable"}`))
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp = httptest.NewRecorder()
-	NewRouter(memoryStore).ServeHTTP(resp, req)
+	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected visual fail fallback status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
 	}

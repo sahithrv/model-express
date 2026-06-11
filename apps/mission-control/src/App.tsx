@@ -73,7 +73,7 @@ import type {
   WorkerRequirement,
 } from "./types";
 
-const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://localhost:8080";
+const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://127.0.0.1:8080";
 const jobsPerPage = 10;
 const activeLiveRefreshIntervalMs = 10_000;
 const idleLiveRefreshIntervalMs = 30_000;
@@ -864,6 +864,7 @@ type Notice = {
 };
 
 type DatasetFolder = {
+  token: string;
   path: string;
   name: string;
   preflight?: DatasetUploadPreflight;
@@ -1877,7 +1878,7 @@ export function App() {
     const folder = await window.missionControl.selectDatasetFolder();
     if (folder) {
       try {
-        const preflight = await window.missionControl.preflightDatasetFolder({ datasetPath: folder.path });
+        const preflight = await window.missionControl.preflightDatasetFolder({ datasetToken: folder.token });
         setNewProjectFolder({ ...folder, preflight });
       } catch (error) {
         setNewProjectFolder(folder);
@@ -1913,7 +1914,7 @@ export function App() {
 
       const metadata = await window.missionControl.uploadDatasetFolder({
         projectId: project.id,
-        datasetPath: newProjectFolder.path,
+        datasetToken: newProjectFolder.token,
       });
 
       await request<Dataset>(`/projects/${project.id}/datasets`, {

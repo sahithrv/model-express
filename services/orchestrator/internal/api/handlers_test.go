@@ -77,6 +77,305 @@ func TestAutomationSettingsPersistAndReload(t *testing.T) {
 	}
 }
 
+func TestResolveOrchestratorListenAddrDefaultsLoopback(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_ORCHESTRATOR_ADDR", "")
+	t.Setenv("MODEL_EXPRESS_ALLOW_LAN", "")
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "")
+
+	addr, err := ResolveOrchestratorListenAddr()
+	if err != nil {
+		t.Fatalf("resolve listen addr: %v", err)
+	}
+	if addr != defaultOrchestratorAddr {
+		t.Fatalf("expected default addr %q, got %q", defaultOrchestratorAddr, addr)
+	}
+}
+
+func TestResolveOrchestratorListenAddrGuardsLANBind(t *testing.T) {
+	if err := validateOrchestratorListenAddr("0.0.0.0:8080", false, ""); err == nil {
+		t.Fatal("expected non-loopback bind to require explicit LAN opt-in")
+	}
+	if err := validateOrchestratorListenAddr("0.0.0.0:8080", true, ""); err == nil {
+		t.Fatal("expected non-loopback bind to require an API token")
+	}
+	if err := validateOrchestratorListenAddr("0.0.0.0:8080", true, "token"); err != nil {
+		t.Fatalf("expected LAN bind with token to pass: %v", err)
+	}
+	if err := validateOrchestratorListenAddr("127.0.0.1:8080", false, ""); err != nil {
+		t.Fatalf("expected loopback bind to pass without token: %v", err)
+	}
+}
+
+func TestLANModeAPITokenMiddlewareKeepsHealthOpen(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_ALLOW_LAN", "true")
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "api-token")
+
+	router := NewRouter(store.NewMemoryStore())
+	healthResp := httptest.NewRecorder()
+	router.ServeHTTP(healthResp, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if healthResp.Code != http.StatusOK {
+		t.Fatalf("expected healthz to stay open, got %d: %s", healthResp.Code, healthResp.Body.String())
+	}
+
+	blockedResp := httptest.NewRecorder()
+	router.ServeHTTP(blockedResp, httptest.NewRequest(http.MethodGet, "/projects", nil))
+	if blockedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected missing API token to be rejected, got %d: %s", blockedResp.Code, blockedResp.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/projects", nil)
+	req.Header.Set("X-Model-Express-Api-Token", "api-token")
+	allowedResp := httptest.NewRecorder()
+	router.ServeHTTP(allowedResp, req)
+	if allowedResp.Code != http.StatusOK {
+		t.Fatalf("expected valid API token to pass, got %d: %s", allowedResp.Code, allowedResp.Body.String())
+	}
+}
+
+func TestWorkerCallbackAuthRequiresAttemptAndToken(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
+	attemptID := callbackAttemptID(t, assigned)
+
+	missingAttemptReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(`{"epoch":1,"metrics":{"loss":1.2}}`))
+	missingAttemptReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, missingAttemptReq, assigned)
+	missingAttemptResp := httptest.NewRecorder()
+	router.ServeHTTP(missingAttemptResp, missingAttemptReq)
+	if missingAttemptResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected missing attempt status %d, got %d: %s", http.StatusBadRequest, missingAttemptResp.Code, missingAttemptResp.Body.String())
+	}
+
+	missingTokenReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(`{"epoch":1,"training_attempt_id":"`+attemptID+`","metrics":{"loss":1.2}}`))
+	missingTokenReq.Header.Set("Content-Type", "application/json")
+	missingTokenResp := httptest.NewRecorder()
+	router.ServeHTTP(missingTokenResp, missingTokenReq)
+	if missingTokenResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected missing token status %d, got %d: %s", http.StatusUnauthorized, missingTokenResp.Code, missingTokenResp.Body.String())
+	}
+
+	wrongTokenReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(`{"epoch":1,"training_attempt_id":"`+attemptID+`","metrics":{"loss":1.2}}`))
+	wrongTokenReq.Header.Set("Content-Type", "application/json")
+	wrongTokenReq.Header.Set(callbackTokenHeader, "wrong-token")
+	wrongTokenResp := httptest.NewRecorder()
+	router.ServeHTTP(wrongTokenResp, wrongTokenReq)
+	if wrongTokenResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected wrong token status %d, got %d: %s", http.StatusUnauthorized, wrongTokenResp.Code, wrongTokenResp.Body.String())
+	}
+}
+
+func TestWorkerCallbackTokenReturnedByPollAllowsMetric(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
+	body := `{"epoch":1,"training_attempt_id":"` + callbackAttemptID(t, assigned) + `","metrics":{"loss":1.2}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected valid callback status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+}
+
+func TestLANModeCallbackEndpointUsesAttemptTokenInsteadOfAPIToken(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_ALLOW_LAN", "true")
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "api-token")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	blockedPollReq := httptest.NewRequest(http.MethodPost, "/workers/"+worker.ID+"/poll", strings.NewReader(`{}`))
+	blockedPollReq.Header.Set("Content-Type", "application/json")
+	blockedPollResp := httptest.NewRecorder()
+	router.ServeHTTP(blockedPollResp, blockedPollReq)
+	if blockedPollResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected poll without API token to be rejected, got %d: %s", blockedPollResp.Code, blockedPollResp.Body.String())
+	}
+
+	pollReq := httptest.NewRequest(http.MethodPost, "/workers/"+worker.ID+"/poll", strings.NewReader(`{}`))
+	pollReq.Header.Set("Content-Type", "application/json")
+	pollReq.Header.Set("X-Model-Express-Api-Token", "api-token")
+	pollResp := httptest.NewRecorder()
+	router.ServeHTTP(pollResp, pollReq)
+	if pollResp.Code != http.StatusOK {
+		t.Fatalf("poll job status %d: %s", pollResp.Code, pollResp.Body.String())
+	}
+	var payload pollJobResponse
+	if err := json.Unmarshal(pollResp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode poll response: %v", err)
+	}
+	if payload.Job == nil {
+		t.Fatal("expected poll to return a job")
+	}
+
+	assigned := *payload.Job
+	body := `{"epoch":1,"training_attempt_id":"` + callbackAttemptID(t, assigned) + `","metrics":{"loss":1.2}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected callback token to authorize callback without API token, got %d: %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestPollModalJobAddsCallbackTokenAndRemoteSessionWithoutPersistingToken(t *testing.T) {
+	t.Setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.example.test")
+	t.Setenv("MODAL_S3_ENDPOINT_URL", "https://storage.example.test")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "modal worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
+
+	if assigned.ID != job.ID {
+		t.Fatalf("expected modal job, got %#v", assigned)
+	}
+	if got := jobConfigString(assigned.Config, "callback_token_header"); got != callbackTokenHeader {
+		t.Fatalf("expected callback token header %q, got %q", callbackTokenHeader, got)
+	}
+	session := payloadMap(assigned.Config, "remote_training_session")
+	if payloadString(session, "id") == "" ||
+		payloadString(session, "training_attempt_id") != callbackAttemptID(t, assigned) ||
+		payloadString(session, "status") != "active" ||
+		payloadString(session, "expires_at") == "" ||
+		payloadString(session, "storage_prefix") == "" ||
+		payloadString(session, "public_callback_url") != "https://orchestrator.example.test" ||
+		payloadString(session, "public_storage_url") != "https://storage.example.test" {
+		t.Fatalf("unexpected remote training session metadata: %#v", session)
+	}
+	storageScope := payloadMap(session, "storage_scope")
+	if len(storageScope) == 0 {
+		t.Fatalf("expected storage scope metadata, got %#v", session)
+	}
+	if redacted := payloadMap(session, "redacted_state"); redacted["public_callback_url_configured"] != true || redacted["public_storage_url_configured"] != true {
+		t.Fatalf("expected redacted remote session state, got %#v", redacted)
+	}
+	persisted, err := memoryStore.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get persisted job: %v", err)
+	}
+	if _, ok := persisted.Config["callback_token"]; ok {
+		t.Fatalf("callback token was persisted in job config: %#v", persisted.Config)
+	}
+	if payloadString(payloadMap(persisted.Config, "remote_training_session"), "id") == "" {
+		t.Fatalf("expected non-secret remote session metadata to persist: %#v", persisted.Config)
+	}
+}
+
+func TestExpiredRemoteTrainingSessionRejectsCallback(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "modal worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
+	session := payloadMap(assigned.Config, "remote_training_session")
+	session["expires_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	if _, err := memoryStore.UpdateJobConfig(assigned.ID, map[string]any{"remote_training_session": session}); err != nil {
+		t.Fatalf("expire remote session: %v", err)
+	}
+
+	body := `{"epoch":1,"training_attempt_id":"` + callbackAttemptID(t, assigned) + `","metrics":{"loss":1.2}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected expired session status %d, got %d: %s", http.StatusUnauthorized, resp.Code, resp.Body.String())
+	}
+}
+
 func TestTrainingRunSummaryPersistsRemoteGpuStageTelemetry(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
@@ -96,9 +395,15 @@ func TestTrainingRunSummaryPersistsRemoteGpuStageTelemetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
 
 	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 	body := strings.NewReader(`{
+		"training_attempt_id":"` + callbackAttemptID(t, assigned) + `",
 		"model":"mobilenet_v3_small",
 		"provider":"modal",
 		"gpu_type":"T4",
@@ -122,6 +427,7 @@ func TestTrainingRunSummaryPersistsRemoteGpuStageTelemetry(t *testing.T) {
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", body)
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -273,9 +579,15 @@ func TestTrainingRunSummaryUpdatesWorkerRequirementMaterializationStatus(t *test
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
 
 	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 	body := strings.NewReader(`{
+		"training_attempt_id":"` + callbackAttemptID(t, assigned) + `",
 		"model":"mobilenet_v3_small",
 		"provider":"modal",
 		"gpu_type":"T4",
@@ -292,6 +604,7 @@ func TestTrainingRunSummaryUpdatesWorkerRequirementMaterializationStatus(t *test
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", body)
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -626,10 +939,16 @@ func TestCompleteJobAcknowledgesBeforePostTrainingHooksFinish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
 
 	router := NewRouter(memoryStore)
-	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/complete", strings.NewReader(`{"mlflow_run_id":"run_1"}`))
+	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/complete", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assigned)+`","mlflow_run_id":"run_1"}`))
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -750,7 +1069,7 @@ func TestCreateChampionExportIsIdempotentByChampionAndFormat(t *testing.T) {
 		ProjectID:         project.ID,
 		JobID:             job.ID,
 		SelectionReason:   "best validation score",
-		DeploymentProfile: map[string]any{"artifact_uri": "file:///first.onnx"},
+		DeploymentProfile: map[string]any{"artifact_uri": "s3://bucket/model-express/artifacts/train_1/model.onnx"},
 	})
 	if err != nil {
 		t.Fatalf("upsert champion: %v", err)
@@ -769,7 +1088,15 @@ func TestCreateChampionExportIsIdempotentByChampionAndFormat(t *testing.T) {
 		t.Fatalf("decode first export: %v", err)
 	}
 
-	secondReq := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/exports", strings.NewReader(`{"format":"onnx","artifact_uri":"file:///second.onnx","metadata":{"request":"second"}}`))
+	rejectedReq := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/exports", strings.NewReader(`{"format":"onnx","artifact_uri":"file:///second.onnx","metadata":{"request":"rejected"}}`))
+	rejectedReq.Header.Set("Content-Type", "application/json")
+	rejectedResp := httptest.NewRecorder()
+	router.ServeHTTP(rejectedResp, rejectedReq)
+	if rejectedResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected request-supplied artifact uri status %d, got %d: %s", http.StatusBadRequest, rejectedResp.Code, rejectedResp.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/exports", strings.NewReader(`{"format":"onnx","metadata":{"request":"second"}}`))
 	secondReq.Header.Set("Content-Type", "application/json")
 	secondResp := httptest.NewRecorder()
 	router.ServeHTTP(secondResp, secondReq)
@@ -783,7 +1110,7 @@ func TestCreateChampionExportIsIdempotentByChampionAndFormat(t *testing.T) {
 	if second.ID != first.ID {
 		t.Fatalf("expected existing export %s to be updated, got new export %s", first.ID, second.ID)
 	}
-	if second.ChampionID != champion.ID || second.ArtifactURI != "file:///second.onnx" {
+	if second.ChampionID != champion.ID || second.ArtifactURI != "s3://bucket/model-express/artifacts/train_1/model.onnx" {
 		t.Fatalf("unexpected updated export: %#v", second)
 	}
 	exports, err := memoryStore.ListProjectChampionExports(project.ID)
@@ -957,8 +1284,14 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 		t.Fatalf("expected source checkpoint to be preserved separately, got %q", sourceArtifactURI)
 	}
 
-	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+exportJob.ID+"/champion-export-result", strings.NewReader(`{"status":"READY","artifact_uri":"file:///exports/champion.onnx","metadata":{"labels":["cat","dog"]}}`))
+	worker, err := memoryStore.RegisterWorker(project.ID, "export worker", "")
+	if err != nil {
+		t.Fatalf("register export worker: %v", err)
+	}
+	assignedExport := pollJobForCallback(t, router, worker.ID, `{"templates":["export_champion"]}`)
+	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+exportJob.ID+"/champion-export-result", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assignedExport)+`","status":"READY","artifact_uri":"file:///exports/champion.onnx","metadata":{"labels":["cat","dog"]}}`))
 	resultReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, resultReq, assignedExport)
 	resultResp := httptest.NewRecorder()
 	router.ServeHTTP(resultResp, resultReq)
 	if resultResp.Code != http.StatusOK {
@@ -1064,8 +1397,14 @@ func TestChampionDemoPredictionQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 		t.Fatalf("unexpected prediction job config: %#v", predictionJob.Config)
 	}
 
-	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+predictionJob.ID+"/champion-demo-prediction-result", strings.NewReader(`{"status":"SUCCEEDED","predicted_label":"cat","confidence":0.97,"top_k":[{"label":"cat","confidence":0.97}],"latency_ms":12.5,"correct":true}`))
+	worker, err := memoryStore.RegisterWorker(project.ID, "demo worker", "")
+	if err != nil {
+		t.Fatalf("register demo worker: %v", err)
+	}
+	assignedPrediction := pollJobForCallback(t, router, worker.ID, `{"templates":["champion_demo_prediction"]}`)
+	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+predictionJob.ID+"/champion-demo-prediction-result", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assignedPrediction)+`","status":"SUCCEEDED","predicted_label":"cat","confidence":0.97,"top_k":[{"label":"cat","confidence":0.97}],"latency_ms":12.5,"correct":true}`))
 	resultReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, resultReq, assignedPrediction)
 	resultResp := httptest.NewRecorder()
 	router.ServeHTTP(resultResp, resultReq)
 	if resultResp.Code != http.StatusOK {
@@ -1105,7 +1444,7 @@ func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t 
 			"input_shape":  []int{1, 3, 224, 224},
 		},
 		"artifacts": []map[string]any{
-			{"format": "framework_native_checkpoint", "status": "created", "path": "file:///exports/model.pt"},
+			{"format": "framework_native_checkpoint", "status": "created", "path": "s3://model-express/model-express/artifacts/job_1/model.pt"},
 		},
 	}
 	if _, err := memoryStore.UpsertProjectChampion(runs.ProjectChampionUpsert{
@@ -1114,7 +1453,7 @@ func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t 
 		JobID:           trainingJob.ID,
 		SelectionReason: "best validation score",
 		DeploymentProfile: map[string]any{
-			"artifact_uri": "file:///exports/model.pt",
+			"artifact_uri": "s3://model-express/model-express/artifacts/job_1/model.pt",
 			"model_profile": map[string]any{
 				"export_manifest": manifest,
 			},
@@ -1132,7 +1471,7 @@ func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t 
 		JobID:       trainingJob.ID,
 		Status:      runs.ChampionExportStatusReady,
 		Format:      "onnx",
-		ArtifactURI: "file:///exports/model.pt",
+		ArtifactURI: "s3://model-express/model-express/artifacts/job_1/model.pt",
 	}); err != nil {
 		t.Fatalf("create stale mismatched export: %v", err)
 	}
@@ -1146,7 +1485,7 @@ func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t 
 		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, resp.Code, resp.Body.String())
 	}
 	predictionJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateChampionDemoPrediction)
-	if artifactURI := jobConfigString(predictionJob.Config, "export_artifact_uri"); artifactURI != "file:///exports/model.pt" {
+	if artifactURI := jobConfigString(predictionJob.Config, "export_artifact_uri"); artifactURI != "s3://model-express/model-express/artifacts/job_1/model.pt" {
 		t.Fatalf("expected deployment checkpoint artifact, got %q", artifactURI)
 	}
 	if manifest := payloadMap(payloadMap(predictionJob.Config, "export_metadata"), "manifest"); len(manifest) == 0 {
@@ -1210,8 +1549,14 @@ func TestChampionDemoPredictionAcceptsRuntimeUnavailableWorkerResult(t *testing.
 		t.Fatalf("expected dataset_id in prediction job config, got %#v", predictionJob.Config)
 	}
 
-	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+predictionJob.ID+"/champion-demo-prediction-result", strings.NewReader(`{"status":"RUNTIME_UNAVAILABLE","error":"No worker-owned export manifest path was supplied or found."}`))
+	worker, err := memoryStore.RegisterWorker(project.ID, "demo worker", "")
+	if err != nil {
+		t.Fatalf("register demo worker: %v", err)
+	}
+	assignedPrediction := pollJobForCallback(t, router, worker.ID, `{"templates":["champion_demo_prediction"]}`)
+	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+predictionJob.ID+"/champion-demo-prediction-result", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assignedPrediction)+`","status":"RUNTIME_UNAVAILABLE","error":"No worker-owned export manifest path was supplied or found."}`))
 	resultReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, resultReq, assignedPrediction)
 	resultResp := httptest.NewRecorder()
 	router.ServeHTTP(resultResp, resultReq)
 	if resultResp.Code != http.StatusOK {
@@ -1355,16 +1700,14 @@ func TestRetryableFailJobRequeuesUntilMaxAttempts(t *testing.T) {
 	router := NewRouter(memoryStore)
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{})
-		if err != nil {
-			t.Fatalf("poll attempt %d: %v", attempt, err)
-		}
+		assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 		if assigned.ID != job.ID || assigned.Attempt != attempt {
 			t.Fatalf("unexpected assigned job at attempt %d: %#v", attempt, assigned)
 		}
-		body := strings.NewReader(`{"error":"modal container exited before completion","retryable":true}`)
+		body := strings.NewReader(`{"training_attempt_id":"` + callbackAttemptID(t, assigned) + `","error":"modal container exited before completion","retryable":true}`)
 		req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", body)
 		req.Header.Set("Content-Type", "application/json")
+		setCallbackToken(t, req, assigned)
 		resp := httptest.NewRecorder()
 		router.ServeHTTP(resp, req)
 		if resp.Code != http.StatusOK {
@@ -1386,15 +1729,13 @@ func TestRetryableFailJobRequeuesUntilMaxAttempts(t *testing.T) {
 		}
 	}
 
-	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{})
-	if err != nil {
-		t.Fatalf("poll final attempt: %v", err)
-	}
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 	if assigned.ID != job.ID || assigned.Attempt != 3 {
 		t.Fatalf("unexpected final assignment: %#v", assigned)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", strings.NewReader(`{"error":"modal container exited before completion","retryable":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assigned)+`","error":"modal container exited before completion","retryable":true}`))
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -1435,10 +1776,7 @@ func TestRetryableOOMFailureEscalatesGpuAndBlocksRepeatedResource(t *testing.T) 
 	}
 	router := NewRouter(memoryStore)
 
-	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
-	if err != nil {
-		t.Fatalf("poll job: %v", err)
-	}
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 	activeAttemptID := jobConfigString(assigned.Config, "active_attempt_id")
 	body, _ := json.Marshal(map[string]any{
 		"error":                    "CUDA out of memory",
@@ -1454,6 +1792,7 @@ func TestRetryableOOMFailureEscalatesGpuAndBlocksRepeatedResource(t *testing.T) 
 	})
 	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -1498,10 +1837,7 @@ func TestRetryableOOMFailureEscalatesGpuAndBlocksRepeatedResource(t *testing.T) 
 		t.Fatalf("create repeated job: %v", err)
 	}
 	guardRouter := NewRouter(guardStore)
-	assignedRepeated, err := guardStore.PollJob(guardWorker.ID, store.JobPollFilter{Provider: "modal"})
-	if err != nil {
-		t.Fatalf("poll repeated job: %v", err)
-	}
+	assignedRepeated := pollJobForCallback(t, guardRouter, guardWorker.ID, `{"provider":"modal"}`)
 	repeatedBody, _ := json.Marshal(map[string]any{
 		"error":                    "CUDA out of memory",
 		"retryable":                true,
@@ -1516,6 +1852,7 @@ func TestRetryableOOMFailureEscalatesGpuAndBlocksRepeatedResource(t *testing.T) 
 	})
 	repeatedReq := httptest.NewRequest(http.MethodPost, "/jobs/"+repeatedJob.ID+"/fail", bytes.NewReader(repeatedBody))
 	repeatedReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, repeatedReq, assignedRepeated)
 	repeatedResp := httptest.NewRecorder()
 	guardRouter.ServeHTTP(repeatedResp, repeatedReq)
 	if repeatedResp.Code != http.StatusOK {
@@ -1555,10 +1892,7 @@ func TestStaleModalAttemptCallbacksDoNotOverwriteActiveAttempt(t *testing.T) {
 	}
 	router := NewRouter(memoryStore)
 
-	firstAttempt, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
-	if err != nil {
-		t.Fatalf("poll first attempt: %v", err)
-	}
+	firstAttempt := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 	firstAttemptID := jobConfigString(firstAttempt.Config, "active_attempt_id")
 	failBody, _ := json.Marshal(map[string]any{
 		"error":                    "CUDA out of memory",
@@ -1573,16 +1907,14 @@ func TestStaleModalAttemptCallbacksDoNotOverwriteActiveAttempt(t *testing.T) {
 	})
 	failReq := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", bytes.NewReader(failBody))
 	failReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, failReq, firstAttempt)
 	failResp := httptest.NewRecorder()
 	router.ServeHTTP(failResp, failReq)
 	if failResp.Code != http.StatusOK {
 		t.Fatalf("expected fail status %d, got %d: %s", http.StatusOK, failResp.Code, failResp.Body.String())
 	}
 
-	secondAttempt, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
-	if err != nil {
-		t.Fatalf("poll second attempt: %v", err)
-	}
+	secondAttempt := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 	secondAttemptID := jobConfigString(secondAttempt.Config, "active_attempt_id")
 	goodSummary, _ := json.Marshal(map[string]any{
 		"training_attempt_id": secondAttemptID,
@@ -1592,6 +1924,7 @@ func TestStaleModalAttemptCallbacksDoNotOverwriteActiveAttempt(t *testing.T) {
 	})
 	goodReq := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", bytes.NewReader(goodSummary))
 	goodReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, goodReq, secondAttempt)
 	goodResp := httptest.NewRecorder()
 	router.ServeHTTP(goodResp, goodReq)
 	if goodResp.Code != http.StatusOK {
@@ -1606,10 +1939,11 @@ func TestStaleModalAttemptCallbacksDoNotOverwriteActiveAttempt(t *testing.T) {
 	})
 	staleReq := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-summary", bytes.NewReader(staleSummary))
 	staleReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, staleReq, firstAttempt)
 	staleResp := httptest.NewRecorder()
 	router.ServeHTTP(staleResp, staleReq)
-	if staleResp.Code != http.StatusAccepted {
-		t.Fatalf("expected stale summary status %d, got %d: %s", http.StatusAccepted, staleResp.Code, staleResp.Body.String())
+	if staleResp.Code != http.StatusConflict {
+		t.Fatalf("expected stale summary status %d, got %d: %s", http.StatusConflict, staleResp.Code, staleResp.Body.String())
 	}
 	summary, err := memoryStore.GetTrainingRunSummary(job.ID)
 	if err != nil {
@@ -1625,10 +1959,11 @@ func TestStaleModalAttemptCallbacksDoNotOverwriteActiveAttempt(t *testing.T) {
 		strings.NewReader(`{"training_attempt_id":"`+firstAttemptID+`","mlflow_run_id":"stale"}`),
 	)
 	completeReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, completeReq, firstAttempt)
 	completeResp := httptest.NewRecorder()
 	router.ServeHTTP(completeResp, completeReq)
-	if completeResp.Code != http.StatusOK {
-		t.Fatalf("expected stale complete status %d, got %d: %s", http.StatusOK, completeResp.Code, completeResp.Body.String())
+	if completeResp.Code != http.StatusConflict {
+		t.Fatalf("expected stale complete status %d, got %d: %s", http.StatusConflict, completeResp.Code, completeResp.Body.String())
 	}
 	activeJob, err := memoryStore.GetJob(job.ID)
 	if err != nil {
@@ -1656,17 +1991,23 @@ func TestFailJobDoesNotDowngradeSucceededJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
 	if _, err := memoryStore.CompleteJob(job.ID, "run_1"); err != nil {
 		t.Fatalf("complete job: %v", err)
 	}
 
-	router := NewRouter(memoryStore)
-	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", strings.NewReader(`{"error":"late failure","retryable":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/fail", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assigned)+`","error":"late failure","retryable":true}`))
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("expected late fail status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("expected late fail status %d, got %d: %s", http.StatusConflict, resp.Code, resp.Body.String())
 	}
 	updated, err := memoryStore.GetJob(job.ID)
 	if err != nil {
@@ -1712,10 +2053,7 @@ func TestCancelPlanActiveExecutionStopsJobsRequirementsAndIgnoresStaleCallbacks(
 	if err != nil {
 		t.Fatalf("register worker: %v", err)
 	}
-	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
-	if err != nil {
-		t.Fatalf("poll job: %v", err)
-	}
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
 	activeAttemptID := jobConfigString(assigned.Config, "active_attempt_id")
 	if activeAttemptID == "" {
 		t.Fatalf("expected active attempt id on assigned job: %#v", assigned)
@@ -1740,6 +2078,7 @@ func TestCancelPlanActiveExecutionStopsJobsRequirementsAndIgnoresStaleCallbacks(
 	})
 	recordReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/modal-call", bytes.NewReader(recordBody))
 	recordReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, recordReq, assigned)
 	recordResp := httptest.NewRecorder()
 	router.ServeHTTP(recordResp, recordReq)
 	if recordResp.Code != http.StatusOK {
@@ -1812,10 +2151,11 @@ func TestCancelPlanActiveExecutionStopsJobsRequirementsAndIgnoresStaleCallbacks(
 	})
 	lateModalReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/modal-call", bytes.NewReader(lateModalBody))
 	lateModalReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, lateModalReq, assigned)
 	lateModalResp := httptest.NewRecorder()
 	router.ServeHTTP(lateModalResp, lateModalReq)
-	if lateModalResp.Code != http.StatusAccepted {
-		t.Fatalf("expected late modal call to be ignored with %d, got %d: %s", http.StatusAccepted, lateModalResp.Code, lateModalResp.Body.String())
+	if lateModalResp.Code != http.StatusConflict {
+		t.Fatalf("expected late modal call to be rejected with %d, got %d: %s", http.StatusConflict, lateModalResp.Code, lateModalResp.Body.String())
 	}
 	afterLateModal, err := memoryStore.GetJob(assigned.ID)
 	if err != nil {
@@ -1831,10 +2171,11 @@ func TestCancelPlanActiveExecutionStopsJobsRequirementsAndIgnoresStaleCallbacks(
 		strings.NewReader(`{"training_attempt_id":"`+activeAttemptID+`","mlflow_run_id":"stale"}`),
 	)
 	completeReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, completeReq, assigned)
 	completeResp := httptest.NewRecorder()
 	router.ServeHTTP(completeResp, completeReq)
-	if completeResp.Code != http.StatusOK {
-		t.Fatalf("expected stale complete status %d, got %d: %s", http.StatusOK, completeResp.Code, completeResp.Body.String())
+	if completeResp.Code != http.StatusConflict {
+		t.Fatalf("expected stale complete status %d, got %d: %s", http.StatusConflict, completeResp.Code, completeResp.Body.String())
 	}
 	afterComplete, err := memoryStore.GetJob(assigned.ID)
 	if err != nil {
@@ -2611,7 +2952,7 @@ func TestBudgetCapSelectsBestAvailableChampionWhenAllQueuedFullTrainIsBlocked(t 
 	}
 	if _, err := memoryStore.UpsertTrainingRunEvaluation(priorJob.ID, runs.TrainingRunEvaluationUpdate{
 		ModelProfile: map[string]any{
-			"artifact_uri":  "s3://models/prior/model.onnx",
+			"artifact_uri":  "s3://model-express/model-express/artifacts/prior/model.onnx",
 			"export_status": "ready",
 		},
 	}); err != nil {
@@ -2719,7 +3060,7 @@ func TestCostPolicySkippedFullTrainSelectsChampionAfterAllowedJobsFinish(t *test
 	}
 	if _, err := memoryStore.UpsertTrainingRunEvaluation(previewJob.ID, runs.TrainingRunEvaluationUpdate{
 		ModelProfile: map[string]any{
-			"artifact_uri":  "s3://models/preview/model.onnx",
+			"artifact_uri":  "s3://model-express/model-express/artifacts/preview/model.onnx",
 			"export_status": "ready",
 		},
 	}); err != nil {
@@ -2744,7 +3085,7 @@ func TestCostPolicySkippedFullTrainSelectsChampionAfterAllowedJobsFinish(t *test
 	if err != nil {
 		t.Fatalf("list champion exports: %v", err)
 	}
-	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI != "s3://models/preview/model.onnx" {
+	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI != "s3://model-express/model-express/artifacts/preview/model.onnx" {
 		t.Fatalf("expected ready preview export, got %#v", exports)
 	}
 }
@@ -4022,9 +4363,15 @@ func TestTrainingRunEvaluationAddsBackendDiagnostics(t *testing.T) {
 	}
 
 	router := NewRouter(server.store)
-	body := []byte(`{"holistic_scores":{"overall_score":0.72},"model_profile":{"estimated_latency_ms":10}}`)
+	worker, err := server.store.RegisterWorker(plan.ProjectID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
+	body := []byte(`{"training_attempt_id":"` + callbackAttemptID(t, assigned) + `","holistic_scores":{"overall_score":0.72},"model_profile":{"estimated_latency_ms":10}}`)
 	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/training-run-evaluation", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
 	resp := httptest.NewRecorder()
 
 	router.ServeHTTP(resp, req)
@@ -7509,6 +7856,52 @@ func findProjectJob(t *testing.T, memoryStore *store.MemoryStore, projectID stri
 	}
 	t.Fatalf("expected project job with template %s", template)
 	return jobs.ExperimentJob{}
+}
+
+func pollJobForCallback(t *testing.T, router http.Handler, workerID string, body string) jobs.ExperimentJob {
+	t.Helper()
+	if body == "" {
+		body = `{}`
+	}
+	req := httptest.NewRequest(http.MethodPost, "/workers/"+workerID+"/poll", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("poll job status %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload pollJobResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode poll response: %v", err)
+	}
+	if payload.Job == nil {
+		t.Fatal("expected poll to return a job")
+	}
+	if jobConfigString(payload.Job.Config, "active_attempt_id") == "" {
+		t.Fatalf("expected active attempt id in poll response config: %#v", payload.Job.Config)
+	}
+	if jobConfigString(payload.Job.Config, "callback_token") == "" {
+		t.Fatalf("expected callback token in poll response config: %#v", payload.Job.Config)
+	}
+	return *payload.Job
+}
+
+func setCallbackToken(t *testing.T, req *http.Request, job jobs.ExperimentJob) {
+	t.Helper()
+	token := jobConfigString(job.Config, "callback_token")
+	if token == "" {
+		t.Fatalf("poll response for job %s did not include callback token", job.ID)
+	}
+	req.Header.Set(callbackTokenHeader, token)
+}
+
+func callbackAttemptID(t *testing.T, job jobs.ExperimentJob) string {
+	t.Helper()
+	attemptID := jobConfigString(job.Config, "active_attempt_id")
+	if attemptID == "" {
+		t.Fatalf("poll response for job %s did not include active attempt id", job.ID)
+	}
+	return attemptID
 }
 
 func plannerInputForPayload(t *testing.T, server *Server, projectID string) agents.ExperimentPlannerInput {

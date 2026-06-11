@@ -1,6 +1,8 @@
 server:
   host: "127.0.0.1"
   port: 8080
+  allow_lan: false
+  api_token_env: "MODEL_EXPRESS_API_TOKEN"
 
 database:
   driver: "postgres"

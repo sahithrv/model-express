@@ -1,6 +1,11 @@
 package api
 
 import (
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,11 +18,55 @@ import (
 
 type Server struct {
 	store                       store.Store
+	callbackSecret              []byte
 	autoReviewMu                sync.Mutex
 	trainingTerminalHooksMu     sync.Mutex
 	trainingTerminalHooksQueued map[string]bool
 	automationSettings          settings.AutomationSettings
 	settingsMu                  sync.RWMutex
+}
+
+const defaultOrchestratorAddr = "127.0.0.1:8080"
+
+func ResolveOrchestratorListenAddr() (string, error) {
+	addr := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_ORCHESTRATOR_ADDR"))
+	if addr == "" {
+		addr = defaultOrchestratorAddr
+	}
+	if err := validateOrchestratorListenAddr(
+		addr,
+		envFlag("MODEL_EXPRESS_ALLOW_LAN", false),
+		os.Getenv("MODEL_EXPRESS_API_TOKEN"),
+	); err != nil {
+		return "", err
+	}
+	return addr, nil
+}
+
+func validateOrchestratorListenAddr(addr string, allowLAN bool, apiToken string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("MODEL_EXPRESS_ORCHESTRATOR_ADDR must be host:port: %w", err)
+	}
+	if listenHostIsLoopback(host) {
+		return nil
+	}
+	if !allowLAN {
+		return fmt.Errorf("refusing non-loopback orchestrator bind %q without MODEL_EXPRESS_ALLOW_LAN=true", addr)
+	}
+	if strings.TrimSpace(apiToken) == "" {
+		return fmt.Errorf("MODEL_EXPRESS_API_TOKEN is required when binding orchestrator to %q", addr)
+	}
+	return nil
+}
+
+func listenHostIsLoopback(host string) bool {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func NewRouter(store store.Store) *gin.Engine {
@@ -26,6 +75,11 @@ func NewRouter(store store.Store) *gin.Engine {
 	router := gin.Default()
 
 	router.GET("/healthz", server.health)
+
+	if apiToken := apiTokenForLANMode(); apiToken != "" {
+		router.Use(apiTokenMiddleware(apiToken))
+	}
+
 	router.GET("/automl/capabilities", server.getAutoMLCapabilities)
 	router.GET("/settings/automation", server.getAutomationSettings)
 	router.PATCH("/settings/automation", server.updateAutomationSettings)
@@ -110,6 +164,7 @@ func NewRouter(store store.Store) *gin.Engine {
 func newServer(store store.Store) *Server {
 	server := &Server{
 		store:                       store,
+		callbackSecret:              callbackSecretFromEnv(),
 		trainingTerminalHooksQueued: make(map[string]bool),
 		automationSettings:          automationSettingsFromEnv(),
 	}
@@ -124,6 +179,66 @@ func newServer(store store.Store) *Server {
 	server.automationSettings.AutoMLSampler = normalizeAutoMLSampler(server.automationSettings.AutoMLSampler)
 
 	return server
+}
+
+func apiTokenForLANMode() string {
+	if !envFlag("MODEL_EXPRESS_ALLOW_LAN", false) {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv("MODEL_EXPRESS_API_TOKEN"))
+}
+
+func apiTokenMiddleware(apiToken string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if callbackEndpointUsesAttemptToken(c.Request.Method, c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		if !secureTokenEqual(apiTokenFromRequest(c), apiToken) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid API token"})
+			return
+		}
+		c.Next()
+	}
+}
+
+func callbackEndpointUsesAttemptToken(method string, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "jobs" || strings.TrimSpace(parts[1]) == "" {
+		return false
+	}
+	switch parts[2] {
+	case "metrics",
+		"training-run-summary",
+		"training-run-evaluation",
+		"modal-call",
+		"champion-export-result",
+		"champion-demo-prediction-result",
+		"complete",
+		"fail":
+		return true
+	default:
+		return false
+	}
+}
+
+func apiTokenFromRequest(c *gin.Context) string {
+	if token := strings.TrimSpace(c.GetHeader("X-Model-Express-Api-Token")); token != "" {
+		return token
+	}
+	return bearerToken(c.GetHeader("Authorization"))
+}
+
+func bearerToken(header string) string {
+	header = strings.TrimSpace(header)
+	const prefix = "Bearer "
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
 }
 
 type healthResponse struct {

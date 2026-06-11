@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: model_express
       POSTGRES_DB: model_express
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
@@ -24,7 +24,7 @@ services:
       - --artifacts-destination
       - /mlflow/artifacts
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
       - mlflow-artifacts:/mlflow/artifacts
 
@@ -39,8 +39,7 @@ services:
       MINIO_ROOT_USER: model_express
       MINIO_ROOT_PASSWORD: model_express_password
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
     volumes:
       - minio-data:/data
 

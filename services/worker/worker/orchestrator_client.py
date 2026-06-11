@@ -26,14 +26,16 @@ class OrchestratorClient:
     
     def get_dataset(self, dataset_id: str) -> dict:
         response = requests.get(
-            f"{self.base_url}/datasets/{dataset_id}", timeout=self.timeout
+            f"{self.base_url}/datasets/{dataset_id}",
+            **self._request_kwargs(timeout=self.timeout),
         )
         response.raise_for_status()
         return response.json()
 
     def get_job(self, job_id: str) -> dict:
         response = requests.get(
-            f"{self.base_url}/jobs/{job_id}", timeout=request_timeout_seconds()
+            f"{self.base_url}/jobs/{job_id}",
+            **self._request_kwargs(timeout=request_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -42,7 +44,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/datasets/{dataset_id}/profile",
             json={"profile": profile},
-            timeout=self.timeout,
+            **self._callback_request_kwargs(timeout=self.timeout),
         )
         response.raise_for_status()
         return response.json()
@@ -51,7 +53,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/datasets/{dataset_id}/metadata/imports",
             json=payload,
-            timeout=report_timeout_seconds(),
+            **self._callback_request_kwargs(timeout=report_timeout_seconds()),
         )
         if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
             return {
@@ -83,7 +85,7 @@ class OrchestratorClient:
         response = requests.get(
             f"{self.base_url}/datasets/{dataset_id}/metadata/bundle",
             params=params,
-            timeout=self.timeout,
+            **self._request_kwargs(timeout=self.timeout),
         )
         if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES or response.status_code == 204:
             return None
@@ -104,7 +106,7 @@ class OrchestratorClient:
                 "name": name or os.getenv("WORKER_NAME", "local-worker-1"),
                 "gpu_type": gpu_type or os.getenv("GPU_TYPE", "local"),
             },
-            timeout=request_timeout_seconds(),
+            **self._request_kwargs(timeout=request_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -113,7 +115,7 @@ class OrchestratorClient:
     def heartbeat_worker(self, worker_id: str) -> dict:
         response = requests.post(
             f"{self.base_url}/workers/{worker_id}/heartbeat",
-            timeout=request_timeout_seconds(),
+            **self._request_kwargs(timeout=request_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -122,7 +124,7 @@ class OrchestratorClient:
     def list_project_worker_requirements(self, project_id: str) -> list[dict]:
         response = requests.get(
             f"{self.base_url}/projects/{project_id}/worker-requirements",
-            timeout=request_timeout_seconds(),
+            **self._request_kwargs(timeout=request_timeout_seconds()),
         )
         response.raise_for_status()
         payload = response.json()
@@ -146,7 +148,7 @@ class OrchestratorClient:
                 "plan_id": plan_id,
                 "payload": payload or {},
             },
-            timeout=report_timeout_seconds(),
+            **self._request_kwargs(timeout=report_timeout_seconds()),
         )
         if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
             return {
@@ -173,7 +175,7 @@ class OrchestratorClient:
             payload["templates"] = templates
         if include_unspecified_provider_templates:
             payload["include_unspecified_provider_templates"] = include_unspecified_provider_templates
-        kwargs = {"timeout": request_timeout_seconds()}
+        kwargs = self._request_kwargs(timeout=request_timeout_seconds())
         if payload:
             kwargs["json"] = payload
         response = requests.post(
@@ -190,8 +192,8 @@ class OrchestratorClient:
             json=self._with_callback_identity(job_id, {
                 "epoch": epoch,
                 "metrics": metrics,
-            }, job=job),
-            timeout=report_timeout_seconds(),
+            }, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -200,8 +202,8 @@ class OrchestratorClient:
     def report_training_run_summary(self, job_id: str, summary: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/training-run-summary",
-            json=self._with_callback_identity(job_id, summary, job=job),
-            timeout=report_timeout_seconds(),
+            json=self._with_callback_identity(job_id, summary, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -209,8 +211,8 @@ class OrchestratorClient:
     def report_training_run_evaluation(self, job_id: str, evaluation: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/training-run-evaluation",
-            json=self._with_callback_identity(job_id, evaluation, job=job),
-            timeout=report_timeout_seconds(),
+            json=self._with_callback_identity(job_id, evaluation, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -218,8 +220,8 @@ class OrchestratorClient:
     def report_modal_call(self, job_id: str, payload: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/modal-call",
-            json=self._with_callback_identity(job_id, payload, job=job),
-            timeout=report_timeout_seconds(),
+            json=self._with_callback_identity(job_id, payload, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
             return {
@@ -233,8 +235,8 @@ class OrchestratorClient:
     def report_champion_export_result(self, job_id: str, result: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/champion-export-result",
-            json=self._with_callback_identity(job_id, result, job=job),
-            timeout=report_timeout_seconds(),
+            json=self._with_callback_identity(job_id, result, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -242,8 +244,8 @@ class OrchestratorClient:
     def report_champion_demo_prediction_result(self, job_id: str, result: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/champion-demo-prediction-result",
-            json=self._with_callback_identity(job_id, result, job=job),
-            timeout=report_timeout_seconds(),
+            json=self._with_callback_identity(job_id, result, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -252,7 +254,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/datasets/{dataset_id}/visual-exemplars",
             json=payload,
-            timeout=report_timeout_seconds(),
+            **self._callback_request_kwargs(timeout=report_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -261,7 +263,7 @@ class OrchestratorClient:
         response = requests.post(
             f"{self.base_url}/datasets/{dataset_id}/visual-analysis-result",
             json=payload,
-            timeout=report_timeout_seconds(),
+            **self._callback_request_kwargs(timeout=report_timeout_seconds()),
         )
         _raise_for_status_with_body(response)
         return response.json()
@@ -269,8 +271,8 @@ class OrchestratorClient:
     def complete_job(self, job_id: str, mlflow_run_id: str = "", *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/complete",
-            json=self._with_callback_identity(job_id, {"mlflow_run_id": mlflow_run_id}, job=job),
-            timeout=report_timeout_seconds(),
+            json=self._with_callback_identity(job_id, {"mlflow_run_id": mlflow_run_id}, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         response.raise_for_status()
         return response.json()
@@ -292,11 +294,11 @@ class OrchestratorClient:
             payload["error"] = error
             if retryable:
                 payload["retryable"] = True
-        payload = self._with_callback_identity(job_id, payload, job=job)
+        payload = self._with_callback_identity(job_id, payload, job=job, strict=True)
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/fail",
             json=payload,
-            timeout=report_timeout_seconds(),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
         _raise_for_status_with_body(response)
         return response.json()
@@ -323,13 +325,30 @@ class OrchestratorClient:
             self.fail_job(job_id, str(exc), retryable=True, job=job)
             raise
 
-    def _with_callback_identity(self, job_id: str, payload: dict, *, job: dict | None = None) -> dict:
+    def _with_callback_identity(
+        self,
+        job_id: str,
+        payload: dict,
+        *,
+        job: dict | None = None,
+        strict: bool = False,
+    ) -> dict:
         out = dict(payload)
+        context_job = job or self._active_job_for(job_id)
+        attempt_id = _training_attempt_id(context_job)
+        if attempt_id:
+            existing_attempt_id = str(out.get("training_attempt_id") or "").strip()
+            if strict and existing_attempt_id and existing_attempt_id != attempt_id:
+                raise ValueError(
+                    f"Job {job_id} callback training_attempt_id {existing_attempt_id!r} "
+                    f"does not match active attempt {attempt_id!r}."
+                )
+            out["training_attempt_id"] = attempt_id
+            return out
         if out.get("training_attempt_id"):
             return out
-        attempt_id = _training_attempt_id(job or self._active_job_for(job_id))
-        if attempt_id:
-            out["training_attempt_id"] = attempt_id
+        if strict and isinstance(context_job, dict):
+            raise ValueError(f"Job {job_id} callback requires training_attempt_id from the active job context.")
         return out
 
     def _active_job_for(self, job_id: str) -> dict | None:
@@ -337,6 +356,48 @@ class OrchestratorClient:
         if isinstance(job, dict) and str(job.get("id") or "") == str(job_id):
             return job
         return None
+
+    def _active_job(self) -> dict | None:
+        job = getattr(self._job_context, "job", None)
+        return job if isinstance(job, dict) else None
+
+    def _callback_request_kwargs(
+        self,
+        job_id: str | None = None,
+        *,
+        job: dict | None = None,
+        timeout: int | float,
+    ) -> dict:
+        kwargs = self._request_kwargs(timeout=timeout)
+        headers = dict(kwargs.get("headers") or {})
+        headers.update(self._callback_headers(job_id, job=job))
+        if headers:
+            kwargs["headers"] = headers
+        return kwargs
+
+    def _request_kwargs(self, *, timeout: int | float) -> dict:
+        kwargs = {"timeout": timeout}
+        headers = self._api_headers()
+        if headers:
+            kwargs["headers"] = headers
+        return kwargs
+
+    def _api_headers(self) -> dict:
+        token = os.getenv("MODEL_EXPRESS_API_TOKEN", "").strip()
+        if not token:
+            return {}
+        return {"X-Model-Express-API-Token": token}
+
+    def _callback_headers(self, job_id: str | None = None, *, job: dict | None = None) -> dict:
+        context_job = job
+        if context_job is None and job_id is not None:
+            context_job = self._active_job_for(job_id)
+        if context_job is None:
+            context_job = self._active_job()
+        token = _callback_token(context_job)
+        if not token:
+            return {}
+        return {"Authorization": f"Bearer {token}"}
 
 
 def request_timeout_seconds() -> int:
@@ -363,14 +424,39 @@ def _training_attempt_id(job: dict | None) -> str:
         return ""
     config = job.get("config") if isinstance(job.get("config"), dict) else {}
     for value in (
-        job.get("training_attempt_id"),
         config.get("active_attempt_id"),
+        job.get("training_attempt_id"),
         config.get("training_attempt_id"),
     ):
         text = str(value or "").strip()
         if text:
             return text
     return ""
+
+
+def _callback_token(job: dict | None) -> str:
+    if not isinstance(job, dict):
+        return ""
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    session = _remote_training_session_metadata(config)
+    for value in (
+        config.get("callback_token"),
+        job.get("callback_token"),
+        session.get("callback_token"),
+        session.get("token"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _remote_training_session_metadata(config: dict) -> dict:
+    for key in ("remote_training_session", "remoteTrainingSession", "RemoteTrainingSession"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _positive_int_env(name: str, default: int) -> int:

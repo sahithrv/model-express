@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -139,6 +140,92 @@ class DemoInferenceTests(unittest.TestCase):
             self.assertEqual(payload["runtime"], "framework_native_checkpoint")
             self.assertEqual(payload["predicted_label"], "dog")
             self.assertTrue(payload["correct"])
+
+    def test_inference_rejects_file_artifact_uri_outside_worker_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            outside = root / "outside" / "model.torchscript.pt"
+            outside.parent.mkdir()
+            outside.write_bytes(b"not worker owned")
+            image_path = root / "demo.jpg"
+            Image.new("RGB", (4, 4), (20, 20, 20)).save(image_path)
+            manifest = {
+                "schema_version": "champion_export_manifest_v1",
+                "status": "created",
+                "metadata": {"class_labels": ["cat", "dog"]},
+                "artifacts": [
+                    {
+                        "format": "torchscript",
+                        "status": "created",
+                        "path": outside.resolve().as_uri(),
+                    }
+                ],
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(root / "exports")}):
+                payload = run_demo_inference_from_manifest(
+                    manifest=manifest,
+                    image_path=image_path,
+                    true_label="dog",
+                )
+
+            self.assertEqual(payload["status"], "pending")
+            self.assertEqual(payload["error_code"], "MODEL_ARTIFACT_NOT_FOUND")
+
+    def test_framework_native_checkpoint_rejects_unsafe_pickle_without_execution(self) -> None:
+        try:
+            import torch
+            from worker.training.modal_app import _build_model  # noqa: F401
+        except Exception as exc:  # pragma: no cover - depends on optional local deps
+            raise unittest.SkipTest(f"torchvision model builder is unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_root = root / "exports"
+            checkpoint = export_root / "job" / "model.pt"
+            marker = root / "unsafe_executed.txt"
+            checkpoint.parent.mkdir(parents=True)
+
+            class UnsafePayload:
+                def __reduce__(self):
+                    return (
+                        eval,
+                        (f"__import__('pathlib').Path({str(marker)!r}).write_text('executed')",),
+                    )
+
+            torch.save({"state_dict": UnsafePayload()}, checkpoint)
+            image_path = root / "demo.jpg"
+            Image.new("RGB", (32, 32), (20, 20, 20)).save(image_path)
+            manifest = {
+                "schema_version": "champion_export_manifest_v1",
+                "status": "created",
+                "metadata": {
+                    "model": "mobilenet_v3_small",
+                    "class_labels": ["cat", "dog"],
+                    "input_shape": [1, 3, 32, 32],
+                    "training_config": {"fine_tune_strategy": "full"},
+                    "preprocessing": {"normalization": "none"},
+                },
+                "artifacts": [
+                    {
+                        "format": "framework_native_checkpoint",
+                        "status": "created",
+                        "path": str(checkpoint),
+                    }
+                ],
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(export_root)}):
+                payload = run_demo_inference_from_manifest(
+                    manifest=manifest,
+                    image_path=image_path,
+                    true_label="dog",
+                )
+
+            self.assertEqual(payload["status"], "pending")
+            self.assertEqual(payload["error_code"], "INFERENCE_FAILED")
+            self.assertIn("CHECKPOINT_UNSAFE_PICKLE_REJECTED", payload["error"])
+            self.assertFalse(marker.exists())
 
     def test_yolo_detection_postprocess_decodes_rows_and_applies_nms(self) -> None:
         try:

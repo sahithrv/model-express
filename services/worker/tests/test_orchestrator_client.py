@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import requests
+import pytest
 
 from worker.orchestrator_client import OrchestratorClient
+
+
+@pytest.fixture(autouse=True)
+def _clear_api_token(monkeypatch):
+    monkeypatch.delenv("MODEL_EXPRESS_API_TOKEN", raising=False)
 
 
 class _FakeResponse:
@@ -85,6 +91,112 @@ def test_job_context_attaches_training_attempt_id(monkeypatch):
     }
 
 
+def test_job_context_attaches_callback_token_header(monkeypatch):
+    calls = []
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict | None = None,
+        timeout: int | None = None,
+        headers: dict | None = None,
+    ):
+        calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    job = {
+        "id": "job_1",
+        "config": {
+            "active_attempt_id": "job_1_attempt_2",
+            "callback_token": "callback-secret",
+        },
+    }
+    with client.job_context(job):
+        client.report_metric("job_1", 1, {"macro_f1": 0.42})
+        client.complete_job("job_1", mlflow_run_id="run_1")
+
+    assert calls[0]["headers"] == {"Authorization": "Bearer callback-secret"}
+    assert calls[0]["json"]["training_attempt_id"] == "job_1_attempt_2"
+    assert calls[1]["headers"] == {"Authorization": "Bearer callback-secret"}
+    assert calls[1]["json"]["training_attempt_id"] == "job_1_attempt_2"
+
+
+def test_callback_and_api_tokens_use_separate_headers(monkeypatch):
+    calls = []
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict | None = None,
+        timeout: int | None = None,
+        headers: dict | None = None,
+    ):
+        calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+        return _FakeResponse()
+
+    monkeypatch.setenv("MODEL_EXPRESS_API_TOKEN", "api-token")
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    job = {
+        "id": "job_1",
+        "config": {
+            "active_attempt_id": "job_1_attempt_2",
+            "callback_token": "callback-secret",
+        },
+    }
+    with client.job_context(job):
+        client.complete_job("job_1", mlflow_run_id="run_1")
+
+    assert calls[0]["headers"] == {
+        "X-Model-Express-API-Token": "api-token",
+        "Authorization": "Bearer callback-secret",
+    }
+    assert calls[0]["json"]["training_attempt_id"] == "job_1_attempt_2"
+
+
+def test_missing_callback_token_is_not_invented(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    job = {"id": "job_1", "config": {"active_attempt_id": "job_1_attempt_2"}}
+    with client.job_context(job):
+        client.complete_job("job_1", mlflow_run_id="run_1")
+
+    assert "headers" not in calls[0]
+    assert calls[0]["json"]["training_attempt_id"] == "job_1_attempt_2"
+
+
+def test_job_context_requires_training_attempt_id_for_job_callbacks(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    with client.job_context({"id": "job_1", "config": {"callback_token": "callback-secret"}}):
+        try:
+            client.complete_job("job_1", mlflow_run_id="run_1")
+        except ValueError as exc:
+            assert "requires training_attempt_id" in str(exc)
+        else:
+            raise AssertionError("complete_job should reject unbound job callbacks")
+
+    assert calls == []
+
+
 def test_poll_job_keeps_short_request_timeout(monkeypatch):
     calls = []
 
@@ -101,6 +213,29 @@ def test_poll_job_keeps_short_request_timeout(monkeypatch):
     assert calls[0]["url"] == "http://orchestrator.test/workers/worker_1/poll"
     assert calls[0]["timeout"] == 12
     assert "json" not in calls[0] or calls[0]["json"] is None
+
+
+def test_poll_job_sends_api_token_header_when_configured(monkeypatch):
+    calls = []
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict | None = None,
+        timeout: int | None = None,
+        headers: dict | None = None,
+    ):
+        calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+        return _FakeResponse()
+
+    monkeypatch.setenv("MODEL_EXPRESS_API_TOKEN", "api-token")
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    client.poll_job("worker_1")
+
+    assert calls[0]["url"] == "http://orchestrator.test/workers/worker_1/poll"
+    assert calls[0]["headers"] == {"X-Model-Express-API-Token": "api-token"}
 
 
 def test_poll_job_can_send_modal_filter(monkeypatch):

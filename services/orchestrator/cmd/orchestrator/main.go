@@ -41,9 +41,14 @@ func main() {
 	}
 	defer postgresStore.Close()
 
+	addr, err := api.ResolveOrchestratorListenAddr()
+	if err != nil {
+		logger.Error("invalid orchestrator listen address", "error", err)
+		diagnostics.Event("error", "orchestrator_listen_addr_invalid", map[string]any{"error": err.Error()})
+		os.Exit(1)
+	}
 	router := api.NewRouter(postgresStore)
 
-	addr := ":8080"
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           router,

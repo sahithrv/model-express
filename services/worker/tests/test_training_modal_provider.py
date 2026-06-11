@@ -18,6 +18,12 @@ from worker.training.modal_provider import (
 from worker.training.modal_resources import classify_oom_failure
 
 
+@pytest.fixture(autouse=True)
+def _modal_storage_credentials(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "scoped-test-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "scoped-test-secret")
+
+
 class _FakeModalApp:
     def __init__(self, events: list[str] | None = None):
         self.enter_count = 0
@@ -133,6 +139,7 @@ class _FakeClient:
         error: str,
         retryable: bool = False,
         metadata: dict | None = None,
+        job: dict | None = None,
     ) -> dict:
         payload = {"job_id": job_id, "error": error, "retryable": retryable}
         if isinstance(metadata, dict):
@@ -257,6 +264,11 @@ def test_modal_training_uses_with_options_for_per_job_gpu_and_memory(monkeypatch
                 "batch_size": 12,
                 "memory_mb": 49152,
                 "active_attempt_id": "job_1:attempt-2",
+                "callback_token": "callback-secret",
+                "remote_training_session": {
+                    "id": "session_1",
+                    "orchestrator_public_url": "https://orchestrator.test",
+                },
             },
         },
     )
@@ -266,9 +278,27 @@ def test_modal_training_uses_with_options_for_per_job_gpu_and_memory(monkeypatch
     assert remote_payloads[0]["modal_resources"]["effective_batch_size"] == 12
     assert remote_payloads[0]["job"]["config"]["modal_resources"]["memory_mb"] == 49152
     assert remote_payloads[0]["job"]["config"]["active_attempt_id"] == "job_1:attempt-2"
+    assert remote_payloads[0]["training_attempt_id"] == "job_1:attempt-2"
+    assert remote_payloads[0]["callback_token"] == "callback-secret"
+    assert remote_payloads[0]["remote_training_session"]["id"] == "session_1"
+    assert remote_payloads[0]["storage_scope"]["read_keys"] == ["dataset.zip"]
+    assert remote_payloads[0]["storage_scope"]["write_prefixes"] == ["model-express/artifacts/job_1/"]
+    assert remote_payloads[0]["aws_access_key_id"] == "scoped-test-key"
     assert client.failures == []
     assert sys.modules["worker.training.modal_app"].train_image_classifier.options_calls[0]["gpu"] == "A10"
     assert os.environ["MODAL_GPU_TYPE"] == "T4"
+
+
+def test_modal_storage_rejects_default_root_credentials(monkeypatch):
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "model_express")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "model_express_password")
+
+    with pytest.raises(ValueError, match="default local MinIO root credentials"):
+        modal_provider._modal_storage_payload(
+            {"id": "job_1", "config": {}},
+            {"id": "dataset_1", "storage_uri": "s3://bucket/dataset.zip"},
+        )
 
 
 def test_modal_training_spawn_reports_function_call_object_id(monkeypatch):
@@ -531,6 +561,9 @@ def test_modal_training_batch_flag_on_remote_unsupported_falls_back(monkeypatch)
                 "provider": "modal",
                 "plan_id": "plan_1",
                 "training_tier": "preview",
+                "active_attempt_id": "job_1:attempt-1",
+                "callback_token": "callback-secret-1",
+                "remote_training_session": {"id": "session_1"},
                 "dataset_materialization": {"dataset_cache_key": "sha256-a"},
             },
         },
@@ -543,6 +576,9 @@ def test_modal_training_batch_flag_on_remote_unsupported_falls_back(monkeypatch)
                 "provider": "modal",
                 "plan_id": "plan_1",
                 "training_tier": "preview",
+                "active_attempt_id": "job_2:attempt-1",
+                "callback_token": "callback-secret-2",
+                "remote_training_session": {"id": "session_2"},
                 "dataset_materialization": {"dataset_cache_key": "sha256-a"},
             },
         },
@@ -565,6 +601,10 @@ def test_modal_training_batch_flag_on_remote_unsupported_falls_back(monkeypatch)
     assert remote_payloads[0]["batch"]["batch_id"] == "modal-preview-batch-test"
     assert [job["id"] for job in remote_payloads[0]["jobs"]] == ["job_1", "job_2"]
     assert remote_payloads[0]["dataset"]["id"] == "dataset_1"
+    assert remote_payloads[0]["job_callback_metadata"]["job_1"]["training_attempt_id"] == "job_1:attempt-1"
+    assert remote_payloads[0]["job_callback_metadata"]["job_1"]["callback_token"] == "callback-secret-1"
+    assert remote_payloads[0]["job_callback_metadata"]["job_1"]["remote_training_session"]["id"] == "session_1"
+    assert remote_payloads[0]["job_callback_metadata"]["job_2"]["callback_token"] == "callback-secret-2"
     assert [job["id"] for job in submitted] == ["job_1", "job_2"]
     assert submitted[0]["config"]["modal_batch"]["batch_remote_status"] == (
         "remote_batch_shell_unsupported_single_job_fallback"
@@ -740,7 +780,10 @@ def test_modal_output_context_makes_cp1252_streams_tolerant(monkeypatch):
 
 
 def test_modal_dataset_profile_invocation_error_reports_retryable_failure(monkeypatch):
-    def remote(_payload: dict):
+    remote_payloads = []
+
+    def remote(payload: dict):
+        remote_payloads.append(payload)
         raise TimeoutError("profile timed out")
 
     fake_modal_app = types.ModuleType("worker.training.modal_app")
@@ -755,7 +798,13 @@ def test_modal_dataset_profile_invocation_error_reports_retryable_failure(monkey
         {
             "id": "job_1",
             "project_id": "project_1",
-            "config": {"dataset_id": "dataset_1", "provider": "modal"},
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "active_attempt_id": "job_1:attempt-1",
+                "callback_token": "callback-secret",
+                "remote_training_session": {"id": "session_1"},
+            },
         },
     )
 
@@ -767,10 +816,16 @@ def test_modal_dataset_profile_invocation_error_reports_retryable_failure(monkey
         in client.failures[0]["error"]
     )
     assert "profile timed out" in client.failures[0]["error"]
+    assert remote_payloads[0]["training_attempt_id"] == "job_1:attempt-1"
+    assert remote_payloads[0]["callback_token"] == "callback-secret"
+    assert remote_payloads[0]["remote_training_session"]["id"] == "session_1"
 
 
 def test_modal_dataset_materialization_invocation_error_reports_retryable_failure(monkeypatch):
-    def remote(_payload: dict):
+    remote_payloads = []
+
+    def remote(payload: dict):
+        remote_payloads.append(payload)
         raise TimeoutError("materialization timed out")
 
     fake_modal_app = types.ModuleType("worker.training.modal_app")
@@ -786,7 +841,13 @@ def test_modal_dataset_materialization_invocation_error_reports_retryable_failur
             {
                 "id": "job_1",
                 "project_id": "project_1",
-                "config": {"dataset_id": "dataset_1", "provider": "modal"},
+                "config": {
+                    "dataset_id": "dataset_1",
+                    "provider": "modal",
+                    "active_attempt_id": "job_1:attempt-1",
+                    "callback_token": "callback-secret",
+                    "remote_training_session": {"id": "session_1"},
+                },
             },
         )
 
@@ -798,3 +859,6 @@ def test_modal_dataset_materialization_invocation_error_reports_retryable_failur
         in client.failures[0]["error"]
     )
     assert "materialization timed out" in client.failures[0]["error"]
+    assert remote_payloads[0]["training_attempt_id"] == "job_1:attempt-1"
+    assert remote_payloads[0]["callback_token"] == "callback-secret"
+    assert remote_payloads[0]["remote_training_session"]["id"] == "session_1"
