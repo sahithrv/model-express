@@ -8,7 +8,7 @@ import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -59,7 +59,7 @@ def extract_dataset_archive(
 
     temp_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(temp_dir)
+        _safe_extract_zip(archive, temp_dir)
 
     if extract_dir.exists():
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -184,7 +184,7 @@ def ensure_dataset_materialized(
         staging_dir.mkdir(parents=True)
         extract_started = time.perf_counter()
         with zipfile.ZipFile(archive_path) as archive:
-            archive.extractall(staging_dir)
+            _safe_extract_zip(archive, staging_dir)
         telemetry["dataset_materialization_extract_seconds"] = round(
             time.perf_counter() - extract_started,
             6,
@@ -587,6 +587,32 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def _safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
+    root = Path(destination).resolve(strict=False)
+    for member in archive.infolist():
+        relative_path = _safe_zip_member_path(member.filename)
+        target = (root / Path(*relative_path.parts)).resolve(strict=False)
+        if not _is_relative_to(target, root):
+            raise ValueError(f"Unsafe dataset archive member path: {member.filename!r}")
+        if member.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(member) as source, target.open("wb") as handle:
+            shutil.copyfileobj(source, handle)
+
+
+def _safe_zip_member_path(name: str) -> PurePosixPath:
+    normalized = str(name or "").replace("\\", "/")
+    posix_path = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(str(name or ""))
+    if not normalized.strip() or posix_path.is_absolute() or windows_path.is_absolute():
+        raise ValueError(f"Unsafe dataset archive member path: {name!r}")
+    if any(part in {"", ".", ".."} for part in posix_path.parts):
+        raise ValueError(f"Unsafe dataset archive member path: {name!r}")
+    return posix_path
 
 
 def _normalized_checksum(checksum_sha256: str | None) -> str:

@@ -8,6 +8,7 @@ const { app, BrowserWindow, dialog, ipcMain, Menu } = electron;
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const net = require("net");
 const os = require("os");
 const path = require("path");
 const { Transform } = require("stream");
@@ -27,6 +28,7 @@ const DEFAULT_JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const DATASET_SELECTION_TTL_MS = 4 * 60 * 60 * 1000;
 const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
 const DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+const MODEL_ARTIFACT_EXTENSIONS = [".onnx", ".ort", ".pt", ".pth", ".torchscript", ".safetensors"];
 const electronRuntimeAvailable = Boolean(app && BrowserWindow && dialog && ipcMain && Menu);
 
 function createWindow() {
@@ -179,6 +181,28 @@ function isLoopbackHostname(hostname) {
     host === "0:0:0:0:0:0:0:1" ||
     /^127(?:\.\d{1,3}){3}$/.test(host)
   );
+}
+
+function isPrivateOrLocalHostname(hostname) {
+  const host = String(hostname ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (isLoopbackHostname(host) || host === "0.0.0.0" || host === "::") {
+    return true;
+  }
+  if (net.isIP(host) === 4) {
+    const parts = host.split(".").map((part) => Number.parseInt(part, 10));
+    const [a, b] = parts;
+    return (
+      a === 10 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254) ||
+      (a === 100 && b >= 64 && b <= 127)
+    );
+  }
+  if (net.isIP(host) === 6) {
+    return host === "::" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:");
+  }
+  return host === "localhost" || host.endsWith(".localhost");
 }
 
 function allowedOriginsFromEnv(names, env = process.env) {
@@ -431,7 +455,18 @@ function validateLocalArtifactPath(artifactUri, env = process.env) {
   if (!allowed) {
     throw new Error("Model artifact must be under a configured Model Express artifact or export root.");
   }
+  if (isPathInsideOrEqual(realCandidate, path.join(repoRoot(env), "artifacts", "logs"))) {
+    throw new Error("Model artifact loading refuses log directories.");
+  }
+  if (!isAllowedModelArtifactFile(realCandidate)) {
+    throw new Error("Model artifact must use a supported model artifact extension.");
+  }
   return realCandidate;
+}
+
+function isAllowedModelArtifactFile(filePath) {
+  const name = path.basename(String(filePath ?? "")).toLowerCase();
+  return MODEL_ARTIFACT_EXTENSIONS.some((extension) => name.endsWith(extension));
 }
 
 function validateExternalDataLocalPath(sourcePath, artifactDir, mountPath, explicit) {
@@ -1157,9 +1192,12 @@ function firstNonEmpty(...values) {
   return values.map((value) => String(value ?? "").trim()).find(Boolean) || "";
 }
 
-function validateRemoteModalUrl(value, label) {
+function validateRemoteModalUrl(value, label, env = process.env) {
   const parsed = parseHttpOrigin(value, label);
-  if (isLoopbackHostname(parsed.hostname)) {
+  if (parsed.protocol !== "https:" && !envFlagFrom(env, "MODEL_EXPRESS_ALLOW_INSECURE_MODAL_URLS", false)) {
+    throw new Error(`${label} must use https for Modal workers.`);
+  }
+  if (isPrivateOrLocalHostname(parsed.hostname)) {
     throw new Error(`${label} must be remotely reachable for Modal workers.`);
   }
   if (parsed.port === "5432" || parsed.port === "5000" || parsed.port === "9001") {
@@ -1493,9 +1531,12 @@ function safeLogText(value) {
   const redacted = String(value ?? "")
     .replace(/data:image\/[a-z0-9.+-]+;base64,[^\s"]+/gi, "[redacted]")
     .replace(/https?:\/\/[^\s"]*trycloudflare\.com[^\s"]*/gi, "[redacted-url]")
-    .replace(/https?:\/\/[^\s"]*(?:token|secret|signature|x-amz-signature|authorization)=[^\s"]*/gi, "[redacted-url]")
+    .replace(/([?&](?:x-amz-credential|x-amz-signature|x-amz-security-token|awsaccesskeyid|signature|token|secret|authorization)=)[^&\s"]+/gi, "$1[redacted]")
+    .replace(/https?:\/\/[^\s"]*(?:token|secret|signature|x-amz-signature|x-amz-credential|authorization)=[^\s"]*/gi, "[redacted-url]")
+    .replace(/\bsk-[a-z0-9_-]{10,}\b/gi, "[redacted-token]")
     .replace(/bearer\s+[a-z0-9._-]+/gi, "Bearer [redacted]")
-    .replace(/(aws_access_key|api[_-]?key|secret|token|password)\s*[:=]\s*[^\s"]+/gi, "$1=[redacted]");
+    .replace(/\b((?:model_express_)?modal_[a-z0-9_]*url|cloudflared_url|tunnel_url)\s*[:=]\s*https?:\/\/[^\s"]+/gi, "$1=[redacted-url]")
+    .replace(/(aws[_-]?access[_-]?key(?:[_-]?id)?|aws[_-]?secret[_-]?access[_-]?key|accessKeyId|secretAccessKey|api[_-]?key|secret|token|password)\s*[:=]\s*[^\s"]+/gi, "$1=[redacted]");
   return redacted.length > 1800 ? `${redacted.slice(0, 1799).trimEnd()}...` : redacted;
 }
 
@@ -1656,6 +1697,7 @@ module.exports = {
     validateLocalArtifactPath,
     validateOrchestratorBaseUrl,
     validateOrchestratorRequest,
+    validateRemoteModalUrl,
     validateUploadEndpoint,
   },
 };

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import secrets
 import sys
@@ -521,10 +522,14 @@ def _modal_storage_scope(jobs: list[dict], dataset: dict) -> dict:
 
 def _dataset_storage_bucket_key(dataset: dict) -> tuple[str, str]:
     storage_uri = str(dataset.get("storage_uri") or "").strip()
-    parsed = urlparse(storage_uri)
-    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
-        raise ValueError("Modal storage scope requires an s3:// dataset storage_uri.")
-    return parsed.netloc, parsed.path.lstrip("/")
+    try:
+        from worker.datasets.storage import parse_s3_uri
+
+        return parse_s3_uri(storage_uri)
+    except ValueError as exc:
+        raise ValueError("Modal storage scope requires an s3:// dataset storage_uri.") from exc
+    except Exception as exc:
+        raise ValueError("Modal storage scope requires a valid s3:// dataset storage_uri.") from exc
 
 
 def _job_storage_prefix(job: dict) -> str:
@@ -532,7 +537,9 @@ def _job_storage_prefix(job: dict) -> str:
     session = config.get("remote_training_session") if isinstance(config.get("remote_training_session"), dict) else {}
     prefix = str(session.get("storage_prefix") or "").strip().strip("/")
     if prefix:
-        return prefix
+        from worker.datasets.storage import normalize_storage_key
+
+        return normalize_storage_key(prefix)
     job_id = str(job.get("id") or "").strip()
     if not job_id:
         return ""
@@ -791,11 +798,28 @@ def _require_remote_reachable_url(name: str, value: str) -> None:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"{name} must be a full http(s) URL, got {value!r}")
+    if parsed.scheme != "https" and not _env_flag("MODEL_EXPRESS_ALLOW_INSECURE_MODAL_URLS", False):
+        raise ValueError(f"{name} must use https for Modal workers, got {value!r}")
 
-    host = parsed.hostname or ""
-    if host in {"localhost", "127.0.0.1", "::1"}:
+    host = (parsed.hostname or "").strip().strip("[]").lower()
+    if host in {"localhost", "0.0.0.0"} or host.endswith(".localhost"):
         raise ValueError(
-            f"{name} points at {value!r}, but Modal cannot reach your local localhost. "
+            f"{name} points at {value!r}, but Modal cannot reach local or unspecified hosts. "
+            "Expose it with a tunnel and set the public URL before running Modal jobs."
+        )
+    try:
+        ip_address = ipaddress.ip_address(host)
+    except ValueError:
+        return
+    if (
+        ip_address.is_loopback
+        or ip_address.is_private
+        or ip_address.is_link_local
+        or ip_address.is_unspecified
+        or ip_address.is_multicast
+    ):
+        raise ValueError(
+            f"{name} points at {value!r}, but Modal requires a public HTTPS endpoint. "
             "Expose it with a tunnel and set the public URL before running Modal jobs."
         )
 

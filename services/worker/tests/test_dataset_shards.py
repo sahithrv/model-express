@@ -99,6 +99,29 @@ def test_yolo_shard_extraction_preserves_pairs_and_valid_data_yaml(tmp_path: Pat
         assert {path.stem for path in images} == {path.stem for path in labels}
 
 
+def test_yolo_shards_reject_paths_outside_dataset_root(tmp_path: Path) -> None:
+    pytest.importorskip("yaml")
+    dataset = tmp_path / "dataset"
+    outside = tmp_path / "outside" / "images"
+    outside.mkdir(parents=True)
+    (outside / "escape.jpg").write_bytes(b"image")
+    (dataset / "data.yaml").parent.mkdir(parents=True)
+    (dataset / "data.yaml").write_text(
+        "path: ..\ntrain: outside/images\nval: outside/images\nnc: 1\nnames: [escape]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ShardMaterializationError, match="outside the dataset root"):
+        create_shard_artifacts(
+            dataset_dir=dataset,
+            artifact_root=tmp_path / "shards",
+            dataset_checksum="b" * 64,
+            cache_key="sha256-" + "b" * 64,
+            storage_uri="s3://bucket/yolo.zip",
+            max_shard_bytes=16,
+        )
+
+
 def test_materialization_zip_fallback_still_works_when_shards_flag_is_off(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MODEL_EXPRESS_DATASET_SHARDS", "0")
     source_zip = tmp_path / "source.zip"

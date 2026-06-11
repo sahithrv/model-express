@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,7 @@ type Server struct {
 }
 
 const defaultOrchestratorAddr = "127.0.0.1:8080"
+const defaultJSONRequestBodyMaxBytes int64 = 2 * 1024 * 1024
 
 func ResolveOrchestratorListenAddr() (string, error) {
 	addr := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_ORCHESTRATOR_ADDR"))
@@ -73,10 +76,11 @@ func NewRouter(store store.Store) *gin.Engine {
 	server := newServer(store)
 
 	router := gin.Default()
+	router.Use(jsonRequestBodyLimitMiddleware(jsonRequestBodyMaxBytes()))
 
 	router.GET("/healthz", server.health)
 
-	if apiToken := apiTokenForLANMode(); apiToken != "" {
+	if apiToken, required := apiTokenForExposedMode(); required {
 		router.Use(apiTokenMiddleware(apiToken))
 	}
 
@@ -181,11 +185,74 @@ func newServer(store store.Store) *Server {
 	return server
 }
 
-func apiTokenForLANMode() string {
-	if !envFlag("MODEL_EXPRESS_ALLOW_LAN", false) {
-		return ""
+func jsonRequestBodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil && requestHasJSONBody(c.Request) {
+			if c.Request.ContentLength > maxBytes {
+				c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "JSON request body too large"})
+				return
+			}
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		}
+		c.Next()
 	}
-	return strings.TrimSpace(os.Getenv("MODEL_EXPRESS_API_TOKEN"))
+}
+
+func requestHasJSONBody(req *http.Request) bool {
+	if req == nil || req.Body == nil {
+		return false
+	}
+	contentType := strings.ToLower(strings.TrimSpace(req.Header.Get("Content-Type")))
+	return contentType == "" || strings.Contains(contentType, "application/json")
+}
+
+func jsonRequestBodyMaxBytes() int64 {
+	value := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_JSON_BODY_MAX_BYTES"))
+	if value == "" {
+		return defaultJSONRequestBodyMaxBytes
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return defaultJSONRequestBodyMaxBytes
+	}
+	if parsed < 64*1024 {
+		return 64 * 1024
+	}
+	if parsed > 16*1024*1024 {
+		return 16 * 1024 * 1024
+	}
+	return parsed
+}
+
+func apiTokenForExposedMode() (string, bool) {
+	if !orchestratorExposedMode() {
+		return "", false
+	}
+	return strings.TrimSpace(os.Getenv("MODEL_EXPRESS_API_TOKEN")), true
+}
+
+func orchestratorExposedMode() bool {
+	if envFlag("MODEL_EXPRESS_ALLOW_LAN", false) || envFlag("MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE", false) {
+		return true
+	}
+	for _, name := range []string{"MODAL_ORCHESTRATOR_URL", "MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL"} {
+		if publicOrTunnelURL(os.Getenv(name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func publicOrTunnelURL(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Hostname() == "" {
+		return false
+	}
+	return !listenHostIsLoopback(parsed.Hostname())
 }
 
 func apiTokenMiddleware(apiToken string) gin.HandlerFunc {

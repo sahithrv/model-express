@@ -3,8 +3,8 @@ import boto3
 import json
 import os
 from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urlparse
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import unquote, urlparse
 
 def s3_client():
     access_key = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
@@ -39,9 +39,9 @@ def parse_s3_uri(storage_uri: str) -> tuple[str, str]:
 
     if parsed.scheme != "s3":
         raise ValueError(f"Expected s3:// URI, got: {storage_uri}")
-    
+
     bucket = parsed.netloc
-    key = parsed.path.lstrip("/")
+    key = normalize_storage_key(parsed.path.lstrip("/"))
 
     if not bucket or not key:
         raise ValueError(f"Invalid S3 URI: {storage_uri}")
@@ -119,12 +119,26 @@ def scope_values(scope: dict, *names: str) -> list[str]:
 
 
 def key_allowed(key: str, *, exact: list[str], prefixes: list[str]) -> bool:
-    normalized = key.lstrip("/")
-    exact_keys = {item.lstrip("/") for item in exact if item}
+    normalized = normalize_storage_key(key)
+    exact_keys = {normalize_storage_key(item) for item in exact if str(item or "").strip()}
     if normalized in exact_keys:
         return True
     for prefix in prefixes:
-        normalized_prefix = str(prefix or "").lstrip("/")
-        if normalized_prefix and normalized.startswith(normalized_prefix):
+        if not str(prefix or "").strip():
+            continue
+        normalized_prefix = normalize_storage_key(prefix)
+        if normalized == normalized_prefix or normalized.startswith(normalized_prefix + "/"):
             return True
     return False
+
+
+def normalize_storage_key(value: str) -> str:
+    raw = unquote(str(value or "").replace("\\", "/")).strip()
+    raw = raw.lstrip("/")
+    posix_path = PurePosixPath(raw)
+    windows_path = PureWindowsPath(str(value or ""))
+    if not raw or posix_path.is_absolute() or windows_path.is_absolute():
+        raise ValueError("S3 key is unsafe or empty.")
+    if any(part in {"", ".", ".."} for part in posix_path.parts):
+        raise ValueError("S3 key contains path traversal.")
+    return "/".join(posix_path.parts)

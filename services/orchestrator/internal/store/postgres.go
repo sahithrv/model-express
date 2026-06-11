@@ -1321,6 +1321,7 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 		if job.MaxAttempts < 1 {
 			job.MaxAttempts = defaultJobMaxAttempts
 		}
+		previousConfig := copyAnyMap(job.Config)
 		var updated jobs.ExperimentJob
 		if job.Attempt >= job.MaxAttempts {
 			nextConfig := jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
@@ -1370,6 +1371,9 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 				current_job_id = ''
 			WHERE current_job_id = $2
 		`, workers.StatusIdle, job.ID, workers.StatusOffline); err != nil {
+			return nil, err
+		}
+		if err := closeRemoteTrainingSessionForJobConfigTx(ctx, tx, previousConfig, runs.RemoteTrainingSessionStatusExpired, now); err != nil {
 			return nil, err
 		}
 		recovered = append(recovered, updated)
@@ -3868,6 +3872,7 @@ func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobO
 	}
 
 	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
+	previousConfig := copyAnyMap(job.Config)
 	nextConfig := copyAnyMap(job.Config)
 	if options.Config != nil {
 		nextConfig = copyAnyMap(options.Config)
@@ -3925,6 +3930,14 @@ func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobO
 	`, workers.StatusIdle, jobID, workers.StatusOffline); err != nil {
 		return jobs.ExperimentJob{}, false, err
 	}
+	if requeued {
+		err = closeRemoteTrainingSessionForJobConfigTx(ctx, tx, previousConfig, runs.RemoteTrainingSessionStatusExpired, time.Now().UTC())
+	} else {
+		err = closeRemoteTrainingSessionForJobConfigTx(ctx, tx, previousConfig, runs.RemoteTrainingSessionStatusFailed, time.Now().UTC())
+	}
+	if err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return jobs.ExperimentJob{}, false, err
@@ -3959,6 +3972,7 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 		return current, nil
 	}
 	nextConfig := jobConfigWithTerminalAttempt(current.Config, current.ID, current.Attempt)
+	previousConfig := copyAnyMap(current.Config)
 	configJSON, err := json.Marshal(nextConfig)
 	if err != nil {
 		return jobs.ExperimentJob{}, fmt.Errorf("marshal terminal job config: %w", err)
@@ -3989,6 +4003,9 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 		`, workers.StatusIdle, job.WorkerID); err != nil {
 			return jobs.ExperimentJob{}, err
 		}
+	}
+	if err := closeRemoteTrainingSessionForJobConfigTx(ctx, tx, previousConfig, status, time.Now().UTC()); err != nil {
+		return jobs.ExperimentJob{}, err
 	}
 
 	if err := tx.Commit(); err != nil {

@@ -22,6 +22,32 @@ const (
 	ChampionFeedbackRatingBad      = "bad"
 )
 
+const (
+	RemoteTrainingSessionStatusActive  = "active"
+	RemoteTrainingSessionStatusClosing = "closing"
+	RemoteTrainingSessionStatusClosed  = "closed"
+	RemoteTrainingSessionStatusExpired = "expired"
+	RemoteTrainingSessionStatusFailed  = "failed"
+)
+
+type RemoteTrainingSession struct {
+	ID                    string         `json:"id"`
+	ProjectID             string         `json:"project_id"`
+	JobID                 string         `json:"job_id"`
+	TrainingAttemptID     string         `json:"training_attempt_id"`
+	Status                string         `json:"status"`
+	CallbackTokenHash     string         `json:"callback_token_hash,omitempty"`
+	OrchestratorPublicURL string         `json:"orchestrator_public_url,omitempty"`
+	StoragePublicURL      string         `json:"storage_public_url,omitempty"`
+	StoragePrefix         string         `json:"storage_prefix,omitempty"`
+	StorageScope          map[string]any `json:"storage_scope,omitempty"`
+	Metadata              map[string]any `json:"metadata,omitempty"`
+	CreatedAt             time.Time      `json:"created_at"`
+	UpdatedAt             time.Time      `json:"updated_at"`
+	ExpiresAt             time.Time      `json:"expires_at"`
+	ClosedAt              *time.Time     `json:"closed_at,omitempty"`
+}
+
 type TrainingRunSummary struct {
 	JobID                  string         `json:"job_id"`
 	ProjectID              string         `json:"project_id"`

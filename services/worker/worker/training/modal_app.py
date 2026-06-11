@@ -1848,14 +1848,20 @@ def _resolve_existing_yolo_path(
 ) -> Path:
     candidates = _yolo_local_path_candidates(dataset_dir, data_config_path, config, value)
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.exists() and _path_is_within(candidate, dataset_dir):
             return candidate.resolve()
     suffix = _normalized_yolo_suffix(value)
     if suffix:
         for candidate in sorted(dataset_dir.rglob(Path(suffix).name), key=lambda path: str(path)):
             if _path_suffix(candidate, suffix) and candidate.exists():
                 return candidate.resolve()
-    return candidates[0].resolve() if candidates else (data_config_path.parent / value).resolve()
+    for candidate in candidates:
+        if _path_is_within(candidate, dataset_dir):
+            return candidate.resolve()
+    fallback = (data_config_path.parent / value).resolve()
+    if _path_is_within(fallback, dataset_dir):
+        return fallback
+    raise ValueError(f"YOLO data config path is outside the materialized dataset: {value!r}")
 
 
 def _yolo_local_path_candidates(
@@ -1864,11 +1870,11 @@ def _yolo_local_path_candidates(
     config: dict,
     value: str,
 ) -> list[Path]:
+    _validate_yolo_path_value(value)
     path = Path(value)
     candidates: list[Path] = []
     config_parent = data_config_path.parent
     if path.is_absolute():
-        candidates.append(path)
         for suffix in _absolute_path_suffixes(path):
             candidates.append(dataset_dir / suffix)
             candidates.append(config_parent / suffix)
@@ -1876,6 +1882,7 @@ def _yolo_local_path_candidates(
 
     root_value = str(config.get("path") or "").strip()
     if root_value:
+        _validate_yolo_path_value(root_value)
         root = Path(root_value)
         if root.is_absolute():
             if root.name:
@@ -1911,6 +1918,25 @@ def _path_suffix(path: Path, suffix: str) -> bool:
     normalized_path = path.resolve().as_posix().rstrip("/").lower()
     normalized_suffix = suffix.replace("\\", "/").strip("/").lower()
     return bool(normalized_suffix) and normalized_path.endswith(f"/{normalized_suffix}")
+
+
+def _validate_yolo_path_value(value: str) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    lowered = text.lower()
+    if "://" in lowered or lowered.startswith(("s3:", "gs:", "http:", "https:", "file:")):
+        raise ValueError(f"YOLO data config path uses an unsupported URI: {value!r}")
+    if ".." in Path(text.replace("\\", "/")).parts:
+        raise ValueError(f"YOLO data config path contains parent traversal: {value!r}")
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _unique_paths(paths: list[Path]) -> list[Path]:

@@ -1147,6 +1147,10 @@ func (s *Server) createJob(c *gin.Context) {
 	if req.Config == nil {
 		req.Config = map[string]any{}
 	}
+	if err := validateCreateJobRequest(req); err != nil {
+		writeStoreError(c, err)
+		return
+	}
 
 	job, err := s.store.CreateJob(c.Param("id"), req.Template, req.Config)
 	if err != nil {
@@ -1155,6 +1159,93 @@ func (s *Server) createJob(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, job)
+}
+
+func validateCreateJobRequest(req createJobRequest) error {
+	if !validDirectJobTemplate(req.Template) {
+		return fmt.Errorf("%w: unsupported job template %q", store.ErrInvalidRequest, req.Template)
+	}
+	if err := validateCreateJobConfigValue(req.Config, "config"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validDirectJobTemplate(template string) bool {
+	switch strings.ToLower(strings.TrimSpace(template)) {
+	case jobs.TemplateProfileDataset,
+		jobs.TemplateTrainExperiment,
+		jobs.TemplateLabelQualityAudit,
+		jobs.TemplateExportChampion,
+		jobs.TemplateChampionDemoPrediction,
+		jobs.TemplateGenerateVisualExemplars,
+		jobs.TemplateAnalyzeDatasetVisuals:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateCreateJobConfigValue(value any, location string) error {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			field := strings.TrimSpace(key)
+			if unsafeCreateJobConfigKey(field) {
+				return fmt.Errorf("%w: job config field %s cannot be supplied through the public job endpoint", store.ErrInvalidRequest, location+"."+field)
+			}
+			if err := validateCreateJobConfigValue(item, location+"."+field); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for index, item := range typed {
+			if err := validateCreateJobConfigValue(item, fmt.Sprintf("%s[%d]", location, index)); err != nil {
+				return err
+			}
+		}
+	case string:
+		if unsafeCreateJobConfigString(typed) {
+			return fmt.Errorf("%w: job config value %s contains an unsafe path or URI", store.ErrInvalidRequest, location)
+		}
+	}
+	return nil
+}
+
+func unsafeCreateJobConfigKey(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	if normalized == "" {
+		return false
+	}
+	return strings.Contains(normalized, "path") ||
+		strings.Contains(normalized, "uri") ||
+		strings.Contains(normalized, "url") ||
+		strings.Contains(normalized, "endpoint") ||
+		strings.Contains(normalized, "token") ||
+		strings.Contains(normalized, "secret") ||
+		strings.Contains(normalized, "password") ||
+		strings.Contains(normalized, "credential") ||
+		strings.Contains(normalized, "access_key")
+}
+
+func unsafeCreateJobConfigString(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	normalized := strings.ToLower(trimmed)
+	if strings.Contains(normalized, "file://") ||
+		strings.Contains(normalized, "s3://") ||
+		strings.Contains(normalized, "http://") ||
+		strings.Contains(normalized, "https://") ||
+		strings.Contains(normalized, "..") ||
+		strings.HasPrefix(trimmed, "/") ||
+		strings.HasPrefix(trimmed, `\`) {
+		return true
+	}
+	return len(trimmed) >= 3 &&
+		((trimmed[1] == ':' && (trimmed[2] == '\\' || trimmed[2] == '/')) ||
+			(trimmed[0] == '\\' && trimmed[1] == '\\'))
 }
 
 func (s *Server) listProjectJobs(c *gin.Context) {
@@ -4014,7 +4105,7 @@ func (s *Server) listProjectAgentInvocations(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"invocations": invocations})
+	c.JSON(http.StatusOK, gin.H{"invocations": agentInvocationResponseRows(invocations)})
 }
 
 func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
@@ -4040,9 +4131,52 @@ func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
 		"project_id":                    projectID,
 		"generated_at":                  time.Now().UTC(),
 		"limit":                         limit,
-		"agent_invocations":             invocations,
+		"agent_invocations":             agentInvocationResponseRows(invocations),
 		"memory_embedding_usage_events": usageEvents,
 	})
+}
+
+type agentInvocationSummary struct {
+	ID                string    `json:"id"`
+	ProjectID         string    `json:"project_id"`
+	DatasetID         string    `json:"dataset_id,omitempty"`
+	PlanID            string    `json:"plan_id,omitempty"`
+	JobID             string    `json:"job_id,omitempty"`
+	AgentName         string    `json:"agent_name"`
+	AgentVersion      string    `json:"agent_version,omitempty"`
+	PromptVersion     string    `json:"prompt_version,omitempty"`
+	Provider          string    `json:"provider,omitempty"`
+	Model             string    `json:"model,omitempty"`
+	ValidationStatus  string    `json:"validation_status"`
+	ValidationError   string    `json:"validation_error,omitempty"`
+	AcceptedForMemory bool      `json:"accepted_for_memory"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+func agentInvocationResponseRows(invocations []memory.AgentInvocation) any {
+	if envFlag("MODEL_EXPRESS_ENABLE_RAW_AGENT_AUDIT", false) {
+		return invocations
+	}
+	out := make([]agentInvocationSummary, 0, len(invocations))
+	for _, invocation := range invocations {
+		out = append(out, agentInvocationSummary{
+			ID:                invocation.ID,
+			ProjectID:         invocation.ProjectID,
+			DatasetID:         invocation.DatasetID,
+			PlanID:            invocation.PlanID,
+			JobID:             invocation.JobID,
+			AgentName:         invocation.AgentName,
+			AgentVersion:      invocation.AgentVersion,
+			PromptVersion:     invocation.PromptVersion,
+			Provider:          invocation.Provider,
+			Model:             invocation.Model,
+			ValidationStatus:  invocation.ValidationStatus,
+			ValidationError:   invocation.ValidationError,
+			AcceptedForMemory: invocation.AcceptedForMemory,
+			CreatedAt:         invocation.CreatedAt,
+		})
+	}
+	return out
 }
 
 func (s *Server) listProjectStrategyScorecards(c *gin.Context) {
@@ -4243,6 +4377,17 @@ func (s *Server) reportChampionExportResult(c *gin.Context) {
 		writeStoreError(c, fmt.Errorf("%w: artifact_uri is required for READY export result", store.ErrInvalidRequest))
 		return
 	}
+	existingExport, err := s.findProjectChampionExport(job.ProjectID, exportID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if status == runs.ChampionExportStatusReady {
+		if err := validateChampionExportReadyResult(job, existingExport, req); err != nil {
+			writeStoreError(c, err)
+			return
+		}
+	}
 
 	export, err := s.store.UpdateChampionExport(exportID, runs.ChampionExportUpdate{
 		Status:           status,
@@ -4274,6 +4419,105 @@ func (s *Server) reportChampionExportResult(c *gin.Context) {
 		s.closeRemoteTrainingSession(job, jobs.StatusFailed)
 	}
 	c.JSON(http.StatusOK, gin.H{"export": export, "job": job})
+}
+
+func (s *Server) findProjectChampionExport(projectID string, exportID string) (runs.ChampionExport, error) {
+	exports, err := s.store.ListProjectChampionExports(projectID)
+	if err != nil {
+		return runs.ChampionExport{}, err
+	}
+	for _, export := range exports {
+		if export.ID == strings.TrimSpace(exportID) {
+			return export, nil
+		}
+	}
+	return runs.ChampionExport{}, store.ErrNotFound
+}
+
+func validateChampionExportReadyResult(job jobs.ExperimentJob, export runs.ChampionExport, req championExportResultRequest) error {
+	artifactURI := strings.TrimSpace(req.ArtifactURI)
+	if !artifactMatchesChampionExportFormat(artifactURI, export.Format) {
+		return fmt.Errorf("%w: artifact_uri does not match requested champion export format", store.ErrInvalidRequest)
+	}
+	if !trustedChampionExportArtifactURI(artifactURI) && !strings.HasPrefix(strings.ToLower(artifactURI), "file://") {
+		return fmt.Errorf("%w: artifact_uri must be a trusted S3 artifact or worker-owned file URI", store.ErrInvalidRequest)
+	}
+	manifest := payloadMap(req.Metadata, "manifest")
+	if len(manifest) == 0 {
+		return fmt.Errorf("%w: worker export manifest is required for READY export result", store.ErrInvalidRequest)
+	}
+	if payloadString(manifest, "schema_version") != "champion_export_manifest_v1" {
+		return fmt.Errorf("%w: worker export manifest schema is invalid", store.ErrInvalidRequest)
+	}
+	if !championExportManifestHasCreatedArtifact(manifest, export.Format) {
+		return fmt.Errorf("%w: worker export manifest does not include a created artifact for the requested format", store.ErrInvalidRequest)
+	}
+	if !championExportManifestHasProvenance(manifest, job.ID, export.ID) {
+		return fmt.Errorf("%w: worker export manifest provenance does not match the export job", store.ErrInvalidRequest)
+	}
+	return nil
+}
+
+func championExportManifestHasCreatedArtifact(manifest map[string]any, format string) bool {
+	artifacts, ok := manifest["artifacts"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range artifacts {
+		artifact := mapFromAny(item)
+		if len(artifact) == 0 {
+			continue
+		}
+		if !strings.EqualFold(payloadString(artifact, "status"), "created") {
+			continue
+		}
+		artifactFormat := strings.ToLower(strings.TrimSpace(firstNonEmptyString(
+			payloadString(artifact, "format"),
+			payloadString(artifact, "artifact_format"),
+		)))
+		if artifactFormat == "" || artifactFormat == strings.ToLower(strings.TrimSpace(format)) ||
+			(format == "pytorch" && artifactFormat == "framework_native") {
+			return true
+		}
+	}
+	return false
+}
+
+func championExportManifestHasProvenance(manifest map[string]any, exportJobID string, exportID string) bool {
+	metadata := payloadMap(manifest, "metadata")
+	if championExportProvenanceMatches(payloadMap(metadata, "provenance"), exportJobID, exportID) {
+		return true
+	}
+	artifacts, ok := manifest["artifacts"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range artifacts {
+		artifact := mapFromAny(item)
+		if len(artifact) == 0 {
+			continue
+		}
+		if championExportProvenanceMatches(payloadMap(artifact, "provenance"), exportJobID, exportID) {
+			return true
+		}
+	}
+	return false
+}
+
+func championExportProvenanceMatches(provenance map[string]any, exportJobID string, exportID string) bool {
+	if len(provenance) == 0 {
+		return false
+	}
+	if payloadString(provenance, "schema_version") != "worker_artifact_provenance_v1" ||
+		payloadString(provenance, "generated_by") != "model-express-worker" {
+		return false
+	}
+	source := payloadString(provenance, "source")
+	if source != "worker_generated" && source != "worker_controlled_copy" && source != "controlled_legacy_manifest_fallback" {
+		return false
+	}
+	return payloadString(provenance, "export_job_id") == strings.TrimSpace(exportJobID) ||
+		payloadString(provenance, "source_export_id") == strings.TrimSpace(exportID)
 }
 
 func (s *Server) reportChampionDemoPredictionResult(c *gin.Context) {
@@ -4587,9 +4831,7 @@ func (s *Server) validateJobCallback(c *gin.Context, jobID string, trainingAttem
 	}
 	activeAttemptID := strings.TrimSpace(jobConfigString(job.Config, "active_attempt_id"))
 	if !jobStatusIsTerminal(job.Status) && activeAttemptID != "" && activeAttemptID == attemptID {
-		if remoteTrainingSessionExpired(job.Config, attemptID) {
-			s.closeRemoteTrainingSession(job, "expired")
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "remote training session expired"})
+		if rejected := s.rejectInactiveRemoteTrainingSession(c, job, attemptID); rejected {
 			return job, false
 		}
 		return job, true
@@ -4605,6 +4847,41 @@ func (s *Server) validateJobCallback(c *gin.Context, jobID string, trainingAttem
 		"job_status":          job.Status,
 	})
 	return job, false
+}
+
+func (s *Server) rejectInactiveRemoteTrainingSession(c *gin.Context, job jobs.ExperimentJob, attemptID string) bool {
+	session := payloadMap(job.Config, "remote_training_session")
+	if len(session) == 0 || payloadString(session, "training_attempt_id") != strings.TrimSpace(attemptID) {
+		return false
+	}
+	sessionID := payloadString(session, "id")
+	if sessionID != "" {
+		record, err := s.store.GetRemoteTrainingSession(sessionID)
+		if err == nil {
+			if time.Now().UTC().After(record.ExpiresAt) || time.Now().UTC().Equal(record.ExpiresAt) {
+				s.closeRemoteTrainingSession(job, runs.RemoteTrainingSessionStatusExpired)
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "remote training session expired"})
+				return true
+			}
+			if store.NormalizeRemoteTrainingSessionStatus(record.Status) != runs.RemoteTrainingSessionStatusActive {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "remote training session is not active"})
+				return true
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			writeStoreError(c, err)
+			return true
+		}
+	}
+	if remoteTrainingSessionExpired(job.Config, attemptID) {
+		s.closeRemoteTrainingSession(job, runs.RemoteTrainingSessionStatusExpired)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "remote training session expired"})
+		return true
+	}
+	if status := store.NormalizeRemoteTrainingSessionStatus(payloadString(session, "status")); status != runs.RemoteTrainingSessionStatusActive {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "remote training session is not active"})
+		return true
+	}
+	return false
 }
 
 func (s *Server) recordStaleJobCallback(job jobs.ExperimentJob, attemptID string, activeAttemptID string, callbackType string, payload map[string]any) {
@@ -9784,7 +10061,7 @@ func (s *Server) augmentPolledJob(job *jobs.ExperimentJob, pollProvider string) 
 		out.Config["callback_token_header"] = callbackTokenHeader
 	}
 	if pollJobUsesModal(out, pollProvider) && attemptID != "" {
-		session, persist := remoteTrainingSessionForPolledJob(out, attemptID)
+		session, persist := s.remoteTrainingSessionForPolledJob(out, attemptID)
 		out.Config["remote_training_session"] = session
 		if persist {
 			if _, err := s.store.UpdateJobConfig(out.ID, map[string]any{"remote_training_session": session}); err != nil {
@@ -9800,7 +10077,7 @@ func pollJobUsesModal(job jobs.ExperimentJob, pollProvider string) bool {
 	return provider == "modal"
 }
 
-func remoteTrainingSessionForPolledJob(job jobs.ExperimentJob, attemptID string) (map[string]any, bool) {
+func (s *Server) remoteTrainingSessionForPolledJob(job jobs.ExperimentJob, attemptID string) (map[string]any, bool) {
 	existing := payloadMap(job.Config, "remote_training_session")
 	if payloadString(existing, "training_attempt_id") == attemptID && payloadString(existing, "id") != "" {
 		session := copyPayloadMap(existing)
@@ -9826,6 +10103,7 @@ func remoteTrainingSessionForPolledJob(job jobs.ExperimentJob, attemptID string)
 			session["storage_scope"] = remoteTrainingSessionStorageScope(job)
 			persist = true
 		}
+		s.upsertRemoteTrainingSessionRecord(job, attemptID, session)
 		return session, persist
 	}
 
@@ -9847,7 +10125,37 @@ func remoteTrainingSessionForPolledJob(job jobs.ExperimentJob, attemptID string)
 	if publicStorageURL := remoteTrainingSessionPublicStorageURL(job); publicStorageURL != "" {
 		session["public_storage_url"] = publicStorageURL
 	}
+	s.upsertRemoteTrainingSessionRecord(job, attemptID, session)
 	return session, true
+}
+
+func (s *Server) upsertRemoteTrainingSessionRecord(job jobs.ExperimentJob, attemptID string, session map[string]any) {
+	expiresAt, err := time.Parse(time.RFC3339Nano, payloadString(session, "expires_at"))
+	if err != nil {
+		expiresAt = time.Now().UTC().Add(remoteTrainingSessionTTL())
+	}
+	record := runs.RemoteTrainingSession{
+		ID:                    payloadString(session, "id"),
+		ProjectID:             job.ProjectID,
+		JobID:                 job.ID,
+		TrainingAttemptID:     strings.TrimSpace(attemptID),
+		Status:                payloadString(session, "status"),
+		CallbackTokenHash:     remoteTrainingSessionTokenHash(s.callbackToken(job.ID, attemptID)),
+		OrchestratorPublicURL: payloadString(session, "public_callback_url"),
+		StoragePublicURL:      payloadString(session, "public_storage_url"),
+		StoragePrefix:         payloadString(session, "storage_prefix"),
+		StorageScope:          payloadMap(session, "storage_scope"),
+		Metadata:              payloadMap(session, "redacted_state"),
+		ExpiresAt:             expiresAt,
+	}
+	if _, err := s.store.UpsertRemoteTrainingSession(record); err != nil {
+		log.Printf("upsert remote training session failed for job %s: %v", job.ID, err)
+	}
+}
+
+func remoteTrainingSessionTokenHash(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return "sha256:" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func remoteTrainingSessionID(jobID string, attemptID string) string {
@@ -9986,15 +10294,34 @@ func (s *Server) closeRemoteTrainingSession(job jobs.ExperimentJob, status strin
 	if len(existing) == 0 {
 		return
 	}
+	normalizedStatus := store.NormalizeRemoteTrainingSessionStatus(status)
 	next := copyPayloadMap(existing)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	next["status"] = strings.ToLower(strings.TrimSpace(status))
+	currentStatus := store.NormalizeRemoteTrainingSessionStatus(payloadString(next, "status"))
+	if currentStatus == runs.RemoteTrainingSessionStatusClosed ||
+		currentStatus == runs.RemoteTrainingSessionStatusExpired ||
+		currentStatus == runs.RemoteTrainingSessionStatusFailed {
+		if sessionID := payloadString(next, "id"); sessionID != "" {
+			if _, err := s.store.CloseRemoteTrainingSession(sessionID, normalizedStatus); err != nil && !errors.Is(err, store.ErrNotFound) {
+				log.Printf("close remote training session record failed for job %s: %v", job.ID, err)
+			}
+		}
+		return
+	}
+	next["status"] = normalizedStatus
 	next["updated_at"] = now
-	if jobStatusIsTerminal(status) || strings.EqualFold(status, "cancelled") || strings.EqualFold(status, "expired") {
+	if normalizedStatus == runs.RemoteTrainingSessionStatusClosed ||
+		normalizedStatus == runs.RemoteTrainingSessionStatusExpired ||
+		normalizedStatus == runs.RemoteTrainingSessionStatusFailed {
 		next["closed_at"] = now
 	}
 	if _, err := s.store.UpdateJobConfig(job.ID, map[string]any{"remote_training_session": next}); err != nil {
 		log.Printf("close remote training session failed for job %s: %v", job.ID, err)
+	}
+	if sessionID := payloadString(next, "id"); sessionID != "" {
+		if _, err := s.store.CloseRemoteTrainingSession(sessionID, normalizedStatus); err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.Printf("close remote training session record failed for job %s: %v", job.ID, err)
+		}
 	}
 }
 
@@ -10241,6 +10568,7 @@ func (s *Server) cancelPlanActiveExecutionByID(planID string, req cancelExecutio
 		} else {
 			response.ActiveJobsMarkedCancelling++
 		}
+		s.closeRemoteTrainingSession(job, runs.RemoteTrainingSessionStatusClosing)
 		cancelledJob, err := s.store.FailJob(job.ID, cancelMessage)
 		if err != nil {
 			return cancelExecutionResponse{}, err
@@ -14875,6 +15203,11 @@ func envFloat(name string, defaultValue float64, minValue float64, maxValue floa
 
 func bindJSON(c *gin.Context, value any) bool {
 	if err := c.ShouldBindJSON(value); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) || strings.Contains(strings.ToLower(err.Error()), "request body too large") {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "JSON request body too large"})
+			return false
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return false
 	}
@@ -14889,6 +15222,11 @@ func bindOptionalJSON(c *gin.Context, value any) bool {
 	if err := c.ShouldBindJSON(value); err != nil {
 		if errors.Is(err, io.EOF) {
 			return true
+		}
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) || strings.Contains(strings.ToLower(err.Error()), "request body too large") {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "JSON request body too large"})
+			return false
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return false

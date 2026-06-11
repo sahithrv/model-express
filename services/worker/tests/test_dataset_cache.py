@@ -41,6 +41,41 @@ def test_dataset_cache_root_can_be_scoped_to_temp_directory(tmp_path):
     assert not dataset_cache_dir(dataset_id, tmp_path).exists()
 
 
+@pytest.mark.parametrize("member_name", ["../escape.txt", "/abs/escape.txt", "nested/../../escape.txt", "C:/escape.txt"])
+def test_dataset_cache_rejects_zip_path_traversal(tmp_path, member_name):
+    dataset_id = "dataset_123"
+    archive_path = dataset_archive_path(dataset_id, tmp_path)
+    archive_path.parent.mkdir(parents=True)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(member_name, "escape")
+
+    with pytest.raises(ValueError, match="Unsafe dataset archive member path"):
+        extract_dataset_archive(archive_path, dataset_id, tmp_path)
+
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_materialized_dataset_rejects_zip_path_traversal(tmp_path):
+    source_zip = tmp_path / "source.zip"
+    with zipfile.ZipFile(source_zip, "w") as archive:
+        archive.writestr("../escape.txt", "escape")
+
+    def fake_download(_storage_uri, destination):
+        shutil.copyfile(source_zip, destination)
+        return destination
+
+    with pytest.raises(ValueError, match="Unsafe dataset archive member path"):
+        ensure_dataset_materialized(
+            dataset_id="dataset_1",
+            storage_uri="s3://bucket/dataset.zip",
+            checksum_sha256="c" * 64,
+            cache_root=tmp_path / "materialized",
+            download_fn=fake_download,
+        )
+
+    assert not (tmp_path / "escape.txt").exists()
+
+
 @pytest.mark.parametrize("dataset_id", ["", "../dataset", "nested/dataset", "nested\\dataset"])
 def test_dataset_cache_rejects_unsafe_dataset_ids(dataset_id):
     with pytest.raises(ValueError):

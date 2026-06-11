@@ -191,6 +191,24 @@ class DatasetProfilerTests(unittest.TestCase):
             self.assertIn("yolo_format", profile["dataset_traits"])
             self.assertIn("object_detection", profile["dataset_traits"])
 
+    def test_profile_does_not_follow_yolo_paths_outside_dataset_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_dir = root / "dataset"
+            outside = root / "outside" / "images"
+            outside.mkdir(parents=True)
+            _write_image(outside / "escape.jpg", (16, 12), (255, 0, 0))
+            dataset_dir.mkdir(parents=True)
+            (dataset_dir / "data.yaml").write_text(
+                "path: ..\ntrain: outside/images\nval: outside/images\nnc: 1\nnames: [escape]\n",
+                encoding="utf-8",
+            )
+
+            profile = profile_image_folder(dataset_dir)
+
+            self.assertEqual(profile.get("total_images"), 0)
+            self.assertEqual(profile.get("yolo_summary", {}).get("split_image_counts"), {"train": 0, "val": 0})
+
     def test_profile_accepts_yolo_config_variants_and_name_formats(self) -> None:
         cases = [
             ("data.yml", "names: {0: real_face, 1: fake_face}\n"),

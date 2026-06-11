@@ -111,8 +111,10 @@ test("artifact paths are limited to configured artifact roots", () => {
   const outsideRoot = tempDir("mx-outside-");
   const artifactPath = path.join(allowedRoot, "model.onnx");
   const outsidePath = path.join(outsideRoot, "model.onnx");
+  const unsupportedPath = path.join(allowedRoot, "training.log");
   fs.writeFileSync(artifactPath, "onnx");
   fs.writeFileSync(outsidePath, "onnx");
+  fs.writeFileSync(unsupportedPath, "log");
   const env = {
     ...process.env,
     MODEL_EXPRESS_ALLOWED_ARTIFACT_ROOTS: allowedRoot,
@@ -123,6 +125,22 @@ test("artifact paths are limited to configured artifact roots", () => {
   assert.throws(
     () => __test.validateLocalArtifactPath(outsidePath, env),
     /configured Model Express artifact or export root/,
+  );
+  assert.throws(
+    () => __test.validateLocalArtifactPath(unsupportedPath, env),
+    /supported model artifact extension/,
+  );
+});
+
+test("artifact loading rejects repo log artifacts even under artifact root", () => {
+  const repoRoot = tempDir("mx-repo-");
+  const logArtifact = path.join(repoRoot, "artifacts", "logs", "model.onnx");
+  fs.mkdirSync(path.dirname(logArtifact), { recursive: true });
+  fs.writeFileSync(logArtifact, "onnx");
+
+  assert.throws(
+    () => __test.validateLocalArtifactPath(logArtifact, { MODEL_EXPRESS_ROOT: repoRoot }),
+    /refuses log directories/,
   );
 });
 
@@ -154,5 +172,31 @@ test("ONNX external data mount paths and tunnel logs are sanitized", () => {
   assert.equal(
     __test.safeLogText("ready: https://unit-test.trycloudflare.com Authorization=Bearer secret"),
     "ready: [redacted-url] Authorization=Bearer [redacted]",
+  );
+  const signed = __test.safeLogText(
+    "MODAL_ORCHESTRATOR_URL=https://modal.example.test AWS_ACCESS_KEY_ID=abc AWS_SECRET_ACCESS_KEY=def sk-testtoken123456789 https://s3.example.test/object?X-Amz-Credential=abc&X-Amz-Signature=def",
+  );
+  assert(!signed.includes("modal.example.test"));
+  assert(!signed.includes("abc"));
+  assert(!signed.includes("def"));
+  assert(!signed.includes("sk-testtoken"));
+});
+
+test("Modal remote URLs reject local private and unsafe service targets", () => {
+  assert.equal(
+    __test.validateRemoteModalUrl("https://orchestrator.example.test", "MODAL_ORCHESTRATOR_URL"),
+    "https://orchestrator.example.test",
+  );
+  assert.throws(
+    () => __test.validateRemoteModalUrl("http://orchestrator.example.test", "MODAL_ORCHESTRATOR_URL", {}),
+    /must use https/,
+  );
+  assert.throws(
+    () => __test.validateRemoteModalUrl("https://10.0.0.2:8080", "MODAL_ORCHESTRATOR_URL"),
+    /remotely reachable/,
+  );
+  assert.throws(
+    () => __test.validateRemoteModalUrl("https://storage.example.test:9001", "MODAL_S3_ENDPOINT_URL"),
+    /must not expose/,
   );
 });

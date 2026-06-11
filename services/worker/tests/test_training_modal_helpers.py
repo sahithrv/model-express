@@ -596,6 +596,41 @@ class ModalTrainingHelperTests(unittest.TestCase):
                 storage.enforce_storage_scope("read", "bucket", "datasets/project_2/data.zip")
             with self.assertRaisesRegex(ValueError, "outside the remote storage scope"):
                 storage.enforce_storage_scope("write", "bucket", "model-express/artifacts/job_2/model.onnx")
+            with self.assertRaisesRegex(ValueError, "outside the remote storage scope"):
+                storage.enforce_storage_scope("write", "bucket", "model-express/artifacts/job_10/model.onnx")
+            with self.assertRaisesRegex(ValueError, "path traversal"):
+                storage.enforce_storage_scope("write", "bucket", "model-express/artifacts/job_1/%2e%2e/job_2/model.onnx")
+            with self.assertRaisesRegex(ValueError, "outside the remote storage scope"):
+                storage.enforce_storage_scope("read", "other-bucket", "datasets/project_1/data.zip")
+
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_EXPRESS_STORAGE_SCOPE": json.dumps(scope),
+                "MODEL_EXPRESS_STORAGE_SCOPE_TOKEN": "wrong-token",
+                "MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE": "true",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "token mismatch"):
+                storage.enforce_storage_scope("read", "bucket", "datasets/project_1/data.zip")
+
+        with patch.dict("os.environ", {"MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE": "true"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "required"):
+                storage.enforce_storage_scope("read", "bucket", "datasets/project_1/data.zip")
+
+        expired_scope = {**scope, "expires_at": "2000-01-01T00:00:00+00:00"}
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_EXPRESS_STORAGE_SCOPE": json.dumps(expired_scope),
+                "MODEL_EXPRESS_STORAGE_SCOPE_TOKEN": "scope-token",
+                "MODEL_EXPRESS_REQUIRE_STORAGE_SCOPE": "true",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "expired"):
+                storage.enforce_storage_scope("read", "bucket", "datasets/project_1/data.zip")
 
     def test_modal_training_failure_report_marks_retryable(self) -> None:
         calls = []
@@ -613,11 +648,26 @@ class ModalTrainingHelperTests(unittest.TestCase):
                 RuntimeError("container exited unexpectedly"),
             )
 
-        self.assertTrue(reported)
-        self.assertEqual(calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
-        self.assertTrue(calls[0]["payload"]["retryable"])
-        self.assertIn("container exited unexpectedly", calls[0]["payload"]["error"])
+            self.assertTrue(reported)
+            self.assertEqual(calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
+            self.assertTrue(calls[0]["payload"]["retryable"])
+            self.assertIn("container exited unexpectedly", calls[0]["payload"]["error"])
 
+    def test_modal_yolo_path_resolver_rejects_paths_outside_materialized_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_dir = root / "dataset"
+            dataset_dir.mkdir()
+            data_yaml = dataset_dir / "data.yaml"
+            data_yaml.write_text("path: .\ntrain: images/train\nval: images/val\nnc: 1\nnames: [cat]\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "parent traversal"):
+                self.modal_app._resolve_existing_yolo_path(
+                    dataset_dir,
+                    data_yaml,
+                    {"path": "."},
+                    "../outside/images",
+                )
     def test_modal_preview_batch_shell_materializes_once_and_runs_classification_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_dir = Path(temp_dir) / "dataset"

@@ -89,6 +89,9 @@ type ProjectTabKey = "mission" | "activity" | "results" | "export" | "developer"
 type LegacyProjectTabKey = "overview" | "data" | "experiments" | "agents" | "operations";
 type ProjectTabTarget = ProjectTabKey | LegacyProjectTabKey;
 type ActivityFilterKey = "all" | "decisions" | "experiments" | "results" | "blockers";
+type ProjectWorkflowTabState = "done" | "active" | "waiting" | "blocked";
+type ProjectWorkflowTabBase = { key: Exclude<ProjectTabKey, "developer">; label: string; icon: ReactNode };
+type ProjectWorkflowTab = ProjectWorkflowTabBase & { state: ProjectWorkflowTabState; detail: string };
 
 const classificationMetricPriority = ["macro_f1", "accuracy", "train_loss", "val_loss"];
 const detectionMetricPriority = [
@@ -107,11 +110,11 @@ const detectionMetricAliases: Record<string, string[]> = {
   mAP50: ["mAP50", "map50"],
 };
 
-const projectTabs: Array<{ key: ProjectTabKey; label: string }> = [
-	{ key: "mission", label: "Mission" },
-	{ key: "activity", label: "Activity" },
-	{ key: "results", label: "Results" },
-	{ key: "export", label: "Export" },
+const projectTabs: ProjectWorkflowTabBase[] = [
+  { key: "mission", label: "Mission", icon: <ClipboardList size={14} /> },
+  { key: "activity", label: "Activity", icon: <Activity size={14} /> },
+  { key: "results", label: "Results", icon: <BarChart3 size={14} /> },
+  { key: "export", label: "Export", icon: <Trophy size={14} /> },
 ];
 
 function metricLabel(key: MetricKey) {
@@ -863,6 +866,36 @@ type Notice = {
   text: string;
 };
 
+function NoticeBanner({ notice }: { notice: Notice }) {
+  const display = noticeDisplay(notice);
+
+  return (
+    <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"} aria-live={notice.kind === "error" ? "assertive" : "polite"}>
+      <span className="notice-icon" aria-hidden="true">
+        {notice.kind === "error" ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
+      </span>
+      <span className="notice-copy">
+        <strong>{display.title}</strong>
+        <small title={notice.text}>{display.message}</small>
+      </span>
+    </div>
+  );
+}
+
+function noticeDisplay(notice: Notice) {
+  if (notice.kind === "error" && notice.text.includes("Cannot read properties of undefined") && notice.text.includes("request")) {
+    return {
+      title: "Desktop bridge unavailable",
+      message: "The browser preview cannot reach the Mission Control desktop bridge. Open the Electron app for live project actions.",
+    };
+  }
+
+  return {
+    title: notice.kind === "error" ? "Action needs attention" : "Mission update",
+    message: notice.text,
+  };
+}
+
 type DatasetFolder = {
   token: string;
   path: string;
@@ -1199,6 +1232,19 @@ export function App() {
   const exportSummary = useMemo(
     () => buildExportSummary(detail, championExportDemo),
     [championExportDemo, detail],
+  );
+  const projectWorkflowTabs = useMemo(
+    () =>
+      buildProjectWorkflowTabs({
+        tabs: projectTabs,
+        missionDigest,
+        missionStages,
+        activityFeed,
+        activityStreamState,
+        resultsSummary,
+        exportSummary,
+      }),
+    [activityFeed, activityStreamState, exportSummary, missionDigest, missionStages, resultsSummary],
   );
   const developerDiagnostics = useMemo(
     () => buildDeveloperDiagnostics(detail, visibleActivityEvents),
@@ -2496,32 +2542,64 @@ export function App() {
         </div>
 
         <section className="nav-section">
-          <div className="section-title">
-            <Database size={15} />
-            Missions
+          <div className="section-title mission-queue-title">
+            <span>
+              <Database size={15} />
+              Missions
+            </span>
+            <small>{projects.length}</small>
           </div>
           <div className="project-list">
             {projects.map((project) => (
               <button
                 key={project.id}
                 className={project.id === selectedProjectId ? "project active" : "project"}
+                aria-current={project.id === selectedProjectId ? "true" : undefined}
                 onClick={() => setSelectedProjectId(project.id)}
+                title={project.goal || missionStateLabelFromProject(project)}
               >
-                <span>{project.name}</span>
-                <small>{project.goal || missionStateLabelFromProject(project)}</small>
+                <span className={`project-status-dot ${missionStateToneFromProject(project)}`} aria-hidden="true" />
+                <span className="project-copy">
+                  <strong>{project.name}</strong>
+                  <small>{project.goal || "Ready for mission setup"}</small>
+                </span>
+                <span className={`project-state ${missionStateToneFromProject(project)}`}>{missionStateLabelFromProject(project)}</span>
               </button>
             ))}
+            {projects.length === 0 && (
+              <div className="project-list-empty">
+                <span className="project-empty-mark" aria-hidden="true">
+                  <Database size={14} />
+                </span>
+                <strong>No missions yet</strong>
+                <small>Create a mission to start the workflow.</small>
+              </div>
+            )}
           </div>
         </section>
       </aside>
 
 			<section className="workspace" data-active-tab={activeProjectTab}>
-        <header className="topbar">
-          <div>
-            <div className="eyebrow">{activeProjectTab === "developer" ? "Developer View" : "Mission"}</div>
+        <header className={`topbar ${activeProjectTab === "developer" ? "developer-topbar" : "mission-command-topbar"}`}>
+          <div className="topbar-copy">
+            <div className="topbar-kicker">
+              <div className="eyebrow">{activeProjectTab === "developer" ? "Developer View" : "Mission"}</div>
+              {activeProjectTab !== "developer" && <span className={`mission-state-pill ${missionDigest.state}`}>{missionDigest.stateLabel}</span>}
+            </div>
             <h2>{selectedProject ? selectedProject.name : "No Mission Selected"}</h2>
+            {activeProjectTab !== "developer" && <p>{selectedProject?.goal || missionDigest.detail}</p>}
           </div>
           <div className="topbar-actions">
+            {activeProjectTab !== "developer" && (
+              <div className={health?.status === "ok" ? "engine-chip ok" : "engine-chip bad"} aria-label={health?.status === "ok" ? "Engine ready" : "Engine offline"}>
+                <span className="engine-chip-light" aria-hidden="true" />
+                <Server size={15} />
+                <span>
+                  <strong>Engine</strong>
+                  <small>{health?.status === "ok" ? "Ready" : "Offline"}</small>
+                </span>
+              </div>
+            )}
             {stoppablePlan && (
               <button className="command compact danger" type="button" onClick={stopActiveRun} disabled={loading}>
                 <X size={15} />
@@ -2529,35 +2607,59 @@ export function App() {
               </button>
             )}
             <button
-              className="command compact"
+              className={activeProjectTab === "developer" ? "command compact back-to-mission" : "diagnostics-toggle"}
               type="button"
+              aria-label={activeProjectTab === "developer" ? "Back to Mission" : "Open Developer View diagnostics"}
               onClick={() => setActiveProjectTab(activeProjectTab === "developer" ? "mission" : "developer")}
             >
-              {activeProjectTab === "developer" ? "Back to Mission" : "Developer View"}
+              {activeProjectTab === "developer" ? (
+                "Back to Mission"
+              ) : (
+                <>
+                  <SquareTerminal size={15} />
+                  <span>
+                    <strong>Diagnostics</strong>
+                    <small>Developer View</small>
+                  </span>
+                </>
+              )}
             </button>
-            <div className={health?.status === "ok" ? "status ok" : "status bad"}>
-              <Server size={16} />
-              {health?.status === "ok" ? "ready" : "offline"}
-            </div>
+            {activeProjectTab === "developer" && (
+              <div className={health?.status === "ok" ? "status ok" : "status bad"}>
+                <Server size={16} />
+                {health?.status === "ok" ? "ready" : "offline"}
+              </div>
+            )}
           </div>
         </header>
 
-        {notice && <div className={`notice ${notice.kind}`}>{notice.text}</div>}
+        {notice && <NoticeBanner notice={notice} />}
 
-				<nav className="section-tabs" aria-label="Project detail tabs" role="tablist">
-					{projectTabs.map((tab) => (
-						<button
-							key={tab.key}
-							type="button"
-							role="tab"
-							className={activeProjectTab === tab.key ? "active" : ""}
-							aria-selected={activeProjectTab === tab.key}
-							onClick={() => setActiveProjectTab(tab.key)}
-						>
-							{tab.label}
-						</button>
-					))}
-				</nav>
+        <nav className="section-tabs" aria-label="Project workflow tabs" role="tablist">
+          {projectWorkflowTabs.map((tab, index) => (
+            <button
+              key={tab.key}
+              type="button"
+              role="tab"
+              className={`workflow-tab state-${tab.state}${activeProjectTab === tab.key ? " selected active" : ""}`}
+              aria-label={`${tab.label}, step ${index + 1}, ${tab.detail}`}
+              aria-selected={activeProjectTab === tab.key}
+              onClick={() => setActiveProjectTab(tab.key)}
+            >
+              <span className="workflow-tab-index">{String(index + 1).padStart(2, "0")}</span>
+              <span className="workflow-tab-main">
+                <span className="workflow-tab-label">
+                  <span className="workflow-tab-icon" aria-hidden="true">
+                    {tab.icon}
+                  </span>
+                  <span>{tab.label}</span>
+                </span>
+                <small>{tab.detail}</small>
+              </span>
+              <span className="workflow-tab-dot" aria-hidden="true" />
+            </button>
+          ))}
+        </nav>
 
 				<section className="mission-route" id="mission" data-project-tab="mission">
           <MissionRoute
@@ -3634,25 +3736,47 @@ export function App() {
                 createProjectWithDataset(new FormData(event.currentTarget));
               }}
             >
-              <input name="name" placeholder="Project Name" required />
-              <input name="goal" placeholder="Goal / extra context (optional)" />
-              <button className="dataset-picker" type="button" onClick={chooseNewProjectFolder} disabled={loading}>
-                <FolderOpen size={18} />
-                <span>
-                  <strong>{newProjectFolder ? newProjectFolder.name : "Choose Folder & Upload"}</strong>
-                  <small>{newProjectFolder ? newProjectFolder.path : "Required image dataset folder"}</small>
-                </span>
-                {newProjectFolder && <CheckCircle2 size={18} />}
-              </button>
+              <div className="new-mission-fields">
+                <label>
+                  <span>Mission name</span>
+                  <input name="name" placeholder="Surface defect classifier" required />
+                </label>
+                <label>
+                  <span>Goal</span>
+                  <input name="goal" placeholder="Optimize accuracy, cost, latency, or deployment constraints" />
+                </label>
+              </div>
+              <div className="new-mission-dataset">
+                <div className="mission-section-head">
+                  <div>
+                    <small>Dataset source</small>
+                    <strong>Attach an image folder</strong>
+                  </div>
+                  <Badge value={newProjectFolder ? "selected" : "required"} />
+                </div>
+                <button className="dataset-picker" type="button" onClick={chooseNewProjectFolder} disabled={loading}>
+                  <FolderOpen size={18} />
+                  <span>
+                    <strong>{newProjectFolder ? newProjectFolder.name : "Choose Folder & Upload"}</strong>
+                    <small>{newProjectFolder ? newProjectFolder.path : "Required image dataset folder"}</small>
+                  </span>
+                  {newProjectFolder && <CheckCircle2 size={18} />}
+                </button>
+              </div>
               {newProjectFolder?.preflight && (
-                <div className={newProjectFolder.preflight.warnings.length > 0 ? "notice-inline warning" : "notice-inline"}>
-                  <small>
-                    {newProjectFolder.preflight.file_count.toLocaleString()} files,{" "}
-                    {formatBytes(newProjectFolder.preflight.uncompressed_size_bytes)} before ZIP
-                    {newProjectFolder.preflight.warnings.length > 0
-                      ? `; ${newProjectFolder.preflight.warnings[0].message}`
-                      : ""}
-                  </small>
+                <div className={newProjectFolder.preflight.warnings.length > 0 ? "notice-inline warning preflight-card" : "notice-inline preflight-card"}>
+                  <div>
+                    <strong>{newProjectFolder.preflight.warnings.length > 0 ? "Preflight warning" : "Preflight ready"}</strong>
+                    <small>{newProjectFolder.preflight.warnings[0]?.message || "Folder scan completed before upload packaging."}</small>
+                  </div>
+                  <span>
+                    <strong>{newProjectFolder.preflight.file_count.toLocaleString()}</strong>
+                    <small>files</small>
+                  </span>
+                  <span>
+                    <strong>{formatBytes(newProjectFolder.preflight.uncompressed_size_bytes)}</strong>
+                    <small>before ZIP</small>
+                  </span>
                 </div>
               )}
               <button className="command primary" disabled={!newProjectFolder || loading}>
@@ -3755,6 +3879,10 @@ function MissionRoute({
   const activeStage = currentMissionStage(stages);
   const completedStageCount = stages.filter((stage) => stage.status === "done").length;
   const flowProgress = missionStageProgress(stages);
+
+  if (brief.id === "no-mission") {
+    return <MissionEmptyState brief={brief} stages={stages} actions={actions} onAction={onAction} />;
+  }
 
   return (
     <div className="mission-workspace">
@@ -3890,6 +4018,80 @@ function MissionRoute({
   );
 }
 
+function MissionEmptyState({
+  brief,
+  stages,
+  actions,
+  onAction,
+}: {
+  brief: MissionBrief;
+  stages: MissionStage[];
+  actions: MissionNextAction[];
+  onAction: (action: MissionNextAction) => void;
+}) {
+  const primary = actions.find((action) => action.priority === "primary") ?? actions[0];
+  const secondary = actions.filter((action) => action.id !== primary?.id).slice(0, 1);
+  const previewStages = stages.slice(0, 5);
+
+  return (
+    <div className="mission-empty-state">
+      <section className="mission-empty-hero">
+        <div className="mission-empty-copy">
+          <span className="mission-empty-mark" aria-hidden="true">
+            <BrainCircuit size={22} />
+          </span>
+          <div>
+            <div className="eyebrow">Mission setup</div>
+            <h3>{brief.title}</h3>
+            <p>{brief.goal}</p>
+          </div>
+          <div className="mission-empty-actions">
+            {primary && (
+              <button className="mission-primary-action" type="button" onClick={() => onAction(primary)} disabled={primary.disabled}>
+                <span>
+                  <strong>{primary.label}</strong>
+                  <small>{primary.reason}</small>
+                </span>
+                <FolderOpen size={17} />
+              </button>
+            )}
+            {secondary.map((action) => (
+              <button className="mission-secondary-action" type="button" key={action.id} onClick={() => onAction(action)} disabled={action.disabled}>
+                <span>
+                  <strong>{action.label}</strong>
+                  <small>{action.reason}</small>
+                </span>
+                <RefreshCcw size={14} />
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="mission-empty-panel" aria-label="Mission workflow preview">
+          <div className="mission-section-head">
+            <div>
+              <div className="eyebrow">Run flow</div>
+              <strong>From folder to export-ready model</strong>
+            </div>
+            <Badge value={brief.statusLabel} />
+          </div>
+          <div className="mission-empty-flow">
+            {previewStages.map((stage, index) => (
+              <div className="mission-empty-step" key={stage.id}>
+                <small>{String(index + 1).padStart(2, "0")}</small>
+                <span>{missionStageIcon(index === 0 ? "active" : "waiting")}</span>
+                <div>
+                  <strong>{stage.label}</strong>
+                  <p>{stage.detail}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ThinkingRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="thinking-row">
@@ -3956,6 +4158,60 @@ function missionStageProgress(stages: MissionStage[]) {
   return Math.round((completed / stages.length) * 100);
 }
 
+function buildProjectWorkflowTabs({
+  tabs,
+  missionDigest,
+  missionStages,
+  activityFeed,
+  activityStreamState,
+  resultsSummary,
+  exportSummary,
+}: {
+  tabs: ProjectWorkflowTabBase[];
+  missionDigest: MissionDigest;
+  missionStages: MissionStage[];
+  activityFeed: ActivityCardModel[];
+  activityStreamState: ActivityStreamState;
+  resultsSummary: ResultsSummary;
+  exportSummary: ExportSummary;
+}): ProjectWorkflowTab[] {
+  const stageState = (ids: string[]) => summarizeWorkflowStageState(missionStages.filter((stage) => ids.includes(stage.id)));
+  const activityDetail =
+    missionDigest.liveActivity.status === "idle" && activityFeed.length > 0
+      ? `${activityFeed.length} journal ${activityFeed.length === 1 ? "entry" : "entries"}`
+      : missionDigest.liveActivity.label || activityStreamBadge(activityStreamState);
+  const details: Record<Exclude<ProjectTabKey, "developer">, { state: ProjectWorkflowTabState; detail: string }> = {
+    mission: {
+      state: missionDigest.state === "empty" ? "active" : stageState(["created", "dataset", "plan"]),
+      detail: missionDigest.stateLabel,
+    },
+    activity: {
+      state: stageState(["experiments", "refinement"]),
+      detail: activityDetail,
+    },
+    results: {
+      state: stageState(["evaluation", "champion"]),
+      detail: resultsSummary.hasResults
+        ? `${resultsSummary.primaryMetricValue} ${resultsSummary.primaryMetricLabel}`
+        : "Awaiting evidence",
+    },
+    export: {
+      state: stageState(["export", "demo"]),
+      detail: exportSummary.statusLabel,
+    },
+  };
+
+  return tabs.map((tab) => ({ ...tab, ...details[tab.key] }));
+}
+
+function summarizeWorkflowStageState(stages: MissionStage[]): ProjectWorkflowTabState {
+  if (stages.some((stage) => stage.status === "blocked")) return "blocked";
+  if (stages.some((stage) => stage.status === "active")) return "active";
+  if (stages.length > 0 && stages.every((stage) => stage.status === "done")) return "done";
+  if (stages.some((stage) => stage.status === "done")) return "active";
+  return "waiting";
+}
+
 function missionStageIcon(status: MissionStage["status"]): ReactNode {
   if (status === "done") return <CheckCircle2 size={15} />;
   if (status === "active") return <Activity size={15} />;
@@ -4011,10 +4267,47 @@ function ActivityRoute({
         {visibleCards.length > 0 ? (
           visibleCards.map((card) => <ActivityCard key={card.id} card={card} onOpenDeveloper={onOpenDeveloper} />)
         ) : (
-          <div className="empty">No journal entries match this filter yet.</div>
+          <ActivityEmptyState hasCards={cards.length > 0} filter={filter} />
         )}
       </div>
     </div>
+  );
+}
+
+function ActivityEmptyState({ hasCards, filter }: { hasCards: boolean; filter: ActivityFilterKey }) {
+  const filtered = hasCards && filter !== "all";
+  const preview = [
+    { label: "Mission created", detail: "Goal, dataset, and setup context are captured." },
+    { label: "Planner decision", detail: "The agent explains what it is doing and why." },
+    { label: "Experiment result", detail: "Completed runs surface the evidence that matters." },
+  ];
+
+  return (
+    <section className="activity-empty-state">
+      <span className="activity-empty-mark" aria-hidden="true">
+        <Activity size={18} />
+      </span>
+      <div className="activity-empty-copy">
+        <div className="eyebrow">Operations journal</div>
+        <strong>{filtered ? "No entries match this filter" : "Waiting for the first mission event"}</strong>
+        <p>
+          {filtered
+            ? "Try another journal filter to see decisions, experiments, results, and blockers already captured."
+            : "When the mission starts, this stream will summarize planner decisions, worker movement, experiment results, and handoff readiness."}
+        </p>
+      </div>
+      <div className="activity-empty-preview" aria-label="Activity journal preview">
+        {preview.map((item, index) => (
+          <span key={item.label}>
+            <small>{String(index + 1).padStart(2, "0")}</small>
+            <span>
+              <strong>{item.label}</strong>
+              <small>{item.detail}</small>
+            </span>
+          </span>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -4162,11 +4455,79 @@ function ResultsRoute({
               </button>
             ))
           ) : (
-            <div className="empty">Results will appear after experiments report metrics.</div>
+            <ResultsEmptyState hasResults={summary.hasResults} />
           )}
         </div>
       </section>
     </div>
+  );
+}
+
+function ResultsEmptyState({ hasResults }: { hasResults: boolean }) {
+  const steps = [
+    { label: "Train candidates", detail: "Experiments report comparable metrics." },
+    { label: "Score fit", detail: "Model Express weighs accuracy, risk, and handoff readiness." },
+    { label: "Select champion", detail: "The best supported model becomes the export candidate." },
+  ];
+
+  return (
+    <section className="results-empty-state">
+      <span className="results-empty-mark" aria-hidden="true">
+        <BarChart3 size={18} />
+      </span>
+      <div className="results-empty-copy">
+        <div className="eyebrow">Evidence queue</div>
+        <strong>{hasResults ? "Waiting for ranked candidates" : "Waiting for experiment metrics"}</strong>
+        <p>
+          {hasResults
+            ? "Completed runs exist, but Model Express needs enough comparable evidence before ranking the strongest candidates."
+            : "Once training jobs finish, this area will summarize the leading models and why each one matters."}
+        </p>
+      </div>
+      <div className="results-empty-steps" aria-label="Results evidence flow">
+        {steps.map((step, index) => (
+          <span key={step.label}>
+            <small>{String(index + 1).padStart(2, "0")}</small>
+            <span>
+              <strong>{step.label}</strong>
+              <small>{step.detail}</small>
+            </span>
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ExportWaitingState({ readinessLabel }: { readinessLabel: string }) {
+  const steps = [
+    { label: "Champion selected", detail: "Model Express chooses the strongest supported candidate." },
+    { label: "Package prepared", detail: "The ONNX artifact, label map, and model card are assembled." },
+    { label: "Demo validated", detail: "A held-out image confirms the handoff path works." },
+  ];
+
+  return (
+    <section className="export-waiting-state">
+      <span className="export-waiting-mark" aria-hidden="true">
+        <Trophy size={18} />
+      </span>
+      <div className="export-waiting-copy">
+        <div className="eyebrow">Handoff queue</div>
+        <strong>Waiting for a champion model</strong>
+        <p>{readinessLabel}</p>
+      </div>
+      <div className="export-waiting-steps" aria-label="Export readiness flow">
+        {steps.map((step, index) => (
+          <span key={step.label}>
+            <small>{String(index + 1).padStart(2, "0")}</small>
+            <span>
+              <strong>{step.label}</strong>
+              <small>{step.detail}</small>
+            </span>
+          </span>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -4254,6 +4615,8 @@ function ExportRoute({
           </button>
         </div>
       </section>
+
+      {!summary.hasChampion && <ExportWaitingState readinessLabel={summary.readinessLabel} />}
 
       <section className="handoff-grid">
         <div className="handoff-section">
@@ -6575,6 +6938,14 @@ function missionStateLabelFromProject(project: Project) {
   if (status === "FAILED" || status === "BLOCKED") return "Needs input";
   if (status === "RUNNING" || status === "ACTIVE") return "In progress";
   return "Ready";
+}
+
+function missionStateToneFromProject(project: Project) {
+  const status = normalizedStatus(project.status || "");
+  if (status === "COMPLETED") return "done";
+  if (status === "FAILED" || status === "BLOCKED") return "blocked";
+  if (status === "RUNNING" || status === "ACTIVE") return "active";
+  return "ready";
 }
 
 function buildMissionBrief(

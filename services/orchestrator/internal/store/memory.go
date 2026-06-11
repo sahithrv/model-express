@@ -39,6 +39,7 @@ type MemoryStore struct {
 	workers              map[string]workers.Worker
 	jobs                 map[string]jobs.ExperimentJob
 	metrics              map[string][]jobs.EpochMetric
+	remoteSessions       map[string]runs.RemoteTrainingSession
 	plans                map[string]plans.ExperimentPlan
 	summaries            map[string]runs.TrainingRunSummary
 	evaluations          map[string]runs.TrainingRunEvaluation
@@ -70,6 +71,7 @@ func NewMemoryStore() *MemoryStore {
 		workers:              make(map[string]workers.Worker),
 		jobs:                 make(map[string]jobs.ExperimentJob),
 		metrics:              make(map[string][]jobs.EpochMetric),
+		remoteSessions:       make(map[string]runs.RemoteTrainingSession),
 		plans:                make(map[string]plans.ExperimentPlan),
 		summaries:            make(map[string]runs.TrainingRunSummary),
 		evaluations:          make(map[string]runs.TrainingRunEvaluation),
@@ -688,6 +690,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 		if job.MaxAttempts < 1 {
 			job.MaxAttempts = defaultJobMaxAttempts
 		}
+		previousConfig := copyAnyMap(job.Config)
 		if job.Attempt >= job.MaxAttempts {
 			job.Status = jobs.StatusFailed
 			job.Error = "job lease expired after maximum attempts"
@@ -701,6 +704,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 			job.StartedAt = nil
 			job.Config = jobConfigWithPendingAttempt(job.Config, job.ID, job.Attempt+1)
 		}
+		s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, runs.RemoteTrainingSessionStatusExpired, now)
 		job.LeaseOwnerWorkerID = ""
 		job.LeaseExpiresAt = nil
 		job.LeaseLastHeartbeatAt = nil
@@ -2269,6 +2273,7 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 
 	now := time.Now().UTC()
 	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
+	previousConfig := copyAnyMap(job.Config)
 	nextConfig := copyAnyMap(job.Config)
 	if options.Config != nil {
 		nextConfig = copyAnyMap(options.Config)
@@ -2286,6 +2291,11 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 		job.Error = message
 		job.CompletedAt = &now
 		job.Config = jobConfigWithTerminalAttempt(nextConfig, job.ID, job.Attempt)
+	}
+	if requeued {
+		s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, runs.RemoteTrainingSessionStatusExpired, now)
+	} else {
+		s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, runs.RemoteTrainingSessionStatusFailed, now)
 	}
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
@@ -2325,11 +2335,13 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	}
 
 	now := time.Now().UTC()
+	previousConfig := copyAnyMap(job.Config)
 	job.Status = status
 	job.MLflowRunID = mlflowRunID
 	job.Error = message
 	job.CompletedAt = &now
 	job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
+	s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, status, now)
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
 	job.LeaseLastHeartbeatAt = nil

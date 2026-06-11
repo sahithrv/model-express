@@ -1,0 +1,245 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/runs"
+	"model-express/services/orchestrator/internal/store"
+)
+
+func TestCreateJobRejectsUnsupportedTemplateAndUnsafeConfig(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	unsupportedReq := httptest.NewRequest(
+		http.MethodPost,
+		"/projects/"+project.ID+"/jobs",
+		strings.NewReader(`{"template":"mobilenet_transfer","config":{"dataset_id":"dataset_1"}}`),
+	)
+	unsupportedReq.Header.Set("Content-Type", "application/json")
+	unsupportedResp := httptest.NewRecorder()
+	router.ServeHTTP(unsupportedResp, unsupportedReq)
+	if unsupportedResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsupported template status %d, got %d: %s", http.StatusBadRequest, unsupportedResp.Code, unsupportedResp.Body.String())
+	}
+
+	unsafeReq := httptest.NewRequest(
+		http.MethodPost,
+		"/projects/"+project.ID+"/jobs",
+		strings.NewReader(`{"template":"profile_dataset","config":{"dataset_id":"dataset_1","artifact_uri":"file:///etc/passwd"}}`),
+	)
+	unsafeReq.Header.Set("Content-Type", "application/json")
+	unsafeResp := httptest.NewRecorder()
+	router.ServeHTTP(unsafeResp, unsafeReq)
+	if unsafeResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe config status %d, got %d: %s", http.StatusBadRequest, unsafeResp.Code, unsafeResp.Body.String())
+	}
+}
+
+func TestAgentInvocationResponsesRedactRawTraceByDefault(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := memoryStore.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:        project.ID,
+		AgentName:        "planner",
+		Provider:         "openai",
+		Model:            "test-model",
+		InputMessages:    []map[string]string{{"role": "user", "content": "secret-token-value"}},
+		InputContext:     map[string]any{"secret": "secret-context-value"},
+		RawOutput:        "secret-raw-output",
+		ParsedOutput:     map[string]any{"secret": "secret-parsed-output"},
+		ValidationStatus: memory.InvocationValidationValid,
+	}); err != nil {
+		t.Fatalf("create invocation: %v", err)
+	}
+	router := NewRouter(memoryStore)
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/agent-invocations", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	for _, forbidden := range []string{"secret-token-value", "secret-context-value", "secret-raw-output", "secret-parsed-output", "input_messages", "input_context", "raw_output", "parsed_output"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("agent invocation response leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestJSONBodyLimitRejectsOversizedRequest(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_JSON_BODY_MAX_BYTES", "65536")
+	router := NewRouter(store.NewMemoryStore())
+	body := `{"name":"` + strings.Repeat("a", 70_000) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/projects", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusRequestEntityTooLarge, resp.Code, resp.Body.String())
+	}
+}
+
+func TestPublicOrTunnelModeRequiresAPITokenForControlRoutes(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "")
+	t.Setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.example.test")
+
+	unauthenticatedRouter := NewRouter(store.NewMemoryStore())
+	unauthenticatedResp := httptest.NewRecorder()
+	unauthenticatedRouter.ServeHTTP(unauthenticatedResp, httptest.NewRequest(http.MethodGet, "/projects", nil))
+	if unauthenticatedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d without API token, got %d: %s", http.StatusUnauthorized, unauthenticatedResp.Code, unauthenticatedResp.Body.String())
+	}
+
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "api-token")
+	authenticatedRouter := NewRouter(store.NewMemoryStore())
+	req := httptest.NewRequest(http.MethodGet, "/projects", nil)
+	req.Header.Set("Authorization", "Bearer api-token")
+	authenticatedResp := httptest.NewRecorder()
+	authenticatedRouter.ServeHTTP(authenticatedResp, req)
+	if authenticatedResp.Code != http.StatusOK {
+		t.Fatalf("expected status %d with API token, got %d: %s", http.StatusOK, authenticatedResp.Code, authenticatedResp.Body.String())
+	}
+}
+
+func TestClosedRemoteTrainingSessionRejectsCallbackAndCloseIsIdempotent(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "api-token")
+	t.Setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.example.test")
+
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "modal worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{"provider":"modal"}`)
+	sessionID := payloadString(payloadMap(assigned.Config, "remote_training_session"), "id")
+	record, err := memoryStore.GetRemoteTrainingSession(sessionID)
+	if err != nil {
+		t.Fatalf("get remote session: %v", err)
+	}
+	if record.Status != runs.RemoteTrainingSessionStatusActive || record.CallbackTokenHash == "" {
+		t.Fatalf("expected active stored session with callback token hash, got %#v", record)
+	}
+	if strings.Contains(record.CallbackTokenHash, jobConfigString(assigned.Config, "callback_token")) {
+		t.Fatalf("callback token hash leaked raw callback token: %#v", record)
+	}
+
+	callbackBody := `{"epoch":1,"training_attempt_id":"` + callbackAttemptID(t, assigned) + `","metrics":{"loss":1.2}}`
+	activeReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(callbackBody))
+	activeReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, activeReq, assigned)
+	activeResp := httptest.NewRecorder()
+	router.ServeHTTP(activeResp, activeReq)
+	if activeResp.Code != http.StatusCreated {
+		t.Fatalf("expected active session callback without API token to use callback auth, got %d: %s", activeResp.Code, activeResp.Body.String())
+	}
+
+	closed, err := memoryStore.CloseRemoteTrainingSession(sessionID, runs.RemoteTrainingSessionStatusClosed)
+	if err != nil {
+		t.Fatalf("close remote session: %v", err)
+	}
+	closedAgain, err := memoryStore.CloseRemoteTrainingSession(sessionID, runs.RemoteTrainingSessionStatusFailed)
+	if err != nil {
+		t.Fatalf("close remote session again: %v", err)
+	}
+	if closedAgain.Status != closed.Status || closedAgain.ClosedAt == nil {
+		t.Fatalf("expected idempotent terminal close, got first=%#v second=%#v", closed, closedAgain)
+	}
+
+	closedReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/metrics", strings.NewReader(callbackBody))
+	closedReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, closedReq, assigned)
+	closedResp := httptest.NewRecorder()
+	router.ServeHTTP(closedResp, closedReq)
+	if closedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected closed session callback status %d, got %d: %s", http.StatusUnauthorized, closedResp.Code, closedResp.Body.String())
+	}
+}
+
+func TestChampionExportReadyResultRejectsBareFileURI(t *testing.T) {
+	job := jobs.ExperimentJob{ID: "job_1"}
+	export := runs.ChampionExport{ID: "export_1", Format: "onnx"}
+	req := championExportResultRequest{
+		Status:      runs.ChampionExportStatusReady,
+		ArtifactURI: "file:///tmp/champion.onnx",
+		Metadata:    map[string]any{"labels": []any{"cat"}},
+	}
+
+	err := validateChampionExportReadyResult(job, export, req)
+	if err == nil {
+		t.Fatal("expected bare file URI export result to be rejected")
+	}
+}
+
+func TestChampionExportReadyResultAcceptsWorkerManifest(t *testing.T) {
+	job := jobs.ExperimentJob{ID: "job_1"}
+	export := runs.ChampionExport{ID: "export_1", Format: "onnx"}
+	manifestJSON := `{
+		"schema_version":"champion_export_manifest_v1",
+		"status":"ok",
+		"metadata":{
+			"provenance":{
+				"schema_version":"worker_artifact_provenance_v1",
+				"generated_by":"model-express-worker",
+				"source":"worker_generated",
+				"export_job_id":"job_1",
+				"source_export_id":"export_1"
+			}
+		},
+		"artifacts":[{
+			"format":"onnx",
+			"status":"created",
+			"path":"/tmp/champion.onnx",
+			"provenance":{
+				"schema_version":"worker_artifact_provenance_v1",
+				"generated_by":"model-express-worker",
+				"source":"worker_generated",
+				"export_job_id":"job_1",
+				"source_export_id":"export_1"
+			}
+		}]
+	}`
+	var manifest map[string]any
+	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	req := championExportResultRequest{
+		Status:      runs.ChampionExportStatusReady,
+		ArtifactURI: "file:///tmp/champion.onnx",
+		Metadata:    map[string]any{"manifest": manifest},
+	}
+
+	if err := validateChampionExportReadyResult(job, export, req); err != nil {
+		t.Fatalf("expected worker manifest to be accepted: %v", err)
+	}
+}

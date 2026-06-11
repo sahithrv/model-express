@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -273,6 +274,7 @@ func TestLANModeCallbackEndpointUsesAttemptTokenInsteadOfAPIToken(t *testing.T) 
 }
 
 func TestPollModalJobAddsCallbackTokenAndRemoteSessionWithoutPersistingToken(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "test-api-token")
 	t.Setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.example.test")
 	t.Setenv("MODAL_S3_ENDPOINT_URL", "https://storage.example.test")
 
@@ -1289,7 +1291,47 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 		t.Fatalf("register export worker: %v", err)
 	}
 	assignedExport := pollJobForCallback(t, router, worker.ID, `{"templates":["export_champion"]}`)
-	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+exportJob.ID+"/champion-export-result", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assignedExport)+`","status":"READY","artifact_uri":"file:///exports/champion.onnx","metadata":{"labels":["cat","dog"]}}`))
+	exportArtifactURI := "file:///exports/champion.onnx"
+	resultPayload, err := json.Marshal(map[string]any{
+		"training_attempt_id": callbackAttemptID(t, assignedExport),
+		"status":              "READY",
+		"artifact_uri":        exportArtifactURI,
+		"metadata": map[string]any{
+			"labels": []string{"cat", "dog"},
+			"manifest": map[string]any{
+				"schema_version": "champion_export_manifest_v1",
+				"status":         "ok",
+				"metadata": map[string]any{
+					"format": "onnx",
+					"provenance": map[string]any{
+						"schema_version":   "worker_artifact_provenance_v1",
+						"generated_by":     "model-express-worker",
+						"source":           "worker_generated",
+						"export_job_id":    exportJob.ID,
+						"source_export_id": export.ID,
+						"artifact_format":  "onnx",
+					},
+				},
+				"artifacts": []map[string]any{{
+					"format": "onnx",
+					"status": "created",
+					"path":   "/exports/champion.onnx",
+					"provenance": map[string]any{
+						"schema_version":   "worker_artifact_provenance_v1",
+						"generated_by":     "model-express-worker",
+						"source":           "worker_generated",
+						"export_job_id":    exportJob.ID,
+						"source_export_id": export.ID,
+						"artifact_format":  "onnx",
+					},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal export result payload: %v", err)
+	}
+	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+exportJob.ID+"/champion-export-result", bytes.NewReader(resultPayload))
 	resultReq.Header.Set("Content-Type", "application/json")
 	setCallbackToken(t, resultReq, assignedExport)
 	resultResp := httptest.NewRecorder()
@@ -1301,7 +1343,7 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list exports: %v", err)
 	}
-	if exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI != "file:///exports/champion.onnx" {
+	if exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI != exportArtifactURI {
 		t.Fatalf("expected ready export with artifact, got %#v", exports[0])
 	}
 	updatedJob, err := memoryStore.GetJob(exportJob.ID)
@@ -7865,6 +7907,9 @@ func pollJobForCallback(t *testing.T, router http.Handler, workerID string, body
 	}
 	req := httptest.NewRequest(http.MethodPost, "/workers/"+workerID+"/poll", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if apiToken := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_API_TOKEN")); apiToken != "" {
+		req.Header.Set("X-Model-Express-Api-Token", apiToken)
+	}
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {

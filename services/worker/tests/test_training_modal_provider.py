@@ -24,6 +24,30 @@ def _modal_storage_credentials(monkeypatch):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "scoped-test-secret")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8080",
+        "https://localhost:8080",
+        "https://0.0.0.0:8080",
+        "https://10.0.0.5:8080",
+        "https://169.254.10.1:8080",
+        "http://orchestrator.example.test",
+    ],
+)
+def test_modal_remote_urls_reject_local_private_or_insecure_targets(monkeypatch, url):
+    monkeypatch.delenv("MODEL_EXPRESS_ALLOW_INSECURE_MODAL_URLS", raising=False)
+
+    with pytest.raises(ValueError):
+        modal_provider._require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", url)
+
+
+def test_modal_remote_url_allows_explicit_insecure_dev_override(monkeypatch):
+    monkeypatch.setenv("MODEL_EXPRESS_ALLOW_INSECURE_MODAL_URLS", "true")
+
+    modal_provider._require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", "http://orchestrator.example.test")
+
+
 class _FakeModalApp:
     def __init__(self, events: list[str] | None = None):
         self.enter_count = 0
@@ -297,6 +321,26 @@ def test_modal_storage_rejects_default_root_credentials(monkeypatch):
     with pytest.raises(ValueError, match="default local MinIO root credentials"):
         modal_provider._modal_storage_payload(
             {"id": "job_1", "config": {}},
+            {"id": "dataset_1", "storage_uri": "s3://bucket/dataset.zip"},
+        )
+
+
+def test_modal_storage_payload_rejects_dataset_key_traversal(monkeypatch):
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+
+    with pytest.raises(ValueError, match="dataset storage_uri"):
+        modal_provider._modal_storage_payload(
+            {"id": "job_1", "config": {}},
+            {"id": "dataset_1", "storage_uri": "s3://bucket/datasets/%2e%2e/secrets.zip"},
+        )
+
+
+def test_modal_storage_payload_rejects_session_prefix_traversal(monkeypatch):
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+
+    with pytest.raises(ValueError, match="path traversal"):
+        modal_provider._modal_storage_payload(
+            {"id": "job_1", "config": {"remote_training_session": {"storage_prefix": "model-express/artifacts/job_1/../job_2"}}},
             {"id": "dataset_1", "storage_uri": "s3://bucket/dataset.zip"},
         )
 

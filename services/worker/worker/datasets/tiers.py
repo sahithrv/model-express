@@ -293,8 +293,12 @@ def _resolve_yolo_split_images(config_path: Path, config: dict, split: str) -> l
 
 def _resolve_yolo_path(config_path: Path, config: dict, value: str) -> Path:
     path = Path(value)
+    config_root = config_path.parent.resolve()
     if path.is_absolute():
-        return path
+        resolved = path.resolve()
+        if not _path_is_within(resolved, config_root):
+            raise ValueError(f"YOLO data config path is outside the dataset root: {value!r}")
+        return resolved
     root_value = str(config.get("path") or "").strip()
     if root_value:
         root = Path(root_value)
@@ -302,7 +306,10 @@ def _resolve_yolo_path(config_path: Path, config: dict, value: str) -> Path:
             root = config_path.parent / root
     else:
         root = config_path.parent
-    return (root / path).resolve()
+    resolved = (root / path).resolve()
+    if not _path_is_within(resolved, config_root):
+        raise ValueError(f"YOLO data config path is outside the dataset root: {value!r}")
+    return resolved
 
 
 def _images_from_split_file(path: Path, config_base: Path) -> list[Path]:
@@ -314,6 +321,8 @@ def _images_from_split_file(path: Path, config_base: Path) -> list[Path]:
         image_path = Path(value)
         if not image_path.is_absolute():
             image_path = (config_base / image_path).resolve()
+        if not _path_is_within(image_path, config_base.resolve()):
+            raise ValueError(f"YOLO split file path is outside the dataset root: {value!r}")
         if image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES:
             images.append(image_path)
     return images
@@ -414,3 +423,11 @@ def _seed(seed: int, namespace: str) -> int:
 
 def _stable_text(value: object) -> str:
     return str(value or "").strip().lower()
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (OSError, ValueError):
+        return False

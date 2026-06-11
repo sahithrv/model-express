@@ -1105,9 +1105,13 @@ def _resolve_yolo_split_targets(
             continue
         split_path = Path(value)
         if split_path.is_absolute():
-            targets.append(split_path)
+            if _path_is_within(split_path, config_path.parent):
+                targets.append(split_path)
         else:
-            targets.extend(root / split_path for root in roots)
+            for root in roots:
+                target = (root / split_path).resolve()
+                if _path_is_within(target, config_path.parent):
+                    targets.append(target)
     return _unique_paths(targets)
 
 
@@ -1117,7 +1121,9 @@ def _resolve_yolo_config_roots(config_path: Path, path_hint: str | list[str] | N
         if _is_remote_yolo_path(value):
             continue
         root = Path(value)
-        roots.append(root if root.is_absolute() else config_path.parent / root)
+        resolved = root.resolve() if root.is_absolute() else (config_path.parent / root).resolve()
+        if _path_is_within(resolved, config_path.parent):
+            roots.append(resolved)
     return _unique_paths(roots) or [config_path.parent]
 
 
@@ -1133,6 +1139,14 @@ def _as_path_values(value: str | list[str] | None) -> list[str]:
 def _is_remote_yolo_path(value: str) -> bool:
     lowered = value.lower()
     return "://" in lowered or lowered.startswith(("s3:", "gs:"))
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _count_yolo_images_for_target(

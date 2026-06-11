@@ -107,3 +107,29 @@ def test_yolo_preview_subset_preserves_pairs_and_valid_data_yaml(tmp_path: Path)
         labels = sorted((preview_yaml.parent / "labels" / split).glob("*.txt"))
         assert len(images) == len(labels) == 2
         assert {path.stem for path in images} == {path.stem for path in labels}
+
+
+def test_yolo_preview_subset_rejects_paths_outside_dataset_root(tmp_path: Path) -> None:
+    pytest.importorskip("yaml")
+    dataset = tmp_path / "dataset"
+    outside = tmp_path / "outside" / "images"
+    outside.mkdir(parents=True)
+    (outside / "escape.jpg").write_bytes(b"image")
+    data_yaml = dataset / "data.yaml"
+    data_yaml.parent.mkdir(parents=True)
+    data_yaml.write_text(
+        "path: ..\ntrain: outside/images\nval: outside/images\nnc: 1\nnames: [escape]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="outside the dataset root"):
+        materialize_yolo_preview_subset(
+            dataset_dir=dataset,
+            data_config_path=data_yaml,
+            output_root=tmp_path / "subsets",
+            dataset_checksum="b" * 64,
+            fraction=1.0,
+            seed=11,
+            split_policy="official_yolo",
+            image_size_family="object_detection:512",
+        )
