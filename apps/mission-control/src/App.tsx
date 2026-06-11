@@ -3752,9 +3752,39 @@ function MissionRoute({
 }) {
   const primaryAction = actions.find((action) => action.priority === "primary") ?? actions[0];
   const latestActivity = activity[0] ?? null;
+  const activeStage = currentMissionStage(stages);
+  const completedStageCount = stages.filter((stage) => stage.status === "done").length;
+  const flowProgress = missionStageProgress(stages);
 
   return (
     <div className="mission-workspace">
+      <section className={`mission-stage-panel mission-flow-board ${activeStage.status}`}>
+        <div className="mission-flow-head">
+          <div className="mission-now-state">
+            <span className={`mission-now-icon ${activeStage.status}`}>{missionStageIcon(activeStage.status)}</span>
+            <div>
+              <div className="eyebrow">Realtime project state</div>
+              <h3>{activeStage.label}</h3>
+              <p>{activeStage.detail}</p>
+            </div>
+          </div>
+          <div className="mission-flow-meta">
+            <Badge value={brief.statusLabel} />
+            <small>
+              {completedStageCount}/{stages.length} steps complete
+            </small>
+            <button className="mission-link-button" type="button" onClick={() => onOpenTab("activity", "activity")}>
+              <Activity size={13} />
+              Open journal
+            </button>
+          </div>
+        </div>
+        <div className="mission-flow-progress" aria-hidden="true">
+          <span style={{ width: `${flowProgress}%` }} />
+        </div>
+        <MissionStageTimeline stages={stages} />
+      </section>
+
       <section className="mission-card">
         <div className="mission-card-head">
           <div>
@@ -3800,19 +3830,6 @@ function MissionRoute({
           <ThinkingRow label="Decision" value={thinking.decision} />
           <ThinkingRow label="Expected outcome" value={thinking.expectedOutcome} />
         </div>
-      </section>
-
-      <section className="mission-stage-panel">
-        <div className="mission-section-head">
-          <div>
-            <div className="eyebrow">Progress stage</div>
-            <strong>{brief.progressLabel}</strong>
-          </div>
-          <button className="mission-link-button" type="button" onClick={() => onOpenTab("activity", "activity")}>
-            Open journal
-          </button>
-        </div>
-        <MissionStageTimeline stages={stages} />
       </section>
 
       <aside className="mission-inspector">
@@ -3884,10 +3901,17 @@ function ThinkingRow({ label, value }: { label: string; value: string }) {
 
 function MissionStageTimeline({ stages }: { stages: MissionStage[] }) {
   return (
-    <div className="mission-stage-timeline">
-      {stages.map((stage) => (
-        <div className={`mission-stage ${stage.status}`} key={stage.id}>
-          <span className="timeline-dot" />
+    <div className="mission-stage-timeline" aria-label="Mission workflow">
+      {stages.map((stage, index) => (
+        <div
+          className={`mission-stage ${stage.status}`}
+          key={stage.id}
+          aria-current={stage.status === "active" || stage.status === "blocked" ? "step" : undefined}
+        >
+          <span className={`mission-stage-marker ${stage.status}`} aria-hidden="true">
+            {missionStageIcon(stage.status)}
+          </span>
+          <small className="mission-stage-number">{String(index + 1).padStart(2, "0")}</small>
           <div>
             <strong>{stage.label}</strong>
             <small>{stage.detail}</small>
@@ -3897,6 +3921,46 @@ function MissionStageTimeline({ stages }: { stages: MissionStage[] }) {
       ))}
     </div>
   );
+}
+
+function currentMissionStage(stages: MissionStage[]): MissionStage {
+  if (stages.length > 0 && stages.every((stage) => stage.status === "waiting")) {
+    return {
+      id: "empty",
+      label: "Waiting for mission",
+      detail: stages[0]?.detail || "Create or select a mission to begin.",
+      status: "waiting",
+    };
+  }
+
+  return (
+    stages.find((stage) => stage.status === "blocked") ??
+    stages.find((stage) => stage.status === "active") ??
+    stages.find((stage) => stage.status === "waiting") ??
+    stages[stages.length - 1] ?? {
+      id: "empty",
+      label: "Waiting for mission",
+      detail: "Create or select a mission to begin.",
+      status: "waiting",
+    }
+  );
+}
+
+function missionStageProgress(stages: MissionStage[]) {
+  if (stages.length === 0) return 0;
+  const activeIndex = stages.findIndex((stage) => stage.status === "active" || stage.status === "blocked");
+  if (activeIndex >= 0) {
+    return Math.round(((activeIndex + 0.55) / stages.length) * 100);
+  }
+  const completed = stages.filter((stage) => stage.status === "done").length;
+  return Math.round((completed / stages.length) * 100);
+}
+
+function missionStageIcon(status: MissionStage["status"]): ReactNode {
+  if (status === "done") return <CheckCircle2 size={15} />;
+  if (status === "active") return <Activity size={15} />;
+  if (status === "blocked") return <AlertTriangle size={15} />;
+  return <Timer size={15} />;
 }
 
 function ActivityRoute({

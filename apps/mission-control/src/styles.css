@@ -1008,6 +1008,10 @@ button {
 }
 
 .mission-link-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
   justify-self: start;
   min-height: 30px;
   border: 1px solid #26342f;
@@ -1097,10 +1101,10 @@ button {
 
 .mission-workspace {
   display: grid;
-  grid-template-columns: minmax(220px, 0.9fr) minmax(340px, 1.25fr) minmax(260px, 0.85fr);
+  grid-template-columns: minmax(240px, 0.9fr) minmax(360px, 1.18fr) minmax(280px, 0.86fr);
   grid-template-areas:
-    "card thinking inspector"
-    "stages stages inspector";
+    "flow flow flow"
+    "card thinking inspector";
   align-items: start;
   gap: 14px;
   min-width: 0;
@@ -1140,7 +1144,137 @@ button {
 }
 
 .mission-stage-panel {
-  grid-area: stages;
+  grid-area: flow;
+}
+
+.mission-flow-board {
+  position: relative;
+  gap: 14px;
+  overflow: hidden;
+  border-color: rgba(125, 183, 255, 0.34);
+  background:
+    linear-gradient(135deg, rgba(125, 183, 255, 0.11), rgba(0, 212, 126, 0.07) 46%, rgba(17, 20, 22, 0.96) 72%),
+    rgba(17, 20, 22, 0.96);
+  box-shadow:
+    0 24px 70px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.mission-flow-board.done {
+  border-color: rgba(0, 212, 126, 0.4);
+}
+
+.mission-flow-board.blocked {
+  border-color: rgba(255, 104, 117, 0.46);
+}
+
+.mission-flow-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  min-width: 0;
+}
+
+.mission-now-state {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.mission-now-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid rgba(125, 183, 255, 0.42);
+  border-radius: 8px;
+  color: #7db7ff;
+  background: rgba(125, 183, 255, 0.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.mission-now-icon.done {
+  border-color: rgba(0, 212, 126, 0.42);
+  color: #00d47e;
+  background: rgba(0, 212, 126, 0.1);
+}
+
+.mission-now-icon.active {
+  border-color: rgba(125, 183, 255, 0.56);
+  color: #d8eaff;
+  background: rgba(125, 183, 255, 0.16);
+  animation: mission-pulse 1.45s ease-out infinite;
+}
+
+.mission-now-icon.blocked {
+  border-color: rgba(255, 104, 117, 0.52);
+  color: #ff9ca5;
+  background: rgba(255, 104, 117, 0.11);
+}
+
+.mission-now-icon.waiting {
+  border-color: rgba(255, 209, 102, 0.34);
+  color: #ffd166;
+  background: rgba(255, 209, 102, 0.09);
+}
+
+.mission-flow-head h3 {
+  margin: 0;
+  color: #fbfffc;
+  font-size: 25px;
+  line-height: 1.12;
+}
+
+.mission-flow-head p {
+  max-width: 760px;
+  margin: 0;
+  color: #b9c5c0;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.mission-flow-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 182px;
+}
+
+.mission-flow-meta > small {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  border: 1px solid rgba(55, 64, 70, 0.72);
+  border-radius: 7px;
+  padding: 0 9px;
+  color: #8d9993;
+  background: rgba(8, 12, 14, 0.72);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.mission-flow-progress {
+  height: 7px;
+  overflow: hidden;
+  border: 1px solid rgba(55, 64, 70, 0.62);
+  border-radius: 999px;
+  background: rgba(7, 10, 11, 0.86);
+}
+
+.mission-flow-progress span {
+  display: block;
+  height: 100%;
+  min-width: 7px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7db7ff 0%, #00d47e 58%, #ffd166 100%);
+  box-shadow: 0 0 18px rgba(0, 212, 126, 0.24);
+  transition: width 260ms ease;
 }
 
 .mission-inspector {
@@ -1282,33 +1416,74 @@ button {
 
 .mission-stage-timeline {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(86px, 1fr));
+  gap: 7px;
 }
 
 .mission-stage {
+  position: relative;
   display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   align-content: start;
-  gap: 8px;
+  gap: 9px;
   min-width: 0;
-  min-height: 118px;
+  min-height: 138px;
   border: 1px solid rgba(55, 64, 70, 0.66);
   border-radius: 8px;
-  padding: 10px;
-  background: #0b0f10;
+  padding: 11px;
+  background: rgba(8, 12, 14, 0.76);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    transform 160ms ease;
+}
+
+.mission-stage:hover {
+  transform: translateY(-1px);
+  border-color: rgba(184, 199, 191, 0.34);
+  background: rgba(12, 17, 18, 0.9);
+}
+
+.mission-stage::after {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  left: 10px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(74, 91, 83, 0.34);
+  content: "";
 }
 
 .mission-stage.done {
   border-color: rgba(0, 212, 126, 0.28);
+  background: rgba(0, 212, 126, 0.055);
+}
+
+.mission-stage.done::after {
+  background: rgba(0, 212, 126, 0.64);
 }
 
 .mission-stage.active {
-  border-color: rgba(125, 183, 255, 0.42);
-  background: rgba(125, 183, 255, 0.06);
+  border-color: rgba(125, 183, 255, 0.56);
+  background: rgba(125, 183, 255, 0.09);
+  box-shadow:
+    0 16px 38px rgba(0, 0, 0, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.mission-stage.active::after {
+  background: #7db7ff;
 }
 
 .mission-stage.blocked {
-  border-color: rgba(255, 104, 117, 0.38);
+  border-color: rgba(255, 104, 117, 0.48);
+  background: rgba(255, 104, 117, 0.075);
+}
+
+.mission-stage.blocked::after {
+  background: #ff6875;
 }
 
 .mission-stage > div {
@@ -1319,7 +1494,7 @@ button {
 
 .mission-stage strong {
   color: #eef3f0;
-  font-size: 12px;
+  font-size: 12.5px;
   line-height: 1.25;
 }
 
@@ -1328,6 +1503,55 @@ button {
   font-size: 11px;
   line-height: 1.35;
   overflow-wrap: anywhere;
+}
+
+.mission-stage > div small {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.mission-stage-marker {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid rgba(74, 91, 83, 0.76);
+  border-radius: 8px;
+  color: #8d9993;
+  background: rgba(6, 9, 10, 0.74);
+}
+
+.mission-stage-marker.done {
+  border-color: rgba(0, 212, 126, 0.42);
+  color: #00d47e;
+  background: rgba(0, 212, 126, 0.08);
+}
+
+.mission-stage-marker.active {
+  border-color: rgba(125, 183, 255, 0.58);
+  color: #d8eaff;
+  background: rgba(125, 183, 255, 0.14);
+}
+
+.mission-stage-marker.blocked {
+  border-color: rgba(255, 104, 117, 0.52);
+  color: #ff9ca5;
+  background: rgba(255, 104, 117, 0.1);
+}
+
+.mission-stage-marker.waiting {
+  border-color: rgba(255, 209, 102, 0.3);
+  color: #ffd166;
+  background: rgba(255, 209, 102, 0.075);
+}
+
+.mission-stage-number {
+  color: #64716b;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
 }
 
 .activity-journal,
@@ -1580,6 +1804,22 @@ button {
   }
   100% {
     box-shadow: 0 0 0 0 rgba(0, 212, 126, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mission-now-icon.active,
+  .live-agent-pulse.active {
+    animation: none;
+  }
+
+  .mission-stage,
+  .mission-flow-progress span {
+    transition: none;
+  }
+
+  .mission-stage:hover {
+    transform: none;
   }
 }
 
@@ -5073,8 +5313,8 @@ button {
   .mission-workspace {
     grid-template-columns: minmax(0, 1fr) minmax(280px, 0.8fr);
     grid-template-areas:
+      "flow flow"
       "card thinking"
-      "stages stages"
       "inspector inspector";
   }
 
@@ -5085,7 +5325,7 @@ button {
   }
 
   .mission-stage-timeline {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   }
 
   .developer-intro {
@@ -5225,9 +5465,9 @@ button {
 
   .mission-workspace {
     grid-template-areas:
+      "flow"
       "card"
       "thinking"
-      "stages"
       "inspector";
   }
 
@@ -5256,6 +5496,7 @@ button {
   .memory-probe-summary,
   .memory-probe-run summary,
   .mission-status-head,
+  .mission-flow-head,
   .mission-section-head,
   .agent-audit-head {
     align-items: stretch;
