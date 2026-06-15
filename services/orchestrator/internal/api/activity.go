@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
@@ -40,6 +41,87 @@ type agentActivityEvent struct {
 	Status    string         `json:"status"`
 	CreatedAt time.Time      `json:"created_at"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+func (s *Server) listProjectExecutionEvents(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	events, err := s.store.ListProjectExecutionEvents(c.Param("id"), limit)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+func (s *Server) streamProjectExecutionEvents(c *gin.Context) {
+	projectID := c.Param("id")
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	interval, _ := strconv.Atoi(c.DefaultQuery("interval_ms", "2000"))
+	if interval < 500 {
+		interval = 500
+	}
+	if interval > 10000 {
+		interval = 10000
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	lastID := c.GetHeader("Last-Event-ID")
+	delivered := map[string]bool{}
+	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
+	defer ticker.Stop()
+
+	send := func() bool {
+		events, err := s.store.ListProjectExecutionEvents(projectID, limit)
+		if err != nil {
+			c.SSEvent("error", gin.H{"error": err.Error()})
+			c.Writer.Flush()
+			return false
+		}
+		sort.Slice(events, func(i, j int) bool {
+			return events[i].CreatedAt.Before(events[j].CreatedAt)
+		})
+		seenLastID := lastID == ""
+		for _, event := range events {
+			if delivered[event.ID] {
+				continue
+			}
+			if !seenLastID {
+				if event.ID == lastID {
+					seenLastID = true
+				}
+				continue
+			}
+			c.Writer.WriteString("id: " + event.ID + "\n")
+			c.SSEvent("execution_event", event)
+			delivered[event.ID] = true
+			lastID = event.ID
+		}
+		if !seenLastID {
+			lastID = ""
+		}
+		c.Writer.Flush()
+		return true
+	}
+
+	send()
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		}
+	}
 }
 
 var (

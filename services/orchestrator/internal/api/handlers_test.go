@@ -2644,6 +2644,7 @@ func TestAutomaticReviewAutoExecutionCreatesWorkerRequirement(t *testing.T) {
 }
 
 func TestAutomaticExecutionWorkerRequirementScalesToQueuedJobs(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_PROFILE", "fast-remote")
 	t.Setenv("MODEL_EXPRESS_MAX_AUTO_WORKERS", "4")
 
 	memoryStore := store.NewMemoryStore()
@@ -2708,6 +2709,7 @@ func TestAutomaticExecutionWorkerRequirementScalesToQueuedJobs(t *testing.T) {
 }
 
 func TestManualModalExecutionRequestedConcurrencyOverridesBalancedDefault(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_PROFILE", "fast-remote")
 	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
 	t.Setenv("MODEL_EXPRESS_MAX_AUTO_WORKERS", "8")
 
@@ -2825,6 +2827,7 @@ func TestExecuteModalPlanLeavesTrainingTierUnsetWhenFlagOff(t *testing.T) {
 }
 
 func TestCostModePolicyConstrainsWorkerRequirementAndJobConfig(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_PROFILE", "fast-remote")
 	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
 
 	tests := []struct {
@@ -3189,6 +3192,7 @@ func TestPersistentGPUProviderSchedulesOnlyWhenConfigured(t *testing.T) {
 }
 
 func TestFullPlanMockedIntegrationCostAwarePersistentProvider(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_PROFILE", "fast-remote")
 	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
 	t.Setenv("MODEL_EXPRESS_PERSISTENT_GPU_PROVIDER", "1")
 	t.Setenv("MODEL_EXPRESS_PERSISTENT_GPU_CACHE_ROOT", "/mnt/model-express-cache")

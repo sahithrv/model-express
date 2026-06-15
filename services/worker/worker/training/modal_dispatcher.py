@@ -37,7 +37,7 @@ MODAL_DISPATCHER_UNSPECIFIED_PROVIDER_TEMPLATES = [
     "champion_demo_prediction",
     "generate_visual_exemplars",
 ]
-DEFAULT_DISPATCHER_SLOTS = 2
+DEFAULT_DISPATCHER_SLOTS = 1
 MAX_DISPATCHER_SLOTS = 8
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0
@@ -774,11 +774,12 @@ def modal_dispatcher_enabled() -> bool:
 
 
 def modal_dispatcher_slot_count() -> int:
+    maximum = MAX_DISPATCHER_SLOTS if _fast_remote_execution_profile_enabled() else 1
     return _positive_int_env(
         "MODEL_EXPRESS_MODAL_DISPATCHER_SLOTS",
         DEFAULT_DISPATCHER_SLOTS,
         minimum=1,
-        maximum=MAX_DISPATCHER_SLOTS,
+        maximum=maximum,
     )
 
 
@@ -834,6 +835,14 @@ def modal_dispatcher_required_slot_count(requirements: list[dict]) -> int:
         target = max(target, _positive_int_value(requirement.get("target_count"), default=0))
         target = max(target, _positive_int_value(requirement.get("max_concurrent_jobs"), default=0))
     return min(max(target, 0), MAX_DISPATCHER_SLOTS)
+
+
+def _fast_remote_execution_profile_enabled() -> bool:
+    for name in ("MODEL_EXPRESS_EXECUTION_PROFILE", "MODEL_EXPRESS_V1_PROFILE"):
+        value = os.getenv(name, "").strip().lower().replace("_", "-")
+        if value == "fast-remote":
+            return True
+    return False
 
 
 def modal_dispatcher_worker_name() -> str:
