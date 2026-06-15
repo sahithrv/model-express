@@ -1054,6 +1054,12 @@ button {
   background: rgba(255, 209, 102, 0.08);
 }
 
+.notice-inline.error {
+  border-color: rgba(255, 104, 117, 0.32);
+  color: #f1a2aa;
+  background: rgba(255, 104, 117, 0.08);
+}
+
 .section-tabs {
   position: sticky;
   top: -24px;

@@ -30,6 +30,8 @@ const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
 const DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const MODEL_ARTIFACT_EXTENSIONS = [".onnx", ".ort", ".pt", ".pth", ".torchscript", ".safetensors"];
 const electronRuntimeAvailable = Boolean(app && BrowserWindow && dialog && ipcMain && Menu);
+let missionControlEnvCache = null;
+let missionControlEnvCacheKey = "";
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -62,12 +64,12 @@ function createWindow() {
   }
 }
 
-function validateOrchestratorRequest(request = {}) {
+function validateOrchestratorRequest(request = {}, env = process.env) {
   if (!request || typeof request !== "object" || Array.isArray(request)) {
     throw new Error("Orchestrator request must be an object.");
   }
   const method = validateOrchestratorMethod(request.method);
-  const baseUrl = validateOrchestratorBaseUrl(request.baseUrl ?? DEFAULT_ORCHESTRATOR_URL);
+  const baseUrl = validateOrchestratorBaseUrl(request.baseUrl ?? DEFAULT_ORCHESTRATOR_URL, env);
   const requestPath = validateAppRequestPath(request.path);
   const bodyText = serializeJsonRequestBody(method, request.body);
   const url = new URL(requestPath, baseUrl).toString();
@@ -399,6 +401,20 @@ function repoRoot(env = process.env) {
   return path.resolve(env.MODEL_EXPRESS_ROOT || path.resolve(__dirname, "..", "..", ".."));
 }
 
+function missionControlEnv(env = process.env) {
+  const root = repoRoot(env);
+  const envFile = String(env.MODEL_EXPRESS_ENV_FILE ?? "");
+  const cacheKey = `${root}\0${envFile}`;
+  if (missionControlEnvCacheKey !== cacheKey) {
+    missionControlEnvCache = loadRepoEnv(root, env);
+    missionControlEnvCacheKey = cacheKey;
+  }
+  return {
+    ...env,
+    ...(missionControlEnvCache ?? {}),
+  };
+}
+
 function workerRoot(root = repoRoot()) {
   return path.join(root, "services", "worker");
 }
@@ -575,12 +591,13 @@ if (electronRuntimeAvailable) {
   });
 
   ipcMain.handle("orchestrator:request", async (_event, request) => {
-    const validated = validateOrchestratorRequest(request);
+    const env = missionControlEnv();
+    const validated = validateOrchestratorRequest(request, env);
     const response = await fetch(validated.url, {
       method: validated.method,
       headers: {
         "Content-Type": "application/json",
-        ...apiTokenHeaders(),
+        ...apiTokenHeaders(env),
       },
       body: validated.bodyText,
     });
@@ -654,10 +671,7 @@ if (electronRuntimeAvailable) {
   });
 
   ipcMain.handle("dataset:preflightFolder", async (_event, options) => {
-    const { datasetPath } = resolveDatasetFolderOption(options);
-    const entries = await collectDatasetFiles(datasetPath);
-    const archivePlan = planZipArchive(entries);
-    return datasetUploadPreflight(entries, archivePlan, options);
+    return preflightDatasetFolder(options);
   });
 
   ipcMain.handle("demo:selectImage", async () => {
@@ -933,13 +947,14 @@ async function readS3ObjectBuffer(artifactUri, options = {}, purpose = "storage"
 }
 
 function createS3Client(options = {}, { purpose = "storage" } = {}) {
+  const env = missionControlEnv();
   return new S3Client({
-    endpoint: resolveS3Endpoint(options, purpose),
-    region: options.region ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1",
+    endpoint: resolveS3Endpoint(options, purpose, env),
+    region: options.region ?? env.AWS_DEFAULT_REGION ?? "us-east-1",
     forcePathStyle: true,
     credentials: {
-      accessKeyId: options.accessKeyId ?? process.env.AWS_ACCESS_KEY_ID ?? "model_express",
-      secretAccessKey: options.secretAccessKey ?? process.env.AWS_SECRET_ACCESS_KEY ?? "model_express_password",
+      accessKeyId: options.accessKeyId ?? env.AWS_ACCESS_KEY_ID ?? "model_express",
+      secretAccessKey: options.secretAccessKey ?? env.AWS_SECRET_ACCESS_KEY ?? "model_express_password",
     },
   });
 }
@@ -1431,8 +1446,8 @@ function resolveWorkerPython(workerDir, env) {
   return process.platform === "win32" ? "python" : "python3";
 }
 
-function resolveLogDir(repoRoot) {
-  return process.env.MODEL_EXPRESS_LOG_DIR ?? path.join(repoRoot, "artifacts", "logs");
+function resolveLogDir(repoRoot, env = process.env) {
+  return env.MODEL_EXPRESS_LOG_DIR ?? path.join(repoRoot, "artifacts", "logs");
 }
 
 function appendDiagnosticLog(logDir, level, event, fields = {}) {
@@ -1544,9 +1559,9 @@ function sensitiveLogKey(key) {
   return /api[_-]?key|authorization|base64|credential|image|password|prompt|raw_output|secret|storage_uri|token|uri|url/i.test(key);
 }
 
-function loadRepoEnv(repoRoot) {
+function loadRepoEnv(repoRoot, runtimeEnv = process.env) {
   const env = {};
-  const envFile = process.env.MODEL_EXPRESS_ENV_FILE;
+  const envFile = runtimeEnv.MODEL_EXPRESS_ENV_FILE;
   const files = envFile
     ? [path.resolve(repoRoot, envFile)]
     : [path.join(repoRoot, ".env"), path.join(repoRoot, ".env.local")];
@@ -1593,27 +1608,29 @@ async function uploadDatasetFolder(options) {
   if (!projectId) {
     throw new Error("Project id is required before uploading a dataset.");
   }
-  const { datasetPath } = resolveDatasetFolderOption(options);
+  const env = missionControlEnv();
+  const folder = resolveDatasetFolderOption(options);
+  const datasetPath = folder.path;
 
   const datasetName = path.basename(datasetPath);
   const safeName = datasetName.replace(/[^a-zA-Z0-9._-]/g, "-");
-  const bucket = options.bucket ?? "model-express";
-  const endpoint = validateUploadEndpoint(options.endpoint);
-  const accessKeyId = options.accessKeyId ?? "model_express";
-  const secretAccessKey = options.secretAccessKey ?? "model_express_password";
-  const region = options.region ?? "us-east-1";
+  const bucket = options.bucket ?? env.S3_BUCKET ?? "model-express";
+  const endpoint = validateUploadEndpoint(options.endpoint, env);
+  const accessKeyId = options.accessKeyId ?? env.AWS_ACCESS_KEY_ID ?? "model_express";
+  const secretAccessKey = options.secretAccessKey ?? env.AWS_SECRET_ACCESS_KEY ?? "model_express_password";
+  const region = options.region ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
   const key = `datasets/${projectId}/${safeName}.zip`;
   const entries = await collectDatasetFiles(datasetPath);
   if (entries.length === 0) {
     throw new Error(`Dataset folder does not contain any files: ${datasetPath}`);
   }
   const archivePlan = planZipArchive(entries);
-  const preflight = datasetUploadPreflight(entries, archivePlan, options);
+  const preflight = datasetUploadPreflight(entries, archivePlan, options, env);
   if (preflight.errors.length > 0) {
     throw new Error(preflight.errors.map((item) => item.message).join(" "));
   }
   if (preflight.warnings.length > 0) {
-    appendDiagnosticLog(resolveLogDir(process.env.MODEL_EXPRESS_ROOT ?? path.resolve(__dirname, "..", "..", "..")), "warn", "dataset_upload_preflight_warning", {
+    appendDiagnosticLog(resolveLogDir(repoRoot(env), env), "warn", "dataset_upload_preflight_warning", {
       project_id: projectId,
       file_count: preflight.file_count,
       uncompressed_size_bytes: preflight.uncompressed_size_bytes,
@@ -1669,12 +1686,20 @@ async function uploadDatasetFolder(options) {
   };
 }
 
-function datasetUploadPreflight(entries, archivePlan, options = {}) {
+async function preflightDatasetFolder(options = {}) {
+  const env = missionControlEnv();
+  const folder = resolveDatasetFolderOption(options);
+  const entries = await collectDatasetFiles(folder.path);
+  const archivePlan = planZipArchive(entries);
+  return datasetUploadPreflight(entries, archivePlan, options, env);
+}
+
+function datasetUploadPreflight(entries, archivePlan, options = {}, env = process.env) {
   return buildDatasetUploadPreflight(entries, archivePlan, {
-    warnFileCount: options.warnFileCount ?? process.env.MODEL_EXPRESS_UPLOAD_WARN_FILE_COUNT,
-    warnBytes: options.warnBytes ?? process.env.MODEL_EXPRESS_UPLOAD_WARN_BYTES,
-    maxFileCount: options.maxFileCount ?? process.env.MODEL_EXPRESS_UPLOAD_MAX_FILE_COUNT,
-    maxBytes: options.maxBytes ?? process.env.MODEL_EXPRESS_UPLOAD_MAX_BYTES,
+    warnFileCount: options.warnFileCount ?? env.MODEL_EXPRESS_UPLOAD_WARN_FILE_COUNT,
+    warnBytes: options.warnBytes ?? env.MODEL_EXPRESS_UPLOAD_WARN_BYTES,
+    maxFileCount: options.maxFileCount ?? env.MODEL_EXPRESS_UPLOAD_MAX_FILE_COUNT,
+    maxBytes: options.maxBytes ?? env.MODEL_EXPRESS_UPLOAD_MAX_BYTES,
   });
 }
 
@@ -1684,7 +1709,9 @@ module.exports = {
     configuredLocalArtifactRoots,
     externalDataMountPath,
     isLoopbackHostname,
+    missionControlEnv,
     parseCloudflaredTunnelUrl,
+    preflightDatasetFolder,
     rememberDatasetFolder,
     requireAuthenticatedOrchestratorExposure,
     remoteTrainingSessionActive,

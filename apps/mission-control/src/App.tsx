@@ -527,6 +527,13 @@ const trainingSummariesFetchLimit = 100;
 const trainingEvaluationsFetchLimit = 50;
 const selectedJobMetricsFetchLimit = 200;
 
+function missionControlErrorMessage(error: unknown): string {
+  const message = errorMessage(error);
+  if (message.includes("401") && message.includes("missing or invalid API token")) {
+    return "The backend is in LAN or tunnel mode but Mission Control has no matching MODEL_EXPRESS_API_TOKEN. Set it in .env.local, or remove the public Modal/tunnel URL for local-only use, then restart the backend and app.";
+  }
+  return message;
+}
 
 const defaultAutomationSettings: AutomationSettings = {
   auto_review_experiments: false,
@@ -560,6 +567,7 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectFolder, setNewProjectFolder] = useState<DatasetFolder | null>(null);
+  const [newProjectError, setNewProjectError] = useState("");
 	const [jobPage, setJobPage] = useState(0);
 	const [selectedMetricKey, setSelectedMetricKey] = useState<MetricKey>("macro_f1");
 	const [activeProjectTab, setActiveProjectTab] = useState<ProjectTabKey>("mission");
@@ -1357,6 +1365,7 @@ export function App() {
   }, [superviseWorkerRequirements]);
 
   async function chooseNewProjectFolder() {
+    setNewProjectError("");
     const folder = await window.missionControl.selectDatasetFolder();
     if (folder) {
       try {
@@ -1364,7 +1373,9 @@ export function App() {
         setNewProjectFolder({ ...folder, preflight });
       } catch (error) {
         setNewProjectFolder(folder);
-        setNotice({ kind: "error", text: errorMessage(error) });
+        const message = missionControlErrorMessage(error);
+        setNewProjectError(message);
+        setNotice({ kind: "error", text: message });
       }
     }
   }
@@ -1374,7 +1385,9 @@ export function App() {
     const goal = String(formData.get("goal") ?? "").trim();
 
     if (!name || !newProjectFolder) {
-      setNotice({ kind: "error", text: "Project name and dataset folder are required." });
+      const message = "Project name and dataset folder are required.";
+      setNewProjectError(message);
+      setNotice({ kind: "error", text: message });
       return;
     }
     const uploadWarnings = newProjectFolder.preflight?.warnings ?? [];
@@ -1388,6 +1401,7 @@ export function App() {
 
     setLoading(true);
     setNotice(null);
+    setNewProjectError("");
     try {
       const project = await request<Project>("/projects", {
         method: "POST",
@@ -1422,12 +1436,15 @@ export function App() {
 
       setSelectedProjectId(project.id);
       setNewProjectFolder(null);
+      setNewProjectError("");
       setNewProjectOpen(false);
       await refreshProjects();
       await refreshProjectDetail(project.id, { includeSlowData: true, forceSlowData: true });
       setNotice({ kind: "info", text: `Created ${project.name} with dataset ${metadata.name}. ${workerMessage}` });
     } catch (error) {
-      setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+      const message = missionControlErrorMessage(error);
+      setNewProjectError(message);
+      setNotice({ kind: "error", text: message });
     } finally {
       setLoading(false);
     }
@@ -1968,7 +1985,14 @@ export function App() {
         </label>
 
         <div className="sidebar-actions">
-          <button className="command primary" onClick={() => setNewProjectOpen(true)} disabled={loading}>
+          <button
+            className="command primary"
+            onClick={() => {
+              setNewProjectError("");
+              setNewProjectOpen(true);
+            }}
+            disabled={loading}
+          >
             <Plus size={16} />
             New Mission
           </button>
@@ -3161,7 +3185,14 @@ export function App() {
                 <div className="eyebrow">New Project</div>
                 <h3>Project Dataset Setup</h3>
               </div>
-              <button className="icon-command" onClick={() => setNewProjectOpen(false)} disabled={loading}>
+              <button
+                className="icon-command"
+                onClick={() => {
+                  setNewProjectError("");
+                  setNewProjectOpen(false);
+                }}
+                disabled={loading}
+              >
                 <X size={16} />
               </button>
             </header>
@@ -3213,6 +3244,11 @@ export function App() {
                     <strong>{formatBytes(newProjectFolder.preflight.uncompressed_size_bytes)}</strong>
                     <small>before ZIP</small>
                   </span>
+                </div>
+              )}
+              {newProjectError && (
+                <div className="notice-inline error" role="alert">
+                  {newProjectError}
                 </div>
               )}
               <button className="command primary" disabled={!newProjectFolder || loading}>

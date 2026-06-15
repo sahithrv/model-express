@@ -780,6 +780,16 @@ export function noticeDisplay(notice: Notice) {
       message: "The browser preview cannot reach the Mission Control desktop bridge. Open the Electron app for live project actions.",
     };
   }
+  if (
+    notice.kind === "error" &&
+    ((notice.text.includes("401") && notice.text.includes("missing or invalid API token")) ||
+      (notice.text.includes("MODEL_EXPRESS_API_TOKEN") && notice.text.includes("LAN or tunnel mode")))
+  ) {
+    return {
+      title: "API token required",
+      message: "The backend is in LAN or tunnel mode. Set MODEL_EXPRESS_API_TOKEN in .env.local, or remove the public Modal/tunnel URL for local-only use, then restart the backend and app.",
+    };
+  }
 
   return {
     title: notice.kind === "error" ? "Action needs attention" : "Mission update",

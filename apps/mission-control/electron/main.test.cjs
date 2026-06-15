@@ -50,6 +50,26 @@ test("orchestrator origins and API token headers use explicit env controls", () 
   });
 });
 
+test("mission control request env loads API token from repo env files", () => {
+  const repo = tempDir("mx-repo-env-");
+  fs.writeFileSync(
+    path.join(repo, ".env.local"),
+    "MODEL_EXPRESS_API_TOKEN=file-token\nMODEL_EXPRESS_ALLOWED_ORCHESTRATOR_ORIGINS=https://mx.example.test\n",
+  );
+
+  const env = __test.missionControlEnv({ MODEL_EXPRESS_ROOT: repo });
+
+  assert.equal(env.MODEL_EXPRESS_API_TOKEN, "file-token");
+  assert.deepEqual(__test.apiTokenHeaders(env), {
+    Authorization: "Bearer file-token",
+    "X-Model-Express-API-Token": "file-token",
+  });
+  assert.equal(
+    __test.validateOrchestratorRequest({ baseUrl: "https://mx.example.test", path: "/projects" }, env).url,
+    "https://mx.example.test/projects",
+  );
+});
+
 test("public orchestrator exposure requires LAN auth controls", () => {
   assert.throws(
     () => __test.requireAuthenticatedOrchestratorExposure({ MODEL_EXPRESS_API_TOKEN: "test-token" }),
@@ -90,6 +110,19 @@ test("dataset folder operations require a picker-backed selection token", () => 
     () => __test.resolveDatasetFolderOption({ datasetPath: unselectedRoot }),
     /must be selected/,
   );
+});
+
+test("dataset preflight uses picker-backed selection token path", async () => {
+  __test.selectedDatasetFolders.clear();
+  const selectedRoot = tempDir("mx-dataset-preflight-");
+  fs.writeFileSync(path.join(selectedRoot, "image.jpg"), "x");
+
+  const selected = __test.rememberDatasetFolder(selectedRoot);
+  const preflight = await __test.preflightDatasetFolder({ datasetToken: selected.token });
+
+  assert.equal(preflight.file_count, 1);
+  assert.equal(preflight.uncompressed_size_bytes, 1);
+  assert.equal(preflight.largest_file.path, "image.jpg");
 });
 
 test("dataset upload endpoints reject remote origins unless allowlisted", () => {

@@ -36,11 +36,15 @@ func ResolveOrchestratorListenAddr() (string, error) {
 	if addr == "" {
 		addr = defaultOrchestratorAddr
 	}
+	apiToken := os.Getenv("MODEL_EXPRESS_API_TOKEN")
 	if err := validateOrchestratorListenAddr(
 		addr,
 		envFlag("MODEL_EXPRESS_ALLOW_LAN", false),
-		os.Getenv("MODEL_EXPRESS_API_TOKEN"),
+		apiToken,
 	); err != nil {
+		return "", err
+	}
+	if err := validateOrchestratorExposureConfig(apiToken); err != nil {
 		return "", err
 	}
 	return addr, nil
@@ -59,6 +63,16 @@ func validateOrchestratorListenAddr(addr string, allowLAN bool, apiToken string)
 	}
 	if strings.TrimSpace(apiToken) == "" {
 		return fmt.Errorf("MODEL_EXPRESS_API_TOKEN is required when binding orchestrator to %q", addr)
+	}
+	return nil
+}
+
+func validateOrchestratorExposureConfig(apiToken string) error {
+	if !orchestratorExposedMode() {
+		return nil
+	}
+	if strings.TrimSpace(apiToken) == "" {
+		return fmt.Errorf("MODEL_EXPRESS_API_TOKEN is required when LAN, tunnel, or public Modal orchestrator URL exposure is enabled")
 	}
 	return nil
 }

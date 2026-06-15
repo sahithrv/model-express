@@ -81,7 +81,10 @@ func TestAutomationSettingsPersistAndReload(t *testing.T) {
 func TestResolveOrchestratorListenAddrDefaultsLoopback(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_ORCHESTRATOR_ADDR", "")
 	t.Setenv("MODEL_EXPRESS_ALLOW_LAN", "")
+	t.Setenv("MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE", "")
 	t.Setenv("MODEL_EXPRESS_API_TOKEN", "")
+	t.Setenv("MODAL_ORCHESTRATOR_URL", "")
+	t.Setenv("MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL", "")
 
 	addr, err := ResolveOrchestratorListenAddr()
 	if err != nil {
@@ -104,6 +107,24 @@ func TestResolveOrchestratorListenAddrGuardsLANBind(t *testing.T) {
 	}
 	if err := validateOrchestratorListenAddr("127.0.0.1:8080", false, ""); err != nil {
 		t.Fatalf("expected loopback bind to pass without token: %v", err)
+	}
+}
+
+func TestResolveOrchestratorListenAddrRequiresTokenForPublicTunnelConfig(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_ORCHESTRATOR_ADDR", "")
+	t.Setenv("MODEL_EXPRESS_ALLOW_LAN", "")
+	t.Setenv("MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE", "")
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "")
+	t.Setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.example.test")
+	t.Setenv("MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL", "")
+
+	if _, err := ResolveOrchestratorListenAddr(); err == nil || !strings.Contains(err.Error(), "MODEL_EXPRESS_API_TOKEN") {
+		t.Fatalf("expected public tunnel config to require MODEL_EXPRESS_API_TOKEN, got %v", err)
+	}
+
+	t.Setenv("MODEL_EXPRESS_API_TOKEN", "api-token")
+	if addr, err := ResolveOrchestratorListenAddr(); err != nil || addr != defaultOrchestratorAddr {
+		t.Fatalf("expected token-authenticated public tunnel config to pass, addr=%q err=%v", addr, err)
 	}
 }
 
