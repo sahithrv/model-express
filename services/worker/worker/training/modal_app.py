@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import copy
 import csv
 import contextvars
+import hashlib
 import json
 import os
 import random
@@ -349,6 +351,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     dataset_tier_metadata = _dict_or_empty(execution_metadata.get("dataset_tier"))
     metadata_bundle_metadata = _dict_or_empty(execution_metadata.get("metadata_bundle"))
     dataloader_metadata = _dict_or_empty(execution_metadata.get("dataloader"))
+    effective_preprocessing = _dict_or_empty(_dict_or_empty(execution_metadata.get("preprocessing")).get("effective_config")) or preprocessing
     subset_manifest = dataset_tier_metadata.get("subset_manifest")
     if isinstance(subset_manifest, dict):
         dataset_materialization["subset_manifest"] = subset_manifest
@@ -524,18 +527,26 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         crop_metrics={"accuracy": test_accuracy, "macro_f1": test_macro_f1, "loss": test_loss},
     )
     model_profile = _model_profile(model, model_name, image_size, device, val_loader)
-    demo_images = _demo_images_from_test_examples(test_eval_details, class_names)
+    demo_images = _demo_images_from_test_examples(
+        test_eval_details,
+        class_names,
+        dataset=dataset,
+        job_id=job_id,
+    )
     _modal_training_phase(job_id, "export_start", started_at)
     export_bundle = _export_trained_champion_bundle(
         model=model,
         model_name=model_name,
         class_names=class_names,
         image_size=image_size,
-        preprocessing=preprocessing,
+        preprocessing=effective_preprocessing,
         model_profile=model_profile,
-        training_config=config,
+        training_config={**config, "preprocessing": effective_preprocessing},
         dataset=dataset,
         job_id=job_id,
+        export_self_test_samples=test_eval_details.get("export_self_test_samples")
+        if isinstance(test_eval_details.get("export_self_test_samples"), list)
+        else [],
     )
     _modal_training_phase(job_id, "export_done", started_at, status=export_bundle.get("status", ""))
     runtime_seconds = time.time() - started_at
@@ -555,7 +566,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         ),
         "class_labels": class_names,
         "input_shape": [1, 3, image_size, image_size],
-        "preprocessing": preprocessing,
+        "preprocessing": effective_preprocessing,
         "export_status": export_bundle.get("status", ""),
         "artifact_uri": export_bundle.get("artifact_uri", ""),
         "onnx_artifact_uri": export_bundle.get("onnx_artifact_uri", ""),
@@ -636,6 +647,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "class_balancing": class_balancing,
                 "sampling_strategy": sampling_strategy,
                 "preprocessing": preprocessing,
+                "effective_preprocessing": effective_preprocessing,
                 "worker_execution_metadata": _public_execution_metadata(execution_metadata),
                 "dataset_materialization": dataset_materialization,
                 "bbox_crop_ablation": bbox_ablation,
@@ -2017,6 +2029,10 @@ def _load_image_data(
             "compare_full_image": compare_bbox_crop,
         },
         "metadata_bundle": _metadata_bundle_execution_metadata(metadata_bundle, metadata_spec),
+        "preprocessing": {
+            "effective_config": preprocessing,
+            "dataset_normalization_metadata_applied": normalization_metadata is not None,
+        },
     }
     if requested_bbox_crop:
         bbox_source = "legacy_sidecar"
@@ -3284,9 +3300,13 @@ def _evaluate(
     targets = []
     confidences = []
     sample_paths = _sample_paths_from_loader(loader) if collect_examples else []
+    self_test_samples: list[dict] = []
+    self_test_limit = _export_self_test_sample_limit() if collect_examples else 0
 
     with torch.no_grad():
         for inputs, labels in loader:
+            batch_start = len(predictions)
+            cpu_inputs = inputs.detach().cpu() if collect_examples else None
             inputs = inputs.to(device)
             labels = labels.to(device)
             outputs = model(inputs)
@@ -3302,6 +3322,20 @@ def _evaluate(
             predictions.extend(predicted.cpu().tolist())
             targets.extend(labels.cpu().tolist())
             confidences.extend(batch_confidences.cpu().tolist())
+            if collect_examples and len(self_test_samples) < self_test_limit and cpu_inputs is not None:
+                self_test_samples.extend(
+                    _export_self_test_sample_records(
+                        inputs=cpu_inputs,
+                        logits=outputs.detach().cpu(),
+                        targets=labels.detach().cpu(),
+                        predictions=predicted.detach().cpu(),
+                        probabilities=probabilities.detach().cpu(),
+                        sample_paths=sample_paths,
+                        batch_start=batch_start,
+                        class_names=class_names,
+                        remaining=self_test_limit - len(self_test_samples),
+                    )
+                )
 
     correct = sum(1 for prediction, target in zip(predictions, targets) if prediction == target)
     accuracy = correct / max(len(targets), 1)
@@ -3328,6 +3362,7 @@ def _evaluate(
             sample_paths,
             class_names,
         )
+        details["export_self_test_samples"] = self_test_samples
     return total_loss / max(total_examples, 1), accuracy, float(macro_f1), details
 
 
@@ -3356,16 +3391,103 @@ def _example_prediction_records(
         records.append(
             {
                 "path": sample_paths[index] if index < len(sample_paths) else "",
+                "predicted_class_index": prediction,
+                "true_class_index": target,
                 "predicted_class": class_names[prediction] if prediction < len(class_names) else str(prediction),
                 "true_class": class_names[target] if target < len(class_names) else str(target),
                 "confidence": round(confidence, 6),
                 "correct": prediction == target,
+                "class_label_order_hash": _class_label_order_hash(class_names),
             }
         )
     return records
 
 
-def _demo_images_from_test_examples(eval_details: dict, class_names: list[str], max_total: int = 32) -> list[dict]:
+def _export_self_test_sample_records(
+    *,
+    inputs,
+    logits,
+    targets,
+    predictions,
+    probabilities,
+    sample_paths: list[str],
+    batch_start: int,
+    class_names: list[str],
+    remaining: int,
+) -> list[dict]:
+    import torch
+
+    records: list[dict] = []
+    count = min(max(0, remaining), int(inputs.shape[0]))
+    label_hash = _class_label_order_hash(class_names)
+    for offset in range(count):
+        global_index = batch_start + offset
+        sample_logits = logits[offset].reshape(-1).tolist()
+        sample_probs = probabilities[offset].reshape(-1)
+        top_count = min(5, len(class_names), int(sample_probs.numel()))
+        values, indices = torch.topk(sample_probs, k=top_count)
+        true_index = int(targets[offset].item())
+        predicted_index = int(predictions[offset].item())
+        path = sample_paths[global_index] if global_index < len(sample_paths) else ""
+        records.append(
+            {
+                "sample_id": f"heldout:{Path(path).stem or global_index}",
+                "image_id": Path(path).name if path else "",
+                "image_path": path,
+                "split": "test",
+                "input_tensor": inputs[offset].clone(),
+                "input_tensor_shape": [int(dim) for dim in inputs[offset].shape],
+                "true_index": true_index,
+                "true_label": class_names[true_index] if true_index < len(class_names) else str(true_index),
+                "predicted_index": predicted_index,
+                "predicted_label": class_names[predicted_index] if predicted_index < len(class_names) else str(predicted_index),
+                "pytorch_logits": [float(value) for value in sample_logits],
+                "pytorch_probabilities": [float(value) for value in sample_probs.tolist()],
+                "pytorch_top_k": [
+                    {
+                        "index": int(index),
+                        "label": class_names[int(index)] if int(index) < len(class_names) else str(index),
+                        "probability": round(float(value), 6),
+                    }
+                    for value, index in zip(values.tolist(), indices.tolist())
+                ],
+                "class_label_order_hash": label_hash,
+                "image_metadata": {
+                    "source": "heldout_test",
+                    "demo_source_type": "heldout_test_original_bytes",
+                    "parity_safe": True,
+                },
+            }
+        )
+    return records
+
+
+def _export_self_test_sample_limit() -> int:
+    value = os.getenv("MODEL_EXPRESS_EXPORT_SELF_TEST_SAMPLES", "").strip()
+    if not value:
+        return 3
+    try:
+        parsed = int(value)
+    except ValueError:
+        return 3
+    return max(1, min(parsed, 16))
+
+
+def _class_label_order_hash(class_names: list[str]) -> str:
+    from worker.exporting.self_test import class_label_order_hash
+
+    return class_label_order_hash(class_names)
+
+
+def _demo_images_from_test_examples(
+    eval_details: dict,
+    class_names: list[str],
+    max_total: int = 32,
+    *,
+    dataset: dict | None = None,
+    job_id: str = "",
+    artifact_uploader=None,
+) -> list[dict]:
     records = eval_details.get("example_predictions") if isinstance(eval_details, dict) else []
     if not isinstance(records, list):
         return []
@@ -3381,21 +3503,36 @@ def _demo_images_from_test_examples(eval_details: dict, class_names: list[str], 
             continue
         seen_paths.add(path)
         thumbnail_uri, thumbnail_width, thumbnail_height, thumbnail_bytes = _thumbnail_data_uri(path)
-        original_uri, original_width, original_height, original_bytes, original_error = _original_image_data_uri(path)
-        if not thumbnail_uri and not original_uri:
+        original_width, original_height, original_bytes, original_mime_type, image_format, original_error = _original_image_metadata(path)
+        original_artifact_uri = ""
+        artifact_error = ""
+        if not original_error:
+            original_artifact_uri, artifact_error = _upload_heldout_demo_original_image(
+                path,
+                dataset=dataset,
+                job_id=job_id,
+                image_format=image_format,
+                artifact_uploader=artifact_uploader,
+            )
+        if not thumbnail_uri and not original_artifact_uri:
             continue
         true_label = str(record.get("true_class") or "")
         predicted_label = str(record.get("predicted_class") or "")
-        inference_uri = original_uri or thumbnail_uri
-        parity_safe = bool(original_uri)
+        inference_uri = original_artifact_uri or thumbnail_uri
+        parity_safe = bool(original_artifact_uri)
+        parity_failure_reason = ""
+        if not parity_safe:
+            parity_failure_reason = artifact_error or original_error or "original_image_artifact_unavailable"
         demo_images.append(
             {
                 "id": f"test:{Path(path).stem}",
                 "image_id": Path(path).name,
                 "uri": inference_uri,
                 "image_uri": inference_uri,
-                "preview_uri": thumbnail_uri or original_uri,
+                "preview_uri": thumbnail_uri or original_artifact_uri,
                 "thumbnail_uri": thumbnail_uri,
+                "original_image_uri": original_artifact_uri,
+                "source_artifact_uri": original_artifact_uri,
                 "class_name": true_label,
                 "label": true_label,
                 "true_label": true_label,
@@ -3403,20 +3540,29 @@ def _demo_images_from_test_examples(eval_details: dict, class_names: list[str], 
                 "width": original_width or thumbnail_width,
                 "height": original_height or thumbnail_height,
                 "size_bytes": original_bytes or thumbnail_bytes,
+                "mime_type": original_mime_type,
                 "metadata": {
                     "source": "heldout_test",
-                    "demo_source_type": "heldout_test_original_bytes" if parity_safe else "heldout_test_thumbnail_fallback",
+                    "demo_source_type": "heldout_test_original_artifact" if parity_safe else "heldout_test_thumbnail_fallback",
                     "parity_safe": parity_safe,
                     "parity_status": "ok" if parity_safe else "unsafe",
-                    "parity_failure_reason": "" if parity_safe else original_error or "original_image_unavailable",
+                    "parity_failure_reason": "" if parity_safe else parity_failure_reason,
+                    "original_image_uri": original_artifact_uri,
+                    "source_artifact_uri": original_artifact_uri,
                     "source_path": path,
                     "source_size_bytes": original_bytes,
+                    "source_width": original_width,
+                    "source_height": original_height,
+                    "source_mime_type": original_mime_type,
                     "thumbnail_size_bytes": thumbnail_bytes,
                     "thumbnail_width": thumbnail_width,
                     "thumbnail_height": thumbnail_height,
+                    "true_class_index_at_training": record.get("true_class_index"),
+                    "predicted_class_index_at_training": record.get("predicted_class_index"),
                     "predicted_label_at_training": predicted_label,
                     "confidence_at_training": round(float(record.get("confidence") or 0.0), 6),
                     "correct_at_training": bool(record.get("correct")),
+                    "class_label_order_hash": record.get("class_label_order_hash") or _class_label_order_hash(class_names),
                 },
             }
         )
@@ -3461,17 +3607,17 @@ def _thumbnail_data_uri(path: str, image_size: int = 224, quality: int = 76) -> 
         return "", 0, 0, 0
 
 
-def _original_image_data_uri(path: str) -> tuple[str, int, int, int, str]:
+def _original_image_metadata(path: str) -> tuple[int, int, int, str, str, str]:
     try:
         from PIL import Image
     except Exception as exc:
-        return "", 0, 0, 0, f"pillow_unavailable: {exc}"
+        return 0, 0, 0, "", "", f"pillow_unavailable: {exc}"
 
     source_path = Path(path)
     try:
         size_bytes = source_path.stat().st_size
     except OSError as exc:
-        return "", 0, 0, 0, f"original_image_unavailable: {exc}"
+        return 0, 0, 0, "", "", f"original_image_unavailable: {exc}"
 
     width = 0
     height = 0
@@ -3481,30 +3627,75 @@ def _original_image_data_uri(path: str) -> tuple[str, int, int, int, str]:
             width, height = image.size
             image_format = str(image.format or "")
     except Exception as exc:
-        return "", 0, 0, size_bytes, f"original_image_decode_failed: {exc}"
+        return 0, 0, size_bytes, "", "", f"original_image_decode_failed: {exc}"
 
-    max_bytes = _heldout_demo_max_original_bytes()
-    if max_bytes <= 0:
-        return "", width, height, size_bytes, "original_image_inline_disabled"
-    if size_bytes > max_bytes:
-        return "", width, height, size_bytes, "original_image_exceeds_demo_inline_cap"
-    try:
-        payload = base64.b64encode(source_path.read_bytes()).decode("ascii")
-    except OSError as exc:
-        return "", width, height, size_bytes, f"original_image_read_failed: {exc}"
     mime_type = _image_mime_type(source_path, image_format)
-    return f"data:{mime_type};base64,{payload}", width, height, size_bytes, ""
+    return width, height, size_bytes, mime_type, image_format, ""
 
 
-def _heldout_demo_max_original_bytes() -> int:
-    value = os.getenv("MODEL_EXPRESS_HELDOUT_DEMO_MAX_ORIGINAL_BYTES", "").strip()
-    if not value:
-        return 1_500_000
+def _upload_heldout_demo_original_image(
+    path: str,
+    *,
+    dataset: dict | None,
+    job_id: str,
+    image_format: str,
+    artifact_uploader=None,
+) -> tuple[str, str]:
+    if not isinstance(dataset, dict) or not str(job_id or "").strip():
+        return "", "original_image_artifact_upload_not_configured"
+    source_path = Path(path)
+    if not source_path.exists() or not source_path.is_file():
+        return "", "original_image_unavailable"
+    uploader = artifact_uploader
+    if uploader is None:
+        try:
+            from worker.datasets.storage import upload_file_to_s3_uri as uploader
+        except Exception as exc:
+            return "", f"artifact_uploader_unavailable: {exc}"
     try:
-        parsed = int(value)
-    except ValueError:
-        return 1_500_000
-    return max(0, min(parsed, 8_000_000))
+        remote_base = _artifact_remote_base_uri(dataset, job_id)
+        artifact_name = _heldout_demo_original_artifact_name(source_path, image_format)
+        remote_uri = f"{remote_base}/heldout_demo_images/{artifact_name}"
+        uploader(source_path, remote_uri)
+        return remote_uri, ""
+    except Exception as exc:
+        return "", f"original_image_artifact_upload_failed: {exc}"
+
+
+def _heldout_demo_original_artifact_name(path: Path, image_format: str) -> str:
+    stem = _safe_path_part(path.stem)[:80]
+    digest = _file_sha256_prefix(path)
+    extension = _heldout_demo_image_extension(path, image_format)
+    return f"{stem}-{digest}{extension}"
+
+
+def _file_sha256_prefix(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        digest.update(str(path).encode("utf-8", errors="replace"))
+    return digest.hexdigest()[:16]
+
+
+def _heldout_demo_image_extension(path: Path, image_format: str) -> str:
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        return suffix
+    normalized = str(image_format or "").strip().lower()
+    if normalized in {"jpeg", "jpg"}:
+        return ".jpg"
+    if normalized == "png":
+        return ".png"
+    if normalized == "webp":
+        return ".webp"
+    if normalized in {"tiff", "tif"}:
+        return ".tiff"
+    if normalized == "bmp":
+        return ".bmp"
+    return ".img"
 
 
 def _image_mime_type(path: Path, image_format: str) -> str:
@@ -3658,6 +3849,7 @@ def _export_trained_champion_bundle(
     training_config: dict,
     dataset: dict,
     job_id: str,
+    export_self_test_samples: list[dict] | None = None,
 ) -> dict:
     try:
         from worker.exporting.artifacts import produce_champion_export_artifacts
@@ -3677,6 +3869,7 @@ def _export_trained_champion_bundle(
             model_profile=model_profile,
             training_config=training_config,
             formats=("onnx", "torchscript", "framework_native"),
+            export_self_test_samples=export_self_test_samples,
         )
         remote_base = _artifact_remote_base_uri(dataset, job_id)
         public_manifest, artifact_uris = _upload_manifest_artifacts(manifest, remote_base, upload_file_to_s3_uri)
@@ -3684,9 +3877,12 @@ def _export_trained_champion_bundle(
         onnx_artifact = next((item for item in artifact_uris if item["format"] == "onnx"), None)
         primary_artifact = onnx_artifact or (artifact_uris[0] if artifact_uris else None)
         validation_errors = _artifact_errors(public_manifest)
-        status = "READY" if onnx_artifact else "PENDING_ARTIFACT"
+        validation_errors.extend(_export_self_test_errors(public_manifest))
+        status = "READY" if onnx_artifact and not _export_self_test_failed(public_manifest) else "PENDING_ARTIFACT"
         if not artifact_uris:
             status = "FAILED" if validation_errors else "PENDING_ARTIFACT"
+        elif _export_self_test_failed(public_manifest):
+            status = "FAILED"
         manifest_uri = f"{remote_base}/manifest.json"
         manifest_path = export_dir / "manifest.remote.json"
         manifest_path.write_text(json.dumps(public_manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -3703,6 +3899,26 @@ def _export_trained_champion_bundle(
         }
     except Exception as exc:
         return _export_error("EXPORT_FAILED", str(exc))
+
+
+def _export_self_test_errors(manifest: dict) -> list[str]:
+    try:
+        from worker.exporting.self_test import export_self_test_validation_errors
+    except Exception:
+        return []
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    self_test = metadata.get("export_self_test") if isinstance(metadata.get("export_self_test"), dict) else {}
+    return export_self_test_validation_errors(self_test)
+
+
+def _export_self_test_failed(manifest: dict) -> bool:
+    try:
+        from worker.exporting.self_test import export_self_test_failed
+    except Exception:
+        return False
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    self_test = metadata.get("export_self_test") if isinstance(metadata.get("export_self_test"), dict) else {}
+    return export_self_test_failed(self_test)
 
 
 
@@ -3761,7 +3977,7 @@ def _fallback_latency_ms(model_name: str, image_size: int) -> float:
     return base * max(0.5, (image_size / 224) ** 2)
 
 
-def _post_json(url: str, payload: dict, *, callback_token: str = "") -> None:
+def _post_json(url: str, payload: dict, *, callback_token: str = ""):
     import requests
 
     kwargs = {"json": payload, "timeout": _orchestrator_report_timeout_seconds()}
@@ -3770,14 +3986,14 @@ def _post_json(url: str, payload: dict, *, callback_token: str = "") -> None:
         kwargs["headers"] = {"Authorization": f"Bearer {token}"}
     response = requests.post(url, **kwargs)
     response.raise_for_status()
+    return response
 
 
-def _post_callback_json(url: str, payload: dict, callback_auth_token: str) -> None:
+def _post_callback_json(url: str, payload: dict, callback_auth_token: str):
     token = str(callback_auth_token or "").strip()
     if token:
-        _post_json(url, payload, callback_token=token)
-        return
-    _post_json(url, payload)
+        return _post_json(url, payload, callback_token=token)
+    return _post_json(url, payload)
 
 
 def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> bool:
@@ -3854,11 +4070,174 @@ def _post_training_run_evaluation(
 ) -> None:
     if isinstance(job, dict):
         payload = {**payload, **callback_identity(job, modal_resources)}
-    _post_callback_json(
-        f"{orchestrator_url}/jobs/{job_id}/training-run-evaluation",
+    payload = _compact_training_run_evaluation_payload_if_needed(payload)
+    url = f"{orchestrator_url}/jobs/{job_id}/training-run-evaluation"
+    token = callback_token(job)
+    try:
+        _post_callback_json(url, payload, token)
+        return
+    except Exception as exc:
+        if not _is_payload_too_large_error(exc):
+            raise
+    retry_payload = _compact_training_run_evaluation_payload(
         payload,
-        callback_token(job),
+        reason="http_413",
+        payload_bytes_before=_training_evaluation_payload_size_bytes(payload),
+        soft_limit_bytes=_training_evaluation_payload_soft_limit_bytes(),
     )
+    _post_callback_json(
+        url,
+        retry_payload,
+        token,
+    )
+
+
+def _compact_training_run_evaluation_payload_if_needed(payload: dict) -> dict:
+    payload_bytes = _training_evaluation_payload_size_bytes(payload)
+    soft_limit = _training_evaluation_payload_soft_limit_bytes()
+    if payload_bytes <= soft_limit:
+        return payload
+    return _compact_training_run_evaluation_payload(
+        payload,
+        reason="preflight_size_guard",
+        payload_bytes_before=payload_bytes,
+        soft_limit_bytes=soft_limit,
+    )
+
+
+def _compact_training_run_evaluation_payload(
+    payload: dict,
+    *,
+    reason: str,
+    payload_bytes_before: int,
+    soft_limit_bytes: int,
+) -> dict:
+    compacted = copy.deepcopy(payload)
+    objective = compacted.get("objective_profile")
+    if not isinstance(objective, dict):
+        objective = {}
+        compacted["objective_profile"] = objective
+    images = objective.get("heldout_demo_images")
+    compacted_image_count = 0
+    if isinstance(images, list):
+        compacted_images = []
+        for image in images:
+            compacted_image, changed = _compact_heldout_demo_image_record(image)
+            compacted_images.append(compacted_image)
+            if changed:
+                compacted_image_count += 1
+        objective["heldout_demo_images"] = compacted_images
+    objective["evaluation_payload_compacted_due_to_size"] = True
+    objective["evaluation_payload_soft_limit_bytes"] = soft_limit_bytes
+    diagnostic = {
+        "code": "evaluation_payload_compacted_due_to_size",
+        "reason": reason,
+        "payload_bytes_before": payload_bytes_before,
+        "payload_bytes_after": 0,
+        "soft_limit_bytes": soft_limit_bytes,
+        "heldout_demo_image_count": len(images) if isinstance(images, list) else 0,
+        "compacted_image_count": compacted_image_count,
+    }
+    _append_evaluation_payload_diagnostic(objective, diagnostic)
+    payload_bytes_after = _training_evaluation_payload_size_bytes(compacted)
+    objective["evaluation_payload_size_bytes"] = payload_bytes_after
+    diagnostic["payload_bytes_after"] = payload_bytes_after
+    return compacted
+
+
+def _compact_heldout_demo_image_record(image) -> tuple[dict, bool]:
+    if not isinstance(image, dict):
+        return image, False
+    record = copy.deepcopy(image)
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    metadata = copy.deepcopy(metadata)
+    changed = False
+    original_uri = _heldout_original_artifact_uri(record, metadata)
+    preview_uri = _string_value(record.get("preview_uri"))
+    thumbnail_uri = _string_value(record.get("thumbnail_uri")) or preview_uri
+    compact_uri = original_uri or thumbnail_uri or preview_uri
+    for key in ("uri", "image_uri"):
+        value = _string_value(record.get(key))
+        if _is_inline_image_data_uri(value) and value != thumbnail_uri and value != preview_uri:
+            record[key] = compact_uri
+            changed = True
+        elif _is_inline_image_data_uri(value) and original_uri:
+            record[key] = original_uri
+            changed = True
+    for key in ("original_image_data_uri", "source_image_data_uri", "image_bytes", "base64_image"):
+        if _is_inline_image_data_uri(_string_value(record.get(key))):
+            record.pop(key, None)
+            changed = True
+        if _is_inline_image_data_uri(_string_value(metadata.get(key))):
+            metadata.pop(key, None)
+            changed = True
+    if original_uri:
+        for key in ("original_image_uri", "source_artifact_uri"):
+            if _string_value(record.get(key)) != original_uri:
+                record[key] = original_uri
+                changed = True
+            if _string_value(metadata.get(key)) != original_uri:
+                metadata[key] = original_uri
+                changed = True
+    if metadata:
+        record["metadata"] = metadata
+    return record, changed
+
+
+def _heldout_original_artifact_uri(record: dict, metadata: dict) -> str:
+    for source in (record, metadata):
+        for key in ("original_image_uri", "source_artifact_uri"):
+            value = _string_value(source.get(key))
+            if value and not _is_inline_image_data_uri(value):
+                return value
+    for source in (record, metadata):
+        for key in ("uri", "image_uri"):
+            value = _string_value(source.get(key))
+            if value and not _is_inline_image_data_uri(value):
+                return value
+    return ""
+
+
+def _append_evaluation_payload_diagnostic(objective: dict, diagnostic: dict) -> None:
+    diagnostics = objective.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        diagnostics = []
+    diagnostics.append(diagnostic)
+    objective["diagnostics"] = diagnostics
+
+
+def _training_evaluation_payload_size_bytes(payload: dict) -> int:
+    try:
+        return len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _training_evaluation_payload_soft_limit_bytes() -> int:
+    value = os.getenv("MODEL_EXPRESS_TRAINING_EVALUATION_PAYLOAD_SOFT_LIMIT_BYTES", "").strip()
+    if not value:
+        return 1_500_000
+    try:
+        parsed = int(value)
+    except ValueError:
+        return 1_500_000
+    return max(64_000, min(parsed, 1_900_000))
+
+
+def _is_payload_too_large_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 413:
+        return True
+    message = str(exc).lower()
+    return "413" in message or "payload too large" in message or "request entity too large" in message
+
+
+def _is_inline_image_data_uri(value: str) -> bool:
+    return str(value or "").strip().lower().startswith("data:image/")
+
+
+def _string_value(value) -> str:
+    return str(value or "").strip()
 
 
 

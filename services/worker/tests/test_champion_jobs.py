@@ -374,6 +374,35 @@ class ChampionJobTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(path.suffix, ".png")
 
+    def test_demo_image_path_prefers_original_artifact_over_thumbnail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloaded = []
+            original_uri = "s3://bucket/model-express/artifacts/job_1/heldout_demo_images/cat.png"
+            thumbnail_uri = "data:image/jpeg;base64,BBBB"
+
+            def fake_download(storage_uri: str, destination: Path) -> Path:
+                downloaded.append((storage_uri, destination))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"original image bytes")
+                return destination
+
+            with (
+                patch("worker.champion_jobs.download_s3_uri", fake_download),
+                patch.dict("os.environ", {"WORKER_DEMO_IMAGE_ROOT": str(Path(temp_dir) / "demo_images")}),
+            ):
+                path, error = _demo_image_path(
+                    {
+                        "image_uri": thumbnail_uri,
+                        "image_metadata": {"source_artifact_uri": original_uri},
+                    },
+                    "job_predict",
+                )
+
+            self.assertEqual(error, "")
+            self.assertIsNotNone(path)
+            self.assertEqual(downloaded[0][0], original_uri)
+            self.assertTrue(path.exists())
+
     def test_dispatch_rejects_unknown_templates_instead_of_faking_success(self) -> None:
         client = FakeClient()
         with self.assertRaises(ValueError):

@@ -38,6 +38,7 @@ import {
   isLocalInferenceUnsafeError,
   LocalInferenceUnsafeError,
   predictChampionImage,
+  readyBrowserONNXExport,
   readyONNXExport,
   type ChampionLocalRuntime,
 } from "./championLocalInference";
@@ -1229,14 +1230,19 @@ export function App() {
   }, [championExportDemo.demoImages]);
 
   useEffect(() => {
-    if (readyONNXExport(championExportDemo.exports)) {
+    if (
+      readyBrowserONNXExport(championExportDemo.exports, {
+        deploymentProfile: championExportDemo.deploymentProfile,
+        modelProfile: championExportDemo.modelProfile,
+      })
+    ) {
       setLocalInferenceStatus((status) => (status === "not_ready" ? "available" : status));
     } else {
       localRuntime.current = null;
       setLocalInferenceStatus("not_ready");
       setLocalInferenceError("");
     }
-  }, [championExportDemo.exports]);
+  }, [championExportDemo.deploymentProfile, championExportDemo.exports, championExportDemo.modelProfile]);
 
   useEffect(() => {
     if (!championDetectionDefaults.isDetection) return;
@@ -1706,9 +1712,12 @@ export function App() {
   }
 
   async function ensureChampionLocalRuntime() {
-    const exportRecord = readyONNXExport(championExportDemo.exports);
+    const exportRecord = readyBrowserONNXExport(championExportDemo.exports, {
+      deploymentProfile: championExportDemo.deploymentProfile,
+      modelProfile: championExportDemo.modelProfile,
+    });
     if (!exportRecord) {
-      throw new Error("No READY ONNX export is available for local UI inference.");
+      throw new LocalInferenceUnsafeError("EXPORT_SELF_TEST_NOT_VERIFIED", "No browser-safe ONNX export is available for local UI inference.");
     }
     const artifactURI = exportRecord.artifact_uri || exportRecord.model_uri || exportRecord.download_url || "";
     if (!artifactURI) {
@@ -1762,7 +1771,12 @@ export function App() {
     setDemoPredictionError("");
     setDemoPredictionLoading(true);
     try {
-      if (readyONNXExport(championExportDemo.exports)) {
+      if (
+        readyBrowserONNXExport(championExportDemo.exports, {
+          deploymentProfile: championExportDemo.deploymentProfile,
+          modelProfile: championExportDemo.modelProfile,
+        })
+      ) {
         try {
           await runChampionLocalPrediction(image);
           return;

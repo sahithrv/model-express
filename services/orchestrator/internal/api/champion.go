@@ -52,6 +52,7 @@ type createChampionFeedbackRequest struct {
 type championExportResultRequest struct {
 	Status            string         `json:"status"`
 	ArtifactURI       string         `json:"artifact_uri"`
+	ManifestURI       string         `json:"manifest_uri"`
 	Metadata          map[string]any `json:"metadata"`
 	ValidationErrors  []string       `json:"validation_errors"`
 	Error             string         `json:"error"`
@@ -685,6 +686,11 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 			}
 		}
 	}
+	backendImageURI := championDemoInferenceImageURI(imageURI, imageMetadata)
+	if backendImageURI != imageURI {
+		imageMetadata["requested_image_uri"] = imageURI
+		imageMetadata["backend_image_uri"] = backendImageURI
+	}
 
 	prediction, err := s.store.CreateChampionDemoPrediction(runs.ChampionDemoPredictionCreate{
 		ProjectID:     champion.ProjectID,
@@ -715,7 +721,7 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 			"export_artifact_uri":    readyExport.ArtifactURI,
 			"manifest_path":          championExportManifestPath(readyExport.Metadata),
 			"export_metadata":        readyExport.Metadata,
-			"image_uri":              imageURI,
+			"image_uri":              backendImageURI,
 			"image_id":               imageID,
 			"true_label":             trueLabel,
 			"image_metadata":         imageMetadata,
@@ -997,6 +1003,7 @@ func (s *Server) reportChampionExportResult(c *gin.Context) {
 		writeStoreError(c, fmt.Errorf("%w: artifact_uri is required for READY export result", store.ErrInvalidRequest))
 		return
 	}
+	req.Metadata = championExportResultMetadata(req)
 	existingExport, err := s.findProjectChampionExport(job.ProjectID, exportID)
 	if err != nil {
 		writeStoreError(c, err)
@@ -1075,6 +1082,9 @@ func validateChampionExportReadyResult(job jobs.ExperimentJob, export runs.Champ
 	if !championExportManifestHasProvenance(manifest, job.ID, export.ID) {
 		return fmt.Errorf("%w: worker export manifest provenance does not match the export job", store.ErrInvalidRequest)
 	}
+	if championExportManifestSelfTestFailed(manifest) {
+		return fmt.Errorf("%w: worker export manifest ONNX self-test failed", store.ErrInvalidRequest)
+	}
 	return nil
 }
 
@@ -1096,11 +1106,32 @@ func championExportManifestHasCreatedArtifact(manifest map[string]any, format st
 			payloadString(artifact, "artifact_format"),
 		)))
 		if artifactFormat == "" || artifactFormat == strings.ToLower(strings.TrimSpace(format)) ||
-			(format == "pytorch" && artifactFormat == "framework_native") {
+			(format == "pytorch" && (artifactFormat == "framework_native" || artifactFormat == "framework_native_checkpoint")) {
 			return true
 		}
 	}
 	return false
+}
+
+func championExportResultMetadata(req championExportResultRequest) map[string]any {
+	metadata := copyPayloadMap(req.Metadata)
+	manifestURI := strings.TrimSpace(req.ManifestURI)
+	if manifestURI != "" {
+		if _, ok := metadata["manifest_uri"]; !ok {
+			metadata["manifest_uri"] = manifestURI
+		}
+		if _, ok := metadata["export_manifest_uri"]; !ok {
+			metadata["export_manifest_uri"] = manifestURI
+		}
+	}
+	return metadata
+}
+
+func championExportManifestSelfTestFailed(manifest map[string]any) bool {
+	metadata := payloadMap(manifest, "metadata")
+	selfTest := payloadMap(metadata, "export_self_test")
+	status := strings.ToLower(strings.TrimSpace(payloadString(selfTest, "status")))
+	return status == "failed"
 }
 
 func championExportManifestHasProvenance(manifest map[string]any, exportJobID string, exportID string) bool {
@@ -1245,7 +1276,7 @@ func championDemoImageMetadata(profile map[string]any, imageURI string) (string,
 	for _, key := range []string{"heldout_demo_images", "demo_images", "test_images", "visual_exemplars", "exemplars"} {
 		for _, entry := range profileEntries(profile[key]) {
 			exemplar, ok := visualExemplarFromProfileEntry(entry)
-			if !ok || strings.TrimSpace(exemplar.URI) != imageURI {
+			if !ok || !championDemoImageURIMatches(exemplar, imageURI) {
 				continue
 			}
 			trueLabel := exemplar.Label
@@ -1284,6 +1315,35 @@ func championDemoImageMetadata(profile map[string]any, imageURI string) (string,
 		}
 	}
 	return "", "", nil, false
+}
+
+func championDemoImageURIMatches(exemplar datasets.VisualExemplar, imageURI string) bool {
+	imageURI = strings.TrimSpace(imageURI)
+	for _, candidate := range championDemoImageURICandidates(exemplar) {
+		if strings.TrimSpace(candidate) == imageURI {
+			return true
+		}
+	}
+	return false
+}
+
+func championDemoImageURICandidates(exemplar datasets.VisualExemplar) []string {
+	candidates := []string{exemplar.URI}
+	for _, key := range []string{"image_uri", "uri", "preview_uri", "thumbnail_uri", "original_image_uri", "source_artifact_uri"} {
+		if value := firstString(exemplar.Metadata, key); value != "" {
+			candidates = append(candidates, value)
+		}
+	}
+	return candidates
+}
+
+func championDemoInferenceImageURI(requestedImageURI string, metadata map[string]any) string {
+	for _, key := range []string{"original_image_uri", "source_artifact_uri"} {
+		if uri := strings.TrimSpace(firstString(metadata, key)); uri != "" {
+			return uri
+		}
+	}
+	return requestedImageURI
 }
 
 func normalizeChampionExportFormat(format string) string {

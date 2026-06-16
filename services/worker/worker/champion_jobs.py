@@ -25,6 +25,7 @@ from worker.exporting.artifacts import (
     validate_controlled_artifact_path,
 )
 from worker.exporting.inference import run_demo_inference_from_manifest
+from worker.exporting.self_test import export_self_test_failed, export_self_test_validation_errors
 from worker.orchestrator_client import OrchestratorClient
 
 SUPPORTED_EXPORT_FORMATS = {"onnx", "torchscript", "pytorch", "safetensors"}
@@ -157,7 +158,10 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
         manifest = _error_manifest(export_dir, requested_format, validation_errors, status="pending_dependencies", provenance=provenance)
 
     created_artifacts = _created_artifacts(manifest)
-    if created_artifacts:
+    validation_errors.extend(_manifest_export_self_test_errors(manifest))
+    if _manifest_export_self_test_failed(manifest):
+        status = "FAILED"
+    elif created_artifacts:
         status = "READY"
     elif validation_errors and requested_format == "safetensors":
         status = "PENDING_ARTIFACT"
@@ -877,7 +881,12 @@ def _apply_transfer_strategy(model, head_name: str, freeze_backbone: bool, fine_
 
 
 def _demo_image_path(config: dict, job_id: str) -> tuple[Path | None, str]:
-    value = _first_string(config, "local_image_path", "image_path", "image_uri")
+    image_metadata = config.get("image_metadata") if isinstance(config.get("image_metadata"), dict) else {}
+    value = _first_string(config, "original_image_uri", "source_artifact_uri")
+    if not value:
+        value = _first_string(image_metadata, "original_image_uri", "source_artifact_uri")
+    if not value:
+        value = _first_string(config, "local_image_path", "image_path", "image_uri")
     if not value:
         return None, "image_uri or local_image_path is required"
     if value.startswith("data:image/"):
@@ -1096,6 +1105,18 @@ def _artifact_errors(manifest: dict) -> list[str]:
         error = str(artifact.get("error", "artifact was not created"))
         errors.append(f"{error_code}: {error}")
     return errors
+
+
+def _manifest_export_self_test_errors(manifest: dict) -> list[str]:
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    self_test = metadata.get("export_self_test") if isinstance(metadata.get("export_self_test"), dict) else {}
+    return export_self_test_validation_errors(self_test)
+
+
+def _manifest_export_self_test_failed(manifest: dict) -> bool:
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    self_test = metadata.get("export_self_test") if isinstance(metadata.get("export_self_test"), dict) else {}
+    return export_self_test_failed(self_test)
 
 
 def _error_manifest(

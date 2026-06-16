@@ -185,6 +185,65 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual([call["json"]["training_attempt_id"] for call in calls], ["job_1:attempt-2"] * 3)
         self.assertTrue(all(call["headers"] == {"Authorization": "Bearer callback-secret"} for call in calls))
 
+    def test_training_run_evaluation_retries_compacted_payload_after_413(self) -> None:
+        calls = []
+
+        class Response:
+            def __init__(self, status_code: int) -> None:
+                self.status_code = status_code
+
+            def raise_for_status(self) -> None:
+                if self.status_code == 413:
+                    exc = RuntimeError("413 Payload Too Large")
+                    exc.response = self
+                    raise exc
+
+        def fake_post(url: str, *, json: dict, timeout: int, headers: dict | None = None):
+            calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
+            return Response(413 if len(calls) == 1 else 200)
+
+        original = "data:image/png;base64," + ("A" * 200_000)
+        thumbnail = "data:image/jpeg;base64," + ("B" * 1_000)
+        payload = {
+            "objective_profile": {
+                "heldout_demo_images": [
+                    {
+                        "uri": original,
+                        "image_uri": original,
+                        "preview_uri": thumbnail,
+                        "thumbnail_uri": thumbnail,
+                        "original_image_uri": "s3://bucket/model-express/artifacts/job_1/heldout_demo_images/cat.png",
+                        "metadata": {
+                            "source_artifact_uri": "s3://bucket/model-express/artifacts/job_1/heldout_demo_images/cat.png",
+                            "parity_safe": True,
+                        },
+                    }
+                ]
+            }
+        }
+
+        with patch("requests.post", fake_post):
+            self.modal_app._post_training_run_evaluation(
+                "https://orchestrator.test",
+                "job_1",
+                payload,
+                job={
+                    "id": "job_1",
+                    "config": {
+                        "active_attempt_id": "job_1:attempt-2",
+                        "callback_token": "callback-secret",
+                    },
+                },
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0]["json"]["objective_profile"]["heldout_demo_images"][0]["image_uri"].startswith("data:image/png"))
+        retry_image = calls[1]["json"]["objective_profile"]["heldout_demo_images"][0]
+        self.assertEqual(retry_image["image_uri"], "s3://bucket/model-express/artifacts/job_1/heldout_demo_images/cat.png")
+        self.assertTrue(retry_image["thumbnail_uri"].startswith("data:image/jpeg;base64,"))
+        diagnostics = calls[1]["json"]["objective_profile"]["diagnostics"]
+        self.assertEqual(diagnostics[-1]["code"], "evaluation_payload_compacted_due_to_size")
+
     def test_modal_failure_callback_uses_callback_token_and_active_attempt(self) -> None:
         calls = []
 

@@ -743,12 +743,25 @@ func visualExemplarFromProfileEntry(entry any) (datasets.VisualExemplar, bool) {
 	if err := json.Unmarshal(blob, &exemplar); err != nil {
 		return datasets.VisualExemplar{}, false
 	}
+	raw := map[string]any{}
+	_ = json.Unmarshal(blob, &raw)
 	if exemplar.URI == "" {
-		var raw map[string]any
-		if err := json.Unmarshal(blob, &raw); err == nil {
+		if len(raw) > 0 {
 			exemplar.URI = firstString(raw, "image_uri", "url", "path", "storage_uri")
 			if exemplar.ClassName == "" {
 				exemplar.ClassName = firstString(raw, "class", "class_name", "label")
+			}
+		}
+	}
+	if len(raw) > 0 {
+		if exemplar.Metadata == nil {
+			exemplar.Metadata = map[string]any{}
+		}
+		for _, key := range []string{"image_uri", "preview_uri", "thumbnail_uri", "original_image_uri", "source_artifact_uri"} {
+			if value := strings.TrimSpace(firstString(raw, key)); value != "" {
+				if _, exists := exemplar.Metadata[key]; !exists {
+					exemplar.Metadata[key] = value
+				}
 			}
 		}
 	}

@@ -9,6 +9,12 @@ from urllib.parse import unquote, urlparse
 
 from worker.exporting.metadata import build_champion_export_metadata
 from worker.exporting.preprocessing import benchmark_preprocessing_latency
+from worker.exporting.self_test import (
+    export_self_test_failed,
+    export_self_test_validation_errors,
+    export_self_test_warning,
+    run_onnx_pytorch_self_test,
+)
 
 MANIFEST_SCHEMA_VERSION = "champion_export_manifest_v1"
 PROVENANCE_SCHEMA_VERSION = "worker_artifact_provenance_v1"
@@ -104,6 +110,8 @@ def produce_champion_export_artifacts(
     sample_input_shape: Iterable[int] | None = None,
     provenance: dict | None = None,
     validation_errors: Iterable[str] | None = None,
+    export_self_test_samples: Iterable[dict] | None = None,
+    export_self_test_tolerance: dict | None = None,
 ) -> dict:
     """Create worker-owned export artifacts without touching backend records."""
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -134,11 +142,28 @@ def produce_champion_export_artifacts(
     if "onnx" in requested_formats:
         artifacts.append(_write_onnx(export_dir, model, input_shape, provenance=provenance))
 
+    onnx_artifact = _created_artifact_for_format(artifacts, "onnx")
+    if onnx_artifact is not None:
+        self_test = run_onnx_pytorch_self_test(
+            model=model,
+            onnx_path=Path(str(onnx_artifact.get("path") or "")),
+            metadata=metadata,
+            samples=export_self_test_samples,
+            tolerance=export_self_test_tolerance,
+        )
+        metadata["export_self_test"] = self_test
+        metadata["export_status"] = _export_status_from_self_test(metadata.get("runtime"), self_test)
+        self_test_errors = export_self_test_validation_errors(self_test)
+        if self_test_errors:
+            metadata["provenance"]["validation_errors"] = list(
+                dict.fromkeys([*metadata["provenance"].get("validation_errors", []), *self_test_errors])
+            )
+
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "metadata": metadata,
         "artifacts": artifacts,
-        "status": _overall_status(artifacts),
+        "status": _manifest_status(artifacts, metadata.get("export_self_test")),
     }
     manifest_path = export_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -551,6 +576,49 @@ def _overall_status(artifacts: list[dict]) -> str:
     if any(artifact.get("status") == "failed" for artifact in artifacts):
         return "failed"
     return "pending_dependencies"
+
+
+def _manifest_status(artifacts: list[dict], self_test: object) -> str:
+    status = _overall_status(artifacts)
+    if status != "created" or not isinstance(self_test, dict):
+        return status
+    if export_self_test_failed(self_test):
+        return "failed_validation"
+    if export_self_test_warning(self_test):
+        return "created_with_warnings"
+    return status
+
+
+def _created_artifact_for_format(artifacts: list[dict], format_name: str) -> dict | None:
+    for artifact in artifacts:
+        if (
+            isinstance(artifact, dict)
+            and artifact.get("format") == format_name
+            and artifact.get("status") == "created"
+            and artifact.get("path")
+        ):
+            return artifact
+    return None
+
+
+def _export_status_from_self_test(runtime: object, self_test: dict) -> dict:
+    status = str(self_test.get("status") or "not_run")
+    if status == "passed":
+        export_status = "self_test_passed"
+    elif status == "failed":
+        export_status = "self_test_failed"
+    elif status == "warning":
+        export_status = "self_test_warning"
+    else:
+        export_status = "self_test_not_run"
+    return {
+        "schema_version": "champion_export_status_v1",
+        "status": export_status,
+        "runtime": str(runtime or "onnx"),
+        "self_test_status": status,
+        "export_verified": bool(self_test.get("export_verified")),
+        "diagnostic_reason": str(self_test.get("diagnostic_reason") or ""),
+    }
 
 
 def _input_shape(sample_input_shape: Iterable[int] | None, image_size: int) -> list[int]:

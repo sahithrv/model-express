@@ -37,6 +37,13 @@ export type ChampionLocalRuntimeContext = {
   modelProfile?: Record<string, unknown>;
 };
 
+export type ChampionLocalInferenceSafety = {
+  safe: boolean;
+  code: string;
+  message: string;
+  selfTestStatus: string;
+};
+
 type ChampionModelArtifact = {
   artifact_uri: string;
   bytes: ArrayBuffer;
@@ -77,10 +84,79 @@ export function readyONNXExport(exports: ChampionExport[]) {
   });
 }
 
+export function readyBrowserONNXExport(
+  exports: ChampionExport[],
+  context?: Omit<Partial<ChampionLocalRuntimeContext>, "exportRecord">,
+) {
+  return exports.find((item) => {
+    const status = String(item.status || "").toUpperCase();
+    const format = String(item.format || "").toLowerCase();
+    const uri = item.artifact_uri || item.model_uri || item.download_url || "";
+    return (
+      status === "READY" &&
+      format === "onnx" &&
+      uri.toLowerCase().includes(".onnx") &&
+      championLocalInferenceSafety(item, {
+        deploymentProfile: context?.deploymentProfile,
+        modelProfile: context?.modelProfile,
+      }).safe
+    );
+  });
+}
+
+export function championLocalInferenceSafety(
+  exportRecord: ChampionExport | null | undefined,
+  context?: Partial<ChampionLocalRuntimeContext>,
+): ChampionLocalInferenceSafety {
+  if (!exportRecord) {
+    return unsafe("EXPORT_UNAVAILABLE", "No ONNX export is available for browser inference.", "");
+  }
+  const metadata = exportMetadata({
+    exportRecord,
+    deploymentProfile: context?.deploymentProfile,
+    modelProfile: context?.modelProfile,
+  });
+  const selfTest = recordObject(metadata.export_self_test);
+  const selfTestStatus = String(selfTest.status || "").toLowerCase();
+  if (selfTestStatus !== "passed") {
+    if (selfTestStatus === "failed") {
+      return unsafe("EXPORT_SELF_TEST_FAILED", "Browser inference refused this ONNX export because export-time PyTorch parity failed.", selfTestStatus);
+    }
+    if (selfTestStatus === "warning") {
+      return unsafe("EXPORT_SELF_TEST_WARNING", "Browser inference refused this ONNX export because export-time parity has warnings.", selfTestStatus);
+    }
+    return unsafe("EXPORT_SELF_TEST_NOT_VERIFIED", "Browser inference requires a passed ONNX-vs-PyTorch held-out self-test.", selfTestStatus || "missing");
+  }
+  const labels = classLabels(metadata, context?.modelProfile, context?.deploymentProfile);
+  if (labels.length === 0) {
+    return unsafe("CLASS_LABELS_UNAVAILABLE", "The ONNX export manifest does not include class labels.", selfTestStatus);
+  }
+  if (new Set(labels).size !== labels.length) {
+    return unsafe("CLASS_LABEL_ORDER_INVALID", "The ONNX export manifest contains duplicate class labels.", selfTestStatus);
+  }
+  const shape = modelTensorShape(metadata);
+  if (!shape || shape.length !== 4 || shape[0] !== 1 || shape[1] !== 3 || shape[2] !== shape[3]) {
+    return unsafe("INPUT_SHAPE_UNSUPPORTED", "Browser inference requires a static NCHW square image tensor contract.", selfTestStatus);
+  }
+  if (bboxCropRequestedFromMetadata(metadata)) {
+    return unsafe("LOCAL_PREPROCESSING_UNSUPPORTED", "Browser inference cannot apply bbox-crop preprocessing safely.", selfTestStatus);
+  }
+  return {
+    safe: true,
+    code: "LOCAL_INFERENCE_SAFE",
+    message: "Browser ONNX inference is guarded by a passed export self-test.",
+    selfTestStatus,
+  };
+}
+
 export async function createChampionLocalRuntime(
   artifact: ChampionModelArtifact,
   context: ChampionLocalRuntimeContext,
 ): Promise<ChampionLocalRuntime> {
+  const safety = championLocalInferenceSafety(context.exportRecord, context);
+  if (!safety.safe) {
+    throw new LocalInferenceUnsafeError(safety.code, safety.message);
+  }
   ort.env.wasm.numThreads = 1;
   const externalData = (artifact.external_data ?? [])
     .filter((item) => item.path && item.bytes)
@@ -254,8 +330,8 @@ function classLabels(...records: Array<Record<string, unknown> | undefined>) {
 }
 
 function inputImageSize(metadata: Record<string, unknown>, modelProfile?: Record<string, unknown>) {
-  const shape = metadata.input_shape;
-  if (Array.isArray(shape) && shape.length >= 4) {
+  const shape = modelTensorShape(metadata);
+  if (shape && shape.length >= 4) {
     const parsed = Number(shape[shape.length - 1]);
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
@@ -373,18 +449,54 @@ function drawImageForRuntime(context: CanvasRenderingContext2D, image: HTMLImage
 
 function preprocessingConfig(metadata: Record<string, unknown>) {
   const direct = recordObject(metadata.preprocessing);
+  const standaloneContract = recordObject(metadata.preprocessing_contract);
+  const standaloneContractConfig = recordObject(standaloneContract.config);
   const contract = recordObject(metadata.inference_contract);
   const contractPreprocessing = recordObject(contract.preprocessing);
   const contractConfig = recordObject(contractPreprocessing.config);
   return {
     ...direct,
+    ...standaloneContract,
+    ...standaloneContractConfig,
+    ...contractPreprocessing,
     ...contractConfig,
   };
+}
+
+function modelTensorShape(metadata: Record<string, unknown>) {
+  const direct = metadata.input_shape;
+  if (Array.isArray(direct) && direct.length === 4) {
+    const parsed = direct.map((item) => Number(item));
+    if (parsed.every((item) => Number.isFinite(item) && item > 0)) return parsed;
+  }
+  const contract = recordObject(metadata.inference_contract);
+  const input = recordObject(contract.input);
+  const shape = input.model_tensor_shape;
+  if (Array.isArray(shape) && shape.length === 4) {
+    const parsed = shape.map((item) => Number(item));
+    if (parsed.every((item) => Number.isFinite(item) && item > 0)) return parsed;
+  }
+  return null;
+}
+
+function bboxCropRequestedFromMetadata(metadata: Record<string, unknown>) {
+  const standaloneContract = recordObject(metadata.preprocessing_contract);
+  const contract = recordObject(metadata.inference_contract);
+  const contractPreprocessing = recordObject(contract.preprocessing);
+  return [
+    metadata.preprocessing,
+    standaloneContract,
+    standaloneContract.config,
+    contractPreprocessing,
+    contractPreprocessing.config,
+    preprocessingConfig(metadata),
+  ].some(bboxCropRequestedFromConfig);
 }
 
 function assertLocalInferenceParitySafe(runtime: ChampionLocalRuntime, image: ChampionDemoImage, imageSource: string) {
   const metadata = recordObject(image.metadata);
   const sourceType = String(metadata.demo_source_type || metadata.source || "").toLowerCase();
+  const originalArtifactURI = originalImageURI(image);
   if (bboxCropRequested(runtime)) {
     throw new LocalInferenceUnsafeError(
       "LOCAL_PREPROCESSING_UNSUPPORTED",
@@ -395,6 +507,18 @@ function assertLocalInferenceParitySafe(runtime: ChampionLocalRuntime, image: Ch
     throw new LocalInferenceUnsafeError(
       "DEMO_IMAGE_NOT_PARITY_SAFE",
       String(metadata.parity_failure_reason || "The selected held-out image is a thumbnail or non-parity-safe derivative."),
+    );
+  }
+  if (originalArtifactURI.startsWith("s3://")) {
+    throw new LocalInferenceUnsafeError(
+      "LOCAL_ORIGINAL_ARTIFACT_UNAVAILABLE",
+      "Held-out demo inference requires original image bytes stored in artifact storage; backend demo inference is required for parity.",
+    );
+  }
+  if (originalArtifactURI && imageSource !== originalArtifactURI && sourceType.includes("heldout_test")) {
+    throw new LocalInferenceUnsafeError(
+      "ORIGINAL_BYTES_REQUIRED",
+      "Local browser inference cannot prove it is using the original held-out image bytes.",
     );
   }
   if (sourceType === "heldout_test" && metadata.parity_safe !== true) {
@@ -425,9 +549,19 @@ function assertLocalInferenceParitySafe(runtime: ChampionLocalRuntime, image: Ch
 }
 
 function bboxCropRequested(runtime: ChampionLocalRuntime) {
-  const preprocessing = preprocessingConfig(runtime.metadata);
-  const resize = String(preprocessing.resize_strategy || runtime.resizeStrategy || "").toLowerCase();
-  const crop = String(preprocessing.crop_strategy || runtime.cropStrategy || "").toLowerCase();
+  return (
+    bboxCropRequestedFromMetadata(runtime.metadata) ||
+    bboxCropRequestedFromConfig({
+      resize_strategy: runtime.resizeStrategy,
+      crop_strategy: runtime.cropStrategy,
+    })
+  );
+}
+
+function bboxCropRequestedFromConfig(value: unknown) {
+  const preprocessing = recordObject(value);
+  const resize = String(preprocessing.resize_strategy || "").toLowerCase();
+  const crop = String(preprocessing.crop_strategy || "").toLowerCase();
   const bboxMode = String(preprocessing.bbox_mode || "").toLowerCase();
   return (
     resize === "bbox_crop_if_available" ||
@@ -439,6 +573,7 @@ function bboxCropRequested(runtime: ChampionLocalRuntime) {
 }
 
 function localImageSourceKind(image: ChampionDemoImage, imageSource: string) {
+  if (imageSource === originalImageURI(image)) return "original_artifact";
   if (imageSource === image.thumbnail_uri) return "thumbnail";
   if (imageSource === image.preview_uri) return "preview";
   if (imageSource === image.uri || imageSource === image.image_uri) return "original_or_worker_uri";
@@ -790,6 +925,15 @@ function demoImageLabel(image?: ChampionDemoImage | null) {
   return image?.true_label || image?.label || image?.class_name || "";
 }
 
+function originalImageURI(image?: ChampionDemoImage | null) {
+  const metadata = recordObject(image?.metadata);
+  return String(image?.original_image_uri || image?.source_artifact_uri || metadata.original_image_uri || metadata.source_artifact_uri || "").trim();
+}
+
 function recordObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function unsafe(code: string, message: string, selfTestStatus: string): ChampionLocalInferenceSafety {
+  return { safe: false, code, message, selfTestStatus };
 }

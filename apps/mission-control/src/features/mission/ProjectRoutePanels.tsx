@@ -34,7 +34,7 @@ import {
   X,
 } from "lucide-react";
 
-import { readyONNXExport, type ChampionLocalRuntime } from "../../championLocalInference";
+import { championLocalInferenceSafety, readyONNXExport, type ChampionLocalRuntime } from "../../championLocalInference";
 import { activityFilters } from "../activity/activityFilters";
 import { exportWaitingSteps } from "../exportDemo/exportWaitingSteps";
 import { resultsEmptySteps } from "../results/resultsEmptySteps";
@@ -2778,39 +2778,48 @@ export function ChampionExportDemoPanel({
           </div>
           {data.exports.length > 0 ? (
             <div className="export-record-list">
-              {data.exports.slice(0, 4).map((exportRecord, index) => (
-                <div
-                  className={`export-record ${statusToneClass(exportRecord.status)}`}
-                  key={exportRecord.id || `${exportRecord.format}-${index}`}
-                >
-                  <span>
-                    <strong>{exportRecord.format || "model artifact"}</strong>
-                    <small>
-                      {exportRecord.artifact_uri ||
-                        exportRecord.model_uri ||
-                        exportRecord.download_url ||
-                        exportStatusMessage(exportRecord.status)}
-                    </small>
-                  </span>
-                  <span>
-                    <Badge value={exportRecord.status || "PENDING"} />
-                    <small>
-                      {exportRecord.size_bytes
-                        ? formatBytes(exportRecord.size_bytes)
-                        : exportRecord.completed_at ||
-                          exportRecord.failed_at ||
-                          exportRecord.updated_at ||
-                          exportRecord.started_at ||
-                          exportRecord.requested_at ||
-                          exportRecord.created_at ||
-                          ""}
-                    </small>
-                  </span>
-                  {(exportRecord.error || exportRecord.error_message || (exportRecord.validation_errors ?? []).length > 0) && (
-                    <p>{exportRecord.error || exportRecord.error_message || exportRecord.validation_errors?.join("; ")}</p>
-                  )}
-                </div>
-              ))}
+              {data.exports.slice(0, 4).map((exportRecord, index) => {
+                const localSafety = championLocalInferenceSafety(exportRecord, {
+                  deploymentProfile: data.deploymentProfile,
+                  modelProfile: data.modelProfile,
+                });
+                return (
+                  <div
+                    className={`export-record ${statusToneClass(exportRecord.status)}`}
+                    key={exportRecord.id || `${exportRecord.format}-${index}`}
+                  >
+                    <span>
+                      <strong>{exportRecord.format || "model artifact"}</strong>
+                      <small>
+                        {exportRecord.artifact_uri ||
+                          exportRecord.model_uri ||
+                          exportRecord.download_url ||
+                          exportStatusMessage(exportRecord.status)}
+                      </small>
+                    </span>
+                    <span>
+                      <Badge value={exportRecord.status || "PENDING"} />
+                      <small>
+                        {exportRecord.size_bytes
+                          ? formatBytes(exportRecord.size_bytes)
+                          : exportRecord.completed_at ||
+                            exportRecord.failed_at ||
+                            exportRecord.updated_at ||
+                            exportRecord.started_at ||
+                            exportRecord.requested_at ||
+                            exportRecord.created_at ||
+                            ""}
+                      </small>
+                    </span>
+                    {String(exportRecord.format || "").toLowerCase() === "onnx" && (
+                      <p>{localSafety.safe ? "Browser parity self-test passed." : localSafety.message}</p>
+                    )}
+                    {(exportRecord.error || exportRecord.error_message || (exportRecord.validation_errors ?? []).length > 0) && (
+                      <p>{exportRecord.error || exportRecord.error_message || exportRecord.validation_errors?.join("; ")}</p>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <div className="empty compact">No export request has been recorded for this champion yet.</div>
@@ -3144,6 +3153,12 @@ export function PredictionRow({ prediction, index }: { prediction: ChampionDemoP
   const topK = Array.isArray(prediction.top_k) ? prediction.top_k : [];
   const detections = detectionBoxesFromPrediction(prediction);
   const imageMetadata = { ...recordObject(prediction.image_metadata), ...recordObject(prediction.metadata) };
+  const parityStatus =
+    recordString(imageMetadata, "parity_status") ||
+    recordString(recordObject(imageMetadata.preprocessing_parity), "status") ||
+    "";
+  const runtime = recordString(imageMetadata, "runtime");
+  const sourceKind = recordString(imageMetadata, "image_source_kind") || recordString(imageMetadata, "demo_source_type");
   const imageSrc =
     recordString(imageMetadata, "thumbnail_uri") ||
     recordString(imageMetadata, "preview_uri") ||
@@ -3187,6 +3202,14 @@ export function PredictionRow({ prediction, index }: { prediction: ChampionDemoP
         <span>
           <small>Correctness</small>
           <strong>{typeof prediction.correct === "boolean" ? (prediction.correct ? "correct" : "missed") : "-"}</strong>
+        </span>
+        <span>
+          <small>Runtime</small>
+          <strong>{runtime || "-"}</strong>
+        </span>
+        <span>
+          <small>Parity</small>
+          <strong>{parityStatus || sourceKind || "-"}</strong>
         </span>
       </div>
       {(prediction.error || prediction.error_message) && <p>{prediction.error || prediction.error_message}</p>}

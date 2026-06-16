@@ -243,3 +243,78 @@ func TestChampionExportReadyResultAcceptsWorkerManifest(t *testing.T) {
 		t.Fatalf("expected worker manifest to be accepted: %v", err)
 	}
 }
+
+func TestChampionExportReadyResultRejectsFailedSelfTest(t *testing.T) {
+	job := jobs.ExperimentJob{ID: "job_1"}
+	export := runs.ChampionExport{ID: "export_1", Format: "onnx"}
+	manifest := validWorkerExportManifest("onnx", "job_1", "export_1")
+	metadata := manifest["metadata"].(map[string]any)
+	metadata["export_self_test"] = map[string]any{
+		"schema_version":    "champion_export_self_test_v1",
+		"status":            "failed",
+		"diagnostic_reason": "ONNX_OUTPUT_MISMATCH",
+	}
+	req := championExportResultRequest{
+		Status:      runs.ChampionExportStatusReady,
+		ArtifactURI: "file:///tmp/champion.onnx",
+		Metadata:    map[string]any{"manifest": manifest},
+	}
+
+	err := validateChampionExportReadyResult(job, export, req)
+	if err == nil || !strings.Contains(err.Error(), "ONNX self-test failed") {
+		t.Fatalf("expected failed self-test to reject READY export, got %v", err)
+	}
+}
+
+func TestChampionExportReadyResultAcceptsFrameworkNativeCheckpointForPytorch(t *testing.T) {
+	job := jobs.ExperimentJob{ID: "job_1"}
+	export := runs.ChampionExport{ID: "export_1", Format: "pytorch"}
+	manifest := validWorkerExportManifest("framework_native_checkpoint", "job_1", "export_1")
+	req := championExportResultRequest{
+		Status:      runs.ChampionExportStatusReady,
+		ArtifactURI: "file:///tmp/champion.pt",
+		Metadata:    map[string]any{"manifest": manifest},
+	}
+
+	if err := validateChampionExportReadyResult(job, export, req); err != nil {
+		t.Fatalf("expected framework-native checkpoint manifest to satisfy pytorch export: %v", err)
+	}
+}
+
+func TestChampionExportResultMetadataCarriesManifestURI(t *testing.T) {
+	metadata := championExportResultMetadata(championExportResultRequest{
+		ManifestURI: "file:///tmp/manifest.json",
+		Metadata:    map[string]any{"existing": "value"},
+	})
+
+	if metadata["existing"] != "value" ||
+		metadata["manifest_uri"] != "file:///tmp/manifest.json" ||
+		metadata["export_manifest_uri"] != "file:///tmp/manifest.json" {
+		t.Fatalf("expected manifest URI to be preserved in metadata, got %#v", metadata)
+	}
+}
+
+func validWorkerExportManifest(format string, jobID string, exportID string) map[string]any {
+	provenance := map[string]any{
+		"schema_version":   "worker_artifact_provenance_v1",
+		"generated_by":     "model-express-worker",
+		"source":           "worker_generated",
+		"export_job_id":    jobID,
+		"source_export_id": exportID,
+	}
+	return map[string]any{
+		"schema_version": "champion_export_manifest_v1",
+		"status":         "created",
+		"metadata": map[string]any{
+			"provenance": provenance,
+		},
+		"artifacts": []any{
+			map[string]any{
+				"format":     format,
+				"status":     "created",
+				"path":       "/tmp/champion",
+				"provenance": provenance,
+			},
+		},
+	}
+}

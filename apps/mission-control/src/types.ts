@@ -422,6 +422,8 @@ export type ChampionDemoImage = {
   image_uri?: string;
   preview_uri?: string;
   thumbnail_uri?: string;
+  original_image_uri?: string;
+  source_artifact_uri?: string;
   class_name?: string;
   label?: string;
   true_label?: string;
