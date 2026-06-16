@@ -121,6 +121,7 @@ if modal is not None:
             "requests",
             "scikit-learn",
             "onnx",
+            "onnxruntime==1.26.0",
             "onnxscript",
             "pyyaml",
             "torch",

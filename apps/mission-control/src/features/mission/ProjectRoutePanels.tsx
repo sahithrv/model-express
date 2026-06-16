@@ -770,7 +770,17 @@ export function MissionStageTimeline({ stages }: { stages: MissionStage[] }) {
 }
 
 function currentMissionStage(stages: MissionStage[]): MissionStage {
-  if (stages.length > 0 && stages.every((stage) => stage.status === "waiting")) {
+  const latestDoneIndex = stages.reduce(
+    (index, stage, stageIndex) => (stage.status === "done" ? stageIndex : index),
+    -1,
+  );
+  const searchStages = latestDoneIndex >= 0 ? stages.slice(latestDoneIndex + 1) : stages;
+
+  if (
+    latestDoneIndex === -1 &&
+    searchStages.length > 0 &&
+    searchStages.every((stage) => stage.status === "waiting")
+  ) {
     return {
       id: "empty",
       label: "Waiting for mission",
@@ -780,9 +790,9 @@ function currentMissionStage(stages: MissionStage[]): MissionStage {
   }
 
   return (
-    stages.find((stage) => stage.status === "blocked") ??
-    stages.find((stage) => stage.status === "active") ??
-    stages.find((stage) => stage.status === "waiting") ??
+    searchStages.find((stage) => stage.status === "blocked") ??
+    searchStages.find((stage) => stage.status === "active") ??
+    searchStages.find((stage) => stage.status === "waiting") ??
     stages[stages.length - 1] ?? {
       id: "empty",
       label: "Waiting for mission",
@@ -794,9 +804,16 @@ function currentMissionStage(stages: MissionStage[]): MissionStage {
 
 function missionStageProgress(stages: MissionStage[]) {
   if (stages.length === 0) return 0;
-  const activeIndex = stages.findIndex((stage) => stage.status === "active" || stage.status === "blocked");
+  const latestDoneIndex = stages.reduce(
+    (index, stage, stageIndex) => (stage.status === "done" ? stageIndex : index),
+    -1,
+  );
+  const activeIndex = stages
+    .slice(Math.max(0, latestDoneIndex + 1))
+    .findIndex((stage) => stage.status === "active" || stage.status === "blocked");
   if (activeIndex >= 0) {
-    return Math.round(((activeIndex + 0.55) / stages.length) * 100);
+    const absoluteActiveIndex = Math.max(0, latestDoneIndex + 1) + activeIndex;
+    return Math.round(((absoluteActiveIndex + 0.55) / stages.length) * 100);
   }
   const completed = stages.filter((stage) => stage.status === "done").length;
   return Math.round((completed / stages.length) * 100);
@@ -2763,8 +2780,6 @@ export function ChampionExportDemoPanel({
   const activeFps = prediction?.latency_ms && prediction.latency_ms > 0 ? 1000 / prediction.latency_ms : 0;
   const postprocessLatency = predictionPostprocessLatency(prediction);
   const portableBundle = data.portableBundle;
-  const portableBundleLocation =
-    portableBundle?.artifact_uri || portableBundle?.uri || portableBundle?.artifact_path || portableBundle?.path || "";
   const portableBundleDetail = portableBundle?.bytes
     ? formatBytes(portableBundle.bytes)
     : portableBundle?.contents?.length
@@ -2836,7 +2851,7 @@ export function ChampionExportDemoPanel({
             <div className={`export-record portable-bundle-record ${statusToneClass(portableBundle.status)}`}>
               <span>
                 <strong>Portable bundle</strong>
-                <small>{portableBundleLocation || portableBundle.error || "bundle metadata pending"}</small>
+                <small>{portableBundle.artifact_uri || portableBundle.uri || portableBundle.artifact_path || portableBundle.path || portableBundle.error || "bundle metadata pending"}</small>
               </span>
               <span>
                 <Badge value={portableBundle.status || "PENDING"} />

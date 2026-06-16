@@ -56,6 +56,58 @@ test("stale failed worker state does not block completed demo validation", async
   assert.equal(stageStatus(stages, "demo"), "done");
 });
 
+test("champion export-ready handoff path skips refinement waiting state", async () => {
+  const { buildMissionDigest, buildMissionStages } = await loadMissionModel();
+  const project = projectFixture();
+  const detail = completedChampionDetail();
+  const exportDemo = exportDemoFixture();
+
+  const digest = buildDigest(buildMissionDigest, project, detail);
+  const stages = buildMissionStages(project, detail, digest, exportDemo);
+
+  assert.equal(stageStatus(stages, "refinement"), "done");
+  assert.equal(stageStatus(stages, "champion"), "done");
+  assert.equal(stageStatus(stages, "export"), "done");
+  assert.equal(stageStatus(stages, "demo"), "active");
+});
+
+test("validated demo marks handoff as complete with no stale waiting before completed stages", async () => {
+  const { buildMissionDigest, buildMissionStages } = await loadMissionModel();
+  const project = projectFixture();
+  const detail = completedChampionDetail();
+  const exportDemo = exportDemoFixture({
+    demoPredictions: [{ id: "prediction-1", status: "SUCCEEDED", completed_at: timestamp, created_at: timestamp }],
+  });
+
+  const digest = buildDigest(buildMissionDigest, project, detail);
+  const stages = buildMissionStages(project, detail, digest, exportDemo);
+
+  const latestDoneIndex = stages.reduce((index, stage, stageIndex) => (stage.status === "done" ? stageIndex : index), -1);
+  const hasWaitingAfterDone = stages.some((stage, index) => index > latestDoneIndex && stage.status === "waiting");
+  const completed = stages.filter((stage) => stage.status === "done").length;
+
+  assert.equal(hasWaitingAfterDone, false);
+  assert.equal(completed, 9);
+});
+
+test("active follow-up refinement remains visible when no handoff is ready", async () => {
+  const { buildMissionDigest, buildMissionStages } = await loadMissionModel();
+  const project = projectFixture();
+  const detail = completedChampionDetail({
+    champion: null,
+    decisions: [decisionFixture({ id: "decision-add", decision_type: "ADD_EXPERIMENTS" })],
+    plans: [planFixture()],
+  });
+  const exportDemo = exportDemoFixture({ exports: [] });
+
+  const digest = buildDigest(buildMissionDigest, project, detail);
+  const stages = buildMissionStages(project, detail, digest, exportDemo);
+
+  assert.equal(stageStatus(stages, "champion"), "waiting");
+  assert.equal(stageStatus(stages, "refinement"), "active");
+  assert.equal(stageStatus(stages, "export"), "waiting");
+});
+
 test("failed worker state remains blocking while queued jobs still need capacity", async () => {
   const { buildMissionDigest, buildMissionStages } = await loadMissionModel();
   const project = projectFixture();
@@ -379,6 +431,19 @@ function exportDemoFixture(overrides = {}) {
     demoImages: [],
     demoPredictions: [],
     feedback: [],
+    ...overrides,
+  };
+}
+
+function decisionFixture(overrides = {}) {
+  return {
+    id: "decision-1",
+    decision_type: "ADD_EXPERIMENTS",
+    created_at: timestamp,
+    updated_at: timestamp,
+    project_id: projectFixture().id,
+    payload: {},
+    rationale: "Fixture follow-up plan request.",
     ...overrides,
   };
 }

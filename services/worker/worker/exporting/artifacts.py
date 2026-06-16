@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -407,15 +409,16 @@ def _write_onnx(export_dir: Path, model, input_shape: list[int], *, provenance: 
     try:
         model.eval()
         dummy_input = torch.zeros(tuple(input_shape), dtype=torch.float32)
-        torch.onnx.export(
-            model.cpu(),
-            dummy_input,
-            str(path),
-            input_names=["input"],
-            output_names=["logits"],
-            dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-            opset_version=17,
-        )
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            torch.onnx.export(
+                model.cpu(),
+                dummy_input,
+                str(path),
+                input_names=["input"],
+                output_names=["logits"],
+                dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+                opset_version=18,
+            )
     except Exception as exc:
         if "onnx" in str(exc).lower() and "install" in str(exc).lower():
             return _skipped_artifact("onnx", "ONNX_UNAVAILABLE", str(exc), provenance=provenance)

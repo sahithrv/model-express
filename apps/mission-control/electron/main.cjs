@@ -29,6 +29,7 @@ const DATASET_SELECTION_TTL_MS = 4 * 60 * 60 * 1000;
 const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
 const DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const MODEL_ARTIFACT_EXTENSIONS = [".onnx", ".ort", ".pt", ".pth", ".torchscript", ".safetensors"];
+const PORTABLE_BUNDLE_EXTENSIONS = [".zip"];
 const electronRuntimeAvailable = Boolean(app && BrowserWindow && dialog && ipcMain && Menu);
 let missionControlEnvCache = null;
 let missionControlEnvCacheKey = "";
@@ -458,31 +459,59 @@ function configuredLocalArtifactRoots(env = process.env) {
 }
 
 function validateLocalArtifactPath(artifactUri, env = process.env) {
+  return validateLocalArtifactPathForExtensions(
+    artifactUri,
+    env,
+    MODEL_ARTIFACT_EXTENSIONS,
+    "Model artifact",
+    "Model artifact must use a supported model artifact extension.",
+  );
+}
+
+function validateLocalPortableBundlePath(artifactUri, env = process.env) {
+  return validateLocalArtifactPathForExtensions(
+    artifactUri,
+    env,
+    PORTABLE_BUNDLE_EXTENSIONS,
+    "Export bundle",
+    "Export bundle must use a supported archive extension.",
+  );
+}
+
+function validateLocalArtifactPathForExtensions(artifactUri, env, allowedExtensions, label, extensionMessage) {
   const localPath = localPathFromURI(String(artifactUri ?? "").trim());
   if (!localPath) {
-    throw new Error(`Unsupported model artifact URI: ${artifactUri}`);
+    throw new Error(`Unsupported ${label.toLowerCase()} URI: ${artifactUri}`);
   }
   const candidate = path.isAbsolute(localPath) ? localPath : path.resolve(repoRoot(env), localPath);
   if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
-    throw new Error(`Model artifact does not exist: ${redactPathForError(candidate)}`);
+    throw new Error(`${label} does not exist: ${redactPathForError(candidate)}`);
   }
   const realCandidate = fs.realpathSync.native(candidate);
   const allowed = configuredLocalArtifactRoots(env).some((rootPath) => isPathInsideOrEqual(realCandidate, rootPath));
   if (!allowed) {
-    throw new Error("Model artifact must be under a configured Model Express artifact or export root.");
+    throw new Error(`${label} must be under a configured Model Express artifact or export root.`);
   }
   if (isPathInsideOrEqual(realCandidate, path.join(repoRoot(env), "artifacts", "logs"))) {
-    throw new Error("Model artifact loading refuses log directories.");
+    throw new Error(`${label} loading refuses log directories.`);
   }
-  if (!isAllowedModelArtifactFile(realCandidate)) {
-    throw new Error("Model artifact must use a supported model artifact extension.");
+  if (!isAllowedArtifactFile(realCandidate, allowedExtensions)) {
+    throw new Error(extensionMessage);
   }
   return realCandidate;
 }
 
 function isAllowedModelArtifactFile(filePath) {
+  return isAllowedArtifactFile(filePath, MODEL_ARTIFACT_EXTENSIONS);
+}
+
+function isAllowedPortableBundleFile(filePath) {
+  return isAllowedArtifactFile(filePath, PORTABLE_BUNDLE_EXTENSIONS);
+}
+
+function isAllowedArtifactFile(filePath, allowedExtensions) {
   const name = path.basename(String(filePath ?? "")).toLowerCase();
-  return MODEL_ARTIFACT_EXTENSIONS.some((extension) => name.endsWith(extension));
+  return allowedExtensions.some((extension) => name.endsWith(extension));
 }
 
 function validateExternalDataLocalPath(sourcePath, artifactDir, mountPath, explicit) {
@@ -728,6 +757,10 @@ if (electronRuntimeAvailable) {
     };
   });
 
+  ipcMain.handle("artifact:save", async (_event, request) => {
+    return saveArtifact(request);
+  });
+
   ipcMain.handle("worker:ensureProjectWorker", async (_event, options) => {
     return ensureProjectWorker(options);
   });
@@ -769,6 +802,61 @@ function imageMimeType(imagePath) {
 function readLocalArtifactBuffer(artifactUri) {
   const artifactPath = validateLocalArtifactPath(artifactUri);
   return fs.readFileSync(artifactPath);
+}
+
+async function saveArtifact(request = {}) {
+  const artifactUri = String(request?.artifactUri ?? "").trim();
+  if (!artifactUri) {
+    throw new Error("artifactUri is required.");
+  }
+  validatePortableBundleArtifactUri(artifactUri);
+  const defaultName = safeDownloadFileName(request.defaultPath || artifactFileName(artifactUri) || "portable_inference_bundle.zip");
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "Save portable inference bundle",
+    defaultPath: defaultName,
+    filters: [
+      { name: "ZIP archives", extensions: ["zip"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+  if (result.canceled || !result.filePath) {
+    return null;
+  }
+  const buffer = artifactUri.startsWith("s3://")
+    ? await readS3ObjectBuffer(artifactUri, request, "artifact")
+    : readLocalPortableBundleBuffer(artifactUri);
+  await fs.promises.writeFile(result.filePath, buffer);
+  return {
+    artifact_uri: artifactUri,
+    path: result.filePath,
+    size_bytes: buffer.byteLength,
+  };
+}
+
+function validatePortableBundleArtifactUri(artifactUri) {
+  if (artifactUri.startsWith("s3://")) {
+    const parsed = new URL(artifactUri);
+    const key = parsed.pathname.replace(/^\/+/, "");
+    if (!parsed.hostname || !key) {
+      throw new Error(`Invalid S3 export bundle URI: ${artifactUri}`);
+    }
+    if (!isAllowedPortableBundleFile(key)) {
+      throw new Error("Export bundle must use a supported archive extension.");
+    }
+    return;
+  }
+  validateLocalPortableBundlePath(artifactUri);
+}
+
+function readLocalPortableBundleBuffer(artifactUri) {
+  const artifactPath = validateLocalPortableBundlePath(artifactUri);
+  return fs.readFileSync(artifactPath);
+}
+
+function safeDownloadFileName(value) {
+  const base = path.basename(String(value ?? "").trim() || "portable_inference_bundle.zip");
+  const safe = base.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").trim();
+  return safe || "portable_inference_bundle.zip";
 }
 
 function readLocalExternalDataFiles(artifactUri, request = {}) {
@@ -1722,6 +1810,7 @@ module.exports = {
     selectedDatasetFolders,
     validateAppRequestPath,
     validateLocalArtifactPath,
+    validateLocalPortableBundlePath,
     validateOrchestratorBaseUrl,
     validateOrchestratorRequest,
     validateRemoteModalUrl,

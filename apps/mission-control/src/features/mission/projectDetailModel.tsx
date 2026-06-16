@@ -1153,6 +1153,11 @@ export function buildMissionStages(
   const exportReady = Boolean(readyONNXExport(exportDemo.exports));
   const demoValidated = exportDemo.demoPredictions.some((prediction) => normalizedStatus(prediction.status || "") === "SUCCEEDED");
   const blocked = digest.state === "blocked";
+  const handoffReady = exportReady || demoValidated;
+  const championSelected = Boolean(detail.champion);
+  const shouldSkipRefinement = championSelected;
+  const isRefinementRequest = normalizedStatus(latestDecision?.decision_type || "") === "ADD_EXPERIMENTS";
+  const refinementNeedsFollowUp = isRefinementRequest && !followUpPlan && !championSelected;
 
   const status = (done: boolean, activeNow: boolean): MissionStage["status"] =>
     blocked && activeNow ? "blocked" : done ? "done" : activeNow ? "active" : "waiting";
@@ -1205,17 +1210,26 @@ export function buildMissionStages(
       label: "Refinement",
       detail: followUpPlan
         ? `${followUpPlan.experiments.length} targeted follow-up experiment${followUpPlan.experiments.length === 1 ? "" : "s"} prepared.`
+        : shouldSkipRefinement
+          ? "Champion selected; no further refinement is required for this handoff."
         : latestDecision
           ? userFacingActivityText(missionDecisionToUserText(latestDecision), 120)
           : "Starts when evaluation reveals a useful improvement target.",
-      status: status(Boolean(followUpPlan), Boolean(latestDecision && latestDecision.decision_type === "ADD_EXPERIMENTS" && !followUpPlan)),
+      status: status(
+        Boolean(followUpPlan) || shouldSkipRefinement,
+        refinementNeedsFollowUp,
+      ),
       timestamp: followUpPlan?.created_at || latestDecision?.created_at,
     },
     {
       id: "champion",
       label: "Champion Selection",
-      detail: detail.champion ? "Best candidate selected for handoff." : "Starts after enough evidence is available.",
-      status: status(Boolean(detail.champion), evaluationDone && !detail.champion),
+      detail: detail.champion
+        ? handoffReady
+          ? "Champion selected and the handoff path is complete."
+          : "Best candidate selected for handoff."
+        : "Starts after enough evidence is available.",
+      status: status(championSelected, evaluationDone && !championSelected && !refinementNeedsFollowUp),
       timestamp: detail.champion?.created_at,
     },
     {

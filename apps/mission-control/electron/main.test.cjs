@@ -165,6 +165,32 @@ test("artifact paths are limited to configured artifact roots", () => {
   );
 });
 
+test("portable bundle save paths require configured artifact roots and zip archives", () => {
+  const allowedRoot = tempDir("mx-bundles-");
+  const outsideRoot = tempDir("mx-bundle-outside-");
+  const bundlePath = path.join(allowedRoot, "portable_inference_bundle.zip");
+  const outsideBundlePath = path.join(outsideRoot, "portable_inference_bundle.zip");
+  const modelPath = path.join(allowedRoot, "model.onnx");
+  fs.writeFileSync(bundlePath, "zip");
+  fs.writeFileSync(outsideBundlePath, "zip");
+  fs.writeFileSync(modelPath, "onnx");
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_ARTIFACT_ROOTS: allowedRoot,
+  };
+
+  assert.equal(__test.validateLocalPortableBundlePath(bundlePath, env), fs.realpathSync.native(bundlePath));
+  assert.equal(__test.validateLocalPortableBundlePath(pathToFileURL(bundlePath).toString(), env), fs.realpathSync.native(bundlePath));
+  assert.throws(
+    () => __test.validateLocalPortableBundlePath(outsideBundlePath, env),
+    /configured Model Express artifact or export root/,
+  );
+  assert.throws(
+    () => __test.validateLocalPortableBundlePath(modelPath, env),
+    /supported archive extension/,
+  );
+});
+
 test("artifact loading rejects repo log artifacts even under artifact root", () => {
   const repoRoot = tempDir("mx-repo-");
   const logArtifact = path.join(repoRoot, "artifacts", "logs", "model.onnx");

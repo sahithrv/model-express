@@ -92,6 +92,18 @@ interface Window {
         bytes: ArrayBuffer;
       }>;
     }>;
+    saveArtifact(options: {
+      artifactUri: string;
+      defaultPath?: string;
+      endpoint?: string;
+      accessKeyId?: string;
+      secretAccessKey?: string;
+      region?: string;
+    }): Promise<{
+      artifact_uri: string;
+      path: string;
+      size_bytes: number;
+    } | null>;
     ensureProjectWorker(options: {
       projectId: string;
       baseUrl: string;
