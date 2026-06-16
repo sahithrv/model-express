@@ -2762,6 +2762,14 @@ export function ChampionExportDemoPanel({
   const activeDetections = detectionBoxesFromPrediction(prediction);
   const activeFps = prediction?.latency_ms && prediction.latency_ms > 0 ? 1000 / prediction.latency_ms : 0;
   const postprocessLatency = predictionPostprocessLatency(prediction);
+  const portableBundle = data.portableBundle;
+  const portableBundleLocation =
+    portableBundle?.artifact_uri || portableBundle?.uri || portableBundle?.artifact_path || portableBundle?.path || "";
+  const portableBundleDetail = portableBundle?.bytes
+    ? formatBytes(portableBundle.bytes)
+    : portableBundle?.contents?.length
+      ? `${portableBundle.contents.length} file(s)`
+      : portableBundle?.error || "";
 
   return (
     <div className="export-demo-panel">
@@ -2823,6 +2831,18 @@ export function ChampionExportDemoPanel({
             </div>
           ) : (
             <div className="empty compact">No export request has been recorded for this champion yet.</div>
+          )}
+          {portableBundle && (
+            <div className={`export-record portable-bundle-record ${statusToneClass(portableBundle.status)}`}>
+              <span>
+                <strong>Portable bundle</strong>
+                <small>{portableBundleLocation || portableBundle.error || "bundle metadata pending"}</small>
+              </span>
+              <span>
+                <Badge value={portableBundle.status || "PENDING"} />
+                <small>{portableBundleDetail}</small>
+              </span>
+            </div>
           )}
         </div>
 

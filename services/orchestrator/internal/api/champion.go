@@ -1105,7 +1105,18 @@ func championExportManifestHasCreatedArtifact(manifest map[string]any, format st
 			payloadString(artifact, "format"),
 			payloadString(artifact, "artifact_format"),
 		)))
-		if artifactFormat == "" || artifactFormat == strings.ToLower(strings.TrimSpace(format)) ||
+		if artifactFormat == "" {
+			artifactURI := firstNonEmptyString(
+				payloadString(artifact, "uri"),
+				payloadString(artifact, "artifact_uri"),
+				payloadString(artifact, "path"),
+			)
+			if artifactMatchesChampionExportFormat(artifactURI, format) {
+				return true
+			}
+			continue
+		}
+		if artifactFormat == strings.ToLower(strings.TrimSpace(format)) ||
 			(format == "pytorch" && (artifactFormat == "framework_native" || artifactFormat == "framework_native_checkpoint")) {
 			return true
 		}

@@ -34,7 +34,14 @@ def _upload_manifest_artifacts(manifest: dict, remote_base: str, upload_file_to_
     public_manifest.pop("manifest_path", None)
     if isinstance(public_manifest.get("metadata"), dict):
         onnx_artifact = next((item for item in artifact_uris if item["format"] == "onnx"), None)
+        bundle_artifact = next((item for item in artifact_uris if item["format"] == "portable_inference_bundle"), None)
         public_manifest["metadata"]["artifact_uri"] = onnx_artifact["uri"] if onnx_artifact else ""
+        if bundle_artifact:
+            public_manifest["metadata"]["portable_bundle_uri"] = bundle_artifact["uri"]
+            bundle_summary = public_manifest["metadata"].get("portable_inference_bundle")
+            if isinstance(bundle_summary, dict):
+                bundle_summary["artifact_path"] = bundle_artifact["uri"]
+                bundle_summary["artifact_uri"] = bundle_artifact["uri"]
     return public_manifest, artifact_uris
 
 

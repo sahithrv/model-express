@@ -1313,12 +1313,23 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	}
 	assignedExport := pollJobForCallback(t, router, worker.ID, `{"templates":["export_champion"]}`)
 	exportArtifactURI := "file:///exports/champion.onnx"
+	portableBundleURI := "file:///exports/portable_inference_bundle.zip"
+	manifestURI := "file:///exports/manifest.json"
 	resultPayload, err := json.Marshal(map[string]any{
 		"training_attempt_id": callbackAttemptID(t, assignedExport),
 		"status":              "READY",
 		"artifact_uri":        exportArtifactURI,
+		"manifest_uri":        manifestURI,
 		"metadata": map[string]any{
-			"labels": []string{"cat", "dog"},
+			"labels":              []string{"cat", "dog"},
+			"portable_bundle_uri": portableBundleURI,
+			"portable_inference_bundle": map[string]any{
+				"schema_version": "portable_inference_bundle_v1",
+				"status":         "created",
+				"artifact_uri":   portableBundleURI,
+				"artifact_path":  "/exports/portable_inference_bundle.zip",
+				"contents":       []string{"model.onnx", "manifest.json"},
+			},
 			"manifest": map[string]any{
 				"schema_version": "champion_export_manifest_v1",
 				"status":         "ok",
@@ -1333,19 +1344,34 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 						"artifact_format":  "onnx",
 					},
 				},
-				"artifacts": []map[string]any{{
-					"format": "onnx",
-					"status": "created",
-					"path":   "/exports/champion.onnx",
-					"provenance": map[string]any{
-						"schema_version":   "worker_artifact_provenance_v1",
-						"generated_by":     "model-express-worker",
-						"source":           "worker_generated",
-						"export_job_id":    exportJob.ID,
-						"source_export_id": export.ID,
-						"artifact_format":  "onnx",
+				"artifacts": []map[string]any{
+					{
+						"format": "onnx",
+						"status": "created",
+						"path":   "/exports/champion.onnx",
+						"provenance": map[string]any{
+							"schema_version":   "worker_artifact_provenance_v1",
+							"generated_by":     "model-express-worker",
+							"source":           "worker_generated",
+							"export_job_id":    exportJob.ID,
+							"source_export_id": export.ID,
+							"artifact_format":  "onnx",
+						},
 					},
-				}},
+					{
+						"format": "portable_inference_bundle",
+						"status": "created",
+						"path":   "/exports/portable_inference_bundle.zip",
+						"provenance": map[string]any{
+							"schema_version":   "worker_artifact_provenance_v1",
+							"generated_by":     "model-express-worker",
+							"source":           "worker_generated",
+							"export_job_id":    exportJob.ID,
+							"source_export_id": export.ID,
+							"artifact_format":  "portable_inference_bundle",
+						},
+					},
+				},
 			},
 		},
 	})
@@ -1366,6 +1392,27 @@ func TestChampionExportRequestQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	}
 	if exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI != exportArtifactURI {
 		t.Fatalf("expected ready export with artifact, got %#v", exports[0])
+	}
+	if exports[0].Metadata["portable_bundle_uri"] != portableBundleURI {
+		t.Fatalf("expected portable bundle URI to be preserved, got %#v", exports[0].Metadata)
+	}
+	if exports[0].Metadata["manifest_uri"] != manifestURI || exports[0].Metadata["export_manifest_uri"] != manifestURI {
+		t.Fatalf("expected manifest URI aliases to be preserved, got %#v", exports[0].Metadata)
+	}
+	storedManifest := payloadMap(exports[0].Metadata, "manifest")
+	if !championExportManifestHasCreatedArtifact(storedManifest, "onnx") {
+		t.Fatalf("expected stored manifest to preserve created ONNX artifact, got %#v", storedManifest)
+	}
+	artifacts := storedManifest["artifacts"].([]any)
+	foundBundleArtifact := false
+	for _, item := range artifacts {
+		artifact := mapFromAny(item)
+		if payloadString(artifact, "format") == "portable_inference_bundle" && payloadString(artifact, "status") == "created" {
+			foundBundleArtifact = true
+		}
+	}
+	if !foundBundleArtifact {
+		t.Fatalf("expected stored manifest to preserve portable bundle artifact, got %#v", storedManifest)
 	}
 	updatedJob, err := memoryStore.GetJob(exportJob.ID)
 	if err != nil {

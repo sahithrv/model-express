@@ -8,6 +8,11 @@ from typing import Iterable
 from urllib.parse import unquote, urlparse
 
 from worker.exporting.metadata import build_champion_export_metadata
+from worker.exporting.portable_bundle import (
+    PORTABLE_ARTIFACT_FORMAT,
+    portable_bundle_summary,
+    write_portable_inference_bundle,
+)
 from worker.exporting.preprocessing import benchmark_preprocessing_latency
 from worker.exporting.self_test import (
     export_self_test_failed,
@@ -159,12 +164,19 @@ def produce_champion_export_artifacts(
                 dict.fromkeys([*metadata["provenance"].get("validation_errors", []), *self_test_errors])
             )
 
+    status = _manifest_status(artifacts, metadata.get("export_self_test"))
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "metadata": metadata,
         "artifacts": artifacts,
-        "status": _manifest_status(artifacts, metadata.get("export_self_test")),
+        "status": status,
     }
+    _append_portable_bundle_artifact(
+        export_dir,
+        manifest,
+        requested_format="onnx" if "onnx" in requested_formats else "",
+        provenance=provenance,
+    )
     manifest_path = export_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     manifest["manifest_path"] = str(manifest_path)
@@ -249,6 +261,8 @@ def produce_existing_champion_export_manifest(
                 )
             ],
             "failed",
+            requested_format=manifest_format,
+            provenance=provenance,
         )
 
     if not source_path.exists() or not source_path.is_file():
@@ -272,6 +286,8 @@ def produce_existing_champion_export_manifest(
                 )
             ],
             "pending_dependencies",
+            requested_format=manifest_format,
+            provenance=provenance,
         )
 
     input_shape = _input_shape(sample_input_shape, image_size)
@@ -308,7 +324,14 @@ def produce_existing_champion_export_manifest(
             source_path=source_path,
             validation_errors=validation_errors,
         )
-    return _write_manifest(export_dir, metadata, [artifact], "created")
+    return _write_manifest(
+        export_dir,
+        metadata,
+        [artifact],
+        "created",
+        requested_format=manifest_format,
+        provenance=provenance,
+    )
 
 
 def _write_framework_native_checkpoint(export_dir: Path, model, metadata: dict, *, provenance: dict | None = None) -> dict:
@@ -651,17 +674,59 @@ def _artifact_filename(artifact_format: str, source_path: Path) -> str:
     return f"model{suffix}"
 
 
-def _write_manifest(export_dir: Path, metadata: dict, artifacts: list[dict], status: str) -> dict:
+def _write_manifest(
+    export_dir: Path,
+    metadata: dict,
+    artifacts: list[dict],
+    status: str,
+    *,
+    requested_format: str = "",
+    provenance: dict | None = None,
+) -> dict:
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "metadata": metadata,
         "artifacts": artifacts,
         "status": status,
     }
+    _append_portable_bundle_artifact(
+        export_dir,
+        manifest,
+        requested_format=requested_format,
+        provenance=provenance,
+    )
     manifest_path = export_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     manifest["manifest_path"] = str(manifest_path)
     return manifest
+
+
+def _append_portable_bundle_artifact(
+    export_dir: Path,
+    manifest: dict,
+    *,
+    requested_format: str,
+    provenance: dict | None = None,
+) -> None:
+    if str(requested_format).lower() != "onnx":
+        return
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), list) else []
+    if any(isinstance(artifact, dict) and artifact.get("format") == PORTABLE_ARTIFACT_FORMAT for artifact in artifacts):
+        return
+    bundle_artifact = write_portable_inference_bundle(
+        export_dir=export_dir,
+        manifest=manifest,
+        requested_format=requested_format,
+        provenance=provenance,
+    )
+    artifacts.append(bundle_artifact)
+    manifest["artifacts"] = artifacts
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    summary = portable_bundle_summary(bundle_artifact)
+    metadata["portable_inference_bundle"] = summary
+    if summary.get("artifact_uri"):
+        metadata["portable_bundle_uri"] = summary["artifact_uri"]
+    manifest["metadata"] = metadata
 
 
 def _manifest_provenance(

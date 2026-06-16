@@ -956,15 +956,25 @@ class ModalTrainingHelperTests(unittest.TestCase):
             root = Path(temp_dir)
             model = root / "model.onnx"
             sidecar = root / "model.onnx.data"
+            bundle = root / "portable_inference_bundle.zip"
             model.write_bytes(b"onnx bytes")
             sidecar.write_bytes(b"external tensor bytes")
+            bundle.write_bytes(b"zip bytes")
             uploads = []
 
             def fake_upload(source: Path, destination: str) -> None:
                 uploads.append((Path(source).name, destination))
 
             manifest = {
-                "metadata": {},
+                "metadata": {
+                    "portable_inference_bundle": {
+                        "schema_version": "portable_inference_bundle_v1",
+                        "status": "created",
+                        "artifact_uri": bundle.resolve().as_uri(),
+                        "artifact_path": str(bundle),
+                        "contents": ["model.onnx", "manifest.json"],
+                    }
+                },
                 "artifacts": [
                     {
                         "format": "onnx",
@@ -977,7 +987,13 @@ class ModalTrainingHelperTests(unittest.TestCase):
                                 "bytes": sidecar.stat().st_size,
                             }
                         ],
-                    }
+                    },
+                    {
+                        "format": "portable_inference_bundle",
+                        "status": "created",
+                        "path": str(bundle),
+                        "contents": ["model.onnx", "manifest.json"],
+                    },
                 ],
             }
 
@@ -992,10 +1008,25 @@ class ModalTrainingHelperTests(unittest.TestCase):
                 [
                     ("model.onnx", "s3://bucket/exports/job_1/model.onnx"),
                     ("model.onnx.data", "s3://bucket/exports/job_1/model.onnx.data"),
+                    ("portable_inference_bundle.zip", "s3://bucket/exports/job_1/portable_inference_bundle.zip"),
                 ],
             )
-            self.assertEqual(artifact_uris, [{"format": "onnx", "uri": "s3://bucket/exports/job_1/model.onnx"}])
+            self.assertEqual(
+                artifact_uris,
+                [
+                    {"format": "onnx", "uri": "s3://bucket/exports/job_1/model.onnx"},
+                    {
+                        "format": "portable_inference_bundle",
+                        "uri": "s3://bucket/exports/job_1/portable_inference_bundle.zip",
+                    },
+                ],
+            )
             self.assertEqual(public_manifest["artifacts"][0]["external_data"][0]["uri"], "s3://bucket/exports/job_1/model.onnx.data")
+            self.assertEqual(public_manifest["metadata"]["portable_bundle_uri"], "s3://bucket/exports/job_1/portable_inference_bundle.zip")
+            self.assertEqual(
+                public_manifest["metadata"]["portable_inference_bundle"]["artifact_uri"],
+                "s3://bucket/exports/job_1/portable_inference_bundle.zip",
+            )
 
     def test_profile_image_dataset_uses_ephemeral_materialized_dataset_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

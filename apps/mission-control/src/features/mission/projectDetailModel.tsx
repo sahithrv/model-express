@@ -49,6 +49,7 @@ import type {
   MissionControlTelemetryResponse,
   Project,
   ProjectChampion,
+  PortableInferenceBundle,
   RetrievedMemoryCard,
   StrategyScorecard,
   TrainingRunEvaluation,
@@ -733,6 +734,7 @@ export type ChampionExportDemo = {
   hasChampion: boolean;
   exportStatus: string;
   exports: ChampionExport[];
+  portableBundle?: PortableInferenceBundle;
   projectId: string;
   modelCard: Record<string, unknown>;
   deploymentProfile: Record<string, unknown>;
@@ -5332,10 +5334,14 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     recordString(modelProfile, "input_size") ? `input: ${recordString(modelProfile, "input_size")}` : "",
   ]).slice(0, 6);
 
+  const uniqueExports = uniqueBy(exports, (item, index) => item.id || item.artifact_uri || item.model_uri || item.download_url || String(index));
+  const portableBundle = firstPortableInferenceBundle(uniqueExports);
+
   return {
     hasChampion: true,
     exportStatus,
-    exports: uniqueBy(exports, (item, index) => item.id || item.artifact_uri || item.model_uri || item.download_url || String(index)),
+    exports: uniqueExports,
+    portableBundle,
     projectId: champion.project_id,
     modelCard,
     deploymentProfile: deployment,
@@ -5979,7 +5985,7 @@ export function normalizedStatus(value: string) {
 
 export function statusToneClass(value?: string) {
   const status = normalizedStatus(value || "PENDING").toLowerCase();
-  if (["succeeded", "ready", "correct", "completed"].includes(status)) return "status-good";
+  if (["succeeded", "ready", "correct", "completed", "created"].includes(status)) return "status-good";
   if (["failed", "error", "missed", "runtime_unavailable"].includes(status)) return "status-bad";
   if (["requested", "running", "pending", "pending_artifact", "queued"].includes(status)) return "status-wait";
   return "";
@@ -6040,6 +6046,65 @@ export function stringArrayPayload(value: unknown) {
 export function championExportsFromUnknown(value: unknown): ChampionExport[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => recordObject(item) as ChampionExport).filter((item) => Object.keys(item).length > 0);
+}
+
+export function firstPortableInferenceBundle(exports: ChampionExport[]): PortableInferenceBundle | undefined {
+  for (const exportRecord of exports) {
+    const bundle = portableInferenceBundleFromExport(exportRecord);
+    if (bundle) return bundle;
+  }
+  return undefined;
+}
+
+export function portableInferenceBundleFromExport(exportRecord: ChampionExport): PortableInferenceBundle | undefined {
+  const exportObject = recordObject(exportRecord);
+  const metadata = recordObject(exportRecord.metadata);
+  const summary = recordObject(metadata.portable_inference_bundle ?? exportObject.portable_inference_bundle);
+  const manifest = recordObject(metadata.manifest);
+  const artifact = portableBundleArtifactFromManifest(manifest);
+  const status =
+    recordFirstString(summary, ["status"]) ||
+    recordFirstString(artifact, ["status"]) ||
+    (recordFirstString(metadata, ["portable_bundle_uri", "portable_inference_bundle_uri"]) ? "created" : "");
+  const artifactURI =
+    recordFirstString(exportObject, ["portable_bundle_uri", "portable_inference_bundle_uri"]) ||
+    recordFirstString(metadata, ["portable_bundle_uri", "portable_inference_bundle_uri"]) ||
+    recordFirstString(summary, ["artifact_uri", "uri"]) ||
+    recordFirstString(artifact, ["uri", "artifact_uri"]);
+  const artifactPath =
+    recordFirstString(summary, ["artifact_path", "path"]) ||
+    recordFirstString(artifact, ["artifact_path", "local_path", "path"]);
+  const contents = uniqueStrings([
+    ...stringArrayPayload(summary.contents),
+    ...stringArrayPayload(artifact.contents),
+  ]);
+  const bytes = recordNumber(summary, "bytes") || recordNumber(artifact, "bytes");
+  const error = recordFirstString(summary, ["error", "message"]) || recordFirstString(artifact, ["error", "message"]);
+  const errorCode = recordFirstString(summary, ["error_code", "code"]) || recordFirstString(artifact, ["error_code", "code"]);
+  if (!artifactURI && !artifactPath && !status && contents.length === 0 && !error) return undefined;
+  return {
+    schema_version: recordFirstString(summary, ["schema_version"]) || "portable_inference_bundle_v1",
+    status: status || (artifactURI || artifactPath ? "created" : "unknown"),
+    artifact_uri: artifactURI,
+    artifact_path: artifactPath || artifactURI,
+    uri: artifactURI,
+    path: artifactPath,
+    bytes: bytes || undefined,
+    contents,
+    error_code: errorCode,
+    error,
+  };
+}
+
+export function portableBundleArtifactFromManifest(manifest: Record<string, unknown>) {
+  const artifacts = Array.isArray(manifest.artifacts) ? manifest.artifacts : [];
+  for (const item of artifacts) {
+    const artifact = recordObject(item);
+    if (recordString(artifact, "format").toLowerCase() === "portable_inference_bundle") {
+      return artifact;
+    }
+  }
+  return {};
 }
 
 export function championExportExternalData(exportRecord: ChampionExport) {

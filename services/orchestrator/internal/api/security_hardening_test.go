@@ -244,6 +244,81 @@ func TestChampionExportReadyResultAcceptsWorkerManifest(t *testing.T) {
 	}
 }
 
+func TestChampionExportReadyResultAcceptsONNXWithAdditionalPortableInferenceBundle(t *testing.T) {
+	job := jobs.ExperimentJob{ID: "job_1"}
+	export := runs.ChampionExport{ID: "export_1", Format: "onnx"}
+	manifest := validWorkerExportManifest("onnx", "job_1", "export_1")
+	provenance := payloadMap(payloadMap(manifest, "metadata"), "provenance")
+	manifest["artifacts"] = append(manifest["artifacts"].([]any), map[string]any{
+		"format": "portable_inference_bundle",
+		"status": "created",
+		"path":   "/tmp/portable_inference_bundle.zip",
+		"provenance": map[string]any{
+			"schema_version":   "worker_artifact_provenance_v1",
+			"generated_by":     "model-express-worker",
+			"source":           "worker_generated",
+			"export_job_id":    "job_1",
+			"source_export_id": "export_1",
+			"artifact_format":  "portable_inference_bundle",
+		},
+	})
+	if len(provenance) == 0 {
+		t.Fatal("expected test manifest provenance")
+	}
+	req := championExportResultRequest{
+		Status:      runs.ChampionExportStatusReady,
+		ArtifactURI: "file:///tmp/champion.onnx",
+		Metadata:    map[string]any{"manifest": manifest},
+	}
+
+	if err := validateChampionExportReadyResult(job, export, req); err != nil {
+		t.Fatalf("expected ONNX manifest with optional portable bundle to be accepted: %v", err)
+	}
+}
+
+func TestChampionExportReadyResultRejectsZipOnlyONNXManifest(t *testing.T) {
+	job := jobs.ExperimentJob{ID: "job_1"}
+	export := runs.ChampionExport{ID: "export_1", Format: "onnx"}
+	cases := []struct {
+		name     string
+		artifact map[string]any
+	}{
+		{
+			name: "explicit portable bundle",
+			artifact: map[string]any{
+				"format": "portable_inference_bundle",
+				"status": "created",
+				"path":   "/tmp/portable_inference_bundle.zip",
+			},
+		},
+		{
+			name: "omitted format zip",
+			artifact: map[string]any{
+				"status": "created",
+				"path":   "/tmp/portable_inference_bundle.zip",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := validWorkerExportManifest("onnx", "job_1", "export_1")
+			provenance := payloadMap(payloadMap(manifest, "metadata"), "provenance")
+			tc.artifact["provenance"] = provenance
+			manifest["artifacts"] = []any{tc.artifact}
+			req := championExportResultRequest{
+				Status:      runs.ChampionExportStatusReady,
+				ArtifactURI: "file:///tmp/champion.onnx",
+				Metadata:    map[string]any{"manifest": manifest},
+			}
+
+			err := validateChampionExportReadyResult(job, export, req)
+			if err == nil || !strings.Contains(err.Error(), "created artifact for the requested format") {
+				t.Fatalf("expected zip-only manifest to be rejected, got %v", err)
+			}
+		})
+	}
+}
+
 func TestChampionExportReadyResultRejectsFailedSelfTest(t *testing.T) {
 	job := jobs.ExperimentJob{ID: "job_1"}
 	export := runs.ChampionExport{ID: "export_1", Format: "onnx"}
@@ -284,10 +359,11 @@ func TestChampionExportReadyResultAcceptsFrameworkNativeCheckpointForPytorch(t *
 func TestChampionExportResultMetadataCarriesManifestURI(t *testing.T) {
 	metadata := championExportResultMetadata(championExportResultRequest{
 		ManifestURI: "file:///tmp/manifest.json",
-		Metadata:    map[string]any{"existing": "value"},
+		Metadata:    map[string]any{"existing": "value", "portable_bundle_uri": "file:///tmp/portable_inference_bundle.zip"},
 	})
 
 	if metadata["existing"] != "value" ||
+		metadata["portable_bundle_uri"] != "file:///tmp/portable_inference_bundle.zip" ||
 		metadata["manifest_uri"] != "file:///tmp/manifest.json" ||
 		metadata["export_manifest_uri"] != "file:///tmp/manifest.json" {
 		t.Fatalf("expected manifest URI to be preserved in metadata, got %#v", metadata)

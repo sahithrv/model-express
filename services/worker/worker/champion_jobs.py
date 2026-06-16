@@ -34,6 +34,12 @@ HELPER_EXPORT_FORMATS = {
     "torchscript": "torchscript",
     "pytorch": "framework_native",
 }
+PRIMARY_ARTIFACT_FORMATS = {
+    "onnx": "onnx",
+    "torchscript": "torchscript",
+    "pytorch": "framework_native_checkpoint",
+    "safetensors": "safetensors",
+}
 
 
 def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
@@ -157,11 +163,11 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
         )
         manifest = _error_manifest(export_dir, requested_format, validation_errors, status="pending_dependencies", provenance=provenance)
 
-    created_artifacts = _created_artifacts(manifest)
+    primary_artifact = _created_artifact_for_requested_format(manifest, requested_format)
     validation_errors.extend(_manifest_export_self_test_errors(manifest))
     if _manifest_export_self_test_failed(manifest):
         status = "FAILED"
-    elif created_artifacts:
+    elif primary_artifact:
         status = "READY"
     elif validation_errors and requested_format == "safetensors":
         status = "PENDING_ARTIFACT"
@@ -949,19 +955,30 @@ def _export_result_payload(
     manifest: dict,
     validation_errors: list[str],
 ) -> dict:
-    created = _created_artifacts(manifest)
-    artifact_uri = _file_uri(created[0]["path"]) if created else ""
+    primary_artifact = _created_artifact_for_requested_format(manifest, requested_format)
+    artifact_uri = _file_uri(primary_artifact.get("path")) if primary_artifact else ""
     manifest_path = manifest.get("manifest_path")
     errors = list(dict.fromkeys(error for error in validation_errors if error))
+    portable_bundle = _portable_bundle_artifact(manifest)
+    portable_bundle_uri = _file_uri(portable_bundle.get("path")) if portable_bundle.get("status") == "created" else ""
+    manifest_metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    portable_summary = manifest_metadata.get("portable_inference_bundle")
+    if not isinstance(portable_summary, dict):
+        portable_summary = {}
+    result_metadata = {
+        "manifest": _public_manifest(manifest),
+        "export_dir": str(Path(str(manifest_path)).parent) if manifest_path else "",
+    }
+    if portable_bundle_uri:
+        result_metadata["portable_bundle_uri"] = portable_bundle_uri
+    if portable_summary:
+        result_metadata["portable_inference_bundle"] = portable_summary
     return {
         "status": status,
         "format": requested_format,
         "artifact_uri": artifact_uri,
         "manifest_uri": _file_uri(manifest_path) if manifest_path else "",
-        "metadata": {
-            "manifest": _public_manifest(manifest),
-            "export_dir": str(Path(str(manifest_path)).parent) if manifest_path else "",
-        },
+        "metadata": result_metadata,
         "validation_errors": errors,
         "error": "; ".join(errors),
     }
@@ -1089,6 +1106,27 @@ def _created_artifacts(manifest: dict) -> list[dict]:
         for artifact in artifacts
         if isinstance(artifact, dict) and artifact.get("status") == "created" and artifact.get("path")
     ]
+
+
+def _created_artifact_for_requested_format(manifest: dict, requested_format: str) -> dict | None:
+    expected = PRIMARY_ARTIFACT_FORMATS.get(str(requested_format).lower(), str(requested_format).lower())
+    for artifact in _created_artifacts(manifest):
+        artifact_format = str(artifact.get("format") or artifact.get("artifact_format") or "").lower()
+        if artifact_format == expected:
+            return artifact
+    return None
+
+
+def _portable_bundle_artifact(manifest: dict) -> dict:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        return {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if str(artifact.get("format") or "").lower() == "portable_inference_bundle":
+            return artifact
+    return {}
 
 
 def _artifact_errors(manifest: dict) -> list[str]:

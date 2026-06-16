@@ -72,10 +72,19 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(result["status"], "READY")
             self.assertEqual(result["format"], "onnx")
             self.assertTrue(result["artifact_uri"].startswith("file://"))
+            self.assertTrue(result["artifact_uri"].endswith("/model.onnx"))
+            self.assertIn("portable_bundle_uri", result["metadata"])
+            self.assertTrue(result["metadata"]["portable_bundle_uri"].endswith("/portable_inference_bundle.zip"))
             self.assertTrue((export_root / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
             manifest = result["metadata"]["manifest"]
             self.assertEqual(manifest["metadata"]["provenance"]["schema_version"], "worker_artifact_provenance_v1")
             self.assertEqual(manifest["artifacts"][0]["provenance"]["source"], "worker_controlled_copy")
+            self.assertTrue(
+                any(
+                    artifact.get("format") == "portable_inference_bundle" and artifact.get("status") == "created"
+                    for artifact in manifest["artifacts"]
+                )
+            )
             self.assertEqual(client.completed, ["job_export"])
             self.assertEqual(client.failed, [])
 

@@ -29,7 +29,7 @@ class ExportArtifactTests(unittest.TestCase):
             self.assertTrue(Path(manifest["manifest_path"]).exists())
             self.assertEqual(
                 {artifact["format"] for artifact in manifest["artifacts"]},
-                {"framework_native_checkpoint", "torchscript", "onnx"},
+                {"framework_native_checkpoint", "torchscript", "onnx", "portable_inference_bundle"},
             )
             self.assertTrue(all(artifact["status"] == "skipped" for artifact in manifest["artifacts"]))
 

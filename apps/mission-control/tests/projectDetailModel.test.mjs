@@ -76,6 +76,51 @@ test("failed worker state remains blocking while queued jobs still need capacity
   assert.equal(stageStatus(stages, "experiments"), "blocked");
 });
 
+test("portable bundle is derived separately from ready ONNX export", async () => {
+  const { buildChampionExportDemo } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    championExports: [
+      {
+        id: "export-onnx",
+        project_id: "project-1",
+        champion_id: "champion-1",
+        job_id: "job-1",
+        status: "READY",
+        format: "onnx",
+        artifact_uri: "file:///exports/model.onnx",
+        metadata: {
+          portable_bundle_uri: "file:///exports/portable_inference_bundle.zip",
+          portable_inference_bundle: {
+            schema_version: "portable_inference_bundle_v1",
+            status: "created",
+            artifact_uri: "file:///exports/portable_inference_bundle.zip",
+            contents: ["model.onnx", "manifest.json"],
+          },
+          manifest: {
+            schema_version: "champion_export_manifest_v1",
+            artifacts: [
+              { format: "onnx", status: "created", path: "/exports/model.onnx" },
+              {
+                format: "portable_inference_bundle",
+                status: "created",
+                path: "/exports/portable_inference_bundle.zip",
+                contents: ["model.onnx", "manifest.json"],
+              },
+            ],
+          },
+        },
+      },
+    ],
+  });
+
+  const exportDemo = buildChampionExportDemo(detail);
+
+  assert.equal(exportDemo.exports[0].artifact_uri, "file:///exports/model.onnx");
+  assert.equal(exportDemo.portableBundle?.artifact_uri, "file:///exports/portable_inference_bundle.zip");
+  assert.equal(exportDemo.portableBundle?.status, "created");
+  assert.deepEqual(exportDemo.portableBundle?.contents, ["model.onnx", "manifest.json"]);
+});
+
 function buildDigest(buildMissionDigest, selectedProject, detail) {
   return buildMissionDigest({
     health: { status: "ok", service: "orchestrator", timestamp },

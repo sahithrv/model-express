@@ -413,6 +413,21 @@ export type ChampionExport = {
   error?: string;
   error_message?: string;
   metadata?: Record<string, unknown>;
+  portable_bundle_uri?: string;
+  portable_inference_bundle?: PortableInferenceBundle;
+};
+
+export type PortableInferenceBundle = {
+  schema_version?: string;
+  status?: string;
+  artifact_uri?: string;
+  artifact_path?: string;
+  uri?: string;
+  path?: string;
+  bytes?: number;
+  contents?: string[];
+  error_code?: string;
+  error?: string;
 };
 
 export type ChampionDemoImage = {
