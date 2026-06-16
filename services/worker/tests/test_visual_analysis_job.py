@@ -146,6 +146,74 @@ def test_visual_dataset_metadata_merges_active_safe_metadata_summary():
     assert metadata["profile"]["agent_safe_metadata_summary"]["capabilities"]["bbox_annotations"] is True
 
 
+def test_run_visual_llm_analysis_accepts_profile_total_when_manifest_is_truncated(monkeypatch):
+    class FakeVisualLLMConfig:
+        enabled = True
+        provider = "fake_visual"
+        model = "fake-model"
+
+    class FakeVisualLLMClient:
+        def __init__(self, _config):
+            pass
+
+        def generate_json(self, *, system_prompt: str, user_prompt: str, images: list) -> str:
+            return json.dumps(
+                {
+                    "schema_version": "dataset_visual_analysis_v1",
+                    "dataset_id": "dataset_1",
+                    "dataset_name": "CUB",
+                    "total_images": 11796,
+                    "images_analyzed": 1,
+                    "trigger_reason": "initial_profile",
+                    "confidence": "low",
+                    "coverage_report": {
+                        "selection_strategy": "deterministic_risk_and_representative_sampling",
+                        "selection_basis": ["class_representative"],
+                        "images_available": 10000,
+                        "images_analyzed": 1,
+                        "classes_total": 200,
+                        "classes_covered": 1,
+                        "class_coverage_ratio": 0.005,
+                    },
+                    "classes_to_watch": [],
+                    "visual_traits": [],
+                    "preprocessing_hypotheses": [],
+                    "cautions": [],
+                    "limitations": ["Only a bounded visual sample was inspected."],
+                }
+            )
+
+    monkeypatch.setattr(
+        "worker.visual_analysis.client.VisualLLMConfig.from_env",
+        staticmethod(lambda: FakeVisualLLMConfig()),
+    )
+    monkeypatch.setattr("worker.visual_analysis.client.VisualLLMClient", FakeVisualLLMClient)
+
+    dataset = {
+        "id": "dataset_1",
+        "name": "CUB",
+        "profile": {"total_images": 11796, "class_count": 200},
+    }
+    config = {"dataset_id": "dataset_1"}
+    pack = {
+        "sample_manifest": {
+            "images_available": 10000,
+            "images_analyzed": 1,
+            "classes_total": 200,
+            "classes_covered": 1,
+            "class_coverage_ratio": 0.005,
+            "samples": [{"image_id": "img_001", "class_name": "bird"}],
+        },
+        "image_inputs": [],
+    }
+
+    result = jobs._run_visual_llm_analysis(dataset, config, pack)
+
+    assert result["analysis"]["total_images"] == 11796
+    assert result["analysis"]["coverage_report"]["images_available"] == 10000
+    assert result["repair"]["attempted"] is False
+
+
 def _fake_visual_llm_analysis(dataset: dict, config: dict, pack: dict) -> dict:
     manifest = pack["sample_manifest"]
     analysis = {

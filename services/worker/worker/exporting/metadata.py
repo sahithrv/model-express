@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Iterable
 
@@ -69,6 +70,8 @@ def build_champion_export_metadata(
         "format": "framework_native_checkpoint",
         "input_shape": input_shape,
         "class_labels": labels,
+        "class_index_order": [{"index": index, "label": label} for index, label in enumerate(labels)],
+        "class_label_order_hash": _class_label_order_hash(labels),
         "class_count": len(labels),
         "confidence_threshold_defaults": confidence_threshold_defaults,
         "latency_budget": latency_budget,
@@ -308,6 +311,11 @@ def _class_labels(class_names: Iterable[str], *records: dict) -> list[str]:
                 if labels:
                     return labels
     return []
+
+
+def _class_label_order_hash(labels: list[str]) -> str:
+    payload = "\n".join(labels).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _resolve_model_kind(

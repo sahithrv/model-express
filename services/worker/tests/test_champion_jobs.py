@@ -228,6 +228,58 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(client.completed, ["job_export"])
             self.assertEqual(client.failed, [])
 
+    def test_export_rejects_checkpoint_class_label_order_mismatch(self) -> None:
+        try:
+            import torch
+        except Exception as exc:  # pragma: no cover - depends on optional local deps
+            raise unittest.SkipTest(f"torch is unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_root = root / "exports"
+            model = _build_torchvision_model(
+                model_name="mobilenet_v3_small",
+                class_count=2,
+                pretrained=False,
+                freeze_backbone=True,
+                fine_tune_strategy="head_only",
+                dropout=0.0,
+            )
+            checkpoint = export_root / "checkpoints" / "source.pt"
+            checkpoint.parent.mkdir(parents=True)
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "metadata": {
+                        "model": "mobilenet_v3_small",
+                        "class_labels": ["dog", "cat"],
+                    },
+                },
+                checkpoint,
+            )
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "torchscript",
+                    "champion_job_id": "train_1",
+                    "source_artifact_uri": str(checkpoint),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 32,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(export_root)}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "FAILED")
+            self.assertIn("CLASS_LABEL_ORDER_MISMATCH", result["error"])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed[0][0], "job_export")
+
     def test_export_rejects_unsafe_pickle_checkpoint_without_execution(self) -> None:
         try:
             import torch

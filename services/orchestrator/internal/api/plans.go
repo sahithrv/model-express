@@ -326,14 +326,12 @@ func (s *Server) validateFollowUpPlanCanExecute(plan plans.ExperimentPlan) error
 	if plan.SourceDecisionID == "" {
 		return nil
 	}
-	if terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
-		if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(plan.ProjectID); err != nil {
-			return err
-		} else if ok {
-			message := fmt.Sprintf("Follow-up execution blocked for plan %s because the project already has a selected champion.", plan.ID)
-			s.recordChampionSelectedFollowUpBlocked(plan.ProjectID, plan.ID, plan.SourceDecisionID, plan.ID, message, stopReason, stopDetails)
-			return fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
-		}
+	if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(plan.ProjectID); err != nil {
+		return err
+	} else if ok {
+		message := fmt.Sprintf("Follow-up execution blocked for plan %s because the project already has a selected champion.", plan.ID)
+		s.recordChampionSelectedFollowUpBlocked(plan.ProjectID, plan.ID, plan.SourceDecisionID, plan.ID, message, stopReason, stopDetails)
+		return fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
 	}
 	projectPlans, err := s.store.ListProjectExperimentPlans(plan.ProjectID)
 	if err != nil {

@@ -1634,10 +1634,13 @@ export function buildMissionDigest({
     decisionRejections(latestDecision).length > 0 &&
     validationStatus &&
     !["accepted", "approved", "valid"].includes(validationStatus);
-  const activeFailedEvent = visibleActivityEvents.find((event) => ["failed", "blocked"].includes(activityStatus(event.status)));
+  const activeFailedEvent = visibleActivityEvents.find(
+    (event) => ["failed", "blocked"].includes(activityStatus(event.status)) && !isChampionSelectedGuardActivity(event),
+  );
   const failedWithoutProgress = counts.FAILED > 0 && counts.SUCCEEDED === 0 && activeJobs === 0 && queuedJobs === 0;
   const orchestratorUnhealthy = Boolean(health && health.status !== "ok");
-  const hardBlocked = orchestratorUnhealthy || Boolean(activeFailedEvent) || Boolean(blockingDecision) || workerSummary.failed || failedWithoutProgress;
+  const workerCapacityBlocked = workerSummary.failed && (queuedJobs > 0 || activeJobs > 0);
+  const hardBlocked = orchestratorUnhealthy || Boolean(activeFailedEvent) || Boolean(blockingDecision) || workerCapacityBlocked || failedWithoutProgress;
 
   let state: MissionDigestState = "plan_ready";
   if (hardBlocked) {
@@ -1686,6 +1689,7 @@ export function buildMissionDigest({
     activeJobs,
     terminalJobs,
     workerSummary,
+    workerCapacityBlocked,
     orchestratorUnhealthy,
     activeFailedEvent,
     blockingDecision: Boolean(blockingDecision),
@@ -1720,6 +1724,7 @@ export function buildMissionDigest({
       queuedJobs,
       activeJobs,
       workerSummary,
+      workerCapacityBlocked,
       orchestratorUnhealthy,
       blockingDecision: Boolean(blockingDecision),
     }),
@@ -1973,6 +1978,7 @@ export function missionStateCopy({
   activeJobs,
   terminalJobs,
   workerSummary,
+  workerCapacityBlocked,
   orchestratorUnhealthy,
   activeFailedEvent,
   blockingDecision,
@@ -1986,6 +1992,7 @@ export function missionStateCopy({
   activeJobs: number;
   terminalJobs: number;
   workerSummary: ReturnType<typeof missionWorkerSummary>;
+  workerCapacityBlocked: boolean;
   orchestratorUnhealthy: boolean;
   activeFailedEvent?: AgentActivityEvent;
   blockingDecision: boolean;
@@ -1997,7 +2004,7 @@ export function missionStateCopy({
         detail: "Refresh the connection or verify the orchestrator URL before scheduling more work.",
       };
     }
-    if (workerSummary.failed) {
+    if (workerCapacityBlocked) {
       return {
         headline: "Worker supervision needs attention.",
         detail: "A worker or requirement reported a failure. Open Operations for the exact worker state.",
@@ -2185,6 +2192,7 @@ export function buildMissionNextActions({
   queuedJobs,
   activeJobs,
   workerSummary,
+  workerCapacityBlocked,
   orchestratorUnhealthy,
   blockingDecision,
 }: {
@@ -2198,6 +2206,7 @@ export function buildMissionNextActions({
   queuedJobs: number;
   activeJobs: number;
   workerSummary: ReturnType<typeof missionWorkerSummary>;
+  workerCapacityBlocked: boolean;
   orchestratorUnhealthy: boolean;
   blockingDecision: boolean;
 }): MissionNextAction[] {
@@ -2215,7 +2224,7 @@ export function buildMissionNextActions({
           actionKey: "refresh",
           disabled: loading,
         })
-      : workerSummary.failed || (queuedJobs > 0 && workerSummary.availableWorkers === 0)
+      : workerCapacityBlocked || (queuedJobs > 0 && workerSummary.availableWorkers === 0)
         ? action("open-workers", "Open Workers", "Worker state explains why queued work is not moving.", "primary", {
             targetTab: "operations",
             targetId: "workers",
@@ -2511,10 +2520,11 @@ export function buildMissionChampionSummary(detail: ProjectDetail): MissionChamp
 }
 
 export function missionLiveStepFromEvent(event: AgentActivityEvent): MissionLiveActivity["steps"][number] {
+  const championGuard = isChampionSelectedGuardActivity(event);
   return {
     id: `event-${event.id}`,
     label: missionActivityLabelForEvent(event),
-    status: missionLiveStatus(event.status),
+    status: championGuard ? "succeeded" : missionLiveStatus(event.status),
     timestamp: event.created_at,
     ...missionActivityTargetForEvent(event),
   };
@@ -2531,6 +2541,7 @@ export function missionLiveStatus(value: string): MissionLiveActivity["steps"][n
 export function missionActivityLabelForEvent(event: AgentActivityEvent) {
   const status = activityStatus(event.status);
   const text = `${event.type} ${event.title} ${event.message}`.toLowerCase();
+  if (isChampionSelectedGuardActivity(event)) return "Champion selected";
   if (text.includes("memory") || text.includes("retrieval")) return "Retrieving memories";
   if (text.includes("dataset") || text.includes("profile")) return "Reading dataset profile";
   if (text.includes("candidate") || text.includes("ranking") || text.includes("rank")) return "Ranking candidates";
@@ -2572,6 +2583,7 @@ export function missionLiveActivityDetail(label: string, status: MissionLiveActi
   if (label === "Waiting for workers") return "Queued work is waiting for worker capacity.";
   if (label === "Waiting for training results") return "Training jobs are expected to report metrics.";
   if (label === "Writing decision") return "The agent is recording a compact project decision.";
+  if (label === "Champion selected") return "A champion is selected; follow-up scheduling requires reopen.";
   if (label === "Selecting champion") return "Completed runs are being promoted into a champion outcome.";
   if (status === "failed") return "The latest agentic step failed; open Agents for the audit trail.";
   if (status === "blocked") return "The latest agentic step is blocked by a visible gate.";
@@ -2590,6 +2602,13 @@ export function missionEnsureLiveStep(
 
 export function missionSignalDetailForEvent(event: AgentActivityEvent) {
   const label = missionActivityLabelForEvent(event);
+  if (label === "Champion selected") {
+    const metadata = recordObject(event.metadata);
+    return activitySafeDisplayText(
+      recordString(metadata, "reason") || "Champion selected; reopen experimentation to schedule more.",
+      180,
+    );
+  }
   if (label === "Validation blocked") return "Open Agents for backend gate detail.";
   if (label === "Retrieving memories") return "Memory lookup completed without exposing raw payloads.";
   if (label === "Scheduling workers" || label === "Waiting for workers") return "Worker state is available in Operations.";
@@ -2718,6 +2737,16 @@ export function fallbackActivityFromExecutionEvent(event: ExecutionEvent): Agent
     case "AGENT_OUTCOME_RECORDED": {
       const validationStatus = recordString(payload, "backend_validation_status").toLowerCase();
       if (validationStatus === "blocked") {
+        if (recordString(payload, "backend_stop_guard").toLowerCase() === "champion_selected_guard") {
+          return {
+            ...base,
+            type: "planner.champion_guard",
+            severity: "info",
+            title: "Champion selected",
+            status: "succeeded",
+            message: activitySafeDisplayText(recordString(payload, "reason") || event.message, 220),
+          };
+        }
         return {
           ...base,
           type: "planner.blocked",
@@ -3027,6 +3056,14 @@ export function activityStatus(value: string): AgentActivityEvent["status"] {
   const normalized = value.toLowerCase();
   if (["active", "waiting", "succeeded", "failed", "blocked"].includes(normalized)) return normalized;
   return "active";
+}
+
+export function isChampionSelectedGuardActivity(event: AgentActivityEvent) {
+  const metadata = recordObject(event.metadata);
+  const guard = recordString(metadata, "backend_stop_guard").toLowerCase();
+  const validationError = recordString(metadata, "validation_error").toLowerCase();
+  const text = `${event.type} ${event.title} ${event.message} ${guard} ${validationError}`.toLowerCase();
+  return guard === "champion_selected_guard" || text.includes("champion selected guard");
 }
 
 export function activityTimestamp(event: AgentActivityEvent) {
@@ -6244,6 +6281,12 @@ export function demoImageURI(image?: ChampionDemoImage | null) {
   return image?.uri || image?.image_uri || "";
 }
 
+export function demoImageInferenceURI(image?: ChampionDemoImage | null) {
+  const source = demoImageURI(image);
+  if (source && !source.startsWith("s3://")) return source;
+  return "";
+}
+
 export function demoImagePreviewURI(image?: ChampionDemoImage | null) {
   return image?.preview_uri || image?.thumbnail_uri || image?.uri || image?.image_uri || "";
 }
@@ -6267,7 +6310,7 @@ export function demoImageDetail(image?: ChampionDemoImage | null) {
 export function demoPredictionRequestMetadata(image: ChampionDemoImage) {
   const metadata: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(recordObject(image.metadata))) {
-    if (["path", "preview_uri", "thumbnail_uri", "uri", "image_uri"].includes(key.toLowerCase())) continue;
+    if (["path", "source_path", "source_image_path", "original_path", "preview_uri", "thumbnail_uri", "uri", "image_uri"].includes(key.toLowerCase())) continue;
     if (typeof value === "string" && isLikelyEncodedPayload(value)) continue;
     metadata[key] = value;
   }

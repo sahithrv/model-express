@@ -35,6 +35,8 @@ import {
 } from "lucide-react";
 import {
   createChampionLocalRuntime,
+  isLocalInferenceUnsafeError,
+  LocalInferenceUnsafeError,
   predictChampionImage,
   readyONNXExport,
   type ChampionLocalRuntime,
@@ -395,6 +397,7 @@ import {
   predictionPostprocessLatency,
   normalizeDemoPredictionResponse,
   attachDemoPredictionPreview,
+  demoImageInferenceURI,
   demoImageURI,
   demoImagePreviewURI,
   demoImageLabel,
@@ -1732,9 +1735,9 @@ export function App() {
   }
 
   async function runChampionLocalPrediction(image: ChampionDemoImage) {
-    const imageSource = demoImagePreviewURI(image) || demoImageURI(image);
+    const imageSource = demoImageInferenceURI(image);
     if (!imageSource || imageSource.startsWith("s3://")) {
-      throw new Error("Local UI inference needs an image preview URI or a local uploaded image.");
+      throw new LocalInferenceUnsafeError("LOCAL_IMAGE_UNAVAILABLE", "Local UI inference needs original image bytes or a local image URI.");
     }
     const runtime = await ensureChampionLocalRuntime();
     const prediction = await predictChampionImage(runtime, image, imageSource, {
@@ -1760,8 +1763,16 @@ export function App() {
     setDemoPredictionLoading(true);
     try {
       if (readyONNXExport(championExportDemo.exports)) {
-        await runChampionLocalPrediction(image);
-        return;
+        try {
+          await runChampionLocalPrediction(image);
+          return;
+        } catch (error) {
+          if (!isLocalInferenceUnsafeError(error)) {
+            throw error;
+          }
+          setLocalInferenceStatus("error");
+          setLocalInferenceError(`${error.message} Falling back to backend demo inference.`);
+        }
       }
       const response = await request<ChampionDemoPrediction | { prediction?: ChampionDemoPrediction }>(
         `/projects/${selectedProjectId}/champion/demo-predictions`,
@@ -1787,7 +1798,7 @@ export function App() {
         await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
       }
     } catch (error) {
-      if (readyONNXExport(championExportDemo.exports)) {
+      if (readyONNXExport(championExportDemo.exports) && !isLocalInferenceUnsafeError(error)) {
         setLocalInferenceStatus("error");
         setLocalInferenceError(error instanceof Error ? error.message : String(error));
       }

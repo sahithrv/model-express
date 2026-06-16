@@ -573,15 +573,17 @@ func (s *Server) listProjectChampionDemoImages(c *gin.Context) {
 	}
 	caps := visualExemplarCapsFromQuery(c, 24, 4, 1_500_000)
 	exemplars := cappedVisualExemplars(championHeldoutDemoImageProfile(champion), caps, "heldout_demo_images", "demo_images", "test_images")
+	sourceOfTruth := "champion.evaluation.heldout_demo_images"
 	if len(exemplars) == 0 {
 		exemplars = testOnlyVisualExemplars(cappedVisualExemplars(dataset.Profile, caps, "demo_images", "visual_exemplars", "test_images"))
+		sourceOfTruth = "datasets.profile"
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"project_id":      projectID,
 		"dataset_id":      dataset.ID,
 		"champion_job_id": champion.JobID,
-		"source_of_truth": "datasets.profile",
+		"source_of_truth": sourceOfTruth,
 		"caps":            caps,
 		"images":          exemplars,
 	})
@@ -656,7 +658,19 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 	if req.MaxDetections > 0 {
 		imageMetadata["max_detections"] = req.MaxDetections
 	}
-	if err == nil {
+	if matchedImageID, matchedTrueLabel, matchedMetadata, ok := championDemoImageMetadata(championHeldoutDemoImageProfile(champion), imageURI); ok {
+		if imageID == "" {
+			imageID = matchedImageID
+		}
+		if trueLabel == "" {
+			trueLabel = matchedTrueLabel
+		}
+		for key, value := range matchedMetadata {
+			if _, exists := imageMetadata[key]; !exists {
+				imageMetadata[key] = value
+			}
+		}
+	} else if err == nil {
 		if matchedImageID, matchedTrueLabel, matchedMetadata, ok := championDemoImageMetadata(dataset.Profile, imageURI); ok {
 			if imageID == "" {
 				imageID = matchedImageID
@@ -704,10 +718,11 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 			"image_uri":              imageURI,
 			"image_id":               imageID,
 			"true_label":             trueLabel,
+			"image_metadata":         imageMetadata,
 			"top_k":                  req.TopK,
 			"requested_at":           time.Now().UTC().Format(time.RFC3339),
 			"prediction_contract":    "worker reports via /jobs/:id/champion-demo-prediction-result",
-			"backend_runs_inference": false,
+			"backend_runs_inference": true,
 		}
 		if req.ConfidenceThreshold != nil {
 			jobConfig["confidence_threshold"] = *req.ConfidenceThreshold
@@ -1227,7 +1242,7 @@ func championDemoImageMetadata(profile map[string]any, imageURI string) (string,
 	if imageURI == "" {
 		return "", "", nil, false
 	}
-	for _, key := range []string{"demo_images", "visual_exemplars", "exemplars"} {
+	for _, key := range []string{"heldout_demo_images", "demo_images", "test_images", "visual_exemplars", "exemplars"} {
 		for _, entry := range profileEntries(profile[key]) {
 			exemplar, ok := visualExemplarFromProfileEntry(entry)
 			if !ok || strings.TrimSpace(exemplar.URI) != imageURI {

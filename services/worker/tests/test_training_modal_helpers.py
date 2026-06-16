@@ -1489,6 +1489,35 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(label_lookup["cat_key"], 0)
         self.assertEqual(label_lookup["dog_key"], 1)
 
+    def test_metadata_fetch_absence_counts_as_zero_records(self) -> None:
+        class Response:
+            status_code = 404
+
+            def raise_for_status(self) -> None:
+                raise AssertionError("404 should be treated as metadata unavailable")
+
+        with patch("requests.get", return_value=Response()):
+            bundle = self.modal_app._fetch_training_metadata_bundle(
+                "https://orchestrator.test",
+                "dataset_1",
+                {},
+            )
+
+        self.assertIsNone(bundle)
+        self.assertEqual(len(self.modal_app._metadata_manifest_records(bundle)), 0)
+
+    def test_metadata_helpers_tolerate_absent_optional_sections(self) -> None:
+        self.assertEqual(self.modal_app._metadata_manifest_records(None), [])
+
+        execution_metadata = {
+            "dataset_tier": None,
+            "metadata_bundle": None,
+            "dataloader": None,
+        }
+        self.assertEqual(self.modal_app._dict_or_empty(execution_metadata.get("dataset_tier")), {})
+        self.assertEqual(self.modal_app._dict_or_empty(execution_metadata.get("metadata_bundle")), {})
+        self.assertEqual(self.modal_app._dict_or_empty(execution_metadata.get("dataloader")), {})
+
     def test_metadata_bundle_resolves_paths_under_common_image_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_dir = Path(temp_dir)

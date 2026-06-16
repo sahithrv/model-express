@@ -9,7 +9,7 @@ from PIL import Image
 
 from worker.exporting.artifacts import produce_champion_export_artifacts
 from worker.exporting.inference import _postprocess_detection_outputs, run_demo_inference_from_manifest
-from worker.exporting.preprocessing import prepare_image_for_inference
+from worker.exporting.preprocessing import prepare_image_for_inference, preprocessing_parity_diagnostics
 
 
 class DemoInferenceTests(unittest.TestCase):
@@ -31,6 +31,64 @@ class DemoInferenceTests(unittest.TestCase):
         self.assertEqual(prepared.size, (8, 8))
         self.assertEqual(prepared.getpixel((0, 0)), (0, 0, 0))
         self.assertEqual(prepared.getpixel((0, 2)), (255, 0, 0))
+
+    def test_bbox_preprocessing_requires_runtime_metadata_for_parity(self) -> None:
+        image = Image.new("RGB", (10, 10), (255, 0, 0))
+        for x in range(5, 10):
+            for y in range(10):
+                image.putpixel((x, y), (0, 0, 255))
+        metadata = {
+            "input_shape": [1, 3, 4, 4],
+            "preprocessing": {
+                "resize_strategy": "squash",
+                "crop_strategy": "bbox_crop_if_available",
+                "normalization": "none",
+            },
+        }
+
+        diagnostics = preprocessing_parity_diagnostics(metadata, {})
+        self.assertEqual(diagnostics["status"], "unsafe")
+        self.assertEqual(diagnostics["issues"][0]["code"], "BBOX_METADATA_REQUIRED")
+        with self.assertRaisesRegex(ValueError, "BBOX_METADATA_REQUIRED"):
+            prepare_image_for_inference(Image, image, metadata, strict_metadata=True)
+
+        prepared = prepare_image_for_inference(
+            Image,
+            image,
+            metadata,
+            image_metadata={"bbox": {"x1": 5, "y1": 0, "x2": 10, "y2": 10}},
+            strict_metadata=True,
+        )
+        self.assertEqual(prepared.size, (4, 4))
+        self.assertGreater(prepared.getpixel((3, 2))[2], prepared.getpixel((3, 2))[0])
+
+    def test_legacy_heldout_thumbnail_metadata_is_not_parity_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "demo.jpg"
+            Image.new("RGB", (16, 16), (255, 0, 0)).save(image_path)
+            manifest = {
+                "schema_version": "champion_export_manifest_v1",
+                "status": "created",
+                "metadata": {
+                    "model": "tiny",
+                    "class_labels": ["cat", "dog"],
+                    "input_shape": [1, 3, 16, 16],
+                    "preprocessing": {"normalization": "none"},
+                },
+                "artifacts": [],
+            }
+
+            payload = run_demo_inference_from_manifest(
+                manifest=manifest,
+                image_path=image_path,
+                true_label="cat",
+                image_metadata={"source": "heldout_test"},
+            )
+
+            self.assertEqual(payload["status"], "pending")
+            self.assertEqual(payload["error_code"], "HELDOUT_IMAGE_SOURCE_UNVERIFIED")
+            self.assertEqual(payload["image_metadata"]["parity_status"], "unsafe")
 
     def test_inference_returns_pending_when_supported_artifact_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -102,6 +160,46 @@ class DemoInferenceTests(unittest.TestCase):
                 true_label="dog",
             )
             self.assertTrue(cached_payload["latency_breakdown_ms"]["model_cache_hit"])
+
+    def test_onnx_classification_inference_returns_ranked_payload_when_available(self) -> None:
+        try:
+            import onnxruntime  # noqa: F401
+            import onnxscript  # noqa: F401
+            import torch
+            from torch import nn
+        except Exception as exc:  # pragma: no cover - depends on optional local deps
+            raise unittest.SkipTest(f"ONNX inference dependencies are unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            export_dir = Path(temp_dir)
+            model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 4 * 4, 2))
+            with torch.no_grad():
+                model[1].weight.zero_()
+                model[1].bias[:] = torch.tensor([0.1, 1.1])
+            manifest = produce_champion_export_artifacts(
+                export_dir=export_dir,
+                model_name="tiny_linear",
+                class_names=["cat", "dog"],
+                image_size=4,
+                model=model,
+                preprocessing={"normalization": "none"},
+                formats=("onnx",),
+            )
+            image_path = export_dir / "demo.jpg"
+            Image.new("RGB", (4, 4), (20, 20, 20)).save(image_path)
+
+            payload = run_demo_inference_from_manifest(
+                manifest_path=Path(manifest["manifest_path"]),
+                image_path=image_path,
+                true_label="dog",
+                image_metadata={"parity_safe": True, "demo_source_type": "custom_original_bytes"},
+            )
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["runtime"], "onnx")
+            self.assertEqual(payload["predicted_label"], "dog")
+            self.assertEqual([item["label"] for item in payload["top_k"]], ["dog", "cat"])
+            self.assertEqual(payload["image_metadata"]["parity_status"], "ok")
 
     def test_framework_native_checkpoint_inference_returns_ranked_payload(self) -> None:
         try:

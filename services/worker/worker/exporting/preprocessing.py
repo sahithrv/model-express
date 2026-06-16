@@ -53,6 +53,8 @@ def build_inference_contract(
                 "crop_strategy": crop_strategy,
                 "requires_runtime_metadata": True,
                 "required_metadata": ["bounding_boxes"],
+                "accepted_coordinate_formats": ["xyxy_pixels", "xyxy_normalized", "xywh_pixels", "xywh_normalized"],
+                "padding_fraction": 0.05,
             }
         )
     if resize_strategy == "preserve_aspect_pad":
@@ -138,10 +140,26 @@ def build_inference_contract(
     }
 
 
-def prepare_image_for_inference(Image, image, metadata: dict):
+def prepare_image_for_inference(
+    Image,
+    image,
+    metadata: dict,
+    image_metadata: dict | None = None,
+    *,
+    strict_metadata: bool = False,
+):
     image_size = image_size_from_metadata(metadata)
     config = _preprocessing_config_from_metadata(metadata)
     rgb = image.convert("RGB")
+    if _bbox_crop_requested(config):
+        bbox = _bbox_from_runtime_metadata(image_metadata, rgb.size)
+        if bbox is None:
+            if strict_metadata:
+                raise ValueError(
+                    "BBOX_METADATA_REQUIRED: preprocessing requires bounding_boxes metadata for parity-safe inference."
+                )
+        else:
+            rgb = crop_image_to_bbox(rgb, bbox)
     resize_strategy = config["resize_strategy"]
     crop_strategy = config["crop_strategy"]
     if resize_strategy == "preserve_aspect_pad":
@@ -163,6 +181,69 @@ def resize_with_padding(Image, image, image_size: int):
     top = (image_size - rgb.height) // 2
     canvas.paste(rgb, (left, top))
     return canvas
+
+
+def crop_image_to_bbox(image, bbox: tuple[int, int, int, int]):
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    xmin, ymin, xmax, ymax = bbox
+    pad_x = max(1, int((xmax - xmin) * 0.05))
+    pad_y = max(1, int((ymax - ymin) * 0.05))
+    crop_box = (
+        max(0, xmin - pad_x),
+        max(0, ymin - pad_y),
+        min(width, xmax + pad_x),
+        min(height, ymax + pad_y),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return rgb
+    return rgb.crop(crop_box)
+
+
+def preprocessing_parity_diagnostics(metadata: dict, image_metadata: dict | None = None) -> dict:
+    config = _preprocessing_config_from_metadata(metadata)
+    diagnostics = {
+        "schema_version": "demo_preprocessing_parity_v1",
+        "status": "ok",
+        "issues": [],
+        "preprocessing": {
+            "resize_strategy": config["resize_strategy"],
+            "crop_strategy": config["crop_strategy"],
+            "normalization": config["normalization"],
+            "bbox_mode": config["bbox_mode"],
+        },
+    }
+    source_type = ""
+    parity_safe = None
+    if isinstance(image_metadata, dict):
+        source_type = str(image_metadata.get("demo_source_type") or image_metadata.get("source") or "").lower()
+        if isinstance(image_metadata.get("parity_safe"), bool):
+            parity_safe = image_metadata["parity_safe"]
+    if parity_safe is False or "thumbnail" in source_type:
+        diagnostics["status"] = "unsafe"
+        diagnostics["issues"].append(
+            {
+                "code": "DEMO_IMAGE_NOT_PARITY_SAFE",
+                "message": "Demo image metadata marks the source as a thumbnail or non-parity-safe derivative.",
+            }
+        )
+    elif source_type == "heldout_test" and parity_safe is not True:
+        diagnostics["status"] = "unsafe"
+        diagnostics["issues"].append(
+            {
+                "code": "HELDOUT_IMAGE_SOURCE_UNVERIFIED",
+                "message": "Held-out demo image metadata does not prove that original image bytes are being used.",
+            }
+        )
+    if _bbox_crop_requested(config) and not _has_runtime_bbox_metadata(image_metadata):
+        diagnostics["status"] = "unsafe"
+        diagnostics["issues"].append(
+            {
+                "code": "BBOX_METADATA_REQUIRED",
+                "message": "Preprocessing requires bounding_boxes metadata before demo inference can match validation/test.",
+            }
+        )
+    return diagnostics
 
 
 def image_size_from_metadata(metadata: dict) -> int:
@@ -482,6 +563,100 @@ def _bbox_crop_requested(config: dict) -> bool:
         or config.get("resize_strategy") == "bbox_crop_if_available"
         or config.get("bbox_mode") in {"crop_if_available", "crop_and_compare_full_image"}
     )
+
+
+def _has_runtime_bbox_metadata(image_metadata: dict | None) -> bool:
+    if not isinstance(image_metadata, dict):
+        return False
+    for key in ("bounding_boxes", "bbox", "box", "annotation"):
+        if key in image_metadata:
+            return True
+    metadata = image_metadata.get("metadata")
+    return isinstance(metadata, dict) and _has_runtime_bbox_metadata(metadata)
+
+
+def _bbox_from_runtime_metadata(
+    image_metadata: dict | None,
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(image_metadata, dict):
+        return None
+    for key in ("bounding_boxes", "bbox", "box"):
+        value = image_metadata.get(key)
+        bbox = _bbox_from_value(value, image_size)
+        if bbox is not None:
+            return bbox
+    annotation = image_metadata.get("annotation")
+    if isinstance(annotation, dict):
+        bbox = _bbox_from_runtime_metadata(annotation, image_size)
+        if bbox is not None:
+            return bbox
+    nested = image_metadata.get("metadata")
+    if isinstance(nested, dict):
+        return _bbox_from_runtime_metadata(nested, image_size)
+    return None
+
+
+def _bbox_from_value(value: object, image_size: tuple[int, int]) -> tuple[int, int, int, int] | None:
+    if isinstance(value, list):
+        if value and isinstance(value[0], dict):
+            return _bbox_from_value(value[0], image_size)
+        if len(value) >= 4:
+            return _bbox_from_xyxy(value[:4], image_size)
+    if isinstance(value, tuple) and len(value) >= 4:
+        return _bbox_from_xyxy(value[:4], image_size)
+    if not isinstance(value, dict):
+        return None
+    candidates = [
+        (value.get("xmin", value.get("x1")), value.get("ymin", value.get("y1")), value.get("xmax", value.get("x2")), value.get("ymax", value.get("y2"))),
+        (
+            value.get("left", value.get("x")),
+            value.get("top", value.get("y")),
+            None,
+            None,
+        ),
+    ]
+    for xmin, ymin, xmax, ymax in candidates:
+        if xmin is None or ymin is None:
+            continue
+        if xmax is None or ymax is None:
+            width = value.get("width", value.get("w"))
+            height = value.get("height", value.get("h"))
+            if width is None or height is None:
+                continue
+            try:
+                xmax = float(xmin) + float(width)
+                ymax = float(ymin) + float(height)
+            except (TypeError, ValueError):
+                continue
+        bbox = _bbox_from_xyxy((xmin, ymin, xmax, ymax), image_size)
+        if bbox is not None:
+            return bbox
+    return None
+
+
+def _bbox_from_xyxy(values: object, image_size: tuple[int, int]) -> tuple[int, int, int, int] | None:
+    try:
+        xmin, ymin, xmax, ymax = [float(item) for item in values]
+    except (TypeError, ValueError):
+        return None
+    width, height = image_size
+    if max(abs(xmin), abs(ymin), abs(xmax), abs(ymax)) <= 2.0:
+        xmin *= width
+        xmax *= width
+        ymin *= height
+        ymax *= height
+    if xmax < xmin:
+        xmin, xmax = xmax, xmin
+    if ymax < ymin:
+        ymin, ymax = ymax, ymin
+    xmin = max(0, min(int(round(xmin)), width))
+    xmax = max(0, min(int(round(xmax)), width))
+    ymin = max(0, min(int(round(ymin)), height))
+    ymax = max(0, min(int(round(ymax)), height))
+    if xmax <= xmin or ymax <= ymin:
+        return None
+    return xmin, ymin, xmax, ymax
 
 
 def _three_float_list(value: object, positive: bool = False) -> list[float] | None:

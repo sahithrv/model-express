@@ -22,6 +22,7 @@ from worker.exporting.preprocessing import (
     image_to_chw_float32_array,
     normalization_values,
     prepare_image_for_inference,
+    preprocessing_parity_diagnostics,
 )
 
 _MODEL_CACHE_LOCK = threading.Lock()
@@ -35,6 +36,7 @@ def run_demo_inference_from_manifest(
     image_path: Path,
     top_k: int = 5,
     true_label: str | None = None,
+    image_metadata: dict | None = None,
     confidence_threshold: float | None = None,
     iou_threshold: float | None = None,
     max_detections: int | None = None,
@@ -47,15 +49,49 @@ def run_demo_inference_from_manifest(
     if manifest.get("status") == "error":
         return _pending_payload(manifest.get("error_code", "MANIFEST_ERROR"), manifest.get("error", ""))
 
-    artifact = _find_created_artifact(manifest, "torchscript")
-    runtime = "torchscript"
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    class_labels = [str(label) for label in metadata.get("class_labels", [])]
+    if not class_labels:
+        return _pending_payload("CLASS_LABELS_UNAVAILABLE", "Export metadata has no class labels.")
+    label_error = _class_label_error(class_labels)
+    if label_error:
+        return _pending_payload("CLASS_LABEL_ORDER_INVALID", label_error)
+    image_metadata_payload = image_metadata if isinstance(image_metadata, dict) else {}
+    parity = preprocessing_parity_diagnostics(metadata, image_metadata_payload)
+    if parity.get("status") != "ok":
+        issue = _first_parity_issue(parity)
+        return _pending_payload(
+            str(issue.get("code") or "DEMO_PREPROCESSING_PARITY_UNSAFE"),
+            str(issue.get("message") or "Demo inference is not parity-safe for this image."),
+            image_metadata=_inference_image_metadata(image_metadata_payload, parity, "unavailable"),
+        )
+    if _is_detection_metadata(metadata):
+        return _run_detection_inference_from_manifest(
+            manifest_path=manifest_path,
+            manifest=manifest,
+            image_path=image_path,
+            class_labels=class_labels,
+            metadata=metadata,
+            true_label=true_label,
+            image_metadata=image_metadata_payload,
+            parity=parity,
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold,
+            max_detections=max_detections,
+        )
+
+    artifact = _find_created_artifact(manifest, "onnx")
+    runtime = "onnx"
+    if artifact is None:
+        artifact = _find_created_artifact(manifest, "torchscript")
+        runtime = "torchscript"
     if artifact is None:
         artifact = _find_created_artifact(manifest, "framework_native_checkpoint")
         runtime = "framework_native_checkpoint"
     if artifact is None:
         return _pending_payload(
             "MODEL_ARTIFACT_UNAVAILABLE",
-            "Demo inference requires a created TorchScript or framework-native checkpoint artifact in the export manifest.",
+            "Demo inference requires a created ONNX, TorchScript, or framework-native checkpoint artifact in the export manifest.",
         )
 
     model_path = _resolve_artifact_path(manifest_path, artifact.get("path") or artifact.get("uri"))
@@ -65,28 +101,23 @@ def run_demo_inference_from_manifest(
             "The model artifact referenced by the manifest is not available.",
         )
 
+    if runtime == "onnx":
+        return _run_classification_onnx_inference(
+            model_path=model_path,
+            image_path=image_path,
+            metadata=metadata,
+            image_metadata=image_metadata_payload,
+            parity=parity,
+            class_labels=class_labels,
+            true_label=true_label,
+            top_k=top_k,
+        )
+
     try:
         import torch
         from PIL import Image
     except Exception as exc:
         return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", str(exc))
-
-    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
-    class_labels = [str(label) for label in metadata.get("class_labels", [])]
-    if not class_labels:
-        return _pending_payload("CLASS_LABELS_UNAVAILABLE", "Export metadata has no class labels.")
-    if _is_detection_metadata(metadata):
-        return _run_detection_inference_from_manifest(
-            manifest_path=manifest_path,
-            manifest=manifest,
-            image_path=image_path,
-            class_labels=class_labels,
-            metadata=metadata,
-            true_label=true_label,
-            confidence_threshold=confidence_threshold,
-            iou_threshold=iou_threshold,
-            max_detections=max_detections,
-        )
 
     try:
         load_started = time.perf_counter()
@@ -97,7 +128,7 @@ def run_demo_inference_from_manifest(
         model_load_ms = 0.0 if model_cache_hit else (time.perf_counter() - load_started) * 1000
 
         preprocess_started = time.perf_counter()
-        tensor = _image_tensor(Image, torch, image_path, metadata).unsqueeze(0)
+        tensor = _image_tensor(Image, torch, image_path, metadata, image_metadata_payload).unsqueeze(0)
         preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
 
         inference_started = time.perf_counter()
@@ -110,6 +141,12 @@ def run_demo_inference_from_manifest(
         postprocess_started = time.perf_counter()
         with torch.no_grad():
             probabilities = torch.nn.functional.softmax(logits, dim=1)[0]
+            if int(probabilities.numel()) != len(class_labels):
+                return _pending_payload(
+                    "LABEL_MAP_OUTPUT_MISMATCH",
+                    f"Model output class count {int(probabilities.numel())} does not match export class_labels count {len(class_labels)}.",
+                    image_metadata=_inference_image_metadata(image_metadata_payload, parity, runtime),
+                )
             count = min(max(1, int(top_k)), len(class_labels), int(probabilities.numel()))
             values, indices = torch.topk(probabilities, k=count)
         postprocess_ms = (time.perf_counter() - postprocess_started) * 1000
@@ -128,6 +165,91 @@ def run_demo_inference_from_manifest(
     )
     payload["status"] = "ok"
     payload["runtime"] = runtime
+    payload["image_metadata"] = _inference_image_metadata(image_metadata_payload, parity, runtime)
+    payload["latency_breakdown_ms"] = {
+        "model_load": round(max(0.0, model_load_ms), 3),
+        "model_cache_hit": model_cache_hit,
+        "preprocess": round(max(0.0, preprocess_ms), 3),
+        "inference": round(max(0.0, inference_ms), 3),
+        "postprocess": round(max(0.0, postprocess_ms), 3),
+        "streaming_total": payload["latency_ms"],
+        "single_request_total": round(
+            max(0.0, model_load_ms + preprocess_ms + inference_ms + postprocess_ms),
+            3,
+        ),
+    }
+    return payload
+
+
+def _run_classification_onnx_inference(
+    *,
+    model_path: Path,
+    image_path: Path,
+    metadata: dict,
+    image_metadata: dict,
+    parity: dict,
+    class_labels: list[str],
+    true_label: str | None,
+    top_k: int,
+) -> dict:
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        from PIL import Image
+    except Exception as exc:
+        return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", str(exc))
+
+    try:
+        load_started = time.perf_counter()
+        session, model_cache_hit = _cached_runtime(
+            _runtime_cache_key(model_path, "onnx", metadata),
+            lambda: ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"]),
+        )
+        model_load_ms = 0.0 if model_cache_hit else (time.perf_counter() - load_started) * 1000
+
+        preprocess_started = time.perf_counter()
+        array = _image_array(Image, image_path, metadata, image_metadata)
+        tensor = np.expand_dims(array, axis=0).astype("float32", copy=False)
+        preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
+
+        inference_started = time.perf_counter()
+        input_name = session.get_inputs()[0].name
+        output_names = [output.name for output in session.get_outputs()]
+        output_values = session.run(output_names, {input_name: tensor})
+        inference_ms = (time.perf_counter() - inference_started) * 1000
+
+        postprocess_started = time.perf_counter()
+        logits = np.asarray(output_values[0], dtype=np.float32)
+        if logits.ndim > 1:
+            logits = logits.reshape(logits.shape[0], -1)[0]
+        else:
+            logits = logits.reshape(-1)
+        if int(logits.size) != len(class_labels):
+            return _pending_payload(
+                "LABEL_MAP_OUTPUT_MISMATCH",
+                f"ONNX output class count {int(logits.size)} does not match export class_labels count {len(class_labels)}.",
+                image_metadata=_inference_image_metadata(image_metadata, parity, "onnx"),
+            )
+        probabilities = _softmax_numpy(logits)
+        count = min(max(1, int(top_k)), len(class_labels), int(probabilities.size))
+        indices = np.argsort(probabilities)[::-1][:count]
+        postprocess_ms = (time.perf_counter() - postprocess_started) * 1000
+    except Exception as exc:
+        return _pending_payload("INFERENCE_FAILED", str(exc))
+
+    predictions = [
+        {"label": class_labels[int(index)], "confidence": float(probabilities[int(index)])}
+        for index in indices.tolist()
+    ]
+    payload = build_demo_prediction_payload(
+        image_id=str(image_path),
+        predictions=predictions,
+        latency_ms=preprocess_ms + inference_ms + postprocess_ms,
+        true_label=true_label,
+    )
+    payload["status"] = "ok"
+    payload["runtime"] = "onnx"
+    payload["image_metadata"] = _inference_image_metadata(image_metadata, parity, "onnx")
     payload["latency_breakdown_ms"] = {
         "model_load": round(max(0.0, model_load_ms), 3),
         "model_cache_hit": model_cache_hit,
@@ -151,6 +273,8 @@ def _run_detection_inference_from_manifest(
     class_labels: list[str],
     metadata: dict,
     true_label: str | None,
+    image_metadata: dict,
+    parity: dict,
     confidence_threshold: float | None,
     iou_threshold: float | None,
     max_detections: int | None,
@@ -194,7 +318,13 @@ def _run_detection_inference_from_manifest(
         preprocess_started = time.perf_counter()
         with Image.open(image_path) as image:
             original_size = image.size
-            prepared = prepare_image_for_inference(Image, image, metadata)
+            prepared = prepare_image_for_inference(
+                Image,
+                image,
+                metadata,
+                image_metadata=image_metadata,
+                strict_metadata=True,
+            )
             input_size = prepared.size
             array = image_to_chw_float32_array(prepared, metadata)
         tensor = np.expand_dims(array, axis=0).astype("float32", copy=False)
@@ -240,16 +370,17 @@ def _run_detection_inference_from_manifest(
             3,
         ),
     }
-    image_metadata = payload.get("image_metadata") if isinstance(payload.get("image_metadata"), dict) else {}
-    image_metadata.update(
+    result_image_metadata = payload.get("image_metadata") if isinstance(payload.get("image_metadata"), dict) else {}
+    result_image_metadata.update(
         {
+            **_inference_image_metadata(image_metadata, parity, "onnx"),
             "runtime": "onnx",
             "confidence_threshold": thresholds["confidence_threshold"],
             "iou_threshold": thresholds["iou_threshold"],
             "max_detections": thresholds["max_detections"],
         }
     )
-    payload["image_metadata"] = image_metadata
+    payload["image_metadata"] = result_image_metadata
     return payload
 
 
@@ -731,11 +862,21 @@ def _float_value(value: object, default: float = 0.0) -> float:
         return default
 
 
-def _image_tensor(Image, torch, image_path: Path, metadata: dict):
-    with Image.open(image_path) as image:
-        prepared = prepare_image_for_inference(Image, image, metadata)
-        array = image_to_chw_float32_array(prepared, metadata)
+def _image_tensor(Image, torch, image_path: Path, metadata: dict, image_metadata: dict | None = None):
+    array = _image_array(Image, image_path, metadata, image_metadata)
     return torch.from_numpy(array)
+
+
+def _image_array(Image, image_path: Path, metadata: dict, image_metadata: dict | None = None):
+    with Image.open(image_path) as image:
+        prepared = prepare_image_for_inference(
+            Image,
+            image,
+            metadata,
+            image_metadata=image_metadata,
+            strict_metadata=True,
+        )
+        return image_to_chw_float32_array(prepared, metadata)
 
 
 def _image_size(metadata: dict) -> int:
@@ -756,6 +897,47 @@ def _three_floats(value: object, positive: bool = False) -> list[float] | None:
     if positive and any(item <= 0 for item in parsed):
         return None
     return parsed
+
+
+def _softmax_numpy(values):
+    import numpy as np
+
+    values = np.asarray(values, dtype=np.float32)
+    shifted = values - np.max(values)
+    exps = np.exp(shifted)
+    total = float(np.sum(exps))
+    if total <= 0:
+        return np.zeros_like(values)
+    return exps / total
+
+
+def _class_label_error(class_labels: list[str]) -> str:
+    labels = [str(label).strip() for label in class_labels]
+    if any(not label for label in labels):
+        return "Export class_labels contains an empty label."
+    if len(set(labels)) != len(labels):
+        return "Export class_labels contains duplicates, so model output indices are ambiguous."
+    return ""
+
+
+def _first_parity_issue(parity: dict) -> dict:
+    issues = parity.get("issues") if isinstance(parity, dict) else []
+    if isinstance(issues, list):
+        for issue in issues:
+            if isinstance(issue, dict):
+                return issue
+    return {}
+
+
+def _inference_image_metadata(image_metadata: dict | None, parity: dict, runtime: str) -> dict:
+    source = image_metadata if isinstance(image_metadata, dict) else {}
+    return {
+        **source,
+        "runtime": runtime,
+        "preprocessing_parity": parity,
+        "parity_status": parity.get("status", "unknown") if isinstance(parity, dict) else "unknown",
+        "preprocessing_contract_applied": parity.get("status") == "ok" if isinstance(parity, dict) else False,
+    }
 
 
 def _find_created_artifact(manifest: dict, format_name: str) -> dict | None:
@@ -810,8 +992,8 @@ def _safe_path_part(value: str) -> str:
     return safe or "artifact"
 
 
-def _pending_payload(error_code: str, error: str) -> dict:
-    return {
+def _pending_payload(error_code: str, error: str, image_metadata: dict | None = None) -> dict:
+    payload = {
         "schema_version": "champion_demo_prediction_v1",
         "status": "pending",
         "error_code": str(error_code),
@@ -821,3 +1003,6 @@ def _pending_payload(error_code: str, error: str) -> dict:
         "confidence": 0.0,
         "latency_ms": 0.0,
     }
+    if isinstance(image_metadata, dict):
+        payload["image_metadata"] = image_metadata
+    return payload

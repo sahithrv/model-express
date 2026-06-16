@@ -97,13 +97,13 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 }
 
 func (s *Server) plannerFollowUpStopReason(projectID string, sourcePlan plans.ExperimentPlan, projectPlans []plans.ExperimentPlan) (string, string, bool, error) {
-	if !terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
-		return "", "", false, nil
-	}
 	if stopReason, _, ok, err := s.projectChampionSelectedFollowUpStopReason(projectID); err != nil {
 		return "", "", false, err
 	} else if ok {
 		return stopReason, "champion_selected_guard", true, nil
+	}
+	if !terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
+		return "", "", false, nil
 	}
 	project, err := s.store.GetProject(projectID)
 	if err != nil {
@@ -355,14 +355,12 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
-	if terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
-		if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(projectID); err != nil {
-			return plans.ExperimentPlan{}, false, err
-		} else if ok {
-			message := "Follow-up scheduling blocked because the project already has a selected champion."
-			s.recordChampionSelectedFollowUpBlocked(projectID, sourcePlan.ID, decision.ID, "", message, stopReason, stopDetails)
-			return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
-		}
+	if stopReason, stopDetails, ok, err := s.projectChampionSelectedFollowUpStopReason(projectID); err != nil {
+		return plans.ExperimentPlan{}, false, err
+	} else if ok {
+		message := "Follow-up scheduling blocked because the project already has a selected champion."
+		s.recordChampionSelectedFollowUpBlocked(projectID, sourcePlan.ID, decision.ID, "", message, stopReason, stopDetails)
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
 	}
 	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
 		if err := s.validateExistingFollowUpPlanStillNovel(projectID, decision.ID, existingPlan, projectPlans); err != nil {
@@ -606,7 +604,7 @@ func (s *Server) projectChampionSelectionState(projectID string) (projectChampio
 			state.TerminalAt = champion.CreatedAt
 		}
 		state.Reason = fmt.Sprintf(
-			"Project already has selected champion %s; autonomous follow-up scheduling requires an explicit reopen or new exploration round.",
+			"Project already has selected champion %s; follow-up scheduling requires an explicit reopen or new exploration round.",
 			champion.JobID,
 		)
 		state.PlanID = champion.PlanID
@@ -629,7 +627,7 @@ func (s *Server) projectChampionSelectionState(projectID string) (projectChampio
 				state.Terminal = true
 				state.TerminalAt = decision.CreatedAt
 				state.Reason = fmt.Sprintf(
-					"Project already has SELECT_CHAMPION decision %s; autonomous follow-up scheduling requires an explicit reopen or new exploration round.",
+					"Project already has SELECT_CHAMPION decision %s; follow-up scheduling requires an explicit reopen or new exploration round.",
 					decision.ID,
 				)
 				state.PlanID = decision.PlanID
@@ -824,14 +822,12 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 
 	decision, ok := actionDecisionForPlan(agentDecisions, latestPlan.ID)
 	if !ok {
-		if terminalPlannerGuardsEnabledForMode(s.currentAutomationSettings().AgentMode) {
-			if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(project.ID); err != nil {
-				return automaticExperimentReviewResult{}, err
-			} else if selected {
-				message := fmt.Sprintf("Automatic experiment review skipped for plan %s because the project already has a selected champion.", latestPlan.ID)
-				s.recordChampionSelectedFollowUpBlocked(project.ID, latestPlan.ID, "", "", message, stopReason, stopDetails)
-				return automaticExperimentReviewResult{}, nil
-			}
+		if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(project.ID); err != nil {
+			return automaticExperimentReviewResult{}, err
+		} else if selected {
+			message := fmt.Sprintf("Automatic experiment review skipped for plan %s because the project already has a selected champion.", latestPlan.ID)
+			s.recordChampionSelectedFollowUpBlocked(project.ID, latestPlan.ID, "", "", message, stopReason, stopDetails)
+			return automaticExperimentReviewResult{}, nil
 		}
 		decision, err = s.store.CreateAgentDecision(
 			project.ID,

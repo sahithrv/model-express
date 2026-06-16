@@ -319,11 +319,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     )
     _modal_training_phase(job_id, "metadata_fetch_start", started_at)
     metadata_bundle = _fetch_training_metadata_bundle(orchestrator_url, dataset_id, config)
+    metadata_record_count = len(_metadata_manifest_records(metadata_bundle))
     _modal_training_phase(
         job_id,
         "metadata_fetch_done",
         started_at,
-        records=len(_metadata_manifest_records(metadata_bundle)),
+        records=metadata_record_count,
     )
 
     _modal_training_phase(job_id, "data_load_start", started_at)
@@ -345,7 +346,10 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         metadata_bundle=metadata_bundle,
         dataset_tier_config=dataset_tier_config,
     )
-    subset_manifest = execution_metadata.get("dataset_tier", {}).get("subset_manifest")
+    dataset_tier_metadata = _dict_or_empty(execution_metadata.get("dataset_tier"))
+    metadata_bundle_metadata = _dict_or_empty(execution_metadata.get("metadata_bundle"))
+    dataloader_metadata = _dict_or_empty(execution_metadata.get("dataloader"))
+    subset_manifest = dataset_tier_metadata.get("subset_manifest")
     if isinstance(subset_manifest, dict):
         dataset_materialization["subset_manifest"] = subset_manifest
     effective_batch_size = _positive_int(getattr(train_loader, "batch_size", None), default=batch_size)
@@ -361,9 +365,9 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         train_examples=len(train_loader.dataset),
         val_examples=len(val_loader.dataset),
         test_examples=len(test_loader.dataset),
-        metadata_status=execution_metadata.get("metadata_bundle", {}).get("status"),
-        split_strategy=execution_metadata.get("metadata_bundle", {}).get("split_strategy"),
-        loader_workers=execution_metadata.get("dataloader", {}).get("workers"),
+        metadata_status=metadata_bundle_metadata.get("status"),
+        split_strategy=metadata_bundle_metadata.get("split_strategy"),
+        loader_workers=dataloader_metadata.get("workers"),
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _modal_training_phase(job_id, "model_build_start", started_at, model=model_name, pretrained=pretrained, device=str(device))
@@ -2394,7 +2398,13 @@ def _coerce_metadata_bundle(payload: object) -> dict:
     return payload
 
 
-def _metadata_manifest_records(bundle: dict) -> list:
+def _dict_or_empty(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _metadata_manifest_records(bundle: object) -> list:
+    if not isinstance(bundle, dict):
+        return []
     for key in ("manifest_records", "records", "samples", "files"):
         value = bundle.get(key)
         if isinstance(value, list):
@@ -3370,27 +3380,40 @@ def _demo_images_from_test_examples(eval_details: dict, class_names: list[str], 
         if not path or path in seen_paths:
             continue
         seen_paths.add(path)
-        thumbnail_uri, width, height, size_bytes = _thumbnail_data_uri(path)
-        if not thumbnail_uri:
+        thumbnail_uri, thumbnail_width, thumbnail_height, thumbnail_bytes = _thumbnail_data_uri(path)
+        original_uri, original_width, original_height, original_bytes, original_error = _original_image_data_uri(path)
+        if not thumbnail_uri and not original_uri:
             continue
         true_label = str(record.get("true_class") or "")
         predicted_label = str(record.get("predicted_class") or "")
+        inference_uri = original_uri or thumbnail_uri
+        parity_safe = bool(original_uri)
         demo_images.append(
             {
                 "id": f"test:{Path(path).stem}",
                 "image_id": Path(path).name,
-                "uri": thumbnail_uri,
-                "image_uri": thumbnail_uri,
+                "uri": inference_uri,
+                "image_uri": inference_uri,
+                "preview_uri": thumbnail_uri or original_uri,
                 "thumbnail_uri": thumbnail_uri,
                 "class_name": true_label,
                 "label": true_label,
                 "true_label": true_label,
                 "split": "test",
-                "width": width,
-                "height": height,
-                "size_bytes": size_bytes,
+                "width": original_width or thumbnail_width,
+                "height": original_height or thumbnail_height,
+                "size_bytes": original_bytes or thumbnail_bytes,
                 "metadata": {
                     "source": "heldout_test",
+                    "demo_source_type": "heldout_test_original_bytes" if parity_safe else "heldout_test_thumbnail_fallback",
+                    "parity_safe": parity_safe,
+                    "parity_status": "ok" if parity_safe else "unsafe",
+                    "parity_failure_reason": "" if parity_safe else original_error or "original_image_unavailable",
+                    "source_path": path,
+                    "source_size_bytes": original_bytes,
+                    "thumbnail_size_bytes": thumbnail_bytes,
+                    "thumbnail_width": thumbnail_width,
+                    "thumbnail_height": thumbnail_height,
                     "predicted_label_at_training": predicted_label,
                     "confidence_at_training": round(float(record.get("confidence") or 0.0), 6),
                     "correct_at_training": bool(record.get("correct")),
@@ -3436,6 +3459,70 @@ def _thumbnail_data_uri(path: str, image_size: int = 224, quality: int = 76) -> 
             return f"data:image/jpeg;base64,{payload}", rgb.width, rgb.height, size_bytes
     except Exception:
         return "", 0, 0, 0
+
+
+def _original_image_data_uri(path: str) -> tuple[str, int, int, int, str]:
+    try:
+        from PIL import Image
+    except Exception as exc:
+        return "", 0, 0, 0, f"pillow_unavailable: {exc}"
+
+    source_path = Path(path)
+    try:
+        size_bytes = source_path.stat().st_size
+    except OSError as exc:
+        return "", 0, 0, 0, f"original_image_unavailable: {exc}"
+
+    width = 0
+    height = 0
+    image_format = ""
+    try:
+        with Image.open(source_path) as image:
+            width, height = image.size
+            image_format = str(image.format or "")
+    except Exception as exc:
+        return "", 0, 0, size_bytes, f"original_image_decode_failed: {exc}"
+
+    max_bytes = _heldout_demo_max_original_bytes()
+    if max_bytes <= 0:
+        return "", width, height, size_bytes, "original_image_inline_disabled"
+    if size_bytes > max_bytes:
+        return "", width, height, size_bytes, "original_image_exceeds_demo_inline_cap"
+    try:
+        payload = base64.b64encode(source_path.read_bytes()).decode("ascii")
+    except OSError as exc:
+        return "", width, height, size_bytes, f"original_image_read_failed: {exc}"
+    mime_type = _image_mime_type(source_path, image_format)
+    return f"data:{mime_type};base64,{payload}", width, height, size_bytes, ""
+
+
+def _heldout_demo_max_original_bytes() -> int:
+    value = os.getenv("MODEL_EXPRESS_HELDOUT_DEMO_MAX_ORIGINAL_BYTES", "").strip()
+    if not value:
+        return 1_500_000
+    try:
+        parsed = int(value)
+    except ValueError:
+        return 1_500_000
+    return max(0, min(parsed, 8_000_000))
+
+
+def _image_mime_type(path: Path, image_format: str) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
+    normalized_format = image_format.strip().lower()
+    if normalized_format in {"jpeg", "jpg"}:
+        return "image/jpeg"
+    if normalized_format in {"png", "webp", "gif", "bmp"}:
+        return f"image/{normalized_format}"
+    return "image/jpeg"
 
 
 def _label_quality_audit_requested(config: dict) -> bool:

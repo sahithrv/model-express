@@ -423,14 +423,12 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		return true, nil
 	}
 	automationSettings := s.currentAutomationSettings()
-	if terminalPlannerGuardsEnabledForMode(automationSettings.AgentMode) {
-		if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(job.ProjectID); err != nil {
-			return false, err
-		} else if selected {
-			message := fmt.Sprintf("Experiment Planner skipped for plan %s because the project already has a selected champion.", input.SourcePlan.ID)
-			s.recordChampionSelectedFollowUpBlocked(job.ProjectID, input.SourcePlan.ID, "", "", message, stopReason, stopDetails)
-			return true, nil
-		}
+	if stopReason, stopDetails, selected, err := s.projectChampionSelectedFollowUpStopReason(job.ProjectID); err != nil {
+		return false, err
+	} else if selected {
+		message := fmt.Sprintf("Experiment Planner skipped for plan %s because the project already has a selected champion.", input.SourcePlan.ID)
+		s.recordChampionSelectedFollowUpBlocked(job.ProjectID, input.SourcePlan.ID, "", "", message, stopReason, stopDetails)
+		return true, nil
 	}
 
 	s.recordExperimentPlannerStarted(input)

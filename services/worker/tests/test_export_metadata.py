@@ -28,6 +28,8 @@ class ExportMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["default_runtime"], "onnx")
         self.assertEqual(metadata["input_shape"], [1, 3, 224, 224])
         self.assertEqual(metadata["class_labels"], ["cat", "dog"])
+        self.assertEqual(metadata["class_index_order"], [{"index": 0, "label": "cat"}, {"index": 1, "label": "dog"}])
+        self.assertTrue(metadata["class_label_order_hash"])
         self.assertEqual(metadata["class_count"], 2)
         self.assertEqual(metadata["artifact_uri"], "s3://bucket/model.pt")
         self.assertEqual(metadata["confidence_threshold_defaults"]["classification"]["top_k"], 5)

@@ -17,6 +17,20 @@ export type ChampionLocalRuntime = {
   maxDetections: number;
 };
 
+export class LocalInferenceUnsafeError extends Error {
+  code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "LocalInferenceUnsafeError";
+    this.code = code;
+  }
+}
+
+export function isLocalInferenceUnsafeError(error: unknown): error is LocalInferenceUnsafeError {
+  return error instanceof LocalInferenceUnsafeError;
+}
+
 export type ChampionLocalRuntimeContext = {
   exportRecord: ChampionExport;
   deploymentProfile?: Record<string, unknown>;
@@ -78,6 +92,12 @@ export async function createChampionLocalRuntime(
   const session = await ort.InferenceSession.create(artifact.bytes, sessionOptions);
   const metadata = exportMetadata(context);
   const labels = classLabels(metadata, context.modelProfile, context.deploymentProfile);
+  if (labels.length === 0) {
+    throw new LocalInferenceUnsafeError("CLASS_LABELS_UNAVAILABLE", "The ONNX export manifest does not include class labels.");
+  }
+  if (new Set(labels).size !== labels.length) {
+    throw new LocalInferenceUnsafeError("CLASS_LABEL_ORDER_INVALID", "The ONNX export manifest contains duplicate class labels.");
+  }
   const imageSize = inputImageSize(metadata, context.modelProfile);
   const thresholds = detectionThresholds(metadata);
   return {
@@ -103,6 +123,7 @@ export async function predictChampionImage(
   imageSource: string,
   options: ChampionPredictionOptions = {},
 ): Promise<ChampionDemoPrediction> {
+  assertLocalInferenceParitySafe(runtime, image, imageSource);
   const started = performance.now();
   const input = await imageTensor(imageSource, runtime);
   const inputName = runtime.session.inputNames[0];
@@ -146,6 +167,9 @@ export async function predictChampionImage(
         runtime: "onnxruntime-web",
         artifact_uri: runtime.artifactURI,
         thumbnail_uri: imageSource,
+        image_source_kind: localImageSourceKind(image, imageSource),
+        parity_status: "ok",
+        preprocessing_contract_applied: true,
         task_type: "object_detection",
         detections,
         detection_count: detections.length,
@@ -160,6 +184,12 @@ export async function predictChampionImage(
     };
   }
   const logits = Array.from(output.data as Iterable<number>);
+  if (runtime.labels.length > 0 && logits.length !== runtime.labels.length) {
+    throw new LocalInferenceUnsafeError(
+      "LABEL_MAP_OUTPUT_MISMATCH",
+      `ONNX output class count ${logits.length} does not match export class_labels count ${runtime.labels.length}.`,
+    );
+  }
   const probabilities = softmax(logits);
   const topK = probabilities
     .map((confidence, index) => ({
@@ -186,6 +216,9 @@ export async function predictChampionImage(
       runtime: "onnxruntime-web",
       artifact_uri: runtime.artifactURI,
       thumbnail_uri: imageSource,
+      image_source_kind: localImageSourceKind(image, imageSource),
+      parity_status: "ok",
+      preprocessing_contract_applied: true,
     },
   };
 }
@@ -208,6 +241,12 @@ function classLabels(...records: Array<Record<string, unknown> | undefined>) {
       const value = recordObject(record)[key];
       if (Array.isArray(value) && value.length > 0) {
         return value.map((item) => String(item));
+      }
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return Object.entries(value as Record<string, unknown>)
+          .sort(([left], [right]) => labelMapSortKey(left) - labelMapSortKey(right))
+          .map(([, label]) => String(label))
+          .filter(Boolean);
       }
     }
   }
@@ -341,6 +380,75 @@ function preprocessingConfig(metadata: Record<string, unknown>) {
     ...direct,
     ...contractConfig,
   };
+}
+
+function assertLocalInferenceParitySafe(runtime: ChampionLocalRuntime, image: ChampionDemoImage, imageSource: string) {
+  const metadata = recordObject(image.metadata);
+  const sourceType = String(metadata.demo_source_type || metadata.source || "").toLowerCase();
+  if (bboxCropRequested(runtime)) {
+    throw new LocalInferenceUnsafeError(
+      "LOCAL_PREPROCESSING_UNSUPPORTED",
+      "Local browser inference cannot apply bbox-crop preprocessing; backend demo inference is required for parity.",
+    );
+  }
+  if (metadata.parity_safe === false || String(metadata.parity_status || "").toLowerCase() === "unsafe") {
+    throw new LocalInferenceUnsafeError(
+      "DEMO_IMAGE_NOT_PARITY_SAFE",
+      String(metadata.parity_failure_reason || "The selected held-out image is a thumbnail or non-parity-safe derivative."),
+    );
+  }
+  if (sourceType === "heldout_test" && metadata.parity_safe !== true) {
+    throw new LocalInferenceUnsafeError(
+      "HELDOUT_IMAGE_SOURCE_UNVERIFIED",
+      "Held-out demo metadata does not prove that local inference is using original image bytes.",
+    );
+  }
+  if (sourceType.includes("thumbnail")) {
+    throw new LocalInferenceUnsafeError(
+      "THUMBNAIL_INFERENCE_UNSAFE",
+      "The selected held-out image is marked as a thumbnail, so local browser inference would not match validation/test.",
+    );
+  }
+  const originalURI = image.uri || image.image_uri || "";
+  if (image.thumbnail_uri && imageSource === image.thumbnail_uri && originalURI && originalURI !== image.thumbnail_uri) {
+    throw new LocalInferenceUnsafeError(
+      "THUMBNAIL_INFERENCE_UNSAFE",
+      "Local browser inference was about to use a display thumbnail instead of the original held-out image.",
+    );
+  }
+  if (image.thumbnail_uri && imageSource === image.thumbnail_uri && sourceType.includes("heldout_test")) {
+    throw new LocalInferenceUnsafeError(
+      "THUMBNAIL_INFERENCE_UNSAFE",
+      "Held-out demo inference requires original image bytes, not the display thumbnail.",
+    );
+  }
+}
+
+function bboxCropRequested(runtime: ChampionLocalRuntime) {
+  const preprocessing = preprocessingConfig(runtime.metadata);
+  const resize = String(preprocessing.resize_strategy || runtime.resizeStrategy || "").toLowerCase();
+  const crop = String(preprocessing.crop_strategy || runtime.cropStrategy || "").toLowerCase();
+  const bboxMode = String(preprocessing.bbox_mode || "").toLowerCase();
+  return (
+    resize === "bbox_crop_if_available" ||
+    crop === "bbox_crop_if_available" ||
+    crop === "bbox_crop_ablation" ||
+    bboxMode === "crop_if_available" ||
+    bboxMode === "crop_and_compare_full_image"
+  );
+}
+
+function localImageSourceKind(image: ChampionDemoImage, imageSource: string) {
+  if (imageSource === image.thumbnail_uri) return "thumbnail";
+  if (imageSource === image.preview_uri) return "preview";
+  if (imageSource === image.uri || imageSource === image.image_uri) return "original_or_worker_uri";
+  if (imageSource.startsWith("data:image/")) return "inline_image";
+  return "custom";
+}
+
+function labelMapSortKey(value: string) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
 }
 
 function loadImage(source: string) {

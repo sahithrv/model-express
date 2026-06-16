@@ -325,14 +325,15 @@ def _run_visual_llm_analysis(dataset: dict, config: dict, pack: dict) -> dict:
     manifest = pack.get("sample_manifest") if isinstance(pack.get("sample_manifest"), dict) else {}
     samples = manifest.get("samples") if isinstance(manifest.get("samples"), list) else []
     trigger_reason = str(config.get("trigger_reason") or "initial_profile")
+    dataset_metadata = _visual_dataset_metadata(dataset, config, manifest)
     request = VisualAnalysisRequest(
-        dataset_metadata=_visual_dataset_metadata(dataset, config, manifest),
+        dataset_metadata=dataset_metadata,
         sample_manifest=samples,
         images=_agent_image_inputs(pack.get("image_inputs")),
         trigger_reason=trigger_reason,
         allowed_operations=config.get("allowed_operations") if isinstance(config.get("allowed_operations"), dict) else None,
         budget=_visual_analysis_budget(manifest),
-        total_images=int(manifest.get("images_available") or 0),
+        total_images=_visual_analysis_total_images(dataset_metadata, manifest),
     )
     system_prompt, user_prompt = build_visual_analysis_messages(request)
     llm_client = VisualLLMClient(llm_config)
@@ -379,7 +380,11 @@ def _visual_analysis_unavailable_result(dataset: dict, config: dict, pack: dict,
     manifest = pack.get("sample_manifest") if isinstance(pack.get("sample_manifest"), dict) else {}
     samples = manifest.get("samples") if isinstance(manifest.get("samples"), list) else []
     images_analyzed = _positive_int(manifest.get("images_analyzed"), len(samples))
-    total_images = _positive_int(manifest.get("images_available"), images_analyzed)
+    dataset_metadata = _visual_dataset_metadata(dataset, config, manifest)
+    total_images = _positive_int(
+        _visual_analysis_total_images(dataset_metadata, manifest),
+        images_analyzed,
+    )
     trigger_reason = str(config.get("trigger_reason") or "initial_profile")
     limitations = [
         str(item)
@@ -617,6 +622,13 @@ def _visual_dataset_metadata(dataset: dict, config: dict, manifest: dict) -> dic
         "agent_safe_metadata_summary": safe_metadata_summary,
         "visual_trait_summary": profile.get("visual_trait_summary") if isinstance(profile.get("visual_trait_summary"), dict) else {},
     }
+
+
+def _visual_analysis_total_images(dataset_metadata: dict, manifest: dict) -> int:
+    return max(
+        _positive_int(dataset_metadata.get("total_images"), 0),
+        _positive_int(manifest.get("images_available"), 0),
+    )
 
 
 def _safe_config_metadata_summary(config: dict) -> dict:

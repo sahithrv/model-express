@@ -119,32 +119,37 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
                     model_name,
                 )
                 validation_errors.extend(fallback_errors)
-            if checkpoint_metadata:
-                if not class_names:
-                    class_names = _metadata_class_names(checkpoint_metadata)
-                if not config.get("image_size"):
-                    image_size = _metadata_image_size(checkpoint_metadata, image_size)
-                if not model_profile and isinstance(checkpoint_metadata.get("model_profile"), dict):
-                    model_profile = checkpoint_metadata["model_profile"]
-                if not isinstance(config.get("training_config"), dict) and isinstance(
-                    checkpoint_metadata.get("training_config"), dict
-                ):
-                    training_config = checkpoint_metadata["training_config"]
-                model_name = _first_string(checkpoint_metadata, "model", "model_name") or model_name
-            manifest = produce_champion_export_artifacts(
-                export_dir=export_dir,
-                model_name=model_name,
-                class_names=class_names,
-                image_size=image_size,
-                model=model,
-                preprocessing=preprocessing,
-                model_profile=model_profile,
-                training_config=training_config,
-                formats=(HELPER_EXPORT_FORMATS[requested_format],),
-                sample_input_shape=config.get("sample_input_shape"),
-                provenance=provenance,
-                validation_errors=validation_errors,
-            )
+            label_order_errors = _class_label_order_errors(class_names, checkpoint_metadata)
+            validation_errors.extend(label_order_errors)
+            if label_order_errors:
+                manifest = _error_manifest(export_dir, requested_format, validation_errors, provenance=provenance)
+            else:
+                if checkpoint_metadata:
+                    if not class_names:
+                        class_names = _metadata_class_names(checkpoint_metadata)
+                    if not config.get("image_size"):
+                        image_size = _metadata_image_size(checkpoint_metadata, image_size)
+                    if not model_profile and isinstance(checkpoint_metadata.get("model_profile"), dict):
+                        model_profile = checkpoint_metadata["model_profile"]
+                    if not isinstance(config.get("training_config"), dict) and isinstance(
+                        checkpoint_metadata.get("training_config"), dict
+                    ):
+                        training_config = checkpoint_metadata["training_config"]
+                    model_name = _first_string(checkpoint_metadata, "model", "model_name") or model_name
+                manifest = produce_champion_export_artifacts(
+                    export_dir=export_dir,
+                    model_name=model_name,
+                    class_names=class_names,
+                    image_size=image_size,
+                    model=model,
+                    preprocessing=preprocessing,
+                    model_profile=model_profile,
+                    training_config=training_config,
+                    formats=(HELPER_EXPORT_FORMATS[requested_format],),
+                    sample_input_shape=config.get("sample_input_shape"),
+                    provenance=provenance,
+                    validation_errors=validation_errors,
+                )
     else:
         validation_errors.append(
             "safetensors export requires an existing worker-visible safetensors artifact; no source artifact was provided"
@@ -205,6 +210,7 @@ def run_champion_demo_prediction_job(client: OrchestratorClient, job: dict) -> N
             image_path=image_path,
             top_k=_positive_int(config.get("top_k"), 5),
             true_label=true_label,
+            image_metadata=image_metadata,
             confidence_threshold=_optional_float(config.get("confidence_threshold")),
             iou_threshold=_optional_float(config.get("iou_threshold")),
             max_detections=_optional_positive_int(config.get("max_detections")),
@@ -460,6 +466,20 @@ def _metadata_class_names(metadata: dict) -> list[str]:
         if isinstance(values, list):
             return [str(item) for item in values]
     return []
+
+
+def _class_label_order_errors(config_labels: list[str], metadata: dict) -> list[str]:
+    metadata_labels = _metadata_class_names(metadata)
+    if not config_labels or not metadata_labels:
+        return []
+    normalized_config = [str(label) for label in config_labels]
+    normalized_metadata = [str(label) for label in metadata_labels]
+    if normalized_config == normalized_metadata:
+        return []
+    return [
+        "CLASS_LABEL_ORDER_MISMATCH: export class_labels do not match checkpoint metadata class_labels; "
+        "refusing export because model output indices would map to the wrong labels"
+    ]
 
 
 def _config_class_names(config: dict) -> list[str]:
@@ -961,9 +981,9 @@ def _prediction_result_from_inference(payload: dict) -> dict:
         return result
     error_code = str(payload.get("error_code", "INFERENCE_UNAVAILABLE"))
     status = "RUNTIME_UNAVAILABLE"
-    if error_code in {"INFERENCE_FAILED"}:
+    if error_code in {"INFERENCE_FAILED", "LABEL_MAP_OUTPUT_MISMATCH", "CLASS_LABEL_ORDER_INVALID"}:
         status = "FAILED"
-    return {
+    result = {
         "status": status,
         "error_code": error_code,
         "error": payload.get("error", ""),
@@ -972,6 +992,9 @@ def _prediction_result_from_inference(payload: dict) -> dict:
         "top_k": [],
         "latency_ms": 0.0,
     }
+    if isinstance(payload.get("image_metadata"), dict):
+        result["image_metadata"] = payload["image_metadata"]
+    return result
 
 
 def _optional_float(value: object) -> float | None:

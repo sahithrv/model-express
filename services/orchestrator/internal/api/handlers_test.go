@@ -7251,7 +7251,8 @@ func TestPersistedChampionBlocksStaleAddDecisionBeforePlanCreation(t *testing.T)
 	}
 }
 
-func TestPersistedChampionAllowsFollowUpPlanByDefault(t *testing.T) {
+func TestPersistedChampionBlocksFollowUpPlanByDefault(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", "false")
 	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
 
@@ -7278,15 +7279,29 @@ func TestPersistedChampionAllowsFollowUpPlanByDefault(t *testing.T) {
 		t.Fatalf("create add decision: %v", err)
 	}
 
-	followUpPlan, created, err := server.ensureFollowUpPlan(projectID, plan, addDecision)
+	_, _, err = server.ensureFollowUpPlan(projectID, plan, addDecision)
+	if err == nil || !errors.Is(err, errChampionSelectedFollowUpBlocked) {
+		t.Fatalf("expected champion-selected follow-up block by default, got %v", err)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected no follow-up plan after champion selection, got %d total plans", got)
+	}
+	projectJobs, err := server.store.ListProjectJobs(projectID)
 	if err != nil {
-		t.Fatalf("expected follow-up after selected champion by default, got %v", err)
+		t.Fatalf("list project jobs: %v", err)
 	}
-	if !created || followUpPlan.SourceDecisionID != addDecision.ID {
-		t.Fatalf("expected created follow-up from %s, got %#v created=%v", addDecision.ID, followUpPlan, created)
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateTrainExperiment); got != 1 {
+		t.Fatalf("expected only the completed champion training job, got %d training jobs", got)
 	}
-	if got := len(listExperimentPlans(t, server, projectID)); got != 2 {
-		t.Fatalf("expected initial plus follow-up plan, got %d", got)
+	if got := countJobsByTemplate(projectJobs, jobs.TemplateExportChampion); got != 1 {
+		t.Fatalf("expected one queued champion export job, got %d", got)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasBackendStopGuardEvent(events, "champion_selected_guard") {
+		t.Fatalf("expected champion-selected blocked event, got %#v", events)
 	}
 }
 
@@ -7407,7 +7422,7 @@ func TestReopenExperimentationRequiresTerminalChampionState(t *testing.T) {
 }
 
 func TestPostChampionExistingFollowUpPlanCannotCreateJobs(t *testing.T) {
-	t.Setenv("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", "true")
+	t.Setenv("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", "false")
 
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 8),
