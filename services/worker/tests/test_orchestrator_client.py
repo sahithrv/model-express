@@ -4,6 +4,7 @@ import requests
 import pytest
 
 from worker.orchestrator_client import OrchestratorClient
+from worker.orchestrator_client import report_timeout_seconds
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +42,12 @@ def test_complete_job_uses_longer_report_timeout(monkeypatch):
             "timeout": 240,
         }
     ]
+
+
+def test_report_timeout_default_allows_slow_callbacks(monkeypatch):
+    monkeypatch.delenv("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", raising=False)
+
+    assert report_timeout_seconds() == 15 * 60
 
 
 def test_fail_job_can_report_retryable_failure(monkeypatch):

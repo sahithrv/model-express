@@ -121,6 +121,50 @@ test("portable bundle is derived separately from ready ONNX export", async () =>
   assert.deepEqual(exportDemo.portableBundle?.contents, ["model.onnx", "manifest.json"]);
 });
 
+test("ready export record overrides stale pending champion metadata", async () => {
+  const { buildChampionExportDemo } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    champion: championFixture({
+      deployment_profile: {
+        model_card: { export_status: "pending" },
+      },
+    }),
+    championExports: [
+      {
+        id: "export-ready",
+        project_id: "project-1",
+        champion_id: "champion-1",
+        job_id: "job-1",
+        status: "READY",
+        format: "onnx",
+        artifact_uri: "file:///artifacts/model.onnx",
+        completed_at: timestamp,
+        updated_at: timestamp,
+        created_at: timestamp,
+      },
+    ],
+  });
+
+  const exportDemo = buildChampionExportDemo(detail);
+
+  assert.equal(exportDemo.exportStatus, "READY");
+  assert.equal(exportDemo.limitations.includes("Final export artifact is still pending."), false);
+});
+
+test("terminal job status overrides stale running training summary state", async () => {
+  const { activityCardFromRun, effectiveTrainingRunStatus, summarizeTrainingRuns } = await loadMissionModel();
+  const summary = runSummaryFixture({ status: "RUNNING" });
+  const job = jobFixture({ status: "SUCCEEDED" });
+
+  const totals = summarizeTrainingRuns([summary], [], [job]);
+  const card = activityCardFromRun(summary, null, job);
+
+  assert.equal(effectiveTrainingRunStatus(summary, job), "SUCCEEDED");
+  assert.equal(totals.activeRuns, 0);
+  assert.equal(card.type, "result");
+  assert.equal(card.status, "succeeded");
+});
+
 function buildDigest(buildMissionDigest, selectedProject, detail) {
   return buildMissionDigest({
     health: { status: "ok", service: "orchestrator", timestamp },
@@ -224,7 +268,7 @@ function jobFixture(overrides = {}) {
   };
 }
 
-function runSummaryFixture() {
+function runSummaryFixture(overrides = {}) {
   return {
     job_id: "job-1",
     project_id: "project-1",
@@ -243,6 +287,7 @@ function runSummaryFixture() {
     epochs_completed: 1,
     created_at: timestamp,
     updated_at: timestamp,
+    ...overrides,
   };
 }
 
@@ -263,7 +308,7 @@ function runEvaluationFixture() {
   };
 }
 
-function championFixture() {
+function championFixture(overrides = {}) {
   return {
     id: "champion-1",
     project_id: "project-1",
@@ -277,6 +322,7 @@ function championFixture() {
     deployment_profile: {},
     created_at: timestamp,
     updated_at: timestamp,
+    ...overrides,
   };
 }
 

@@ -135,6 +135,35 @@ class DatasetProfilerTests(unittest.TestCase):
             self.assertEqual(profile["class_distribution"], {"cat": 1, "dog": 1})
             self.assertEqual(profile["layout_summary"]["image_folder_root"], "images")
 
+    def test_profile_detects_split_folder_classification_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            for split in ("train", "test", "valid"):
+                _write_image(dataset_dir / split / "air hockey" / f"{split}.jpg", (12, 10), (255, 0, 0))
+                _write_image(dataset_dir / split / "baseball" / f"{split}.jpg", (14, 12), (0, 0, 255))
+
+            profile = profile_image_folder(dataset_dir)
+
+            self.assertEqual(profile["class_names"], ["air hockey", "baseball"])
+            self.assertEqual(profile["class_count"], 2)
+            self.assertEqual(profile["image_count"], 6)
+            self.assertEqual(profile["class_distribution"], {"air hockey": 3, "baseball": 3})
+            self.assertNotIn("train", profile["class_distribution"])
+            self.assertNotIn("test", profile["class_distribution"])
+            self.assertNotIn("valid", profile["class_distribution"])
+            self.assertTrue(profile["layout_summary"]["split_folder_layout"])
+            self.assertTrue(profile["split_summary"]["has_explicit_split"])
+            self.assertTrue(profile["split_summary"]["split_folder_detected"])
+            self.assertEqual(profile["split_summary"]["split_folder_image_counts"], {"test": 2, "train": 2, "val": 2})
+            self.assertEqual(
+                profile["split_summary"]["split_folder_class_counts"],
+                {
+                    "test": {"air hockey": 1, "baseball": 1},
+                    "train": {"air hockey": 1, "baseball": 1},
+                    "val": {"air hockey": 1, "baseball": 1},
+                },
+            )
+
     def test_profile_detects_yolo_object_detection_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_dir = Path(temp_dir)

@@ -608,9 +608,9 @@ func parseCSVManifest(datasetID string, source datasets.DatasetMetadataSource, c
 		return records, warnings, errors
 	}
 	header := normalizedHeader(rows[0])
-	pathIndex := firstHeaderIndex(header, "relative_path", "path", "filepath", "file_path", "image", "image_path", "filename", "file")
-	labelIndex := firstHeaderIndex(header, "label", "label_name", "class", "class_name", "category", "target")
-	splitIndex := firstHeaderIndex(header, "split", "subset", "partition")
+	pathIndex := firstHeaderIndex(header, "relative_path", "filepaths", "filepath", "file_path", "path", "image", "image_path", "filename", "file")
+	labelIndex := firstHeaderIndex(header, "labels", "label", "label_name", "class", "class_name", "category", "target")
+	splitIndex := firstHeaderIndex(header, "data_set", "dataset", "set", "split", "subset", "partition")
 	widthIndex := firstHeaderIndex(header, "width", "image_width")
 	heightIndex := firstHeaderIndex(header, "height", "image_height")
 	if pathIndex < 0 {
@@ -1217,7 +1217,7 @@ func normalizeSplit(value string) string {
 		return "train"
 	case "val", "valid", "validation", "dev":
 		return "val"
-	case "test", "testing":
+	case "test", "testing", "holdout", "heldout":
 		return "test"
 	default:
 		return ""

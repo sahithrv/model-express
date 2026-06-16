@@ -135,6 +135,7 @@ import {
   firstPositiveMetric,
   yoloMetricFromEvaluation,
   runPrimaryMetric,
+  effectiveTrainingRunStatus,
   championPrimaryMetric,
   metricTabOptions,
   NoticeBanner,
@@ -1590,6 +1591,21 @@ export function App() {
     }
   }
 
+  async function ensureChampionBackendWorker(label: string) {
+    if (!selectedProjectId) return "";
+
+    const provider = automationSettings.default_training_provider === "modal" ? "modal" : "local";
+    const workerPool = await window.missionControl.ensureProjectWorker({
+      projectId: selectedProjectId,
+      baseUrl,
+      name: `${provider}-${label}-worker-${selectedProjectId}`,
+      gpuType: provider,
+      count: 1,
+    });
+    const workerLabel = provider === "modal" ? "Modal worker" : "worker";
+    return workerPool.started ? `Started ${workerLabel} for ${label}.` : `${workerLabel} is already running for ${label}.`;
+  }
+
   async function reviewExperiments() {
     if (!selectedProjectId) return;
 
@@ -1668,8 +1684,19 @@ export function App() {
         method: "POST",
         body: { format },
       });
+      let workerMessage = "";
+      if (!["READY", "SUCCEEDED", "FAILED"].includes(normalizedStatus(exportRecord.status || ""))) {
+        try {
+          workerMessage = await ensureChampionBackendWorker("champion-export");
+        } catch (error) {
+          workerMessage = `Export was queued, but worker did not start: ${errorMessage(error)}`;
+        }
+      }
       await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
-      setNotice({ kind: "info", text: `Champion export recorded as ${exportRecord.status || "PENDING"}.` });
+      setNotice({
+        kind: "info",
+        text: `Champion export recorded as ${exportRecord.status || "PENDING"}.${workerMessage ? ` ${workerMessage}` : ""}`,
+      });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -1807,6 +1834,11 @@ export function App() {
       const normalized = attachDemoPredictionPreview(normalizeDemoPredictionResponse(response), image);
       setDemoPrediction(normalized);
       if (normalized.id && !isTerminalDemoPredictionStatus(normalized.status)) {
+        try {
+          await ensureChampionBackendWorker("champion-demo");
+        } catch (error) {
+          setDemoPredictionError(`Backend demo prediction was queued, but worker did not start: ${errorMessage(error)}`);
+        }
         await pollChampionDemoPrediction(normalized.id, image);
       } else {
         await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
@@ -2721,7 +2753,7 @@ export function App() {
                           <small>{summary.job_id}</small>
                           {trainingRunCacheSummary(summary) && <small>{trainingRunCacheSummary(summary)}</small>}
                         </span>
-                        <Badge value={summary.status || "UNKNOWN"} />
+                        <Badge value={effectiveTrainingRunStatus(summary, job)} />
                         <strong title={primaryMetric.label}>{formatMaybeMetric(primaryMetric.value)}</strong>
                         <strong>{formatCurrency(summary.estimated_cost_usd)}</strong>
                         <span>{formatSeconds(summary.runtime_seconds)}</span>

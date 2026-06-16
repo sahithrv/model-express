@@ -283,10 +283,12 @@ class ModalTrainingHelperTests(unittest.TestCase):
             {
                 "MODEL_EXPRESS_MODAL_MATERIALIZATION_TIMEOUT_SECONDS": "1800",
                 "MODEL_EXPRESS_MODAL_PROFILE_TIMEOUT_SECONDS": "7200",
+                "MODEL_EXPRESS_MODAL_TRAINING_TIMEOUT_SECONDS": "14400",
             },
         ):
             self.assertEqual(self.modal_app._modal_dataset_materialization_timeout_seconds(), 1800)
             self.assertEqual(self.modal_app._modal_dataset_profile_timeout_seconds(), 7200)
+            self.assertEqual(self.modal_app._modal_training_timeout_seconds(), 14400)
 
     def test_modal_training_warm_pool_knobs_are_configurable(self) -> None:
         with patch.dict(
@@ -1550,6 +1552,48 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertEqual(execution_metadata["metadata_bundle"]["split_strategy"], "metadata_official")
             self.assertEqual(bbox_lookup["a_train_1.jpg"], (1, 2, 8, 9))
 
+    def test_load_image_data_preserves_split_folder_classification_layout(self) -> None:
+        try:
+            import torch  # noqa: F401
+            import torchvision  # noqa: F401
+        except Exception as exc:  # pragma: no cover - depends on optional training deps
+            raise unittest.SkipTest(f"training dependencies are unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            for split in ("train", "valid", "test"):
+                for class_name, color in (("cat", (255, 0, 0)), ("dog", (0, 0, 255))):
+                    for index in range(2):
+                        image_path = dataset_dir / split / class_name / f"{split}_{class_name}_{index}.jpg"
+                        image_path.parent.mkdir(parents=True, exist_ok=True)
+                        Image.new("RGB", (12, 12), color).save(image_path)
+
+            train_loader, val_loader, test_loader, class_names, _class_weights, execution_metadata = self.modal_app._load_image_data(
+                dataset_dir,
+                batch_size=2,
+                image_size=32,
+                augmentation={},
+                class_balancing="none",
+                sampling_strategy="none",
+                preprocessing={"resize_strategy": "squash", "normalization": "none"},
+            )
+
+            base_dataset = train_loader.dataset.dataset
+            train_paths = _subset_relative_paths(dataset_dir, base_dataset, train_loader.dataset.indices)
+            val_paths = _subset_relative_paths(dataset_dir, base_dataset, val_loader.dataset.indices)
+            test_paths = _subset_relative_paths(dataset_dir, base_dataset, test_loader.dataset.indices)
+
+            self.assertEqual(class_names, ["cat", "dog"])
+            self.assertTrue(train_paths)
+            self.assertTrue(val_paths)
+            self.assertTrue(test_paths)
+            self.assertTrue(all(path.startswith("train/") for path in train_paths), train_paths)
+            self.assertTrue(all(path.startswith("valid/") for path in val_paths), val_paths)
+            self.assertTrue(all(path.startswith("test/") for path in test_paths), test_paths)
+            self.assertEqual(execution_metadata["split_folder"]["status"], "applied")
+            self.assertEqual(execution_metadata["split_folder"]["split_strategy"], "metadata_official")
+            self.assertEqual(execution_metadata["metadata_bundle"]["split_strategy"], "metadata_official")
+
     def test_metadata_bundle_page_merge_deduplicates_repeated_classes(self) -> None:
         first_page = {
             "classes": [
@@ -1698,6 +1742,13 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(audit["status"], "completed")
         self.assertTrue(audit["report_only"])
         self.assertEqual(len(audit["high_confidence_wrong"]), 1)
+
+
+def _subset_relative_paths(dataset_dir: Path, dataset, indices) -> list[str]:
+    return [
+        Path(dataset.samples[index][0]).relative_to(dataset_dir).as_posix()
+        for index in indices
+    ]
 
 
 if __name__ == "__main__":

@@ -41,6 +41,45 @@ func TestServiceParsesCSVManifestAndInventorySplits(t *testing.T) {
 	}
 }
 
+func TestServiceParsesScreenshotStyleCSVManifestAliases(t *testing.T) {
+	dataset := datasets.Dataset{ID: "dataset_1", ProjectID: "project_1", ChecksumSHA256: "dataset_sha"}
+	csvContent := []byte("class_id,filepaths,labels,data_set\n0,train/air hockey/001.jpg,air hockey,training\n1,valid/baseball/001.jpg,baseball,valid\n2,test/baseball/002.jpg,baseball,heldout\n")
+
+	importRecord, err := NewService().Parse(dataset, ImportRequest{
+		Sources: []SourceInput{{
+			RelativePath:   "sports.csv",
+			DeclaredFormat: datasets.MetadataFormatCSVManifest,
+			Content:        csvContent,
+		}},
+		Inventory: DatasetFileInventory{Files: []InventoryFile{
+			{RelativePath: "train/air hockey/001.jpg", SizeBytes: 10},
+			{RelativePath: "valid/baseball/001.jpg", SizeBytes: 11},
+			{RelativePath: "test/baseball/002.jpg", SizeBytes: 12},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if importRecord.Status != datasets.MetadataImportStatusSucceeded {
+		t.Fatalf("status = %s, errors = %#v", importRecord.Status, importRecord.Errors)
+	}
+	if importRecord.Summary.SplitCounts["train"] != 1 || importRecord.Summary.SplitCounts["val"] != 1 || importRecord.Summary.SplitCounts["test"] != 1 {
+		t.Fatalf("split counts = %#v", importRecord.Summary.SplitCounts)
+	}
+	if !hasClass(importRecord.Classes, "air_hockey") || !hasClass(importRecord.Classes, "baseball") {
+		t.Fatalf("classes = %#v", importRecord.Classes)
+	}
+	if !hasRecord(importRecord.ManifestRecords, "train/air hockey/001.jpg", "air hockey", "train") {
+		t.Fatalf("missing aliased train manifest record: %#v", importRecord.ManifestRecords)
+	}
+	if !hasRecord(importRecord.ManifestRecords, "valid/baseball/001.jpg", "baseball", "val") {
+		t.Fatalf("missing aliased val manifest record: %#v", importRecord.ManifestRecords)
+	}
+	if !hasRecord(importRecord.ManifestRecords, "test/baseball/002.jpg", "baseball", "test") {
+		t.Fatalf("missing aliased test manifest record: %#v", importRecord.ManifestRecords)
+	}
+}
+
 func TestServiceInfersClassesInsideTopLevelImageContainer(t *testing.T) {
 	dataset := datasets.Dataset{ID: "dataset_1", ProjectID: "project_1"}
 	importRecord, err := NewService().Parse(dataset, ImportRequest{
@@ -254,6 +293,15 @@ func hasClass(classes []datasets.DatasetClass, classKey string) bool {
 func hasRecordPath(records []datasets.DatasetManifestRecord, relativePath string) bool {
 	for _, record := range records {
 		if record.RelativePath == relativePath {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRecord(records []datasets.DatasetManifestRecord, relativePath string, label string, split string) bool {
+	for _, record := range records {
+		if record.RelativePath == relativePath && record.LabelName == label && record.Split == split {
 			return true
 		}
 	}

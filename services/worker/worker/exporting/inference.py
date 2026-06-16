@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -94,7 +96,7 @@ def run_demo_inference_from_manifest(
             "Demo inference requires a created ONNX, TorchScript, or framework-native checkpoint artifact in the export manifest.",
         )
 
-    model_path = _resolve_artifact_path(manifest_path, artifact.get("path") or artifact.get("uri"))
+    model_path = _resolve_artifact_path(manifest_path, artifact)
     if model_path is None or not model_path.exists():
         return _pending_payload(
             "MODEL_ARTIFACT_NOT_FOUND",
@@ -286,7 +288,7 @@ def _run_detection_inference_from_manifest(
             "YOLO demo inference requires a created ONNX detector artifact.",
         )
 
-    model_path = _resolve_artifact_path(manifest_path, artifact.get("path") or artifact.get("uri"))
+    model_path = _resolve_artifact_path(manifest_path, artifact)
     if model_path is None or not model_path.exists():
         return _pending_payload(
             "MODEL_ARTIFACT_NOT_FOUND",
@@ -955,9 +957,10 @@ def _find_created_artifact(manifest: dict, format_name: str) -> dict | None:
 
 
 def _resolve_artifact_path(manifest_path: Path | None, path_value: object) -> Path | None:
-    if not path_value:
+    artifact = path_value if isinstance(path_value, dict) else {}
+    value = _artifact_reference(path_value)
+    if not value:
         return None
-    value = str(path_value)
     export_dir = manifest_path.parent if manifest_path is not None else None
     if value.startswith("s3://"):
         parsed = urlparse(value)
@@ -965,26 +968,256 @@ def _resolve_artifact_path(manifest_path: Path | None, path_value: object) -> Pa
         destination = Path(".cache/artifacts") / _safe_path_part(parsed.netloc) / _safe_path_part(filename)
         try:
             downloaded = download_s3_uri(value, destination)
-            return validate_controlled_artifact_path(downloaded, export_dir=destination.parent)
+            resolved = validate_controlled_artifact_path(downloaded, export_dir=destination.parent)
+            if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
+                return None
+            return resolved
         except Exception:
             return None
     try:
         if value.startswith("file://"):
-            return resolve_controlled_artifact_reference(value, export_dir=export_dir)
+            resolved = resolve_controlled_artifact_reference(value, export_dir=export_dir)
+            if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
+                return None
+            return resolved
     except ArtifactPathValidationError:
         return None
     path = Path(value)
     if manifest_path is None:
         try:
-            return resolve_controlled_artifact_reference(value)
+            resolved = resolve_controlled_artifact_reference(value)
+            if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
+                return None
+            return resolved
         except ArtifactPathValidationError:
             return None
     try:
         if path.is_absolute():
-            return validate_controlled_artifact_path(path, export_dir=export_dir)
-        return validate_controlled_artifact_path(manifest_path.parent / path, export_dir=export_dir)
+            resolved = validate_controlled_artifact_path(path, export_dir=export_dir)
+        else:
+            resolved = validate_controlled_artifact_path(manifest_path.parent / path, export_dir=export_dir)
+        if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
+            return None
+        return resolved
     except ArtifactPathValidationError:
         return None
+
+
+def _artifact_reference(value: object) -> str:
+    if isinstance(value, dict):
+        for key in ("path", "uri", "artifact_uri", "model_uri", "download_url"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+        return ""
+    return str(value).strip()
+
+
+def _materialize_onnx_external_data(model_path: Path, artifact: dict, artifact_uri: str) -> bool:
+    if not _is_onnx_artifact(model_path, artifact):
+        return True
+    for candidate in _external_data_candidates(model_path, artifact):
+        relative_path = _external_data_relative_path(candidate.get("path"))
+        explicit = bool(candidate.get("explicit"))
+        if not relative_path:
+            if explicit:
+                return False
+            continue
+        destination = _safe_external_data_path(model_path.parent, relative_path)
+        if destination is None:
+            if explicit:
+                return False
+            continue
+        if destination.exists() and destination.is_file():
+            continue
+        sidecar_uri = _external_data_s3_uri(artifact_uri, candidate, relative_path)
+        if sidecar_uri:
+            try:
+                downloaded = download_s3_uri(sidecar_uri, destination)
+                validate_controlled_artifact_path(downloaded, export_dir=model_path.parent)
+                continue
+            except Exception:
+                if explicit:
+                    return False
+                continue
+        source = _external_data_local_source(candidate, model_path.parent)
+        if source is not None:
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if source.resolve() != destination.resolve():
+                    shutil.copy2(source, destination)
+                continue
+            except OSError:
+                if explicit:
+                    return False
+                continue
+        if explicit:
+            return False
+    return True
+
+
+def _is_onnx_artifact(model_path: Path, artifact: dict) -> bool:
+    artifact_format = str(artifact.get("format") or artifact.get("artifact_format") or "").strip().lower()
+    return artifact_format == "onnx" or model_path.name.lower().endswith(".onnx")
+
+
+def _external_data_candidates(model_path: Path, artifact: dict) -> list[dict]:
+    candidates: list[dict] = []
+    external_data = artifact.get("external_data") if isinstance(artifact.get("external_data"), list) else []
+    for item in external_data:
+        if isinstance(item, dict):
+            candidates.append(
+                {
+                    **item,
+                    "path": item.get("path") or item.get("relative_path") or item.get("file_name"),
+                    "explicit": True,
+                }
+            )
+    for location in _onnx_external_data_locations(model_path):
+        candidates.append({"path": location, "explicit": True})
+    inferred_name = _artifact_external_data_file_name(artifact, model_path)
+    if inferred_name:
+        candidates.append({"path": inferred_name, "explicit": False})
+
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        relative_path = _external_data_relative_path(candidate.get("path"))
+        if not relative_path or relative_path in seen:
+            continue
+        seen.add(relative_path)
+        unique.append({**candidate, "path": relative_path})
+    return unique
+
+
+def _artifact_external_data_file_name(artifact: dict, model_path: Path) -> str:
+    for key in ("uri", "artifact_uri", "path", "model_uri", "download_url"):
+        value = str(artifact.get(key) or "").strip()
+        if not value:
+            continue
+        if value.startswith("s3://") or value.startswith("file://"):
+            name = Path(urlparse(value).path).name
+        else:
+            name = Path(value).name
+        if name.lower().endswith(".onnx"):
+            return f"{name}.data"
+    return f"{model_path.name}.data" if model_path.name.lower().endswith(".onnx") else ""
+
+
+def _onnx_external_data_locations(model_path: Path) -> list[str]:
+    try:
+        import onnx
+    except Exception:
+        return []
+    try:
+        model = onnx.load(str(model_path), load_external_data=False)
+    except Exception:
+        return []
+    locations: list[str] = []
+    for tensor in getattr(model.graph, "initializer", []):
+        for entry in getattr(tensor, "external_data", []):
+            if getattr(entry, "key", "") != "location":
+                continue
+            location = str(getattr(entry, "value", "")).strip()
+            if location and location not in locations:
+                locations.append(location)
+    return locations
+
+
+def _external_data_relative_path(value: object) -> str:
+    text = str(value or "").strip()
+    if not text or "://" in text or Path(text).is_absolute() or (len(text) > 1 and text[1] == ":"):
+        return ""
+    parts = []
+    for part in text.replace("\\", "/").split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return ""
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _safe_external_data_path(base_dir: Path, relative_path: str) -> Path | None:
+    relative_path = _external_data_relative_path(relative_path)
+    if not relative_path:
+        return None
+    base = base_dir.resolve()
+    resolved = (base / relative_path).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        return None
+    return resolved
+
+
+def _artifact_s3_uri(artifact: dict, fallback: str) -> str:
+    if str(fallback).startswith("s3://"):
+        return str(fallback)
+    for key in ("uri", "artifact_uri", "path", "model_uri", "download_url"):
+        value = str(artifact.get(key) or "").strip()
+        if value.startswith("s3://"):
+            return value
+    return ""
+
+
+def _external_data_s3_uri(artifact_uri: str, candidate: dict, relative_path: str) -> str:
+    if not artifact_uri.startswith("s3://"):
+        return ""
+    expected_uri = _s3_sidecar_uri(artifact_uri, relative_path)
+    if not expected_uri:
+        return ""
+    for key in ("uri", "artifact_uri", "artifactPath", "artifact_path"):
+        value = str(candidate.get(key) or "").strip()
+        if value.startswith("s3://"):
+            return value if _normalize_s3_object_uri(value) == expected_uri else ""
+    return expected_uri
+
+
+def _s3_sidecar_uri(artifact_uri: str, relative_path: str) -> str:
+    parsed = urlparse(artifact_uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        return ""
+    artifact_key = _storage_relative_path(parsed.path.lstrip("/"))
+    sidecar_path = _storage_relative_path(relative_path)
+    if not artifact_key or not sidecar_path:
+        return ""
+    base_dir = posixpath.dirname(artifact_key)
+    sidecar_key = posixpath.join("" if base_dir == "." else base_dir, sidecar_path)
+    return f"s3://{parsed.netloc}/{sidecar_key}"
+
+
+def _normalize_s3_object_uri(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        return ""
+    key = _storage_relative_path(parsed.path.lstrip("/"))
+    return f"s3://{parsed.netloc}/{key}" if key else ""
+
+
+def _storage_relative_path(value: str) -> str:
+    parts = []
+    for part in str(value).replace("\\", "/").split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return ""
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _external_data_local_source(candidate: dict, artifact_dir: Path) -> Path | None:
+    for key in ("artifact_path", "local_path", "path"):
+        value = str(candidate.get(key) or "").strip()
+        if not value or value.startswith("s3://"):
+            continue
+        try:
+            source = resolve_controlled_artifact_reference(value, export_dir=artifact_dir)
+        except ArtifactPathValidationError:
+            continue
+        if source.exists() and source.is_file():
+            return source
+    return None
 
 
 def _safe_path_part(value: str) -> str:

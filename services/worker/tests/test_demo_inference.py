@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from worker.exporting.artifacts import produce_champion_export_artifacts
-from worker.exporting.inference import _postprocess_detection_outputs, run_demo_inference_from_manifest
+from worker.exporting.inference import _postprocess_detection_outputs, _resolve_artifact_path, run_demo_inference_from_manifest
 from worker.exporting.preprocessing import prepare_image_for_inference, preprocessing_parity_diagnostics
 
 
@@ -200,6 +201,44 @@ class DemoInferenceTests(unittest.TestCase):
             self.assertEqual(payload["predicted_label"], "dog")
             self.assertEqual([item["label"] for item in payload["top_k"]], ["dog", "cat"])
             self.assertEqual(payload["image_metadata"]["parity_status"], "ok")
+
+    def test_s3_onnx_resolution_downloads_inferred_external_data_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            original_cwd = Path.cwd()
+            calls: list[str] = []
+
+            def fake_download(uri: str, destination: Path) -> Path:
+                calls.append(uri)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"external tensor bytes" if uri.endswith(".data") else b"onnx bytes")
+                return destination
+
+            try:
+                os.chdir(root)
+                with patch("worker.exporting.inference.download_s3_uri", fake_download):
+                    model_path = _resolve_artifact_path(
+                        None,
+                        {
+                            "format": "onnx",
+                            "status": "created",
+                            "path": "s3://bucket/model-express/artifacts/job_1/model.onnx",
+                        },
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertIsNotNone(model_path)
+            assert model_path is not None
+            self.assertTrue(model_path.exists())
+            self.assertEqual((model_path.parent / "model.onnx.data").read_bytes(), b"external tensor bytes")
+            self.assertEqual(
+                calls,
+                [
+                    "s3://bucket/model-express/artifacts/job_1/model.onnx",
+                    "s3://bucket/model-express/artifacts/job_1/model.onnx.data",
+                ],
+            )
 
     def test_framework_native_checkpoint_inference_returns_ranked_payload(self) -> None:
         try:

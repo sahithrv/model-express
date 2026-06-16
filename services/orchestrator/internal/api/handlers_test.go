@@ -2457,6 +2457,50 @@ func TestListDashboardEndpointsUsePaginationDefaults(t *testing.T) {
 	assertPagedEvaluations(t, router, project.ID)
 }
 
+func TestListTrainingRunSummariesUsesTerminalJobStatus(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := memoryStore.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{Status: jobs.StatusRunning}); err != nil {
+		t.Fatalf("upsert running summary: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(job.ID, "modal-run"); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/training-run-summaries", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("summaries status %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Summaries []runs.TrainingRunSummary `json:"summaries"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode summaries: %v", err)
+	}
+	if len(payload.Summaries) != 1 {
+		t.Fatalf("expected one summary, got %#v", payload.Summaries)
+	}
+	if payload.Summaries[0].Status != jobs.StatusSucceeded {
+		t.Fatalf("expected terminal job status to win, got %s", payload.Summaries[0].Status)
+	}
+}
+
 func assertPagedJobs(t *testing.T, router http.Handler, projectID string) {
 	t.Helper()
 	resp := httptest.NewRecorder()

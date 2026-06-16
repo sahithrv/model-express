@@ -57,6 +57,25 @@ class DatasetMetadataDiscoveryTests(unittest.TestCase):
                 {warning["code"] for warning in payload["warnings"]},
             )
 
+    def test_root_level_manifest_like_csv_is_sent_as_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            image_path = dataset_dir / "train" / "air hockey" / "001.jpg"
+            image_path.parent.mkdir(parents=True)
+            Image.new("RGB", (2, 2), (255, 0, 0)).save(image_path)
+            content = "class_id,filepaths,labels,data_set\n0,train/air hockey/001.jpg,air hockey,train\n"
+            sports_csv = dataset_dir / "sports.csv"
+            sports_csv.write_bytes(content.encode("utf-8"))
+
+            payload = build_metadata_import_payload(dataset_dir)
+
+            sources = {source["relative_path"]: source for source in payload["sources"]}
+            self.assertEqual(sources["sports.csv"]["declared_format"], "csv_manifest")
+            self.assertEqual(
+                base64.b64decode(sources["sports.csv"]["content_base64"]).decode("utf-8"),
+                content,
+            )
+
     def test_rejects_unsafe_relative_paths_before_transport(self) -> None:
         for path in ("../labels.csv", "/labels.csv", "C:/labels.csv", "metadata\\labels.csv", "a//b.csv"):
             with self.subTest(path=path):

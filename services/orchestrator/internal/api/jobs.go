@@ -262,16 +262,45 @@ func (s *Server) getTrainingRunEvaluation(c *gin.Context) {
 }
 
 func (s *Server) listProjectTrainingRunSummaries(c *gin.Context) {
+	projectID := c.Param("id")
 	limit := queryInt(c, "limit", defaultTrainingSummariesLimit, 1, maxTrainingSummariesLimit)
 	offset := queryInt(c, "offset", 0, 0, 1_000_000_000)
-	items, err := s.store.ListProjectTrainingRunSummariesPage(c.Param("id"), store.PageOptions{Limit: limit + 1, Offset: offset})
+	items, err := s.store.ListProjectTrainingRunSummariesPage(projectID, store.PageOptions{Limit: limit + 1, Offset: offset})
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 
 	summaries, hasMore := pageHasMore(items, limit)
+	summaries = s.reconcileTrainingSummaryTerminalStatus(projectID, summaries)
 	c.JSON(http.StatusOK, pagedListPayload("summaries", summaries, limit, offset, hasMore))
+}
+
+func (s *Server) reconcileTrainingSummaryTerminalStatus(projectID string, summaries []runs.TrainingRunSummary) []runs.TrainingRunSummary {
+	if len(summaries) == 0 {
+		return summaries
+	}
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		log.Printf("training summary status reconciliation failed for project %s: %v", projectID, err)
+		return summaries
+	}
+	jobStatusByID := map[string]string{}
+	for _, job := range projectJobs {
+		if jobStatusIsTerminal(job.Status) {
+			jobStatusByID[job.ID] = job.Status
+		}
+	}
+	if len(jobStatusByID) == 0 {
+		return summaries
+	}
+	reconciled := append([]runs.TrainingRunSummary(nil), summaries...)
+	for index := range reconciled {
+		if status, ok := jobStatusByID[reconciled[index].JobID]; ok {
+			reconciled[index].Status = status
+		}
+	}
+	return reconciled
 }
 
 func (s *Server) listProjectTrainingRunEvaluations(c *gin.Context) {

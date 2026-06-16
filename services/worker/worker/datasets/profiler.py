@@ -54,6 +54,18 @@ YOLO_CONFIG_FILE_NAMES = {"data.yaml", "data.yml", "dataset.yaml", "dataset.yml"
 YOLO_LABEL_DIR_NAMES = {"label", "labels"}
 YOLO_IMAGE_DIR_NAMES = {"images", "image", "imgs", "img", "jpegimages"}
 YOLO_SPLIT_KEYS = {"train": "train", "val": "val", "valid": "val", "test": "test"}
+CLASSIFICATION_SPLIT_DIR_ALIASES = {
+    "train": "train",
+    "training": "train",
+    "val": "val",
+    "valid": "val",
+    "validation": "val",
+    "dev": "val",
+    "test": "test",
+    "testing": "test",
+    "holdout": "test",
+    "heldout": "test",
+}
 METADATA_ARTIFACT_TYPES = {
     "annotation_xml",
     "annotation_json",
@@ -133,8 +145,11 @@ def profile_image_folder(
         max_corrupt_paths=max_corrupt_paths,
     )
     warnings: list[dict] = []
-    class_root = resolve_classification_root(dataset_dir)
+    split_layout = split_folder_classification_layout(dataset_dir)
+    class_root = Path(split_layout["root"]) if split_layout else resolve_classification_root(dataset_dir)
     class_counts: dict[str, int] = {}
+    split_image_counts: dict[str, int] = {}
+    split_class_counts: dict[str, dict[str, int]] = {}
     corrupt_images: list[str] = []
     corrupt_image_count = 0
 
@@ -145,8 +160,18 @@ def profile_image_folder(
     image_file_candidates_seen = 0
     image_header_cap_hit = False
 
-    for class_dir in classification_class_dirs(class_root):
-        class_name = class_dir.name
+    class_entries = (
+        list(split_layout.get("class_dirs", []))
+        if split_layout
+        else [
+            {"class_name": class_dir.name, "path": class_dir, "split": ""}
+            for class_dir in classification_class_dirs(class_root)
+        ]
+    )
+    for entry in class_entries:
+        class_dir = Path(entry["path"])
+        class_name = str(entry["class_name"])
+        split_name = str(entry.get("split") or "")
         image_count = 0
 
         for image_path in sorted(class_dir.rglob("*")):
@@ -176,7 +201,11 @@ def profile_image_folder(
                 if len(corrupt_images) < caps["max_corrupt_paths"]:
                     corrupt_images.append(str(image_path))
         if image_count > 0:
-            class_counts[class_name] = image_count
+            class_counts[class_name] = class_counts.get(class_name, 0) + image_count
+            if split_name:
+                split_image_counts[split_name] = split_image_counts.get(split_name, 0) + image_count
+                per_split = split_class_counts.setdefault(split_name, {})
+                per_split[class_name] = per_split.get(class_name, 0) + image_count
         if image_header_cap_hit:
             break
     if image_header_cap_hit:
@@ -241,6 +270,27 @@ def profile_image_folder(
             non_empty_counts = [count for count in class_counts.values() if count > 0]
             imbalance_ratio = max(non_empty_counts) / min(non_empty_counts) if non_empty_counts else 0.0
     split_summary = split_summary_from_artifacts(artifacts)
+    if split_layout:
+        split_summary["has_explicit_split"] = True
+        split_summary["split_folder_detected"] = True
+        split_summary["split_folder_root"] = (
+            "dataset_root" if class_root == dataset_dir else _safe_relative_to(dataset_dir, class_root)
+        )
+        split_summary["split_folder_image_counts"] = {
+            split: split_image_counts[split]
+            for split in sorted(split_image_counts)
+        }
+        split_summary["split_folder_class_counts"] = {
+            split: {
+                class_name: counts[class_name]
+                for class_name in sorted(counts)
+            }
+            for split, counts in sorted(split_class_counts.items())
+        }
+        split_summary["split_folder_class_count_by_split"] = {
+            split: len(counts)
+            for split, counts in sorted(split_class_counts.items())
+        }
     if yolo_summary.get("split_hints"):
         split_summary["has_explicit_split"] = True
         split_summary["yolo_split_hints"] = yolo_summary.get("split_hints")
@@ -273,6 +323,7 @@ def profile_image_folder(
             else _safe_relative_to(dataset_dir, class_root),
             "class_folder_count": len(class_counts),
             "single_wrapper_unwrapped": class_root != dataset_dir and _is_under_single_wrapper(dataset_dir, class_root),
+            "split_folder_layout": bool(split_layout),
         },
         "task_type": task_type,
         "class_names": class_names,
@@ -367,6 +418,90 @@ def classification_class_dirs(class_root: Path) -> list[Path]:
         and child.name.lower() not in NON_CLASS_DIR_NAMES
         and _contains_image_file(child)
     ]
+
+
+def split_folder_classification_layout(dataset_dir: Path) -> dict | None:
+    for candidate in _split_folder_candidate_roots(Path(dataset_dir)):
+        class_dirs = _split_folder_class_dirs(candidate)
+        if not class_dirs:
+            continue
+        return {
+            "root": candidate,
+            "class_dirs": class_dirs,
+            "splits": sorted({entry["split"] for entry in class_dirs if entry.get("split")}),
+        }
+    return None
+
+
+def _split_folder_candidate_roots(root: Path) -> list[Path]:
+    candidates: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        if not candidate.is_dir():
+            return
+        if all(existing.resolve() != resolved for existing in candidates):
+            candidates.append(candidate)
+
+    add(root)
+    for image_root in _common_image_root_dirs(root):
+        add(image_root)
+    wrapper = _single_wrapper_dir(root)
+    if wrapper is not None:
+        add(wrapper)
+        for image_root in _common_image_root_dirs(wrapper):
+            add(image_root)
+    return candidates
+
+
+def _split_folder_class_dirs(root: Path) -> list[dict]:
+    try:
+        children = sorted(Path(root).iterdir())
+    except OSError:
+        return []
+
+    split_dirs: list[tuple[str, Path]] = []
+    non_split_image_dirs: list[Path] = []
+    for child in children:
+        if not child.is_dir() or child.name.lower() in NON_CLASS_DIR_NAMES:
+            continue
+        if not _contains_image_file(child):
+            continue
+        split_name = _normalize_classification_split_name(child.name)
+        if split_name:
+            split_dirs.append((split_name, child))
+        else:
+            non_split_image_dirs.append(child)
+    if not split_dirs or non_split_image_dirs:
+        return []
+
+    class_dirs: list[dict] = []
+    for split_name, split_dir in split_dirs:
+        try:
+            children = sorted(split_dir.iterdir())
+        except OSError:
+            continue
+        for class_dir in children:
+            if (
+                class_dir.is_dir()
+                and class_dir.name.lower() not in NON_CLASS_DIR_NAMES
+                and _contains_image_file(class_dir)
+            ):
+                class_dirs.append(
+                    {
+                        "split": split_name,
+                        "class_name": class_dir.name,
+                        "path": class_dir,
+                    }
+                )
+    return class_dirs
+
+
+def _normalize_classification_split_name(value: str) -> str:
+    return CLASSIFICATION_SPLIT_DIR_ALIASES.get(str(value or "").strip().lower(), "")
 
 
 def _common_image_root_dirs(root: Path) -> list[Path]:

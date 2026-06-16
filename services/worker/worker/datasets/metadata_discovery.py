@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import os
 from pathlib import Path, PureWindowsPath
@@ -67,6 +68,34 @@ _UNSUPPORTED_METADATA_SUFFIXES = {
     ".parquet",
     ".yaml",
     ".yml",
+}
+_CSV_PATH_HEADER_ALIASES = {
+    "relative_path",
+    "filepaths",
+    "filepath",
+    "file_path",
+    "path",
+    "image",
+    "image_path",
+    "filename",
+    "file",
+}
+_CSV_LABEL_HEADER_ALIASES = {
+    "labels",
+    "label",
+    "label_name",
+    "class",
+    "class_name",
+    "category",
+    "target",
+}
+_CSV_SPLIT_HEADER_ALIASES = {
+    "data_set",
+    "dataset",
+    "set",
+    "split",
+    "subset",
+    "partition",
 }
 
 
@@ -136,6 +165,8 @@ def build_metadata_import_payload(
             continue
 
         declared_format = declared_metadata_format(relative_path)
+        if declared_format is None and _looks_like_root_csv_manifest(relative_path, path):
+            declared_format = "csv_manifest"
         checksum = ""
         source: dict | None = None
         if declared_format:
@@ -302,6 +333,32 @@ def _metadataish_path(parts: list[str]) -> bool:
             "split",
         )
     )
+
+
+def _looks_like_root_csv_manifest(relative_path: str, path: Path) -> bool:
+    if "/" in relative_path or Path(relative_path).suffix.lower() != ".csv":
+        return False
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="ignore", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                if not any(cell.strip() for cell in row):
+                    continue
+                header = {_normalize_csv_header(cell) for cell in row}
+                has_path = bool(header & _CSV_PATH_HEADER_ALIASES)
+                has_label = bool(header & _CSV_LABEL_HEADER_ALIASES)
+                has_split = bool(header & _CSV_SPLIT_HEADER_ALIASES)
+                return has_path and (has_label or has_split)
+    except (OSError, csv.Error):
+        return False
+    return False
+
+
+def _normalize_csv_header(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = normalized.replace("-", "_")
+    normalized = normalized.replace(" ", "_")
+    return normalized
 
 
 def _source_warnings(declared_format: str) -> list[str]:

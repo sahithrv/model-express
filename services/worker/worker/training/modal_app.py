@@ -73,6 +73,7 @@ from worker.training.modal_runtime import (
     _modal_training_buffer_containers,
     _modal_training_min_containers,
     _modal_training_scaledown_window_seconds,
+    _modal_training_timeout_seconds,
     _optional_positive_int_env,
     _positive_int_env,
     app,
@@ -236,7 +237,7 @@ class _DatasetRelativePathResolver:
 @app.function(
     image=image,
     gpu=DEFAULT_GPU,
-    timeout=60 * 60,
+    timeout=_modal_training_timeout_seconds(),
     volumes=training_volume_mounts,
     min_containers=_modal_training_min_containers(),
     buffer_containers=_modal_training_buffer_containers(),
@@ -711,7 +712,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
 @app.function(
     image=image,
     gpu=DEFAULT_GPU,
-    timeout=60 * 60,
+    timeout=_modal_training_timeout_seconds(),
     volumes=training_volume_mounts,
     min_containers=_modal_training_min_containers(),
     buffer_containers=_modal_training_buffer_containers(),
@@ -1133,7 +1134,7 @@ def _modal_training_dataset_for_job(
 @app.function(
     image=image,
     gpu=DEFAULT_GPU,
-    timeout=60 * 60,
+    timeout=_modal_training_timeout_seconds(),
     volumes=training_volume_mounts,
     min_containers=_modal_training_min_containers(),
     buffer_containers=_modal_training_buffer_containers(),
@@ -2014,6 +2015,8 @@ def _load_image_data(
     metadata_bundle_payload = _coerce_metadata_bundle(metadata_bundle)
     path_resolver = _DatasetRelativePathResolver(dataset_dir) if metadata_bundle_payload else None
     metadata_spec = _metadata_bundle_dataset_spec(dataset_dir, metadata_bundle, path_resolver=path_resolver)
+    split_folder_spec = None if metadata_spec is not None else _split_folder_dataset_spec(dataset_dir)
+    dataset_spec = metadata_spec or split_folder_spec
     crop_strategy = str(preprocessing.get("crop_strategy", "")).lower()
     bbox_mode = str(preprocessing.get("bbox_mode", "")).lower()
     requested_bbox_crop = bbox_crop_requested(preprocessing)
@@ -2029,6 +2032,7 @@ def _load_image_data(
             "compare_full_image": compare_bbox_crop,
         },
         "metadata_bundle": _metadata_bundle_execution_metadata(metadata_bundle, metadata_spec),
+        "split_folder": _split_folder_execution_metadata(split_folder_spec),
         "preprocessing": {
             "effective_config": preprocessing,
             "dataset_normalization_metadata_applied": normalization_metadata is not None,
@@ -2060,10 +2064,10 @@ def _load_image_data(
             execution_metadata["bbox_crop"]["applied"] = True
             execution_metadata["bbox_crop"]["status"] = "applied"
 
-    uses_metadata_aware_dataset = metadata_spec is not None or _has_root_metadata_dirs(dataset_dir)
+    uses_metadata_aware_dataset = dataset_spec is not None or _has_root_metadata_dirs(dataset_dir)
     base_dataset = (
-        _MetadataBundleImageDataset(metadata_spec)
-        if metadata_spec is not None
+        _MetadataBundleImageDataset(dataset_spec)
+        if dataset_spec is not None
         else _image_folder_dataset(datasets, dataset_dir)
     )
     if len(base_dataset.classes) < 2:
@@ -2094,9 +2098,13 @@ def _load_image_data(
         if not test_indices:
             test_indices = val_indices
         execution_metadata["metadata_bundle"]["split_strategy"] = "deterministic_random"
+        if split_folder_spec is not None:
+            execution_metadata["split_folder"]["split_strategy"] = "deterministic_random"
     else:
         train_indices, val_indices, test_indices = metadata_split_indices
         execution_metadata["metadata_bundle"]["split_strategy"] = "metadata_official"
+        if split_folder_spec is not None:
+            execution_metadata["split_folder"]["split_strategy"] = "metadata_official"
 
     tier_config = dataset_tier_config if isinstance(dataset_tier_config, dict) else {}
     if tier_config.get("enabled") and tier_config.get("tier") == "preview":
@@ -2127,10 +2135,10 @@ def _load_image_data(
     elif tier_config:
         execution_metadata["dataset_tier"] = {"tier": tier_config.get("tier") or "full"}
 
-    if metadata_spec is not None:
-        train_dataset = _MetadataBundleImageDataset(metadata_spec, transform=train_transform)
-        val_dataset = _MetadataBundleImageDataset(metadata_spec, transform=val_transform)
-        full_image_val_dataset = _MetadataBundleImageDataset(metadata_spec, transform=val_transform)
+    if dataset_spec is not None:
+        train_dataset = _MetadataBundleImageDataset(dataset_spec, transform=train_transform)
+        val_dataset = _MetadataBundleImageDataset(dataset_spec, transform=val_transform)
+        full_image_val_dataset = _MetadataBundleImageDataset(dataset_spec, transform=val_transform)
     else:
         train_dataset = _TransformedImageFolderView(base_dataset, transform=train_transform)
         val_dataset = _TransformedImageFolderView(base_dataset, transform=val_transform)
@@ -2316,6 +2324,153 @@ def _single_wrapper_dir(dataset_dir: Path) -> Path | None:
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+def _split_folder_dataset_spec(dataset_dir: Path) -> dict | None:
+    for root in _split_folder_candidate_roots(dataset_dir):
+        entries = _split_folder_class_dirs(root)
+        if not entries:
+            continue
+        class_names = sorted({str(entry["class_name"]) for entry in entries})
+        class_to_idx = {class_name: index for index, class_name in enumerate(class_names)}
+        samples: list[tuple[str, int]] = []
+        targets: list[int] = []
+        splits: list[str] = []
+        records: list[dict] = []
+        split_counts: dict[str, int] = {}
+        split_class_counts: dict[str, dict[str, int]] = {}
+        for entry in entries:
+            split_name = str(entry["split"])
+            class_name = str(entry["class_name"])
+            target = class_to_idx[class_name]
+            class_dir = Path(entry["path"])
+            for image_path in sorted(class_dir.rglob("*")):
+                if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_SUFFIXES:
+                    continue
+                samples.append((str(image_path), target))
+                targets.append(target)
+                splits.append(split_name)
+                split_counts[split_name] = split_counts.get(split_name, 0) + 1
+                per_split = split_class_counts.setdefault(split_name, {})
+                per_split[class_name] = per_split.get(class_name, 0) + 1
+                records.append(
+                    {
+                        "relative_path": _dataset_relative_path(dataset_dir, image_path),
+                        "label_name": class_name,
+                        "split": split_name,
+                        "source": "split_folder",
+                    }
+                )
+        if not samples:
+            continue
+        return {
+            "class_names": class_names,
+            "samples": samples,
+            "targets": targets,
+            "splits": splits,
+            "records": records,
+            "record_count": len(records),
+            "accepted_record_count": len(samples),
+            "skipped_record_count": 0,
+            "source": "split_folder",
+            "root": str(root),
+            "root_relative_path": _dataset_relative_path(dataset_dir, root),
+            "split_counts": split_counts,
+            "split_class_counts": split_class_counts,
+        }
+    return None
+
+
+def _split_folder_execution_metadata(split_folder_spec: dict | None) -> dict:
+    if split_folder_spec is None:
+        return {
+            "status": "unavailable",
+            "applied": False,
+            "sample_count": 0,
+            "class_count": 0,
+        }
+    split_class_counts = split_folder_spec.get("split_class_counts")
+    if not isinstance(split_class_counts, dict):
+        split_class_counts = {}
+    return {
+        "status": "applied",
+        "applied": True,
+        "root": str(split_folder_spec.get("root_relative_path") or ""),
+        "sample_count": len(split_folder_spec.get("samples") or []),
+        "class_count": len(split_folder_spec.get("class_names") or []),
+        "split_counts": dict(split_folder_spec.get("split_counts") or {}),
+        "split_class_counts": split_class_counts,
+    }
+
+
+def _split_folder_candidate_roots(dataset_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        if not candidate.is_dir():
+            return
+        if all(existing.resolve() != resolved for existing in candidates):
+            candidates.append(candidate)
+
+    add(dataset_dir)
+    for prefix in _metadata_image_root_prefixes(dataset_dir):
+        add(dataset_dir.joinpath(*prefix.split("/")))
+    return candidates
+
+
+def _split_folder_class_dirs(root: Path) -> list[dict]:
+    try:
+        children = sorted(Path(root).iterdir())
+    except OSError:
+        return []
+    split_dirs: list[tuple[str, Path]] = []
+    non_split_image_dirs: list[Path] = []
+    for child in children:
+        if not child.is_dir() or child.name.lower() in ROOT_METADATA_DIR_NAMES:
+            continue
+        if not _contains_image_file(child):
+            continue
+        split_name = _normalize_metadata_split(child.name)
+        if split_name:
+            split_dirs.append((split_name, child))
+        else:
+            non_split_image_dirs.append(child)
+    if not split_dirs or non_split_image_dirs:
+        return []
+
+    class_dirs: list[dict] = []
+    for split_name, split_dir in split_dirs:
+        try:
+            split_children = sorted(split_dir.iterdir())
+        except OSError:
+            continue
+        for class_dir in split_children:
+            if (
+                class_dir.is_dir()
+                and class_dir.name.lower() not in ROOT_METADATA_DIR_NAMES
+                and _contains_image_file(class_dir)
+            ):
+                class_dirs.append(
+                    {
+                        "split": split_name,
+                        "class_name": class_dir.name,
+                        "path": class_dir,
+                    }
+                )
+    return class_dirs
+
+
+def _dataset_relative_path(dataset_dir: Path, path: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(dataset_dir.resolve())
+    except (OSError, ValueError):
+        return path.name
+    value = relative.as_posix()
+    return value or "dataset_root"
 
 
 def _metadata_bundle_dataset_spec(

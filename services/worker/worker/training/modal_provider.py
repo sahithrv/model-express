@@ -29,6 +29,10 @@ class ModalJobCancelled(RuntimeError):
     pass
 
 
+class ModalJobAlreadyTerminal(RuntimeError):
+    pass
+
+
 _MODAL_APP_SESSION_LOCK = threading.RLock()
 _MODAL_APP_SESSION_DEPTH = 0
 
@@ -115,6 +119,17 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
         with _modal_invocation_context(app):
             configured_function = _function_with_modal_options(training_function, modal_resources)
             result = _invoke_modal_function(configured_function, payload, client, job_payload, modal_resources)
+    except ModalJobAlreadyTerminal as exc:
+        log_event(
+            "info",
+            "modal_training_already_terminal",
+            job_id=job["id"],
+            project_id=job.get("project_id", ""),
+            reason=str(exc),
+            modal_resource_signature=modal_resources.get("resource_signature", ""),
+        )
+        print(f"Modal training already terminal for {job['id']}: {exc}")
+        return
     except ModalJobCancelled as exc:
         log_event(
             "info",
@@ -602,12 +617,15 @@ def _wait_for_modal_function_call(call, client: OrchestratorClient, job: dict, m
         except Exception as exc:
             if not _is_modal_get_timeout(exc):
                 raise
-            if not _job_attempt_no_longer_active(client, job):
+            stop_decision = _job_attempt_stop_decision(client, job)
+            if not stop_decision["stop"]:
                 continue
-            cancel_status = _cancel_modal_function_call(call)
-            if call_object_id:
-                _report_modal_call(client, job, modal_resources, call_object_id, cancel_status)
-            raise ModalJobCancelled("backend marked this attempt stale or terminal") from exc
+            if stop_decision["cancel_remote"]:
+                cancel_status = _cancel_modal_function_call(call)
+                if call_object_id:
+                    _report_modal_call(client, job, modal_resources, call_object_id, cancel_status)
+                raise ModalJobCancelled(stop_decision["reason"]) from exc
+            raise ModalJobAlreadyTerminal(stop_decision["reason"]) from exc
 
 
 def _modal_function_call_object_id(call) -> str:
@@ -666,12 +684,16 @@ def _report_modal_call(
 
 
 def _job_attempt_no_longer_active(client: OrchestratorClient, job: dict) -> bool:
+    return bool(_job_attempt_stop_decision(client, job)["stop"])
+
+
+def _job_attempt_stop_decision(client: OrchestratorClient, job: dict) -> dict:
     getter = getattr(client, "get_job", None)
     if not callable(getter):
-        return False
+        return {"stop": False, "cancel_remote": False, "reason": ""}
     job_id = str(job.get("id") or "")
     if not job_id:
-        return False
+        return {"stop": False, "cancel_remote": False, "reason": ""}
     try:
         latest = getter(job_id)
     except Exception as exc:
@@ -682,14 +704,38 @@ def _job_attempt_no_longer_active(client: OrchestratorClient, job: dict) -> bool
             project_id=job.get("project_id", ""),
             error=str(exc),
         )
-        return False
+        return {"stop": False, "cancel_remote": False, "reason": ""}
     latest_status = str(latest.get("status") or "").strip().upper()
-    if latest_status in {"FAILED", "SUCCEEDED", "CANCELLED"}:
-        return True
     latest_config = latest.get("config") if isinstance(latest.get("config"), dict) else {}
     expected_attempt = callback_identity(job, modal_resources=None).get("training_attempt_id", "")
     active_attempt = str(latest_config.get("active_attempt_id") or "").strip()
-    return bool(expected_attempt and active_attempt and active_attempt != expected_attempt)
+    if latest_status in {"FAILED", "SUCCEEDED", "CANCELLED"}:
+        cancel_remote = latest_status == "CANCELLED" or _remote_cancel_requested(latest_config)
+        return {
+            "stop": True,
+            "cancel_remote": cancel_remote,
+            "reason": f"backend marked this attempt terminal with status {latest_status}",
+        }
+    if expected_attempt and active_attempt and active_attempt != expected_attempt:
+        return {
+            "stop": True,
+            "cancel_remote": True,
+            "reason": "backend marked this attempt stale",
+        }
+    return {"stop": False, "cancel_remote": False, "reason": ""}
+
+
+def _remote_cancel_requested(config: dict) -> bool:
+    return any(
+        _truthy_config_flag(config.get(key))
+        for key in ("cancel_requested", "worker_stop_requested", "terminate_remote_work")
+    )
+
+
+def _truthy_config_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _cancel_modal_function_call(call) -> str:

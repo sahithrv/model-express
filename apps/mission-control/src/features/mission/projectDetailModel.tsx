@@ -189,6 +189,15 @@ export function runPrimaryMetric(summary: TrainingRunSummary | null, evaluation:
   };
 }
 
+export function effectiveTrainingRunStatus(summary: TrainingRunSummary | null, job: Job | null) {
+  const jobStatus = normalizedStatus(job?.status ?? "");
+  if (jobStatus === "SUCCEEDED" || jobStatus === "FAILED") {
+    return jobStatus;
+  }
+  const summaryStatus = String(summary?.status ?? "").trim();
+  return summaryStatus ? normalizedStatus(summaryStatus) : "UNKNOWN";
+}
+
 export function championPrimaryMetric(
   champion: ProjectChampion | null,
   summary: TrainingRunSummary | null,
@@ -868,7 +877,9 @@ export function summarizeTrainingRuns(
     bestMacroF1: best?.summary.best_macro_f1 ?? 0,
     bestPrimaryMetricLabel: best?.metric.label ?? "Macro-F1",
     bestPrimaryMetricValue: best?.metric.value ?? 0,
-    activeRuns: summaries.filter((summary) => ["RUNNING", "ASSIGNED", "QUEUED"].includes(summary.status)).length,
+    activeRuns: summaries.filter((summary) =>
+      ["RUNNING", "ASSIGNED", "QUEUED"].includes(effectiveTrainingRunStatus(summary, jobById.get(summary.job_id) ?? null)),
+    ).length,
   };
 }
 
@@ -1529,9 +1540,10 @@ export function activityCardFromRun(
   evaluation: TrainingRunEvaluation | null,
   job: Job | null,
 ): ActivityCardModel {
-  const status = activityStatus(summary.status);
+  const runStatus = effectiveTrainingRunStatus(summary, job);
+  const status = activityStatus(runStatus);
   const primary = runPrimaryMetric(summary, evaluation, job);
-  const terminal = ["SUCCEEDED", "FAILED"].includes(normalizedStatus(summary.status));
+  const terminal = ["SUCCEEDED", "FAILED"].includes(runStatus);
   return {
     id: `run-${summary.job_id}`,
     type: terminal ? "result" : "experiment",
@@ -4744,7 +4756,7 @@ export function buildSeedVarianceBySignature(
   const groups = new Map<string, Array<{ seed: string; score: number }>>();
   for (const summary of summaries) {
     const job = jobById.get(summary.job_id);
-    if (!job || normalizedStatus(summary.status) !== "SUCCEEDED") continue;
+    if (!job || effectiveTrainingRunStatus(summary, job) !== "SUCCEEDED") continue;
     const signature = experimentComparisonSignature(job.config);
     if (!signature) continue;
     const seed = experimentSeed(job.config);
@@ -5302,11 +5314,12 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     ...demoPredictionsFromUnknown(deployment.demo_predictions),
     ...demoPredictionsFromUnknown(deployment.predictions),
   ];
-  const exportStatus =
+  const metadataExportStatus =
     recordString(modelCard, "export_status") ||
     recordString(deployment, "export_status") ||
-    exports[0]?.status ||
     "PENDING";
+  const uniqueExports = uniqueBy(exports, (item, index) => item.id || item.artifact_uri || item.model_uri || item.download_url || String(index));
+  const exportStatus = championExportOverallStatus(uniqueExports, metadataExportStatus);
   const latency = recordNumber(modelProfile, "estimated_latency_ms");
   const modelSize = recordNumber(modelProfile, "model_size_mb") || recordNumber(modelProfile, "estimated_model_size_mb");
   const objectiveContext = recordString(deployment, "objective_context");
@@ -5334,7 +5347,6 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     recordString(modelProfile, "input_size") ? `input: ${recordString(modelProfile, "input_size")}` : "",
   ]).slice(0, 6);
 
-  const uniqueExports = uniqueBy(exports, (item, index) => item.id || item.artifact_uri || item.model_uri || item.download_url || String(index));
   const portableBundle = firstPortableInferenceBundle(uniqueExports);
 
   return {
@@ -5353,6 +5365,23 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     demoPredictions,
     feedback: detail.championFeedback,
   };
+}
+
+function championExportOverallStatus(exports: ChampionExport[], metadataStatus: string) {
+  const exportStatus = preferredChampionExportStatus(exports.map((exportRecord) => exportRecord.status || ""));
+  if (exportStatus) return exportStatus;
+  return preferredChampionExportStatus([metadataStatus]) || "PENDING";
+}
+
+function preferredChampionExportStatus(statuses: string[]) {
+  const normalized = statuses.map((status) => normalizedStatus(status || "")).filter(Boolean);
+  if (normalized.some((status) => status === "READY" || status === "SUCCEEDED")) return "READY";
+  if (normalized.includes("RUNNING")) return "RUNNING";
+  if (normalized.some((status) => status === "REQUESTED" || status === "QUEUED")) return "QUEUED";
+  if (normalized.includes("PENDING")) return "PENDING";
+  if (normalized.includes("PENDING_ARTIFACT")) return "PENDING_ARTIFACT";
+  if (normalized.includes("FAILED")) return "FAILED";
+  return "";
 }
 
 export function championFeedbackMetricsSnapshot(detail: ProjectDetail) {

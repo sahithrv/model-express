@@ -394,7 +394,7 @@ def test_modal_training_spawn_reports_function_call_object_id(monkeypatch):
     assert modal_call["payload"]["modal_resources"]["modal_call_cancel_status"] == "active"
 
 
-def test_modal_training_spawn_cancels_when_backend_attempt_is_terminal(monkeypatch):
+def test_modal_training_spawn_cancels_when_backend_requests_remote_cancel(monkeypatch):
     call = _FakeFunctionCall(object_id="fc-cancel", errors=[TimeoutError("timed out")])
     fake_function = _FakeSpawnModalFunction(call)
     fake_modal_app = types.ModuleType("worker.training.modal_app")
@@ -411,7 +411,11 @@ def test_modal_training_spawn_cancels_when_backend_attempt_is_terminal(monkeypat
     client.jobs_by_id["job_cancel"] = {
         "id": "job_cancel",
         "status": "FAILED",
-        "config": {"active_attempt_id": "job_cancel:attempt-1"},
+        "config": {
+            "active_attempt_id": "job_cancel:terminal-after-attempt-1",
+            "cancel_requested": True,
+            "terminate_remote_work": True,
+        },
     }
     run_modal_training(
         client,
@@ -436,6 +440,51 @@ def test_modal_training_spawn_cancels_when_backend_attempt_is_terminal(monkeypat
     assert client.failures == []
     assert [entry["payload"]["cancel_status"] for entry in client.modal_calls] == ["active", "cancel_requested"]
     assert all(entry["payload"]["modal_function_call_object_id"] == "fc-cancel" for entry in client.modal_calls)
+
+
+def test_modal_training_spawn_does_not_cancel_when_backend_already_succeeded(monkeypatch):
+    call = _FakeFunctionCall(object_id="fc-complete", errors=[TimeoutError("timed out")])
+    fake_function = _FakeSpawnModalFunction(call)
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = fake_function
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_USE_SPAWN", "1")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_CALL_POLL_SECONDS", "0.25")
+    monkeypatch.setenv("MODEL_EXPRESS_MODAL_CANCEL_TERMINATE_CONTAINERS", "1")
+
+    client = _FakeClient()
+    client.jobs_by_id["job_complete"] = {
+        "id": "job_complete",
+        "status": "SUCCEEDED",
+        "config": {"active_attempt_id": "job_complete:terminal-after-attempt-1"},
+    }
+    run_modal_training(
+        client,
+        {
+            "id": "job_complete",
+            "project_id": "project_1",
+            "attempt": 1,
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "gpu_type": "T4",
+                "batch_size": 16,
+                "memory_mb": 24576,
+                "active_attempt_id": "job_complete:attempt-1",
+            },
+        },
+    )
+
+    assert fake_function.spawn_payloads
+    assert call.cancel_calls == []
+    assert client.job_reads == ["job_complete"]
+    assert client.failures == []
+    assert len(client.modal_calls) == 1
+    assert client.modal_calls[0]["payload"]["cancel_status"] == "active"
+    assert client.modal_calls[0]["payload"]["modal_function_call_object_id"] == "fc-complete"
 
 
 def test_modal_training_invocation_oom_failure_reports_resource_metadata(monkeypatch):
