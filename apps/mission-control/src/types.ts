@@ -419,6 +419,8 @@ export type ChampionExport = {
 
 export type PortableInferenceBundle = {
   schema_version?: string;
+  project_id?: string;
+  export_id?: string;
   status?: string;
   artifact_uri?: string;
   artifact_path?: string;

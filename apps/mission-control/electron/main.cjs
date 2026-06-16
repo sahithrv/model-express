@@ -12,6 +12,7 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const { Transform } = require("stream");
+const { pipeline } = require("stream/promises");
 const { fileURLToPath, pathToFileURL } = require("url");
 const { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 const { buildDatasetUploadPreflight, collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
@@ -30,6 +31,7 @@ const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
 const DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const MODEL_ARTIFACT_EXTENSIONS = [".onnx", ".ort", ".pt", ".pth", ".torchscript", ".safetensors"];
 const PORTABLE_BUNDLE_EXTENSIONS = [".zip"];
+const EXPORT_ARTIFACT_EXTENSIONS = [".zip", ".onnx", ".pt", ".pth", ".torchscript", ".safetensors", ".json"];
 const electronRuntimeAvailable = Boolean(app && BrowserWindow && dialog && ipcMain && Menu);
 let missionControlEnvCache = null;
 let missionControlEnvCacheKey = "";
@@ -478,6 +480,22 @@ function validateLocalPortableBundlePath(artifactUri, env = process.env) {
   );
 }
 
+function validateLocalExportArtifactPath(
+  artifactUri,
+  env = process.env,
+  allowedExtensions = EXPORT_ARTIFACT_EXTENSIONS,
+  extensionMessage = "Export artifact must use a supported download extension.",
+) {
+  rejectParentTraversalSegments(artifactUri, "Export artifact");
+  return validateLocalArtifactPathForExtensions(
+    artifactUri,
+    env,
+    allowedExtensions,
+    "Export artifact",
+    extensionMessage,
+  );
+}
+
 function validateLocalArtifactPathForExtensions(artifactUri, env, allowedExtensions, label, extensionMessage) {
   const localPath = localPathFromURI(String(artifactUri ?? "").trim());
   if (!localPath) {
@@ -761,6 +779,10 @@ if (electronRuntimeAvailable) {
     return saveArtifact(request);
   });
 
+  ipcMain.handle("artifact:saveExport", async (_event, request) => {
+    return saveExportArtifact(request);
+  });
+
   ipcMain.handle("worker:ensureProjectWorker", async (_event, options) => {
     return ensureProjectWorker(options);
   });
@@ -810,26 +832,57 @@ async function saveArtifact(request = {}) {
     throw new Error("artifactUri is required.");
   }
   validatePortableBundleArtifactUri(artifactUri);
-  const defaultName = safeDownloadFileName(request.defaultPath || artifactFileName(artifactUri) || "portable_inference_bundle.zip");
-  const result = await dialog.showSaveDialog(mainWindow, {
-    title: "Save portable inference bundle",
-    defaultPath: defaultName,
-    filters: [
-      { name: "ZIP archives", extensions: ["zip"] },
-      { name: "All files", extensions: ["*"] },
-    ],
-  });
-  if (result.canceled || !result.filePath) {
+  const result = await saveExportArtifact(
+    {
+      ...request,
+      suggestedName: request.suggestedName ?? request.defaultPath,
+      kind: request.kind ?? "portable_bundle",
+    },
+    {},
+  );
+  if (result.canceled) {
     return null;
   }
-  const buffer = artifactUri.startsWith("s3://")
-    ? await readS3ObjectBuffer(artifactUri, request, "artifact")
-    : readLocalPortableBundleBuffer(artifactUri);
-  await fs.promises.writeFile(result.filePath, buffer);
   return {
-    artifact_uri: artifactUri,
-    path: result.filePath,
-    size_bytes: buffer.byteLength,
+    artifact_uri: result.artifact_uri,
+    path: result.file_path,
+    size_bytes: result.bytes,
+  };
+}
+
+async function saveExportArtifact(request = {}, runtime = {}) {
+  const source = resolveExportArtifactSource(request, runtime.env ?? process.env);
+  const showSaveDialog = runtime.showSaveDialog ?? dialog?.showSaveDialog?.bind(dialog);
+  if (!showSaveDialog) {
+    throw new Error("Save dialog is unavailable.");
+  }
+  const suggestedName = safeDownloadFileName(
+    request.suggestedName ||
+      request.defaultPath ||
+      artifactFileName(source.artifact_uri) ||
+      defaultExportArtifactName(request.kind),
+  );
+  const dialogResult = await showSaveDialog(mainWindow, {
+    title: source.kind === "portable_bundle" ? "Save portable inference bundle" : "Save export artifact",
+    defaultPath: suggestedName,
+    filters: exportArtifactDialogFilters(source.extension),
+  });
+  if (dialogResult.canceled || !dialogResult.filePath) {
+    return {
+      canceled: true,
+      file_path: "",
+      bytes: 0,
+      artifact_uri: source.artifact_uri,
+    };
+  }
+  const bytes = source.s3
+    ? await copyS3ObjectToFile(source.artifact_uri, dialogResult.filePath, request)
+    : await copyLocalFileToFile(source.file_path, dialogResult.filePath);
+  return {
+    canceled: false,
+    file_path: dialogResult.filePath,
+    bytes,
+    artifact_uri: source.artifact_uri,
   };
 }
 
@@ -851,6 +904,151 @@ function validatePortableBundleArtifactUri(artifactUri) {
 function readLocalPortableBundleBuffer(artifactUri) {
   const artifactPath = validateLocalPortableBundlePath(artifactUri);
   return fs.readFileSync(artifactPath);
+}
+
+function resolveExportArtifactSource(request = {}, env = process.env) {
+  const artifactUri = String(request?.artifactUri ?? "").trim();
+  const artifactPath = String(request?.artifactPath ?? request?.artifact_path ?? "").trim();
+  const kind = String(request.kind ?? "");
+  const allowedExtensions = exportArtifactExtensionsForKind(kind);
+  const extensionMessage = exportArtifactExtensionMessage(kind);
+  const sourceUri = artifactUri || artifactPath;
+  if (!sourceUri) {
+    throw new Error("artifactUri or artifactPath is required.");
+  }
+  if (/^https?:\/\//i.test(sourceUri)) {
+    throw new Error("HTTP export artifact downloads are not supported by Mission Control.");
+  }
+  if (sourceUri.startsWith("s3://")) {
+    validateS3ExportArtifactUri(sourceUri, allowedExtensions, extensionMessage);
+    return {
+      artifact_uri: sourceUri,
+      file_path: "",
+      extension: exportArtifactExtension(sourceUri, allowedExtensions),
+      kind,
+      s3: true,
+    };
+  }
+  const localSource = artifactPath && !artifactUri.startsWith("file://") && !artifactUri.startsWith("s3://")
+    ? artifactPath
+    : sourceUri;
+  const filePath = validateLocalExportArtifactPath(localSource, env, allowedExtensions, extensionMessage);
+  return {
+    artifact_uri: artifactUri || pathToFileURL(filePath).toString(),
+    file_path: filePath,
+    extension: exportArtifactExtension(filePath, allowedExtensions),
+    kind,
+    s3: false,
+  };
+}
+
+function validateS3ExportArtifactUri(
+  artifactUri,
+  allowedExtensions = EXPORT_ARTIFACT_EXTENSIONS,
+  extensionMessage = "Export artifact must use a supported download extension.",
+) {
+  let parsed;
+  try {
+    parsed = new URL(artifactUri);
+  } catch {
+    throw new Error(`Invalid S3 export artifact URI: ${artifactUri}`);
+  }
+  const key = parsed.pathname.replace(/^\/+/, "");
+  if (!parsed.hostname || !key) {
+    throw new Error(`Invalid S3 export artifact URI: ${artifactUri}`);
+  }
+  rejectParentTraversalSegments(key, "Export artifact");
+  if (!isAllowedExportArtifactFile(key, allowedExtensions)) {
+    throw new Error(extensionMessage);
+  }
+}
+
+function isAllowedExportArtifactFile(filePath, allowedExtensions = EXPORT_ARTIFACT_EXTENSIONS) {
+  return isAllowedArtifactFile(filePath, allowedExtensions);
+}
+
+function exportArtifactExtension(filePath, allowedExtensions = EXPORT_ARTIFACT_EXTENSIONS) {
+  const comparable = artifactComparablePathForExtension(filePath);
+  const extension = allowedExtensions.find((item) => comparable.endsWith(item));
+  return extension || path.extname(comparable);
+}
+
+function exportArtifactExtensionsForKind(kind) {
+  return String(kind ?? "").toLowerCase().includes("portable")
+    ? PORTABLE_BUNDLE_EXTENSIONS
+    : EXPORT_ARTIFACT_EXTENSIONS;
+}
+
+function exportArtifactExtensionMessage(kind) {
+  return String(kind ?? "").toLowerCase().includes("portable")
+    ? "Portable export bundle must use a supported ZIP extension."
+    : "Export artifact must use a supported download extension.";
+}
+
+function artifactComparablePathForExtension(value) {
+  const text = String(value ?? "").trim();
+  if (text.startsWith("s3://") || text.startsWith("file://")) {
+    try {
+      return decodeURIComponent(new URL(text).pathname).toLowerCase();
+    } catch {
+      return text.toLowerCase();
+    }
+  }
+  return text.toLowerCase();
+}
+
+function defaultExportArtifactName(kind) {
+  return String(kind ?? "").toLowerCase().includes("portable") ? "portable_inference_bundle.zip" : "model-export-artifact.zip";
+}
+
+function exportArtifactDialogFilters(extension) {
+  if (extension === ".zip") {
+    return [
+      { name: "ZIP archives", extensions: ["zip"] },
+      { name: "All supported export artifacts", extensions: EXPORT_ARTIFACT_EXTENSIONS.map((item) => item.slice(1)) },
+    ];
+  }
+  return [
+    { name: "All supported export artifacts", extensions: EXPORT_ARTIFACT_EXTENSIONS.map((item) => item.slice(1)) },
+    { name: "All files", extensions: ["*"] },
+  ];
+}
+
+async function copyLocalFileToFile(sourcePath, destinationPath) {
+  const source = fs.realpathSync.native(sourcePath);
+  const destination = path.resolve(destinationPath);
+  if (pathKey(source) === pathKey(destination)) {
+    return fs.statSync(source).size;
+  }
+  return copyReadableToFile(fs.createReadStream(source), destination);
+}
+
+async function copyS3ObjectToFile(artifactUri, destinationPath, options = {}) {
+  const parsed = new URL(artifactUri);
+  const client = createS3Client(options, { purpose: "artifact" });
+  const response = await client.send(
+    new GetObjectCommand({
+      Bucket: parsed.hostname,
+      Key: parsed.pathname.replace(/^\/+/, ""),
+    }),
+  );
+  return copyReadableToFile(response.Body, destinationPath);
+}
+
+async function copyReadableToFile(readable, destinationPath) {
+  if (!readable) {
+    await fs.promises.writeFile(destinationPath, "");
+    return 0;
+  }
+  let bytes = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      bytes += Buffer.isBuffer(chunk) ? chunk.byteLength : Buffer.byteLength(chunk);
+      callback(null, chunk);
+    },
+  });
+  await pipeline(readable, counter, fs.createWriteStream(destinationPath));
+  return bytes;
 }
 
 function safeDownloadFileName(value) {
@@ -929,6 +1127,26 @@ function localPathFromURI(value) {
     return null;
   }
   return value;
+}
+
+function rejectParentTraversalSegments(value, label) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return;
+  }
+  const candidate = text.startsWith("file://") ? safeURLPathname(text) : text;
+  const normalized = safeDecodeURIComponent(candidate).replace(/\\/g, "/");
+  if (normalized.split("/").some((part) => part === "..")) {
+    throw new Error(`${label} path must not contain parent directory segments.`);
+  }
+}
+
+function safeURLPathname(value) {
+  try {
+    return new URL(value).pathname;
+  } catch {
+    return value;
+  }
 }
 
 function externalDataLocalPath(candidate, artifactDir, mountPath) {
@@ -1807,13 +2025,16 @@ module.exports = {
     resolveDatasetFolderOption,
     resolveS3Endpoint,
     safeLogText,
+    saveExportArtifact,
     selectedDatasetFolders,
     validateAppRequestPath,
     validateLocalArtifactPath,
+    validateLocalExportArtifactPath,
     validateLocalPortableBundlePath,
     validateOrchestratorBaseUrl,
     validateOrchestratorRequest,
     validateRemoteModalUrl,
+    validateS3ExportArtifactUri,
     validateUploadEndpoint,
   },
 };

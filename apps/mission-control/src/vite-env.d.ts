@@ -104,6 +104,21 @@ interface Window {
       path: string;
       size_bytes: number;
     } | null>;
+    saveExportArtifact(options: {
+      artifactUri?: string;
+      artifactPath?: string;
+      suggestedName?: string;
+      kind?: string;
+      endpoint?: string;
+      accessKeyId?: string;
+      secretAccessKey?: string;
+      region?: string;
+    }): Promise<{
+      canceled: boolean;
+      file_path: string;
+      bytes: number;
+      artifact_uri?: string;
+    }>;
     ensureProjectWorker(options: {
       projectId: string;
       baseUrl: string;

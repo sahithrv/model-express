@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("missionControl", {
   selectDemoImage: () => ipcRenderer.invoke("demo:selectImage"),
   loadModelArtifact: (options) => ipcRenderer.invoke("artifact:loadModel", options),
   saveArtifact: (options) => ipcRenderer.invoke("artifact:save", options),
+  saveExportArtifact: (options) => ipcRenderer.invoke("artifact:saveExport", options),
   ensureProjectWorker: (options) => ipcRenderer.invoke("worker:ensureProjectWorker", options),
   stopProjectWorker: (options) => ipcRenderer.invoke("worker:stopProjectWorker", options),
 });

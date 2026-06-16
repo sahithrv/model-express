@@ -191,6 +191,180 @@ test("portable bundle save paths require configured artifact roots and zip archi
   );
 });
 
+test("export artifact save streams local zip under allowed export root", async () => {
+  const allowedRoot = tempDir("mx-export-save-");
+  const bundlePath = path.join(allowedRoot, "portable_inference_bundle.zip");
+  const destinationPath = path.join(tempDir("mx-export-destination-"), "saved.zip");
+  fs.writeFileSync(bundlePath, "zip-bytes");
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS: allowedRoot,
+  };
+
+  const result = await __test.saveExportArtifact(
+    {
+      artifactUri: pathToFileURL(bundlePath).toString(),
+      suggestedName: "portable_inference_bundle.zip",
+      kind: "portable_bundle",
+    },
+    {
+      env,
+      showSaveDialog: async (_window, options) => {
+        assert.equal(options.defaultPath, "portable_inference_bundle.zip");
+        return { canceled: false, filePath: destinationPath };
+      },
+    },
+  );
+
+  assert.equal(result.canceled, false);
+  assert.equal(result.file_path, destinationPath);
+  assert.equal(result.bytes, 9);
+  assert.equal(fs.readFileSync(destinationPath, "utf8"), "zip-bytes");
+});
+
+test("export artifact save keeps portable bundle saves zip-only", async () => {
+  const allowedRoot = tempDir("mx-export-portable-kind-");
+  const modelPath = path.join(allowedRoot, "model.onnx");
+  fs.writeFileSync(modelPath, "onnx");
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS: allowedRoot,
+  };
+
+  await assert.rejects(
+    () =>
+      __test.saveExportArtifact(
+        { artifactUri: modelPath, kind: "portable_bundle" },
+        {
+          env,
+          showSaveDialog: async () => ({ canceled: true }),
+        },
+      ),
+    /Portable export bundle must use a supported ZIP extension/,
+  );
+});
+
+test("export artifact save allows non-portable model export extensions", async () => {
+  const allowedRoot = tempDir("mx-export-model-kind-");
+  const modelPath = path.join(allowedRoot, "model.onnx");
+  const destinationPath = path.join(tempDir("mx-export-model-destination-"), "model.onnx");
+  fs.writeFileSync(modelPath, "onnx");
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS: allowedRoot,
+  };
+
+  const result = await __test.saveExportArtifact(
+    { artifactUri: modelPath, suggestedName: "model.onnx", kind: "model_artifact" },
+    {
+      env,
+      showSaveDialog: async () => ({ canceled: false, filePath: destinationPath }),
+    },
+  );
+
+  assert.equal(result.canceled, false);
+  assert.equal(result.bytes, 4);
+  assert.equal(fs.readFileSync(destinationPath, "utf8"), "onnx");
+});
+
+test("export artifact save rejects local zip outside allowed roots", async () => {
+  const allowedRoot = tempDir("mx-export-allowed-");
+  const outsideRoot = tempDir("mx-export-outside-");
+  const outsideBundlePath = path.join(outsideRoot, "portable_inference_bundle.zip");
+  fs.writeFileSync(outsideBundlePath, "zip");
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS: allowedRoot,
+  };
+  let dialogOpened = false;
+
+  await assert.rejects(
+    () =>
+      __test.saveExportArtifact(
+        { artifactUri: pathToFileURL(outsideBundlePath).toString(), kind: "portable_bundle" },
+        {
+          env,
+          showSaveDialog: async () => {
+            dialogOpened = true;
+            return { canceled: true };
+          },
+        },
+      ),
+    /configured Model Express artifact or export root/,
+  );
+  assert.equal(dialogOpened, false);
+});
+
+test("export artifact save rejects unsupported extensions", async () => {
+  const allowedRoot = tempDir("mx-export-extension-");
+  const logPath = path.join(allowedRoot, "training.log");
+  fs.writeFileSync(logPath, "log");
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS: allowedRoot,
+  };
+
+  await assert.rejects(
+    () =>
+      __test.saveExportArtifact(
+        { artifactUri: logPath, kind: "model_artifact" },
+        {
+          env,
+          showSaveDialog: async () => ({ canceled: true }),
+        },
+      ),
+    /supported download extension/,
+  );
+});
+
+test("export artifact save rejects parent traversal segments before resolving", async () => {
+  const allowedRoot = tempDir("mx-export-traversal-");
+  const bundlePath = path.join(allowedRoot, "portable_inference_bundle.zip");
+  fs.writeFileSync(bundlePath, "zip");
+  const traversalPath = `${allowedRoot}${path.sep}nested${path.sep}..${path.sep}portable_inference_bundle.zip`;
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS: allowedRoot,
+  };
+
+  await assert.rejects(
+    () =>
+      __test.saveExportArtifact(
+        { artifactUri: traversalPath, kind: "portable_bundle" },
+        {
+          env,
+          showSaveDialog: async () => ({ canceled: true }),
+        },
+      ),
+    /parent directory segments/,
+  );
+});
+
+test("export artifact save returns canceled true when dialog is canceled", async () => {
+  const allowedRoot = tempDir("mx-export-cancel-");
+  const bundlePath = path.join(allowedRoot, "portable_inference_bundle.zip");
+  fs.writeFileSync(bundlePath, "zip");
+  const env = {
+    ...process.env,
+    MODEL_EXPRESS_ALLOWED_EXPORT_ROOTS: allowedRoot,
+  };
+
+  const result = await __test.saveExportArtifact(
+    { artifactUri: bundlePath, suggestedName: "portable_inference_bundle.zip", kind: "portable_bundle" },
+    {
+      env,
+      showSaveDialog: async () => ({ canceled: true }),
+    },
+  );
+
+  assert.deepEqual(result, {
+    canceled: true,
+    file_path: "",
+    bytes: 0,
+    artifact_uri: bundlePath,
+  });
+});
+
 test("artifact loading rejects repo log artifacts even under artifact root", () => {
   const repoRoot = tempDir("mx-repo-");
   const logArtifact = path.join(repoRoot, "artifacts", "logs", "model.onnx");

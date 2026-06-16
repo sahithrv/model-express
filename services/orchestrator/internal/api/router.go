@@ -196,6 +196,8 @@ func newServer(store store.Store) *Server {
 	}
 	server.automationSettings.AutoMLSampler = normalizeAutoMLSampler(server.automationSettings.AutoMLSampler)
 
+	server.startLeaseRecovery()
+
 	return server
 }
 

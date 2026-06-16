@@ -743,6 +743,7 @@ export type ChampionExportDemo = {
   hasChampion: boolean;
   exportStatus: string;
   exports: ChampionExport[];
+  championExportsStatus?: ProjectDetail["championExportsStatus"];
   portableBundle?: PortableInferenceBundle;
   projectId: string;
   modelCard: Record<string, unknown>;
@@ -755,6 +756,8 @@ export type ChampionExportDemo = {
   demoPredictions: ChampionDemoPrediction[];
   feedback: ChampionFeedback[];
 };
+
+const BLOCKED_EXPORT_LIMITATION = "Export is blocked until the source artifact is available or export is re-run.";
 
 export type ChampionFeedbackRating = ChampionFeedback["rating"];
 
@@ -5225,6 +5228,7 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
       hasChampion: false,
       exportStatus: "PENDING",
       exports: [],
+      championExportsStatus: detail.championExportsStatus,
       projectId: "",
       modelCard: {},
       deploymentProfile: {},
@@ -5333,7 +5337,8 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     recordString(deployment, "export_status") ||
     "PENDING";
   const uniqueExports = uniqueBy(exports, (item, index) => item.id || item.artifact_uri || item.model_uri || item.download_url || String(index));
-  const exportStatus = championExportOverallStatus(uniqueExports, metadataExportStatus);
+  const orderedExports = championExportArchiveRecords(uniqueExports);
+  const exportStatus = championExportOverallStatus(orderedExports, metadataExportStatus);
   const latency = recordNumber(modelProfile, "estimated_latency_ms");
   const modelSize = recordNumber(modelProfile, "model_size_mb") || recordNumber(modelProfile, "estimated_model_size_mb");
   const objectiveContext = recordString(deployment, "objective_context");
@@ -5361,24 +5366,52 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     recordString(modelProfile, "input_size") ? `input: ${recordString(modelProfile, "input_size")}` : "",
   ]).slice(0, 6);
 
-  const portableBundle = firstPortableInferenceBundle(uniqueExports);
+  const portableBundle = firstPortableInferenceBundle(orderedExports);
+  const blockedPendingExport = orderedExports.some(
+    (exportRecord) =>
+      championExportStatusPendingLike(exportRecord.status) &&
+      championExportValidationMessages(exportRecord).length > 0 &&
+      !hasActiveChampionExportJob(detail, exportRecord),
+  );
 
   return {
     hasChampion: true,
     exportStatus,
-    exports: uniqueExports,
+    exports: orderedExports,
+    championExportsStatus: detail.championExportsStatus,
     portableBundle,
     projectId: champion.project_id,
     modelCard,
     deploymentProfile: deployment,
     modelProfile,
     useCases,
-    limitations,
+    limitations: blockedPendingExport ? uniqueStrings([BLOCKED_EXPORT_LIMITATION, ...limitations]).slice(0, 5) : limitations,
     preprocessing: preprocessing.length > 0 ? preprocessing : ["Use the preprocessing from the winning experiment config."],
     demoImages,
     demoPredictions,
     feedback: detail.championFeedback,
   };
+}
+
+function championExportStatusPendingLike(value?: string) {
+  return ["PENDING", "PENDING_ARTIFACT", "REQUESTED", "QUEUED", "RUNNING"].includes(normalizedStatus(value || "PENDING"));
+}
+
+function championExportValidationMessages(exportRecord: ChampionExport) {
+  return uniqueStrings([
+    exportRecord.error || "",
+    exportRecord.error_message || "",
+    ...(exportRecord.validation_errors ?? []),
+  ]);
+}
+
+function hasActiveChampionExportJob(detail: ProjectDetail, exportRecord: ChampionExport) {
+  const exportJobID = exportRecord.job_id || "";
+  return detail.jobs.some((job) => {
+    const status = normalizedStatus(job.status);
+    if (!["QUEUED", "ASSIGNED", "RUNNING", "REQUESTED", "PENDING"].includes(status)) return false;
+    return job.id === exportJobID || job.template === "export_champion";
+  });
 }
 
 function championExportOverallStatus(exports: ChampionExport[], metadataStatus: string) {
@@ -6091,6 +6124,45 @@ export function championExportsFromUnknown(value: unknown): ChampionExport[] {
   return value.map((item) => recordObject(item) as ChampionExport).filter((item) => Object.keys(item).length > 0);
 }
 
+export function championExportArchiveRecords(exports: ChampionExport[]): ChampionExport[] {
+  return [...exports].sort((left, right) => {
+    const rankDelta = championExportArchiveRank(left) - championExportArchiveRank(right);
+    if (rankDelta !== 0) return rankDelta;
+    return championExportTimestamp(right) - championExportTimestamp(left);
+  });
+}
+
+function championExportArchiveRank(exportRecord: ChampionExport) {
+  const portableBundle = portableInferenceBundleFromExport(exportRecord);
+  if (portableBundle && portableBundleDownloadable(portableBundle)) {
+    return 0;
+  }
+  const status = normalizedStatus(exportRecord.status || "");
+  const artifactURI = exportRecord.artifact_uri || exportRecord.model_uri || exportRecord.download_url || "";
+  if ((status === "READY" || status === "SUCCEEDED") && artifactURI) {
+    return 1;
+  }
+  if (status === "FAILED" || status === "ERROR") {
+    return 3;
+  }
+  return 2;
+}
+
+function championExportTimestamp(exportRecord: ChampionExport) {
+  return Math.max(
+    timestampSortScore(exportRecord.completed_at),
+    timestampSortScore(exportRecord.updated_at),
+    timestampSortScore(exportRecord.started_at),
+    timestampSortScore(exportRecord.requested_at),
+    timestampSortScore(exportRecord.created_at),
+  );
+}
+
+export function portableBundleDownloadable(bundle: PortableInferenceBundle) {
+  const status = normalizedStatus(bundle.status || "");
+  return ["READY", "SUCCEEDED", "CREATED"].includes(status) && Boolean(bundle.artifact_uri || bundle.uri || bundle.artifact_path || bundle.path);
+}
+
 export function firstPortableInferenceBundle(exports: ChampionExport[]): PortableInferenceBundle | undefined {
   for (const exportRecord of exports) {
     const bundle = portableInferenceBundleFromExport(exportRecord);
@@ -6127,6 +6199,8 @@ export function portableInferenceBundleFromExport(exportRecord: ChampionExport):
   if (!artifactURI && !artifactPath && !status && contents.length === 0 && !error) return undefined;
   return {
     schema_version: recordFirstString(summary, ["schema_version"]) || "portable_inference_bundle_v1",
+    project_id: exportRecord.project_id,
+    export_id: exportRecord.id,
     status: status || (artifactURI || artifactPath ? "created" : "unknown"),
     artifact_uri: artifactURI,
     artifact_path: artifactPath || artifactURI,

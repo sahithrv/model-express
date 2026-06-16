@@ -83,7 +83,6 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
             validation_errors=validation_errors,
         )
         client.report_champion_export_result(job_id, result)
-        client.fail_job(job_id, "; ".join(validation_errors))
         return
 
     provenance = _export_provenance(config, job_id, requested_format)
@@ -163,20 +162,12 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
         )
         manifest = _error_manifest(export_dir, requested_format, validation_errors, status="pending_dependencies", provenance=provenance)
 
-    primary_artifact = _created_artifact_for_requested_format(manifest, requested_format)
-    validation_errors.extend(_manifest_export_self_test_errors(manifest))
-    if _manifest_export_self_test_failed(manifest):
-        status = "FAILED"
-    elif primary_artifact:
-        status = "READY"
-    elif validation_errors and requested_format == "safetensors":
-        status = "PENDING_ARTIFACT"
-    elif any(artifact.get("status") == "failed" for artifact in manifest.get("artifacts", [])):
-        status = "FAILED"
-        validation_errors.extend(_artifact_errors(manifest))
-    else:
-        status = "PENDING_ARTIFACT"
-        validation_errors.extend(_artifact_errors(manifest))
+    status, validation_errors = _export_status_for_manifest(
+        manifest,
+        requested_format=requested_format,
+        validation_errors=validation_errors,
+        has_source_artifact=source_artifact is not None,
+    )
 
     result = _export_result_payload(
         status=status,
@@ -185,10 +176,7 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
         validation_errors=validation_errors,
     )
     client.report_champion_export_result(job_id, result)
-    if status == "FAILED":
-        client.fail_job(job_id, result.get("error") or "champion export failed")
-        return
-    client.complete_job(job_id, mlflow_run_id="")
+    return
 
 
 def run_champion_demo_prediction_job(client: OrchestratorClient, job: dict) -> None:
@@ -247,10 +235,7 @@ def run_champion_demo_prediction_job(client: OrchestratorClient, job: dict) -> N
         }
     )
     client.report_champion_demo_prediction_result(job_id, payload)
-    if payload["status"] == "FAILED":
-        client.fail_job(job_id, payload.get("error") or "champion demo prediction failed")
-        return
-    client.complete_job(job_id, mlflow_run_id="")
+    return
 
 
 def run_generate_visual_exemplars_job(client: OrchestratorClient, job: dict) -> None:
@@ -1143,6 +1128,53 @@ def _artifact_errors(manifest: dict) -> list[str]:
         error = str(artifact.get("error", "artifact was not created"))
         errors.append(f"{error_code}: {error}")
     return errors
+
+
+def _export_status_for_manifest(
+    manifest: dict,
+    *,
+    requested_format: str,
+    validation_errors: list[str],
+    has_source_artifact: bool,
+) -> tuple[str, list[str]]:
+    # V1 export state semantics:
+    # PENDING: request exists and worker work may still run.
+    # PENDING_ARTIFACT: source training artifact is unavailable, and retrying later may make sense.
+    # FAILED: worker attempted export and hit a deterministic blocker that will not fix itself.
+    # READY: artifact URI is present and validated for the requested format.
+    errors = [*validation_errors, *_manifest_export_self_test_errors(manifest)]
+    artifact_errors = _artifact_errors(manifest)
+    primary_artifact = _created_artifact_for_requested_format(manifest, requested_format)
+    if _manifest_export_self_test_failed(manifest):
+        return "FAILED", errors
+    if primary_artifact:
+        return "READY", errors
+    if artifact_errors:
+        errors.extend(artifact_errors)
+    if _has_deterministic_export_blocker(errors, has_source_artifact=has_source_artifact):
+        return "FAILED", errors
+    if any(artifact.get("status") == "failed" for artifact in manifest.get("artifacts", [])):
+        return "FAILED", errors
+    return "PENDING_ARTIFACT", errors
+
+
+def _has_deterministic_export_blocker(errors: list[str], *, has_source_artifact: bool) -> bool:
+    blocker_codes = (
+        "ARTIFACT_SOURCE_REJECTED",
+        "ARTIFACT_NOT_FOUND",
+        "SOURCE_ARTIFACT_REQUIRED",
+        "CHECKPOINT_UNSAFE_PICKLE_REJECTED",
+        "CLASS_LABEL_ORDER_MISMATCH",
+    )
+    conversion_dependency_codes = (
+        "TORCH_UNAVAILABLE",
+        "ONNXSCRIPT_UNAVAILABLE",
+        "ONNX_UNAVAILABLE",
+    )
+    normalized_errors = [str(error).upper() for error in errors]
+    if any(any(code in error for code in blocker_codes) for error in normalized_errors):
+        return True
+    return not has_source_artifact and any(any(code in error for code in conversion_dependency_codes) for error in normalized_errors)
 
 
 def _manifest_export_self_test_errors(manifest: dict) -> list[str]:

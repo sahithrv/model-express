@@ -39,6 +39,11 @@ export type DatasetMetadataDetail = {
   message: string;
 };
 
+export type ChampionExportsStatus = {
+  status: "available" | "empty" | "error";
+  message: string;
+};
+
 export type ProjectDetail = {
   decisions: AgentDecision[];
   datasets: Dataset[];
@@ -51,6 +56,7 @@ export type ProjectDetail = {
   runEvaluations: TrainingRunEvaluation[];
   champion: ProjectChampion | null;
   championExports: ChampionExport[];
+  championExportsStatus: ChampionExportsStatus;
   championDemoImages: ChampionDemoImage[];
   championDemoPredictions: ChampionDemoPrediction[];
   championFeedback: ChampionFeedback[];
@@ -85,6 +91,10 @@ export function emptyProjectDetail(message = "Select a dataset to load visual an
     runEvaluations: [],
     champion: null,
     championExports: [],
+    championExportsStatus: {
+      status: "empty",
+      message: "No champion export records have been loaded.",
+    },
     championDemoImages: [],
     championDemoPredictions: [],
     championFeedback: [],

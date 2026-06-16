@@ -43,6 +43,12 @@ class FakeClient:
         return {"ok": True}
 
 
+class RaisingExportResultClient(FakeClient):
+    def report_champion_export_result(self, job_id: str, result: dict) -> dict:
+        super().report_champion_export_result(job_id, result)
+        raise RuntimeError("export result callback failed")
+
+
 class ChampionJobTests(unittest.TestCase):
     def test_export_reports_ready_only_when_existing_artifact_is_copied(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -85,7 +91,25 @@ class ChampionJobTests(unittest.TestCase):
                     for artifact in manifest["artifacts"]
                 )
             )
-            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed, [])
+
+    def test_export_result_callback_failure_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = RaisingExportResultClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {"format": "not_a_real_format"},
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(Path(temp_dir) / "exports")}):
+                with self.assertRaisesRegex(RuntimeError, "export result callback failed"):
+                    run_export_champion_job(client, job)
+
+            self.assertEqual(len(client.export_results), 1)
+            self.assertEqual(client.export_results[0][0], "job_export")
+            self.assertEqual(client.completed, [])
             self.assertEqual(client.failed, [])
 
     def test_export_rejects_absolute_artifact_path_outside_worker_roots(self) -> None:
@@ -116,7 +140,7 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(result["artifact_uri"], "")
             self.assertIn("ARTIFACT_SOURCE_REJECTED", result["error"])
             self.assertEqual(client.completed, [])
-            self.assertEqual(client.failed[0][0], "job_export")
+            self.assertEqual(client.failed, [])
 
     def test_export_rejects_file_checkpoint_uri_outside_worker_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -145,7 +169,7 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(result["artifact_uri"], "")
             self.assertIn("ARTIFACT_SOURCE_REJECTED", result["error"])
             self.assertEqual(client.completed, [])
-            self.assertEqual(client.failed[0][0], "job_export")
+            self.assertEqual(client.failed, [])
 
     def test_onnx_export_does_not_relabel_checkpoint_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -176,7 +200,7 @@ class ChampionJobTests(unittest.TestCase):
             self.assertIn("ARTIFACT_SOURCE_REJECTED", result["error"])
             self.assertFalse((root / "exports" / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
             self.assertEqual(client.completed, [])
-            self.assertEqual(client.failed[0][0], "job_export")
+            self.assertEqual(client.failed, [])
 
     def test_onnx_export_converts_framework_checkpoint_when_available(self) -> None:
         try:
@@ -234,7 +258,7 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(result["status"], "READY")
             self.assertEqual(result["format"], "onnx")
             self.assertTrue((export_root / "train_1" / "onnx" / "job_export" / "model.onnx").exists())
-            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.completed, [])
             self.assertEqual(client.failed, [])
 
     def test_export_rejects_checkpoint_class_label_order_mismatch(self) -> None:
@@ -287,7 +311,7 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(result["status"], "FAILED")
             self.assertIn("CLASS_LABEL_ORDER_MISMATCH", result["error"])
             self.assertEqual(client.completed, [])
-            self.assertEqual(client.failed[0][0], "job_export")
+            self.assertEqual(client.failed, [])
 
     def test_export_rejects_unsafe_pickle_checkpoint_without_execution(self) -> None:
         try:
@@ -331,7 +355,96 @@ class ChampionJobTests(unittest.TestCase):
             self.assertIn("CHECKPOINT_UNSAFE_PICKLE_REJECTED", result["error"])
             self.assertFalse(marker.exists())
             self.assertEqual(client.completed, [])
-            self.assertEqual(client.failed[0][0], "job_export")
+            self.assertEqual(client.failed, [])
+
+    def test_export_fails_when_declared_source_artifact_is_missing_after_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_root = root / "exports"
+            missing_source = export_root / "controlled" / "missing.onnx"
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "onnx",
+                    "champion_job_id": "train_1",
+                    "artifact_path": str(missing_source),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 64,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(export_root)}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "FAILED")
+            self.assertIn("ARTIFACT_NOT_FOUND", result["error"])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed, [])
+
+    def test_export_fails_object_detection_without_trained_detector_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "onnx",
+                    "task_type": "object_detection",
+                    "model": "yolov8n",
+                    "class_names": ["person"],
+                    "image_size": 64,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(Path(temp_dir) / "exports")}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "FAILED")
+            self.assertIn("SOURCE_ARTIFACT_REQUIRED", result["error"])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed, [])
+
+    def test_export_fails_conversion_dependency_blocker_when_no_source_artifact_exists(self) -> None:
+        def fake_export_artifacts(**kwargs):
+            return {
+                "schema_version": "champion_export_manifest_v1",
+                "status": "pending_dependencies",
+                "metadata": {"format": "onnx"},
+                "artifacts": [
+                    {
+                        "format": "onnx",
+                        "status": "skipped",
+                        "error_code": "ONNXSCRIPT_UNAVAILABLE",
+                        "error": "onnxscript is not installed",
+                    }
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {"format": "onnx", "class_names": ["cat"], "image_size": 32},
+            }
+
+            with (
+                patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(Path(temp_dir) / "exports")}),
+                patch("worker.champion_jobs._build_architecture_export_fallback", return_value=(object(), [])),
+                patch("worker.champion_jobs.produce_champion_export_artifacts", fake_export_artifacts),
+            ):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "FAILED")
+            self.assertIn("ONNXSCRIPT_UNAVAILABLE", result["error"])
+            self.assertEqual(client.completed, [])
+            self.assertEqual(client.failed, [])
 
     def test_export_without_artifact_reports_pending_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -342,14 +455,17 @@ class ChampionJobTests(unittest.TestCase):
                 "config": {"format": "torchscript", "class_names": ["cat"], "image_size": 32},
             }
 
-            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(Path(temp_dir) / "exports")}):
+            with (
+                patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(Path(temp_dir) / "exports")}),
+                patch("worker.champion_jobs._build_architecture_export_fallback", return_value=(None, [])),
+            ):
                 run_export_champion_job(client, job)
 
             _, result = client.export_results[0]
             self.assertEqual(result["status"], "PENDING_ARTIFACT")
             self.assertEqual(result["artifact_uri"], "")
             self.assertIn("MODEL_UNAVAILABLE", result["error"])
-            self.assertEqual(client.completed, ["job_export"])
+            self.assertEqual(client.completed, [])
             self.assertEqual(client.failed, [])
 
     def test_demo_prediction_reports_runtime_unavailable_without_manifest(self) -> None:
@@ -365,7 +481,7 @@ class ChampionJobTests(unittest.TestCase):
         _, result = client.prediction_results[0]
         self.assertEqual(result["status"], "RUNTIME_UNAVAILABLE")
         self.assertEqual(result["error_code"], "MANIFEST_NOT_CONFIGURED")
-        self.assertEqual(client.completed, ["job_predict"])
+        self.assertEqual(client.completed, [])
         self.assertEqual(client.failed, [])
 
     def test_demo_image_path_materializes_inline_data_uri(self) -> None:

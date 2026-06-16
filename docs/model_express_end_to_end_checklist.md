@@ -31,6 +31,8 @@ LLMs propose structured JSON -> backend validates -> backend stores/schedules ->
 - [x] PR 8: worker has deterministic class-balanced visual exemplar generation with downscale/compression and byte/image caps.
 - [x] PR 8: exemplar result persistence is implemented through capped backend profile merge; durable exemplar history tables and multimodal image attachment remain documented future hardening.
 - [x] PR 9: `docs/me_ground_truth.md` exists and reflects the current architecture and safety boundary.
+- [x] PR V1-5: orchestrator startup runs a lease-recovery sweep and a 60-second default recovery loop, disableable only with `MODEL_EXPRESS_LEASE_RECOVERY_INTERVAL_SECONDS=0`.
+- [x] PR V1-6: local-temp export download smoke verifies a project record, champion record, export record, portable bundle metadata, resolvable artifact path/URI, and saved ZIP `manifest.json` without Modal or real training.
 
 ## Verification Commands
 
@@ -38,14 +40,34 @@ LLMs propose structured JSON -> backend validates -> backend stores/schedules ->
 - [x] `python -m unittest discover -s tests -v` from `services/worker`
 - [x] `python -m py_compile worker/jobs.py worker/orchestrator_client.py worker/champion_jobs.py worker/exporting/artifacts.py` from `services/worker`
 - [x] `npm run build` from `apps/mission-control`
+- [ ] `python scripts/export_download_smoke.py` from repo root; this creates a fake local ONNX export, writes a portable bundle through the worker bundle contract, simulates saving the ZIP outside the export root, and verifies `manifest.json`.
+- [ ] `python -m unittest discover -s scripts -p "test_export_download_smoke.py" -v` from repo root.
 
-## Manual Demo Checklist
+## Automated V1-6 Export Download Smoke
 
-- [ ] Create or select a project with a profiled image-folder dataset.
-- [ ] Confirm Mission Control shows dataset intelligence, split/artifact hints, and preprocessing recommendations.
-- [ ] Execute a validated experiment plan and confirm workers report metrics, summaries, and evaluations.
-- [ ] Select or confirm a champion.
+- [ ] Run `python scripts/export_download_smoke.py --keep` from repo root.
+- [ ] Confirm the output has `PASS project exists`.
+- [ ] Confirm the output has `PASS champion exists`.
+- [ ] Confirm the output has `PASS export record exists`.
+- [ ] Confirm the output has `PASS portable bundle metadata exists`.
+- [ ] Confirm the output has `PASS portable bundle path/URI resolves`.
+- [ ] Confirm the output has `PASS saved ZIP has manifest.json`.
+- [ ] Open the printed `saved_zip` path and confirm the archive contains `manifest.json`, `model.onnx`, `README.md`, `requirements.txt`, `examples/python_onnxruntime.py`, `examples/node_onnxruntime.mjs`, and `parity/expected_outputs.json`.
+
+## Manual Video Demo Checklist
+
+- [ ] Use a known local image-folder dataset named `v1-demo-cats-dogs` with this exact shape: `cat/` and `dog/` class folders, each with at least 8 small `.jpg` or `.png` files.
+- [ ] Create a new project named `v1-demo-cats-dogs-export`.
+- [ ] Import the `v1-demo-cats-dogs` dataset and wait for profile completion.
+- [ ] Confirm Mission Control shows dataset intelligence, class counts for `cat` and `dog`, split/artifact hints, and preprocessing recommendations.
+- [ ] Execute one validated experiment plan and confirm workers report metrics, summaries, and evaluations.
+- [ ] Select or confirm the champion produced by that plan.
 - [ ] Open Export/Demo and request an ONNX export.
+- [ ] Wait until an export record is visible with a created portable inference bundle.
+- [ ] Click Save ZIP and choose a normal destination outside the Model Express workspace, such as the desktop.
+- [ ] Open the saved ZIP and confirm it contains `manifest.json`.
+- [ ] Reopen Mission Control, select an older project with an existing champion export, and confirm its export archive still shows the portable bundle row.
+- [ ] Save the older project's portable ZIP and confirm that saved ZIP also contains `manifest.json`.
 - [ ] Confirm duplicate ONNX requests update the existing export record rather than adding noisy duplicates.
 - [ ] Confirm demo images load from `datasets.profile.demo_images` or `visual_exemplars`.
 - [ ] Run a demo prediction and confirm the backend queues a worker prediction job when a `READY` export exists, then records either top-k results or `RUNTIME_UNAVAILABLE` if the worker lacks the manifest/runtime.
@@ -57,4 +79,4 @@ LLMs propose structured JSON -> backend validates -> backend stores/schedules ->
 - Wire explicit split-file training, bbox crop/full-image ablations, and advanced augmentation object policies.
 - Add production storage upload for worker-local export/exemplar artifacts.
 - Record durable visual-exemplar generation history and planner invocation usage fields beyond compact profile/prompt context.
-- Add standalone lease-recovery ticker, async agent tasks, and stronger DB-backed idempotency keys.
+- Add async agent tasks and stronger DB-backed idempotency keys.

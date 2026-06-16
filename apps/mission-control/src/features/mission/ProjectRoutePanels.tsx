@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ClipboardList,
   Database,
+  Download,
   DollarSign,
   Eye,
   FolderOpen,
@@ -411,6 +412,7 @@ import {
   isSensitiveAuditKey,
   humanizeAuditKey,
   normalizedStatus,
+  portableBundleDownloadable,
   statusToneClass,
   exportStatusMessage,
   predictionStatusMessage,
@@ -1183,6 +1185,8 @@ export function ExportRoute({
   onNextImage,
   onRandomImage,
   onRequestExport,
+  onSavePortableBundle,
+  savingPortableBundle,
   onRunPrediction,
   onOpenDeveloper,
 }: {
@@ -1210,6 +1214,8 @@ export function ExportRoute({
   onNextImage: () => void;
   onRandomImage: () => void;
   onRequestExport: () => void;
+  onSavePortableBundle: (bundle: NonNullable<ChampionExportDemo["portableBundle"]>) => void;
+  savingPortableBundle: boolean;
   onRunPrediction: (image: ChampionDemoImage) => void;
   onOpenFeedback: (rating: ChampionFeedbackRating) => void;
   onSlideshowIntervalChange: (value: number) => void;
@@ -2720,6 +2726,8 @@ export function ChampionExportDemoPanel({
   onNextImage,
   onRandomImage,
   onRequestExport,
+  onSavePortableBundle,
+  savingPortableBundle,
   onRunPrediction,
   onOpenFeedback,
   onSlideshowIntervalChange,
@@ -2749,6 +2757,8 @@ export function ChampionExportDemoPanel({
   onNextImage: () => void;
   onRandomImage: () => void;
   onRequestExport: () => void;
+  onSavePortableBundle: (bundle: NonNullable<ChampionExportDemo["portableBundle"]>) => void;
+  savingPortableBundle: boolean;
   onRunPrediction: (image: ChampionDemoImage) => void;
   onOpenFeedback: (rating: ChampionFeedbackRating) => void;
   onSlideshowIntervalChange: (value: number) => void;
@@ -2780,11 +2790,13 @@ export function ChampionExportDemoPanel({
   const activeFps = prediction?.latency_ms && prediction.latency_ms > 0 ? 1000 / prediction.latency_ms : 0;
   const postprocessLatency = predictionPostprocessLatency(prediction);
   const portableBundle = data.portableBundle;
+  const championExportsStatus = data.championExportsStatus;
   const portableBundleDetail = portableBundle?.bytes
     ? formatBytes(portableBundle.bytes)
     : portableBundle?.contents?.length
       ? `${portableBundle.contents.length} file(s)`
       : portableBundle?.error || "";
+  const canSavePortableBundle = Boolean(portableBundle && portableBundleDownloadable(portableBundle));
 
   return (
     <div className="export-demo-panel">
@@ -2799,9 +2811,14 @@ export function ChampionExportDemoPanel({
               Request ONNX
             </button>
           </div>
+          {championExportsStatus?.status === "error" && (
+            <div className="warning-list">
+              <span>{championExportsStatus.message}</span>
+            </div>
+          )}
           {data.exports.length > 0 ? (
             <div className="export-record-list">
-              {data.exports.slice(0, 4).map((exportRecord, index) => {
+              {data.exports.map((exportRecord, index) => {
                 const localSafety = championLocalInferenceSafety(exportRecord, {
                   deploymentProfile: data.deploymentProfile,
                   modelProfile: data.modelProfile,
@@ -2856,6 +2873,17 @@ export function ChampionExportDemoPanel({
               <span>
                 <Badge value={portableBundle.status || "PENDING"} />
                 <small>{portableBundleDetail}</small>
+                {canSavePortableBundle && (
+                  <button
+                    className="command compact"
+                    type="button"
+                    onClick={() => onSavePortableBundle(portableBundle)}
+                    disabled={savingPortableBundle}
+                  >
+                    <Download size={15} />
+                    {savingPortableBundle ? "Saving" : "Save ZIP"}
+                  </button>
+                )}
               </span>
             </div>
           )}

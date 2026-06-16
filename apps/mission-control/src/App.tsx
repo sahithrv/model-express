@@ -51,6 +51,7 @@ import {
 } from "./api/missionControlClient";
 import {
   emptyProjectDetail,
+  type ChampionExportsStatus,
   type DatasetMetadataDetail,
   type ProjectDetail,
   type VisualAnalysisDetail,
@@ -507,6 +508,7 @@ import type {
   Health,
   Job,
   PlannedExperiment,
+  PortableInferenceBundle,
   MemoryEmbeddingUsageEvent,
   MissionControlTelemetryResponse,
   Project,
@@ -531,11 +533,55 @@ const projectJobsFetchLimit = 100;
 const trainingSummariesFetchLimit = 100;
 const trainingEvaluationsFetchLimit = 50;
 const selectedJobMetricsFetchLimit = 200;
+const selectedProjectStorageKey = "selectedProjectId";
 
 function missionControlErrorMessage(error: unknown): string {
   const message = errorMessage(error);
   if (message.includes("401") && message.includes("missing or invalid API token")) {
     return "The backend is in LAN or tunnel mode but Mission Control has no matching MODEL_EXPRESS_API_TOKEN. Set it in .env.local, or remove the public Modal/tunnel URL for local-only use, then restart the backend and app.";
+  }
+  return message;
+}
+
+type ChampionExportsFetchResult = {
+  exports: ChampionExport[];
+  status: ChampionExportsStatus;
+  failed: boolean;
+};
+
+function championExportsLoadedStatus(exports: ChampionExport[]): ChampionExportsStatus {
+  return exports.length > 0
+    ? { status: "available", message: `${exports.length} champion export record(s) loaded.` }
+    : { status: "empty", message: "No champion export records have been recorded for this champion yet." };
+}
+
+function championExportsErrorStatus(error: unknown): ChampionExportsStatus {
+  return {
+    status: "error",
+    message: `Champion export lookup failed: ${errorMessage(error)}`,
+  };
+}
+
+function noChampionExportsStatus(): ChampionExportsStatus {
+  return {
+    status: "empty",
+    message: "Select a champion before export records can load.",
+  };
+}
+
+function portableBundleSuggestedName(bundle: PortableInferenceBundle, fallbackProjectId: string) {
+  const projectId = bundle.project_id || fallbackProjectId || "project";
+  const exportId = bundle.export_id || "export";
+  return `model-express-${projectId}-${exportId}-portable-bundle.zip`;
+}
+
+function portableBundleSourceKey(bundle: PortableInferenceBundle) {
+  return bundle.artifact_uri || bundle.uri || bundle.artifact_path || bundle.path || bundle.export_id || "portable_bundle";
+}
+
+function exportArtifactMissingLocalBytesMessage(message: string) {
+  if (/does not exist|enoent|missing file|missing artifact/i.test(message)) {
+    return "The export record exists, but the local artifact file is missing. Re-run export for this project.";
   }
   return message;
 }
@@ -562,7 +608,7 @@ export function App() {
   const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
   const [health, setHealth] = useState<Health | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
+  const [selectedProjectId, setSelectedProjectId] = useState<string>(() => localStorage.getItem(selectedProjectStorageKey) ?? "");
   const [detail, setDetail] = useState<ProjectDetail>(() => emptyProjectDetail());
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
@@ -570,6 +616,7 @@ export function App() {
   const [settingsDraft, setSettingsDraft] = useState<AutomationSettings>(defaultAutomationSettings);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [loading, setLoading] = useState(false);
+  const [savingExportArtifactKey, setSavingExportArtifactKey] = useState("");
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectFolder, setNewProjectFolder] = useState<DatasetFolder | null>(null);
   const [newProjectError, setNewProjectError] = useState("");
@@ -608,6 +655,14 @@ export function App() {
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
     [projects, selectedProjectId],
   );
+
+  useEffect(() => {
+    if (selectedProjectId) {
+      localStorage.setItem(selectedProjectStorageKey, selectedProjectId);
+    } else {
+      localStorage.removeItem(selectedProjectStorageKey);
+    }
+  }, [selectedProjectId]);
 
   const selectedJob = useMemo(
     () => detail.jobs.find((job) => job.id === selectedJobId) ?? null,
@@ -829,10 +884,18 @@ export function App() {
   const refreshProjects = useCallback(async () => {
     const response = await request<{ projects: Project[] }>("/projects");
     setProjects(response.projects);
-    if (!selectedProjectId && response.projects.length > 0) {
-      setSelectedProjectId(response.projects[0].id);
-    }
-  }, [request, selectedProjectId]);
+    setSelectedProjectId((current) => {
+      const projectIds = new Set(response.projects.map((project) => project.id));
+      if (current && projectIds.has(current)) {
+        return current;
+      }
+      const stored = localStorage.getItem(selectedProjectStorageKey) ?? "";
+      if (stored && projectIds.has(stored)) {
+        return stored;
+      }
+      return response.projects[0]?.id ?? "";
+    });
+  }, [request]);
 
   const refreshHealth = useCallback(async () => {
     const response = await request<Health>("/healthz");
@@ -1052,7 +1115,20 @@ export function App() {
       const championValue = champion.champion;
       const championSlowData = includeSlowData && championValue
         ? await Promise.all([
-            request<{ exports: ChampionExport[] }>(`/projects/${projectId}/champion/exports`, slowRequestOptions).catch(() => ({ exports: [] })),
+            request<{ exports: ChampionExport[] }>(`/projects/${projectId}/champion/exports`, slowRequestOptions)
+              .then((response): ChampionExportsFetchResult => {
+                const exports = Array.isArray(response.exports) ? response.exports : [];
+                return {
+                  exports,
+                  status: championExportsLoadedStatus(exports),
+                  failed: false,
+                };
+              })
+              .catch((error: unknown): ChampionExportsFetchResult => ({
+                exports: [],
+                status: championExportsErrorStatus(error),
+                failed: true,
+              })),
             request<{ images: ChampionDemoImage[] }>(
               `/projects/${projectId}/champion/demo-images?max_total_images=32&max_per_class=4`,
               slowRequestOptions,
@@ -1077,6 +1153,27 @@ export function App() {
       setDetail((previous) => {
         const previousChampionMatches =
           championValue && previous.champion && previous.champion.job_id === championValue.job_id;
+        const nextChampionExports = championValue
+          ? championExports
+            ? championExports.failed && previousChampionMatches
+              ? previous.championExports
+              : championExports.exports
+            : previousChampionMatches
+              ? previous.championExports
+              : []
+          : [];
+        const nextChampionExportsStatus = championValue
+          ? championExports
+            ? championExports.failed && previousChampionMatches && previous.championExports.length > 0
+              ? {
+                  status: "error" as const,
+                  message: `${championExports.status.message} Showing ${previous.championExports.length} stale export record(s) from the last successful load.`,
+                }
+              : championExports.status
+            : previousChampionMatches
+              ? previous.championExportsStatus
+              : championExportsLoadedStatus([])
+          : noChampionExportsStatus();
         return {
           decisions: decisions?.decisions ?? previous.decisions,
           datasets: datasets.datasets,
@@ -1087,9 +1184,8 @@ export function App() {
           runSummaries: runSummaries.summaries,
           runEvaluations: runEvaluations?.evaluations ?? previous.runEvaluations,
           champion: championValue,
-          championExports: championValue
-            ? championExports?.exports ?? (previousChampionMatches ? previous.championExports : [])
-            : [],
+          championExports: nextChampionExports,
+          championExportsStatus: nextChampionExportsStatus,
           championDemoImages: championValue
             ? championDemoImages?.images ?? (previousChampionMatches ? previous.championDemoImages : [])
             : [],
@@ -1704,6 +1800,40 @@ export function App() {
     }
   }
 
+  async function savePortableBundle(bundle: PortableInferenceBundle) {
+    const artifactUri = bundle.artifact_uri || bundle.uri || "";
+    const artifactPath = bundle.artifact_path || bundle.path || "";
+    if (!artifactUri && !artifactPath) {
+      setNotice({ kind: "error", text: "Portable bundle metadata does not include an artifact URI or local path." });
+      return;
+    }
+
+    const saveKey = portableBundleSourceKey(bundle);
+    setSavingExportArtifactKey(saveKey);
+    setNotice(null);
+    try {
+      const result = await window.missionControl.saveExportArtifact({
+        artifactUri,
+        artifactPath,
+        suggestedName: portableBundleSuggestedName(bundle, selectedProjectId),
+        kind: "portable_bundle",
+      });
+      if (result.canceled) {
+        setNotice({ kind: "info", text: "Portable bundle save canceled." });
+        return;
+      }
+      setNotice({
+        kind: "info",
+        text: `Saved portable bundle to ${result.file_path}${result.bytes ? ` (${formatBytes(result.bytes)})` : ""}.`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setNotice({ kind: "error", text: exportArtifactMissingLocalBytesMessage(message) });
+    } finally {
+      setSavingExportArtifactKey((current) => (current === saveKey ? "" : current));
+    }
+  }
+
   async function chooseChampionDemoImage() {
     try {
       const image = await window.missionControl.selectDemoImage();
@@ -2252,6 +2382,8 @@ export function App() {
               setSelectedDemoImageIndex((index) => randomDemoImageIndex(index, championExportDemo.demoImages.length));
             }}
             onRequestExport={() => requestChampionExport("onnx")}
+            onSavePortableBundle={savePortableBundle}
+            savingPortableBundle={Boolean(savingExportArtifactKey)}
             onRunPrediction={runChampionDemoPrediction}
             onOpenFeedback={openChampionFeedback}
             onSlideshowIntervalChange={setDemoSlideshowIntervalMs}
@@ -2699,6 +2831,8 @@ export function App() {
                 setSelectedDemoImageIndex((index) => randomDemoImageIndex(index, championExportDemo.demoImages.length));
               }}
               onRequestExport={() => requestChampionExport("onnx")}
+              onSavePortableBundle={savePortableBundle}
+              savingPortableBundle={Boolean(savingExportArtifactKey)}
               onRunPrediction={runChampionDemoPrediction}
               onOpenFeedback={openChampionFeedback}
               onSlideshowIntervalChange={setDemoSlideshowIntervalMs}

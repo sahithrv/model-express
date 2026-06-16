@@ -173,6 +173,68 @@ test("portable bundle is derived separately from ready ONNX export", async () =>
   assert.deepEqual(exportDemo.portableBundle?.contents, ["model.onnx", "manifest.json"]);
 });
 
+test("export archive surfaces downloadable portable bundles before stale pending records", async () => {
+  const { buildChampionExportDemo } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    championExports: [
+      {
+        id: "export-pending",
+        project_id: "project-1",
+        champion_id: "champion-1",
+        job_id: "job-pending",
+        status: "PENDING",
+        format: "onnx",
+        created_at: "2026-06-16T10:00:00Z",
+      },
+      {
+        id: "export-ready",
+        project_id: "project-1",
+        champion_id: "champion-1",
+        job_id: "job-ready",
+        status: "READY",
+        format: "onnx",
+        artifact_uri: "file:///exports/model.onnx",
+        completed_at: "2026-06-16T09:00:00Z",
+      },
+      {
+        id: "export-portable",
+        project_id: "project-1",
+        champion_id: "champion-1",
+        job_id: "job-portable",
+        status: "READY",
+        format: "onnx",
+        artifact_uri: "file:///exports/model-portable.onnx",
+        completed_at: "2026-06-16T08:00:00Z",
+        metadata: {
+          portable_inference_bundle: {
+            status: "created",
+            artifact_uri: "file:///exports/portable_inference_bundle.zip",
+          },
+        },
+      },
+      {
+        id: "export-failed",
+        project_id: "project-1",
+        champion_id: "champion-1",
+        job_id: "job-failed",
+        status: "FAILED",
+        format: "onnx",
+        failed_at: "2026-06-16T11:00:00Z",
+      },
+    ],
+  });
+
+  const exportDemo = buildChampionExportDemo(detail);
+
+  assert.deepEqual(exportDemo.exports.map((item) => item.id), [
+    "export-portable",
+    "export-ready",
+    "export-pending",
+    "export-failed",
+  ]);
+  assert.equal(exportDemo.portableBundle?.artifact_uri, "file:///exports/portable_inference_bundle.zip");
+});
+
 test("ready export record overrides stale pending champion metadata", async () => {
   const { buildChampionExportDemo } = await loadMissionModel();
   const detail = completedChampionDetail({
@@ -201,6 +263,32 @@ test("ready export record overrides stale pending champion metadata", async () =
 
   assert.equal(exportDemo.exportStatus, "READY");
   assert.equal(exportDemo.limitations.includes("Final export artifact is still pending."), false);
+});
+
+test("pending export with validation errors and no active export job is surfaced as blocked", async () => {
+  const { buildChampionExportDemo } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    jobs: [jobFixture({ id: "job-1", template: "resnet", status: "SUCCEEDED" })],
+    championExports: [
+      {
+        id: "export-pending-artifact",
+        project_id: "project-1",
+        champion_id: "champion-1",
+        job_id: "job-export",
+        status: "PENDING_ARTIFACT",
+        format: "onnx",
+        validation_errors: ["ARTIFACT_NOT_FOUND: source artifact is not available to the worker"],
+        created_at: timestamp,
+      },
+    ],
+  });
+
+  const exportDemo = buildChampionExportDemo(detail);
+
+  assert.equal(
+    exportDemo.limitations.includes("Export is blocked until the source artifact is available or export is re-run."),
+    true,
+  );
 });
 
 test("terminal job status overrides stale running training summary state", async () => {
@@ -253,6 +341,10 @@ function completedChampionDetail(overrides = {}) {
     runEvaluations: [runEvaluationFixture()],
     champion,
     championExports: exportDemoFixture().exports,
+    championExportsStatus: {
+      status: "available",
+      message: "Fixture export records loaded.",
+    },
     championDemoImages: [],
     championDemoPredictions: [],
     championFeedback: [],
