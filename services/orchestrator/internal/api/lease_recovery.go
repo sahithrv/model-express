@@ -129,4 +129,7 @@ func (s *Server) handleRecoveredExpiredLeaseFailure(job jobs.ExperimentJob) {
 			"error":      err.Error(),
 		})
 	}
+	if job.Template == jobs.TemplateTrainExperiment {
+		s.enqueueTrainingTerminalHooks(job)
+	}
 }

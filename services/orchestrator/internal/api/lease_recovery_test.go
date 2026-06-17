@@ -6,7 +6,9 @@ import (
 
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/workers"
 )
@@ -96,6 +98,117 @@ func TestRecoverExpiredLeasesOnceFailsExpiredMaxAttemptJob(t *testing.T) {
 	}
 }
 
+func TestRecoverExpiredLeasesOnceTerminalFailureRunsTrainingHooks(t *testing.T) {
+	t.Setenv(leaseRecoveryIntervalEnv, "0")
+	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "false")
+	t.Setenv("MODEL_EXPRESS_LLM_ENABLED", "false")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	project, err := memoryStore.CreateProject("lease recovery", "select prior model")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 2, 4, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 2),
+		testExperiment("efficientnet_b0", 2),
+	}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	priorJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"plan_id":    plan.ID,
+		"model":      "mobilenet_v3_small",
+	})
+	if err != nil {
+		t.Fatalf("create prior job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(priorJob.ID, "prior-run"); err != nil {
+		t.Fatalf("complete prior job: %v", err)
+	}
+	score := 0.87
+	if _, err := memoryStore.UpsertTrainingRunSummary(priorJob.ID, runs.TrainingRunSummaryUpdate{
+		Status:       jobs.StatusSucceeded,
+		BestMacroF1:  &score,
+		BestAccuracy: &score,
+	}); err != nil {
+		t.Fatalf("upsert prior summary: %v", err)
+	}
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(priorJob.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri": "s3://model-express/model-express/artifacts/" + priorJob.ID + "/model.onnx",
+		},
+	}); err != nil {
+		t.Fatalf("upsert prior evaluation: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "modal")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	failingJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"plan_id":    plan.ID,
+		"model":      "efficientnet_b0",
+		"provider":   "modal",
+	})
+	if err != nil {
+		t.Fatalf("create failing job: %v", err)
+	}
+	assigned, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
+	if err != nil {
+		t.Fatalf("poll failing job: %v", err)
+	}
+	if assigned.ID != failingJob.ID {
+		t.Fatalf("expected failing job assignment, got %#v", assigned)
+	}
+	for attempt := 1; attempt < assigned.MaxAttempts; attempt++ {
+		recovered, err := server.recoverExpiredLeasesOnce(assigned.LeaseExpiresAt.Add(time.Second))
+		if err != nil {
+			t.Fatalf("recover attempt %d: %v", attempt, err)
+		}
+		if len(recovered) != 1 || recovered[0].Status != jobs.StatusQueued {
+			t.Fatalf("expected queued recovery at attempt %d, got %#v", attempt, recovered)
+		}
+		assigned, err = memoryStore.PollJob(worker.ID, store.JobPollFilter{Provider: "modal"})
+		if err != nil {
+			t.Fatalf("poll retry attempt %d: %v", attempt+1, err)
+		}
+	}
+
+	recovered, err := server.recoverExpiredLeasesOnce(assigned.LeaseExpiresAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("recover max attempt: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0].Status != jobs.StatusFailed {
+		t.Fatalf("expected terminal failed recovery, got %#v", recovered)
+	}
+	champion := waitForLeaseRecoveryChampion(t, memoryStore, project.ID)
+	if champion.JobID != priorJob.ID {
+		t.Fatalf("expected prior successful job %s as champion, got %#v", priorJob.ID, champion)
+	}
+	exports, err := memoryStore.ListProjectChampionExports(project.ID)
+	if err != nil {
+		t.Fatalf("list champion exports: %v", err)
+	}
+	if len(exports) != 1 || exports[0].JobID != priorJob.ID {
+		t.Fatalf("expected one export for prior champion, got %#v", exports)
+	}
+
+	server.runTrainingTerminalHooks(failingJob.ID)
+	exports, err = memoryStore.ListProjectChampionExports(project.ID)
+	if err != nil {
+		t.Fatalf("list champion exports after rerun: %v", err)
+	}
+	if len(exports) != 1 {
+		t.Fatalf("expected terminal hooks to be idempotent, got %#v", exports)
+	}
+}
+
 func TestRecoverExpiredLeasesOnceLeavesNonExpiredJobUntouched(t *testing.T) {
 	memoryStore, server, _, worker, assigned := newLeaseRecoveryTestFixture(t)
 
@@ -168,4 +281,21 @@ func leaseRecoveryHasExecutionEvent(events []execution.ExecutionEvent, eventType
 		}
 	}
 	return false
+}
+
+func waitForLeaseRecoveryChampion(t *testing.T, memoryStore *store.MemoryStore, projectID string) runs.ProjectChampion {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		champion, err := memoryStore.GetProjectChampion(projectID)
+		if err == nil {
+			return champion
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	champion, err := memoryStore.GetProjectChampion(projectID)
+	if err != nil {
+		t.Fatalf("expected champion after terminal hooks: %v", err)
+	}
+	return champion
 }

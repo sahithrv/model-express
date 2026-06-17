@@ -298,6 +298,11 @@ def profile_image_folder(
         split_summary["yolo_split_label_file_counts"] = yolo_summary.get("split_label_file_counts") or {}
     leakage_warnings = _leakage_warnings(image_paths)
     visual_traits = _visual_trait_summary(image_paths, artifacts, class_counts)
+    if not bbox_count and int(visual_traits.get("bbox_count") or 0) > 0:
+        bbox_count = int(visual_traits.get("bbox_count") or 0)
+        metadata_summary["bbox_count"] = bbox_count
+        metadata_summary["bbox_available"] = True
+        metadata_summary["object_detection_available"] = True
     traits = _dataset_traits(
         class_count=len(class_counts),
         image_count=total_images,

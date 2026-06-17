@@ -39,19 +39,22 @@ type createDatasetRequest struct {
 const (
 	callbackTokenHeader = "X-Model-Express-Callback-Token"
 
-	llmExperimentPlannerDecisionSource     = "llm_experiment_planner"
-	costPolicyChampionDecisionSource       = "cost_policy_budget_stop"
-	userCancelChampionDecisionSource       = "user_cancel_best_available"
-	minLLMDecisionConfidence               = 0.50
-	maxLLMPlannerExperiments               = 5
-	plannerMinimumMeaningfulImprovement    = 0.005
-	plannerAutonomousMeaningfulImprovement = 0.010
-	championSelectionOverrideMinDelta      = 0.025
-	plannerNoImprovementRoundsToSelect     = 2
-	plannerDefaultMaxFollowUpRounds        = 10
-	plannerAutonomousMaxFollowUpRounds     = 3
-	plannerBackendValidationRetryLimit     = 1
-	plannerDefaultMaxToolRounds            = 10
+	llmExperimentPlannerDecisionSource       = "llm_experiment_planner"
+	llmPlannerDegradedChampionDecisionSource = "llm_planner_degraded_best_available"
+	terminalTrainingChampionDecisionSource   = "terminal_training_best_available"
+	costPolicyChampionDecisionSource         = "cost_policy_budget_stop"
+	maxFollowUpRoundsChampionDecisionSource  = "max_followup_rounds_stop"
+	userCancelChampionDecisionSource         = "user_cancel_best_available"
+	minLLMDecisionConfidence                 = 0.50
+	maxLLMPlannerExperiments                 = 5
+	plannerMinimumMeaningfulImprovement      = 0.005
+	plannerAutonomousMeaningfulImprovement   = 0.010
+	championSelectionOverrideMinDelta        = 0.025
+	plannerNoImprovementRoundsToSelect       = 2
+	plannerDefaultMaxFollowUpRounds          = 10
+	plannerAutonomousMaxFollowUpRounds       = 3
+	plannerBackendValidationRetryLimit       = 1
+	plannerDefaultMaxToolRounds              = 10
 
 	modalOOMRetryHistoryKey = "modal_oom_retry_history"
 

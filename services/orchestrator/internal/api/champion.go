@@ -17,6 +17,7 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
@@ -268,10 +269,15 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		"selection_overrode": selectionReview.Overridden,
 		"model":              metrics["model"],
 	}); err != nil {
-		return err
+		log.Printf("record champion selected event failed for project %s champion %s: %v", projectID, champion.ID, err)
 	}
 	if _, err := s.ensureChampionExport(projectID, champion, job, "onnx", "", nil); err != nil {
 		log.Printf("auto champion ONNX export request failed for project %s champion %s job %s: %v", projectID, champion.ID, champion.JobID, err)
+		failedExport, failedErr := s.ensureFailedChampionExportState(projectID, champion, "onnx", err)
+		if failedErr != nil {
+			log.Printf("record failed champion export state failed for project %s champion %s: %v", projectID, champion.ID, failedErr)
+		}
+		s.recordChampionExportFailureEvent(projectID, champion, failedExport.ID, "onnx", err)
 	}
 	return nil
 }
@@ -308,6 +314,138 @@ func (s *Server) bestAvailableChampionJobForStoppedProject(projectID string, dec
 		return "", false, nil
 	}
 	return best.JobID, true, nil
+}
+
+type terminalChampionSelectionOptions struct {
+	DecisionSource    string
+	Trigger           string
+	EventType         string
+	Rationale         string
+	EventMessage      string
+	NoChampionMessage string
+	Payload           map[string]any
+}
+
+func (s *Server) selectBestAvailableChampionForTerminalPlanStop(plan plans.ExperimentPlan, opts terminalChampionSelectionOptions) (bool, error) {
+	if plan.ID == "" {
+		return false, nil
+	}
+	if _, err := s.store.GetProjectChampion(plan.ProjectID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+
+	decisionSource := strings.TrimSpace(opts.DecisionSource)
+	if decisionSource == "" {
+		decisionSource = "terminal_best_available"
+	}
+	decisionsForProject, err := s.store.ListProjectAgentDecisions(plan.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	for _, decision := range decisionsForProject {
+		if decision.PlanID == plan.ID && decision.Payload["decision_source"] == decisionSource {
+			if err := s.persistProjectChampionFromDecision(plan.ProjectID, decision); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+
+	summaries, err := s.store.ListProjectTrainingRunSummaries(plan.ProjectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	evaluations, err := s.store.ListProjectTrainingRunEvaluations(plan.ProjectID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	goalText := ""
+	if project, err := s.store.GetProject(plan.ProjectID); err == nil {
+		goalText = project.Goal
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	objectiveContext := projectObjectiveContext(goalText)
+	best, ok := bestSuccessfulTrainingSummaryForObjective(plan.TargetMetric, summaries, evaluations, objectiveContext)
+	eventType := opts.EventType
+	if eventType == "" {
+		eventType = execution.EventAgentOutcomeRecorded
+	}
+	basePayload := terminalChampionSelectionPayload(opts.Payload, decisionSource, opts.Trigger, plan.TargetMetric)
+	if !ok {
+		payload := clonePayload(basePayload)
+		payload["exportable"] = false
+		payload["selected_best_available_model"] = false
+		message := strings.TrimSpace(opts.NoChampionMessage)
+		if message == "" {
+			message = fmt.Sprintf("Terminal automation stopped for plan %s, but no successful model is available to select as champion.", plan.ID)
+		}
+		_, eventErr := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, eventType, message, payload)
+		return false, eventErr
+	}
+
+	evaluationsByJob := map[string]runs.TrainingRunEvaluation{}
+	for _, evaluation := range evaluations {
+		evaluationsByJob[evaluation.JobID] = evaluation
+	}
+	score := holisticRunScore(plan.TargetMetric, best, evaluationsByJob[best.JobID], objectiveContext)
+	decisionPayload := clonePayload(basePayload)
+	decisionPayload["auto_executable"] = true
+	decisionPayload["champion_job_id"] = best.JobID
+	decisionPayload["champion_model"] = best.Model
+	decisionPayload["champion_score"] = roundDiagnosticFloat(score)
+	decisionPayload["champion_macro_f1"] = roundDiagnosticFloat(best.BestMacroF1)
+	decisionPayload["champion_accuracy"] = roundDiagnosticFloat(best.BestAccuracy)
+	decisionPayload["champion_estimated_cost_usd"] = roundDiagnosticFloat(best.EstimatedCostUSD)
+	decisionPayload["champion_runtime_seconds"] = roundDiagnosticFloat(best.RuntimeSeconds)
+	decisionPayload["selected_best_available_model"] = true
+
+	rationale := strings.TrimSpace(opts.Rationale)
+	if rationale == "" {
+		rationale = fmt.Sprintf("Terminal automation stopped additional training for plan %s, so the backend selected the best successful model available: %s.", plan.ID, best.JobID)
+	}
+	decision, err := s.store.CreateAgentDecision(plan.ProjectID, plan.ID, decisions.TypeSelectChampion, rationale, decisionPayload)
+	if err != nil {
+		return false, err
+	}
+	if err := s.persistProjectChampionFromDecision(plan.ProjectID, decision); err != nil {
+		return false, err
+	}
+
+	eventPayload := clonePayload(decisionPayload)
+	if _, ok := eventPayload["source_decision_id"]; !ok {
+		eventPayload["source_decision_id"] = decision.ID
+	}
+	eventPayload["terminal_decision_id"] = decision.ID
+	eventPayload["exportable"] = true
+	message := strings.TrimSpace(opts.EventMessage)
+	if message == "" {
+		message = fmt.Sprintf("Terminal automation stopped for plan %s and selected best available champion %s.", plan.ID, best.JobID)
+	}
+	_, err = s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, eventType, message, eventPayload)
+	return true, err
+}
+
+func terminalChampionSelectionPayload(base map[string]any, decisionSource string, trigger string, targetMetric string) map[string]any {
+	payload := clonePayload(base)
+	payload["decision_source"] = decisionSource
+	if trigger != "" {
+		payload["trigger"] = trigger
+	}
+	if targetMetric != "" {
+		payload["target_metric"] = targetMetric
+	}
+	return payload
+}
+
+func clonePayload(base map[string]any) map[string]any {
+	payload := map[string]any{}
+	for key, value := range base {
+		payload[key] = value
+	}
+	return payload
 }
 
 type championSelectionReview struct {
@@ -544,6 +682,12 @@ func (s *Server) ensureChampionExport(
 		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateExportChampion, exportJobConfig, func(existing jobs.ExperimentJob) bool {
 			return jobConfigString(existing.Config, "export_id") == export.ID
 		}); err != nil {
+			if failedExport, updateErr := s.markChampionExportFailed(export, err); updateErr == nil {
+				export = failedExport
+				s.recordChampionExportFailureEvent(projectID, champion, export.ID, format, err)
+			} else {
+				log.Printf("mark champion export failed state failed for export %s: %v", export.ID, updateErr)
+			}
 			return runs.ChampionExport{}, err
 		}
 	}
@@ -558,6 +702,68 @@ func (s *Server) ensureChampionExport(
 	}
 
 	return export, nil
+}
+
+func (s *Server) ensureFailedChampionExportState(projectID string, champion runs.ProjectChampion, format string, cause error) (runs.ChampionExport, error) {
+	exports, err := s.store.ListProjectChampionExports(projectID)
+	if err == nil {
+		for _, export := range exports {
+			if export.ChampionID == champion.ID && export.Format == format {
+				return s.markChampionExportFailed(export, cause)
+			}
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return runs.ChampionExport{}, err
+	}
+	return s.store.CreateChampionExport(runs.ChampionExportCreate{
+		ProjectID:        projectID,
+		ChampionID:       champion.ID,
+		JobID:            champion.JobID,
+		Status:           runs.ChampionExportStatusFailed,
+		Format:           format,
+		Metadata:         championExportMetadata(champion, format, nil),
+		ValidationErrors: []string{cause.Error()},
+	})
+}
+
+func (s *Server) markChampionExportFailed(export runs.ChampionExport, cause error) (runs.ChampionExport, error) {
+	validationErrors := append([]string(nil), export.ValidationErrors...)
+	if !containsString(validationErrors, cause.Error()) {
+		validationErrors = append(validationErrors, cause.Error())
+	}
+	return s.store.UpdateChampionExport(export.ID, runs.ChampionExportUpdate{
+		Status:           runs.ChampionExportStatusFailed,
+		Metadata:         export.Metadata,
+		ValidationErrors: validationErrors,
+	})
+}
+
+func (s *Server) recordChampionExportFailureEvent(projectID string, champion runs.ProjectChampion, exportID string, format string, cause error) {
+	if exportID != "" {
+		events, err := s.store.ListProjectExecutionEvents(projectID, 50)
+		if err == nil {
+			for _, event := range events {
+				if event.EventType == execution.EventExecutionFailed &&
+					payloadString(event.Payload, "export_id") == exportID &&
+					payloadString(event.Payload, "error") == cause.Error() {
+					return
+				}
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			log.Printf("check champion export failure event failed for project %s champion %s: %v", projectID, champion.ID, err)
+		}
+	}
+	payload := map[string]any{
+		"champion_id":     champion.ID,
+		"champion_job_id": champion.JobID,
+		"export_id":       exportID,
+		"format":          format,
+		"status":          runs.ChampionExportStatusFailed,
+		"error":           cause.Error(),
+	}
+	if _, err := s.store.CreateExecutionEvent(projectID, champion.PlanID, execution.EventExecutionFailed, fmt.Sprintf("Champion export setup failed for job %s.", champion.JobID), payload); err != nil {
+		log.Printf("record champion export failure event failed for project %s champion %s: %v", projectID, champion.ID, err)
+	}
 }
 
 func (s *Server) listProjectChampionDemoImages(c *gin.Context) {
@@ -1423,7 +1629,21 @@ func championArtifactURICandidatesForFormat(deploymentProfile map[string]any, mo
 }
 
 func championArtifactURIFromEvaluation(modelProfile map[string]any) string {
-	return firstString(modelProfile, "onnx_artifact_uri", "artifact_uri", "model_artifact_uri", "export_artifact_uri", "checkpoint_uri")
+	return firstString(
+		modelProfile,
+		"onnx_artifact_uri",
+		"onnx_uri",
+		"artifact_uri",
+		"model_artifact_uri",
+		"export_artifact_uri",
+		"checkpoint_uri",
+		"torchscript_artifact_uri",
+		"torchscript_uri",
+		"pytorch_uri",
+		"model_uri",
+		"safetensors_artifact_uri",
+		"safetensors_uri",
+	)
 }
 
 func artifactMatchesChampionExportFormat(artifactURI string, format string) bool {

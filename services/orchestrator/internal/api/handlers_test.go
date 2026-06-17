@@ -969,6 +969,18 @@ func TestCompleteJobAcknowledgesBeforePostTrainingHooksFinish(t *testing.T) {
 
 	router := NewRouter(memoryStore)
 	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
+	if _, err := memoryStore.UpsertTrainingRunSummary(assigned.ID, runs.TrainingRunSummaryUpdate{
+		Status: jobs.StatusSucceeded,
+	}); err != nil {
+		t.Fatalf("upsert summary: %v", err)
+	}
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(assigned.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri": "s3://model-express/model-express/artifacts/" + assigned.ID + "/model.onnx",
+		},
+	}); err != nil {
+		t.Fatalf("upsert evaluation: %v", err)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/complete", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assigned)+`","mlflow_run_id":"run_1"}`))
 	req.Header.Set("Content-Type", "application/json")
 	setCallbackToken(t, req, assigned)
@@ -1002,6 +1014,119 @@ func TestCompleteJobAcknowledgesBeforePostTrainingHooksFinish(t *testing.T) {
 		t.Fatal("expected post-training hook to start asynchronously")
 	}
 	releaseOnce.Do(func() { close(releaseLLM) })
+}
+
+func TestCompleteTrainExperimentRequiresPersistedOutputs(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 1, 2, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 2)}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"plan_id":    plan.ID,
+		"model":      "mobilenet_v3_small",
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{}`)
+
+	postComplete := func(wantStatus int) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/complete", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assigned)+`","mlflow_run_id":"run_1"}`))
+		req.Header.Set("Content-Type", "application/json")
+		setCallbackToken(t, req, assigned)
+		resp := httptest.NewRecorder()
+		router.ServeHTTP(resp, req)
+		if resp.Code != wantStatus {
+			t.Fatalf("complete status %d, want %d: %s", resp.Code, wantStatus, resp.Body.String())
+		}
+		return resp.Body.String()
+	}
+
+	if body := postComplete(http.StatusConflict); !strings.Contains(body, "succeeded summary") {
+		t.Fatalf("expected missing summary readiness error, got %s", body)
+	}
+	stored, err := memoryStore.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if stored.Status == jobs.StatusSucceeded {
+		t.Fatalf("completion without outputs marked job successful: %#v", stored)
+	}
+
+	if _, err := memoryStore.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{Status: jobs.StatusSucceeded}); err != nil {
+		t.Fatalf("upsert summary: %v", err)
+	}
+	postComplete(http.StatusConflict)
+
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(job.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{"class_labels": []string{"cat", "dog"}},
+	}); err != nil {
+		t.Fatalf("upsert evaluation without artifact: %v", err)
+	}
+	postComplete(http.StatusConflict)
+
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(job.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri": "s3://model-express/model-express/artifacts/" + job.ID + "/model.onnx",
+		},
+	}); err != nil {
+		t.Fatalf("upsert artifact evaluation: %v", err)
+	}
+	postComplete(http.StatusOK)
+
+	completed, err := memoryStore.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get completed job: %v", err)
+	}
+	if completed.Status != jobs.StatusSucceeded {
+		t.Fatalf("expected succeeded job after persisted outputs, got %#v", completed)
+	}
+}
+
+func TestCompleteNonTrainingJobDoesNotRequireTrainingOutputs(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	worker, err := memoryStore.RegisterWorker(project.ID, "worker", "")
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateProfileDataset, map[string]any{"dataset_id": dataset.ID})
+	if err != nil {
+		t.Fatalf("create profile job: %v", err)
+	}
+	router := NewRouter(memoryStore)
+	assigned := pollJobForCallback(t, router, worker.ID, `{"templates":["profile_dataset"],"include_unspecified_provider_templates":["profile_dataset"]}`)
+	req := httptest.NewRequest(http.MethodPost, "/jobs/"+job.ID+"/complete", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assigned)+`","mlflow_run_id":"profile-run"}`))
+	req.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, req, assigned)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected non-training completion status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
 }
 
 func TestCreateChampionExportFallsBackToPendingArtifact(t *testing.T) {
@@ -2680,8 +2805,16 @@ func TestAutomaticReviewRespectsMaxFollowUpRounds(t *testing.T) {
 
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 6),
+		testExperiment("efficientnet_b0", 8),
 	})
-	recordTrainingSummary(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.55, 0.01)
+	weakJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.55)
+	bestJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[1], jobs.StatusSucceeded, 0.66)
+	if _, err := server.store.CompleteJob(weakJob.ID, ""); err != nil {
+		t.Fatalf("complete weak job: %v", err)
+	}
+	if _, err := server.store.CompleteJob(bestJob.ID, ""); err != nil {
+		t.Fatalf("complete best job: %v", err)
+	}
 
 	result, err := server.runAutomaticExperimentReview(projectID)
 	if err != nil {
@@ -2693,13 +2826,66 @@ func TestAutomaticReviewRespectsMaxFollowUpRounds(t *testing.T) {
 	if result.FollowUpPlan != nil {
 		t.Fatalf("expected max round guard to skip follow-up, got %s", result.FollowUpPlan.ID)
 	}
+	champion, err := server.store.GetProjectChampion(projectID)
+	if err != nil {
+		t.Fatalf("expected max-round champion: %v", err)
+	}
+	if champion.JobID != bestJob.ID {
+		t.Fatalf("expected best successful job %s as champion, got %s", bestJob.ID, champion.JobID)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 20)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasExecutionEventPayload(events, execution.EventAgentOutcomeRecorded, "backend_stop_guard", "max_followup_rounds_guard") {
+		t.Fatalf("expected max follow-up terminal event, got %#v", events)
+	}
 
 	_, err = server.runAutomaticExperimentReview(projectID)
 	if err != nil {
 		t.Fatalf("rerun automatic review: %v", err)
 	}
-	if got := len(listAgentDecisions(t, server, projectID)); got != 1 {
-		t.Fatalf("expected one deduplicated action decision, got %d", got)
+	if got := len(listAgentDecisions(t, server, projectID)); got != 2 {
+		t.Fatalf("expected deduplicated ADD_EXPERIMENTS and terminal SELECT_CHAMPION decisions, got %d", got)
+	}
+	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
+		t.Fatalf("expected no automatic follow-up plans, got %d", got-1)
+	}
+}
+
+func TestAutomaticReviewMaxFollowUpRoundsNoSuccessfulRunRecordsTerminalEvent(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
+	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
+	t.Setenv("MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS", "0")
+
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	failedJob, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusFailed, 0)
+	if _, err := server.store.FailJob(failedJob.ID, "training failed"); err != nil {
+		t.Fatalf("fail job: %v", err)
+	}
+
+	result, err := server.runAutomaticExperimentReview(projectID)
+	if err != nil {
+		t.Fatalf("run automatic review: %v", err)
+	}
+	if result.Decision == nil || result.Decision.DecisionType != decisions.TypeAddExperiments {
+		t.Fatalf("expected ADD_EXPERIMENTS decision, got %#v", result.Decision)
+	}
+	if result.FollowUpPlan != nil {
+		t.Fatalf("expected max round guard to skip follow-up, got %s", result.FollowUpPlan.ID)
+	}
+	if _, err := server.store.GetProjectChampion(projectID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected no champion without successful runs, got %v", err)
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 20)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasExecutionEventPayload(events, execution.EventAgentOutcomeRecorded, "exportable", false) {
+		t.Fatalf("expected terminal no-champion event, got %#v", events)
 	}
 	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
 		t.Fatalf("expected no automatic follow-up plans, got %d", got-1)
@@ -3086,34 +3272,64 @@ func TestBudgetCapSelectsBestAvailableChampionWhenAllQueuedFullTrainIsBlocked(t 
 	if err != nil {
 		t.Fatalf("create dataset: %v", err)
 	}
-	priorJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+	slowJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+		"model":      "vit_b_16",
+	})
+	if err != nil {
+		t.Fatalf("create slow prior job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(slowJob.ID, ""); err != nil {
+		t.Fatalf("complete slow prior job: %v", err)
+	}
+	fastJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
 		"dataset_id": dataset.ID,
 		"provider":   "modal",
 		"model":      "mobilenet_v3_small",
 	})
 	if err != nil {
-		t.Fatalf("create prior job: %v", err)
+		t.Fatalf("create fast prior job: %v", err)
 	}
-	if _, err := memoryStore.CompleteJob(priorJob.ID, ""); err != nil {
-		t.Fatalf("complete prior job: %v", err)
+	if _, err := memoryStore.CompleteJob(fastJob.ID, ""); err != nil {
+		t.Fatalf("complete fast prior job: %v", err)
 	}
-	cost := 1.0
-	score := 0.74
-	if _, err := memoryStore.UpsertTrainingRunSummary(priorJob.ID, runs.TrainingRunSummaryUpdate{
+	priorCost := 0.50
+	slowScore := 0.97
+	if _, err := memoryStore.UpsertTrainingRunSummary(slowJob.ID, runs.TrainingRunSummaryUpdate{
 		Status:           jobs.StatusSucceeded,
-		EstimatedCostUSD: &cost,
-		BestMacroF1:      &score,
-		BestAccuracy:     &score,
+		EstimatedCostUSD: &priorCost,
+		BestMacroF1:      &slowScore,
+		BestAccuracy:     &slowScore,
 	}); err != nil {
-		t.Fatalf("seed prior summary: %v", err)
+		t.Fatalf("seed slow prior summary: %v", err)
 	}
-	if _, err := memoryStore.UpsertTrainingRunEvaluation(priorJob.ID, runs.TrainingRunEvaluationUpdate{
+	fastScore := 0.90
+	if _, err := memoryStore.UpsertTrainingRunSummary(fastJob.ID, runs.TrainingRunSummaryUpdate{
+		Status:           jobs.StatusSucceeded,
+		EstimatedCostUSD: &priorCost,
+		BestMacroF1:      &fastScore,
+		BestAccuracy:     &fastScore,
+	}); err != nil {
+		t.Fatalf("seed fast prior summary: %v", err)
+	}
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(slowJob.ID, runs.TrainingRunEvaluationUpdate{
 		ModelProfile: map[string]any{
-			"artifact_uri":  "s3://model-express/model-express/artifacts/prior/model.onnx",
-			"export_status": "ready",
+			"artifact_uri":         "s3://model-express/model-express/artifacts/slow/model.onnx",
+			"export_status":        "ready",
+			"estimated_latency_ms": 120.0,
 		},
 	}); err != nil {
-		t.Fatalf("seed prior evaluation: %v", err)
+		t.Fatalf("seed slow prior evaluation: %v", err)
+	}
+	if _, err := memoryStore.UpsertTrainingRunEvaluation(fastJob.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri":         "s3://model-express/model-express/artifacts/fast/model.onnx",
+			"export_status":        "ready",
+			"estimated_latency_ms": 8.0,
+		},
+	}); err != nil {
+		t.Fatalf("seed fast prior evaluation: %v", err)
 	}
 	full := testExperiment("efficientnet_b0", 8)
 	full.Strategy = "full_train_promoted_candidate"
@@ -3133,11 +3349,18 @@ func TestBudgetCapSelectsBestAvailableChampionWhenAllQueuedFullTrainIsBlocked(t 
 	if err != nil {
 		t.Fatalf("expected budget-stop champion: %v", err)
 	}
-	if champion.JobID != priorJob.ID {
-		t.Fatalf("expected prior job champion %s, got %s", priorJob.ID, champion.JobID)
+	if champion.JobID != fastJob.ID {
+		t.Fatalf("expected fast prior job champion %s, got %s", fastJob.ID, champion.JobID)
 	}
 	if champion.SourceDecisionID == "" {
 		t.Fatalf("expected champion source decision")
+	}
+	events, err := memoryStore.ListProjectExecutionEvents(project.ID, 20)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasExecutionEventPayload(events, execution.EventCostBudgetBlocked, "selected_best_available_model", true) {
+		t.Fatalf("expected budget exhausted champion event, got %#v", events)
 	}
 	exports, err := memoryStore.ListProjectChampionExports(project.ID)
 	if err != nil {
@@ -3145,6 +3368,67 @@ func TestBudgetCapSelectsBestAvailableChampionWhenAllQueuedFullTrainIsBlocked(t 
 	}
 	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI == "" {
 		t.Fatalf("expected ready champion export, got %#v", exports)
+	}
+}
+
+func TestBudgetCapExhaustionNoSuccessfulRunRecordsTerminalEvent(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_COST_MODES", "1")
+
+	memoryStore := store.NewMemoryStore()
+	server := newServer(memoryStore)
+	current := server.currentAutomationSettings()
+	current.CostMode = "balanced"
+	current.BudgetCapUSD = 1.0
+	server.setAutomationSettings(current)
+	project, err := memoryStore.CreateProject("vision project", "fast live classifier")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "minio://datasets/example", strings.Repeat("f", 64), 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	failedJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{
+		"dataset_id": dataset.ID,
+		"provider":   "modal",
+		"model":      "mobilenet_v3_small",
+	})
+	if err != nil {
+		t.Fatalf("create failed job: %v", err)
+	}
+	if _, err := memoryStore.FailJob(failedJob.ID, "training failed"); err != nil {
+		t.Fatalf("fail job: %v", err)
+	}
+	cost := 1.0
+	if _, err := memoryStore.UpsertTrainingRunSummary(failedJob.ID, runs.TrainingRunSummaryUpdate{
+		Status:           jobs.StatusFailed,
+		EstimatedCostUSD: &cost,
+	}); err != nil {
+		t.Fatalf("seed failed summary: %v", err)
+	}
+	full := testExperiment("efficientnet_b0", 8)
+	full.Strategy = "full_train_promoted_candidate"
+	plan, err := memoryStore.CreateExperimentPlan(project.ID, dataset.ID, "macro_f1", 1, 10, []plans.PlannedExperiment{full}, nil, "")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if len(result.Jobs) != 0 {
+		t.Fatalf("expected no queued jobs under exhausted budget, got %d", len(result.Jobs))
+	}
+	if _, err := memoryStore.GetProjectChampion(project.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected no champion without successful runs, got %v", err)
+	}
+	events, err := memoryStore.ListProjectExecutionEvents(project.ID, 20)
+	if err != nil {
+		t.Fatalf("list execution events: %v", err)
+	}
+	if !hasExecutionEventPayload(events, execution.EventCostBudgetBlocked, "exportable", false) {
+		t.Fatalf("expected budget exhausted no-champion event, got %#v", events)
 	}
 }
 
@@ -4290,6 +4574,51 @@ func TestHolisticRunScoreCanPreferFastModelForLiveGoal(t *testing.T) {
 	}
 }
 
+func TestHolisticRunScoreCapsCatastrophicClassificationQuality(t *testing.T) {
+	summary := runs.TrainingRunSummary{
+		JobID:            "job_bad",
+		Status:           jobs.StatusSucceeded,
+		Model:            "efficientnet_b0",
+		BestMacroF1:      0.003,
+		BestAccuracy:     0.009,
+		FinalTrainLoss:   5.20,
+		FinalValLoss:     5.31,
+		EstimatedCostUSD: 0.01,
+		RuntimeSeconds:   30,
+	}
+
+	readiness, readinessBreakdown := deploymentReadinessScoreBreakdown("macro_f1", summary, runs.TrainingRunEvaluation{})
+	if readiness != catastrophicRunScoreFloor || !payloadBool(readinessBreakdown, "catastrophic_quality_gate") {
+		t.Fatalf("expected catastrophic readiness cap, score=%v breakdown=%#v", readiness, readinessBreakdown)
+	}
+	score, breakdown := holisticRunScoreBreakdown("macro_f1", summary, runs.TrainingRunEvaluation{}, projectObjectiveContext("budget sensitive"))
+	if score != catastrophicRunScoreFloor || !payloadBool(breakdown, "catastrophic_quality_gate") {
+		t.Fatalf("expected catastrophic holistic cap, score=%v breakdown=%#v", score, breakdown)
+	}
+
+	lowTargetSummary := summary
+	lowTargetSummary.JobID = "job_low_target"
+	lowTargetSummary.BestMacroF1 = 0.10
+	lowTargetSummary.BestAccuracy = 0.35
+	lowTargetSummary.FinalTrainLoss = 1.10
+	lowTargetSummary.FinalValLoss = 1.25
+	lowTargetScore, lowTargetBreakdown := holisticRunScoreBreakdown("macro_f1", lowTargetSummary, runs.TrainingRunEvaluation{}, projectObjectiveContext("best quality"))
+	if lowTargetScore != catastrophicRunScoreFloor || !payloadBool(lowTargetBreakdown, "catastrophic_quality_gate") {
+		t.Fatalf("expected low target metric to trigger cap, score=%v breakdown=%#v", lowTargetScore, lowTargetBreakdown)
+	}
+
+	learningSummary := summary
+	learningSummary.JobID = "job_learning"
+	learningSummary.BestMacroF1 = 0.42
+	learningSummary.BestAccuracy = 0.50
+	learningSummary.FinalTrainLoss = 0.92
+	learningSummary.FinalValLoss = 1.04
+	learningScore, learningBreakdown := holisticRunScoreBreakdown("macro_f1", learningSummary, runs.TrainingRunEvaluation{}, projectObjectiveContext("budget sensitive"))
+	if learningScore <= catastrophicRunScoreFloor || payloadBool(learningBreakdown, "catastrophic_quality_gate") {
+		t.Fatalf("expected learning run to avoid catastrophic cap, score=%v breakdown=%#v", learningScore, learningBreakdown)
+	}
+}
+
 func TestSelectChampionDecisionCreatesChampionRecord(t *testing.T) {
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		testExperiment("mobilenet_v3_small", 6),
@@ -4473,6 +4802,83 @@ func TestSelectChampionQueuesONNXExportFromCheckpoint(t *testing.T) {
 	}
 	if sourceArtifactURI := jobConfigString(exportJob.Config, "source_artifact_uri"); sourceArtifactURI != "file:///exports/model.pt" {
 		t.Fatalf("expected checkpoint source artifact, got %q", sourceArtifactURI)
+	}
+}
+
+func TestChampionSelectedEventFailureStillCreatesExport(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.91)
+	decision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select deployable model.", map[string]any{
+		"champion_job_id": job.ID,
+	})
+	if err != nil {
+		t.Fatalf("create decision: %v", err)
+	}
+	server.store = &championExportFailureStore{
+		Store:                     server.store,
+		failChampionSelectedEvent: true,
+	}
+
+	if err := server.persistProjectChampionFromDecision(projectID, decision); err != nil {
+		t.Fatalf("persist champion should tolerate telemetry failure: %v", err)
+	}
+	exports, err := server.store.ListProjectChampionExports(projectID)
+	if err != nil {
+		t.Fatalf("list exports: %v", err)
+	}
+	if len(exports) != 1 {
+		t.Fatalf("expected export despite champion event failure, got %#v", exports)
+	}
+}
+
+func TestChampionExportJobCreationFailureLeavesFailedExportState(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
+		testExperiment("mobilenet_v3_small", 6),
+	})
+	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.91)
+	decision, err := server.store.CreateAgentDecision(projectID, plan.ID, decisions.TypeSelectChampion, "Select deployable model.", map[string]any{
+		"champion_job_id": job.ID,
+	})
+	if err != nil {
+		t.Fatalf("create decision: %v", err)
+	}
+	server.store = &championExportFailureStore{
+		Store:               server.store,
+		failExportJobCreate: true,
+	}
+
+	if err := server.persistProjectChampionFromDecision(projectID, decision); err != nil {
+		t.Fatalf("persist champion should tolerate export enqueue failure: %v", err)
+	}
+	exports, err := server.store.ListProjectChampionExports(projectID)
+	if err != nil {
+		t.Fatalf("list exports: %v", err)
+	}
+	if len(exports) != 1 {
+		t.Fatalf("expected one failed export row, got %#v", exports)
+	}
+	if exports[0].Status != runs.ChampionExportStatusFailed || !containsString(exports[0].ValidationErrors, "forced export job failure") {
+		t.Fatalf("expected visible FAILED export state with validation error, got %#v", exports[0])
+	}
+	events, err := server.store.ListProjectExecutionEvents(projectID, 20)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if !hasExecutionEventPayload(events, execution.EventExecutionFailed, "export_id", exports[0].ID) {
+		t.Fatalf("expected export failure execution event, got %#v", events)
+	}
+
+	if err := server.persistProjectChampionFromDecision(projectID, decision); err != nil {
+		t.Fatalf("rerun persist champion: %v", err)
+	}
+	exports, err = server.store.ListProjectChampionExports(projectID)
+	if err != nil {
+		t.Fatalf("list exports after rerun: %v", err)
+	}
+	if len(exports) != 1 {
+		t.Fatalf("expected failed export upsert to stay idempotent, got %#v", exports)
 	}
 }
 
@@ -7768,7 +8174,7 @@ func TestExperimentPlannerFailureRecordsAgentFailedEvent(t *testing.T) {
 	}
 }
 
-func TestPlanningLoopDoesNotRunDeterministicReviewerAfterLLMPlannerFailure(t *testing.T) {
+func TestPlanningLoopAfterLLMPlannerFailureFallsBackToChampionSelection(t *testing.T) {
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{{
@@ -7791,10 +8197,36 @@ func TestPlanningLoopDoesNotRunDeterministicReviewerAfterLLMPlannerFailure(t *te
 		testExperiment("mobilenet_v3_small", 6),
 	})
 	job, _ := createTerminalTrainingJob(t, server, plan, plan.Experiments[0], jobs.StatusSucceeded, 0.62)
+	completedJob, err := server.store.CompleteJob(job.ID, "run_1")
+	if err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+	job = completedJob
+	if _, err := server.store.UpsertTrainingRunEvaluation(job.ID, runs.TrainingRunEvaluationUpdate{
+		ModelProfile: map[string]any{
+			"artifact_uri": "s3://model-express/model-express/artifacts/" + job.ID + "/model.onnx",
+		},
+	}); err != nil {
+		t.Fatalf("upsert evaluation: %v", err)
+	}
 
-	server.runPlanningLoopAfterTrainingJob(job)
-	if decisions := listAgentDecisions(t, server, projectID); len(decisions) != 0 {
-		t.Fatalf("expected no deterministic fallback decision after planner failure, got %#v", decisions)
+	status, err := server.runPlanningLoopAfterTrainingJob(job)
+	if err != nil || status != "degraded" {
+		t.Fatalf("expected degraded planner fallback status without hook failure, status=%q err=%v", status, err)
+	}
+	champion, err := server.store.GetProjectChampion(projectID)
+	if err != nil {
+		t.Fatalf("expected degraded fallback champion: %v", err)
+	}
+	if champion.JobID != job.ID {
+		t.Fatalf("expected degraded fallback champion %s, got %s", job.ID, champion.JobID)
+	}
+	exports, err := server.store.ListProjectChampionExports(projectID)
+	if err != nil {
+		t.Fatalf("list champion exports: %v", err)
+	}
+	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady {
+		t.Fatalf("expected visible ready export after degraded fallback, got %#v", exports)
 	}
 	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
 	if err != nil {
@@ -7805,6 +8237,26 @@ func TestPlanningLoopDoesNotRunDeterministicReviewerAfterLLMPlannerFailure(t *te
 	}
 	if hasExecutionEvent(events, execution.EventExecutionFailed) {
 		t.Fatalf("expected planner failure not to become execution failure, got %#v", events)
+	}
+	if status, err := server.runPlanningLoopAfterTrainingJob(job); err != nil || status == "failed" {
+		t.Fatalf("expected idempotent rerun without hook failure, status=%q err=%v", status, err)
+	}
+	agentDecisions := listAgentDecisions(t, server, projectID)
+	fallbackDecisions := 0
+	for _, decision := range agentDecisions {
+		if decision.DecisionType == decisions.TypeSelectChampion && decision.Payload["decision_source"] == llmPlannerDegradedChampionDecisionSource {
+			fallbackDecisions++
+		}
+	}
+	if fallbackDecisions != 1 {
+		t.Fatalf("expected degraded fallback decision to be idempotent, got %#v", agentDecisions)
+	}
+	exports, err = server.store.ListProjectChampionExports(projectID)
+	if err != nil {
+		t.Fatalf("list champion exports after rerun: %v", err)
+	}
+	if len(exports) != 1 {
+		t.Fatalf("expected degraded fallback export to be idempotent, got %#v", exports)
 	}
 }
 
@@ -7930,6 +8382,26 @@ func newAutomaticReviewFixture(t *testing.T, experiments []plans.PlannedExperime
 	}
 
 	return server, project.ID, plan
+}
+
+type championExportFailureStore struct {
+	store.Store
+	failChampionSelectedEvent bool
+	failExportJobCreate       bool
+}
+
+func (s *championExportFailureStore) CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error) {
+	if s.failChampionSelectedEvent && eventType == execution.EventChampionSelected {
+		return execution.ExecutionEvent{}, errors.New("forced champion selected event failure")
+	}
+	return s.Store.CreateExecutionEvent(projectID, planID, eventType, message, payload)
+}
+
+func (s *championExportFailureStore) CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error) {
+	if s.failExportJobCreate && template == jobs.TemplateExportChampion {
+		return jobs.ExperimentJob{}, errors.New("forced export job failure")
+	}
+	return s.Store.CreateJob(projectID, template, config)
 }
 
 func recordTrainingSummary(
@@ -8101,6 +8573,15 @@ func plannerInputForPayload(t *testing.T, server *Server, projectID string) agen
 func hasExecutionEvent(events []execution.ExecutionEvent, eventType string) bool {
 	for _, event := range events {
 		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func hasExecutionEventPayload(events []execution.ExecutionEvent, eventType string, key string, value any) bool {
+	for _, event := range events {
+		if event.EventType == eventType && event.Payload[key] == value {
 			return true
 		}
 	}

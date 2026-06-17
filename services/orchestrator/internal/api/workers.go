@@ -13,13 +13,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/datasets"
-	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
-	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/workers"
@@ -286,26 +283,6 @@ func (s *Server) selectBestAvailableChampionAfterCostPolicyStop(plan plans.Exper
 }
 
 func (s *Server) selectBestAvailableChampionForCostStoppedPlan(plan plans.ExperimentPlan, costPolicyPayload map[string]any, trigger string) (bool, error) {
-	if plan.ID == "" {
-		return false, nil
-	}
-	if _, err := s.store.GetProjectChampion(plan.ProjectID); err == nil {
-		return true, nil
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return false, err
-	}
-	decisionsForProject, err := s.store.ListProjectAgentDecisions(plan.ProjectID)
-	if err != nil {
-		return false, err
-	}
-	for _, decision := range decisionsForProject {
-		if decision.PlanID == plan.ID && decision.Payload["decision_source"] == costPolicyChampionDecisionSource {
-			if err := s.persistProjectChampionFromDecision(plan.ProjectID, decision); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-	}
 	openJobs, err := s.hasOpenTrainingJobForPlan(plan.ProjectID, plan.ID)
 	if err != nil {
 		return false, err
@@ -313,45 +290,27 @@ func (s *Server) selectBestAvailableChampionForCostStoppedPlan(plan plans.Experi
 	if openJobs {
 		return false, nil
 	}
-	summaries, err := s.store.ListProjectTrainingRunSummaries(plan.ProjectID)
-	if err != nil {
-		return false, err
-	}
-	best, ok := bestSuccessfulTrainingSummaryForObjective(plan.TargetMetric, summaries, nil, agents.ProjectObjectiveContext{})
-	if !ok {
-		_, eventErr := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventCostBudgetBlocked, "Cost policy stopped training, but no successful model is available to export yet.", map[string]any{
-			"decision_source": costPolicyChampionDecisionSource,
-			"trigger":         trigger,
-			"cost_policy":     costPolicyPayload,
-			"exportable":      false,
-		})
-		return false, eventErr
-	}
-	score := holisticRunScore(plan.TargetMetric, best, runs.TrainingRunEvaluation{}, agents.ProjectObjectiveContext{})
-	payload := map[string]any{
-		"decision_source":               costPolicyChampionDecisionSource,
-		"auto_executable":               true,
-		"target_metric":                 plan.TargetMetric,
-		"champion_job_id":               best.JobID,
-		"champion_model":                best.Model,
-		"champion_score":                roundDiagnosticFloat(score),
-		"champion_macro_f1":             roundDiagnosticFloat(best.BestMacroF1),
-		"champion_accuracy":             roundDiagnosticFloat(best.BestAccuracy),
-		"champion_estimated_cost_usd":   roundDiagnosticFloat(best.EstimatedCostUSD),
-		"champion_runtime_seconds":      roundDiagnosticFloat(best.RuntimeSeconds),
-		"budget_stop_trigger":           trigger,
-		"cost_policy":                   costPolicyPayload,
-		"selected_best_available_model": true,
-	}
-	rationale := fmt.Sprintf("Cost mode or budget cap stopped additional training for plan %s, so the backend selected the best successful model available within the budget: %s.", plan.ID, best.JobID)
-	decision, err := s.store.CreateAgentDecision(plan.ProjectID, plan.ID, decisions.TypeSelectChampion, rationale, payload)
-	if err != nil {
-		return false, err
-	}
-	if err := s.persistProjectChampionFromDecision(plan.ProjectID, decision); err != nil {
-		return false, err
-	}
-	return true, nil
+	return s.selectBestAvailableChampionForTerminalPlanStop(plan, terminalChampionSelectionOptions{
+		DecisionSource: costPolicyChampionDecisionSource,
+		Trigger:        trigger,
+		EventType:      execution.EventCostBudgetBlocked,
+		Rationale: fmt.Sprintf(
+			"Cost mode or budget cap stopped additional training for plan %s, so the backend selected the best successful model available within the budget.",
+			plan.ID,
+		),
+		EventMessage: fmt.Sprintf(
+			"Budget/cost policy exhausted additional experiments for plan %s; the best available champion was selected.",
+			plan.ID,
+		),
+		NoChampionMessage: fmt.Sprintf(
+			"Budget/cost policy exhausted additional experiments for plan %s, but no successful model is available to select as champion.",
+			plan.ID,
+		),
+		Payload: map[string]any{
+			"budget_stop_trigger": trigger,
+			"cost_policy":         costPolicyPayload,
+		},
+	})
 }
 
 func (s *Server) hasOpenTrainingJobForPlan(projectID string, planID string) (bool, error) {

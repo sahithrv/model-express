@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import pytest
+import requests
 
 from worker import main as worker_main
 
@@ -141,3 +142,107 @@ def test_worker_idle_log_is_throttled(monkeypatch, capsys):
 
     assert poll_count["value"] == 2
     assert capsys.readouterr().out.count("There are no jobs.") == 1
+
+
+def test_worker_retries_registration_until_success(monkeypatch):
+    instances = []
+    sleeps = []
+
+    class FakeClient:
+        def __init__(self, base_url: str):
+            self.base_url = base_url
+            self.register_calls = 0
+            instances.append(self)
+
+        def register_worker(self, project_id: str) -> dict:
+            self.register_calls += 1
+            if self.register_calls < 3:
+                raise requests.ConnectionError("orchestrator unavailable")
+            return {"id": "worker_1", "project_id": project_id}
+
+        def poll_job(self, worker_id: str, **_kwargs):
+            raise KeyboardInterrupt
+
+    monkeypatch.setenv("PROJECT_ID", "project_1")
+    monkeypatch.setattr(worker_main, "OrchestratorClient", FakeClient)
+    monkeypatch.setattr(worker_main, "_retry_delay_seconds", lambda _attempt: 0.01)
+    monkeypatch.setattr(worker_main.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(KeyboardInterrupt):
+        worker_main.main()
+
+    assert instances[0].register_calls == 3
+    assert sleeps == [0.01, 0.01]
+
+
+def test_worker_poll_transport_failure_backs_off_and_continues(monkeypatch):
+    poll_count = {"value": 0}
+    sleeps = []
+
+    class FakeClient:
+        def __init__(self, base_url: str):
+            self.base_url = base_url
+
+        def register_worker(self, project_id: str) -> dict:
+            return {"id": "worker_1", "project_id": project_id}
+
+        def poll_job(self, worker_id: str, **_kwargs):
+            poll_count["value"] += 1
+            if poll_count["value"] == 1:
+                raise requests.Timeout("poll timeout")
+            raise KeyboardInterrupt
+
+    monkeypatch.setenv("PROJECT_ID", "project_1")
+    monkeypatch.setattr(worker_main, "OrchestratorClient", FakeClient)
+    monkeypatch.setattr(worker_main, "_retry_delay_seconds", lambda _attempt: 0.01)
+    monkeypatch.setattr(worker_main.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(KeyboardInterrupt):
+        worker_main.main()
+
+    assert poll_count["value"] == 2
+    assert sleeps == [0.01]
+
+
+def test_worker_fail_report_transport_failure_does_not_crash_worker(monkeypatch):
+    counts = {"poll": 0, "fail": 0}
+
+    class FakeClient:
+        def __init__(self, base_url: str):
+            self.base_url = base_url
+
+        def register_worker(self, project_id: str) -> dict:
+            return {"id": "worker_1", "project_id": project_id}
+
+        @contextmanager
+        def job_context(self, job: dict):
+            yield
+
+        def poll_job(self, worker_id: str, **_kwargs):
+            counts["poll"] += 1
+            if counts["poll"] > 1:
+                raise KeyboardInterrupt
+            return {
+                "id": "job_1",
+                "project_id": "project_1",
+                "template": "train_experiment",
+                "config": {"active_attempt_id": "job_1_attempt_1"},
+            }
+
+        def fail_job(self, job_id: str, error: str, retryable: bool = False, metadata=None, job=None):
+            counts["fail"] += 1
+            raise requests.ConnectionError("fail endpoint unavailable")
+
+    def fail_run_job(_client, _job):
+        raise RuntimeError("worker failure")
+
+    monkeypatch.setenv("PROJECT_ID", "project_1")
+    monkeypatch.setattr(worker_main, "OrchestratorClient", FakeClient)
+    monkeypatch.setattr(worker_main, "run_job", fail_run_job)
+    monkeypatch.setattr(worker_main, "_retry_delay_seconds", lambda _attempt: 0.01)
+    monkeypatch.setattr(worker_main.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        worker_main.main()
+
+    assert counts == {"poll": 2, "fail": worker_main.FAIL_REPORT_MAX_ATTEMPTS}

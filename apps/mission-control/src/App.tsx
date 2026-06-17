@@ -54,6 +54,7 @@ import {
   type ChampionExportsStatus,
   type DatasetMetadataDetail,
   type ProjectDetail,
+  type ProjectDetailLoadStatus,
   type VisualAnalysisDetail,
 } from "./hooks/useProjectDetail";
 import { eventNeedsSlowProjectRefresh, type ActivityStreamState } from "./hooks/useActivityStream";
@@ -549,24 +550,109 @@ type ChampionExportsFetchResult = {
   failed: boolean;
 };
 
+type ListFetchResult<T> = {
+  items: T[];
+  status: ProjectDetailLoadStatus;
+  failed: boolean;
+};
+
+type WorkerRequirementsFetchResult = {
+  requirements: WorkerRequirement[];
+  status: ProjectDetailLoadStatus;
+  failed: boolean;
+};
+
+type ChampionDemoPredictionsFetchResult = {
+  predictions?: ChampionDemoPrediction[];
+  history?: ChampionDemoPrediction[];
+  demo_predictions?: ChampionDemoPrediction[];
+  status: ProjectDetailLoadStatus;
+  failed: boolean;
+};
+
+type ChampionFeedbackFetchResult = {
+  feedback?: ChampionFeedback[];
+  items?: ChampionFeedback[];
+  status: ProjectDetailLoadStatus;
+  failed: boolean;
+};
+
+function loadedStatus(message: string): ProjectDetailLoadStatus {
+  return {
+    status: "available",
+    message,
+    last_success_at: new Date().toISOString(),
+  };
+}
+
+function emptyLoadStatus(message: string): ProjectDetailLoadStatus {
+  return {
+    status: "empty",
+    message,
+    last_success_at: new Date().toISOString(),
+  };
+}
+
+function errorLoadStatus(message: string): ProjectDetailLoadStatus {
+  return {
+    status: "error",
+    message,
+  };
+}
+
+function staleLoadStatus(
+  failedStatus: ProjectDetailLoadStatus,
+  staleCount: number,
+  noun: string,
+  previousStatus?: ProjectDetailLoadStatus,
+): ProjectDetailLoadStatus {
+  return {
+    status: "stale",
+    message: `${failedStatus.message} Showing ${staleCount} stale ${noun}${staleCount === 1 ? "" : "s"} from the last successful load.`,
+    last_success_at: previousStatus?.last_success_at,
+  };
+}
+
+function loadedListStatus(count: number, noun: string, emptyMessage: string): ProjectDetailLoadStatus {
+  return count > 0
+    ? loadedStatus(`${count} ${noun}${count === 1 ? "" : "s"} loaded.`)
+    : emptyLoadStatus(emptyMessage);
+}
+
+function previousProjectDetailMatches(previous: ProjectDetail, projectId: string) {
+  return (
+    previous.champion?.project_id === projectId ||
+    previous.datasets.some((dataset) => dataset.project_id === projectId) ||
+    previous.jobs.some((job) => job.project_id === projectId) ||
+    previous.plans.some((plan) => plan.project_id === projectId) ||
+    previous.workerRequirements.some((requirement) => requirement.project_id === projectId)
+  );
+}
+
 function championExportsLoadedStatus(exports: ChampionExport[]): ChampionExportsStatus {
   return exports.length > 0
-    ? { status: "available", message: `${exports.length} champion export record(s) loaded.` }
-    : { status: "empty", message: "No champion export records have been recorded for this champion yet." };
+    ? loadedStatus(`${exports.length} champion export record(s) loaded.`)
+    : emptyLoadStatus("No champion export records have been recorded for this champion yet.");
 }
 
 function championExportsErrorStatus(error: unknown): ChampionExportsStatus {
-  return {
-    status: "error",
-    message: `Champion export lookup failed: ${errorMessage(error)}`,
-  };
+  return errorLoadStatus(`Champion export lookup failed: ${errorMessage(error)}`);
 }
 
 function noChampionExportsStatus(): ChampionExportsStatus {
-  return {
-    status: "empty",
-    message: "Select a champion before export records can load.",
-  };
+  return emptyLoadStatus("Select a champion before export records can load.");
+}
+
+function DetailLoadStatusNotice({ status }: { status?: ProjectDetailLoadStatus }) {
+  if (!status || !["stale", "error"].includes(status.status)) {
+    return null;
+  }
+  return (
+    <div className={`notice-inline detail-load-status ${status.status === "error" ? "error" : "warning"}`} role={status.status === "error" ? "alert" : "status"}>
+      <Badge value={status.status.toUpperCase()} />
+      <span>{status.message}</span>
+    </div>
+  );
 }
 
 function portableBundleSuggestedName(bundle: PortableInferenceBundle, fallbackProjectId: string) {
@@ -812,6 +898,7 @@ export function App() {
   const firstDatasetId = detail.datasets[0]?.id ?? "";
   const jobPageCount = Math.max(1, Math.ceil(detail.jobs.length / jobsPerPage));
   const visibleJobs = detail.jobs.slice(jobPage * jobsPerPage, jobPage * jobsPerPage + jobsPerPage);
+  const detailLiveRefreshUnhealthy = ["stale", "error"].includes(detail.loadStatus.liveRefresh.status);
 
   const request = useCallback(
     async <T,>(path: string, options: RequestOptions = {}) => {
@@ -1054,6 +1141,22 @@ export function App() {
       const slowRequestOptions: Pick<RequestOptions, "bypassCache"> = {
         bypassCache: options.forceSlowData ?? false,
       };
+      const workerRequirementsRequest = request<{ requirements: WorkerRequirement[] }>(
+        `/projects/${projectId}/worker-requirements`,
+      )
+        .then((response): WorkerRequirementsFetchResult => {
+          const requirements = Array.isArray(response.requirements) ? response.requirements : [];
+          return {
+            requirements,
+            status: loadedListStatus(requirements.length, "worker requirement", "No worker requirements have been recorded."),
+            failed: false,
+          };
+        })
+        .catch((error: unknown): WorkerRequirementsFetchResult => ({
+          requirements: [],
+          status: errorLoadStatus(`Worker requirements lookup failed: ${errorMessage(error)}`),
+          failed: true,
+        }));
 
       const [
         datasets,
@@ -1062,7 +1165,6 @@ export function App() {
         runSummaries,
         champion,
         workers,
-        workerRequirements,
         executionEvents,
       ] = await Promise.all([
         request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
@@ -1071,9 +1173,9 @@ export function App() {
         request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries?limit=${trainingSummariesFetchLimit}`),
         request<{ champion: ProjectChampion | null }>(`/projects/${projectId}/champion`),
         request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
-        request<{ requirements: WorkerRequirement[] }>(`/projects/${projectId}/worker-requirements`),
         request<{ events: ExecutionEvent[] }>(`/projects/${projectId}/execution-events?limit=8`),
       ]);
+      const workerRequirements = await workerRequirementsRequest;
 
       const firstDataset = datasets.datasets[0] ?? null;
       const slowData = includeSlowData
@@ -1081,12 +1183,34 @@ export function App() {
             request<{ evaluations: TrainingRunEvaluation[] }>(
               `/projects/${projectId}/training-run-evaluations?limit=${trainingEvaluationsFetchLimit}&compact=1`,
               slowRequestOptions,
-            ).catch(
-              (): { evaluations: TrainingRunEvaluation[] } => ({ evaluations: [] }),
-            ),
-            request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`, slowRequestOptions).catch(
-              (): { decisions: AgentDecision[] } => ({ decisions: [] }),
-            ),
+            )
+              .then((response): ListFetchResult<TrainingRunEvaluation> => {
+                const items = Array.isArray(response.evaluations) ? response.evaluations : [];
+                return {
+                  items,
+                  status: loadedListStatus(items.length, "training evaluation", "No training evaluations have been recorded."),
+                  failed: false,
+                };
+              })
+              .catch((error: unknown): ListFetchResult<TrainingRunEvaluation> => ({
+                items: [],
+                status: errorLoadStatus(`Training evaluation lookup failed: ${errorMessage(error)}`),
+                failed: true,
+              })),
+            request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`, slowRequestOptions)
+              .then((response): ListFetchResult<AgentDecision> => {
+                const items = Array.isArray(response.decisions) ? response.decisions : [];
+                return {
+                  items,
+                  status: loadedListStatus(items.length, "agent decision", "No agent decisions have been recorded."),
+                  failed: false,
+                };
+              })
+              .catch((error: unknown): ListFetchResult<AgentDecision> => ({
+                items: [],
+                status: errorLoadStatus(`Agent decision lookup failed: ${errorMessage(error)}`),
+                failed: true,
+              })),
             request<AgentInvocationsResponse>(`/projects/${projectId}/agent-invocations?limit=8`, slowRequestOptions).catch(
               (): AgentInvocationsResponse => ({ invocations: [] }),
             ),
@@ -1136,13 +1260,37 @@ export function App() {
             request<{ predictions?: ChampionDemoPrediction[]; history?: ChampionDemoPrediction[]; demo_predictions?: ChampionDemoPrediction[] }>(
               `/projects/${projectId}/champion/demo-predictions?limit=8`,
               slowRequestOptions,
-            ).catch((): { predictions?: ChampionDemoPrediction[]; history?: ChampionDemoPrediction[]; demo_predictions?: ChampionDemoPrediction[] } => ({
-              predictions: [],
-            })),
+            )
+              .then((response): ChampionDemoPredictionsFetchResult => {
+                const items = response.predictions ?? response.history ?? response.demo_predictions ?? [];
+                return {
+                  ...response,
+                  status: loadedListStatus(items.length, "demo prediction", "No champion demo prediction history has been recorded."),
+                  failed: false,
+                };
+              })
+              .catch((error: unknown): ChampionDemoPredictionsFetchResult => ({
+                predictions: [],
+                status: errorLoadStatus(`Champion demo prediction lookup failed: ${errorMessage(error)}`),
+                failed: true,
+              })),
             request<{ feedback?: ChampionFeedback[]; items?: ChampionFeedback[] }>(
               `/projects/${projectId}/champion/feedback`,
               slowRequestOptions,
-            ).catch((): { feedback?: ChampionFeedback[]; items?: ChampionFeedback[] } => ({ feedback: [] })),
+            )
+              .then((response): ChampionFeedbackFetchResult => {
+                const items = response.feedback ?? response.items ?? [];
+                return {
+                  ...response,
+                  status: loadedListStatus(items.length, "feedback record", "No champion feedback has been recorded."),
+                  failed: false,
+                };
+              })
+              .catch((error: unknown): ChampionFeedbackFetchResult => ({
+                feedback: [],
+                status: errorLoadStatus(`Champion feedback lookup failed: ${errorMessage(error)}`),
+                failed: true,
+              })),
           ])
         : null;
       const championExports = championSlowData?.[0];
@@ -1151,11 +1299,66 @@ export function App() {
       const championFeedback = championSlowData?.[3];
 
       setDetail((previous) => {
-        const previousChampionMatches =
-          championValue && previous.champion && previous.champion.job_id === championValue.job_id;
+        const previousProjectMatches = previousProjectDetailMatches(previous, projectId);
+        const previousChampionMatches = Boolean(
+          championValue &&
+            previous.champion &&
+            previous.champion.project_id === championValue.project_id &&
+            previous.champion.job_id === championValue.job_id,
+        );
+        const runEvaluationsStale = Boolean(runEvaluations?.failed && previousProjectMatches && previous.runEvaluations.length > 0);
+        const decisionsStale = Boolean(decisions?.failed && previousProjectMatches && previous.decisions.length > 0);
+        const workerRequirementsStale =
+          workerRequirements.failed && previousProjectMatches && previous.workerRequirements.length > 0;
+        const championExportsStale = Boolean(championExports?.failed && previousChampionMatches && previous.championExports.length > 0);
+        const fetchedDemoPredictions = championDemoPredictions
+          ? championDemoPredictions.predictions ?? championDemoPredictions.history ?? championDemoPredictions.demo_predictions ?? []
+          : undefined;
+        const championDemoPredictionsStale = Boolean(
+          championDemoPredictions?.failed && previousChampionMatches && previous.championDemoPredictions.length > 0,
+        );
+        const fetchedChampionFeedback = championFeedback ? championFeedback.feedback ?? championFeedback.items ?? [] : undefined;
+        const championFeedbackStale = Boolean(championFeedback?.failed && previousChampionMatches && previous.championFeedback.length > 0);
+        const nextRunEvaluations = runEvaluations
+          ? runEvaluationsStale
+            ? previous.runEvaluations
+            : runEvaluations.items
+          : previousProjectMatches
+            ? previous.runEvaluations
+            : [];
+        const nextRunEvaluationsStatus = runEvaluations
+          ? runEvaluationsStale
+            ? staleLoadStatus(runEvaluations.status, previous.runEvaluations.length, "training evaluation", previous.loadStatus.runEvaluations)
+            : runEvaluations.status
+          : previousProjectMatches
+            ? previous.loadStatus.runEvaluations
+            : emptyLoadStatus("Training evaluations have not been loaded.");
+        const nextDecisions = decisions
+          ? decisionsStale
+            ? previous.decisions
+            : decisions.items
+          : previousProjectMatches
+            ? previous.decisions
+            : [];
+        const nextDecisionsStatus = decisions
+          ? decisionsStale
+            ? staleLoadStatus(decisions.status, previous.decisions.length, "agent decision", previous.loadStatus.decisions)
+            : decisions.status
+          : previousProjectMatches
+            ? previous.loadStatus.decisions
+            : emptyLoadStatus("Agent decisions have not been loaded.");
+        const nextWorkerRequirements = workerRequirementsStale ? previous.workerRequirements : workerRequirements.requirements;
+        const nextWorkerRequirementsStatus = workerRequirementsStale
+          ? staleLoadStatus(
+              workerRequirements.status,
+              previous.workerRequirements.length,
+              "worker requirement",
+              previous.loadStatus.workerRequirements,
+            )
+          : workerRequirements.status;
         const nextChampionExports = championValue
           ? championExports
-            ? championExports.failed && previousChampionMatches
+            ? championExportsStale
               ? previous.championExports
               : championExports.exports
             : previousChampionMatches
@@ -1164,48 +1367,89 @@ export function App() {
           : [];
         const nextChampionExportsStatus = championValue
           ? championExports
-            ? championExports.failed && previousChampionMatches && previous.championExports.length > 0
-              ? {
-                  status: "error" as const,
-                  message: `${championExports.status.message} Showing ${previous.championExports.length} stale export record(s) from the last successful load.`,
-                }
+            ? championExportsStale
+              ? staleLoadStatus(championExports.status, previous.championExports.length, "champion export record", previous.loadStatus.championExports)
               : championExports.status
             : previousChampionMatches
-              ? previous.championExportsStatus
+              ? previous.loadStatus.championExports
               : championExportsLoadedStatus([])
           : noChampionExportsStatus();
+        const nextChampionDemoPredictions = championValue
+          ? championDemoPredictions
+            ? championDemoPredictionsStale
+              ? previous.championDemoPredictions
+              : fetchedDemoPredictions ?? []
+            : previousChampionMatches
+              ? previous.championDemoPredictions
+              : []
+          : [];
+        const nextChampionDemoPredictionsStatus = championValue
+          ? championDemoPredictions
+            ? championDemoPredictionsStale
+              ? staleLoadStatus(
+                  championDemoPredictions.status,
+                  previous.championDemoPredictions.length,
+                  "demo prediction",
+                  previous.loadStatus.championDemoPredictions,
+                )
+              : championDemoPredictions.status
+            : previousChampionMatches
+              ? previous.loadStatus.championDemoPredictions
+              : emptyLoadStatus("Champion demo prediction history has not been loaded.")
+          : emptyLoadStatus("Select a champion before demo prediction history can load.");
+        const nextChampionFeedback = championValue
+          ? championFeedback
+            ? championFeedbackStale
+              ? previous.championFeedback
+              : fetchedChampionFeedback ?? []
+            : previousChampionMatches
+              ? previous.championFeedback
+              : []
+          : [];
+        const nextChampionFeedbackStatus = championValue
+          ? championFeedback
+            ? championFeedbackStale
+              ? staleLoadStatus(championFeedback.status, previous.championFeedback.length, "feedback record", previous.loadStatus.championFeedback)
+              : championFeedback.status
+            : previousChampionMatches
+              ? previous.loadStatus.championFeedback
+              : emptyLoadStatus("Champion feedback has not been loaded.")
+          : emptyLoadStatus("Select a champion before feedback can load.");
+        const nextLoadStatus = {
+          ...previous.loadStatus,
+          runEvaluations: nextRunEvaluationsStatus,
+          decisions: nextDecisionsStatus,
+          workerRequirements: nextWorkerRequirementsStatus,
+          championExports: nextChampionExportsStatus,
+          championDemoPredictions: nextChampionDemoPredictionsStatus,
+          championFeedback: nextChampionFeedbackStatus,
+          liveRefresh: loadedStatus("Project detail refreshed."),
+        };
         return {
-          decisions: decisions?.decisions ?? previous.decisions,
+          decisions: nextDecisions,
           datasets: datasets.datasets,
           visualAnalysis: visualAnalysis ?? previous.visualAnalysis,
           datasetMetadata: datasetMetadata ?? previous.datasetMetadata,
           jobs: jobs.jobs,
           plans: plans.plans,
           runSummaries: runSummaries.summaries,
-          runEvaluations: runEvaluations?.evaluations ?? previous.runEvaluations,
+          runEvaluations: nextRunEvaluations,
           champion: championValue,
           championExports: nextChampionExports,
           championExportsStatus: nextChampionExportsStatus,
           championDemoImages: championValue
             ? championDemoImages?.images ?? (previousChampionMatches ? previous.championDemoImages : [])
             : [],
-          championDemoPredictions:
-            championValue
-              ? championDemoPredictions?.predictions ??
-                championDemoPredictions?.history ??
-                championDemoPredictions?.demo_predictions ??
-                (previousChampionMatches ? previous.championDemoPredictions : [])
-              : [],
-          championFeedback: championValue
-            ? championFeedback?.feedback ?? championFeedback?.items ?? (previousChampionMatches ? previous.championFeedback : [])
-            : [],
+          championDemoPredictions: nextChampionDemoPredictions,
+          championFeedback: nextChampionFeedback,
           workers: workers.workers,
-          workerRequirements: workerRequirements.requirements,
+          workerRequirements: nextWorkerRequirements,
           executionEvents: executionEvents.events,
           agentInvocations: agentInvocations ? agentInvocationsFromResponse(agentInvocations) : previous.agentInvocations,
           telemetry: telemetry ?? previous.telemetry,
           agentMemory: agentMemory?.records ?? previous.agentMemory,
           strategyScorecards: strategyScorecards?.scorecards ?? previous.strategyScorecards,
+          loadStatus: nextLoadStatus,
         };
       });
 
@@ -1266,8 +1510,29 @@ export function App() {
         await refreshProjectDetail(selectedProjectId, { includeSlowData, forceSlowData: includeSlowData });
       }
       await refreshSelectedJobMetrics();
-    } catch {
+    } catch (error) {
       setHealth(null);
+      setDetail((previous) => {
+        if (!selectedProjectId || !previousProjectDetailMatches(previous, selectedProjectId)) {
+          return previous;
+        }
+        const hasPriorProjectData =
+          previous.jobs.length > 0 ||
+          previous.plans.length > 0 ||
+          previous.runSummaries.length > 0 ||
+          previous.executionEvents.length > 0;
+        return {
+          ...previous,
+          loadStatus: {
+            ...previous.loadStatus,
+            liveRefresh: {
+              status: hasPriorProjectData ? "stale" : "error",
+              message: `Live refresh failed: ${errorMessage(error)}${hasPriorProjectData ? " Showing the last loaded project detail." : ""}`,
+              last_success_at: previous.loadStatus.liveRefresh.last_success_at,
+            },
+          },
+        };
+      });
     } finally {
       liveRefreshInFlight.current = false;
     }
@@ -2238,12 +2503,15 @@ export function App() {
           </div>
           <div className="topbar-actions">
             {activeProjectTab !== "developer" && (
-              <div className={health?.status === "ok" ? "engine-chip ok" : "engine-chip bad"} aria-label={health?.status === "ok" ? "Engine ready" : "Engine offline"}>
+              <div
+                className={health?.status === "ok" && !detailLiveRefreshUnhealthy ? "engine-chip ok" : "engine-chip bad"}
+                aria-label={health?.status === "ok" && !detailLiveRefreshUnhealthy ? "Engine ready" : "Engine needs attention"}
+              >
                 <span className="engine-chip-light" aria-hidden="true" />
                 <Server size={15} />
                 <span>
                   <strong>Engine</strong>
-                  <small>{health?.status === "ok" ? "Ready" : "Offline"}</small>
+                  <small>{detailLiveRefreshUnhealthy ? "Stale" : health?.status === "ok" ? "Ready" : "Offline"}</small>
                 </span>
               </div>
             )}
@@ -2272,15 +2540,16 @@ export function App() {
               )}
             </button>
             {activeProjectTab === "developer" && (
-              <div className={health?.status === "ok" ? "status ok" : "status bad"}>
+              <div className={health?.status === "ok" && !detailLiveRefreshUnhealthy ? "status ok" : "status bad"}>
                 <Server size={16} />
-                {health?.status === "ok" ? "ready" : "offline"}
+                {detailLiveRefreshUnhealthy ? "stale" : health?.status === "ok" ? "ready" : "offline"}
               </div>
             )}
           </div>
         </header>
 
         {notice && <NoticeBanner notice={notice} />}
+        <DetailLoadStatusNotice status={detail.loadStatus.liveRefresh} />
 
         <nav className="section-tabs" aria-label="Project workflow tabs" role="tablist">
           {projectWorkflowTabs.map((tab, index) => (
@@ -2862,6 +3131,7 @@ export function App() {
                 </div>
               </div>
 
+              <DetailLoadStatusNotice status={detail.loadStatus.runEvaluations} />
               {detail.runSummaries.length > 0 ? (
                 <div className="run-table">
                   <div className="run-table-row run-table-head">
@@ -2969,6 +3239,7 @@ export function App() {
                 </div>
               </div>
 
+              <DetailLoadStatusNotice status={detail.loadStatus.decisions} />
               {decisionChatTurns.length > 0 ? (
                 <AgentDecisionChat turns={decisionChatTurns} />
               ) : (
@@ -2989,6 +3260,7 @@ export function App() {
             <div className="automation-grid">
               <div className="automation-block">
                 <strong>Worker Requirements</strong>
+                <DetailLoadStatusNotice status={detail.loadStatus.workerRequirements} />
                 {detail.workerRequirements.length > 0 ? (
                   <div className="status-list">
                     {detail.workerRequirements.slice(0, 4).map((requirement) => (

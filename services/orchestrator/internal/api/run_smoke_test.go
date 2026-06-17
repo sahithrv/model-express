@@ -103,8 +103,16 @@ func TestFakeRunSmokeEndToEndSuccessVisibility(t *testing.T) {
 		Decisions []decisions.AgentDecision `json:"decisions"`
 	}
 	harness.getJSON("/projects/"+project.ID+"/agent-decisions", http.StatusOK, &decisionsPayload)
-	if len(decisionsPayload.Decisions) == 0 || decisionsPayload.Decisions[0].ID != decision.ID {
+	if !smokeDecisionVisible(decisionsPayload.Decisions, decision.ID) {
 		t.Fatalf("expected reviewer decision to be UI-visible, got %#v", decisionsPayload)
+	}
+
+	var exportsPayload struct {
+		Exports []runs.ChampionExport `json:"exports"`
+	}
+	harness.getJSON("/projects/"+project.ID+"/champion/exports", http.StatusOK, &exportsPayload)
+	if len(exportsPayload.Exports) != 1 || exportsPayload.Exports[0].JobID != assigned.ID {
+		t.Fatalf("expected champion export to be UI-visible, got %#v", exportsPayload)
 	}
 }
 
@@ -162,6 +170,34 @@ func TestFakeRunSmokeMidRunFailureStaysVisibleAndRejectsStaleCompletion(t *testi
 	harness.getJSON("/projects/"+project.ID+"/champion", http.StatusOK, &championPayload)
 	if championPayload.Champion != nil {
 		t.Fatalf("failed run should not expose a champion, got %#v", championPayload.Champion)
+	}
+}
+
+func TestFakeRunSmokeRejectsCompletionWithoutModelOutputs(t *testing.T) {
+	harness := newRunSmokeHarness(t)
+	project, _, plan := harness.createProfiledProjectDatasetAndPlan()
+	worker := harness.registerWorker(project.ID, "smoke modal worker", "modal")
+
+	var executionResult executeExperimentPlanResponse
+	harness.postJSON("/plans/"+plan.ID+"/execute", executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"}, http.StatusCreated, &executionResult)
+	assigned := pollJobForCallback(t, harness.router, worker.ID, `{"provider":"modal"}`)
+
+	harness.postCallbackJSON("/jobs/"+assigned.ID+"/complete", assigned, map[string]any{
+		"training_attempt_id": callbackAttemptID(t, assigned),
+		"mlflow_run_id":       "missing-output-run",
+	}, http.StatusConflict, nil)
+
+	var storedJob jobs.ExperimentJob
+	harness.getJSON("/jobs/"+assigned.ID, http.StatusOK, &storedJob)
+	if storedJob.Status == jobs.StatusSucceeded {
+		t.Fatalf("completion without persisted model outputs should not succeed, got %#v", storedJob)
+	}
+	var championPayload struct {
+		Champion *runs.ProjectChampion `json:"champion"`
+	}
+	harness.getJSON("/projects/"+project.ID+"/champion", http.StatusOK, &championPayload)
+	if championPayload.Champion != nil {
+		t.Fatalf("false completion should not expose a champion, got %#v", championPayload.Champion)
 	}
 }
 
@@ -500,6 +536,15 @@ func (h runSmokeHarness) getJSON(path string, wantStatus int, out any) {
 func smokeJobWithStatus(projectJobs []jobs.ExperimentJob, jobID string, status string) bool {
 	for _, job := range projectJobs {
 		if job.ID == jobID && job.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+func smokeDecisionVisible(projectDecisions []decisions.AgentDecision, decisionID string) bool {
+	for _, decision := range projectDecisions {
+		if decision.ID == decisionID {
 			return true
 		}
 	}

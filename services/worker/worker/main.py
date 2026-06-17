@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import random
 import time
 import traceback
+
+import requests
 
 for _key, _value in {
     "OMP_NUM_THREADS": "4",
@@ -20,6 +23,10 @@ from worker.training.modal_dispatcher import modal_dispatcher_enabled, run_modal
 
 POLL_INTERVAL_SECONDS = 5
 IDLE_LOG_SECONDS = 60
+RETRY_INITIAL_SECONDS = 1.0
+RETRY_MAX_SECONDS = 30.0
+RETRY_JITTER_FRACTION = 0.2
+FAIL_REPORT_MAX_ATTEMPTS = 3
 GENERIC_PROVIDER_FALLBACK_TEMPLATES = [
     "profile_dataset",
     "analyze_dataset_visuals",
@@ -38,7 +45,7 @@ def main() -> None:
         run_modal_dispatcher(client, project_id or "")
         return
 
-    worker = client.register_worker(project_id or "")
+    worker = _register_worker_with_retry(client, project_id or "")
     worker_id = worker["id"]
     log_event(
         "info",
@@ -49,13 +56,30 @@ def main() -> None:
     )
 
     last_idle_log_at = 0.0
+    poll_backoff_attempt = 0
     while True:
         provider = _poll_provider()
-        job = client.poll_job(
-            worker_id,
-            provider=provider,
-            include_unspecified_provider_templates=GENERIC_PROVIDER_FALLBACK_TEMPLATES if provider else None,
-        )
+        try:
+            job = client.poll_job(
+                worker_id,
+                provider=provider,
+                include_unspecified_provider_templates=GENERIC_PROVIDER_FALLBACK_TEMPLATES if provider else None,
+            )
+            poll_backoff_attempt = 0
+        except requests.RequestException as exc:
+            delay = _retry_delay_seconds(poll_backoff_attempt)
+            poll_backoff_attempt += 1
+            log_event(
+                "warn",
+                "worker_poll_failed_retrying",
+                worker_id=worker_id,
+                project_id=project_id or "",
+                orchestrator_url=oURL,
+                error=str(exc),
+                retry_delay_seconds=round(delay, 3),
+            )
+            time.sleep(delay)
+            continue
 
         if job is None:
             now = time.monotonic()
@@ -90,13 +114,26 @@ def main() -> None:
             )
         except Exception as exc:
             retryable = _worker_exception_retryable(exc)
-            client.fail_job(
-                job["id"],
-                str(exc),
-                retryable=retryable,
-                metadata={"failure_class": "worker_exception" if retryable else "validation"},
-                job=job,
-            )
+            try:
+                _report_job_failure_with_retry(
+                    client,
+                    job,
+                    str(exc),
+                    retryable=retryable,
+                    metadata={"failure_class": "worker_exception" if retryable else "validation"},
+                )
+            except Exception as report_exc:
+                log_event(
+                    "error",
+                    "job_failure_report_failed",
+                    worker_id=worker_id,
+                    job_id=job.get("id"),
+                    project_id=job.get("project_id"),
+                    template=job.get("template"),
+                    error=str(exc),
+                    report_error=str(report_exc),
+                    traceback=traceback.format_exc(),
+                )
             log_event(
                 "error",
                 "job_failed",
@@ -120,6 +157,77 @@ def _poll_provider() -> str | None:
 
 def _worker_exception_retryable(exc: Exception) -> bool:
     return not isinstance(exc, (KeyError, ValueError))
+
+
+def _register_worker_with_retry(client: OrchestratorClient, project_id: str) -> dict:
+    attempt = 0
+    while True:
+        try:
+            worker = client.register_worker(project_id)
+            if attempt:
+                log_event("info", "worker_register_recovered", project_id=project_id, attempts=attempt + 1)
+            return worker
+        except requests.RequestException as exc:
+            delay = _retry_delay_seconds(attempt)
+            attempt += 1
+            log_event(
+                "warn",
+                "worker_register_failed_retrying",
+                project_id=project_id,
+                orchestrator_url=getattr(client, "base_url", ""),
+                error=str(exc),
+                retry_delay_seconds=round(delay, 3),
+            )
+            time.sleep(delay)
+
+
+def _report_job_failure_with_retry(
+    client: OrchestratorClient,
+    job: dict,
+    error: str,
+    *,
+    retryable: bool,
+    metadata: dict,
+) -> None:
+    attempt = 0
+    while True:
+        try:
+            client.fail_job(
+                job["id"],
+                error,
+                retryable=retryable,
+                metadata=metadata,
+                job=job,
+            )
+            return
+        except requests.RequestException as exc:
+            if attempt >= FAIL_REPORT_MAX_ATTEMPTS - 1 or not _transient_request_error(exc):
+                raise
+            delay = _retry_delay_seconds(attempt)
+            attempt += 1
+            log_event(
+                "warn",
+                "job_failure_report_retrying",
+                job_id=job.get("id"),
+                project_id=job.get("project_id"),
+                error=str(exc),
+                retry_delay_seconds=round(delay, 3),
+                attempt=attempt,
+                max_attempts=FAIL_REPORT_MAX_ATTEMPTS,
+            )
+            time.sleep(delay)
+
+
+def _transient_request_error(exc: requests.RequestException) -> bool:
+    if isinstance(exc, requests.HTTPError):
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        return status_code in {408, 429} or (isinstance(status_code, int) and status_code >= 500)
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    base = min(RETRY_MAX_SECONDS, RETRY_INITIAL_SECONDS * (2 ** max(0, attempt)))
+    return base + random.uniform(0, base * RETRY_JITTER_FRACTION)
 
 
 def worker_poll_interval_seconds() -> float:

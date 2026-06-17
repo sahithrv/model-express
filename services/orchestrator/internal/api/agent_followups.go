@@ -79,7 +79,7 @@ func (s *Server) schedulePlannerDecision(projectID string, sourcePlan plans.Expe
 			sourcePlan.ID,
 			maxRounds,
 		)
-		return nil
+		return s.selectBestAvailableChampionAfterMaxFollowUpStop(sourcePlan, decision, projectPlans, maxRounds)
 	}
 
 	followUpPlan, _, err := s.ensureFollowUpPlan(projectID, sourcePlan, decision)
@@ -131,6 +131,46 @@ func (s *Server) plannerFollowUpStopReason(projectID string, sourcePlan plans.Ex
 		MinimumMeaningfulImprovement: plannerMinimumMeaningfulImprovement,
 	})
 	return stopReason, guardTag, ok, nil
+}
+
+func (s *Server) selectBestAvailableChampionAfterMaxFollowUpStop(sourcePlan plans.ExperimentPlan, decision decisions.AgentDecision, projectPlans []plans.ExperimentPlan, maxRounds int) error {
+	followUpRounds := followUpRoundCount(projectPlans)
+	reason := fmt.Sprintf("max_followup_rounds reached (%d)", maxRounds)
+	payload := map[string]any{
+		"source_decision_id":        decision.ID,
+		"blocked_decision_type":     decision.DecisionType,
+		"backend_validation_status": "blocked",
+		"backend_stop_guard":        "max_followup_rounds_guard",
+		"reason":                    reason,
+		"max_followup_rounds":       maxRounds,
+		"followup_rounds":           followUpRounds,
+	}
+	selected, err := s.selectBestAvailableChampionForTerminalPlanStop(sourcePlan, terminalChampionSelectionOptions{
+		DecisionSource: maxFollowUpRoundsChampionDecisionSource,
+		Trigger:        "max_followup_rounds",
+		EventType:      execution.EventAgentOutcomeRecorded,
+		Rationale: fmt.Sprintf(
+			"Max follow-up rounds were reached for plan %s after ADD_EXPERIMENTS decision %s, so the backend selected the best successful model available.",
+			sourcePlan.ID,
+			decision.ID,
+		),
+		EventMessage: fmt.Sprintf(
+			"Max follow-up rounds were reached for plan %s; the best available champion was selected instead of scheduling another plan.",
+			sourcePlan.ID,
+		),
+		NoChampionMessage: fmt.Sprintf(
+			"Max follow-up rounds were reached for plan %s, but no successful training run is available to select as champion.",
+			sourcePlan.ID,
+		),
+		Payload: payload,
+	})
+	if err != nil {
+		return err
+	}
+	if !selected {
+		log.Printf("max follow-up terminal selection found no successful training run for project %s plan %s", sourcePlan.ProjectID, sourcePlan.ID)
+	}
+	return nil
 }
 
 func (s *Server) reviewProjectExperiments(c *gin.Context) {
@@ -875,6 +915,9 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 			latestPlan.ID,
 			maxRounds,
 		)
+		if err := s.selectBestAvailableChampionAfterMaxFollowUpStop(latestPlan, decision, projectPlans, maxRounds); err != nil {
+			return automaticExperimentReviewResult{}, err
+		}
 		return result, nil
 	}
 
@@ -1115,8 +1158,16 @@ func (s *Server) runTrainingTerminalHooks(jobID string) {
 		log.Printf("AutoML trial observation failed for job %s: %v", job.ID, err)
 	}
 	s.runTrainingMonitorAfterTrainingJob(job)
-	s.runPlanningLoopAfterTrainingJob(job)
-	s.recordTrainingTerminalHookEvent(job, "finished", fmt.Sprintf("Post-training agent hooks finished for job %s.", job.ID), "")
+	planningStatus, planningErr := s.runPlanningLoopAfterTrainingJob(job)
+	if planningStatus == "" {
+		planningStatus = "finished"
+	}
+	if planningErr != nil {
+		log.Printf("post-training planner hook finished with %s status for job %s: %v", planningStatus, job.ID, planningErr)
+		s.recordTrainingTerminalHookEvent(job, planningStatus, fmt.Sprintf("Post-training agent hooks finished with %s planner status for job %s.", planningStatus, job.ID), planningErr.Error())
+		return
+	}
+	s.recordTrainingTerminalHookEvent(job, planningStatus, fmt.Sprintf("Post-training agent hooks finished for job %s.", job.ID), "")
 }
 
 func (s *Server) recordTrainingTerminalHookEvent(job jobs.ExperimentJob, status string, message string, errorText string) {
@@ -1137,23 +1188,179 @@ func (s *Server) recordTrainingTerminalHookEvent(job jobs.ExperimentJob, status 
 	}
 }
 
-func (s *Server) runPlanningLoopAfterTrainingJob(job jobs.ExperimentJob) {
+func (s *Server) runPlanningLoopAfterTrainingJob(job jobs.ExperimentJob) (string, error) {
 	if err := s.recordExperimentPlannerOutcomeAfterTrainingJob(job); err != nil {
 		log.Printf("record experiment planner outcome failed after training job %s: %v", job.ID, err)
 	}
 	if selected, err := s.selectBestAvailableChampionIfCostStoppedAfterTrainingJob(job); err != nil {
 		log.Printf("budget-stop champion selection failed after training job %s: %v", job.ID, err)
 	} else if selected {
-		return
+		return "finished", nil
 	}
 
 	handled, err := s.runExperimentPlannerAfterTrainingJob(job)
 	if err != nil {
 		log.Printf("llm experiment planner failed after training job %s: %v", job.ID, err)
-		return
+		outcome, fallbackErr := s.runDegradedPlannerFallbackAfterTrainingJob(job, err)
+		if fallbackErr != nil {
+			return "failed", fallbackErr
+		}
+		if outcome == degradedPlannerFallbackSelected || outcome == degradedPlannerFallbackDeferred {
+			return "degraded", nil
+		}
+		return "failed", err
 	}
 	if handled {
-		return
+		return "finished", nil
 	}
-	s.runAutomaticExperimentReviewAfterTrainingJob(job)
+	if result, err := s.runAutomaticExperimentReview(job.ProjectID); err != nil {
+		log.Printf("automatic experiment review failed after training job %s: %v", job.ID, err)
+		return "failed", err
+	} else if result.Decision != nil || result.FollowUpPlan != nil || len(result.Jobs) > 0 {
+		return "finished", nil
+	}
+	terminalOutcome, err := s.selectBestAvailableChampionAfterTerminalTrainingJob(job, "terminal_training_hook")
+	if err != nil {
+		return "failed", err
+	}
+	if terminalOutcome == terminalChampionFallbackSelected || terminalOutcome == terminalChampionFallbackDeferred {
+		return "finished", nil
+	}
+	return "failed", fmt.Errorf("no successful training run is available to select as champion")
+}
+
+type degradedPlannerFallbackOutcome string
+
+const (
+	degradedPlannerFallbackNone     degradedPlannerFallbackOutcome = "none"
+	degradedPlannerFallbackSelected degradedPlannerFallbackOutcome = "selected"
+	degradedPlannerFallbackDeferred degradedPlannerFallbackOutcome = "deferred"
+)
+
+func (s *Server) runDegradedPlannerFallbackAfterTrainingJob(job jobs.ExperimentJob, plannerErr error) (degradedPlannerFallbackOutcome, error) {
+	result, err := s.runAutomaticExperimentReview(job.ProjectID)
+	if err != nil {
+		return degradedPlannerFallbackNone, err
+	}
+	if result.Decision != nil && result.Decision.DecisionType == decisions.TypeSelectChampion {
+		return degradedPlannerFallbackSelected, nil
+	}
+	if _, err := s.store.GetProjectChampion(job.ProjectID); err == nil {
+		return degradedPlannerFallbackSelected, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return degradedPlannerFallbackNone, err
+	}
+
+	plan, ok, err := s.trainingJobExperimentPlan(job)
+	if err != nil || !ok {
+		return degradedPlannerFallbackNone, err
+	}
+	openJobs, err := s.hasOpenTrainingJobForPlan(plan.ProjectID, plan.ID)
+	if err != nil {
+		return degradedPlannerFallbackNone, err
+	}
+	if openJobs {
+		return degradedPlannerFallbackDeferred, nil
+	}
+	selected, err := s.selectBestAvailableChampionForTerminalPlanStop(plan, terminalChampionSelectionOptions{
+		DecisionSource: llmPlannerDegradedChampionDecisionSource,
+		Trigger:        "llm_planner_failure",
+		EventType:      execution.EventAgentOutcomeRecorded,
+		Rationale: fmt.Sprintf(
+			"Experiment Planner failed after training job %s, so the backend selected the best successful model available for plan %s.",
+			job.ID,
+			plan.ID,
+		),
+		EventMessage: fmt.Sprintf(
+			"Experiment Planner failed after training job %s; deterministic fallback selected the best available champion.",
+			job.ID,
+		),
+		NoChampionMessage: fmt.Sprintf(
+			"Experiment Planner failed after training job %s, but no successful model is available to select as champion.",
+			job.ID,
+		),
+		Payload: map[string]any{
+			"job_id":        job.ID,
+			"planner_error": plannerErr.Error(),
+		},
+	})
+	if err != nil {
+		return degradedPlannerFallbackNone, err
+	}
+	if selected {
+		return degradedPlannerFallbackSelected, nil
+	}
+	return degradedPlannerFallbackNone, nil
+}
+
+type terminalChampionFallbackOutcome string
+
+const (
+	terminalChampionFallbackNone     terminalChampionFallbackOutcome = "none"
+	terminalChampionFallbackSelected terminalChampionFallbackOutcome = "selected"
+	terminalChampionFallbackDeferred terminalChampionFallbackOutcome = "deferred"
+)
+
+func (s *Server) selectBestAvailableChampionAfterTerminalTrainingJob(job jobs.ExperimentJob, trigger string) (terminalChampionFallbackOutcome, error) {
+	plan, ok, err := s.trainingJobExperimentPlan(job)
+	if err != nil || !ok {
+		if err != nil {
+			return terminalChampionFallbackNone, err
+		}
+		return terminalChampionFallbackDeferred, nil
+	}
+	openJobs, err := s.hasOpenTrainingJobForPlan(plan.ProjectID, plan.ID)
+	if err != nil {
+		return terminalChampionFallbackNone, err
+	}
+	if openJobs {
+		return terminalChampionFallbackDeferred, nil
+	}
+	selected, err := s.selectBestAvailableChampionForTerminalPlanStop(plan, terminalChampionSelectionOptions{
+		DecisionSource: terminalTrainingChampionDecisionSource,
+		Trigger:        trigger,
+		EventType:      execution.EventAgentOutcomeRecorded,
+		Rationale: fmt.Sprintf(
+			"Training jobs for plan %s reached a terminal state, so the backend selected the best successful model available.",
+			plan.ID,
+		),
+		EventMessage: fmt.Sprintf(
+			"Terminal training hooks selected the best available champion for plan %s.",
+			plan.ID,
+		),
+		NoChampionMessage: fmt.Sprintf(
+			"Training jobs for plan %s reached a terminal state, but no successful model is available to select as champion.",
+			plan.ID,
+		),
+		Payload: map[string]any{
+			"job_id": job.ID,
+		},
+	})
+	if err != nil {
+		return terminalChampionFallbackNone, err
+	}
+	if selected {
+		return terminalChampionFallbackSelected, nil
+	}
+	return terminalChampionFallbackNone, nil
+}
+
+func (s *Server) trainingJobExperimentPlan(job jobs.ExperimentJob) (plans.ExperimentPlan, bool, error) {
+	planID := jobConfigString(job.Config, "plan_id")
+	if summary, err := s.store.GetTrainingRunSummary(job.ID); err == nil && summary.PlanID != "" {
+		planID = summary.PlanID
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return plans.ExperimentPlan{}, false, err
+	}
+	if planID == "" {
+		return plans.ExperimentPlan{}, false, nil
+	}
+	plan, err := s.store.GetExperimentPlan(planID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return plans.ExperimentPlan{}, false, nil
+		}
+		return plans.ExperimentPlan{}, false, err
+	}
+	return plan, true, nil
 }

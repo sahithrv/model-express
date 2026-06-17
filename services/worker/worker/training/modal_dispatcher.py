@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import socket
 import threading
 import time
@@ -10,6 +11,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable
+
+import requests
 
 from worker.diagnostics import log_event
 from worker.jobs import run_job
@@ -44,6 +47,9 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0
 DEFAULT_REQUIREMENT_REFRESH_SECONDS = 5.0
 DEFAULT_MODAL_BATCH_MAX_TRIALS = 3
 DEFAULT_IDLE_POLL_SLOTS = 1
+RETRY_INITIAL_SECONDS = 1.0
+RETRY_MAX_SECONDS = 30.0
+RETRY_JITTER_FRACTION = 0.2
 REQUIREMENT_DEMAND_STATUSES = {"ACTIVE", "PENDING", "STARTING"}
 DISPATCHER_STATUS_EVENT = "DISPATCHER_STATUS"
 DISPATCHER_IDLE_EXIT_EVENT = "DISPATCHER_IDLE_EXIT"
@@ -119,6 +125,10 @@ class ModalDispatcher:
         self._idle_started_at: float | None = None
         self._last_claimed_at: float | None = None
         self._last_poll_slot_floor = modal_dispatcher_idle_poll_slots()
+        self._register_backoff_attempt = 0
+        self._next_register_retry_at = 0.0
+        self._poll_backoff_attempt = 0
+        self._next_poll_retry_at = 0.0
 
     def run_forever(self) -> None:
         try:
@@ -167,6 +177,8 @@ class ModalDispatcher:
         self.register_slots()
         self._collect_finished_slots()
         self._heartbeat_due_slots()
+        if time.monotonic() < self._next_poll_retry_at:
+            return any(slot.future is not None or slot.job is not None for slot in self.slots)
         claimed = False
         claimed_slots: list[_DispatcherSlot] = []
         for slot in self.slots:
@@ -174,12 +186,18 @@ class ModalDispatcher:
                 continue
             if not self._slot_in_current_target(slot):
                 continue
-            job = self.client.poll_job(
-                slot.worker_id,
-                provider="modal",
-                templates=self._poll_templates(),
-                include_unspecified_provider_templates=MODAL_DISPATCHER_UNSPECIFIED_PROVIDER_TEMPLATES,
-            )
+            try:
+                job = self.client.poll_job(
+                    slot.worker_id,
+                    provider="modal",
+                    templates=self._poll_templates(),
+                    include_unspecified_provider_templates=MODAL_DISPATCHER_UNSPECIFIED_PROVIDER_TEMPLATES,
+                )
+                self._poll_backoff_attempt = 0
+                self._next_poll_retry_at = 0.0
+            except requests.RequestException as exc:
+                self._schedule_poll_retry(slot.worker_id, exc)
+                return any(slot.future is not None or slot.job is not None for slot in self.slots)
             if job is None:
                 continue
             slot.job = job
@@ -209,14 +227,22 @@ class ModalDispatcher:
                 raise TimeoutError("Timed out waiting for Modal dispatcher jobs to finish.")
             time.sleep(0.01)
 
-    def register_slots(self) -> None:
+    def register_slots(self) -> bool:
+        if time.monotonic() < self._next_register_retry_at:
+            return False
         while len(self.slots) < self.slot_count:
             index = len(self.slots) + 1
-            worker = self.client.register_worker(
-                self.project_id,
-                name=f"{modal_dispatcher_worker_name()}-slot-{index}",
-                gpu_type="modal",
-            )
+            try:
+                worker = self.client.register_worker(
+                    self.project_id,
+                    name=f"{modal_dispatcher_worker_name()}-slot-{index}",
+                    gpu_type="modal",
+                )
+                self._register_backoff_attempt = 0
+                self._next_register_retry_at = 0.0
+            except requests.RequestException as exc:
+                self._schedule_register_retry(index, exc)
+                return False
             slot = _DispatcherSlot(index=index, worker_id=worker["id"])
             self.slots.append(slot)
             log_event(
@@ -226,6 +252,35 @@ class ModalDispatcher:
                 worker_id=slot.worker_id,
                 slot=index,
             )
+        return True
+
+    def _schedule_register_retry(self, slot_index: int, exc: requests.RequestException) -> None:
+        delay = _retry_delay_seconds(self._register_backoff_attempt)
+        self._register_backoff_attempt += 1
+        self._next_register_retry_at = time.monotonic() + delay
+        log_event(
+            "warn",
+            "modal_dispatcher_register_failed_retrying",
+            project_id=self.project_id,
+            slot=slot_index,
+            orchestrator_url=getattr(self.client, "base_url", ""),
+            error=str(exc),
+            retry_delay_seconds=round(delay, 3),
+        )
+
+    def _schedule_poll_retry(self, worker_id: str, exc: requests.RequestException) -> None:
+        delay = _retry_delay_seconds(self._poll_backoff_attempt)
+        self._poll_backoff_attempt += 1
+        self._next_poll_retry_at = time.monotonic() + delay
+        log_event(
+            "warn",
+            "modal_dispatcher_poll_failed_retrying",
+            project_id=self.project_id,
+            worker_id=worker_id,
+            orchestrator_url=getattr(self.client, "base_url", ""),
+            error=str(exc),
+            retry_delay_seconds=round(delay, 3),
+        )
 
     def _run_claimed_job(self, worker_id: str, job: dict) -> None:
         with _client_job_context(self.client, job):
@@ -974,3 +1029,8 @@ def _positive_float_env(name: str, default: float) -> float:
     except ValueError:
         return default
     return parsed if parsed > 0 else default
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    base = min(RETRY_MAX_SECONDS, RETRY_INITIAL_SECONDS * (2 ** max(0, attempt)))
+    return base + random.uniform(0, base * RETRY_JITTER_FRACTION)

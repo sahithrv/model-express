@@ -744,6 +744,8 @@ export type ChampionExportDemo = {
   exportStatus: string;
   exports: ChampionExport[];
   championExportsStatus?: ProjectDetail["championExportsStatus"];
+  championDemoPredictionsStatus?: ProjectDetail["loadStatus"]["championDemoPredictions"];
+  championFeedbackStatus?: ProjectDetail["loadStatus"]["championFeedback"];
   portableBundle?: PortableInferenceBundle;
   projectId: string;
   modelCard: Record<string, unknown>;
@@ -1669,7 +1671,8 @@ export function buildMissionDigest({
     (event) => ["failed", "blocked"].includes(activityStatus(event.status)) && !isChampionSelectedGuardActivity(event),
   );
   const failedWithoutProgress = counts.FAILED > 0 && counts.SUCCEEDED === 0 && activeJobs === 0 && queuedJobs === 0;
-  const orchestratorUnhealthy = Boolean(health && health.status !== "ok");
+  const liveRefreshUnhealthy = ["stale", "error"].includes(detail.loadStatus.liveRefresh.status);
+  const orchestratorUnhealthy = Boolean((health && health.status !== "ok") || liveRefreshUnhealthy);
   const workerCapacityBlocked = workerSummary.failed && (queuedJobs > 0 || activeJobs > 0);
   const hardBlocked = orchestratorUnhealthy || Boolean(activeFailedEvent) || Boolean(blockingDecision) || workerCapacityBlocked || failedWithoutProgress;
 
@@ -5229,6 +5232,8 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
       exportStatus: "PENDING",
       exports: [],
       championExportsStatus: detail.championExportsStatus,
+      championDemoPredictionsStatus: detail.loadStatus.championDemoPredictions,
+      championFeedbackStatus: detail.loadStatus.championFeedback,
       projectId: "",
       modelCard: {},
       deploymentProfile: {},
@@ -5379,6 +5384,8 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     exportStatus,
     exports: orderedExports,
     championExportsStatus: detail.championExportsStatus,
+    championDemoPredictionsStatus: detail.loadStatus.championDemoPredictions,
+    championFeedbackStatus: detail.loadStatus.championFeedback,
     portableBundle,
     projectId: champion.project_id,
     modelCard,

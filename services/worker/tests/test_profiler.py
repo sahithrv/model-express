@@ -118,6 +118,8 @@ class DatasetProfilerTests(unittest.TestCase):
             self.assertNotIn("CUB_200_2011", profile["class_distribution"])
             self.assertEqual(profile["layout_summary"]["image_folder_root"], "CUB_200_2011/images")
             self.assertTrue(profile["metadata_summary"]["bbox_available"])
+            self.assertEqual(profile["metadata_summary"]["bbox_count"], 2)
+            self.assertEqual(profile["bbox_count"], 2)
             self.assertEqual(profile["visual_trait_summary"]["bbox_count"], 2)
             self.assertTrue(profile["split_summary"]["has_explicit_split"])
 

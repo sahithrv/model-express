@@ -12,6 +12,13 @@ import (
 	"model-express/services/orchestrator/internal/runs"
 )
 
+const (
+	catastrophicRunScoreFloor            = 0.001
+	catastrophicTargetMetricMax          = 0.200
+	catastrophicRandomLossRatioThreshold = 0.90
+	catastrophicAbsoluteLossThreshold    = 2.00
+)
+
 func experimentPlannerPerformanceContext(
 	targetMetric string,
 	projectPlans []plans.ExperimentPlan,
@@ -251,6 +258,9 @@ func holisticRunScoreBreakdown(targetMetric string, summary runs.TrainingRunSumm
 		score = quality*0.92 + latencyScore*0.03 + costScore*0.025 + runtimeScore*0.025
 		weights = map[string]float64{"quality": 0.92, "latency": 0.03, "cost": 0.025, "runtime": 0.025}
 	}
+	if payloadBool(readinessBreakdown, "catastrophic_quality_gate") {
+		score = catastrophicRunScoreFloor
+	}
 	breakdown := map[string]any{
 		"score":                   roundDiagnosticFloat(score),
 		"quality_score":           roundDiagnosticFloat(quality),
@@ -266,6 +276,11 @@ func holisticRunScoreBreakdown(targetMetric string, summary runs.TrainingRunSumm
 		"per_class_score":         payloadFloat(readinessBreakdown, "per_class_score"),
 		"loss_health_score":       payloadFloat(readinessBreakdown, "loss_health_score"),
 		"confusion_health_score":  payloadFloat(readinessBreakdown, "confusion_health_score"),
+	}
+	if payloadBool(readinessBreakdown, "catastrophic_quality_gate") {
+		breakdown["catastrophic_quality_gate"] = true
+		breakdown["catastrophic_quality_reason"] = readinessBreakdown["catastrophic_quality_reason"]
+		breakdown["score_cap"] = catastrophicRunScoreFloor
 	}
 	return clamp01(score), breakdown
 }
@@ -303,7 +318,7 @@ func deploymentReadinessScoreBreakdown(targetMetric string, summary runs.Trainin
 	weighted.add(confusionScore, 0.09, hasConfusionScore)
 	weighted.add(overallScore, 0.04, overallScore > 0)
 	score := weighted.value(validationScore)
-	return score, map[string]any{
+	breakdown := map[string]any{
 		"score":                   roundDiagnosticFloat(score),
 		"validation_metric_score": roundDiagnosticFloat(validationScore),
 		"heldout_metric_score":    roundDiagnosticFloat(heldoutScore),
@@ -324,6 +339,17 @@ func deploymentReadinessScoreBreakdown(targetMetric string, summary runs.Trainin
 			"overall":           0.04,
 		},
 	}
+	if capped, details := catastrophicClassificationQuality(targetMetric, summary, evaluation, validationScore, hasLossScore); capped {
+		score = catastrophicRunScoreFloor
+		breakdown["score"] = roundDiagnosticFloat(score)
+		breakdown["catastrophic_quality_gate"] = true
+		breakdown["catastrophic_quality_reason"] = "target classification metric is below the bad-quality threshold"
+		breakdown["score_cap"] = catastrophicRunScoreFloor
+		for key, value := range details {
+			breakdown[key] = value
+		}
+	}
+	return score, breakdown
 }
 
 type weightedScore struct {
@@ -367,6 +393,78 @@ func validationMetricScore(targetMetric string, summary runs.TrainingRunSummary,
 	default:
 		return weightedMetricAverage([]metricComponent{{macroF1, 0.60}, {accuracy, 0.40}}, maxFloat(macroF1, accuracy))
 	}
+}
+
+func catastrophicClassificationQuality(
+	targetMetric string,
+	summary runs.TrainingRunSummary,
+	evaluation runs.TrainingRunEvaluation,
+	validationScore float64,
+	hasLoss bool,
+) (bool, map[string]any) {
+	switch normalizedPlannerTargetMetric(targetMetric) {
+	case "accuracy", "macro_f1":
+	default:
+		return false, nil
+	}
+	macroF1 := clamp01(summary.BestMacroF1)
+	accuracy := clamp01(summary.BestAccuracy)
+	targetScore, targetMetricName := classificationTargetMetricScore(targetMetric, macroF1, accuracy)
+	badMetrics := targetScore <= catastrophicTargetMetricMax
+	lossValue, lossSource := worstObservedLoss(summary, evaluation)
+	lossThreshold := catastrophicLossThreshold(evaluationClassCount(evaluation))
+	badLoss := hasLoss && lossValue > 0 && lossValue >= lossThreshold
+	details := map[string]any{
+		"catastrophic_metric_threshold": roundDiagnosticFloat(catastrophicTargetMetricMax),
+		"catastrophic_loss_threshold":   roundDiagnosticFloat(lossThreshold),
+		"validation_metric_score":       roundDiagnosticFloat(validationScore),
+		"target_metric_name":            targetMetricName,
+		"target_metric_score":           roundDiagnosticFloat(targetScore),
+		"worst_observed_loss":           roundDiagnosticFloat(lossValue),
+		"worst_observed_loss_source":    lossSource,
+		"loss_random_or_worse":          badLoss,
+	}
+	return badMetrics, details
+}
+
+func classificationTargetMetricScore(targetMetric string, macroF1 float64, accuracy float64) (float64, string) {
+	switch normalizedPlannerTargetMetric(targetMetric) {
+	case "accuracy":
+		return accuracy, "accuracy"
+	default:
+		return macroF1, "macro_f1"
+	}
+}
+
+func worstObservedLoss(summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, string) {
+	values := []struct {
+		value  float64
+		source string
+	}{
+		{summary.FinalValLoss, "final_val_loss"},
+		{payloadFloat(evaluation.ObjectiveProfile, "heldout_test_loss"), "heldout_test_loss"},
+		{summary.FinalTrainLoss, "final_train_loss"},
+	}
+	bestValue := 0.0
+	bestSource := ""
+	for _, candidate := range values {
+		if candidate.value <= 0 || !isFiniteFloat(candidate.value) {
+			continue
+		}
+		if candidate.value > bestValue {
+			bestValue = candidate.value
+			bestSource = candidate.source
+		}
+	}
+	return bestValue, bestSource
+}
+
+func catastrophicLossThreshold(classCount int) float64 {
+	randomBaseline := math.Log(float64(maxInt(classCount, 2)))
+	if randomBaseline <= 0 || !isFiniteFloat(randomBaseline) {
+		randomBaseline = math.Log(2)
+	}
+	return maxFloat(catastrophicAbsoluteLossThreshold, randomBaseline*catastrophicRandomLossRatioThreshold)
 }
 
 func detectionMetricFromEvaluation(evaluation runs.TrainingRunEvaluation, metric string) float64 {

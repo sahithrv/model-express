@@ -39,10 +39,24 @@ export type DatasetMetadataDetail = {
   message: string;
 };
 
-export type ChampionExportsStatus = {
-  status: "available" | "empty" | "error";
+export type ProjectDetailLoadStatus = {
+  status: "available" | "empty" | "stale" | "error";
   message: string;
+  last_success_at?: string;
 };
+
+export type ProjectDetailLoadStatusKey =
+  | "runEvaluations"
+  | "decisions"
+  | "workerRequirements"
+  | "championExports"
+  | "championDemoPredictions"
+  | "championFeedback"
+  | "liveRefresh";
+
+export type ProjectDetailLoadStatusMap = Record<ProjectDetailLoadStatusKey, ProjectDetailLoadStatus>;
+
+export type ChampionExportsStatus = ProjectDetailLoadStatus;
 
 export type ProjectDetail = {
   decisions: AgentDecision[];
@@ -66,9 +80,44 @@ export type ProjectDetail = {
   agentInvocations: AgentInvocation[];
   agentMemory: AgentMemoryRecord[];
   strategyScorecards: StrategyScorecard[];
+  loadStatus: ProjectDetailLoadStatusMap;
 };
 
+export function emptyProjectDetailLoadStatus(): ProjectDetailLoadStatusMap {
+  return {
+    runEvaluations: {
+      status: "empty",
+      message: "Training evaluations have not been loaded.",
+    },
+    decisions: {
+      status: "empty",
+      message: "Agent decisions have not been loaded.",
+    },
+    workerRequirements: {
+      status: "empty",
+      message: "Worker requirements have not been loaded.",
+    },
+    championExports: {
+      status: "empty",
+      message: "No champion export records have been loaded.",
+    },
+    championDemoPredictions: {
+      status: "empty",
+      message: "Champion demo prediction history has not been loaded.",
+    },
+    championFeedback: {
+      status: "empty",
+      message: "Champion feedback has not been loaded.",
+    },
+    liveRefresh: {
+      status: "empty",
+      message: "Live refresh has not run yet.",
+    },
+  };
+}
+
 export function emptyProjectDetail(message = "Select a dataset to load visual analysis evidence."): ProjectDetail {
+  const loadStatus = emptyProjectDetailLoadStatus();
   return {
     decisions: [],
     datasets: [],
@@ -104,5 +153,6 @@ export function emptyProjectDetail(message = "Select a dataset to load visual an
     agentInvocations: [],
     agentMemory: [],
     strategyScorecards: [],
+    loadStatus,
   };
 }

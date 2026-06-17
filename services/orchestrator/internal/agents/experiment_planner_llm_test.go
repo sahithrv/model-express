@@ -209,6 +209,7 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"create workers",
 		"create jobs",
 		"bypass backend validation",
+		"20-30 classifier epochs",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("expected prompt to contain %q", expected)
@@ -236,6 +237,7 @@ func TestExperimentPlannerStaticPromptCompactV1IsShorterAndKeepsContractGuidance
 		"Backend validation remains the gate",
 		"draft-only for ADD_EXPERIMENTS",
 		"Return only valid JSON",
+		"20-30 classifier epochs",
 	} {
 		if !strings.Contains(compactPrompt, expected) {
 			t.Fatalf("expected compact static prompt to retain %q, got %q", expected, compactPrompt)

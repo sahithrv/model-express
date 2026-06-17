@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 import time
 
+import requests
+
 from worker.training import modal_dispatcher
 from worker.training.modal_dispatcher import ModalDispatcher, MAX_DISPATCHER_SLOTS
 from worker.training.modal_provider import ModalRetryableFailureReported
@@ -899,6 +901,72 @@ def test_modal_dispatcher_failed_requirement_refresh_prevents_idle_exit(monkeypa
     dispatcher.run_once()
 
     assert dispatcher._should_exit_for_idle() is False
+
+
+def test_modal_dispatcher_register_failure_keeps_dispatcher_alive(monkeypatch):
+    monkeypatch.setattr(modal_dispatcher, "_retry_delay_seconds", lambda _attempt: 0.01)
+    client = _FakeClient([])
+    original_register = client.register_worker
+    calls = {"register": 0}
+
+    def flaky_register(project_id: str, *, name: str | None = None, gpu_type: str | None = None) -> dict:
+        calls["register"] += 1
+        if calls["register"] == 1:
+            raise requests.ConnectionError("orchestrator unavailable")
+        return original_register(project_id, name=name, gpu_type=gpu_type)
+
+    client.register_worker = flaky_register
+    dispatcher = ModalDispatcher(
+        client,
+        "project_1",
+        slot_count=1,
+        poll_interval_seconds=0.01,
+        heartbeat_interval_seconds=0.01,
+        requirement_refresh_seconds=0,
+        job_runner=lambda _client, _job: None,
+        materializer=lambda _client, _job: {},
+    )
+
+    assert dispatcher.run_once() is False
+    assert dispatcher.slots == []
+    assert dispatcher._next_register_retry_at > 0
+
+    dispatcher._next_register_retry_at = 0
+    dispatcher.run_once()
+    assert len(dispatcher.slots) == 1
+    assert calls["register"] == 2
+
+
+def test_modal_dispatcher_poll_failure_keeps_dispatcher_alive_and_retries(monkeypatch):
+    monkeypatch.setattr(modal_dispatcher, "_retry_delay_seconds", lambda _attempt: 0.01)
+    client = _FakeClient([])
+    calls = {"poll": 0}
+
+    def flaky_poll(worker_id: str, *, provider=None, templates=None, include_unspecified_provider_templates=None):
+        calls["poll"] += 1
+        if calls["poll"] == 1:
+            raise requests.Timeout("poll timeout")
+        return None
+
+    client.poll_job = flaky_poll
+    dispatcher = ModalDispatcher(
+        client,
+        "project_1",
+        slot_count=1,
+        poll_interval_seconds=0.01,
+        heartbeat_interval_seconds=0.01,
+        requirement_refresh_seconds=0,
+        job_runner=lambda _client, _job: None,
+        materializer=lambda _client, _job: {},
+    )
+
+    assert dispatcher.run_once() is False
+    assert len(dispatcher.slots) == 1
+    assert dispatcher._next_poll_retry_at > 0
+
+    dispatcher._next_poll_retry_at = 0
+    dispatcher.run_once()
+    assert calls["poll"] == 2
 
 
 def test_modal_dispatcher_grows_slots_from_active_worker_requirement():

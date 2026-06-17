@@ -1437,6 +1437,21 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertEqual(image.size, (8, 8))
             self.assertEqual(label, 0)
 
+    def test_bbox_lookup_reads_cub_sidecar_boxes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            cub_root = dataset_dir / "CUB_200_2011"
+            image_path = cub_root / "images" / "001.Black_footed_Albatross" / "one.jpg"
+            image_path.parent.mkdir(parents=True)
+            Image.new("RGB", (80, 60), (240, 20, 20)).save(image_path)
+            (cub_root / "images.txt").write_text("1 001.Black_footed_Albatross/one.jpg\n", encoding="utf-8")
+            (cub_root / "bounding_boxes.txt").write_text("1 2 3 30 40\n", encoding="utf-8")
+
+            lookup = self.modal_app._load_bbox_lookup(dataset_dir)
+
+            self.assertEqual(lookup[str(image_path.resolve()).lower()], (2, 3, 32, 43))
+            self.assertEqual(lookup["one.jpg"], (2, 3, 32, 43))
+
     def test_image_folder_dataset_uses_common_top_level_image_root(self) -> None:
         try:
             from torchvision import datasets

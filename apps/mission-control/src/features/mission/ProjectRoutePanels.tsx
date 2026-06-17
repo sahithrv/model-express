@@ -40,7 +40,7 @@ import { activityFilters } from "../activity/activityFilters";
 import { exportWaitingSteps } from "../exportDemo/exportWaitingSteps";
 import { resultsEmptySteps } from "../results/resultsEmptySteps";
 import type { ActivityStreamState } from "../../hooks/useActivityStream";
-import type { DatasetMetadataDetail, ProjectDetail, VisualAnalysisDetail } from "../../hooks/useProjectDetail";
+import type { DatasetMetadataDetail, ProjectDetail, ProjectDetailLoadStatus, VisualAnalysisDetail } from "../../hooks/useProjectDetail";
 import {
   formatBytes,
   formatChartValue,
@@ -2702,6 +2702,18 @@ export function VisualAnalysisPanel({
   );
 }
 
+function DetailLoadStatusNotice({ status }: { status?: ProjectDetailLoadStatus }) {
+  if (!status || !["stale", "error"].includes(status.status)) {
+    return null;
+  }
+  return (
+    <div className={`notice-inline detail-load-status ${status.status === "error" ? "error" : "warning"}`} role={status.status === "error" ? "alert" : "status"}>
+      <Badge value={status.status.toUpperCase()} />
+      <span>{status.message}</span>
+    </div>
+  );
+}
+
 export function ChampionExportDemoPanel({
   data,
   prediction,
@@ -2811,11 +2823,7 @@ export function ChampionExportDemoPanel({
               Request ONNX
             </button>
           </div>
-          {championExportsStatus?.status === "error" && (
-            <div className="warning-list">
-              <span>{championExportsStatus.message}</span>
-            </div>
-          )}
+          <DetailLoadStatusNotice status={championExportsStatus} />
           {data.exports.length > 0 ? (
             <div className="export-record-list">
               {data.exports.map((exportRecord, index) => {
@@ -2914,6 +2922,9 @@ export function ChampionExportDemoPanel({
           )}
         </div>
       </div>
+
+      <DetailLoadStatusNotice status={data.championDemoPredictionsStatus} />
+      <DetailLoadStatusNotice status={data.championFeedbackStatus} />
 
       <div className="champion-test-bench">
         <div className="test-image-stage">

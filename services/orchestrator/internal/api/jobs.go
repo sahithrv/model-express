@@ -550,14 +550,21 @@ func (s *Server) completeJob(c *gin.Context) {
 	if !bindJSON(c, &req) {
 		return
 	}
-	if _, ok := s.validateJobCallback(
+	callbackJob, ok := s.validateJobCallback(
 		c,
 		c.Param("id"),
 		req.TrainingAttemptID,
 		"complete",
 		map[string]any{"mlflow_run_id": req.MLflowRunID},
-	); !ok {
+	)
+	if !ok {
 		return
+	}
+	if callbackJob.Template == jobs.TemplateTrainExperiment {
+		if err := s.validateTrainingCompletionReadiness(callbackJob); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	job, err := s.store.CompleteJob(c.Param("id"), req.MLflowRunID)
@@ -568,16 +575,36 @@ func (s *Server) completeJob(c *gin.Context) {
 	s.closeRemoteTrainingSession(job, jobs.StatusSucceeded)
 
 	if job.Template == jobs.TemplateTrainExperiment {
-		if _, err := s.store.UpsertTrainingRunSummary(job.ID, runs.TrainingRunSummaryUpdate{
-			Status: jobs.StatusSucceeded,
-		}); err != nil {
-			log.Printf("post-complete training summary update failed for job %s: %v", job.ID, err)
-		}
 		s.enqueueTrainingTerminalHooks(job)
 	}
 	s.updateWorkerRequirementDemandAfterTerminalJob(job)
 
 	c.JSON(http.StatusOK, job)
+}
+
+func (s *Server) validateTrainingCompletionReadiness(job jobs.ExperimentJob) error {
+	summary, err := s.store.GetTrainingRunSummary(job.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("%w: training completion requires a succeeded summary and exportable evaluation artifact", store.ErrInvalidRequest)
+		}
+		return err
+	}
+	if strings.ToUpper(strings.TrimSpace(summary.Status)) != jobs.StatusSucceeded {
+		return fmt.Errorf("%w: training completion requires a succeeded summary and exportable evaluation artifact", store.ErrInvalidRequest)
+	}
+	evaluation, err := s.store.GetTrainingRunEvaluation(job.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("%w: training completion requires a succeeded summary and exportable evaluation artifact", store.ErrInvalidRequest)
+		}
+		return err
+	}
+	artifactURI := championArtifactURIFromEvaluation(evaluation.ModelProfile)
+	if artifactURI == "" || championExportFormatFromArtifactURI(artifactURI) == "" {
+		return fmt.Errorf("%w: training completion requires a succeeded summary and exportable evaluation artifact", store.ErrInvalidRequest)
+	}
+	return nil
 }
 
 func (s *Server) failJob(c *gin.Context) {

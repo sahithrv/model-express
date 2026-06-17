@@ -3040,7 +3040,83 @@ def _load_bbox_lookup(dataset_dir: Path) -> dict[str, tuple[int, int, int, int]]
         for key in keys:
             if key:
                 lookup[key] = bbox
+    lookup.update(_load_cub_bbox_lookup(dataset_dir))
     return lookup
+
+
+def _load_cub_bbox_lookup(dataset_dir: Path) -> dict[str, tuple[int, int, int, int]]:
+    lookup: dict[str, tuple[int, int, int, int]] = {}
+    for images_path in sorted(dataset_dir.rglob("images.txt")):
+        root = images_path.parent
+        bbox_path = root / "bounding_boxes.txt"
+        if not bbox_path.is_file():
+            continue
+        id_to_path = _read_cub_image_paths(images_path)
+        id_to_bbox = _read_cub_bboxes(bbox_path)
+        for image_id, bbox in id_to_bbox.items():
+            relative_path = id_to_path.get(image_id, "")
+            if not relative_path:
+                continue
+            keys = {
+                relative_path.lower(),
+                Path(relative_path).name.lower(),
+                Path(relative_path).stem.lower(),
+            }
+            for candidate in _cub_image_candidates(root, relative_path):
+                keys.add(str(candidate.resolve()).lower())
+                keys.add(candidate.name.lower())
+                keys.add(candidate.stem.lower())
+            for key in keys:
+                if key:
+                    lookup[key] = bbox
+    return lookup
+
+
+def _read_cub_image_paths(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return out
+    for line in lines:
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) == 2:
+            out[fields[0]] = fields[1].strip().replace("\\", "/")
+    return out
+
+
+def _read_cub_bboxes(path: Path) -> dict[str, tuple[int, int, int, int]]:
+    out: dict[str, tuple[int, int, int, int]] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return out
+    for line in lines:
+        fields = line.strip().split()
+        if len(fields) < 5:
+            continue
+        try:
+            x = float(fields[1])
+            y = float(fields[2])
+            width = float(fields[3])
+            height = float(fields[4])
+        except ValueError:
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        xmin = int(round(x))
+        ymin = int(round(y))
+        xmax = int(round(x + width))
+        ymax = int(round(y + height))
+        if xmax > xmin and ymax > ymin:
+            out[fields[0]] = (xmin, ymin, xmax, ymax)
+    return out
+
+
+def _cub_image_candidates(root: Path, relative_path: str) -> list[Path]:
+    relative = Path(relative_path)
+    candidates = [root / relative, root / "images" / relative]
+    return [candidate for candidate in candidates if candidate.is_file()]
 
 
 def _resolve_annotation_image_path(dataset_dir: Path, filename: str) -> Path | None:

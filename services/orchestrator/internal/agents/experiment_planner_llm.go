@@ -1186,6 +1186,7 @@ Rules:
 - Use planner_context_snapshot.blocked_repeats as explicit "do not repeat" guidance when its applies_when conditions match the current diagnosis.
 - Treat scorecard-derived strategy_lessons as structured outcome evidence. Prefer improved_champion lessons and avoid failed/no_improvement lessons with similar dataset traits or objective profile.
 - Use planner_context_snapshot.training_dynamics_card to decide whether more epochs are justified; if more_epochs_justified is false, do not propose more epochs without a substantive mechanism change.
+- You may choose 20-30 classifier epochs for high-signal full/champion-challenge candidates when training_dynamics_card shows continuing improvement, underfitting, or too-short prior runs; pair longer training with a substantive mechanism and early_stopping_patience rather than an epochs-only repeat.
 - Use planner_context_snapshot.per_class_error_card for class_imbalance, minority_targeting, focal/weighted loss, sampler, and metric-target decisions.
 - Use planner_context_snapshot.deployment_card to compare quality challengers against latency, cost, parameter count, throughput, and objective weights before proposing heavy models.
 - Use planner_context_snapshot.mechanism_coverage_card to avoid tried/blocked/failed mechanisms and to prefer eligible mechanisms with diagnosis support.
@@ -1239,6 +1240,7 @@ func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.J
 		"You must choose mechanisms before concrete models/configs; for ADD_EXPERIMENTS, provide candidate_hypotheses and keep direct proposed_experiments draft-only.",
 		"If planner_context_snapshot.project_trajectory_card marks architecture_challenge as exhausted, use a different mechanism or stop/continue pivot.",
 		"Invalid shallow proposals include shallow epoch/lr-only repeats, choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.",
+		"20-30 classifier epochs are allowed for high-signal full/champion-challenge candidates when training dynamics show continuing improvement, underfitting, or too-short prior runs; include early stopping and a substantive mechanism, not an epochs-only repeat.",
 		"Latency is a live-budget tiebreaker; if observed or expected latency is below roughly 25ms, prioritize macro-F1, per-class recall, and meaningful quality gains.",
 		"If planner_validation_feedback is present, correct the rejected draft instead of repeating it.",
 	}, " "))

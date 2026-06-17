@@ -200,6 +200,12 @@ def test_job_context_requires_training_attempt_id_for_job_callbacks(monkeypatch)
             assert "requires training_attempt_id" in str(exc)
         else:
             raise AssertionError("complete_job should reject unbound job callbacks")
+        try:
+            client.fail_job("job_1", "worker lost connection", retryable=True)
+        except ValueError as exc:
+            assert "requires training_attempt_id" in str(exc)
+        else:
+            raise AssertionError("fail_job should reject unbound job callbacks")
 
     assert calls == []
 
