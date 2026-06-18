@@ -433,3 +433,115 @@ test("Modal remote URLs reject local private and unsafe service targets", () => 
     /must not expose/,
   );
 });
+
+test("cloud preflight accepts OPENAI_API_KEY fallback source", async () => {
+  const env = cloudPreflightEnv({
+    MODEL_EXPRESS_LLM_API_KEY: "",
+    MODEL_EXPRESS_VISUAL_LLM_API_KEY: "",
+    OPENAI_API_KEY: "sk-test-fallback",
+  });
+
+  const preflight = await __test.preflightCloud(
+    { stage: "dataset_upload", baseUrl: "http://127.0.0.1:8080", live: false },
+    { env, fetch: okBackendPreflightFetch },
+  );
+
+  assert.equal(preflight.status, "ok");
+  const check = preflight.checks.find((item) => item.id === "openai_key_env");
+  assert.equal(check?.status, "ok");
+  assert.equal(check?.metadata?.source, "OPENAI_API_KEY");
+  assert(!JSON.stringify(preflight).includes("sk-test-fallback"));
+});
+
+test("cloud preflight rejects default MinIO root credentials", async () => {
+  const env = cloudPreflightEnv({
+    AWS_ACCESS_KEY_ID: "model_express",
+    AWS_SECRET_ACCESS_KEY: "model_express_password",
+    MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID: "",
+    MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY: "",
+  });
+
+  const preflight = await __test.preflightCloud(
+    { stage: "worker_start", baseUrl: "http://127.0.0.1:8080", live: false },
+    { env, fetch: okBackendPreflightFetch },
+  );
+
+  assert.equal(preflight.status, "failed");
+  const failed = preflight.checks.filter((item) => item.status === "failed");
+  assert(failed.some((item) => /default local MinIO root credentials/.test(item.message)));
+});
+
+test("cloud preflight reports wrong public orchestrator API token before Modal start", async () => {
+  const env = cloudPreflightEnv();
+  const fetch = async (url) => {
+    if (String(url).includes("/preflight/cloud")) {
+      return jsonResponse(200, { status: "ok", checks: [] });
+    }
+    if (String(url).includes("/settings/automation")) {
+      return jsonResponse(401, { error: "missing or invalid API token" });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const preflight = await __test.preflightCloud(
+    { stage: "worker_start", baseUrl: "http://127.0.0.1:8080", live: true },
+    { env, fetch, s3LiveCheck: async () => undefined },
+  );
+
+  assert.equal(preflight.status, "failed");
+  const check = preflight.checks.find((item) => item.id === "public_orchestrator");
+  assert.equal(check?.status, "failed");
+  assert.match(check?.remediation ?? "", /MODEL_EXPRESS_API_TOKEN/);
+});
+
+function cloudPreflightEnv(overrides = {}) {
+  return {
+    ...process.env,
+    MODEL_EXPRESS_V1_PROFILE: "cloud",
+    MODEL_EXPRESS_EXECUTION_PROFILE: "fast-remote",
+    MODEL_EXPRESS_ALLOW_LAN: "true",
+    MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE: "true",
+    MODEL_EXPRESS_API_TOKEN: "api-token",
+    MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER: "modal",
+    MODEL_EXPRESS_DEFAULT_GPU_TYPE: "T4",
+    MODEL_EXPRESS_LLM_ENABLED: "true",
+    MODEL_EXPRESS_LLM_PROVIDER: "openai",
+    MODEL_EXPRESS_LLM_MODEL: "gpt-test",
+    MODEL_EXPRESS_LLM_API_STYLE: "responses",
+    MODEL_EXPRESS_LLM_STORED_RESPONSES: "true",
+    MODEL_EXPRESS_LLM_API_KEY: "model-express-key",
+    MODEL_EXPRESS_VISUAL_LLM_API_KEY: "",
+    OPENAI_API_KEY: "",
+    MODAL_ORCHESTRATOR_URL: "https://orchestrator.example.test",
+    MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL: "",
+    S3_ENDPOINT_URL: "https://s3.example.test",
+    MODAL_S3_ENDPOINT_URL: "https://s3.example.test",
+    MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL: "",
+    S3_BUCKET: "model-express",
+    MODEL_EXPRESS_ARTIFACT_BUCKET: "model-express",
+    AWS_ACCESS_KEY_ID: "scoped-upload-key",
+    AWS_SECRET_ACCESS_KEY: "scoped-upload-secret",
+    MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID: "scoped-modal-key",
+    MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY: "scoped-modal-secret",
+    MODEL_EXPRESS_ALLOW_MODAL_ROOT_STORAGE: "false",
+    MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED: "false",
+    MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED: "false",
+    ...overrides,
+  };
+}
+
+async function okBackendPreflightFetch(url) {
+  if (!String(url).includes("/preflight/cloud")) {
+    throw new Error(`unexpected fetch ${url}`);
+  }
+  return jsonResponse(200, { status: "ok", checks: [] });
+}
+
+function jsonResponse(status, payload) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 200 ? "OK" : "Unauthorized",
+    text: async () => JSON.stringify(payload),
+  };
+}

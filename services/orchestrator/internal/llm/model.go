@@ -37,6 +37,7 @@ type Config struct {
 	Provider               string
 	BaseURL                string
 	APIKey                 string
+	APIKeySource           string
 	Model                  string
 	Timeout                time.Duration
 	APIStyle               string
@@ -115,10 +116,7 @@ func ConfigFromEnv(enabled bool, provider string, model string) Config {
 		baseURL = "https://api.openai.com/v1"
 	}
 
-	apiKey := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_LLM_API_KEY"))
-	if apiKey == "" {
-		apiKey = strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY"))
-	}
+	apiKey, apiKeySource := apiKeyFromEnv(normalizedProvider)
 
 	apiStyle := NormalizeAPIStyle(firstEnv("MODEL_EXPRESS_LLM_API_STYLE", "MODEL_EXPRESS_VISUAL_LLM_API_STYLE"))
 	reasoningEffort := NormalizeReasoningEffort(firstEnv("MODEL_EXPRESS_LLM_REASONING_EFFORT", "MODEL_EXPRESS_VISUAL_LLM_REASONING_EFFORT"))
@@ -130,6 +128,7 @@ func ConfigFromEnv(enabled bool, provider string, model string) Config {
 		Provider:               normalizedProvider,
 		BaseURL:                baseURL,
 		APIKey:                 apiKey,
+		APIKeySource:           apiKeySource,
 		Model:                  selectedModel,
 		Timeout:                time.Duration(timeoutSeconds) * time.Second,
 		APIStyle:               apiStyle,
@@ -139,6 +138,21 @@ func ConfigFromEnv(enabled bool, provider string, model string) Config {
 		MaxToolRounds:          envIntDefault(DefaultMaxToolRounds, "MODEL_EXPRESS_LLM_MAX_TOOL_ROUNDS", "MODEL_EXPRESS_VISUAL_LLM_MAX_TOOL_ROUNDS"),
 		MaxRetries:             envIntDefault(DefaultMaxRetries, "MODEL_EXPRESS_LLM_MAX_RETRIES", "MODEL_EXPRESS_VISUAL_LLM_MAX_RETRIES"),
 	}
+}
+
+func apiKeyFromEnv(provider string) (string, string) {
+	if apiKey := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_LLM_API_KEY")); apiKey != "" {
+		return apiKey, "MODEL_EXPRESS_LLM_API_KEY"
+	}
+	if apiKey := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY")); apiKey != "" {
+		return apiKey, "MODEL_EXPRESS_VISUAL_LLM_API_KEY"
+	}
+	if provider == ProviderOpenAI {
+		if apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); apiKey != "" {
+			return apiKey, "OPENAI_API_KEY"
+		}
+	}
+	return "", ""
 }
 
 func NormalizeAPIStyle(value string) string {

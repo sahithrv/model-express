@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld("missionControl", {
   selectAndUploadDataset: (options) => ipcRenderer.invoke("dataset:selectAndUpload", options),
   selectDatasetFolder: () => ipcRenderer.invoke("dataset:selectFolder"),
   preflightDatasetFolder: (options) => ipcRenderer.invoke("dataset:preflightFolder", options),
+  preflightCloud: (options) => ipcRenderer.invoke("cloud:preflight", options),
   uploadDatasetFolder: (options) => ipcRenderer.invoke("dataset:uploadFolder", options),
   selectDemoImage: () => ipcRenderer.invoke("demo:selectImage"),
   loadModelArtifact: (options) => ipcRenderer.invoke("artifact:loadModel", options),

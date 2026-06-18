@@ -211,6 +211,7 @@ class VisualAnalysisAgentTests(unittest.TestCase):
                 "MODEL_EXPRESS_VISUAL_LLM_MAX_TOOL_ROUNDS": "4",
                 "MODEL_EXPRESS_VISUAL_LLM_MAX_RETRIES": "3",
                 "MODEL_EXPRESS_VISUAL_LLM_RETRY_BACKOFF_SECONDS": "0.5",
+                "OPENAI_API_KEY": "openai-fallback-key",
             },
             clear=True,
         ):
@@ -234,6 +235,36 @@ class VisualAnalysisAgentTests(unittest.TestCase):
             config = VisualLLMConfig.from_env()
 
         self.assertEqual(config.timeout_seconds, 180)
+
+    def test_visual_llm_config_uses_openai_api_key_fallback_for_openai(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "OPENAI_API_KEY": "openai-fallback-key",
+                "MODEL_EXPRESS_VISUAL_LLM_PROVIDER": "openai",
+            },
+            clear=True,
+        ):
+            config = VisualLLMConfig.from_env()
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.provider, "openai")
+        self.assertEqual(config.api_key, "openai-fallback-key")
+
+    def test_visual_llm_config_does_not_use_openai_api_key_fallback_for_compatible_provider(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "OPENAI_API_KEY": "openai-fallback-key",
+                "MODEL_EXPRESS_VISUAL_LLM_PROVIDER": "openai_compatible",
+            },
+            clear=True,
+        ):
+            config = VisualLLMConfig.from_env()
+
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.provider, "openai_compatible")
+        self.assertEqual(config.api_key, "")
 
     def test_debug_request_and_fingerprint_omit_image_bytes(self) -> None:
         request = VisualAnalysisRequest(

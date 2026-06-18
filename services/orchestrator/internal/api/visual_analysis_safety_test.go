@@ -903,6 +903,30 @@ func TestProfileUpdateQueuesVisualAnalysisBeforeInitialPlan(t *testing.T) {
 	}
 }
 
+func TestVisualAnalysisAutomationEnabledUsesOpenAIKeyFallback(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_ENABLED", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_ENABLED", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_PROVIDER", "openai")
+	t.Setenv("OPENAI_API_KEY", "openai-fallback-key")
+
+	if !visualAnalysisAutomationEnabled() {
+		t.Fatalf("expected OPENAI_API_KEY fallback to enable OpenAI visual analysis")
+	}
+}
+
+func TestVisualAnalysisAutomationEnabledDoesNotUseOpenAIKeyFallbackForCompatibleProvider(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_ENABLED", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_ENABLED", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY", "")
+	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_PROVIDER", "openai_compatible")
+	t.Setenv("OPENAI_API_KEY", "openai-fallback-key")
+
+	if visualAnalysisAutomationEnabled() {
+		t.Fatalf("expected OPENAI_API_KEY fallback to stay OpenAI-only")
+	}
+}
+
 func TestInitialVisualAnalysisResultCreatesInitialPlan(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_VISUAL_LLM_ENABLED", "true")
 	t.Setenv("MODEL_EXPRESS_VISUAL_ANALYSIS_COOLDOWN_MINUTES", "0")

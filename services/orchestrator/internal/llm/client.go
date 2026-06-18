@@ -211,6 +211,9 @@ func (c OpenAICompatibleClient) generateChatJSONWithUsage(ctx context.Context, r
 		return nil, nil, fmt.Errorf("MODEL_EXPRESS_LLM_MODEL is required")
 	}
 	if c.config.APIKey == "" && c.config.Provider != ProviderLocal {
+		if c.config.Provider == ProviderOpenAI {
+			return nil, nil, fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY or OPENAI_API_KEY is required for provider %s", c.config.Provider)
+		}
 		return nil, nil, fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY is required for provider %s", c.config.Provider)
 	}
 
@@ -264,6 +267,9 @@ func (c OpenAICompatibleClient) postResponse(ctx context.Context, call responses
 		return ResponseResult{}, fmt.Errorf("MODEL_EXPRESS_LLM_MODEL is required")
 	}
 	if c.config.APIKey == "" && c.config.Provider != ProviderLocal {
+		if c.config.Provider == ProviderOpenAI {
+			return ResponseResult{}, fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY or OPENAI_API_KEY is required for provider %s", c.config.Provider)
+		}
 		return ResponseResult{}, fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY is required for provider %s", c.config.Provider)
 	}
 
@@ -418,6 +424,9 @@ func (c OpenAICompatibleClient) modelForRequest(req JSONRequest) (string, error)
 		return "", fmt.Errorf("MODEL_EXPRESS_LLM_BASE_URL is required for provider %s", c.config.Provider)
 	}
 	if c.config.APIKey == "" && c.config.Provider != ProviderLocal {
+		if c.config.Provider == ProviderOpenAI {
+			return "", fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY or OPENAI_API_KEY is required for provider %s", c.config.Provider)
+		}
 		return "", fmt.Errorf("MODEL_EXPRESS_LLM_API_KEY is required for provider %s", c.config.Provider)
 	}
 	model := req.Model

@@ -580,8 +580,8 @@ func (s *Server) listExperimentPlans(c *gin.Context) {
 }
 
 func (s *Server) executeExperimentPlan(c *gin.Context) {
-	var req executeExperimentPlanRequest
-	if !bindJSON(c, &req) {
+	req := s.defaultExecuteExperimentPlanRequest()
+	if !bindOptionalJSON(c, &req) {
 		return
 	}
 

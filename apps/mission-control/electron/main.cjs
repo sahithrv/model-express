@@ -14,7 +14,7 @@ const path = require("path");
 const { Transform } = require("stream");
 const { pipeline } = require("stream/promises");
 const { fileURLToPath, pathToFileURL } = require("url");
-const { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
+const { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 const { buildDatasetUploadPreflight, collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
 
 let mainWindow;
@@ -721,6 +721,10 @@ if (electronRuntimeAvailable) {
     return preflightDatasetFolder(options);
   });
 
+  ipcMain.handle("cloud:preflight", async (_event, options) => {
+    return preflightCloud(options);
+  });
+
   ipcMain.handle("demo:selectImage", async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
       title: "Select image for champion test",
@@ -1292,6 +1296,15 @@ async function ensureProjectWorker(options = {}) {
   fs.mkdirSync(logDir, { recursive: true });
   const targetCount = normalizeWorkerCount(options.count);
   const useModalDispatcher = shouldUseModalDispatcher(options);
+  if (useModalDispatcher) {
+    const preflight = await preflightCloud(
+      { stage: "worker_start", baseUrl, live: true },
+      { env: { ...process.env, ...repoEnv } },
+    );
+    if (preflight.status !== "ok") {
+      throw new Error(formatCloudPreflightError(preflight));
+    }
+  }
   const processCount = useModalDispatcher ? 1 : targetCount;
   const pids = [];
   let startedCount = 0;
@@ -2000,6 +2013,418 @@ async function preflightDatasetFolder(options = {}) {
   return datasetUploadPreflight(entries, archivePlan, options, env);
 }
 
+async function preflightCloud(options = {}, runtime = {}) {
+  const env = runtime.env ?? missionControlEnv();
+  const checks = [];
+  const stage = String(options.stage ?? "manual").trim() || "manual";
+  const live = options.live !== false;
+  const baseUrl = validateOrchestratorBaseUrl(options.baseUrl || DEFAULT_ORCHESTRATOR_URL, env);
+
+  addCloudCheck(
+    checks,
+    cloudProfile(env) === "cloud" ? "ok" : "failed",
+    "cloud_profile",
+    cloudProfile(env) === "cloud"
+      ? "Cloud v1 profile is enabled."
+      : "Cloud Agentic Demo requires the cloud v1 profile.",
+    cloudProfile(env) === "cloud"
+      ? ""
+      : "Set MODEL_EXPRESS_V1_PROFILE=cloud and start with MODEL_EXPRESS_ENV_FILE=.env.v1.cloud.",
+    { stage, profile: cloudProfile(env) },
+  );
+
+  const provider = normalizedProvider(env.MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER || "local");
+  addCloudCheck(
+    checks,
+    provider === "modal" ? "ok" : "failed",
+    "training_provider_env",
+    provider === "modal"
+      ? "Environment default training provider is Modal."
+      : "Cloud Agentic Demo requires Modal as the default training provider.",
+    provider === "modal" ? "" : "Set MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER=modal.",
+    { provider },
+  );
+
+  addOpenAIEnvChecks(checks, env);
+  addCloudURLCheck(checks, "modal_orchestrator_url", "MODAL_ORCHESTRATOR_URL", firstNonEmpty(env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL), env);
+  addCloudURLCheck(checks, "s3_endpoint", "S3_ENDPOINT_URL", env.S3_ENDPOINT_URL, env);
+  addCloudURLCheck(checks, "modal_s3_endpoint", "MODAL_S3_ENDPOINT_URL", firstNonEmpty(env.MODAL_S3_ENDPOINT_URL, env.MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL), env);
+  addCloudBucketCheck(checks, env);
+  addStorageCredentialChecks(checks, env);
+
+  try {
+    requireAuthenticatedOrchestratorExposure(env);
+    addCloudCheck(checks, "ok", "api_token_env", "Public orchestrator token controls are configured.", "", {
+      token_present: Boolean(String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim()),
+    });
+  } catch (error) {
+    addCloudCheck(
+      checks,
+      "failed",
+      "api_token_env",
+      "Modal cannot reach the orchestrator safely without public-token controls.",
+      errorMessage(error),
+    );
+  }
+
+  const fetchFn = runtime.fetch ?? globalThis.fetch;
+  await mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, fetchFn });
+  if (live) {
+    await preflightPublicOrchestrator(checks, { env, fetchFn });
+    await preflightS3RoundTrip(checks, { env, s3LiveCheck: runtime.s3LiveCheck });
+  }
+
+  const status = checks.some((check) => check.status === "failed") ? "failed" : "ok";
+  return { status, checks };
+}
+
+function addOpenAIEnvChecks(checks, env) {
+  const provider = normalizedProvider(env.MODEL_EXPRESS_LLM_PROVIDER || env.MODEL_EXPRESS_VISUAL_LLM_PROVIDER || "openai");
+  const apiStyle = String(env.MODEL_EXPRESS_LLM_API_STYLE || env.MODEL_EXPRESS_VISUAL_LLM_API_STYLE || "").trim().toLowerCase();
+  const storedResponses = String(env.MODEL_EXPRESS_LLM_STORED_RESPONSES ?? env.MODEL_EXPRESS_VISUAL_LLM_STORED_RESPONSES ?? "true").trim().toLowerCase();
+  const keySource = openAIKeySource(env, provider);
+
+  addCloudCheck(
+    checks,
+    provider === "openai" ? "ok" : "failed",
+    "openai_provider_env",
+    provider === "openai" ? "OpenAI provider is configured." : "Cloud Agentic Demo requires the OpenAI provider.",
+    provider === "openai" ? "" : "Set MODEL_EXPRESS_LLM_PROVIDER=openai.",
+    { provider },
+  );
+  addCloudCheck(
+    checks,
+    apiStyle === "responses" ? "ok" : "failed",
+    "openai_responses_env",
+    apiStyle === "responses" ? "OpenAI Responses API style is configured." : "Cloud Agentic Demo requires the OpenAI Responses API.",
+    apiStyle === "responses" ? "" : "Set MODEL_EXPRESS_LLM_API_STYLE=responses.",
+    { api_style: apiStyle || "chat_completions" },
+  );
+  addCloudCheck(
+    checks,
+    !["0", "false", "no", "off"].includes(storedResponses) ? "ok" : "failed",
+    "openai_stored_responses_env",
+    !["0", "false", "no", "off"].includes(storedResponses)
+      ? "Stored Responses are enabled."
+      : "Cloud Agentic Demo requires stored Responses.",
+    !["0", "false", "no", "off"].includes(storedResponses) ? "" : "Set MODEL_EXPRESS_LLM_STORED_RESPONSES=true.",
+  );
+  addCloudCheck(
+    checks,
+    keySource ? "ok" : "failed",
+    "openai_key_env",
+    keySource ? "OpenAI API key is configured." : "Cloud Agentic Demo requires an OpenAI API key.",
+    keySource ? "" : "Set MODEL_EXPRESS_LLM_API_KEY or OPENAI_API_KEY and run preflight again.",
+    keySource ? { source: keySource } : undefined,
+  );
+}
+
+function openAIKeySource(env, provider) {
+  if (String(env.MODEL_EXPRESS_LLM_API_KEY ?? "").trim()) return "MODEL_EXPRESS_LLM_API_KEY";
+  if (String(env.MODEL_EXPRESS_VISUAL_LLM_API_KEY ?? "").trim()) return "MODEL_EXPRESS_VISUAL_LLM_API_KEY";
+  if (provider === "openai" && String(env.OPENAI_API_KEY ?? "").trim()) return "OPENAI_API_KEY";
+  return "";
+}
+
+function addCloudURLCheck(checks, id, label, value, env) {
+  try {
+    const origin = validateRemoteModalUrl(value, label, env);
+    const parsed = new URL(origin);
+    if (parsed.protocol !== "https:") {
+      throw new Error(`${label} must use https for the cloud v1 preflight.`);
+    }
+    addCloudCheck(checks, "ok", id, `${label} is a public HTTPS origin.`, "", {
+      scheme: parsed.protocol.replace(":", ""),
+      host: parsed.hostname,
+    });
+  } catch (error) {
+    addCloudCheck(
+      checks,
+      "failed",
+      id,
+      `${label} is not a public HTTPS URL reachable by Modal.`,
+      `${label} must be a public HTTPS origin and must not point at private/local hosts, Postgres, MLflow, or the MinIO console.`,
+      { error: errorMessage(error) },
+    );
+  }
+}
+
+function addCloudBucketCheck(checks, env) {
+  const bucket = firstNonEmpty(env.S3_BUCKET, env.MODEL_EXPRESS_ARTIFACT_BUCKET);
+  addCloudCheck(
+    checks,
+    bucket ? "ok" : "failed",
+    "s3_bucket",
+    bucket ? "S3 bucket is configured." : "S3 bucket is not configured.",
+    bucket ? "" : "Set S3_BUCKET and MODEL_EXPRESS_ARTIFACT_BUCKET.",
+    bucket ? { bucket } : undefined,
+  );
+}
+
+function addStorageCredentialChecks(checks, env) {
+  addCredentialCheck(checks, "s3_upload_credentials", env.AWS_ACCESS_KEY_ID, env.AWS_SECRET_ACCESS_KEY, "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to scoped upload credentials.", env);
+  const modalAccessKey = firstNonEmpty(env.MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID, env.AWS_ACCESS_KEY_ID);
+  const modalSecretKey = firstNonEmpty(env.MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY, env.AWS_SECRET_ACCESS_KEY);
+  addCredentialCheck(
+    checks,
+    "modal_s3_credentials",
+    modalAccessKey,
+    modalSecretKey,
+    "Set MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID and MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY to scoped Modal credentials.",
+    env,
+  );
+}
+
+function addCredentialCheck(checks, id, accessKey, secretKey, remediation, env) {
+  const accessPresent = Boolean(String(accessKey ?? "").trim());
+  const secretPresent = Boolean(String(secretKey ?? "").trim());
+  if (!accessPresent || !secretPresent) {
+    addCloudCheck(checks, "failed", id, "S3 credentials are incomplete.", remediation, {
+      access_key_present: accessPresent,
+      secret_key_present: secretPresent,
+    });
+    return;
+  }
+  if (
+    String(accessKey).trim() === "model_express" &&
+    String(secretKey).trim() === "model_express_password" &&
+    !envFlagFrom(env, "MODEL_EXPRESS_ALLOW_MODAL_ROOT_STORAGE", false)
+  ) {
+    addCloudCheck(
+      checks,
+      "failed",
+      id,
+      "Cloud storage refuses default local MinIO root credentials.",
+      "Use scoped S3 credentials. Set MODEL_EXPRESS_ALLOW_MODAL_ROOT_STORAGE=true only for an explicit advanced demo fallback.",
+    );
+    return;
+  }
+  addCloudCheck(checks, "ok", id, "Scoped S3 credentials are configured.", "", {
+    access_key_present: true,
+    secret_key_present: true,
+  });
+}
+
+async function mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, fetchFn }) {
+  if (typeof fetchFn !== "function") {
+    addCloudCheck(checks, "failed", "backend_preflight", "Backend cloud preflight could not run.", "Start the orchestrator and run preflight again.");
+    return;
+  }
+  try {
+    const response = await fetchFn(new URL("/preflight/cloud", baseUrl).toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...apiTokenHeaders(env),
+      },
+      body: JSON.stringify({ stage, live }),
+    });
+    const payload = await parseJSONResponse(response);
+    if (payload && Array.isArray(payload.checks)) {
+      for (const check of payload.checks) {
+        checks.push(normalizeCloudCheck(check, "backend"));
+      }
+      return;
+    }
+    if (!response.ok) {
+      addCloudCheck(
+        checks,
+        "failed",
+        "backend_preflight",
+        response.status === 401
+          ? "Public orchestrator returned 401 for cloud preflight."
+          : "Backend cloud preflight failed.",
+        response.status === 401
+          ? "Mission Control and the orchestrator are using different MODEL_EXPRESS_API_TOKEN values."
+          : safeProviderError(payload?.error || response.statusText),
+        { status: response.status },
+      );
+      return;
+    }
+    addCloudCheck(checks, "ok", "backend_preflight", "Backend cloud preflight endpoint is reachable.");
+  } catch (error) {
+    addCloudCheck(
+      checks,
+      "failed",
+      "backend_preflight",
+      "Backend cloud preflight endpoint is not reachable.",
+      `Start the orchestrator at ${baseUrl} and run preflight again. ${safeProviderError(errorMessage(error))}`,
+    );
+  }
+}
+
+async function preflightPublicOrchestrator(checks, { env, fetchFn }) {
+  const publicURL = firstNonEmpty(env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL);
+  if (typeof fetchFn !== "function") {
+    addCloudCheck(checks, "failed", "public_orchestrator", "Public orchestrator check could not run.", "Start Mission Control with a fetch-capable Electron runtime.");
+    return;
+  }
+  let origin;
+  try {
+    origin = validateRemoteModalUrl(publicURL, "MODAL_ORCHESTRATOR_URL", env);
+    if (new URL(origin).protocol !== "https:") {
+      throw new Error("MODAL_ORCHESTRATOR_URL must use https for the cloud v1 preflight.");
+    }
+  } catch (error) {
+    addCloudCheck(checks, "failed", "public_orchestrator", "Modal cannot reach the orchestrator.", errorMessage(error));
+    return;
+  }
+  try {
+    const response = await fetchFn(new URL("/settings/automation", origin).toString(), {
+      method: "GET",
+      headers: apiTokenHeaders(env),
+    });
+    if (response.status === 401 || response.status === 403) {
+      addCloudCheck(
+        checks,
+        "failed",
+        "public_orchestrator",
+        "Public orchestrator returned 401.",
+        "Mission Control and the orchestrator are using different MODEL_EXPRESS_API_TOKEN values.",
+        { status: response.status },
+      );
+      return;
+    }
+    if (!response.ok) {
+      addCloudCheck(checks, "failed", "public_orchestrator", "Public orchestrator check failed.", safeProviderError(response.statusText), { status: response.status });
+      return;
+    }
+    addCloudCheck(checks, "ok", "public_orchestrator", "Public orchestrator responded with the configured API token.");
+  } catch (error) {
+    addCloudCheck(checks, "failed", "public_orchestrator", "Modal cannot reach the orchestrator.", safeProviderError(errorMessage(error)));
+  }
+}
+
+async function preflightS3RoundTrip(checks, { env, s3LiveCheck }) {
+  if (typeof s3LiveCheck === "function") {
+    try {
+      await s3LiveCheck(env);
+      addCloudCheck(checks, "ok", "s3_live", "S3 preflight write/read/delete succeeded.");
+    } catch (error) {
+      addCloudCheck(checks, "failed", "s3_live", "S3 preflight write/read/delete failed.", safeProviderError(errorMessage(error)));
+    }
+    return;
+  }
+  const bucket = firstNonEmpty(env.S3_BUCKET, env.MODEL_EXPRESS_ARTIFACT_BUCKET);
+  if (!bucket) {
+    addCloudCheck(checks, "failed", "s3_live", "S3 preflight cannot run without a bucket.", "Set S3_BUCKET and MODEL_EXPRESS_ARTIFACT_BUCKET.");
+    return;
+  }
+  const key = `model-express/preflight/${crypto.randomUUID()}.txt`;
+  const body = Buffer.from(`model-express-cloud-preflight ${new Date().toISOString()}\n`, "utf8");
+  const client = createS3ClientFromEnv(env);
+  let wrote = false;
+  try {
+    await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentLength: body.byteLength, ContentType: "text/plain" }));
+    wrote = true;
+    const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const read = await streamToBuffer(response.Body);
+    if (!read.equals(body)) {
+      throw new Error("S3 preflight read did not match written bytes.");
+    }
+    addCloudCheck(checks, "ok", "s3_live", "S3 preflight write/read/delete succeeded.", "", { key_prefix: "model-express/preflight/" });
+  } catch (error) {
+    addCloudCheck(checks, "failed", "s3_live", "S3 preflight write/read/delete failed.", safeProviderError(errorMessage(error)), { key_prefix: "model-express/preflight/" });
+  } finally {
+    if (wrote) {
+      await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })).catch(() => undefined);
+    }
+  }
+}
+
+function createS3ClientFromEnv(env) {
+  return new S3Client({
+    endpoint: resolveS3Endpoint({}, "storage", env),
+    region: env.AWS_DEFAULT_REGION || "us-east-1",
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: String(env.AWS_ACCESS_KEY_ID ?? "").trim(),
+      secretAccessKey: String(env.AWS_SECRET_ACCESS_KEY ?? "").trim(),
+    },
+  });
+}
+
+function addCloudCheck(checks, status, id, message, remediation = "", metadata) {
+  const check = {
+    id,
+    status,
+    message,
+  };
+  if (remediation) {
+    check.remediation = remediation;
+  }
+  if (metadata && Object.keys(metadata).length > 0) {
+    check.metadata = metadata;
+  }
+  checks.push(check);
+}
+
+function normalizeCloudCheck(check, source) {
+  return {
+    id: source ? `${source}:${String(check.id ?? "check")}` : String(check.id ?? "check"),
+    status: String(check.status ?? "failed"),
+    message: String(check.message ?? "Cloud preflight check failed."),
+    ...(check.remediation ? { remediation: String(check.remediation) } : {}),
+    ...(check.metadata && typeof check.metadata === "object" ? { metadata: sanitizeCloudMetadata(check.metadata) } : {}),
+  };
+}
+
+function sanitizeCloudMetadata(metadata) {
+  const safe = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (sensitiveLogKey(key)) {
+      safe[key] = "[redacted]";
+    } else {
+      safe[key] = value;
+    }
+  }
+  return safe;
+}
+
+async function parseJSONResponse(response) {
+  const text = await response.text();
+  if (!text) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text };
+  }
+}
+
+function cloudProfile(env) {
+  const value = String(env.MODEL_EXPRESS_V1_PROFILE ?? "").trim().toLowerCase().replace(/_/g, "-");
+  if (value === "cloud-v1" || value === "v1-cloud") {
+    return "cloud";
+  }
+  return value;
+}
+
+function normalizedProvider(value) {
+  const provider = String(value ?? "").trim().toLowerCase().replace(/-/g, "_");
+  return provider || "local";
+}
+
+function safeProviderError(value) {
+  return safeLogText(String(value ?? "").trim() || "Provider check failed.");
+}
+
+function formatCloudPreflightError(preflight) {
+  const failed = Array.isArray(preflight?.checks)
+    ? preflight.checks.filter((check) => String(check.status ?? "").toLowerCase() === "failed")
+    : [];
+  const details = failed.slice(0, 4).map((check) => {
+    const remediation = check.remediation ? ` ${check.remediation}` : "";
+    return `${check.message}${remediation}`;
+  });
+  return ["Cloud Agentic Demo / Modal + OpenAI required.", ...details].join(" ");
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function datasetUploadPreflight(entries, archivePlan, options = {}, env = process.env) {
   return buildDatasetUploadPreflight(entries, archivePlan, {
     warnFileCount: options.warnFileCount ?? env.MODEL_EXPRESS_UPLOAD_WARN_FILE_COUNT,
@@ -2017,6 +2442,7 @@ module.exports = {
     isLoopbackHostname,
     missionControlEnv,
     parseCloudflaredTunnelUrl,
+    preflightCloud,
     preflightDatasetFolder,
     rememberDatasetFolder,
     requireAuthenticatedOrchestratorExposure,

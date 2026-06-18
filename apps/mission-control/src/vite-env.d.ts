@@ -24,6 +24,11 @@ interface Window {
       maxFileCount?: number;
       maxBytes?: number;
     }): Promise<DatasetUploadPreflight>;
+    preflightCloud(options: {
+      stage: "dataset_upload" | "plan_execution" | "worker_start" | "manual";
+      baseUrl: string;
+      live?: boolean;
+    }): Promise<CloudPreflightResult>;
     uploadDatasetFolder(options: {
       projectId: string;
       datasetToken: string;
@@ -165,4 +170,17 @@ interface DatasetUploadPreflight {
   } | null;
   warnings: DatasetUploadWarning[];
   errors: DatasetUploadWarning[];
+}
+
+interface CloudPreflightCheck {
+  id: string;
+  status: "ok" | "failed" | "warning" | string;
+  message: string;
+  remediation?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface CloudPreflightResult {
+  status: "ok" | "failed" | string;
+  checks: CloudPreflightCheck[];
 }

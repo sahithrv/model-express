@@ -20,6 +20,7 @@ import (
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
@@ -1003,7 +1004,18 @@ func visualAnalysisAutomationEnabled() bool {
 	if value, ok := envFlagValue("MODEL_EXPRESS_VISUAL_ANALYSIS_ENABLED"); ok {
 		return value
 	}
-	return envFlag("MODEL_EXPRESS_VISUAL_LLM_ENABLED", false) || strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY")) != ""
+	return envFlag("MODEL_EXPRESS_VISUAL_LLM_ENABLED", false) || visualLLMAPIKeyConfigured()
+}
+
+func visualLLMAPIKeyConfigured() bool {
+	if strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY")) != "" {
+		return true
+	}
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_VISUAL_LLM_PROVIDER")))
+	if provider == "" {
+		provider = llm.ProviderOpenAI
+	}
+	return provider == llm.ProviderOpenAI && strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != ""
 }
 
 func visualAnalysisCooldownDuration() time.Duration {

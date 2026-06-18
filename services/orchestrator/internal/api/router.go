@@ -101,6 +101,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/automl/capabilities", server.getAutoMLCapabilities)
 	router.GET("/settings/automation", server.getAutomationSettings)
 	router.PATCH("/settings/automation", server.updateAutomationSettings)
+	router.POST("/preflight/cloud", server.preflightCloud)
 
 	router.POST("/projects", server.createProject)
 	router.GET("/projects", server.listProjects)

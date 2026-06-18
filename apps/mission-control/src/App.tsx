@@ -544,6 +544,17 @@ function missionControlErrorMessage(error: unknown): string {
   return message;
 }
 
+type CloudPreflightStage = "dataset_upload" | "plan_execution" | "worker_start" | "manual";
+
+function cloudPreflightFailureMessage(result: CloudPreflightResult): string {
+  const failed = result.checks.filter((check) => normalizedStatus(check.status) === "FAILED");
+  const details = failed.slice(0, 4).map((check) => {
+    const remediation = check.remediation ? ` ${check.remediation}` : "";
+    return `${check.message}${remediation}`;
+  });
+  return ["Cloud Agentic Demo / Modal + OpenAI required.", ...details].join(" ");
+}
+
 type ChampionExportsFetchResult = {
   exports: ChampionExport[];
   status: ChampionExportsStatus;
@@ -1538,12 +1549,21 @@ export function App() {
     }
   }, [refreshHealth, refreshProjectDetail, refreshProjects, refreshSelectedJobMetrics, selectedProjectId]);
 
+  const ensureCloudPreflight = useCallback(async (stage: CloudPreflightStage) => {
+    const result = await window.missionControl.preflightCloud({ stage, baseUrl, live: true });
+    if (normalizedStatus(result.status) !== "OK") {
+      throw new Error(cloudPreflightFailureMessage(result));
+    }
+    return result;
+  }, [baseUrl]);
+
   const { resetWorkerSupervisor, superviseWorkerRequirements } = useWorkerSupervisor({
     baseUrl,
     selectedProjectId,
     workerRequirements: detail.workerRequirements,
     jobs: detail.jobs,
     request,
+    preflightCloud: ensureCloudPreflight,
     refreshProjectDetail,
   });
 
@@ -1774,6 +1794,8 @@ export function App() {
     setNotice(null);
     setNewProjectError("");
     try {
+      await ensureCloudPreflight("dataset_upload");
+
       const project = await request<Project>("/projects", {
         method: "POST",
         body: { name, goal },
@@ -1842,25 +1864,29 @@ export function App() {
   async function requestVisualAnalysisRerun() {
     const dataset = detail.datasets[0] ?? null;
     if (!selectedProjectId || !dataset) return;
+    const provider = automationSettings.default_training_provider === "modal" ? "modal" : "local";
 
     setLoading(true);
     setNotice(null);
     try {
+      if (provider === "modal") {
+        await ensureCloudPreflight("worker_start");
+      }
       const response = await request<Record<string, unknown>>(`/datasets/${dataset.id}/visual-analyses/run`, {
         method: "POST",
-        body: { trigger_reason: "manual" },
+        body: { trigger_reason: "manual", provider },
       });
       let workerMessage = "Worker is ready to pick it up.";
       try {
         const workerProcess = await window.missionControl.ensureProjectWorker({
           projectId: selectedProjectId,
           baseUrl,
-          name: `visual-analysis-worker-${selectedProjectId}`,
-          gpuType: "local",
+          name: `${provider}-visual-analysis-worker-${selectedProjectId}`,
+          gpuType: provider,
         });
         workerMessage = workerProcess.started
-          ? "Started a visual-analysis worker."
-          : "Visual-analysis worker is already running.";
+          ? `Started a ${provider === "modal" ? "Modal " : ""}visual-analysis worker.`
+          : `${provider === "modal" ? "Modal visual-analysis" : "Visual-analysis"} worker is already running.`;
       } catch (error) {
         workerMessage = `Queued, but worker did not start: ${errorMessage(error)}`;
       }
@@ -1892,23 +1918,31 @@ export function App() {
     setLoading(true);
     setNotice(null);
     try {
+      await ensureCloudPreflight("plan_execution");
       const plan = detail.plans.find((candidate) => candidate.id === planId);
       const workerCount = Math.max(
         1,
         Math.min(plan?.recommended_workers ?? 1, plan?.experiments.length || 1),
       );
+      const provider = automationSettings.default_training_provider || "local";
+      const gpuType = automationSettings.default_gpu_type || "";
 
       const response = await request<{ jobs: Job[]; worker_requirement?: WorkerRequirement }>(`/plans/${planId}/execute`, {
         method: "POST",
-        body: { provider: "modal", gpu_type: "T4", max_concurrent_jobs: workerCount },
+        body: { provider, gpu_type: gpuType, max_concurrent_jobs: workerCount },
       });
 
       const targetCount = Math.max(1, response.worker_requirement?.target_count ?? workerCount);
+      const workerProvider = response.worker_requirement?.provider || provider;
+      const workerGpuType =
+        workerProvider === "modal"
+          ? "modal"
+          : response.worker_requirement?.gpu_type || gpuType || workerProvider || "local";
       const workerPool = await window.missionControl.ensureProjectWorker({
         projectId: selectedProjectId,
         baseUrl,
-        name: `modal-worker-${selectedProjectId}`,
-        gpuType: "modal",
+        name: `${workerProvider}-worker-${selectedProjectId}`,
+        gpuType: workerGpuType,
         count: targetCount,
       });
 
@@ -1956,6 +1990,9 @@ export function App() {
     if (!selectedProjectId) return "";
 
     const provider = automationSettings.default_training_provider === "modal" ? "modal" : "local";
+    if (provider === "modal") {
+      await ensureCloudPreflight("worker_start");
+    }
     const workerPool = await window.missionControl.ensureProjectWorker({
       projectId: selectedProjectId,
       baseUrl,
@@ -2009,17 +2046,25 @@ export function App() {
 
       const plan = response.follow_up_plan;
       const workerCount = Math.max(1, Math.min(plan.recommended_workers, plan.experiments.length || 1));
+      await ensureCloudPreflight("plan_execution");
+      const provider = automationSettings.default_training_provider || "local";
+      const gpuType = automationSettings.default_gpu_type || "";
       const execution = await request<{ jobs: Job[]; worker_requirement?: WorkerRequirement }>(`/plans/${plan.id}/execute`, {
         method: "POST",
-        body: { provider: "modal", gpu_type: "T4", max_concurrent_jobs: workerCount },
+        body: { provider, gpu_type: gpuType, max_concurrent_jobs: workerCount },
       });
 
       const targetCount = Math.max(1, execution.worker_requirement?.target_count ?? workerCount);
+      const workerProvider = execution.worker_requirement?.provider || provider;
+      const workerGpuType =
+        workerProvider === "modal"
+          ? "modal"
+          : execution.worker_requirement?.gpu_type || gpuType || workerProvider || "local";
       const workerPool = await window.missionControl.ensureProjectWorker({
         projectId: selectedProjectId,
         baseUrl,
-        name: `modal-worker-${selectedProjectId}`,
-        gpuType: "modal",
+        name: `${workerProvider}-worker-${selectedProjectId}`,
+        gpuType: workerGpuType,
         count: targetCount,
       });
 
@@ -2422,7 +2467,7 @@ export function App() {
           </span>
           <span>
             <strong>Model Express</strong>
-            <small>Autonomous ML engineer</small>
+            <small>Cloud Agentic Demo / Modal + OpenAI required</small>
           </span>
         </div>
         <div className="chrome-right">

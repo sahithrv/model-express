@@ -22,12 +22,15 @@ type RefreshProjectDetail = (
   options?: { includeSlowData?: boolean; forceSlowData?: boolean },
 ) => Promise<void>;
 
+type CloudPreflightStage = "dataset_upload" | "plan_execution" | "worker_start" | "manual";
+
 type WorkerSupervisorOptions = {
   baseUrl: string;
   selectedProjectId: string;
   workerRequirements: SupervisorWorkerRequirement[];
   jobs: SupervisorJob[];
   request: <T>(path: string, options?: RequestOptions) => Promise<T>;
+  preflightCloud?: (stage: CloudPreflightStage) => Promise<unknown>;
   refreshProjectDetail: RefreshProjectDetail;
 };
 
@@ -37,6 +40,7 @@ export function useWorkerSupervisor({
   workerRequirements,
   jobs,
   request,
+  preflightCloud,
   refreshProjectDetail,
 }: WorkerSupervisorOptions) {
   const workerRequirementsRef = useRef<SupervisorWorkerRequirement[]>([]);
@@ -78,6 +82,9 @@ export function useWorkerSupervisor({
       activeRequirementEnsureAt.current.set(requirement.id, now);
       supervisingRequirements.current.add(requirement.id);
       try {
+        if (requirement.provider === "modal") {
+          await preflightCloud?.("worker_start");
+        }
         if (!alreadyActive) {
           await request<SupervisorWorkerRequirement>(`/worker-requirements/${requirement.id}`, {
             method: "PATCH",
@@ -112,7 +119,7 @@ export function useWorkerSupervisor({
         refreshProjectDetail(selectedProjectId, { includeSlowData: false }).catch(() => undefined);
       }
     }
-  }, [baseUrl, refreshProjectDetail, request, selectedProjectId]);
+  }, [baseUrl, preflightCloud, refreshProjectDetail, request, selectedProjectId]);
 
   return { resetWorkerSupervisor, superviseWorkerRequirements };
 }

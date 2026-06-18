@@ -41,10 +41,11 @@ class VisualLLMConfig:
         base_url = os.getenv("MODEL_EXPRESS_VISUAL_LLM_BASE_URL", "").strip().rstrip("/")
         if not base_url and provider == "openai":
             base_url = "https://api.openai.com/v1"
+        api_key = os.getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY", "").strip()
+        if not api_key and provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY", "").strip()
         enabled_value = os.getenv("MODEL_EXPRESS_VISUAL_LLM_ENABLED", "").strip().lower()
-        enabled = enabled_value in {"1", "true", "yes", "on"} or bool(
-            os.getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY", "").strip()
-        )
+        enabled = enabled_value in {"1", "true", "yes", "on"} or bool(api_key)
         timeout = _int_env("MODEL_EXPRESS_VISUAL_LLM_TIMEOUT_SECONDS", DEFAULT_VISUAL_LLM_TIMEOUT_SECONDS)
         temperature = _float_env("MODEL_EXPRESS_VISUAL_LLM_TEMPERATURE", 0.0)
         api_style = _api_style_env("MODEL_EXPRESS_VISUAL_LLM_API_STYLE", "chat")
@@ -55,7 +56,7 @@ class VisualLLMConfig:
             enabled=enabled,
             provider=provider,
             base_url=base_url,
-            api_key=os.getenv("MODEL_EXPRESS_VISUAL_LLM_API_KEY", "").strip(),
+            api_key=api_key,
             model=os.getenv("MODEL_EXPRESS_VISUAL_LLM_MODEL", "").strip(),
             timeout_seconds=timeout,
             temperature=temperature,
@@ -218,7 +219,7 @@ class VisualLLMClient:
         if not self.config.model:
             raise ValueError("MODEL_EXPRESS_VISUAL_LLM_MODEL is required")
         if not self.config.api_key and self.config.provider != "local":
-            raise ValueError("MODEL_EXPRESS_VISUAL_LLM_API_KEY is required")
+            raise ValueError("MODEL_EXPRESS_VISUAL_LLM_API_KEY or OPENAI_API_KEY is required")
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
