@@ -119,10 +119,10 @@ test("results summary keeps backend champion first even when display score is lo
 });
 
 test("demo images put known-correct held-out examples before hard failures", async () => {
-  const { demoImagesFromUnknown } = await loadMissionModel();
+  const { demoImageCategory, demoImageCategoryDetail, demoImageTrainingPredictionText, demoImagesFromUnknown } = await loadMissionModel();
   const ordered = demoImagesFromUnknown([
     { id: "wrong-high-confidence", metadata: { correct_at_training: false } },
-    { id: "correct-a", metadata: { correct_at_training: true } },
+    { id: "correct-a", metadata: { correct_at_training: true, demo_role: "representative" } },
     { id: "wrong-low-confidence", metadata: { correct_at_training: "false" } },
     { id: "correct-b", metadata: { correct_at_training: "true" } },
     { id: "unknown" },
@@ -135,6 +135,11 @@ test("demo images put known-correct held-out examples before hard failures", asy
     "wrong-low-confidence",
     "unknown",
   ]);
+  assert.equal(demoImageCategory(ordered[0]), "representative");
+  assert.equal(demoImageCategory(ordered[1]), "challenge");
+  assert.equal(demoImageCategory({ metadata: { demo_set: "challenge_heldout" } }), "challenge");
+  assert.equal(demoImageTrainingPredictionText({ metadata: { predicted_label_at_training: "dog", confidence_at_training: 0.8123 } }), "Training-time prediction: dog (81%).");
+  assert.match(demoImageCategoryDetail({ metadata: { correct_at_training: false, predicted_label_at_training: "dog" } }), /Known hard example/);
 });
 
 test("stale failed worker state does not block completed demo validation", async () => {

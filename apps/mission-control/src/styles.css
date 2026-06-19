@@ -5977,6 +5977,38 @@ button {
   gap: 8px;
 }
 
+.demo-gallery-sections {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.demo-image-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.demo-image-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.demo-image-section-head > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.demo-image-section-head small {
+  color: #8ca099;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .export-record {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 132px;
@@ -6058,6 +6090,24 @@ button {
   background: rgba(0, 212, 126, 0.08);
 }
 
+.demo-image-row.demo-image-representative {
+  border-color: rgba(0, 212, 126, 0.3);
+}
+
+.demo-image-row.demo-image-challenge {
+  border-color: rgba(255, 184, 77, 0.34);
+  background:
+    linear-gradient(90deg, rgba(255, 184, 77, 0.07), rgba(255, 184, 77, 0.01)),
+    #101715;
+}
+
+.demo-image-row.demo-image-challenge.selected {
+  border-color: rgba(255, 184, 77, 0.68);
+  background:
+    linear-gradient(90deg, rgba(255, 184, 77, 0.12), rgba(255, 184, 77, 0.03)),
+    #101715;
+}
+
 .demo-image-row img,
 .demo-image-placeholder {
   width: 54px;
@@ -6075,6 +6125,30 @@ button {
   font-size: 10px;
   font-weight: 900;
   text-transform: uppercase;
+}
+
+.demo-image-note {
+  display: grid;
+  gap: 4px;
+  border: 1px solid rgba(140, 160, 153, 0.18);
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: #b8c7bf;
+  background: #0b100f;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.demo-image-note.representative {
+  border-color: rgba(0, 212, 126, 0.24);
+}
+
+.demo-image-note.challenge {
+  border-color: rgba(255, 184, 77, 0.32);
+  color: #ffdca3;
+  background:
+    linear-gradient(180deg, rgba(255, 184, 77, 0.07), rgba(255, 184, 77, 0.01)),
+    #0b100f;
 }
 
 .prediction-row {

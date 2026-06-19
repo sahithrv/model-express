@@ -3749,6 +3749,8 @@ def _demo_images_from_test_examples(
             continue
         true_label = str(record.get("true_class") or "")
         predicted_label = str(record.get("predicted_class") or "")
+        training_correct = bool(record.get("correct"))
+        demo_role = "representative" if training_correct else "challenge"
         inference_uri = original_artifact_uri or thumbnail_uri
         parity_safe = bool(original_artifact_uri)
         parity_failure_reason = ""
@@ -3792,7 +3794,10 @@ def _demo_images_from_test_examples(
                     "predicted_class_index_at_training": record.get("predicted_class_index"),
                     "predicted_label_at_training": predicted_label,
                     "confidence_at_training": round(float(record.get("confidence") or 0.0), 6),
-                    "correct_at_training": bool(record.get("correct")),
+                    "correct_at_training": training_correct,
+                    "demo_role": demo_role,
+                    "demo_set": "representative_heldout" if training_correct else "challenge_heldout",
+                    "challenge_reason": "" if training_correct else "high_confidence_heldout_miss",
                     "class_label_order_hash": record.get("class_label_order_hash") or _class_label_order_hash(class_names),
                 },
             }

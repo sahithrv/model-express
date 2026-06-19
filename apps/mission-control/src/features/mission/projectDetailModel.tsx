@@ -6477,9 +6477,63 @@ function orderDemoImagesForDemo(images: ChampionDemoImage[]) {
   return [...ordered, ...unknown];
 }
 
-function demoImageTrainingCorrectness(image: ChampionDemoImage) {
+export type DemoImageCategory = "representative" | "challenge" | "custom" | "heldout";
+
+export function demoImageCategory(image?: ChampionDemoImage | null): DemoImageCategory {
+  if (!image) return "heldout";
+  if (demoImageIsExplicitCustom(image)) return "custom";
   const metadata = recordObject(image.metadata);
-  const value = metadata.correct_at_training;
+  const explicit = [
+    recordString(metadata, "demo_role"),
+    recordString(metadata, "demo_category"),
+    recordString(metadata, "demo_set"),
+  ]
+    .find(Boolean)
+    ?.toLowerCase() ?? "";
+  if (explicit.includes("challenge") || explicit.includes("hard")) return "challenge";
+  if (explicit.includes("representative") || explicit.includes("showcase") || explicit.includes("passing")) return "representative";
+  const correctness = demoImageTrainingCorrectness(image);
+  if (correctness === true) return "representative";
+  if (correctness === false) return "challenge";
+  return "heldout";
+}
+
+export function demoImageCategoryLabel(image?: ChampionDemoImage | null) {
+  const category = demoImageCategory(image);
+  if (category === "representative") return "Representative";
+  if (category === "challenge") return "Challenge";
+  if (category === "custom") return "Custom";
+  return "Held-out";
+}
+
+export function demoImageCategoryDetail(image?: ChampionDemoImage | null) {
+  if (!image) return "";
+  const category = demoImageCategory(image);
+  if (category === "challenge") {
+    const trainingPrediction = demoImageTrainingPredictionText(image);
+    return trainingPrediction
+      ? `Known hard example from held-out evaluation. ${trainingPrediction}`
+      : "Known hard example from held-out evaluation; use it to inspect classes for the next fine-tuning round.";
+  }
+  if (category === "representative") {
+    return "Representative held-out example the selected model handled correctly during evaluation.";
+  }
+  return "";
+}
+
+export function demoImageTrainingPredictionText(image?: ChampionDemoImage | null) {
+  if (!image) return "";
+  const metadata = recordObject(image.metadata);
+  const predicted = recordString(metadata, "predicted_label_at_training");
+  if (!predicted) return "";
+  const confidence = numericValue(metadata.confidence_at_training);
+  return `Training-time prediction: ${predicted}${confidence > 0 ? ` (${formatTopKScore(confidence)})` : ""}.`;
+}
+
+export function demoImageTrainingCorrectness(image?: ChampionDemoImage | null) {
+  if (!image) return null;
+  const metadata = recordObject(image.metadata);
+  const value = metadata.correct_at_training ?? metadata.training_correct ?? metadata.correct;
   if (typeof value === "boolean") return value;
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();

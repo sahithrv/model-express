@@ -443,6 +443,10 @@ import {
   demoImagePreviewURI,
   demoImageLabel,
   demoImageDetail,
+  demoImageCategory,
+  demoImageCategoryDetail,
+  demoImageCategoryLabel,
+  demoImageTrainingPredictionText,
   demoPredictionRequestMetadata,
   isTerminalDemoPredictionStatus,
   sleep,
@@ -3149,6 +3153,11 @@ export function ChampionExportDemoPanel({
 
   const selectedImage = data.demoImages[selectedImageIndex] ?? data.demoImages[0] ?? null;
   const selectedImageRunnable = demoImageIsRunnable(selectedImage);
+  const selectedImageRunLabel = demoImageCategory(selectedImage) === "challenge" ? "Run challenge" : "Run example";
+  const demoImageRows = data.demoImages.map((image, index) => ({ image, index }));
+  const representativeDemoRows = demoImageRows.filter(({ image }) => demoImageCategory(image) === "representative");
+  const challengeDemoRows = demoImageRows.filter(({ image }) => demoImageCategory(image) === "challenge");
+  const heldoutDemoRows = demoImageRows.filter(({ image }) => demoImageCategory(image) === "heldout");
   const customURI = customImageURI.trim();
   const customImageMatchesPicker = customImage ? customURI === demoImageURI(customImage) : false;
   const customPreviewImage = customImageURI.trim()
@@ -3164,6 +3173,8 @@ export function ChampionExportDemoPanel({
   const activeImage = customPreviewImage ?? selectedImage;
   const activePreviewURI = demoImagePreviewURI(activeImage);
   const activeImageLabel = demoImageLabel(activeImage);
+  const activeImageCategory = demoImageCategory(activeImage);
+  const activeImageCategoryDetail = demoImageCategoryDetail(activeImage);
   const detectorDemo = championExportDemoIsDetection(data) || detectionBoxesFromPrediction(prediction).length > 0;
   const activeDetections = detectionBoxesFromPrediction(prediction);
   const activeFps = prediction?.latency_ms && prediction.latency_ms > 0 ? 1000 / prediction.latency_ms : 0;
@@ -3311,10 +3322,16 @@ export function ChampionExportDemoPanel({
           <div className="test-image-meta">
             <span>
               <Badge value={activeImage?.split || "TEST"} />
+              <Badge value={demoImageCategoryLabel(activeImage)} />
               <strong>{activeImageLabel || activeImage?.image_id || "Select an image"}</strong>
             </span>
             <small>{demoImageDetail(activeImage) || "Held-out image or custom worker-visible URI"}</small>
           </div>
+          {activeImageCategoryDetail && (
+            <div className={`demo-image-note ${activeImageCategory}`}>
+              <span>{activeImageCategoryDetail}</span>
+            </div>
+          )}
         </div>
 
         <div className="test-controls">
@@ -3337,10 +3354,10 @@ export function ChampionExportDemoPanel({
                 type="button"
                 onClick={() => selectedImage && onRunPrediction(selectedImage)}
                 disabled={!selectedImage || !selectedImageRunnable || predictionLoading}
-                title={selectedImageRunnable ? "Run held-out image" : "Original image unavailable for this held-out image"}
+                title={selectedImageRunnable ? selectedImageRunLabel : "Original image unavailable for this held-out image"}
               >
                 <Play size={15} />
-                Run held-out
+                {selectedImageRunLabel}
               </button>
             </span>
           </div>
@@ -3476,7 +3493,7 @@ export function ChampionExportDemoPanel({
       <div className="demo-grid">
         <div className="demo-block">
           <div className="demo-block-head">
-            <strong>Held-out Images</strong>
+            <strong>Held-out Examples</strong>
             <span>
               <button className="icon-command" type="button" onClick={onRandomImage} disabled={data.demoImages.length < 2} title="Random demo image">
                 <Shuffle size={14} />
@@ -3489,33 +3506,41 @@ export function ChampionExportDemoPanel({
                 type="button"
                 onClick={() => selectedImage && onRunPrediction(selectedImage)}
                 disabled={!selectedImage || !selectedImageRunnable || predictionLoading}
-                title={selectedImageRunnable ? "Predict held-out image" : "Original image unavailable for this held-out image"}
+                title={selectedImageRunnable ? selectedImageRunLabel : "Original image unavailable for this held-out image"}
               >
                 <Play size={15} />
-                Predict
+                {selectedImageRunLabel}
               </button>
             </span>
           </div>
           {data.demoImages.length > 0 ? (
-            <div className="demo-image-list">
-              {data.demoImages.slice(0, 6).map((image, index) => (
-                <button
-                  className={`demo-image-row ${index === selectedImageIndex ? "selected" : ""}`}
-                  key={image.id || image.image_id || `${image.uri}-${index}`}
-                  type="button"
-                  onClick={() => onSelectImage(index)}
-                >
-                  {demoImagePreviewURI(image) ? (
-                    <img src={demoImagePreviewURI(image)} alt={demoImageLabel(image) || "demo image"} />
-                  ) : (
-                    <div className="demo-image-placeholder">image</div>
-                  )}
-                  <span>
-                    <strong>{demoImageLabel(image) || image.image_id || "unlabeled"}</strong>
-                    <small>{demoImageDetail(image) || "image metadata pending"}</small>
-                  </span>
-                </button>
-              ))}
+            <div className="demo-gallery-sections">
+              <DemoImageSection
+                title="Representative"
+                description="Held-out examples the champion already classified correctly."
+                rows={representativeDemoRows}
+                selectedImageIndex={selectedImageIndex}
+                onSelectImage={onSelectImage}
+                empty="No known-correct held-out demo examples are stored for this run."
+              />
+              <DemoImageSection
+                title="Challenge"
+                description="Known held-out misses that can guide another fine-tuning round."
+                rows={challengeDemoRows}
+                selectedImageIndex={selectedImageIndex}
+                onSelectImage={onSelectImage}
+                empty="No known challenge examples are stored for this run."
+              />
+              {heldoutDemoRows.length > 0 && (
+                <DemoImageSection
+                  title="Other held-out"
+                  description="Held-out examples without training-time correctness metadata."
+                  rows={heldoutDemoRows}
+                  selectedImageIndex={selectedImageIndex}
+                  onSelectImage={onSelectImage}
+                  empty=""
+                />
+              )}
             </div>
           ) : (
             <div className="empty compact">No held-out/test demo images are exposed by the backend yet.</div>
@@ -3561,6 +3586,63 @@ export function ChampionExportDemoPanel({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function DemoImageSection({
+  title,
+  description,
+  rows,
+  selectedImageIndex,
+  onSelectImage,
+  empty,
+}: {
+  title: string;
+  description: string;
+  rows: Array<{ image: ChampionDemoImage; index: number }>;
+  selectedImageIndex: number;
+  onSelectImage: (index: number) => void;
+  empty: string;
+}) {
+  return (
+    <div className={`demo-image-section ${rows.length === 0 ? "empty-section" : ""}`}>
+      <div className="demo-image-section-head">
+        <span>
+          <strong>{title}</strong>
+          <small>{description}</small>
+        </span>
+        <Badge value={String(rows.length)} />
+      </div>
+      {rows.length > 0 ? (
+        <div className="demo-image-list">
+          {rows.slice(0, 8).map(({ image, index }) => {
+            const previewURI = demoImagePreviewURI(image);
+            const category = demoImageCategory(image);
+            const trainingPrediction = demoImageTrainingPredictionText(image);
+            return (
+              <button
+                className={`demo-image-row demo-image-${category} ${index === selectedImageIndex ? "selected" : ""}`}
+                key={image.id || image.image_id || `${image.uri}-${index}`}
+                type="button"
+                onClick={() => onSelectImage(index)}
+              >
+                {previewURI ? (
+                  <img src={previewURI} alt={demoImageLabel(image) || "demo image"} />
+                ) : (
+                  <div className="demo-image-placeholder">image</div>
+                )}
+                <span>
+                  <strong>{demoImageLabel(image) || image.image_id || "unlabeled"}</strong>
+                  <small>{trainingPrediction || demoImageDetail(image) || "image metadata pending"}</small>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        empty && <div className="empty compact">{empty}</div>
+      )}
     </div>
   );
 }

@@ -64,6 +64,8 @@ class HeldoutDemoImageTests(unittest.TestCase):
         self.assertEqual(image["preview_uri"], image["thumbnail_uri"])
         self.assertTrue(image["metadata"]["parity_safe"])
         self.assertEqual(image["metadata"]["demo_source_type"], "heldout_test_original_artifact")
+        self.assertEqual(image["metadata"]["demo_role"], "representative")
+        self.assertEqual(image["metadata"]["demo_set"], "representative_heldout")
         self.assertEqual(image["metadata"]["original_image_uri"], uploads[0][1])
         self.assertEqual(image["metadata"]["predicted_label_at_training"], "cat")
         self.assertEqual(image["metadata"]["true_class_index_at_training"], 0)
@@ -95,6 +97,9 @@ class HeldoutDemoImageTests(unittest.TestCase):
         self.assertFalse(image["metadata"]["parity_safe"])
         self.assertEqual(image["metadata"]["parity_status"], "unsafe")
         self.assertEqual(image["metadata"]["parity_failure_reason"], "original_image_artifact_upload_not_configured")
+        self.assertEqual(image["metadata"]["demo_role"], "challenge")
+        self.assertEqual(image["metadata"]["demo_set"], "challenge_heldout")
+        self.assertEqual(image["metadata"]["challenge_reason"], "high_confidence_heldout_miss")
 
     def test_demo_images_start_with_correct_examples_without_dropping_hard_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -149,6 +154,8 @@ class HeldoutDemoImageTests(unittest.TestCase):
         self.assertEqual(records[1]["metadata"]["correct_at_training"], False)
         self.assertEqual(records[2]["metadata"]["correct_at_training"], True)
         self.assertEqual(records[3]["metadata"]["correct_at_training"], False)
+        self.assertEqual(records[0]["metadata"]["demo_role"], "representative")
+        self.assertEqual(records[1]["metadata"]["demo_role"], "challenge")
         self.assertEqual(records[1]["metadata"]["confidence_at_training"], 0.99)
 
     def test_compacted_evaluation_payload_stays_below_safe_threshold_for_many_demo_images(self) -> None:
