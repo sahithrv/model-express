@@ -4,18 +4,13 @@ Electron desktop app for operating the local Model Express orchestrator.
 
 ## Development
 
-Start the backing services and orchestrator first:
+Mission Control starts the local Postgres and MinIO support services with Docker Compose.
+Start Docker Desktop, then start the orchestrator and app:
 
 ```powershell
-docker compose -f ..\..\infra\compose.yaml up -d postgres minio
 cd ..\..\services\orchestrator
 go run ./cmd/orchestrator
-```
-
-Then run the desktop app:
-
-```powershell
-cd apps/mission-control
+cd ..\..\apps\mission-control
 npm install
 npm run dev
 ```

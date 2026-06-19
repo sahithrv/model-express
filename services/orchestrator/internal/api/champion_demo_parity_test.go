@@ -38,12 +38,13 @@ func TestChampionDemoPredictionCarriesHeldoutImageMetadataToWorkerJob(t *testing
 			"objective_profile": map[string]any{
 				"heldout_demo_images": []map[string]any{
 					{
-						"id":         "test:cat",
-						"image_id":   "cat.png",
-						"uri":        "data:image/png;base64,AAAA",
-						"class_name": "cat",
-						"label":      "cat",
-						"split":      "test",
+						"id":                 "test:cat",
+						"image_id":           "cat.png",
+						"uri":                "data:image/png;base64,AAAA",
+						"original_image_uri": "data:image/png;base64,AAAA",
+						"class_name":         "cat",
+						"label":              "cat",
+						"split":              "test",
 						"metadata": map[string]any{
 							"source":           "heldout_test",
 							"demo_source_type": "heldout_test_original_bytes",
@@ -186,5 +187,101 @@ func TestChampionDemoPredictionUsesOriginalArtifactForCompactHeldoutImage(t *tes
 	}
 	if imageMetadata["requested_image_uri"] != thumbnailURI || imageMetadata["backend_image_uri"] != originalURI {
 		t.Fatalf("expected thumbnail request and backend original URI metadata, got %#v", imageMetadata)
+	}
+}
+
+func TestChampionDemoPredictionRejectsThumbnailOnlyHeldoutImage(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	trainingJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(trainingJob.ID, "mlflow-run"); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+	thumbnailURI := "data:image/jpeg;base64,THUMB"
+	champion, err := memoryStore.UpsertProjectChampion(runs.ProjectChampionUpsert{
+		ProjectID:       project.ID,
+		DatasetID:       dataset.ID,
+		JobID:           trainingJob.ID,
+		SelectionReason: "best validation score",
+		Evaluation: map[string]any{
+			"objective_profile": map[string]any{
+				"heldout_demo_images": []map[string]any{
+					{
+						"id":            "test:cat",
+						"image_id":      "cat.png",
+						"uri":           thumbnailURI,
+						"image_uri":     thumbnailURI,
+						"preview_uri":   thumbnailURI,
+						"thumbnail_uri": thumbnailURI,
+						"class_name":    "cat",
+						"label":         "cat",
+						"split":         "test",
+						"metadata": map[string]any{
+							"source":           "heldout_test",
+							"demo_source_type": "heldout_test_thumbnail_preview",
+							"preview_uri":      thumbnailURI,
+							"thumbnail_uri":    thumbnailURI,
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("upsert champion: %v", err)
+	}
+	if _, err := memoryStore.CreateChampionExport(runs.ChampionExportCreate{
+		ProjectID:   project.ID,
+		ChampionID:  champion.ID,
+		JobID:       trainingJob.ID,
+		Status:      runs.ChampionExportStatusReady,
+		Format:      "onnx",
+		ArtifactURI: "file:///exports/champion.onnx",
+	}); err != nil {
+		t.Fatalf("create export: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/demo-predictions", strings.NewReader(`{"image_uri":"`+thumbnailURI+`","top_k":3}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Prediction       runs.ChampionDemoPrediction `json:"prediction"`
+		RuntimeAvailable bool                        `json:"runtime_available"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.RuntimeAvailable || payload.Prediction.Status != runs.ChampionDemoPredictionStatusFailed {
+		t.Fatalf("expected failed non-runtime prediction, got %#v", payload)
+	}
+	if !strings.Contains(payload.Prediction.Error, championDemoOriginalUnavailableCode) {
+		t.Fatalf("expected original unavailable error, got %q", payload.Prediction.Error)
+	}
+	if payload.Prediction.ImageMetadata["error_code"] != championDemoOriginalUnavailableCode {
+		t.Fatalf("expected error code metadata, got %#v", payload.Prediction.ImageMetadata)
+	}
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	for _, job := range projectJobs {
+		if job.Template == jobs.TemplateChampionDemoPrediction {
+			t.Fatalf("expected no worker prediction job for thumbnail-only heldout image, got %#v", job)
+		}
 	}
 }

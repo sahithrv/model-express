@@ -3,12 +3,32 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const test = require("node:test");
+const { EventEmitter } = require("events");
 const { pathToFileURL } = require("url");
 
 const { __test } = require("./main.cjs");
 
 function tempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function fakeChildProcess() {
+  const child = fakeTunnelChild();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  return child;
+}
+
+function fakeTunnelChild() {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.killed = false;
+  child.pid = Math.floor(Math.random() * 100000) + 1;
+  child.kill = function kill() {
+    this.killed = true;
+    this.exitCode = 0;
+  };
+  return child;
 }
 
 test("orchestrator requests are limited to app paths, approved methods, and loopback by default", () => {
@@ -52,12 +72,13 @@ test("orchestrator origins and API token headers use explicit env controls", () 
 
 test("mission control request env loads API token from repo env files", () => {
   const repo = tempDir("mx-repo-env-");
+  const userDataDir = tempDir("mx-user-data-repo-env-");
   fs.writeFileSync(
     path.join(repo, ".env.local"),
     "MODEL_EXPRESS_API_TOKEN=file-token\nMODEL_EXPRESS_ALLOWED_ORCHESTRATOR_ORIGINS=https://mx.example.test\n",
   );
 
-  const env = __test.missionControlEnv({ MODEL_EXPRESS_ROOT: repo });
+  const env = __test.missionControlEnv({ MODEL_EXPRESS_ROOT: repo, MODEL_EXPRESS_USER_DATA_DIR: userDataDir });
 
   assert.equal(env.MODEL_EXPRESS_API_TOKEN, "file-token");
   assert.deepEqual(__test.apiTokenHeaders(env), {
@@ -68,6 +89,119 @@ test("mission control request env loads API token from repo env files", () => {
     __test.validateOrchestratorRequest({ baseUrl: "https://mx.example.test", path: "/projects" }, env).url,
     "https://mx.example.test/projects",
   );
+});
+
+test("missing API token is generated and persisted outside the repo without leaking in logs", () => {
+  const userDataDir = tempDir("mx-user-data-");
+  const env = {
+    MODEL_EXPRESS_USER_DATA_DIR: userDataDir,
+    MODEL_EXPRESS_API_TOKEN: "",
+  };
+
+  const first = __test.ensureLocalApiTokenEnv(env, { userDataDir });
+  const token = first.MODEL_EXPRESS_API_TOKEN;
+  const second = __test.ensureLocalApiTokenEnv(env, { userDataDir });
+  const configFile = __test.localConfigPath(env, { userDataDir });
+
+  assert.equal(/^[A-Za-z0-9_-]{43}$/.test(token), true, "expected a strong generated token");
+  assert.equal(second.MODEL_EXPRESS_API_TOKEN === token, true, "expected persisted token to be reused");
+  assert.equal(fs.existsSync(configFile), true, "expected token config in user data");
+  assert.equal(configFile.startsWith(userDataDir), true, "expected token config outside the repo");
+  assert.equal(fs.readFileSync(configFile, "utf8").includes(token), true, "expected config to contain the token");
+  assert.equal(__test.safeLogText(`MODEL_EXPRESS_API_TOKEN=${token}`).includes(token), false, "expected token log redaction");
+});
+
+test("app-local runtime config generates and reuses MinIO credentials without fixed defaults", () => {
+  const userDataDir = tempDir("mx-runtime-user-data-");
+  const env = {
+    MODEL_EXPRESS_USER_DATA_DIR: userDataDir,
+    S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+    MODEL_EXPRESS_API_TOKEN: "",
+  };
+
+  const first = __test.appLocalRuntimeEnv(env, { userDataDir });
+  const second = __test.appLocalRuntimeEnv(env, { userDataDir });
+  const configFile = __test.localConfigPath(env, { userDataDir });
+  const config = JSON.parse(fs.readFileSync(configFile, "utf8"));
+
+  assert.equal(first.AWS_ACCESS_KEY_ID, second.AWS_ACCESS_KEY_ID);
+  assert.equal(first.AWS_SECRET_ACCESS_KEY, second.AWS_SECRET_ACCESS_KEY);
+  assert.equal(first.S3_BUCKET, "model-express");
+  assert.equal(first.MODEL_EXPRESS_ARTIFACT_PREFIX, "model-express/artifacts");
+  assert.equal(first.MODEL_EXPRESS_MODAL_TUNNEL_S3, "true");
+  assert.equal(first.MODEL_EXPRESS_ALLOW_MODAL_ROOT_STORAGE, "true");
+  assert.notEqual(first.AWS_ACCESS_KEY_ID, "model_express");
+  assert.notEqual(first.AWS_SECRET_ACCESS_KEY, "model_express_password");
+  assert.equal(config.minio_access_key, first.AWS_ACCESS_KEY_ID);
+  assert.equal(__test.safeLogText(`AWS_SECRET_ACCESS_KEY=${first.AWS_SECRET_ACCESS_KEY}`).includes(first.AWS_SECRET_ACCESS_KEY), false);
+});
+
+test("Docker Compose supervisor uses generated MinIO env and reports Docker missing", async () => {
+  const userDataDir = tempDir("mx-runtime-compose-");
+  const repo = tempDir("mx-runtime-repo-");
+  fs.mkdirSync(path.join(repo, "infra"), { recursive: true });
+  const env = __test.appLocalRuntimeEnv(
+    {
+      MODEL_EXPRESS_ROOT: repo,
+      MODEL_EXPRESS_USER_DATA_DIR: userDataDir,
+      S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+    },
+    { userDataDir },
+  );
+  const calls = [];
+  const spawnFn = (command, args, options) => {
+    calls.push({ command, args, options });
+    const child = fakeChildProcess();
+    process.nextTick(() => child.emit("exit", 0, null));
+    return child;
+  };
+
+  await __test.startDockerComposeLocalServices({ env, repoRoot: repo, spawnFn });
+
+  assert.equal(calls[0].command, "docker");
+  assert.deepEqual(calls[0].args.slice(0, 3), ["compose", "-f", path.join(repo, "infra", "compose.yaml")]);
+  assert.deepEqual(calls[0].args.slice(-4), ["up", "-d", "postgres", "minio"]);
+  assert.equal(calls[0].options.env.MINIO_ROOT_USER, env.AWS_ACCESS_KEY_ID);
+  assert.equal(calls[0].options.env.MINIO_ROOT_PASSWORD, env.AWS_SECRET_ACCESS_KEY);
+
+  await assert.rejects(
+    () =>
+      __test.startDockerComposeLocalServices({
+        env,
+        repoRoot: repo,
+        spawnFn: () => {
+          const error = new Error("spawn docker ENOENT");
+          error.code = "ENOENT";
+          throw error;
+        },
+      }),
+    /Start Docker Desktop/,
+  );
+});
+
+test("MinIO bucket bootstrap creates missing bucket with mocked S3 client", async () => {
+  const sent = [];
+  const client = {
+    async send(command) {
+      sent.push(command.constructor.name);
+      if (command.constructor.name === "HeadBucketCommand" && sent.length === 1) {
+        const error = new Error("missing");
+        error.name = "NoSuchBucket";
+        error.$metadata = { httpStatusCode: 404 };
+        throw error;
+      }
+      return {};
+    },
+  };
+
+  await __test.waitForMinioBucket({
+    env: { S3_BUCKET: "model-express", S3_ENDPOINT_URL: "http://127.0.0.1:9000" },
+    client,
+    attempts: 1,
+    sleepFn: async () => undefined,
+  });
+
+  assert.deepEqual(sent, ["HeadBucketCommand", "CreateBucketCommand", "HeadBucketCommand"]);
 });
 
 test("public orchestrator exposure requires LAN auth controls", () => {
@@ -93,6 +227,84 @@ test("remote training sessions have bounded lifetime", () => {
   assert.equal(__test.remoteTrainingSessionTtlMs({ MODEL_EXPRESS_REMOTE_TRAINING_SESSION_TTL_SECONDS: "999999" }), 24 * 60 * 60 * 1000);
   assert.equal(__test.remoteTrainingSessionActive({ processes: [], expiresAt: Date.now() + 60_000 }), true);
   assert.equal(__test.remoteTrainingSessionActive({ processes: [], expiresAt: Date.now() - 1 }), false);
+});
+
+test("remote training session passes generated API token to Modal worker env", async () => {
+  const userDataDir = tempDir("mx-user-data-session-");
+  const env = __test.ensureLocalApiTokenEnv(
+    cloudPreflightEnv({
+      MODEL_EXPRESS_API_TOKEN: "",
+      MODEL_EXPRESS_USER_DATA_DIR: userDataDir,
+      MODAL_ORCHESTRATOR_URL: "",
+      MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL: "",
+      S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+      MODAL_S3_ENDPOINT_URL: "",
+      MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL: "",
+      MODEL_EXPRESS_MODAL_TUNNEL_S3: "true",
+    }),
+    { userDataDir },
+  );
+  const token = env.MODEL_EXPRESS_API_TOKEN;
+  const projectId = `project-${Date.now()}`;
+  const fakeTunnel = (label) => ({
+    url: `https://${label}-auto.trycloudflare.com`,
+    child: {
+      exitCode: null,
+      killed: false,
+      kill() {
+        this.killed = true;
+        this.exitCode = 0;
+      },
+    },
+  });
+
+  const session = await __test.ensureRemoteTrainingSession({
+    projectId,
+    baseUrl: "http://127.0.0.1:8080",
+    env,
+    logDir: tempDir("mx-session-logs-"),
+    startTunnel: async ({ label }) => fakeTunnel(label),
+    ensureLocalRuntime: async ({ env: runtimeEnv }) => ({ managed: true, env: runtimeEnv }),
+  });
+
+  try {
+    assert.equal(session.env.MODEL_EXPRESS_API_TOKEN === token, true, "expected worker env to inherit generated token");
+    assert.equal(session.env.MODAL_ORCHESTRATOR_URL.startsWith("https://orchestrator-auto."), true);
+    assert.equal(session.env.MODAL_S3_ENDPOINT_URL.startsWith("https://s3-auto."), true);
+    assert.equal(session.env.MODEL_EXPRESS_MODAL_TUNNEL_S3, undefined);
+  } finally {
+    __test.stopProjectTunnels(projectId);
+  }
+});
+
+test("remote training session cleans up partial tunnels when S3 tunnel setup fails", async () => {
+  const env = cloudPreflightEnv({
+    MODAL_ORCHESTRATOR_URL: "",
+    MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL: "",
+    S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+    MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_TUNNEL_S3: "true",
+  });
+  const orchestratorChild = fakeTunnelChild();
+  await assert.rejects(
+    () =>
+      __test.ensureRemoteTrainingSession({
+        projectId: `project-cleanup-${Date.now()}`,
+        baseUrl: "http://127.0.0.1:8080",
+        env,
+        logDir: tempDir("mx-session-cleanup-"),
+        startTunnel: async ({ label }) => {
+          if (label === "orchestrator") {
+            return { url: "https://orchestrator-auto.trycloudflare.com", child: orchestratorChild };
+          }
+          throw new Error("s3 tunnel failed");
+        },
+        ensureLocalRuntime: async ({ env: runtimeEnv }) => ({ managed: true, env: runtimeEnv }),
+      }),
+    /s3 tunnel failed/,
+  );
+  assert.equal(orchestratorChild.killed, true);
 });
 
 test("dataset folder operations require a picker-backed selection token", () => {
@@ -434,6 +646,21 @@ test("Modal remote URLs reject local private and unsafe service targets", () => 
   );
 });
 
+test("cloud preflight rejects unsafe explicit public URLs", async () => {
+  const env = cloudPreflightEnv({
+    MODAL_ORCHESTRATOR_URL: "https://10.0.0.2:8080",
+  });
+
+  const preflight = await __test.preflightCloud(
+    { stage: "worker_start", baseUrl: "http://127.0.0.1:8080", live: false },
+    { env, fetch: okBackendPreflightFetch },
+  );
+
+  assert.equal(preflight.status, "failed");
+  const check = preflight.checks.find((item) => item.id === "modal_orchestrator_url");
+  assert.equal(check?.status, "failed");
+});
+
 test("cloud preflight accepts OPENAI_API_KEY fallback source", async () => {
   const env = cloudPreflightEnv({
     MODEL_EXPRESS_LLM_API_KEY: "",
@@ -451,6 +678,111 @@ test("cloud preflight accepts OPENAI_API_KEY fallback source", async () => {
   assert.equal(check?.status, "ok");
   assert.equal(check?.metadata?.source, "OPENAI_API_KEY");
   assert(!JSON.stringify(preflight).includes("sk-test-fallback"));
+});
+
+test("cloud preflight passes with automatic tunnel warnings when public URLs are absent", async () => {
+  const env = cloudPreflightEnv({
+    MODAL_ORCHESTRATOR_URL: "",
+    MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL: "",
+    S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+    MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_TUNNEL_S3: "true",
+  });
+  let sawAutomaticTunnels = false;
+  const fetch = async (url, options = {}) => {
+    if (!String(url).includes("/preflight/cloud")) {
+      throw new Error(`unexpected fetch ${url}`);
+    }
+    const body = JSON.parse(String(options.body ?? "{}"));
+    sawAutomaticTunnels = body.automatic_tunnels === true;
+    return jsonResponse(200, { status: "ok", checks: [] });
+  };
+
+  const preflight = await __test.preflightCloud(
+    { stage: "worker_start", baseUrl: "http://127.0.0.1:8080", live: false },
+    { env, fetch },
+  );
+
+  assert.equal(preflight.status, "ok");
+  assert.equal(sawAutomaticTunnels, true);
+  assert.equal(preflight.checks.find((item) => item.id === "modal_orchestrator_url")?.status, "warning");
+  assert.equal(preflight.checks.find((item) => item.id === "modal_s3_endpoint")?.status, "warning");
+});
+
+test("cloud preflight passes for app-managed local MinIO with automatic tunnels", async () => {
+  const env = cloudPreflightEnv({
+    MODEL_EXPRESS_APP_MANAGED_LOCAL_RUNTIME: "true",
+    MODAL_ORCHESTRATOR_URL: "",
+    MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL: "",
+    S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+    MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_TUNNEL_S3: "true",
+    MODEL_EXPRESS_ALLOW_MODAL_ROOT_STORAGE: "true",
+    AWS_ACCESS_KEY_ID: "mxgeneratedaccess",
+    AWS_SECRET_ACCESS_KEY: "generated-secret",
+    MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID: "mxgeneratedaccess",
+    MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY: "generated-secret",
+  });
+  let sawAutomaticTunnels = false;
+  const fetch = async (url, options = {}) => {
+    if (!String(url).includes("/preflight/cloud")) {
+      throw new Error(`unexpected fetch ${url}`);
+    }
+    const body = JSON.parse(String(options.body ?? "{}"));
+    sawAutomaticTunnels = body.automatic_tunnels === true;
+    return jsonResponse(200, { status: "ok", checks: [] });
+  };
+
+  const preflight = await __test.preflightCloud(
+    { stage: "worker_start", baseUrl: "http://127.0.0.1:8080", live: true },
+    {
+      env,
+      fetch,
+      ensureLocalRuntime: async ({ env: runtimeEnv }) => ({
+        managed: true,
+        env: runtimeEnv,
+        services: ["postgres", "minio"],
+        s3_bucket: "model-express",
+      }),
+      s3LiveCheck: async () => undefined,
+    },
+  );
+
+  assert.equal(preflight.status, "ok");
+  assert.equal(sawAutomaticTunnels, true);
+  assert.equal(preflight.checks.find((item) => item.id === "docker_compose")?.status, "ok");
+  assert.equal(preflight.checks.find((item) => item.id === "minio_api")?.status, "ok");
+  assert.equal(preflight.checks.find((item) => item.id === "s3_bucket_exists")?.status, "ok");
+  assert.equal(preflight.checks.find((item) => item.id === "automatic_tunnels")?.status, "ok");
+  assert(!JSON.stringify(preflight).includes("generated-secret"));
+});
+
+test("cloud preflight fails clearly when automatic tunnels are disabled", async () => {
+  const env = cloudPreflightEnv({
+    MODAL_ORCHESTRATOR_URL: "",
+    MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL: "",
+    S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+    MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_TUNNEL_S3: "true",
+    MODEL_EXPRESS_DISABLE_AUTO_TUNNELS: "true",
+  });
+  let sawAutomaticTunnels = true;
+  const fetch = async (_url, options = {}) => {
+    sawAutomaticTunnels = JSON.parse(String(options.body ?? "{}")).automatic_tunnels === true;
+    return jsonResponse(200, { status: "ok", checks: [] });
+  };
+
+  const preflight = await __test.preflightCloud(
+    { stage: "worker_start", baseUrl: "http://127.0.0.1:8080", live: false },
+    { env, fetch },
+  );
+
+  assert.equal(preflight.status, "failed");
+  assert.equal(sawAutomaticTunnels, false);
+  assert.equal(preflight.checks.find((item) => item.id === "automatic_tunnels")?.status, "failed");
 });
 
 test("cloud preflight rejects default MinIO root credentials", async () => {
@@ -504,6 +836,8 @@ function cloudPreflightEnv(overrides = {}) {
     MODEL_EXPRESS_API_TOKEN: "api-token",
     MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER: "modal",
     MODEL_EXPRESS_DEFAULT_GPU_TYPE: "T4",
+    MODAL_TOKEN_ID: "modal-token-id",
+    MODAL_TOKEN_SECRET: "modal-token-secret",
     MODEL_EXPRESS_LLM_ENABLED: "true",
     MODEL_EXPRESS_LLM_PROVIDER: "openai",
     MODEL_EXPRESS_LLM_MODEL: "gpt-test",

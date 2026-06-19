@@ -402,6 +402,7 @@ import {
   normalizeDemoPredictionResponse,
   attachDemoPredictionPreview,
   demoImageInferenceURI,
+  demoImageIsRunnable,
   demoImageURI,
   demoImagePreviewURI,
   demoImageLabel,
@@ -539,7 +540,7 @@ const selectedProjectStorageKey = "selectedProjectId";
 function missionControlErrorMessage(error: unknown): string {
   const message = errorMessage(error);
   if (message.includes("401") && message.includes("missing or invalid API token")) {
-    return "The backend is in LAN or tunnel mode but Mission Control has no matching MODEL_EXPRESS_API_TOKEN. Set it in .env.local, or remove the public Modal/tunnel URL for local-only use, then restart the backend and app.";
+    return "The backend is in LAN or tunnel mode but is not using the same generated local API token as Mission Control. Restart the backend and Mission Control from the same cloud profile.";
   }
   return message;
 }
@@ -2233,26 +2234,38 @@ export function App() {
       setDemoPredictionError("Demo image has no URI to send to the backend.");
       return;
     }
+    if (!demoImageIsRunnable(image)) {
+      setDemoPrediction(null);
+      setDemoPredictionError("Original image unavailable for demo. Choose a custom image or refresh demo images with an original image source.");
+      return;
+    }
 
     setDemoPrediction(null);
     setDemoPredictionError("");
     setDemoPredictionLoading(true);
+    let localFallbackUsed = false;
     try {
-      if (
-        readyBrowserONNXExport(championExportDemo.exports, {
-          deploymentProfile: championExportDemo.deploymentProfile,
-          modelProfile: championExportDemo.modelProfile,
-        })
-      ) {
-        try {
-          await runChampionLocalPrediction(image);
-          return;
-        } catch (error) {
-          if (!isLocalInferenceUnsafeError(error)) {
-            throw error;
+      const browserSafeExport = readyBrowserONNXExport(championExportDemo.exports, {
+        deploymentProfile: championExportDemo.deploymentProfile,
+        modelProfile: championExportDemo.modelProfile,
+      });
+      if (browserSafeExport) {
+        if (demoImageInferenceURI(image)) {
+          try {
+            await runChampionLocalPrediction(image);
+            return;
+          } catch (error) {
+            if (!isLocalInferenceUnsafeError(error)) {
+              throw error;
+            }
+            localFallbackUsed = true;
+            setLocalInferenceStatus("backend");
+            setLocalInferenceError("");
           }
-          setLocalInferenceStatus("error");
-          setLocalInferenceError(`${error.message} Falling back to backend demo inference.`);
+        } else {
+          localFallbackUsed = true;
+          setLocalInferenceStatus("backend");
+          setLocalInferenceError("");
         }
       }
       const response = await request<ChampionDemoPrediction | { prediction?: ChampionDemoPrediction }>(
@@ -2284,7 +2297,7 @@ export function App() {
         await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
       }
     } catch (error) {
-      if (readyONNXExport(championExportDemo.exports) && !isLocalInferenceUnsafeError(error)) {
+      if (!localFallbackUsed && readyONNXExport(championExportDemo.exports) && !isLocalInferenceUnsafeError(error)) {
         setLocalInferenceStatus("error");
         setLocalInferenceError(error instanceof Error ? error.message : String(error));
       }
@@ -3062,7 +3075,7 @@ export function App() {
                 </div>
                 <div className="champion-grid">
                   <div>
-                    <small>{selectedChampionPrimaryMetric?.label ?? "Macro-F1"}</small>
+                    <small>{selectedChampionPrimaryMetric?.label ?? "Balanced accuracy score"}</small>
                     <strong>{formatMaybeMetric(selectedChampionPrimaryMetric?.value ?? 0)}</strong>
                   </div>
                   <div>

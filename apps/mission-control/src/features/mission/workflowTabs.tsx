@@ -13,5 +13,5 @@ export const projectTabs: ProjectWorkflowTabBase[] = [
   { key: "mission", label: "Mission", icon: <ClipboardList size={14} /> },
   { key: "activity", label: "Activity", icon: <Activity size={14} /> },
   { key: "results", label: "Results", icon: <BarChart3 size={14} /> },
-  { key: "export", label: "Export", icon: <Trophy size={14} /> },
+  { key: "export", label: "Test & Export", icon: <Trophy size={14} /> },
 ];

@@ -3,8 +3,8 @@ package embeddings
 import (
 	"errors"
 	"fmt"
-	"os"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +30,7 @@ type Config struct {
 	Model             string
 	BaseURL           string
 	APIKey            string
+	APIKeySource      string
 	Dimensions        int
 	BackfillLimit     int
 	MaxCallsPerDay    int
@@ -38,13 +39,16 @@ type Config struct {
 }
 
 func ConfigFromEnv() Config {
+	provider := envStringDefault(ProviderOpenAI, "MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER")
+	apiKey, apiKeySource := apiKeyFromEnv(provider)
 	config := Config{
 		RetrievalEnabled:  envBoolDefault(false, "MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED"),
 		EmbeddingsEnabled: envBoolDefault(false, "MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED"),
-		Provider:          envStringDefault(ProviderOpenAI, "MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER"),
+		Provider:          provider,
 		Model:             envStringDefault("", "MODEL_EXPRESS_MEMORY_EMBEDDING_MODEL"),
 		BaseURL:           envStringDefault("", "MODEL_EXPRESS_MEMORY_EMBEDDING_BASE_URL"),
-		APIKey:            envStringDefault("", "MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY"),
+		APIKey:            apiKey,
+		APIKeySource:      apiKeySource,
 		Dimensions:        envIntDefault(DefaultEmbeddingDimensions, "MODEL_EXPRESS_MEMORY_EMBEDDING_DIMENSIONS"),
 		BackfillLimit:     envIntDefault(DefaultBackfillLimit, "MODEL_EXPRESS_MEMORY_BACKFILL_LIMIT"),
 		MaxCallsPerDay:    envIntDefault(100, "MODEL_EXPRESS_MEMORY_EMBEDDING_MAX_CALLS_PER_DAY"),
@@ -52,6 +56,18 @@ func ConfigFromEnv() Config {
 		Timeout:           DefaultTimeout,
 	}
 	return config.Normalized()
+}
+
+func apiKeyFromEnv(provider string) (string, string) {
+	if value := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY")); value != "" {
+		return value, "MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY"
+	}
+	if NormalizeProvider(provider) == ProviderOpenAI {
+		if value := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); value != "" {
+			return value, "OPENAI_API_KEY"
+		}
+	}
+	return "", ""
 }
 
 func (c Config) Normalized() Config {
@@ -97,7 +113,7 @@ func (c Config) ReadyForIndexing() error {
 			return fmt.Errorf("MODEL_EXPRESS_MEMORY_EMBEDDING_BASE_URL is required for provider %s", c.Provider)
 		}
 		if c.APIKey == "" {
-			return fmt.Errorf("MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY is required for provider %s", c.Provider)
+			return fmt.Errorf("MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY or OPENAI_API_KEY is required for provider %s", c.Provider)
 		}
 	case ProviderOpenAICompatible, ProviderLocal:
 		if c.BaseURL == "" {

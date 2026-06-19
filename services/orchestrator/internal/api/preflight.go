@@ -9,12 +9,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"model-express/services/orchestrator/internal/embeddings"
 	"model-express/services/orchestrator/internal/llm"
 )
 
 type cloudPreflightRequest struct {
-	Stage string `json:"stage"`
-	Live  bool   `json:"live"`
+	Stage            string `json:"stage"`
+	Live             bool   `json:"live"`
+	AutomaticTunnels bool   `json:"automatic_tunnels"`
 }
 
 type cloudPreflightResponse struct {
@@ -128,21 +130,45 @@ func (s *Server) runCloudPreflight(req cloudPreflightRequest) cloudPreflightResp
 	} else {
 		builder.ok("openai_key", "OpenAI API key is configured.", map[string]any{"source": config.APIKeySource})
 	}
+	if source := modalAuthSource(); source != "" {
+		builder.ok("modal_auth", "Modal authentication is configured.", map[string]any{"source": source})
+	} else {
+		builder.fail(
+			"modal_auth",
+			"Cloud Agentic Demo requires Modal authentication.",
+			"Run Modal auth setup or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET.",
+			nil,
+		)
+	}
 
-	builder.addURLCheck("modal_orchestrator_url", "MODAL_ORCHESTRATOR_URL", firstEnvValue("MODAL_ORCHESTRATOR_URL", "MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL"))
-	if orchestratorExposedMode() && strings.TrimSpace(os.Getenv("MODEL_EXPRESS_API_TOKEN")) == "" {
+	builder.addOrchestratorURLCheck(firstEnvValue("MODAL_ORCHESTRATOR_URL", "MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL"), req.AutomaticTunnels)
+	if (orchestratorExposedMode() || req.AutomaticTunnels) && strings.TrimSpace(os.Getenv("MODEL_EXPRESS_API_TOKEN")) == "" {
 		builder.fail(
 			"api_token",
 			"Public orchestrator exposure requires MODEL_EXPRESS_API_TOKEN.",
-			"Set MODEL_EXPRESS_API_TOKEN to a long random value and restart Mission Control and the orchestrator.",
+			"Restart Mission Control and the orchestrator so they use the same generated local API token.",
 			nil,
 		)
 	} else {
-		builder.ok("api_token", "Public orchestrator API token requirement is satisfied.", map[string]any{"required": orchestratorExposedMode()})
+		builder.ok("api_token", "Public orchestrator API token requirement is satisfied.", map[string]any{"required": orchestratorExposedMode() || req.AutomaticTunnels})
+	}
+	if req.AutomaticTunnels {
+		builder.ok("automatic_tunnels", "Automatic Cloudflare tunnels are enabled.", nil)
+	} else {
+		builder.fail(
+			"automatic_tunnels",
+			"Automatic Cloudflare tunnels are disabled.",
+			"Allow Mission Control to create Modal tunnels automatically or configure safe public URLs.",
+			nil,
+		)
 	}
 
-	builder.addURLCheck("s3_endpoint", "S3_ENDPOINT_URL", os.Getenv("S3_ENDPOINT_URL"))
-	builder.addURLCheck("modal_s3_endpoint", "MODAL_S3_ENDPOINT_URL", firstEnvValue("MODAL_S3_ENDPOINT_URL", "MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL"))
+	builder.addS3EndpointCheck(os.Getenv("S3_ENDPOINT_URL"), req.AutomaticTunnels)
+	builder.addModalS3EndpointCheck(
+		firstEnvValue("MODAL_S3_ENDPOINT_URL", "MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL"),
+		os.Getenv("S3_ENDPOINT_URL"),
+		req.AutomaticTunnels,
+	)
 
 	bucket := firstEnvValue("S3_BUCKET", "MODEL_EXPRESS_ARTIFACT_BUCKET")
 	if strings.TrimSpace(bucket) == "" {
@@ -153,17 +179,7 @@ func (s *Server) runCloudPreflight(req cloudPreflightRequest) cloudPreflightResp
 
 	builder.addCredentialCheck("s3_upload_credentials", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", false)
 	builder.addCredentialCheck("modal_s3_credentials", "MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID", "MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY", true)
-
-	if envFlag("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", false) || envFlag("MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED", false) {
-		builder.fail(
-			"memory_bootstrap",
-			"Cloud v1 release does not enable memory bootstrap or embeddings.",
-			"Set MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED=false and MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED=false.",
-			nil,
-		)
-	} else {
-		builder.ok("memory_bootstrap", "Memory bootstrap and embeddings are disabled for v1.", nil)
-	}
+	builder.addMemoryRetrievalCheck()
 
 	status := "ok"
 	for _, check := range builder.checks {
@@ -187,6 +203,10 @@ func (b *cloudPreflightBuilder) fail(id string, message string, remediation stri
 	b.checks = append(b.checks, cloudPreflightCheck{ID: id, Status: "failed", Message: message, Remediation: remediation, Metadata: metadata})
 }
 
+func (b *cloudPreflightBuilder) warn(id string, message string, metadata map[string]any) {
+	b.checks = append(b.checks, cloudPreflightCheck{ID: id, Status: "warning", Message: message, Metadata: metadata})
+}
+
 func (b *cloudPreflightBuilder) addURLCheck(id string, name string, value string) {
 	parsed, err := validateCloudPublicURL(value)
 	if err != nil {
@@ -202,6 +222,85 @@ func (b *cloudPreflightBuilder) addURLCheck(id string, name string, value string
 		"scheme": parsed.Scheme,
 		"host":   parsed.Hostname(),
 	})
+}
+
+func (b *cloudPreflightBuilder) addOrchestratorURLCheck(value string, automaticTunnels bool) {
+	if strings.TrimSpace(value) == "" && automaticTunnels {
+		b.warn("modal_orchestrator_url", "Orchestrator tunnel will be created automatically by Mission Control at worker start.", map[string]any{"automatic_tunnel": true})
+		return
+	}
+	b.addURLCheck("modal_orchestrator_url", "MODAL_ORCHESTRATOR_URL", value)
+}
+
+func (b *cloudPreflightBuilder) addS3EndpointCheck(value string, automaticTunnels bool) {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		if automaticTunnels && modalS3TunnelConfigured() {
+			b.warn("s3_endpoint", "Local S3 endpoint will be exposed through an automatic tunnel at worker start.", map[string]any{"automatic_tunnel": true})
+			return
+		}
+		b.fail(
+			"s3_endpoint",
+			"S3 endpoint is not configured.",
+			"Set S3_ENDPOINT_URL to a public HTTPS S3/R2 endpoint or enable MODEL_EXPRESS_MODAL_TUNNEL_S3 for local MinIO tunneling.",
+			nil,
+		)
+		return
+	}
+	parsed, err := validateCloudPublicURL(text)
+	if err == nil {
+		b.ok("s3_endpoint", "S3_ENDPOINT_URL is a public HTTPS origin.", map[string]any{
+			"scheme": parsed.Scheme,
+			"host":   parsed.Hostname(),
+		})
+		return
+	}
+	if automaticTunnels && modalS3TunnelConfigured() {
+		localTarget, parseErr := url.Parse(text)
+		if parseErr == nil && localTarget.Hostname() != "" && preflightLoopbackHost(localTarget.Hostname()) && localTarget.Port() != "9001" {
+			b.warn("s3_endpoint", "Local S3 endpoint will be exposed through an automatic tunnel at worker start.", map[string]any{"automatic_tunnel": true})
+			return
+		}
+	}
+	b.fail(
+		"s3_endpoint",
+		"S3_ENDPOINT_URL is not a public HTTPS URL reachable by Modal.",
+		"Set S3_ENDPOINT_URL to a public HTTPS origin and do not use private/local hosts or service console ports.",
+		map[string]any{"error": err.Error()},
+	)
+}
+
+func (b *cloudPreflightBuilder) addModalS3EndpointCheck(value string, s3Endpoint string, automaticTunnels bool) {
+	if strings.TrimSpace(value) != "" {
+		b.addURLCheck("modal_s3_endpoint", "MODAL_S3_ENDPOINT_URL", value)
+		return
+	}
+	if parsed, err := validateCloudPublicURL(s3Endpoint); err == nil {
+		b.ok("modal_s3_endpoint", "Modal workers will use S3_ENDPOINT_URL.", map[string]any{
+			"scheme": parsed.Scheme,
+			"host":   parsed.Hostname(),
+		})
+		return
+	}
+	if automaticTunnels && modalS3TunnelConfigured() {
+		if !safeAutomaticLocalS3Target(s3Endpoint) {
+			b.fail(
+				"modal_s3_endpoint",
+				"Automatic S3 tunnel target is not safe for Modal.",
+				"Use the loopback MinIO API endpoint on port 9000 and never tunnel the MinIO console port 9001.",
+				nil,
+			)
+			return
+		}
+		b.warn("modal_s3_endpoint", "S3 tunnel will be created automatically by Mission Control at worker start.", map[string]any{"automatic_tunnel": true})
+		return
+	}
+	b.fail(
+		"modal_s3_endpoint",
+		"MODAL_S3_ENDPOINT_URL is not configured.",
+		"Set MODAL_S3_ENDPOINT_URL, use a public HTTPS S3_ENDPOINT_URL, or enable MODEL_EXPRESS_MODAL_TUNNEL_S3 for local MinIO tunneling.",
+		nil,
+	)
 }
 
 func (b *cloudPreflightBuilder) addCredentialCheck(id string, accessName string, secretName string, modal bool) {
@@ -233,6 +332,43 @@ func (b *cloudPreflightBuilder) addCredentialCheck(id string, accessName string,
 		"access_key_present": true,
 		"secret_key_present": true,
 	})
+}
+
+func (b *cloudPreflightBuilder) addMemoryRetrievalCheck() {
+	config := embeddings.ConfigFromEnv()
+	metadata := map[string]any{
+		"retrieval_enabled":  config.RetrievalEnabled,
+		"embeddings_enabled": config.EmbeddingsEnabled,
+		"provider":           config.Provider,
+		"model":              config.Model,
+	}
+	if config.APIKeySource != "" {
+		metadata["api_key_source"] = config.APIKeySource
+	}
+	if !config.RetrievalEnabled && !config.EmbeddingsEnabled {
+		b.warn("memory_retrieval", "Memory retrieval is disabled.", metadata)
+		return
+	}
+	if config.EmbeddingsEnabled {
+		if err := config.ReadyForIndexing(); err != nil {
+			b.fail(
+				"memory_retrieval",
+				"Memory retrieval is enabled but embedding configuration is incomplete.",
+				"Set MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER=openai, MODEL_EXPRESS_MEMORY_EMBEDDING_MODEL=text-embedding-3-small, and MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY or OPENAI_API_KEY.",
+				map[string]any{"error": err.Error()},
+			)
+			return
+		}
+	}
+	if config.RetrievalEnabled && !config.EmbeddingsEnabled {
+		b.warn("memory_retrieval", "Memory retrieval is enabled, but memory embeddings are disabled; only existing indexed memory can be used.", metadata)
+		return
+	}
+	if config.RetrievalEnabled {
+		b.ok("memory_retrieval", "Memory retrieval is enabled and embedding configuration is ready.", metadata)
+		return
+	}
+	b.warn("memory_retrieval", "Memory embeddings are enabled but retrieval is disabled.", metadata)
 }
 
 func validateCloudPublicURL(value string) (*url.URL, error) {
@@ -275,7 +411,7 @@ func (e preflightError) Error() string {
 
 func preflightPrivateOrLocalHost(hostname string) bool {
 	host := strings.Trim(strings.ToLower(strings.TrimSpace(hostname)), "[]")
-	if listenHostIsLoopback(host) || host == "0.0.0.0" || host == "::" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+	if preflightLoopbackHost(host) || host == "0.0.0.0" || host == "::" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -283,6 +419,46 @@ func preflightPrivateOrLocalHost(hostname string) bool {
 		return false
 	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+func preflightLoopbackHost(host string) bool {
+	return listenHostIsLoopback(host) || strings.EqualFold(strings.Trim(host, "[]"), "localhost")
+}
+
+func modalS3TunnelConfigured() bool {
+	return envFlag("MODEL_EXPRESS_MODAL_TUNNEL_S3", false) || envFlag("MODEL_EXPRESS_ALLOW_MODAL_MINIO_TUNNEL", false)
+}
+
+func modalAuthSource() string {
+	if strings.TrimSpace(os.Getenv("MODAL_TOKEN_ID")) != "" && strings.TrimSpace(os.Getenv("MODAL_TOKEN_SECRET")) != "" {
+		return "MODAL_TOKEN_ID/MODAL_TOKEN_SECRET"
+	}
+	if strings.TrimSpace(os.Getenv("MODAL_PROFILE")) != "" {
+		return "MODAL_PROFILE"
+	}
+	if configured := strings.TrimSpace(os.Getenv("MODAL_CONFIG_PATH")); configured != "" {
+		if _, err := os.Stat(configured); err == nil {
+			return "MODAL_CONFIG_PATH"
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if _, err := os.Stat(home + string(os.PathSeparator) + ".modal.toml"); err == nil {
+			return "modal_config"
+		}
+	}
+	return ""
+}
+
+func safeAutomaticLocalS3Target(value string) bool {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		return true
+	}
+	parsed, err := url.Parse(text)
+	if err != nil || parsed.Hostname() == "" {
+		return false
+	}
+	return preflightLoopbackHost(parsed.Hostname()) && parsed.Port() != "9001"
 }
 
 func firstEnvValue(names ...string) string {

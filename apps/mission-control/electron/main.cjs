@@ -24,17 +24,25 @@ const selectedDatasetFolders = new Map();
 
 const DEFAULT_ORCHESTRATOR_URL = "http://127.0.0.1:8080";
 const DEFAULT_S3_ENDPOINT_URL = "http://127.0.0.1:9000";
+const DEFAULT_S3_BUCKET = "model-express";
+const DEFAULT_ARTIFACT_PREFIX = "model-express/artifacts";
+const DEFAULT_DATABASE_URL = "postgres://model_express:model_express@127.0.0.1:5432/model_express?sslmode=disable";
 const ALLOWED_ORCHESTRATOR_METHODS = new Set(["GET", "POST", "PATCH", "DELETE"]);
 const DEFAULT_JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const DATASET_SELECTION_TTL_MS = 4 * 60 * 60 * 1000;
 const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
 const DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+const LOCAL_RUNTIME_BOOTSTRAP_TIMEOUT_MS = 90_000;
+const MINIO_BOOTSTRAP_ATTEMPTS = 40;
+const MINIO_BOOTSTRAP_RETRY_MS = 750;
+const LOCAL_CONFIG_FILE = "model-express.local.json";
 const MODEL_ARTIFACT_EXTENSIONS = [".onnx", ".ort", ".pt", ".pth", ".torchscript", ".safetensors"];
 const PORTABLE_BUNDLE_EXTENSIONS = [".zip"];
 const EXPORT_ARTIFACT_EXTENSIONS = [".zip", ".onnx", ".pt", ".pth", ".torchscript", ".safetensors", ".json"];
 const electronRuntimeAvailable = Boolean(app && BrowserWindow && dialog && ipcMain && Menu);
 let missionControlEnvCache = null;
 let missionControlEnvCacheKey = "";
+let localRuntimeBootstrap = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -252,6 +260,428 @@ function envFlagFrom(env, name, fallback = false) {
   return ["1", "true", "yes", "on"].includes(value);
 }
 
+function missionControlUserDataDir(env = process.env, runtime = {}) {
+  const configured = String(env.MODEL_EXPRESS_USER_DATA_DIR ?? runtime.userDataDir ?? "").trim();
+  if (configured) {
+    return path.resolve(configured);
+  }
+  return defaultModelExpressUserDataDir(env);
+}
+
+function defaultModelExpressUserDataDir(env = process.env) {
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    return path.join(env.APPDATA || path.join(home, "AppData", "Roaming"), "Model Express");
+  }
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Application Support", "Model Express");
+  }
+  return path.join(env.XDG_CONFIG_HOME || path.join(home, ".config"), "model-express");
+}
+
+function localConfigPath(env = process.env, runtime = {}) {
+  return path.join(missionControlUserDataDir(env, runtime), LOCAL_CONFIG_FILE);
+}
+
+function readLocalConfig(env = process.env, runtime = {}) {
+  try {
+    const file = localConfigPath(env, runtime);
+    if (!fs.existsSync(file)) {
+      return {};
+    }
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeLocalConfig(config, env = process.env, runtime = {}) {
+  const file = localConfigPath(env, runtime);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(tempFile, file);
+}
+
+function writeNewLocalConfig(config, env = process.env, runtime = {}) {
+  const file = localConfigPath(env, runtime);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let handle;
+  try {
+    handle = fs.openSync(file, "wx", 0o600);
+    fs.writeFileSync(handle, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+    return true;
+  } catch (error) {
+    if (error && error.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  } finally {
+    if (handle !== undefined) {
+      fs.closeSync(handle);
+    }
+  }
+}
+
+function generateLocalApiToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function ensureLocalApiTokenEnv(env = process.env, runtime = {}) {
+  const explicit = String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim();
+  if (explicit) {
+    return env;
+  }
+  const { apiToken: token } = ensureLocalRuntimeConfig(env, runtime);
+  return {
+    ...env,
+    MODEL_EXPRESS_API_TOKEN: token,
+  };
+}
+
+function ensureLocalRuntimeConfig(env = process.env, runtime = {}) {
+  const configFile = localConfigPath(env, runtime);
+  const configExists = fs.existsSync(configFile);
+  const config = readLocalConfig(env, runtime);
+  const nextConfig = { ...config };
+  let changed = false;
+
+  let apiToken = String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim() || String(nextConfig.model_express_api_token ?? "").trim();
+  if (!apiToken) {
+    apiToken = generateLocalApiToken();
+    nextConfig.model_express_api_token = apiToken;
+    changed = true;
+  } else if (!String(nextConfig.model_express_api_token ?? "").trim() && !String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim()) {
+    nextConfig.model_express_api_token = apiToken;
+    changed = true;
+  }
+
+  let minioAccessKey = String(nextConfig.minio_access_key ?? "").trim();
+  if (!minioAccessKey) {
+    minioAccessKey = generateMinioAccessKey();
+    nextConfig.minio_access_key = minioAccessKey;
+    changed = true;
+  }
+
+  let minioSecretKey = String(nextConfig.minio_secret_key ?? "").trim();
+  if (!minioSecretKey) {
+    minioSecretKey = generateRuntimeSecret();
+    nextConfig.minio_secret_key = minioSecretKey;
+    changed = true;
+  }
+
+  let bucket = String(nextConfig.s3_bucket ?? "").trim();
+  if (!bucket) {
+    bucket = DEFAULT_S3_BUCKET;
+    nextConfig.s3_bucket = bucket;
+    changed = true;
+  }
+
+  let artifactPrefix = normalizeArtifactPrefix(nextConfig.artifact_prefix);
+  if (!artifactPrefix) {
+    artifactPrefix = DEFAULT_ARTIFACT_PREFIX;
+    nextConfig.artifact_prefix = artifactPrefix;
+    changed = true;
+  } else if (artifactPrefix !== nextConfig.artifact_prefix) {
+    nextConfig.artifact_prefix = artifactPrefix;
+    changed = true;
+  }
+
+  if (changed) {
+    nextConfig.updated_at = new Date().toISOString();
+    if (!configExists && !writeNewLocalConfig(nextConfig, env, runtime)) {
+      return ensureLocalRuntimeConfig(env, runtime);
+    }
+    if (configExists) {
+      writeLocalConfig(nextConfig, env, runtime);
+    }
+  }
+
+  return {
+    apiToken,
+    minioAccessKey,
+    minioSecretKey,
+    bucket,
+    artifactPrefix,
+    configPath: configFile,
+  };
+}
+
+function generateMinioAccessKey() {
+  return `mx${crypto.randomBytes(16).toString("hex")}`;
+}
+
+function generateRuntimeSecret() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function normalizeArtifactPrefix(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\/{2,}/g, "/");
+}
+
+function appManagedLocalRuntimeEnabled(env = process.env) {
+  if (envFlagFrom(env, "MODEL_EXPRESS_DISABLE_APP_LOCAL_RUNTIME", false)) {
+    return false;
+  }
+  const configured = String(env.MODEL_EXPRESS_APP_MANAGED_LOCAL_RUNTIME ?? "").trim().toLowerCase();
+  if (configured) {
+    return ["1", "true", "yes", "on"].includes(configured);
+  }
+  const endpoint = String(env.S3_ENDPOINT_URL ?? "").trim();
+  if (!endpoint) {
+    return true;
+  }
+  try {
+    return isLoopbackHostname(parseHttpOrigin(endpoint, "S3 endpoint").hostname);
+  } catch {
+    return false;
+  }
+}
+
+function appLocalRuntimeEnv(env = process.env, runtime = {}) {
+  const tokenEnv = ensureLocalApiTokenEnv(env, runtime);
+  if (!appManagedLocalRuntimeEnabled(tokenEnv)) {
+    return tokenEnv;
+  }
+  const config = ensureLocalRuntimeConfig(tokenEnv, runtime);
+  return {
+    ...tokenEnv,
+    MODEL_EXPRESS_APP_MANAGED_LOCAL_RUNTIME: "true",
+    MODEL_EXPRESS_API_TOKEN: tokenEnv.MODEL_EXPRESS_API_TOKEN || config.apiToken,
+    MODEL_EXPRESS_V1_PROFILE: tokenEnv.MODEL_EXPRESS_V1_PROFILE || "cloud",
+    MODEL_EXPRESS_EXECUTION_PROFILE: tokenEnv.MODEL_EXPRESS_EXECUTION_PROFILE || "fast-remote",
+    MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER: tokenEnv.MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER || "modal",
+    MODEL_EXPRESS_DEFAULT_GPU_TYPE: tokenEnv.MODEL_EXPRESS_DEFAULT_GPU_TYPE || "T4",
+    MODEL_EXPRESS_MODAL_DEFAULT_GPU_TYPE: tokenEnv.MODEL_EXPRESS_MODAL_DEFAULT_GPU_TYPE || tokenEnv.MODEL_EXPRESS_DEFAULT_GPU_TYPE || "T4",
+    MODEL_EXPRESS_ORCHESTRATOR_ADDR: tokenEnv.MODEL_EXPRESS_ORCHESTRATOR_ADDR || "127.0.0.1:8080",
+    MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE: tokenEnv.MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE || "true",
+    DATABASE_URL: tokenEnv.DATABASE_URL || DEFAULT_DATABASE_URL,
+    S3_ENDPOINT_URL: DEFAULT_S3_ENDPOINT_URL,
+    S3_BUCKET: config.bucket,
+    MODEL_EXPRESS_ARTIFACT_BUCKET: config.bucket,
+    MODEL_EXPRESS_ARTIFACT_PREFIX: config.artifactPrefix,
+    AWS_ACCESS_KEY_ID: config.minioAccessKey,
+    AWS_SECRET_ACCESS_KEY: config.minioSecretKey,
+    MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID: config.minioAccessKey,
+    MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY: config.minioSecretKey,
+    MINIO_ROOT_USER: config.minioAccessKey,
+    MINIO_ROOT_PASSWORD: config.minioSecretKey,
+    AWS_DEFAULT_REGION: tokenEnv.AWS_DEFAULT_REGION || "us-east-1",
+    MODEL_EXPRESS_MODAL_TUNNEL_S3: "true",
+    // RC local-only: Modal receives generated local MinIO root credentials through a short-lived tunnel.
+    MODEL_EXPRESS_ALLOW_MODAL_ROOT_STORAGE: "true",
+  };
+}
+
+async function ensureAppLocalRuntime(runtime = {}) {
+  const env = runtime.env ?? missionControlEnv(process.env, runtime);
+  if (!appManagedLocalRuntimeEnabled(env)) {
+    return { managed: false, env };
+  }
+  if (!localRuntimeBootstrap || runtime.force) {
+    localRuntimeBootstrap = bootstrapAppLocalRuntime({ ...runtime, env }).catch((error) => {
+      localRuntimeBootstrap = null;
+      throw error;
+    });
+  }
+  return localRuntimeBootstrap;
+}
+
+async function bootstrapAppLocalRuntime(runtime = {}) {
+  const env = appLocalRuntimeEnv(runtime.env ?? process.env, runtime);
+  const root = repoRoot(env);
+  const logDir = resolveLogDir(root, env);
+  await startDockerComposeLocalServices({ ...runtime, env, repoRoot: root, logDir });
+  await waitForMinioBucket({ ...runtime, env });
+  appendDiagnosticLog(logDir, "info", "local_runtime_ready", {
+    services: ["postgres", "minio"],
+    s3_endpoint_url: env.S3_ENDPOINT_URL,
+    s3_bucket: env.S3_BUCKET,
+    artifact_prefix: env.MODEL_EXPRESS_ARTIFACT_PREFIX,
+  });
+  return {
+    managed: true,
+    env,
+    services: ["postgres", "minio"],
+    s3_endpoint_url: env.S3_ENDPOINT_URL,
+    s3_bucket: env.S3_BUCKET,
+    artifact_prefix: env.MODEL_EXPRESS_ARTIFACT_PREFIX,
+  };
+}
+
+async function startDockerComposeLocalServices({ env = process.env, repoRoot: root = repoRoot(env), logDir, spawnFn = spawn, timeoutMs = LOCAL_RUNTIME_BOOTSTRAP_TIMEOUT_MS } = {}) {
+  const spec = dockerComposeLocalServicesSpec(root, env);
+  try {
+    await runChildProcess(spec.command, spec.args, {
+      cwd: root,
+      env: spec.env,
+      spawnFn,
+      timeoutMs,
+      label: "docker compose",
+      logDir,
+    });
+  } catch (error) {
+    const friendly = dockerRuntimeError(error);
+    friendly.localRuntimeStage = "docker_compose";
+    throw friendly;
+  }
+  return spec;
+}
+
+function dockerComposeLocalServicesSpec(root = repoRoot(), env = process.env) {
+  return {
+    command: env.MODEL_EXPRESS_DOCKER_PATH || "docker",
+    args: ["compose", "-f", path.join(root, "infra", "compose.yaml"), "up", "-d", "postgres", "minio"],
+    env: {
+      ...env,
+      MINIO_ROOT_USER: env.MINIO_ROOT_USER || env.AWS_ACCESS_KEY_ID || "model_express_dev",
+      MINIO_ROOT_PASSWORD: env.MINIO_ROOT_PASSWORD || env.AWS_SECRET_ACCESS_KEY || "model_express_dev_password",
+    },
+  };
+}
+
+function runChildProcess(command, args, { cwd, env, spawnFn = spawn, timeoutMs = 30_000, label = command, logDir } = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawnFn(command, args, {
+        cwd,
+        env,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (child && child.exitCode === null && !child.killed) {
+        child.kill();
+      }
+      const error = new Error(`${label} timed out.`);
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+    }, timeoutMs);
+
+    const onOutput = (streamName, data) => {
+      const text = data.toString();
+      if (streamName === "stdout") {
+        stdout += text;
+      } else {
+        stderr += text;
+      }
+      appendDiagnosticLog(logDir, "info", `${label.replace(/\s+/g, "_")}_${streamName}`, {
+        message: safeLogText(text.trimEnd()),
+      });
+    };
+
+    child.stdout?.on?.("data", (data) => onOutput("stdout", data));
+    child.stderr?.on?.("data", (data) => onOutput("stderr", data));
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+    });
+    child.on("exit", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve({ stdout, stderr, code, signal });
+        return;
+      }
+      const error = new Error(`${label} exited with code ${code ?? "unknown"}${signal ? ` signal ${signal}` : ""}.`);
+      error.stdout = stdout;
+      error.stderr = stderr;
+      error.code = code;
+      error.signal = signal;
+      reject(error);
+    });
+  });
+}
+
+function dockerRuntimeError(error) {
+  const output = `${error?.message ?? ""}\n${error?.stderr ?? ""}\n${error?.stdout ?? ""}`;
+  const remediation = "Start Docker Desktop.";
+  if (error?.code === "ENOENT" || /not recognized|not found|no such file/i.test(output)) {
+    return new Error(`Docker Desktop is required. ${remediation}`);
+  }
+  if (/daemon|docker engine|docker desktop|pipe|npipe|connection refused|cannot connect|is the docker daemon running/i.test(output)) {
+    return new Error(`Docker is not running. ${remediation}`);
+  }
+  return new Error(`Local runtime bootstrap failed while starting Docker Compose. ${remediation}`);
+}
+
+async function waitForMinioBucket({ env = process.env, client, attempts = MINIO_BOOTSTRAP_ATTEMPTS, retryMs = MINIO_BOOTSTRAP_RETRY_MS, sleepFn = sleep } = {}) {
+  const bucket = String(env.S3_BUCKET || env.MODEL_EXPRESS_ARTIFACT_BUCKET || DEFAULT_S3_BUCKET).trim();
+  const s3Client = client || createS3ClientFromEnv(env);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await ensureS3Bucket(s3Client, bucket);
+      return { bucket, attempts: attempt };
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await sleepFn(retryMs);
+      }
+    }
+  }
+  const friendly = new Error(`Local MinIO is not reachable at ${env.S3_ENDPOINT_URL || DEFAULT_S3_ENDPOINT_URL}. Start Docker Desktop.`);
+  friendly.cause = lastError;
+  friendly.localRuntimeStage = "minio_api";
+  throw friendly;
+}
+
+async function ensureS3Bucket(client, bucket) {
+  try {
+    await client.send(new HeadBucketCommand({ Bucket: bucket }));
+    return;
+  } catch (error) {
+    if (!isBucketMissingError(error) && !isPossiblyMissingBucketError(error)) {
+      throw error;
+    }
+  }
+  await client.send(new CreateBucketCommand({ Bucket: bucket }));
+  await client.send(new HeadBucketCommand({ Bucket: bucket }));
+}
+
+function isBucketMissingError(error) {
+  const statusCode = error?.$metadata?.httpStatusCode;
+  const name = String(error?.name ?? "");
+  const code = String(error?.Code ?? error?.code ?? "");
+  return statusCode === 404 || /NoSuchBucket|NotFound/i.test(`${name} ${code}`);
+}
+
+function isPossiblyMissingBucketError(error) {
+  const statusCode = error?.$metadata?.httpStatusCode;
+  return statusCode === 301 || statusCode === 403;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function apiTokenHeaders(env = process.env) {
   const token = String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim();
   if (!token) {
@@ -265,9 +695,12 @@ function apiTokenHeaders(env = process.env) {
 
 function requireAuthenticatedOrchestratorExposure(env = process.env) {
   const token = String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim();
-  if (!token || !envFlagFrom(env, "MODEL_EXPRESS_ALLOW_LAN", false)) {
+  const exposureAuthEnabled =
+    envFlagFrom(env, "MODEL_EXPRESS_ALLOW_LAN", false) ||
+    envFlagFrom(env, "MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE", false);
+  if (!token || !exposureAuthEnabled) {
     throw new Error(
-      "Modal orchestrator tunnels require MODEL_EXPRESS_ALLOW_LAN=true and MODEL_EXPRESS_API_TOKEN so the public callback URL is authenticated.",
+      "Modal orchestrator tunnels require MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE=true or MODEL_EXPRESS_ALLOW_LAN=true and MODEL_EXPRESS_API_TOKEN so the public callback URL is authenticated.",
     );
   }
 }
@@ -404,7 +837,7 @@ function repoRoot(env = process.env) {
   return path.resolve(env.MODEL_EXPRESS_ROOT || path.resolve(__dirname, "..", "..", ".."));
 }
 
-function missionControlEnv(env = process.env) {
+function missionControlEnv(env = process.env, runtime = {}) {
   const root = repoRoot(env);
   const envFile = String(env.MODEL_EXPRESS_ENV_FILE ?? "");
   const cacheKey = `${root}\0${envFile}`;
@@ -412,10 +845,10 @@ function missionControlEnv(env = process.env) {
     missionControlEnvCache = loadRepoEnv(root, env);
     missionControlEnvCacheKey = cacheKey;
   }
-  return {
+  return appLocalRuntimeEnv({
     ...env,
     ...(missionControlEnvCache ?? {}),
-  };
+  }, runtime);
 }
 
 function workerRoot(root = repoRoot()) {
@@ -1258,13 +1691,18 @@ async function readS3ObjectBuffer(artifactUri, options = {}, purpose = "storage"
 
 function createS3Client(options = {}, { purpose = "storage" } = {}) {
   const env = missionControlEnv();
+  const accessKeyId = String(options.accessKeyId ?? env.AWS_ACCESS_KEY_ID ?? "").trim();
+  const secretAccessKey = String(options.secretAccessKey ?? env.AWS_SECRET_ACCESS_KEY ?? "").trim();
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error("S3 credentials are required.");
+  }
   return new S3Client({
     endpoint: resolveS3Endpoint(options, purpose, env),
     region: options.region ?? env.AWS_DEFAULT_REGION ?? "us-east-1",
     forcePathStyle: true,
     credentials: {
-      accessKeyId: options.accessKeyId ?? env.AWS_ACCESS_KEY_ID ?? "model_express",
-      secretAccessKey: options.secretAccessKey ?? env.AWS_SECRET_ACCESS_KEY ?? "model_express_password",
+      accessKeyId,
+      secretAccessKey,
     },
   });
 }
@@ -1283,23 +1721,23 @@ async function ensureProjectWorker(options = {}) {
   if (!projectId) {
     throw new Error("Project id is required before starting a worker.");
   }
-  const baseUrl = validateOrchestratorBaseUrl(options.baseUrl || DEFAULT_ORCHESTRATOR_URL);
 
   const repoRoot = process.env.MODEL_EXPRESS_ROOT ?? path.resolve(__dirname, "..", "..", "..");
+  const env = missionControlEnv({ ...process.env, MODEL_EXPRESS_ROOT: repoRoot });
+  const baseUrl = validateOrchestratorBaseUrl(options.baseUrl || DEFAULT_ORCHESTRATOR_URL, env);
   const workerDir = path.join(repoRoot, "services", "worker");
   if (!fs.existsSync(workerDir)) {
     throw new Error(`Worker directory does not exist: ${workerDir}`);
   }
 
-  const repoEnv = loadRepoEnv(repoRoot);
-  const logDir = resolveLogDir(repoRoot);
+  const logDir = resolveLogDir(repoRoot, env);
   fs.mkdirSync(logDir, { recursive: true });
   const targetCount = normalizeWorkerCount(options.count);
   const useModalDispatcher = shouldUseModalDispatcher(options);
   if (useModalDispatcher) {
     const preflight = await preflightCloud(
       { stage: "worker_start", baseUrl, live: true },
-      { env: { ...process.env, ...repoEnv } },
+      { env },
     );
     if (preflight.status !== "ok") {
       throw new Error(formatCloudPreflightError(preflight));
@@ -1326,7 +1764,7 @@ async function ensureProjectWorker(options = {}) {
       modalSession = await ensureRemoteTrainingSession({
         projectId,
         baseUrl,
-        repoEnv,
+        env,
         logDir,
       });
     }
@@ -1335,14 +1773,13 @@ async function ensureProjectWorker(options = {}) {
       ? `${options.name}-${slot}`
       : `project-${projectId}-worker-${slot}`;
     const childEnv = {
-      ...process.env,
-      ...repoEnv,
+      ...env,
       ORCHESTRATOR_URL: baseUrl,
       PROJECT_ID: projectId,
       WORKER_NAME: workerName,
       GPU_TYPE: options.gpuType ?? "local",
       MODEL_EXPRESS_ROOT: repoRoot,
-      MODEL_EXPRESS_LOG_DIR: process.env.MODEL_EXPRESS_LOG_DIR ?? repoEnv.MODEL_EXPRESS_LOG_DIR ?? logDir,
+      MODEL_EXPRESS_LOG_DIR: env.MODEL_EXPRESS_LOG_DIR ?? logDir,
       PYTHONUNBUFFERED: "1",
     };
     if (useModalDispatcher) {
@@ -1414,16 +1851,20 @@ function stopProjectWorker(options = {}) {
   };
 }
 
-async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, logDir }) {
+async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, env: providedEnv, logDir, startTunnel = startCloudflaredTunnel, ensureLocalRuntime = ensureAppLocalRuntime }) {
   const existing = projectTunnels.get(projectId);
   if (existing && remoteTrainingSessionActive(existing)) {
     return existing;
   }
   stopProjectTunnels(projectId);
 
-  const env = { ...process.env, ...repoEnv };
+  const env = providedEnv ?? { ...process.env, ...repoEnv };
   const childEnv = {};
   const processes = [];
+  const apiToken = String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim();
+  if (apiToken) {
+    childEnv.MODEL_EXPRESS_API_TOKEN = apiToken;
+  }
 
   const configuredOrchestrator = firstNonEmpty(env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL);
   if (configuredOrchestrator) {
@@ -1434,7 +1875,7 @@ async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, l
     childEnv.MODAL_ORCHESTRATOR_URL = validateRemoteModalUrl(baseUrl, "MODAL_ORCHESTRATOR_URL");
   } else {
     requireAuthenticatedOrchestratorExposure(env);
-    const orchestratorTunnel = await startCloudflaredTunnel({
+    const orchestratorTunnel = await startTunnel({
       projectId,
       label: "orchestrator",
       targetUrl: baseUrl,
@@ -1459,15 +1900,25 @@ async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, l
     } else if (envFlagFrom(env, "MODEL_EXPRESS_MODAL_TUNNEL_S3", false) || envFlagFrom(env, "MODEL_EXPRESS_ALLOW_MODAL_MINIO_TUNNEL", false)) {
       const targetUrl = s3Endpoint ? s3Endpoint.origin : DEFAULT_S3_ENDPOINT_URL;
       validateCloudflaredTarget(targetUrl, "s3");
-      const s3Tunnel = await startCloudflaredTunnel({
-        projectId,
-        label: "s3",
-        targetUrl,
-        logDir,
-        env,
-      });
-      childEnv.MODAL_S3_ENDPOINT_URL = s3Tunnel.url;
-      processes.push(s3Tunnel.child);
+      try {
+        if (appManagedLocalRuntimeEnabled(env)) {
+          await ensureLocalRuntime({ env });
+        }
+        const s3Tunnel = await startTunnel({
+          projectId,
+          label: "s3",
+          targetUrl,
+          logDir,
+          env,
+        });
+        childEnv.MODAL_S3_ENDPOINT_URL = s3Tunnel.url;
+        processes.push(s3Tunnel.child);
+      } catch (error) {
+        for (const child of processes) {
+          stopTunnelProcess(child);
+        }
+        throw error;
+      }
     } else {
       throw new Error(
         "Modal workers require MODAL_S3_ENDPOINT_URL, a remote S3_ENDPOINT_URL, or MODEL_EXPRESS_MODAL_TUNNEL_S3=1 for local MinIO API tunneling.",
@@ -1927,7 +2378,9 @@ async function uploadDatasetFolder(options) {
   if (!projectId) {
     throw new Error("Project id is required before uploading a dataset.");
   }
-  const env = missionControlEnv();
+  let env = missionControlEnv();
+  const runtime = await ensureAppLocalRuntime({ env });
+  env = runtime.env ?? env;
   const folder = resolveDatasetFolderOption(options);
   const datasetPath = folder.path;
 
@@ -1935,8 +2388,11 @@ async function uploadDatasetFolder(options) {
   const safeName = datasetName.replace(/[^a-zA-Z0-9._-]/g, "-");
   const bucket = options.bucket ?? env.S3_BUCKET ?? "model-express";
   const endpoint = validateUploadEndpoint(options.endpoint, env);
-  const accessKeyId = options.accessKeyId ?? env.AWS_ACCESS_KEY_ID ?? "model_express";
-  const secretAccessKey = options.secretAccessKey ?? env.AWS_SECRET_ACCESS_KEY ?? "model_express_password";
+  const accessKeyId = String(options.accessKeyId ?? env.AWS_ACCESS_KEY_ID ?? "").trim();
+  const secretAccessKey = String(options.secretAccessKey ?? env.AWS_SECRET_ACCESS_KEY ?? "").trim();
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error("S3 credentials are required before dataset upload.");
+  }
   const region = options.region ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
   const key = `datasets/${projectId}/${safeName}.zip`;
   const entries = await collectDatasetFiles(datasetPath);
@@ -2046,11 +2502,13 @@ async function preflightCloud(options = {}, runtime = {}) {
   );
 
   addOpenAIEnvChecks(checks, env);
-  addCloudURLCheck(checks, "modal_orchestrator_url", "MODAL_ORCHESTRATOR_URL", firstNonEmpty(env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL), env);
-  addCloudURLCheck(checks, "s3_endpoint", "S3_ENDPOINT_URL", env.S3_ENDPOINT_URL, env);
-  addCloudURLCheck(checks, "modal_s3_endpoint", "MODAL_S3_ENDPOINT_URL", firstNonEmpty(env.MODAL_S3_ENDPOINT_URL, env.MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL), env);
+  addModalAuthCheck(checks, env);
+  addModalOrchestratorCheck(checks, env, baseUrl);
+  addS3EndpointCheck(checks, env);
+  addModalS3EndpointCheck(checks, env);
   addCloudBucketCheck(checks, env);
   addStorageCredentialChecks(checks, env);
+  await addLocalRuntimeChecks(checks, { env, live, runtime });
 
   try {
     requireAuthenticatedOrchestratorExposure(env);
@@ -2066,9 +2524,16 @@ async function preflightCloud(options = {}, runtime = {}) {
       errorMessage(error),
     );
   }
+  addCloudCheck(
+    checks,
+    automaticTunnelsEnabled(env) ? "ok" : "failed",
+    "automatic_tunnels",
+    automaticTunnelsEnabled(env) ? "Automatic Cloudflare tunnels are enabled." : "Automatic Cloudflare tunnels are disabled.",
+    automaticTunnelsEnabled(env) ? "" : "Unset MODEL_EXPRESS_DISABLE_AUTO_TUNNELS so Mission Control can create Modal tunnels automatically.",
+  );
 
   const fetchFn = runtime.fetch ?? globalThis.fetch;
-  await mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, fetchFn });
+  await mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, fetchFn, automaticTunnels: automaticTunnelsEnabled(env) });
   if (live) {
     await preflightPublicOrchestrator(checks, { env, fetchFn });
     await preflightS3RoundTrip(checks, { env, s3LiveCheck: runtime.s3LiveCheck });
@@ -2076,6 +2541,51 @@ async function preflightCloud(options = {}, runtime = {}) {
 
   const status = checks.some((check) => check.status === "failed") ? "failed" : "ok";
   return { status, checks };
+}
+
+async function addLocalRuntimeChecks(checks, { env, live, runtime }) {
+  if (!appManagedLocalRuntimeEnabled(env)) {
+    addCloudCheck(checks, "warning", "local_runtime_config", "App-managed local runtime is disabled.");
+    return;
+  }
+  addCloudCheck(checks, "ok", "local_runtime_config", "App-local runtime config is generated.", "", {
+    token_present: Boolean(String(env.MODEL_EXPRESS_API_TOKEN ?? "").trim()),
+    minio_access_key_present: Boolean(String(env.AWS_ACCESS_KEY_ID ?? "").trim()),
+    minio_secret_key_present: Boolean(String(env.AWS_SECRET_ACCESS_KEY ?? "").trim()),
+    bucket: env.S3_BUCKET || DEFAULT_S3_BUCKET,
+    artifact_prefix: env.MODEL_EXPRESS_ARTIFACT_PREFIX || DEFAULT_ARTIFACT_PREFIX,
+  });
+  if (!live) {
+    addCloudCheck(checks, "warning", "docker_compose", "Docker Compose local services will be started automatically when needed.", "", {
+      services: ["postgres", "minio"],
+    });
+    addCloudCheck(checks, "warning", "minio_api", "Local MinIO API will be verified before upload or worker start.", "", {
+      endpoint: env.S3_ENDPOINT_URL || DEFAULT_S3_ENDPOINT_URL,
+    });
+    return;
+  }
+  try {
+    const ensureRuntime = runtime.ensureLocalRuntime ?? ensureAppLocalRuntime;
+    const result = await ensureRuntime({ ...runtime, env });
+    addCloudCheck(checks, "ok", "docker_compose", "Docker Compose local services are running.", "", {
+      services: result.services ?? ["postgres", "minio"],
+    });
+    addCloudCheck(checks, "ok", "minio_api", "Local MinIO API is reachable.", "", {
+      endpoint: env.S3_ENDPOINT_URL || DEFAULT_S3_ENDPOINT_URL,
+    });
+    addCloudCheck(checks, "ok", "s3_bucket_exists", "Local MinIO bucket exists.", "", {
+      bucket: result.s3_bucket ?? env.S3_BUCKET ?? DEFAULT_S3_BUCKET,
+    });
+  } catch (error) {
+    const stage = error?.localRuntimeStage === "minio_api" ? "minio_api" : "docker_compose";
+    addCloudCheck(
+      checks,
+      "failed",
+      stage,
+      stage === "minio_api" ? "Local MinIO API is not reachable." : "Docker Compose local services are not running.",
+      safeProviderError(errorMessage(error)),
+    );
+  }
 }
 
 function addOpenAIEnvChecks(checks, env) {
@@ -2119,6 +2629,36 @@ function addOpenAIEnvChecks(checks, env) {
   );
 }
 
+function addModalAuthCheck(checks, env) {
+  const source = modalAuthSource(env);
+  addCloudCheck(
+    checks,
+    source ? "ok" : "failed",
+    "modal_auth",
+    source ? "Modal authentication is configured." : "Cloud Agentic Demo requires Modal authentication.",
+    source ? "" : "Run Modal auth setup or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET.",
+    source ? { source } : undefined,
+  );
+}
+
+function modalAuthSource(env = process.env) {
+  if (String(env.MODAL_TOKEN_ID ?? "").trim() && String(env.MODAL_TOKEN_SECRET ?? "").trim()) {
+    return "MODAL_TOKEN_ID/MODAL_TOKEN_SECRET";
+  }
+  if (String(env.MODAL_PROFILE ?? "").trim()) {
+    return "MODAL_PROFILE";
+  }
+  const configuredPath = String(env.MODAL_CONFIG_PATH ?? "").trim();
+  if (configuredPath && fs.existsSync(configuredPath)) {
+    return "MODAL_CONFIG_PATH";
+  }
+  const homeConfig = path.join(os.homedir(), ".modal.toml");
+  if (fs.existsSync(homeConfig)) {
+    return "modal_config";
+  }
+  return "";
+}
+
 function openAIKeySource(env, provider) {
   if (String(env.MODEL_EXPRESS_LLM_API_KEY ?? "").trim()) return "MODEL_EXPRESS_LLM_API_KEY";
   if (String(env.MODEL_EXPRESS_VISUAL_LLM_API_KEY ?? "").trim()) return "MODEL_EXPRESS_VISUAL_LLM_API_KEY";
@@ -2147,6 +2687,194 @@ function addCloudURLCheck(checks, id, label, value, env) {
       { error: errorMessage(error) },
     );
   }
+}
+
+function addModalOrchestratorCheck(checks, env, baseUrl) {
+  const configured = firstNonEmpty(env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL);
+  if (configured) {
+    addCloudURLCheck(checks, "modal_orchestrator_url", "MODAL_ORCHESTRATOR_URL", configured, env);
+    return;
+  }
+  if (!automaticTunnelsEnabled(env)) {
+    addCloudCheck(
+      checks,
+      "failed",
+      "modal_orchestrator_url",
+      "Modal orchestrator tunnel is not configured.",
+      "Enable automatic tunnels or set MODAL_ORCHESTRATOR_URL to a public HTTPS origin.",
+    );
+    return;
+  }
+  try {
+    const parsed = parseHttpOrigin(baseUrl, "Orchestrator URL");
+    if (isLoopbackHostname(parsed.hostname)) {
+      validateCloudflaredTarget(parsed.origin, "orchestrator");
+      addCloudCheck(
+        checks,
+        "warning",
+        "modal_orchestrator_url",
+        "Orchestrator tunnel will be created automatically at worker start.",
+        "",
+        { automatic_tunnel: true, target: "loopback" },
+      );
+      return;
+    }
+    const origin = validateRemoteModalUrl(parsed.origin, "MODAL_ORCHESTRATOR_URL", env);
+    if (new URL(origin).protocol !== "https:") {
+      throw new Error("MODAL_ORCHESTRATOR_URL must use https for the cloud v1 preflight.");
+    }
+    addCloudCheck(checks, "ok", "modal_orchestrator_url", "Orchestrator base URL is a public HTTPS origin.", "", {
+      scheme: "https",
+      host: new URL(origin).hostname,
+    });
+  } catch (error) {
+    addCloudCheck(
+      checks,
+      "failed",
+      "modal_orchestrator_url",
+      "Modal cannot reach the orchestrator.",
+      safeProviderError(errorMessage(error)),
+    );
+  }
+}
+
+function addS3EndpointCheck(checks, env) {
+  const endpoint = String(env.S3_ENDPOINT_URL ?? "").trim();
+  if (!endpoint) {
+    if (s3TunnelEnabled(env)) {
+      addCloudCheck(
+        checks,
+        "warning",
+        "s3_endpoint",
+        "Local S3 endpoint will be exposed through an automatic tunnel at worker start.",
+        "",
+        { automatic_tunnel: true, target: DEFAULT_S3_ENDPOINT_URL },
+      );
+      return;
+    }
+    addCloudCheck(
+      checks,
+      "failed",
+      "s3_endpoint",
+      "S3 endpoint is not configured.",
+      "Set S3_ENDPOINT_URL to a public HTTPS S3/R2 endpoint or enable MODEL_EXPRESS_MODAL_TUNNEL_S3 for local MinIO tunneling.",
+    );
+    return;
+  }
+  try {
+    const parsed = parseHttpOrigin(endpoint, "S3_ENDPOINT_URL");
+    if (parsed.port === "9001") {
+      throw new Error("S3_ENDPOINT_URL must not point at the MinIO console port.");
+    }
+    if (isLoopbackHostname(parsed.hostname)) {
+      if (!s3TunnelEnabled(env)) {
+        throw new Error("S3_ENDPOINT_URL is local; Modal needs a public S3 endpoint or automatic S3 tunneling.");
+      }
+      validateCloudflaredTarget(parsed.origin, "s3");
+      addCloudCheck(
+        checks,
+        "warning",
+        "s3_endpoint",
+        "Local S3 endpoint will be exposed through an automatic tunnel at worker start.",
+        "",
+        { automatic_tunnel: true, target: parsed.origin },
+      );
+      return;
+    }
+    const origin = validateRemoteModalUrl(endpoint, "S3_ENDPOINT_URL", env);
+    const remote = new URL(origin);
+    if (remote.protocol !== "https:") {
+      throw new Error("S3_ENDPOINT_URL must use https for the cloud v1 preflight.");
+    }
+    addCloudCheck(checks, "ok", "s3_endpoint", "S3_ENDPOINT_URL is a public HTTPS origin.", "", {
+      scheme: "https",
+      host: remote.hostname,
+    });
+  } catch (error) {
+    addCloudCheck(
+      checks,
+      "failed",
+      "s3_endpoint",
+      "S3_ENDPOINT_URL is not a public HTTPS URL reachable by Modal.",
+      safeProviderError(errorMessage(error)),
+    );
+  }
+}
+
+function addModalS3EndpointCheck(checks, env) {
+  const configured = firstNonEmpty(env.MODAL_S3_ENDPOINT_URL, env.MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL);
+  if (configured) {
+    addCloudURLCheck(checks, "modal_s3_endpoint", "MODAL_S3_ENDPOINT_URL", configured, env);
+    return;
+  }
+  const endpoint = String(env.S3_ENDPOINT_URL ?? "").trim();
+  if (endpoint) {
+    try {
+      const parsed = parseHttpOrigin(endpoint, "S3_ENDPOINT_URL");
+      if (!isLoopbackHostname(parsed.hostname)) {
+        const origin = validateRemoteModalUrl(parsed.origin, "S3_ENDPOINT_URL", env);
+        if (new URL(origin).protocol !== "https:") {
+          throw new Error("S3_ENDPOINT_URL must use https for Modal workers.");
+        }
+        addCloudCheck(checks, "ok", "modal_s3_endpoint", "Modal workers will use S3_ENDPOINT_URL.", "", {
+          scheme: "https",
+          host: new URL(origin).hostname,
+        });
+        return;
+      }
+    } catch (error) {
+      addCloudCheck(
+        checks,
+        "failed",
+        "modal_s3_endpoint",
+        "MODAL_S3_ENDPOINT_URL is not configured and S3_ENDPOINT_URL is not safe for Modal.",
+        safeProviderError(errorMessage(error)),
+      );
+      return;
+    }
+  }
+  if (s3TunnelEnabled(env)) {
+    try {
+      const targetUrl = endpoint ? parseHttpOrigin(endpoint, "S3_ENDPOINT_URL").origin : DEFAULT_S3_ENDPOINT_URL;
+      validateCloudflaredTarget(targetUrl, "s3");
+      addCloudCheck(
+        checks,
+        "warning",
+        "modal_s3_endpoint",
+        "S3 tunnel will be created automatically at worker start.",
+        "",
+        { automatic_tunnel: true },
+      );
+      return;
+    } catch (error) {
+      addCloudCheck(
+        checks,
+        "failed",
+        "modal_s3_endpoint",
+        "Automatic S3 tunnel target is not safe for Modal.",
+        safeProviderError(errorMessage(error)),
+      );
+      return;
+    }
+  }
+  addCloudCheck(
+    checks,
+    "failed",
+    "modal_s3_endpoint",
+    "Modal S3 endpoint is not configured.",
+    "Set MODAL_S3_ENDPOINT_URL, use a public HTTPS S3_ENDPOINT_URL, or enable MODEL_EXPRESS_MODAL_TUNNEL_S3 for local MinIO tunneling.",
+  );
+}
+
+function automaticTunnelsEnabled(env) {
+  return !envFlagFrom(env, "MODEL_EXPRESS_DISABLE_AUTO_TUNNELS", false);
+}
+
+function s3TunnelEnabled(env) {
+  return (
+    envFlagFrom(env, "MODEL_EXPRESS_MODAL_TUNNEL_S3", false) ||
+    envFlagFrom(env, "MODEL_EXPRESS_ALLOW_MODAL_MINIO_TUNNEL", false)
+  );
 }
 
 function addCloudBucketCheck(checks, env) {
@@ -2205,7 +2933,7 @@ function addCredentialCheck(checks, id, accessKey, secretKey, remediation, env) 
   });
 }
 
-async function mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, fetchFn }) {
+async function mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, fetchFn, automaticTunnels }) {
   if (typeof fetchFn !== "function") {
     addCloudCheck(checks, "failed", "backend_preflight", "Backend cloud preflight could not run.", "Start the orchestrator and run preflight again.");
     return;
@@ -2217,7 +2945,7 @@ async function mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, f
         "Content-Type": "application/json",
         ...apiTokenHeaders(env),
       },
-      body: JSON.stringify({ stage, live }),
+      body: JSON.stringify({ stage, live, automatic_tunnels: Boolean(automaticTunnels) }),
     });
     const payload = await parseJSONResponse(response);
     if (payload && Array.isArray(payload.checks)) {
@@ -2255,6 +2983,17 @@ async function mergeBackendCloudPreflight(checks, { baseUrl, stage, live, env, f
 
 async function preflightPublicOrchestrator(checks, { env, fetchFn }) {
   const publicURL = firstNonEmpty(env.MODAL_ORCHESTRATOR_URL, env.MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL);
+  if (!publicURL) {
+    addCloudCheck(
+      checks,
+      "warning",
+      "public_orchestrator",
+      "Public orchestrator probe will run after the automatic tunnel is created at worker start.",
+      "",
+      { automatic_tunnel: true },
+    );
+    return;
+  }
   if (typeof fetchFn !== "function") {
     addCloudCheck(checks, "failed", "public_orchestrator", "Public orchestrator check could not run.", "Start Mission Control with a fetch-capable Electron runtime.");
     return;
@@ -2333,13 +3072,18 @@ async function preflightS3RoundTrip(checks, { env, s3LiveCheck }) {
 }
 
 function createS3ClientFromEnv(env) {
+  const accessKeyId = String(env.AWS_ACCESS_KEY_ID ?? "").trim();
+  const secretAccessKey = String(env.AWS_SECRET_ACCESS_KEY ?? "").trim();
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error("S3 credentials are required.");
+  }
   return new S3Client({
     endpoint: resolveS3Endpoint({}, "storage", env),
     region: env.AWS_DEFAULT_REGION || "us-east-1",
     forcePathStyle: true,
     credentials: {
-      accessKeyId: String(env.AWS_ACCESS_KEY_ID ?? "").trim(),
-      secretAccessKey: String(env.AWS_SECRET_ACCESS_KEY ?? "").trim(),
+      accessKeyId,
+      secretAccessKey,
     },
   });
 }
@@ -2437,9 +3181,19 @@ function datasetUploadPreflight(entries, archivePlan, options = {}, env = proces
 module.exports = {
   __test: {
     apiTokenHeaders,
+    appLocalRuntimeEnv,
+    appManagedLocalRuntimeEnabled,
+    bootstrapAppLocalRuntime,
     configuredLocalArtifactRoots,
+    dockerComposeLocalServicesSpec,
+    ensureAppLocalRuntime,
+    ensureLocalApiTokenEnv,
+    ensureLocalRuntimeConfig,
+    ensureRemoteTrainingSession,
+    ensureS3Bucket,
     externalDataMountPath,
     isLoopbackHostname,
+    localConfigPath,
     missionControlEnv,
     parseCloudflaredTunnelUrl,
     preflightCloud,
@@ -2453,6 +3207,9 @@ module.exports = {
     safeLogText,
     saveExportArtifact,
     selectedDatasetFolders,
+    startDockerComposeLocalServices,
+    stopProjectTunnels,
+    waitForMinioBucket,
     validateAppRequestPath,
     validateLocalArtifactPath,
     validateLocalExportArtifactPath,

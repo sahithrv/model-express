@@ -175,6 +175,7 @@ import {
   runPrimaryMetric,
   championPrimaryMetric,
   metricTabOptions,
+  metricTechnicalLabel,
   NoticeBanner,
   noticeDisplay,
   summarizeTrainingRuns,
@@ -437,6 +438,7 @@ import {
   predictionPostprocessLatency,
   normalizeDemoPredictionResponse,
   attachDemoPredictionPreview,
+  demoImageIsRunnable,
   demoImageURI,
   demoImagePreviewURI,
   demoImageLabel,
@@ -511,6 +513,8 @@ export function MissionRoute({
   const activeStage = currentMissionStage(stages);
   const completedStageCount = stages.filter((stage) => stage.status === "done").length;
   const flowProgress = missionStageProgress(stages);
+  const trialRows = missionTrialProgressRows(brief.trialProgress);
+  const hasTrialProgress = brief.trialProgress.total > 0;
 
   if (brief.id === "no-mission") {
     return <MissionEmptyState brief={brief} stages={stages} actions={actions} onAction={onAction} />;
@@ -541,6 +545,43 @@ export function MissionRoute({
         </div>
         <div className="mission-flow-progress" aria-hidden="true">
           <span style={{ width: `${flowProgress}%` }} />
+        </div>
+        <div className="mission-live-briefing">
+          <div className="mission-briefing-copy">
+            <div className="eyebrow">Live briefing</div>
+            <strong>{brief.plainSummary}</strong>
+            <span>{brief.rightNow}</span>
+          </div>
+          <div className="trial-progress-visual" aria-label="Model trial progress distribution">
+            <div className="trial-progress-head">
+              <span>
+                <small>Model trial progress</small>
+                <strong>{hasTrialProgress ? `${brief.trialProgress.completed}/${brief.trialProgress.total} complete` : "Waiting for plan"}</strong>
+              </span>
+              <Badge value={brief.statusLabel} />
+            </div>
+            <div className="trial-distribution-bar" aria-hidden="true">
+              {trialRows.map((row) => (
+                <span
+                  className={row.key}
+                  key={row.key}
+                  style={{ width: `${hasTrialProgress ? Math.max(5, (row.value / Math.max(1, brief.trialProgress.total)) * 100) : 25}%` }}
+                />
+              ))}
+            </div>
+            <div className="trial-distribution-table">
+              {trialRows.map((row) => (
+                <span className={row.key} key={row.key}>
+                  <small>{row.label}</small>
+                  <strong>{row.value}</strong>
+                </span>
+              ))}
+            </div>
+          </div>
+          <div className="mission-next-decision">
+            <small>Next decision</small>
+            <strong>{brief.nextDecision}</strong>
+          </div>
         </div>
         <div className="mission-flow-console" aria-label="Mission state console">
           <span className={`mission-console-cell ${activeStage.status}`}>
@@ -576,6 +617,7 @@ export function MissionRoute({
           <span>
             <small>{brief.bestMetricLabel}</small>
             <strong>{brief.bestMetricValue}</strong>
+            <em>{metricTechnicalLabel(brief.bestMetricLabel)}</em>
           </span>
           <span>
             <small>ETA</small>
@@ -593,24 +635,27 @@ export function MissionRoute({
       <section className="ai-thinking-card">
         <div className="mission-section-head">
           <div>
-            <div className="eyebrow">What the AI is doing</div>
+            <div className="eyebrow">Why this step</div>
             <strong>{thinking.state}</strong>
           </div>
           <small>{thinking.updatedAt ? formatRelativeTime(thinking.updatedAt) : thinking.confidenceLabel}</small>
         </div>
         <div className="thinking-grid">
           <ThinkingRow label="Observation" value={thinking.observation} />
-          <ThinkingRow label="Reasoning" value={thinking.reasoning} />
           <ThinkingRow label="Decision" value={thinking.decision} />
-          <ThinkingRow label="Expected outcome" value={thinking.expectedOutcome} />
+          <ThinkingRow label="Impact" value={thinking.expectedOutcome} />
         </div>
+        <details className="activity-details">
+          <summary>Developer reasoning</summary>
+          <ThinkingRow label="Reasoning" value={thinking.reasoning} />
+        </details>
       </section>
 
       <aside className="mission-inspector">
         <section className="result-snapshot-card">
           <div className="mission-section-head">
             <div>
-              <div className="eyebrow">Best result</div>
+              <div className="eyebrow">Best model so far</div>
               <strong>{results.championModel}</strong>
             </div>
             <Badge value={exportSummary.statusLabel} />
@@ -619,7 +664,7 @@ export function MissionRoute({
             <small>{results.primaryMetricLabel}</small>
             <strong>{results.primaryMetricValue}</strong>
           </div>
-          <p>{results.whyItWon}</p>
+          <p>{results.leaderComparison}</p>
           <button className="command compact" type="button" onClick={() => onOpenTab("results", "results")}>
             View results
           </button>
@@ -882,6 +927,23 @@ function missionStageIcon(status: MissionStage["status"]): ReactNode {
   return <Timer size={15} />;
 }
 
+function missionTrialProgressRows(progress: MissionBrief["trialProgress"]) {
+  return [
+    { key: "completed", label: "Completed", value: progress.completed },
+    { key: "running", label: "Running", value: progress.running },
+    { key: "waiting", label: "Waiting", value: progress.waiting },
+    { key: "failed", label: "Failed", value: progress.failed },
+  ];
+}
+
+function activityStatusLabel(status: ActivityCardModel["status"]) {
+  if (status === "blocked") return "Action required";
+  if (status === "waiting") return "Waiting";
+  if (status === "active") return "Running";
+  if (status === "succeeded") return "Done";
+  return "Failed";
+}
+
 export function ActivityRoute({
   cards,
   filter,
@@ -912,16 +974,56 @@ export function ActivityRoute({
           <button
             key={item.key}
             type="button"
+            role="tab"
+            aria-selected={filter === item.key}
             className={filter === item.key ? "active" : ""}
             onClick={() => onFilterChange(item.key)}
           >
             {item.label}
+            <small>{cards.filter((card) => activityCardMatchesFilter(card, item.key)).length}</small>
           </button>
         ))}
       </div>
-      <div className="activity-card-list">
+      <div className="activity-timeline-table">
         {visibleCards.length > 0 ? (
-          visibleCards.map((card) => <ActivityCard key={card.id} card={card} onOpenDeveloper={onOpenDeveloper} />)
+          <>
+            <div className="activity-timeline-row activity-timeline-head">
+              <span>Time</span>
+              <span>Event</span>
+              <span>Evidence / result</span>
+              <span>Impact</span>
+              <span>Status</span>
+            </div>
+            {visibleCards.map((card) => (
+              <details className={`activity-timeline-row ${card.type} ${card.status}`} key={card.id}>
+                <summary>
+                  <span>{formatRelativeTime(card.timestamp)}</span>
+                  <span>
+                    <strong>{card.title}</strong>
+                    <small>{card.type}</small>
+                  </span>
+                  <span>{card.evidenceSummary || card.resultSummary || "Evidence pending"}</span>
+                  <span>{card.summary}</span>
+                  <span>
+                    <Badge value={activityStatusLabel(card.status)} />
+                  </span>
+                </summary>
+                <div className="activity-timeline-detail">
+                  <span>
+                    <small>Result</small>
+                    <strong>{card.resultSummary || "Result pending"}</strong>
+                  </span>
+                  <span>
+                    <small>Technical source</small>
+                    <strong>{card.technicalSource}</strong>
+                  </span>
+                  <button className="mission-link-button" type="button" onClick={onOpenDeveloper}>
+                    Open Developer View
+                  </button>
+                </div>
+              </details>
+            ))}
+          </>
         ) : (
           <ActivityEmptyState hasCards={cards.length > 0} filter={filter} />
         )}
@@ -1030,13 +1132,14 @@ export function ResultsRoute({
   onOpenExport: () => void;
   onOpenDeveloper: () => void;
 }) {
+  const leader = summary.topCandidates[0] ?? null;
   return (
     <div className="results-page">
       <section className="results-hero">
         <div>
-          <div className="eyebrow">Current champion</div>
+          <div className="eyebrow">Best model so far</div>
           <h3>{summary.championModel}</h3>
-          <p>{summary.whyItWon}</p>
+          <p>{summary.leaderComparison}</p>
         </div>
         <div className="results-primary-metric">
           <small>{summary.primaryMetricLabel}</small>
@@ -1045,19 +1148,71 @@ export function ResultsRoute({
         </div>
       </section>
 
+      <section className="candidate-section">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">Leaderboard</div>
+            <strong>{leader ? `${leader.model} leads the completed model trials` : "Waiting for comparable model trials"}</strong>
+            <small>{summary.scoreContext}</small>
+          </div>
+          <span className="results-actions">
+            <Badge value={summary.exportStatus} />
+            <button className="command compact" type="button" onClick={onOpenExport}>
+              Test & Export
+            </button>
+            <button className="command compact" type="button" onClick={onOpenDeveloper}>
+              Developer comparison
+            </button>
+          </span>
+        </div>
+        <div className="leaderboard-table">
+          {summary.topCandidates.length > 0 ? (
+            <>
+              <div className="leaderboard-row leaderboard-head">
+                <span>Model</span>
+                <span>Balanced score</span>
+                <span>Accuracy</span>
+                <span>Latency</span>
+                <span>Size</span>
+                <span>Cost</span>
+                <span>Status</span>
+              </div>
+              {summary.topCandidates.map((candidate) => (
+              <button
+                className={candidate.rank === 1 ? "leaderboard-row leader" : "leaderboard-row"}
+                key={`${candidate.rank}-${candidate.jobId || candidate.model}`}
+                type="button"
+                disabled={!candidate.jobId}
+                onClick={() => candidate.jobId && onSelectCandidate(candidate.jobId)}
+              >
+                <span>
+                  <small>#{candidate.rank}</small>
+                  <strong>{candidate.model}</strong>
+                  <small>{candidate.why}</small>
+                </span>
+                <span>
+                  <small>{candidate.metricLabel}</small>
+                  <strong>{candidate.metricValue}</strong>
+                  <small>{candidate.metricTechnicalLabel}</small>
+                </span>
+                <span>{candidate.accuracyValue}</span>
+                <span>{candidate.latency}</span>
+                <span>{candidate.modelSize}</span>
+                <span>{candidate.cost}</span>
+                <span><Badge value={candidate.status} /></span>
+              </button>
+              ))}
+            </>
+          ) : (
+            <ResultsEmptyState hasResults={summary.hasResults} />
+          )}
+        </div>
+      </section>
+
       <section className="results-grid">
         <div className="results-section">
-          <div className="mission-section-head">
-            <div>
-              <div className="eyebrow">Why it won</div>
-              <strong>Champion explanation</strong>
-            </div>
-            <Badge value={summary.exportStatus} />
-          </div>
+          <div className="eyebrow">Why the leader is ahead</div>
           <p>{summary.whyItWon}</p>
-          <button className="command compact" type="button" onClick={onOpenExport}>
-            Open export
-          </button>
         </div>
 
         <div className="results-section">
@@ -1079,42 +1234,45 @@ export function ResultsRoute({
         </div>
       </section>
 
-      <section className="candidate-section">
-        <div className="mission-section-head">
-          <div>
-            <div className="eyebrow">Top candidates</div>
-            <strong>Best three by mission fit</strong>
-          </div>
-          <button className="command compact" type="button" onClick={onOpenDeveloper}>
-            Full comparison
-          </button>
-        </div>
-        <div className="candidate-list">
-          {summary.topCandidates.length > 0 ? (
-            summary.topCandidates.map((candidate) => (
-              <button
-                className="candidate-card"
-                key={`${candidate.rank}-${candidate.jobId || candidate.model}`}
-                type="button"
-                onClick={() => candidate.jobId && onSelectCandidate(candidate.jobId)}
-              >
-                <span>
-                  <small>#{candidate.rank}</small>
-                  <strong>{candidate.model}</strong>
-                  <p>{candidate.why}</p>
-                </span>
-                <span>
-                  <small>{candidate.metricLabel}</small>
-                  <strong>{candidate.metricValue}</strong>
-                  <Badge value={candidate.status} />
-                </span>
-              </button>
-            ))
-          ) : (
-            <ResultsEmptyState hasResults={summary.hasResults} />
+      {(summary.perClassRows.length > 0 || summary.confusionMatrix.length > 0) && (
+        <section className="results-evidence-grid">
+          {summary.perClassRows.length > 0 && (
+            <div className="results-section">
+              <div className="eyebrow">Per-class evidence</div>
+              <div className="results-per-class-table">
+                <div className="results-per-class-row head">
+                  <span>Class</span>
+                  <span>Precision</span>
+                  <span>Recall</span>
+                  <span>F1</span>
+                </div>
+                {summary.perClassRows.map((row) => (
+                  <div className="results-per-class-row" key={row.label}>
+                    <span>{row.label}</span>
+                    <span>{row.precision}</span>
+                    <span>{row.recall}</span>
+                    <span>{row.f1}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
-        </div>
-      </section>
+          {summary.confusionMatrix.length > 0 && (
+            <div className="results-section">
+              <div className="eyebrow">Confusion preview</div>
+              <div className="confusion-preview">
+                {summary.confusionMatrix.map((row, rowIndex) => (
+                  <div key={`results-matrix-${rowIndex}`}>
+                    {row.map((value, columnIndex) => (
+                      <span key={`${rowIndex}-${columnIndex}`}>{value}</span>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }
@@ -1156,8 +1314,8 @@ export function ExportWaitingState({ readinessLabel }: { readinessLabel: string 
         <Trophy size={18} />
       </span>
       <div className="export-waiting-copy">
-        <div className="eyebrow">Handoff queue</div>
-        <strong>Waiting for a champion model</strong>
+        <div className="eyebrow">Test & Export</div>
+        <strong>Waiting for the best model</strong>
         <p>{readinessLabel}</p>
       </div>
       <div className="export-waiting-steps" aria-label="Export readiness flow">
@@ -1182,12 +1340,30 @@ export function ExportRoute({
   predictionError,
   predictionLoading,
   selectedImageIndex,
+  customImage,
+  customImageURI,
+  customTrueLabel,
+  localInferenceStatus,
+  slideshowEnabled,
+  slideshowIntervalMs,
+  detectionConfidenceThreshold,
+  detectionIouThreshold,
+  onCustomImageURIChange,
+  onCustomTrueLabelChange,
+  onChooseCustomImage,
+  onRunCustomPrediction,
+  onToggleSlideshow,
+  onSelectImage,
   onNextImage,
   onRandomImage,
   onRequestExport,
   onSavePortableBundle,
   savingPortableBundle,
   onRunPrediction,
+  onOpenFeedback,
+  onSlideshowIntervalChange,
+  onDetectionConfidenceThresholdChange,
+  onDetectionIouThresholdChange,
   onOpenDeveloper,
 }: {
   summary: ExportSummary;
@@ -1224,16 +1400,229 @@ export function ExportRoute({
   onOpenDeveloper: () => void;
 }) {
   const selectedImage = data.demoImages[selectedImageIndex] ?? data.demoImages[0] ?? null;
-  const previewURI = demoImagePreviewURI(selectedImage);
+  const selectedImageRunnable = demoImageIsRunnable(selectedImage);
+  const customURI = customImageURI.trim();
+  const customImageMatchesPicker = customImage ? customURI === demoImageURI(customImage) : false;
+  const customPreviewImage = customURI
+    ? ({
+        ...(customImage ?? {}),
+        uri: customURI,
+        image_uri: customURI,
+        thumbnail_uri: customImageMatchesPicker ? customImage?.thumbnail_uri : undefined,
+        true_label: customTrueLabel.trim() || customImage?.true_label || customImage?.label || customImage?.class_name,
+        split: customImage?.split || "custom",
+      } satisfies ChampionDemoImage)
+    : null;
+  const activeImage = customPreviewImage ?? selectedImage;
+  const previewURI = demoImagePreviewURI(activeImage);
   const predictionStatus = prediction ? normalizedStatus(prediction.status || "PENDING") : "";
   const confidence = prediction ? numericValue(prediction.confidence) : 0;
+  const activeDetections = detectionBoxesFromPrediction(prediction);
+  const topK = Array.isArray(prediction?.top_k) ? prediction.top_k : [];
+  const portableBundle = data.portableBundle;
+  const canSavePortableBundle = Boolean(portableBundle && portableBundleDownloadable(portableBundle));
+
+  if (!summary.hasChampion) {
+    return (
+      <div className="export-page" id="export-package">
+        <ExportWaitingState readinessLabel={summary.readinessLabel} />
+      </div>
+    );
+  }
 
   return (
     <div className="export-page" id="export-package">
-      <section className="export-package-card">
+      <section className="export-demo-simple test-export-hero">
         <div className="mission-section-head">
           <div>
-            <div className="eyebrow">Export package</div>
+            <div className="eyebrow">Try the best model</div>
+            <h3>{demoImageLabel(activeImage) || "Choose a held-out image"}</h3>
+            <p>Run an image through the best model so far and check the prediction, confidence, known label, correctness, and latency.</p>
+          </div>
+          <span>
+            <Badge value={predictionLoading ? "Running" : summary.demoStatus} />
+            <button className="icon-command" type="button" onClick={onRandomImage} disabled={data.demoImages.length < 2} title="Random held-out image">
+              <Shuffle size={14} />
+            </button>
+            <button className="icon-command" type="button" onClick={onNextImage} disabled={data.demoImages.length < 2} title="Next held-out image">
+              <StepForward size={14} />
+            </button>
+          </span>
+        </div>
+        <div className="demo-simple-grid">
+          <div className="test-image-stage">
+            <div className="test-image-preview">
+              {previewURI ? (
+                <div className="test-image-frame">
+                  <img src={previewURI} alt={demoImageLabel(activeImage) || "demo image"} />
+                  {activeDetections.length > 0 && <DetectionOverlay detections={activeDetections} />}
+                </div>
+              ) : (
+                <div className="test-image-placeholder">
+                  <ImageIcon size={28} />
+                  <span>No image</span>
+                </div>
+              )}
+            </div>
+            <div className="test-image-meta">
+              <span>
+                <Badge value={activeImage?.split || "TEST"} />
+                <strong>{demoImageLabel(activeImage) || activeImage?.image_id || "Select an image"}</strong>
+              </span>
+              <small>{demoImageDetail(activeImage) || "Held-out image or custom URI"}</small>
+            </div>
+          </div>
+
+          <div className="demo-result-summary">
+            {predictionError && <div className="mission-blocker"><AlertTriangle size={15} /><span>{userFacingActivityText(predictionError, 150)}</span></div>}
+            {predictionLoading && <Badge value="Running" />}
+            {prediction ? (
+              <>
+                <span>
+                  <small>Prediction</small>
+                  <strong>{prediction.predicted_label || predictionStatusMessage(predictionStatus)}</strong>
+                </span>
+                <span>
+                  <small>Confidence</small>
+                  <strong>{confidence ? formatTopKScore(confidence) : "-"}</strong>
+                </span>
+                <span>
+                  <small>Known label</small>
+                  <strong>{prediction.true_label || demoImageLabel(activeImage) || "Unknown"}</strong>
+                </span>
+                <span>
+                  <small>Correctness</small>
+                  <strong>{typeof prediction.correct === "boolean" ? (prediction.correct ? "Correct" : "Missed") : "Not scored"}</strong>
+                </span>
+                <span>
+                  <small>Latency</small>
+                  <strong>{typeof prediction.latency_ms === "number" ? formatLatency(prediction.latency_ms) : "-"}</strong>
+                </span>
+                <TopKConfidenceBars topK={topK} />
+                <div className="feedback-actions" aria-label="Prediction feedback">
+                  <button className="command compact" type="button" onClick={() => onOpenFeedback("good")} disabled={predictionLoading} title="Mark output good">
+                    <ThumbsUp size={15} />
+                    Good
+                  </button>
+                  <button className="command compact" type="button" onClick={() => onOpenFeedback("mediocre")} disabled={predictionLoading} title="Mark output mediocre">
+                    <MessageSquare size={15} />
+                    Mediocre
+                  </button>
+                  <button className="command compact" type="button" onClick={() => onOpenFeedback("bad")} disabled={predictionLoading} title="Mark output bad">
+                    <ThumbsDown size={15} />
+                    Bad
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="empty compact">Run a held-out image or choose your own image to see the prediction.</div>
+            )}
+          </div>
+
+          <div className="test-controls export-test-controls">
+            <div className="demo-block-head">
+              <strong>Images</strong>
+              <span>
+                <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={data.demoImages.length < 2 || predictionLoading}>
+                  {slideshowEnabled ? <Pause size={15} /> : <Play size={15} />}
+                  {slideshowEnabled ? "Pause" : "Slideshow"}
+                </button>
+                <button
+                  className="command primary compact"
+                  type="button"
+                  onClick={() => selectedImage && onRunPrediction(selectedImage)}
+                  disabled={!selectedImage || !selectedImageRunnable || predictionLoading}
+                  title={selectedImageRunnable ? "Run held-out image" : "Original image unavailable for this held-out image"}
+                >
+                  <Play size={15} />
+                  Run held-out
+                </button>
+              </span>
+            </div>
+            {data.demoImages.length > 0 ? (
+              <div className="demo-image-strip">
+                {data.demoImages.slice(0, 8).map((image, index) => (
+                  <button
+                    className={index === selectedImageIndex && !customURI ? "selected" : ""}
+                    key={image.id || image.image_id || `${demoImageURI(image)}-${index}`}
+                    type="button"
+                    onClick={() => onSelectImage(index)}
+                  >
+                    {demoImagePreviewURI(image) ? <img src={demoImagePreviewURI(image)} alt={demoImageLabel(image) || "held-out image"} /> : <span>image</span>}
+                    <small>{demoImageLabel(image) || image.image_id || "unlabeled"}</small>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="empty compact">No demo-ready held-out images are available yet.</div>
+            )}
+            {selectedImage && !selectedImageRunnable && !customURI && (
+              <div className="mission-blocker">
+                <AlertTriangle size={15} />
+                <span>Original image unavailable. Choose another held-out image or use your own image.</span>
+              </div>
+            )}
+            <div className="custom-image-actions">
+              <button className="command compact" type="button" onClick={onChooseCustomImage}>
+                <Upload size={15} />
+                Choose Image
+              </button>
+              <button
+                className="command compact"
+                type="button"
+                onClick={onRunCustomPrediction}
+                disabled={!customURI || predictionLoading}
+              >
+                <Play size={15} />
+                Run custom
+              </button>
+            </div>
+            <label className="field">
+              <span><Link2 size={12} /> Image URI</span>
+              <input
+                value={customImageURI}
+                onChange={(event) => onCustomImageURIChange(event.target.value)}
+                placeholder="file://, data:image, s3://, or worker-visible URI"
+              />
+            </label>
+            <label className="field">
+              <span>Known label</span>
+              <input value={customTrueLabel} onChange={(event) => onCustomTrueLabelChange(event.target.value)} placeholder="optional" />
+            </label>
+            <label className="field compact-range">
+              <span><Timer size={12} /> Slideshow speed</span>
+              <input
+                type="range"
+                min={1200}
+                max={10000}
+                step={400}
+                value={slideshowIntervalMs}
+                onChange={(event) => onSlideshowIntervalChange(Number(event.target.value))}
+              />
+              <small>{(slideshowIntervalMs / 1000).toFixed(1)}s</small>
+            </label>
+            {championExportDemoIsDetection(data) && (
+              <div className="detector-controls">
+                <label className="field compact-range">
+                  <span>Confidence</span>
+                  <input type="range" min={0.01} max={0.95} step={0.01} value={detectionConfidenceThreshold} onChange={(event) => onDetectionConfidenceThresholdChange(Number(event.target.value))} />
+                  <small>{formatTopKScore(detectionConfidenceThreshold)}</small>
+                </label>
+                <label className="field compact-range">
+                  <span>IoU</span>
+                  <input type="range" min={0.1} max={0.95} step={0.01} value={detectionIouThreshold} onChange={(event) => onDetectionIouThresholdChange(Number(event.target.value))} />
+                  <small>{formatTopKScore(detectionIouThreshold)}</small>
+                </label>
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+
+      <section className="export-package-card technical-package">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">Portable model package</div>
             <h3>{summary.title}</h3>
             <p>{summary.readinessLabel}</p>
           </div>
@@ -1252,19 +1641,50 @@ export function ExportRoute({
             <small>Demo</small>
             <strong>{summary.demoStatus}</strong>
           </span>
+          <span>
+            <small>Manifest</small>
+            <strong>{summary.manifestAvailable ? "Available" : "Pending"}</strong>
+          </span>
         </div>
         <div className="export-actions">
-          <button className="command primary" type="button" onClick={onRequestExport} disabled={!summary.hasChampion}>
+          <button className="command primary" type="button" onClick={onRequestExport}>
             <HardDriveUpload size={16} />
-            Prepare ONNX
+            Prepare portable model
           </button>
+          {portableBundle && canSavePortableBundle && (
+            <button className="command" type="button" onClick={() => onSavePortableBundle(portableBundle)} disabled={savingPortableBundle}>
+              <Download size={16} />
+              {savingPortableBundle ? "Saving" : "Save package"}
+            </button>
+          )}
           <button className="command" type="button" onClick={onOpenDeveloper}>
-            Open technical manifest
+            Advanced details
           </button>
         </div>
+        <details className="technical-package-details">
+          <summary>Technical package</summary>
+          <div className="technical-runtime-row">
+            <span>
+              <small>Demo route</small>
+              <strong>{demoRuntimeLabel(localInferenceStatus)}</strong>
+            </span>
+          </div>
+          <div className="export-record-list">
+            {data.exports.length > 0 ? data.exports.map((exportRecord, index) => (
+              <div className={`export-record ${statusToneClass(exportRecord.status)}`} key={exportRecord.id || `${exportRecord.format}-${index}`}>
+                <span>
+                  <strong>{exportRecord.format || "model artifact"}</strong>
+                  <small>{exportRecord.artifact_uri || exportRecord.model_uri || exportRecord.download_url || exportStatusMessage(exportRecord.status)}</small>
+                </span>
+                <span>
+                  <Badge value={exportRecord.status || "PENDING"} />
+                  <small>{exportRecord.size_bytes ? formatBytes(exportRecord.size_bytes) : exportRecord.completed_at || exportRecord.updated_at || ""}</small>
+                </span>
+              </div>
+            )) : <div className="empty compact">No package request has been recorded for this model yet.</div>}
+          </div>
+        </details>
       </section>
-
-      {!summary.hasChampion && <ExportWaitingState readinessLabel={summary.readinessLabel} />}
 
       <section className="handoff-grid">
         <div className="handoff-section">
@@ -1289,60 +1709,6 @@ export function ExportRoute({
             {summary.limitations.map((item) => (
               <span key={item}>{item}</span>
             ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="export-demo-simple">
-        <div className="mission-section-head">
-          <div>
-            <div className="eyebrow">Demo image</div>
-            <strong>{demoImageLabel(selectedImage) || "Held-out image"}</strong>
-          </div>
-          <span>
-            <button className="icon-command" type="button" onClick={onRandomImage} disabled={data.demoImages.length < 2} title="Random held-out image">
-              <Shuffle size={14} />
-            </button>
-            <button className="icon-command" type="button" onClick={onNextImage} disabled={data.demoImages.length < 2} title="Next held-out image">
-              <StepForward size={14} />
-            </button>
-            <button
-              className="command compact"
-              type="button"
-              onClick={() => selectedImage && onRunPrediction(selectedImage)}
-              disabled={!selectedImage || predictionLoading}
-            >
-              <Play size={15} />
-              Run demo
-            </button>
-          </span>
-        </div>
-        <div className="demo-simple-grid">
-          <div className="test-image-frame">
-            {previewURI ? <img src={previewURI} alt={demoImageLabel(selectedImage) || "demo image"} /> : <div className="test-image-placeholder">No image</div>}
-            {prediction && detectionBoxesFromPrediction(prediction).length > 0 && <DetectionOverlay detections={detectionBoxesFromPrediction(prediction)} />}
-          </div>
-          <div className="demo-result-summary">
-            {predictionLoading && <Badge value="RUNNING" />}
-            {predictionError && <div className="mission-blocker"><AlertTriangle size={15} /><span>{userFacingActivityText(predictionError, 140)}</span></div>}
-            {prediction ? (
-              <>
-                <span>
-                  <small>Prediction</small>
-                  <strong>{prediction.predicted_label || predictionStatusMessage(predictionStatus)}</strong>
-                </span>
-                <span>
-                  <small>Confidence</small>
-                  <strong>{confidence ? formatTopKScore(confidence) : "-"}</strong>
-                </span>
-                <span>
-                  <small>Latency</small>
-                  <strong>{typeof prediction.latency_ms === "number" ? formatLatency(prediction.latency_ms) : "-"}</strong>
-                </span>
-              </>
-            ) : (
-              <div className="empty compact">Run a demo image after the package is ready.</div>
-            )}
           </div>
         </div>
       </section>
@@ -1596,7 +1962,7 @@ export function ChampionOutcomeSummary({
       )}
       <div className="champion-outcome-actions">
         <button className="command compact" type="button" onClick={() => onOpenTab("export", "export-demo")}>
-          Open Export
+          Test & Export
         </button>
         <button className="command compact" type="button" onClick={() => onOpenTab("experiments", "champion-comparison")}>
           Compare Runs
@@ -2778,10 +3144,11 @@ export function ChampionExportDemoPanel({
   onDetectionIouThresholdChange: (value: number) => void;
 }) {
   if (!data.hasChampion) {
-    return <div className="empty">Champion export and demo details will appear after the backend selects a champion.</div>;
+    return <div className="empty">Test and export details will appear after Model Express selects the best model.</div>;
   }
 
   const selectedImage = data.demoImages[selectedImageIndex] ?? data.demoImages[0] ?? null;
+  const selectedImageRunnable = demoImageIsRunnable(selectedImage);
   const customURI = customImageURI.trim();
   const customImageMatchesPicker = customImage ? customURI === demoImageURI(customImage) : false;
   const customPreviewImage = customImageURI.trim()
@@ -2814,13 +3181,13 @@ export function ChampionExportDemoPanel({
     <div className="export-demo-panel">
       <div className="export-demo-grid">
         <div className="export-block">
-          <strong>Export Status</strong>
+          <strong>Package Status</strong>
           <div className="export-status-line">
             <Badge value={data.exportStatus || "PENDING"} />
             <small>{data.exports.length > 0 ? `${data.exports.length} export record(s)` : "No export records exposed yet."}</small>
             <button className="command compact" type="button" onClick={onRequestExport}>
               <HardDriveUpload size={15} />
-              Request ONNX
+              Prepare portable model
             </button>
           </div>
           <DetailLoadStatusNotice status={championExportsStatus} />
@@ -2952,7 +3319,7 @@ export function ChampionExportDemoPanel({
 
         <div className="test-controls">
           <div className="demo-block-head">
-            <strong>Champion Test</strong>
+            <strong>Try Model</strong>
             <span>
               <Badge value={localInferenceStatus === "ready" || localInferenceStatus === "available" ? "LOCAL_ONNX" : localInferenceStatus === "loading" ? "LOADING_ONNX" : "WORKER_FALLBACK"} />
               <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={data.demoImages.length < 2 || predictionLoading}>
@@ -2969,10 +3336,11 @@ export function ChampionExportDemoPanel({
                 className="command compact"
                 type="button"
                 onClick={() => selectedImage && onRunPrediction(selectedImage)}
-                disabled={!selectedImage || predictionLoading}
+                disabled={!selectedImage || !selectedImageRunnable || predictionLoading}
+                title={selectedImageRunnable ? "Run held-out image" : "Original image unavailable for this held-out image"}
               >
                 <Play size={15} />
-                Predict Held-out
+                Run held-out
               </button>
             </span>
           </div>
@@ -3057,9 +3425,12 @@ export function ChampionExportDemoPanel({
             </div>
           )}
           {localInferenceError && (
-            <div className="warning-list">
-              <span>{localInferenceError}</span>
-            </div>
+            <details className="technical-package-details">
+              <summary>Browser inference diagnostic</summary>
+              <div className="warning-list">
+                <span>{localInferenceError}</span>
+              </div>
+            </details>
           )}
           {predictionLoading && <div className="empty compact">{readyONNXExport(data.exports) ? "Running local ONNX inference..." : "Waiting for inference..."}</div>}
           {prediction ? (
@@ -3097,7 +3468,7 @@ export function ChampionExportDemoPanel({
               </div>
             </>
           ) : (
-            <div className="empty compact">Run a held-out or custom image to see the champion prediction.</div>
+            <div className="empty compact">Run a held-out or custom image to see the model prediction.</div>
           )}
         </div>
       </div>
@@ -3117,7 +3488,8 @@ export function ChampionExportDemoPanel({
                 className="command compact"
                 type="button"
                 onClick={() => selectedImage && onRunPrediction(selectedImage)}
-                disabled={!selectedImage || predictionLoading}
+                disabled={!selectedImage || !selectedImageRunnable || predictionLoading}
+                title={selectedImageRunnable ? "Predict held-out image" : "Original image unavailable for this held-out image"}
               >
                 <Play size={15} />
                 Predict
@@ -3147,6 +3519,12 @@ export function ChampionExportDemoPanel({
             </div>
           ) : (
             <div className="empty compact">No held-out/test demo images are exposed by the backend yet.</div>
+          )}
+          {selectedImage && !selectedImageRunnable && (
+            <div className="mission-blocker">
+              <AlertTriangle size={15} />
+              <span>Original image unavailable. Choose another held-out image or use your own image.</span>
+            </div>
           )}
         </div>
 
@@ -3216,6 +3594,39 @@ export function DetectionOverlay({ detections }: { detections: ChampionDetection
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function demoRuntimeLabel(status: string) {
+  if (status === "ready" || status === "available") return "Browser inference ready";
+  if (status === "loading") return "Preparing browser inference";
+  if (status === "error") return "Browser inference unavailable";
+  return "Backend inference";
+}
+
+export function TopKConfidenceBars({
+  topK,
+}: {
+  topK: NonNullable<ChampionDemoPrediction["top_k"]>;
+}) {
+  const rows = topK
+    .map((item) => ({
+      label: item.label || item.class_name || "class",
+      score: numericValue(item.confidence ?? item.probability ?? item.score),
+    }))
+    .filter((item) => item.score > 0)
+    .slice(0, 3);
+  if (rows.length === 0) return null;
+  return (
+    <div className="topk-bars">
+      {rows.map((item) => (
+        <span key={`${item.label}-${item.score}`}>
+          <small>{item.label}</small>
+          <i aria-hidden="true"><b style={{ width: `${Math.max(3, Math.min(100, item.score * 100))}%` }} /></i>
+          <strong>{formatTopKScore(item.score)}</strong>
+        </span>
+      ))}
     </div>
   );
 }

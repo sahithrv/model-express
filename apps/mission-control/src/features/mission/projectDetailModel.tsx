@@ -99,9 +99,21 @@ export function metricLabel(key: MetricKey) {
       return "Val loss";
     case "accuracy":
       return "Accuracy";
+    case "macro_f1":
+      return "Balanced accuracy score";
     default:
       return key;
   }
+}
+
+export function userFacingMetricLabel(label: string) {
+  return label.toLowerCase().replace(/[-_\s]+/g, "").includes("macrof1")
+    ? "Balanced accuracy score"
+    : label;
+}
+
+export function metricTechnicalLabel(label: string) {
+  return userFacingMetricLabel(label) === "Balanced accuracy score" ? "Macro-F1" : label;
 }
 
 export function isDetectionJob(job: Job | null) {
@@ -181,7 +193,7 @@ export function runPrimaryMetric(summary: TrainingRunSummary | null, evaluation:
     };
   }
   return {
-    label: "Macro-F1",
+    label: "Balanced accuracy score",
     value: summary?.best_macro_f1 ?? 0,
     secondaryLabel: "Accuracy",
     secondaryValue: summary?.best_accuracy ?? 0,
@@ -209,7 +221,7 @@ export function championPrimaryMetric(
   const explicitLabel = recordString(champion.metrics, "primary_metric_label");
   const explicitValue = recordNumber(champion.metrics, "primary_metric_value");
   if (explicitValue > 0) {
-    return { ...metric, label: explicitLabel || metric.label, value: explicitValue };
+    return { ...metric, label: userFacingMetricLabel(explicitLabel || metric.label), value: explicitValue };
   }
   if (metric.isDetection) {
     const map50_95 = firstPositiveMetric([recordNumber(champion.metrics, "best_map50_95"), metric.value]);
@@ -349,6 +361,7 @@ export type MissionDigest = {
   healthLabel: string;
   headline: string;
   detail: string;
+  requiresUserAction: boolean;
   facts: Array<{ label: string; value: string; tone?: MissionTone }>;
   health: MissionHealthItem[];
   nextActions: MissionNextAction[];
@@ -361,16 +374,28 @@ export type MissionBrief = {
   id: string;
   title: string;
   goal: string;
+  plainSummary: string;
+  rightNow: string;
+  nextDecision: string;
   statusLabel: string;
   progressLabel: string;
   completedExperiments: number;
   totalExperiments: number;
+  trialProgress: MissionTrialProgress;
   bestMetricLabel: string;
   bestMetricValue: string;
   etaLabel: string;
   primaryAction: string;
   blocker: string;
   updatedAt: string;
+};
+
+export type MissionTrialProgress = {
+  completed: number;
+  running: number;
+  waiting: number;
+  failed: number;
+  total: number;
 };
 
 export type AIThinking = {
@@ -412,9 +437,21 @@ export type ResultsCandidate = {
   model: string;
   metricLabel: string;
   metricValue: string;
+  metricTechnicalLabel: string;
+  accuracyValue: string;
+  latency: string;
+  modelSize: string;
+  cost: string;
   status: string;
   why: string;
   jobId: string;
+};
+
+export type ResultsPerClassRow = {
+  label: string;
+  precision: string;
+  recall: string;
+  f1: string;
 };
 
 export type ResultsSummary = {
@@ -424,10 +461,14 @@ export type ResultsSummary = {
   primaryMetricValue: string;
   improvementLabel: string;
   exportStatus: string;
+  scoreContext: string;
+  leaderComparison: string;
   whyItWon: string;
   learningSummary: string[];
   remainingRisks: string[];
   topCandidates: ResultsCandidate[];
+  perClassRows: ResultsPerClassRow[];
+  confusionMatrix: number[][];
 };
 
 export type ExportSummary = {
@@ -639,6 +680,7 @@ export type ChampionComparisonRow = {
   runtimeSeconds: number;
   costUsd: number;
   latencyMs: number;
+  modelSize: string;
   objectiveFit: number;
   trainValidationGap: number | null;
   divergenceStatus: string;
@@ -802,8 +844,8 @@ export function noticeDisplay(notice: Notice) {
       (notice.text.includes("MODEL_EXPRESS_API_TOKEN") && notice.text.includes("LAN or tunnel mode")))
   ) {
     return {
-      title: "API token required",
-      message: "The backend is in LAN or tunnel mode. Set MODEL_EXPRESS_API_TOKEN in .env.local, or remove the public Modal/tunnel URL for local-only use, then restart the backend and app.",
+      title: "API token mismatch",
+      message: "The backend is in LAN or tunnel mode but is not using the same generated local API token as Mission Control. Restart the backend and Mission Control from the same cloud profile.",
     };
   }
 
@@ -880,7 +922,7 @@ export function summarizeTrainingRuns(
     totalCost: summaries.reduce((total, summary) => total + summary.estimated_cost_usd, 0),
     totalRuntimeSeconds: summaries.reduce((total, summary) => total + summary.runtime_seconds, 0),
     bestMacroF1: best?.summary.best_macro_f1 ?? 0,
-    bestPrimaryMetricLabel: best?.metric.label ?? "Macro-F1",
+    bestPrimaryMetricLabel: best?.metric.label ?? "Balanced accuracy score",
     bestPrimaryMetricValue: best?.metric.value ?? 0,
     activeRuns: summaries.filter((summary) =>
       ["RUNNING", "ASSIGNED", "QUEUED"].includes(effectiveTrainingRunStatus(summary, jobById.get(summary.job_id) ?? null)),
@@ -958,7 +1000,8 @@ export function projectTabFromTarget(tab: ProjectTabTarget): ProjectTabKey {
 export function missionStateLabelFromProject(project: Project) {
   const status = normalizedStatus(project.status || "");
   if (status === "COMPLETED") return "Completed";
-  if (status === "FAILED" || status === "BLOCKED") return "Needs input";
+  if (status === "FAILED") return "Failed";
+  if (status === "BLOCKED") return "Action required";
   if (status === "RUNNING" || status === "ACTIVE") return "In progress";
   return "Ready";
 }
@@ -977,18 +1020,17 @@ export function buildMissionBrief(
   digest: MissionDigest,
   automationSettings: AutomationSettings,
 ): MissionBrief {
-  const counts = jobStatusCounts(detail.jobs);
-  const completedExperiments = counts.SUCCEEDED + counts.FAILED;
   const latestPlan = detail.plans[0] ?? null;
-  const plannedExperiments = latestPlan?.experiments.length ?? 0;
-  const totalExperiments = Math.max(detail.jobs.length, plannedExperiments, completedExperiments);
+  const progress = missionTrialProgress(detail.jobs, latestPlan);
+  const completedExperiments = progress.completed;
+  const totalExperiments = progress.total;
   const runTotals = summarizeTrainingRuns(detail.runSummaries, detail.runEvaluations, detail.jobs);
   const championSummary = detail.champion ? buildMissionChampionSummary(detail) : undefined;
   const bestMetricLabel = championSummary?.primaryMetricLabel || runTotals.bestPrimaryMetricLabel || "Best result";
   const bestMetricValue =
     championSummary?.primaryMetricValue ||
     (runTotals.bestPrimaryMetricValue > 0 ? formatMaybeMetric(runTotals.bestPrimaryMetricValue) : "Pending");
-  const activeOrQueued = counts.QUEUED + counts.ASSIGNED + counts.RUNNING;
+  const activeOrQueued = progress.running + progress.waiting;
   const etaLabel =
     activeOrQueued > 0 && latestPlan?.estimated_minutes
       ? `${latestPlan.estimated_minutes} min estimate`
@@ -998,7 +1040,29 @@ export function buildMissionBrief(
           ? "Working automatically"
           : "Waiting for approval";
   const primaryAction = digest.nextActions.find((action) => action.priority === "primary")?.label || "Watch progress";
-  const blocker = digest.state === "blocked" ? userFacingActivityText(digest.detail, 160) : "";
+  const blocker = digest.requiresUserAction ? userFacingActivityText(digest.detail, 160) : "";
+  const trialWord = totalExperiments === 1 ? "model trial" : "model trials";
+  const progressPhrase =
+    totalExperiments > 0
+      ? `${progress.completed} of ${totalExperiments} ${trialWord} complete`
+      : project
+        ? "Preparing the first model trial"
+        : "No mission yet";
+  const bestPhrase =
+    bestMetricValue && bestMetricValue !== "Pending"
+      ? `The best model so far scores ${bestMetricValue} on ${bestMetricLabel.toLowerCase()}.`
+      : "No scored model is available yet.";
+  const nextDecision = detail.champion
+    ? "Test the best model, then prepare a portable model package."
+    : progress.running > 0
+      ? "Wait for active trials, then compare the leaderboard."
+      : progress.waiting > 0
+        ? "Wait for training capacity or remaining trials before choosing the best model."
+        : detail.runSummaries.length > 0
+          ? "Compare completed trials and choose the best model."
+          : latestPlan
+            ? "Launch the planned model trials."
+            : "Review the dataset and create the first model trial plan.";
 
   return {
     id: project?.id || "no-mission",
@@ -1006,15 +1070,23 @@ export function buildMissionBrief(
     goal:
       project?.goal ||
       "Give Model Express a dataset and goal. It will train, compare, refine, and prepare the best model.",
+    plainSummary: project
+      ? "Model Express is testing image models, comparing quality and deployment tradeoffs, then preparing the best one for use outside the app."
+      : "Create a project to start image model trials.",
+    rightNow: project
+      ? `${progressPhrase}. ${bestPhrase}`
+      : "Select or create a mission to begin.",
+    nextDecision,
     statusLabel: digest.stateLabel,
     progressLabel:
       totalExperiments > 0
-        ? `${completedExperiments}/${totalExperiments} experiments complete`
+        ? `${completedExperiments}/${totalExperiments} model trials complete`
         : project
-          ? "Preparing first experiment"
+          ? "Preparing first model trial"
           : "No mission yet",
     completedExperiments,
     totalExperiments,
+    trialProgress: progress,
     bestMetricLabel,
     bestMetricValue,
     etaLabel,
@@ -1022,6 +1094,18 @@ export function buildMissionBrief(
     blocker,
     updatedAt: project?.updated_at || "",
   };
+}
+
+export function missionTrialProgress(jobs: Job[], latestPlan: ExperimentPlan | null): MissionTrialProgress {
+  const counts = jobStatusCounts(jobs);
+  const plannedTrials = latestPlan?.experiments.length ?? 0;
+  const running = counts.ASSIGNED + counts.RUNNING;
+  const completed = counts.SUCCEEDED;
+  const failed = counts.FAILED;
+  const plannedButNotQueued = Math.max(0, plannedTrials - jobs.length);
+  const waiting = counts.QUEUED + plannedButNotQueued;
+  const total = Math.max(plannedTrials, jobs.length, completed + running + waiting + failed);
+  return { completed, running, waiting, failed, total };
 }
 
 export function buildCurrentThinking(project: Project | null, detail: ProjectDetail, digest: MissionDigest): AIThinking {
@@ -1052,19 +1136,19 @@ export function buildCurrentThinking(project: Project | null, detail: ProjectDet
       reasoning: "A dataset review is required before Model Express can choose a training path.",
       decision: "Attach an image dataset to begin.",
       expectedOutcome: "The AI will inspect classes, examples, and label coverage.",
-      confidenceLabel: "Needs input",
+      confidenceLabel: "Dataset needed",
       updatedAt: project.updated_at,
     };
   }
 
   if (digest.state === "blocked") {
     return {
-      state: "Needs your input",
+      state: "Action required",
       observation: userFacingActivityText(digest.headline, 140),
       reasoning: userFacingActivityText(digest.detail, 180),
-      decision: "Pause new work until the blocker is resolved.",
+      decision: "Review the issue shown in the next action.",
       expectedOutcome: "Once resolved, Model Express can continue the mission from the latest safe point.",
-      confidenceLabel: "Blocked",
+      confidenceLabel: "Action required",
       updatedAt: latestDecision?.created_at || latestActivity.steps[0]?.timestamp || project.updated_at,
     };
   }
@@ -1074,10 +1158,10 @@ export function buildCurrentThinking(project: Project | null, detail: ProjectDet
     return {
       state: "Preparing handoff",
       observation: `${champion?.model || "The selected model"} is currently leading the mission.`,
-      reasoning: "The completed evidence supports using this model as the best available candidate.",
-      decision: "Prepare the export package and demo validation.",
+      reasoning: "The completed evidence supports using this model as the best model so far.",
+      decision: "Prepare the portable model package and demo validation.",
       expectedOutcome: "You can hand off an export-ready model with an explanation of why it won.",
-      confidenceLabel: "Champion selected",
+      confidenceLabel: "Best model selected",
       updatedAt: detail.champion.updated_at || detail.champion.created_at,
     };
   }
@@ -1106,10 +1190,10 @@ export function buildCurrentThinking(project: Project | null, detail: ProjectDet
 
   if (activeExperiments > 0) {
     return {
-      state: "Running experiments",
-      observation: `${activeExperiments} experiment${activeExperiments === 1 ? "" : "s"} are in progress or waiting to start.`,
-      reasoning: "Model Express is collecting comparable evidence before choosing a refinement or champion.",
-      decision: "Wait for the current experiments to report results.",
+      state: "Running model trials",
+      observation: `${activeExperiments} model trial${activeExperiments === 1 ? "" : "s"} are in progress or waiting to start.`,
+      reasoning: "Model Express is collecting comparable evidence before choosing a refinement or the best model.",
+      decision: "Wait for the current trials to report results.",
       expectedOutcome: "Completed runs will reveal the strongest candidate and the next improvement target.",
       confidenceLabel: "In progress",
       updatedAt: detail.jobs[0]?.completed_at || detail.jobs[0]?.started_at || detail.jobs[0]?.created_at || project.updated_at,
@@ -1118,11 +1202,11 @@ export function buildCurrentThinking(project: Project | null, detail: ProjectDet
 
   if (latestPlan && latestExperiment) {
     return {
-      state: "Planning first experiments",
-      observation: `${latestPlan.experiments.length} experiment${latestPlan.experiments.length === 1 ? "" : "s"} are ready.`,
+      state: "Planning first model trials",
+      observation: `${latestPlan.experiments.length} model trial${latestPlan.experiments.length === 1 ? "" : "s"} are ready.`,
       reasoning: "The initial batch establishes a baseline and tests the most likely model family for the goal.",
-      decision: `Start ${latestExperiment.model || "the first experiment"}.`,
-      expectedOutcome: "Produce the first comparable metrics for champion selection.",
+      decision: `Start ${latestExperiment.model || "the first model trial"}.`,
+      expectedOutcome: "Produce the first comparable metrics for choosing the best model.",
       confidenceLabel: "Plan ready",
       updatedAt: latestPlan.created_at,
     };
@@ -1151,7 +1235,7 @@ export function buildMissionStages(
   const latestPlan = detail.plans[0] ?? null;
   const latestDecision = detail.decisions[0] ?? null;
   const counts = jobStatusCounts(detail.jobs);
-  const completed = counts.SUCCEEDED + counts.FAILED;
+  const completed = counts.SUCCEEDED;
   const active = counts.QUEUED + counts.ASSIGNED + counts.RUNNING;
   const evaluationDone = detail.runEvaluations.length > 0 || detail.agentMemory.some((record) => record.kind === "training_evaluation");
   const followUpPlan = latestDecision ? detail.plans.find((plan) => plan.source_decision_id === latestDecision.id) : null;
@@ -1188,18 +1272,18 @@ export function buildMissionStages(
     },
     {
       id: "plan",
-      label: "Initial Plan Created",
-      detail: latestPlan ? `${latestPlan.experiments.length} experiments selected for the first pass.` : "Starts after dataset review.",
+      label: "Trial Plan Created",
+      detail: latestPlan ? `${latestPlan.experiments.length} model trial${latestPlan.experiments.length === 1 ? "" : "s"} selected for the first pass.` : "Starts after dataset review.",
       status: status(Boolean(latestPlan), Boolean(dataset && missionDatasetProfiled(dataset) && !latestPlan)),
       timestamp: latestPlan?.created_at,
     },
     {
       id: "experiments",
-      label: "Initial Experiments",
+      label: "Model Trials",
       detail:
         detail.jobs.length > 0
-          ? `${completed}/${detail.jobs.length} experiments complete${active > 0 ? `, ${active} still running.` : "."}`
-          : "Experiments start after the plan is approved or auto-run.",
+          ? `${completed}/${detail.jobs.length} model trial${detail.jobs.length === 1 ? "" : "s"} complete${counts.FAILED > 0 ? `, ${counts.FAILED} failed` : ""}${active > 0 ? `, ${active} running or waiting.` : "."}`
+          : "Model trials start after the plan is approved or auto-run.",
       status: status(detail.jobs.length > 0 && active === 0, active > 0 || Boolean(latestPlan && detail.jobs.length === 0)),
       timestamp: detail.jobs[0]?.created_at,
     },
@@ -1228,10 +1312,10 @@ export function buildMissionStages(
     },
     {
       id: "champion",
-      label: "Champion Selection",
+      label: "Choosing the Best Model",
       detail: detail.champion
         ? handoffReady
-          ? "Champion selected and the handoff path is complete."
+          ? "Best model selected and the handoff path is complete."
           : "Best candidate selected for handoff."
         : "Starts after enough evidence is available.",
       status: status(championSelected, evaluationDone && !championSelected && !refinementNeedsFollowUp),
@@ -1239,14 +1323,14 @@ export function buildMissionStages(
     },
     {
       id: "export",
-      label: "Export",
-      detail: exportReady ? "ONNX handoff package is ready." : detail.champion ? "Preparing model handoff package." : "Waiting for champion selection.",
+      label: "Test & Export",
+      detail: exportReady ? "Portable model package is ready." : detail.champion ? "Preparing model handoff package." : "Waiting for the best model.",
       status: status(exportReady, Boolean(detail.champion && !exportReady)),
       timestamp: readyONNXExport(exportDemo.exports)?.completed_at || readyONNXExport(exportDemo.exports)?.updated_at,
     },
     {
       id: "demo",
-      label: "Demo Validation",
+      label: "Try Model",
       detail: demoValidated ? "A demo image has been tested." : "Run a demo image after export readiness.",
       status: status(demoValidated, exportReady && !demoValidated),
       timestamp: exportDemo.demoPredictions[0]?.completed_at || exportDemo.demoPredictions[0]?.created_at,
@@ -1312,7 +1396,7 @@ export function buildActivityFeed(
       timestamp: exportRecord.completed_at || exportRecord.updated_at || exportRecord.created_at || new Date().toISOString(),
       status: "succeeded",
       evidenceSummary: "ONNX artifact readiness was reported.",
-      resultSummary: "Open Export to run a demo image or inspect the handoff package.",
+      resultSummary: "Open Test & Export to run a demo image or inspect the handoff package.",
       technicalSource: "Export record",
       developerPayloadRef: exportRecord.id || exportRecord.artifact_uri || "",
     });
@@ -1343,13 +1427,18 @@ export function buildResultsSummary(
   const topCandidates = comparison
     .slice()
     .sort((left, right) => right.rankScore - left.rankScore)
-    .slice(0, 3)
+    .slice(0, 8)
     .map((row, index) => ({
       rank: index + 1,
       model: row.model || `Candidate ${index + 1}`,
-      metricLabel: row.primaryMetricLabel,
+      metricLabel: userFacingMetricLabel(row.primaryMetricLabel),
       metricValue: formatMaybeMetric(row.primaryMetricValue),
-      status: row.isChampion ? "Champion" : row.divergenceStatus || "Candidate",
+      metricTechnicalLabel: metricTechnicalLabel(row.primaryMetricLabel),
+      accuracyValue: row.secondaryMetricLabel === "Accuracy" ? formatMaybeMetric(row.secondaryMetricValue) : "-",
+      latency: formatLatency(row.latencyMs),
+      modelSize: row.modelSize || "-",
+      cost: formatCurrency(row.costUsd),
+      status: row.isChampion ? "Best model so far" : row.divergenceStatus || "Candidate",
       why: row.isChampion
         ? "Best balance of mission score and deployment fit."
         : candidateWhyText(row),
@@ -1357,11 +1446,32 @@ export function buildResultsSummary(
     }));
   const learningSummary = resultsLearningSummary(detail);
   const remainingRisks = resultsRemainingRisks(detail, exportDemo);
+  const resultEvaluation =
+    (detail.champion
+      ? detail.runEvaluations.find((evaluation) => evaluation.job_id === detail.champion?.job_id)
+      : null) ??
+    detail.runEvaluations[0] ??
+    null;
+  const perClassRows = perClassMetricRows(resultEvaluation?.per_class_metrics ?? {})
+    .slice(0, 8)
+    .map((row) => ({
+      label: row.label,
+      precision: formatMetricNumber(row.precision),
+      recall: formatMetricNumber(row.recall),
+      f1: formatMetricNumber(row.f1),
+    }));
+  const confusionMatrix = normalizedConfusionMatrix(resultEvaluation?.confusion_matrix).slice(0, 6).map((row) => row.slice(0, 6));
+  const leaderComparison =
+    championRow && baselineRow && championRow.jobId !== baselineRow.jobId && improvement > 0
+      ? `${formatMaybeMetric(championRow.primaryMetricValue)} beats the nearest comparison by ${improvement.toFixed(3)}.`
+      : championRow
+        ? `${formatMaybeMetric(championRow.primaryMetricValue)} is the current leading score.`
+        : "Model Express is waiting for comparable scores.";
 
   return {
     hasResults: detail.runSummaries.length > 0 || Boolean(detail.champion),
     championModel: champion?.model || championRow?.model || (runTotals.bestPrimaryMetricValue > 0 ? "Best candidate emerging" : "No champion yet"),
-    primaryMetricLabel: champion?.primaryMetricLabel || championRow?.primaryMetricLabel || runTotals.bestPrimaryMetricLabel,
+    primaryMetricLabel: userFacingMetricLabel(champion?.primaryMetricLabel || championRow?.primaryMetricLabel || runTotals.bestPrimaryMetricLabel),
     primaryMetricValue:
       champion?.primaryMetricValue ||
       (championRow ? formatMaybeMetric(championRow.primaryMetricValue) : runTotals.bestPrimaryMetricValue > 0 ? formatMaybeMetric(runTotals.bestPrimaryMetricValue) : "Pending"),
@@ -1372,15 +1482,17 @@ export function buildResultsSummary(
           ? "Baseline comparison available"
           : "Baseline pending",
     exportStatus: exportReady ? "Export ready" : detail.champion ? "Preparing export" : "Waiting",
+    scoreContext: "Higher is better. The balanced score measures performance across all classes, not just the easy ones.",
+    leaderComparison,
     whyItWon:
-      detail.champion?.selection_reason
-        ? userFacingActivityText(detail.champion.selection_reason, 220)
-        : championRow
-          ? "This candidate currently has the strongest mission score among completed experiments."
-          : "Model Express is still collecting evidence before choosing a champion.",
+      championRow
+        ? `${championRow.model || "The leader"} has the strongest available score and deployment fit among completed model trials.`
+        : "Model Express is still collecting evidence before choosing the best model.",
     learningSummary,
     remainingRisks,
     topCandidates,
+    perClassRows,
+    confusionMatrix,
   };
 }
 
@@ -1390,7 +1502,7 @@ export function buildExportSummary(detail: ProjectDetail, exportDemo: ChampionEx
   const validationErrors = exportDemo.exports.flatMap((item) => item.validation_errors ?? []);
   const demoSucceeded = exportDemo.demoPredictions.some((prediction) => normalizedStatus(prediction.status || "") === "SUCCEEDED");
   const includes = [
-    readyExport ? "ONNX model" : "ONNX model request",
+    readyExport ? "Portable model package (ONNX)" : "Portable model package request",
     "Preprocessing contract",
     "Label map",
     "Model card",
@@ -1398,14 +1510,14 @@ export function buildExportSummary(detail: ProjectDetail, exportDemo: ChampionEx
   ];
   return {
     hasChampion,
-    title: hasChampion ? "Model handoff package" : "Waiting for champion",
+    title: hasChampion ? "Test & Export" : "Waiting for the best model",
     statusLabel: readyExport ? "Ready" : hasChampion ? "Preparing" : "Pending",
     readinessLabel: readyExport
-      ? "The package has a ready ONNX artifact and can be validated with a demo image."
+      ? "The portable package is ready and can be validated with a demo image."
       : hasChampion
-        ? "The champion is selected; prepare the ONNX package when you are ready."
-        : "Export begins after Model Express selects the best model.",
-    primaryFormat: readyExport?.format?.toUpperCase() || "ONNX",
+        ? "The best model is selected; prepare the portable package when you are ready."
+        : "Model Express is still comparing candidates. After it chooses the best model, this page will let you test images and prepare a portable model package.",
+    primaryFormat: readyExport?.format ? `Portable package (${readyExport.format.toUpperCase()})` : "Portable package (ONNX)",
     validationStatus: validationErrors.length > 0 ? "Needs review" : readyExport ? "Passed" : "Not run",
     demoStatus: demoSucceeded ? "Demo passed" : exportDemo.demoImages.length > 0 ? "Demo available" : "Waiting for image",
     includes,
@@ -1518,7 +1630,7 @@ export function activityCardFromEvent(event: AgentActivityEvent): ActivityCardMo
     title = "Decision recorded";
   } else if (text.includes("training") || text.includes("job") || text.includes("run") || text.includes("queued")) {
     type = "experiment";
-    title = status === "succeeded" ? "Experiment finished" : "Experiment started";
+    title = status === "succeeded" ? "Model trial finished" : "Model trial started";
   } else if (text.includes("dataset") || text.includes("profile") || text.includes("memory") || text.includes("retrieval")) {
     type = "observation";
     title = text.includes("dataset") ? "Dataset observation" : "AI reviewed previous experiments";
@@ -1566,12 +1678,12 @@ export function activityCardFromRun(
   return {
     id: `run-${summary.job_id}`,
     type: terminal ? "result" : "experiment",
-    title: terminal ? "Experiment finished" : "Experiment started",
-    summary: `${summary.model || "Candidate model"} ${terminal ? "finished" : "is running"} with ${primary.label} ${formatMaybeMetric(primary.value)}.`,
+    title: terminal ? "Model trial finished" : "Model trial started",
+    summary: `${summary.model || "Candidate model"} ${terminal ? "finished" : "is running"} with ${userFacingMetricLabel(primary.label)} ${formatMaybeMetric(primary.value)}.`,
     timestamp: summary.updated_at || summary.created_at,
     status: status as ActivityCardModel["status"],
     evidenceSummary: `${summary.epochs_completed} epochs completed`,
-    resultSummary: primary.value > 0 ? `${formatMaybeMetric(primary.value)} ${primary.label}` : "Metric pending",
+    resultSummary: primary.value > 0 ? `${formatMaybeMetric(primary.value)} ${userFacingMetricLabel(primary.label)}` : "Metric pending",
     technicalSource: "Training result",
     developerPayloadRef: summary.job_id,
   };
@@ -1592,7 +1704,7 @@ export function candidateWhyText(row: ChampionComparisonRow) {
     row.costUsd > 0 ? `${formatCurrency(row.costUsd)} cost` : "",
     row.objectiveFit > 0 ? `${formatMaybeMetric(row.objectiveFit)} mission fit` : "",
   ].filter(Boolean);
-  return details.length > 0 ? `Strong candidate with ${details.join(", ")}.` : "Comparable result from a completed experiment.";
+  return details.length > 0 ? `Strong candidate with ${details.join(", ")}.` : "Comparable result from a completed model trial.";
 }
 
 export function resultsLearningSummary(detail: ProjectDetail) {
@@ -1603,7 +1715,7 @@ export function resultsLearningSummary(detail: ProjectDetail) {
     latestDecision ? userFacingActivityText(decisionRationaleSummary(latestDecision), 160) : "",
     latestEvaluation?.recommendation_summary ? userFacingActivityText(latestEvaluation.recommendation_summary, 160) : "",
     latestMemory?.summary ? userFacingActivityText(latestMemory.summary, 160) : "",
-    detail.runSummaries.length > 0 ? `${detail.runSummaries.length} experiment${detail.runSummaries.length === 1 ? "" : "s"} produced comparable evidence.` : "",
+    detail.runSummaries.length > 0 ? `${detail.runSummaries.length} model trial${detail.runSummaries.length === 1 ? "" : "s"} produced comparable evidence.` : "",
   ]);
   return items.length > 0 ? items.slice(0, 4) : ["Learning summary will appear after the first completed experiment."];
 }
@@ -1614,7 +1726,7 @@ export function resultsRemainingRisks(detail: ProjectDetail, exportDemo: Champio
     ...exportDemo.limitations.map((item) => userFacingActivityText(item, 140)),
     ...stringArrayPayload(latestDecision?.payload.risks).map((item) => userFacingActivityText(item, 140)),
     detail.jobs.some((job) => normalizedStatus(job.status) === "FAILED")
-      ? "Some experiments failed and should be reviewed before relying on the result."
+      ? "Some model trials failed and should be reviewed before relying on the result."
       : "",
     exportDemo.demoPredictions.length === 0 ? "Run a demo image before deployment handoff." : "",
   ]);
@@ -1674,7 +1786,7 @@ export function buildMissionDigest({
   const liveRefreshUnhealthy = ["stale", "error"].includes(detail.loadStatus.liveRefresh.status);
   const orchestratorUnhealthy = Boolean((health && health.status !== "ok") || liveRefreshUnhealthy);
   const workerCapacityBlocked = workerSummary.failed && (queuedJobs > 0 || activeJobs > 0);
-  const hardBlocked = orchestratorUnhealthy || Boolean(activeFailedEvent) || Boolean(blockingDecision) || workerCapacityBlocked || failedWithoutProgress;
+  const hardBlocked = orchestratorUnhealthy || Boolean(activeFailedEvent) || Boolean(blockingDecision) || failedWithoutProgress;
 
   let state: MissionDigestState = "plan_ready";
   if (hardBlocked) {
@@ -1698,6 +1810,15 @@ export function buildMissionDigest({
   } else {
     state = datasetProfiled ? "plan_ready" : "profiling";
   }
+  const requiresUserAction = stateRequiresUserAction({
+    state,
+    orchestratorUnhealthy,
+    activeFailedEvent,
+    blockingDecision: Boolean(blockingDecision),
+    failedWithoutProgress,
+    selectedProject,
+    dataset,
+  });
 
   const facts = missionFacts({
     state,
@@ -1732,9 +1853,10 @@ export function buildMissionDigest({
   return {
     state,
     stateLabel: missionStateLabel(state),
-    healthLabel: hardBlocked ? "Needs attention" : missionHealthLabel(health),
+    healthLabel: hardBlocked ? "Action required" : missionHealthLabel(health),
     headline: stateCopy.headline,
     detail: stateCopy.detail,
+    requiresUserAction,
     facts,
     health: buildMissionHealth({
       health,
@@ -1778,6 +1900,29 @@ export function buildMissionDigest({
     }),
     champion: detail.champion ? buildMissionChampionSummary(detail) : undefined,
   };
+}
+
+function stateRequiresUserAction({
+  state,
+  orchestratorUnhealthy,
+  activeFailedEvent,
+  blockingDecision,
+  failedWithoutProgress,
+  selectedProject,
+  dataset,
+}: {
+  state: MissionDigestState;
+  orchestratorUnhealthy: boolean;
+  activeFailedEvent?: AgentActivityEvent;
+  blockingDecision: boolean;
+  failedWithoutProgress: boolean;
+  selectedProject: Project | null;
+  dataset: Dataset | null;
+}) {
+  if (state === "empty") return false;
+  if (state === "dataset_needed") return Boolean(selectedProject && !dataset);
+  if (state !== "blocked") return false;
+  return orchestratorUnhealthy || Boolean(activeFailedEvent) || blockingDecision || failedWithoutProgress;
 }
 
 export function buildMissionLiveActivity({
@@ -2040,8 +2185,8 @@ export function missionStateCopy({
     }
     if (workerCapacityBlocked) {
       return {
-        headline: "Worker supervision needs attention.",
-        detail: "A worker or requirement reported a failure. Open Operations for the exact worker state.",
+        headline: "Waiting for training capacity.",
+        detail: "A worker or requirement needs review, but completed results remain safe and queued model trials can continue when capacity returns.",
       };
     }
     if (blockingDecision || activeFailedEvent) {
@@ -2075,10 +2220,10 @@ export function missionStateCopy({
   }
   if (state === "training") {
     return {
-      headline: activeJobs > 0 ? "Experiments are training." : "Experiments are queued.",
+      headline: activeJobs > 0 ? "Model trials are running." : "Waiting for training capacity.",
       detail: activeJobs > 0
-        ? `${activeJobs} training job${activeJobs === 1 ? "" : "s"} running${runTotals.bestPrimaryMetricValue > 0 ? `; best ${runTotals.bestPrimaryMetricLabel} is ${formatMaybeMetric(runTotals.bestPrimaryMetricValue)}.` : "."}`
-        : `${queuedJobs} queued job${queuedJobs === 1 ? "" : "s"} waiting for worker capacity.`,
+        ? `${activeJobs} model trial${activeJobs === 1 ? "" : "s"} running${runTotals.bestPrimaryMetricValue > 0 ? `; best ${runTotals.bestPrimaryMetricLabel} is ${formatMaybeMetric(runTotals.bestPrimaryMetricValue)}.` : "."}`
+        : `${queuedJobs} queued model trial${queuedJobs === 1 ? "" : "s"} waiting for worker capacity.`,
     };
   }
   if (state === "follow_up_ready") {
@@ -2090,19 +2235,19 @@ export function missionStateCopy({
   if (state === "champion_selected") {
     return {
       headline: "A champion has been selected.",
-      detail: `The best reported ${runTotals.bestPrimaryMetricLabel} is ${formatMaybeMetric(runTotals.bestPrimaryMetricValue)}. Export, demo, or compare it against completed runs.`,
+      detail: `The best reported ${runTotals.bestPrimaryMetricLabel} is ${formatMaybeMetric(runTotals.bestPrimaryMetricValue)}. Test, export, or compare it against completed runs.`,
     };
   }
   if (state === "review_needed") {
     return {
       headline: "Completed runs need review.",
-      detail: `${terminalJobs} terminal run${terminalJobs === 1 ? "" : "s"} are ready for the experiment reviewer to compare.`,
+      detail: `${terminalJobs} terminal run${terminalJobs === 1 ? "" : "s"} are ready to compare for choosing the best model.`,
     };
   }
   if (latestPlan) {
     return {
       headline: "An experiment plan is ready.",
-      detail: `${latestPlan.experiments.length} experiment${latestPlan.experiments.length === 1 ? "" : "s"} target ${latestPlan.target_metric}; launch them or inspect the plan first.`,
+      detail: `${latestPlan.experiments.length} model trial${latestPlan.experiments.length === 1 ? "" : "s"} target ${latestPlan.target_metric}; launch them or inspect the plan first.`,
     };
   }
   return {
@@ -2375,7 +2520,7 @@ export function buildMissionNextActions({
     ];
   }
   return [
-    action("open-export", "Open Export", "Use, demo, export, or validate the selected champion.", "primary", {
+    action("open-export", "Test & Export", "Try images, prepare a portable package, or validate the selected model.", "primary", {
       actionKey: "open_export",
       targetTab: "export",
       targetId: "export-demo",
@@ -2668,15 +2813,15 @@ export function missionStateLabel(state: MissionDigestState) {
     case "plan_ready":
       return "Plan Ready";
     case "training":
-      return "Training";
+      return "Running";
     case "review_needed":
-      return "Review Needed";
+      return "Choosing Best Model";
     case "follow_up_ready":
       return "Follow-up Ready";
     case "champion_selected":
-      return "Champion Selected";
+      return "Best Model Selected";
     case "blocked":
-      return "Blocked";
+      return "Action Required";
   }
 }
 
@@ -4365,7 +4510,7 @@ export function visualAnalysisRerunDisabledReason(
   if (!visualAnalysis.manualRunSupported) return "Backend manual visual-analysis endpoint is not available.";
   const policy = visualAnalysis.rerunPolicy;
   if (policy?.manual_run_allowed === false) {
-    return policy.disabled_reason || policy.reason || "Manual visual-analysis rerun is currently blocked by backend policy.";
+    return policy.disabled_reason || policy.reason || "Manual visual-analysis rerun is currently disabled by backend policy.";
   }
   if (loading) return "Another Mission Control request is in progress.";
   return "";
@@ -4383,7 +4528,7 @@ export function visualAnalysisPolicyReadiness(policy: VisualAnalysisRerunPolicy 
   if (policy.active_job_status) return normalizedStatus(policy.active_job_status);
   if (policy.manual_run_allowed === false) {
     if (policy.next_allowed_at) return `After ${new Date(policy.next_allowed_at).toLocaleTimeString()}`;
-    return "Blocked";
+    return "Policy limited";
   }
   return "Ready";
 }
@@ -4753,6 +4898,7 @@ export function buildChampionComparison(
         runtimeSeconds: summary.runtime_seconds,
         costUsd: summary.estimated_cost_usd,
         latencyMs,
+        modelSize: formatModelSize(modelProfile),
         objectiveFit,
         trainValidationGap,
         divergenceStatus,
@@ -6467,17 +6613,68 @@ export function attachDemoPredictionPreview(prediction: ChampionDemoPrediction, 
 }
 
 export function demoImageURI(image?: ChampionDemoImage | null) {
-  return image?.uri || image?.image_uri || "";
+  return image?.uri || image?.image_uri || demoImageOriginalURI(image) || "";
 }
 
 export function demoImageInferenceURI(image?: ChampionDemoImage | null) {
-  const source = demoImageURI(image);
-  if (source && !source.startsWith("s3://")) return source;
+  const original = demoImageOriginalURI(image);
+  const candidates = original ? [original] : demoImageIsStoredDemoRecord(image) ? [] : [image?.uri, image?.image_uri];
+  for (const candidate of candidates) {
+    const source = browserReadableDemoImageSource(candidate);
+    if (source) return source;
+  }
+  return "";
+}
+
+export function browserReadableDemoImageSource(value: unknown) {
+  const source = String(value ?? "").trim();
+  if (!source || source.startsWith("s3://")) return "";
+  if (source.startsWith("data:image/")) return source;
+  if (source.startsWith("file://")) return source;
+  if (source.startsWith("http://") || source.startsWith("https://")) return source;
   return "";
 }
 
 export function demoImagePreviewURI(image?: ChampionDemoImage | null) {
   return image?.preview_uri || image?.thumbnail_uri || image?.uri || image?.image_uri || "";
+}
+
+export function demoImageIsRunnable(image?: ChampionDemoImage | null) {
+  if (!image) return false;
+  const original = demoImageOriginalURI(image);
+  if (original) return true;
+  const source = demoImageURI(image);
+  if (!source) return false;
+  if (demoImageIsStoredDemoRecord(image)) return false;
+  if (source.startsWith("s3://") || source.startsWith("data:image/") || source.startsWith("file://")) return true;
+  if (source === image.preview_uri || source === image.thumbnail_uri) return false;
+  return true;
+}
+
+export function demoImageOriginalURI(image?: ChampionDemoImage | null) {
+  const metadata = recordObject(image?.metadata);
+  return (
+    image?.original_image_uri ||
+    image?.source_artifact_uri ||
+    recordString(metadata, "original_image_uri") ||
+    recordString(metadata, "source_artifact_uri")
+  );
+}
+
+function demoImageIsStoredDemoRecord(image?: ChampionDemoImage | null) {
+  if (!image || demoImageIsExplicitCustom(image)) return false;
+  const metadata = recordObject(image.metadata);
+  const sourceType = recordString(metadata, "demo_source_type").toLowerCase();
+  if (["heldout", "holdout", "test", "stored", "exemplar"].some((token) => sourceType.includes(token))) return true;
+  const split = (image.split || recordString(metadata, "split")).toLowerCase();
+  if (["test", "heldout", "holdout", "validation", "val"].includes(split)) return true;
+  return Boolean(image.preview_uri || image.thumbnail_uri || recordString(metadata, "preview_uri") || recordString(metadata, "thumbnail_uri"));
+}
+
+function demoImageIsExplicitCustom(image: ChampionDemoImage) {
+  const metadata = recordObject(image.metadata);
+  const sourceType = recordString(metadata, "demo_source_type").toLowerCase();
+  return sourceType.startsWith("custom") || String(image.split || recordString(metadata, "split")).toLowerCase() === "custom";
 }
 
 export function demoImageLabel(image?: ChampionDemoImage | null) {
@@ -6508,6 +6705,8 @@ export function demoPredictionRequestMetadata(image: ChampionDemoImage) {
   if (image.width) metadata.width = image.width;
   if (image.height) metadata.height = image.height;
   if (image.image_id || image.id) metadata.image_id = image.image_id || image.id;
+  if (image.original_image_uri) metadata.original_image_uri = image.original_image_uri;
+  if (image.source_artifact_uri) metadata.source_artifact_uri = image.source_artifact_uri;
   return metadata;
 }
 

@@ -40,6 +40,44 @@ test("stale failed worker state does not block export-ready champion demo availa
   assert.equal(workerHealth(digest).tone, "warning");
 });
 
+test("demo image runnable guard treats thumbnails as display-only for stored records", async () => {
+  const { demoImageInferenceURI, demoImageIsRunnable } = await loadMissionModel();
+  const thumbnailURI = "data:image/jpeg;base64,THUMB";
+  const originalURI = "s3://bucket/model-express/artifacts/job_1/heldout_demo_images/cat.png";
+
+  const thumbnailOnlyStored = {
+    uri: thumbnailURI,
+    image_uri: thumbnailURI,
+    preview_uri: thumbnailURI,
+    thumbnail_uri: thumbnailURI,
+    split: "test",
+    metadata: { demo_source_type: "heldout_test_thumbnail_preview" },
+  };
+  const originalStored = {
+    uri: thumbnailURI,
+    image_uri: thumbnailURI,
+    preview_uri: thumbnailURI,
+    thumbnail_uri: thumbnailURI,
+    source_artifact_uri: originalURI,
+    split: "test",
+  };
+  const sourceOnlyStored = {
+    source_artifact_uri: originalURI,
+    metadata: { demo_source_type: "heldout_test_original_artifact" },
+  };
+  const customDataImage = { uri: "data:image/png;base64,AAAA", image_uri: "data:image/png;base64,AAAA", split: "custom" };
+  const customFileImage = { uri: "file:///tmp/cat.png", image_uri: "file:///tmp/cat.png", split: "custom" };
+
+  assert.equal(demoImageIsRunnable(thumbnailOnlyStored), false);
+  assert.equal(demoImageInferenceURI(thumbnailOnlyStored), "");
+  assert.equal(demoImageIsRunnable(originalStored), true);
+  assert.equal(demoImageIsRunnable(sourceOnlyStored), true);
+  assert.equal(demoImageIsRunnable(customDataImage), true);
+  assert.equal(demoImageInferenceURI(customDataImage), customDataImage.uri);
+  assert.equal(demoImageIsRunnable(customFileImage), true);
+  assert.equal(demoImageInferenceURI(customFileImage), customFileImage.uri);
+});
+
 test("stale failed worker state does not block completed demo validation", async () => {
   const { buildMissionDigest, buildMissionStages } = await loadMissionModel();
   const project = projectFixture();

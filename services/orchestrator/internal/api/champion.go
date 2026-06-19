@@ -22,6 +22,8 @@ import (
 	"model-express/services/orchestrator/internal/store"
 )
 
+const championDemoOriginalUnavailableCode = "ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO"
+
 type createChampionExportRequest struct {
 	Format      string         `json:"format"`
 	ArtifactURI string         `json:"artifact_uri"`
@@ -865,7 +867,9 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 	if req.MaxDetections > 0 {
 		imageMetadata["max_detections"] = req.MaxDetections
 	}
+	matchedStoredDemoImage := false
 	if matchedImageID, matchedTrueLabel, matchedMetadata, ok := championDemoImageMetadata(championHeldoutDemoImageProfile(champion), imageURI); ok {
+		matchedStoredDemoImage = true
 		if imageID == "" {
 			imageID = matchedImageID
 		}
@@ -879,6 +883,7 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		}
 	} else if err == nil {
 		if matchedImageID, matchedTrueLabel, matchedMetadata, ok := championDemoImageMetadata(dataset.Profile, imageURI); ok {
+			matchedStoredDemoImage = true
 			if imageID == "" {
 				imageID = matchedImageID
 			}
@@ -897,6 +902,14 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		imageMetadata["requested_image_uri"] = imageURI
 		imageMetadata["backend_image_uri"] = backendImageURI
 	}
+	storedOriginalUnavailable := matchedStoredDemoImage && !championDemoHasOriginalInferenceURI(imageMetadata)
+	predictionStatus := runs.ChampionDemoPredictionStatusPending
+	predictionError := ""
+	if storedOriginalUnavailable {
+		imageMetadata["error_code"] = championDemoOriginalUnavailableCode
+		predictionStatus = runs.ChampionDemoPredictionStatusFailed
+		predictionError = championDemoOriginalUnavailableCode + ": stored demo images need original_image_uri or source_artifact_uri for inference; preview_uri and thumbnail_uri are display-only"
+	}
 
 	prediction, err := s.store.CreateChampionDemoPrediction(runs.ChampionDemoPredictionCreate{
 		ProjectID:     champion.ProjectID,
@@ -906,17 +919,18 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		ImageURI:      imageURI,
 		ImageID:       imageID,
 		ImageMetadata: imageMetadata,
-		Status:        runs.ChampionDemoPredictionStatusPending,
+		Status:        predictionStatus,
 		TrueLabel:     trueLabel,
 		TopK:          []runs.DemoPredictionTopK{},
+		Error:         predictionError,
 	})
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
 	readyExport, hasReadyExport := usableChampionExport(s.store, champion)
-	runtimeAvailable := hasReadyExport
-	if hasReadyExport {
+	runtimeAvailable := hasReadyExport && !storedOriginalUnavailable
+	if hasReadyExport && !storedOriginalUnavailable {
 		jobConfig := map[string]any{
 			"dataset_id":             datasetID,
 			"champion_id":            champion.ID,
@@ -951,7 +965,7 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 			writeStoreError(c, err)
 			return
 		}
-	} else {
+	} else if !storedOriginalUnavailable {
 		prediction, err = s.store.UpdateChampionDemoPrediction(prediction.ID, runs.ChampionDemoPredictionUpdate{
 			Status: runs.ChampionDemoPredictionStatusRuntimeUnavailable,
 			Error:  "no READY champion export is available for worker-backed demo prediction",
@@ -1561,6 +1575,15 @@ func championDemoInferenceImageURI(requestedImageURI string, metadata map[string
 		}
 	}
 	return requestedImageURI
+}
+
+func championDemoHasOriginalInferenceURI(metadata map[string]any) bool {
+	for _, key := range []string{"original_image_uri", "source_artifact_uri"} {
+		if strings.TrimSpace(firstString(metadata, key)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeChampionExportFormat(format string) string {

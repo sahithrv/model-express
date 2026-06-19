@@ -528,6 +528,25 @@ class ChampionJobTests(unittest.TestCase):
             self.assertEqual(downloaded[0][0], original_uri)
             self.assertTrue(path.exists())
 
+    def test_demo_image_path_rejects_stored_thumbnail_without_original(self) -> None:
+        thumbnail_uri = "data:image/jpeg;base64,BBBB"
+
+        path, error = _demo_image_path(
+            {
+                "image_uri": thumbnail_uri,
+                "image_metadata": {
+                    "demo_source_type": "heldout_test_thumbnail_preview",
+                    "split": "test",
+                    "preview_uri": thumbnail_uri,
+                    "thumbnail_uri": thumbnail_uri,
+                },
+            },
+            "job_predict",
+        )
+
+        self.assertIsNone(path)
+        self.assertIn("ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO", error)
+
     def test_dispatch_rejects_unknown_templates_instead_of_faking_success(self) -> None:
         client = FakeClient()
         with self.assertRaises(ValueError):

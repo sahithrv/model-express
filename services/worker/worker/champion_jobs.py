@@ -196,9 +196,12 @@ def run_champion_demo_prediction_job(client: OrchestratorClient, job: dict) -> N
             "error": "No worker-owned export manifest path or manifest metadata was supplied or found.",
         }
     elif image_path is None:
+        error_code = "IMAGE_UNAVAILABLE"
+        if image_error.startswith("ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO"):
+            error_code = "ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO"
         payload = {
             "status": "FAILED",
-            "error_code": "IMAGE_UNAVAILABLE",
+            "error_code": error_code,
             "error": image_error or "Demo image is unavailable to the worker.",
         }
     else:
@@ -877,6 +880,12 @@ def _demo_image_path(config: dict, job_id: str) -> tuple[Path | None, str]:
     if not value:
         value = _first_string(image_metadata, "original_image_uri", "source_artifact_uri")
     if not value:
+        if _stored_demo_image_requires_original(config, image_metadata):
+            return (
+                None,
+                "ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO: stored demo images need original_image_uri or "
+                "source_artifact_uri for inference; preview_uri and thumbnail_uri are display-only",
+            )
         value = _first_string(config, "local_image_path", "image_path", "image_uri")
     if not value:
         return None, "image_uri or local_image_path is required"
@@ -894,6 +903,25 @@ def _demo_image_path(config: dict, job_id: str) -> tuple[Path | None, str]:
     if not path.exists() or not path.is_file():
         return None, f"demo image not found: {path}"
     return path, ""
+
+
+def _stored_demo_image_requires_original(config: dict, image_metadata: dict) -> bool:
+    if _explicit_custom_demo_image(config, image_metadata):
+        return False
+    source_type = _first_string(config, "demo_source_type") or _first_string(image_metadata, "demo_source_type")
+    normalized_source_type = source_type.strip().lower()
+    if any(token in normalized_source_type for token in ("heldout", "holdout", "test", "stored", "exemplar")):
+        return True
+    split = (_first_string(config, "split") or _first_string(image_metadata, "split")).strip().lower()
+    if split in {"test", "heldout", "holdout", "validation", "val"}:
+        return True
+    return bool(_first_string(config, "preview_uri", "thumbnail_uri") or _first_string(image_metadata, "preview_uri", "thumbnail_uri"))
+
+
+def _explicit_custom_demo_image(config: dict, image_metadata: dict) -> bool:
+    source_type = (_first_string(config, "demo_source_type") or _first_string(image_metadata, "demo_source_type")).strip().lower()
+    split = (_first_string(config, "split") or _first_string(image_metadata, "split")).strip().lower()
+    return source_type.startswith("custom") or split == "custom"
 
 
 def _inline_demo_image_path(value: str, job_id: str) -> tuple[Path | None, str]:

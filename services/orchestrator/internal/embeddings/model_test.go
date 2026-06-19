@@ -8,6 +8,7 @@ import (
 )
 
 func TestConfigFromEnvReadsMemoryEmbeddingSettings(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("MODEL_EXPRESS_MEMORY_RETRIEVAL_ENABLED", "true")
 	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "true")
 	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER", "openai_compatible")
@@ -33,6 +34,9 @@ func TestConfigFromEnvReadsMemoryEmbeddingSettings(t *testing.T) {
 	}
 	if config.APIKey != "test-key" {
 		t.Fatalf("APIKey = %q", config.APIKey)
+	}
+	if config.APIKeySource != "MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY" {
+		t.Fatalf("APIKeySource = %q", config.APIKeySource)
 	}
 	if config.Dimensions != 8 {
 		t.Fatalf("Dimensions = %d, want 8", config.Dimensions)
@@ -70,6 +74,42 @@ func TestConfigFromEnvDefaultsDisabledAndSafe(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvUsesOpenAIAPIKeyFallbackForOpenAIProvider(t *testing.T) {
+	clearMemoryEmbeddingEnv(t)
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER", "openai")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small")
+	t.Setenv("OPENAI_API_KEY", "sk-memory-fallback")
+
+	config := ConfigFromEnv()
+
+	if config.APIKey != "sk-memory-fallback" {
+		t.Fatalf("APIKey = %q", config.APIKey)
+	}
+	if config.APIKeySource != "OPENAI_API_KEY" {
+		t.Fatalf("APIKeySource = %q", config.APIKeySource)
+	}
+	if err := config.ReadyForIndexing(); err != nil {
+		t.Fatalf("ReadyForIndexing() = %v", err)
+	}
+}
+
+func TestConfigFromEnvDoesNotUseOpenAIAPIKeyFallbackForCompatibleProvider(t *testing.T) {
+	clearMemoryEmbeddingEnv(t)
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDINGS_ENABLED", "true")
+	t.Setenv("MODEL_EXPRESS_MEMORY_EMBEDDING_PROVIDER", "openai_compatible")
+	t.Setenv("OPENAI_API_KEY", "sk-memory-fallback")
+
+	config := ConfigFromEnv()
+
+	if config.APIKey != "" {
+		t.Fatalf("APIKey = %q, want empty for openai_compatible fallback", config.APIKey)
+	}
+	if config.APIKeySource != "" {
+		t.Fatalf("APIKeySource = %q, want empty", config.APIKeySource)
+	}
+}
+
 func clearMemoryEmbeddingEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
@@ -81,6 +121,7 @@ func clearMemoryEmbeddingEnv(t *testing.T) {
 		"MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY",
 		"MODEL_EXPRESS_MEMORY_EMBEDDING_DIMENSIONS",
 		"MODEL_EXPRESS_MEMORY_BACKFILL_LIMIT",
+		"OPENAI_API_KEY",
 	} {
 		t.Setenv(name, "")
 	}
@@ -105,7 +146,7 @@ func TestReadyForIndexingRequiresConfiguredOpenAIModelAndKey(t *testing.T) {
 		BaseURL:           DefaultOpenAIBaseURL,
 		Dimensions:        4,
 	}
-	if err := missingKey.ReadyForIndexing(); err == nil || !strings.Contains(err.Error(), "MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY") {
+	if err := missingKey.ReadyForIndexing(); err == nil || !strings.Contains(err.Error(), "OPENAI_API_KEY") {
 		t.Fatalf("ReadyForIndexing() missing key error = %v", err)
 	}
 }
