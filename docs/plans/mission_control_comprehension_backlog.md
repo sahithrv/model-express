@@ -429,6 +429,7 @@ Acceptance criteria:
 - [ ] If backend inference is unavailable, show one clear action-oriented message such as `Demo worker unavailable` or `Original image unavailable for demo`.
 - [x] Do not show fallback as an error when fallback is normal/expected.
 - [x] The selected demo image should have a stable original image source that either the browser can load safely or the backend worker can read.
+- [x] Held-out demo image ordering keeps known-correct examples visible before known training-time mistakes, while still keeping hard failures inspectable.
 - [x] Prediction output should show image, predicted class, confidence bars, known label, and correctness.
 
 Likely fix areas:

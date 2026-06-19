@@ -96,6 +96,61 @@ class HeldoutDemoImageTests(unittest.TestCase):
         self.assertEqual(image["metadata"]["parity_status"], "unsafe")
         self.assertEqual(image["metadata"]["parity_failure_reason"], "original_image_artifact_upload_not_configured")
 
+    def test_demo_images_start_with_correct_examples_without_dropping_hard_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = {
+                "cat_correct": root / "cat_correct.png",
+                "dog_correct": root / "dog_correct.png",
+                "cat_wrong": root / "cat_wrong.png",
+                "dog_wrong": root / "dog_wrong.png",
+            }
+            for path in paths.values():
+                Image.new("RGB", (12, 8), (20, 40, 60)).save(path)
+            records = _demo_images_from_test_examples(
+                {
+                    "example_predictions": [
+                        {
+                            "path": str(paths["cat_wrong"]),
+                            "predicted_class": "dog",
+                            "true_class": "cat",
+                            "confidence": 0.99,
+                            "correct": False,
+                        },
+                        {
+                            "path": str(paths["dog_wrong"]),
+                            "predicted_class": "cat",
+                            "true_class": "dog",
+                            "confidence": 0.98,
+                            "correct": False,
+                        },
+                        {
+                            "path": str(paths["dog_correct"]),
+                            "predicted_class": "dog",
+                            "true_class": "dog",
+                            "confidence": 0.80,
+                            "correct": True,
+                        },
+                        {
+                            "path": str(paths["cat_correct"]),
+                            "predicted_class": "cat",
+                            "true_class": "cat",
+                            "confidence": 0.70,
+                            "correct": True,
+                        },
+                    ]
+                },
+                ["cat", "dog"],
+                max_total=4,
+            )
+
+        self.assertEqual(len(records), 4)
+        self.assertEqual(records[0]["metadata"]["correct_at_training"], True)
+        self.assertEqual(records[1]["metadata"]["correct_at_training"], False)
+        self.assertEqual(records[2]["metadata"]["correct_at_training"], True)
+        self.assertEqual(records[3]["metadata"]["correct_at_training"], False)
+        self.assertEqual(records[1]["metadata"]["confidence_at_training"], 0.99)
+
     def test_compacted_evaluation_payload_stays_below_safe_threshold_for_many_demo_images(self) -> None:
         thumbnail = "data:image/jpeg;base64," + ("B" * 8_000)
         original = "data:image/png;base64," + ("A" * 100_000)

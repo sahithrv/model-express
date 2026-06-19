@@ -3724,7 +3724,7 @@ def _demo_images_from_test_examples(
         return []
     wrong = [record for record in records if isinstance(record, dict) and record.get("correct") is False]
     correct = [record for record in records if isinstance(record, dict) and record.get("correct") is True]
-    ranked = sorted(wrong, key=lambda record: -float(record.get("confidence") or 0.0)) + _class_balanced_records(correct, class_names)
+    ranked = _mixed_demo_prediction_records(correct, wrong, class_names)
 
     demo_images: list[dict] = []
     seen_paths: set[str] = set()
@@ -3815,6 +3815,27 @@ def _class_balanced_records(records: list[dict], class_names: list[str]) -> list
         for class_name in sorted(by_class):
             if by_class[class_name]:
                 out.append(by_class[class_name].pop(0))
+    return out
+
+
+def _mixed_demo_prediction_records(correct: list[dict], wrong: list[dict], class_names: list[str]) -> list[dict]:
+    correct_ranked = _class_balanced_records(correct, class_names)
+    wrong_ranked = sorted(wrong, key=lambda record: -float(record.get("confidence") or 0.0))
+    if not correct_ranked:
+        return wrong_ranked
+    if not wrong_ranked:
+        return correct_ranked
+
+    out: list[dict] = []
+    correct_index = 0
+    wrong_index = 0
+    while correct_index < len(correct_ranked) or wrong_index < len(wrong_ranked):
+        if correct_index < len(correct_ranked):
+            out.append(correct_ranked[correct_index])
+            correct_index += 1
+        if wrong_index < len(wrong_ranked):
+            out.append(wrong_ranked[wrong_index])
+            wrong_index += 1
     return out
 
 

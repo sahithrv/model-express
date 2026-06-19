@@ -1425,8 +1425,6 @@ export function buildResultsSummary(
       : 0;
   const exportReady = Boolean(readyONNXExport(exportDemo.exports));
   const topCandidates = comparison
-    .slice()
-    .sort((left, right) => right.rankScore - left.rankScore)
     .slice(0, 8)
     .map((row, index) => ({
       rank: index + 1,
@@ -5540,7 +5538,7 @@ export function buildChampionExportDemo(detail: ProjectDetail): ChampionExportDe
     useCases,
     limitations: blockedPendingExport ? uniqueStrings([BLOCKED_EXPORT_LIMITATION, ...limitations]).slice(0, 5) : limitations,
     preprocessing: preprocessing.length > 0 ? preprocessing : ["Use the preprocessing from the winning experiment config."],
-    demoImages,
+    demoImages: orderDemoImagesForDemo(demoImages),
     demoPredictions,
     feedback: detail.championFeedback,
   };
@@ -6449,7 +6447,46 @@ export function artifactComparablePath(uri: string) {
 
 export function demoImagesFromUnknown(value: unknown): ChampionDemoImage[] {
   if (!Array.isArray(value)) return [];
-  return value.map((item) => recordObject(item) as ChampionDemoImage).filter((item) => Object.keys(item).length > 0);
+  return orderDemoImagesForDemo(
+    value.map((item) => recordObject(item) as ChampionDemoImage).filter((item) => Object.keys(item).length > 0),
+  );
+}
+
+function orderDemoImagesForDemo(images: ChampionDemoImage[]) {
+  if (!images.some((image) => demoImageTrainingCorrectness(image) !== null)) return images;
+  const correct: ChampionDemoImage[] = [];
+  const unknown: ChampionDemoImage[] = [];
+  const incorrect: ChampionDemoImage[] = [];
+  for (const image of images) {
+    const correctness = demoImageTrainingCorrectness(image);
+    if (correctness === true) {
+      correct.push(image);
+    } else if (correctness === false) {
+      incorrect.push(image);
+    } else {
+      unknown.push(image);
+    }
+  }
+  const ordered: ChampionDemoImage[] = [];
+  let correctIndex = 0;
+  let incorrectIndex = 0;
+  while (correctIndex < correct.length || incorrectIndex < incorrect.length) {
+    if (correctIndex < correct.length) ordered.push(correct[correctIndex++]);
+    if (incorrectIndex < incorrect.length) ordered.push(incorrect[incorrectIndex++]);
+  }
+  return [...ordered, ...unknown];
+}
+
+function demoImageTrainingCorrectness(image: ChampionDemoImage) {
+  const metadata = recordObject(image.metadata);
+  const value = metadata.correct_at_training;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "yes", "1"].includes(normalized)) return true;
+    if (["false", "no", "0"].includes(normalized)) return false;
+  }
+  return null;
 }
 
 export function demoPredictionsFromUnknown(value: unknown): ChampionDemoPrediction[] {
@@ -6636,7 +6673,16 @@ export function browserReadableDemoImageSource(value: unknown) {
 }
 
 export function demoImagePreviewURI(image?: ChampionDemoImage | null) {
-  return image?.preview_uri || image?.thumbnail_uri || image?.uri || image?.image_uri || "";
+  const metadata = recordObject(image?.metadata);
+  return (
+    image?.preview_uri ||
+    image?.thumbnail_uri ||
+    recordString(metadata, "preview_uri") ||
+    recordString(metadata, "thumbnail_uri") ||
+    image?.uri ||
+    image?.image_uri ||
+    ""
+  );
 }
 
 export function demoImageIsRunnable(image?: ChampionDemoImage | null) {

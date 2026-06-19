@@ -964,8 +964,7 @@ def _resolve_artifact_path(manifest_path: Path | None, path_value: object) -> Pa
     export_dir = manifest_path.parent if manifest_path is not None else None
     if value.startswith("s3://"):
         parsed = urlparse(value)
-        filename = Path(parsed.path).name or "model.torchscript.pt"
-        destination = Path(".cache/artifacts") / _safe_path_part(parsed.netloc) / _safe_path_part(filename)
+        destination = _s3_artifact_cache_path(value)
         try:
             downloaded = download_s3_uri(value, destination)
             resolved = validate_controlled_artifact_path(downloaded, export_dir=destination.parent)
@@ -1028,9 +1027,9 @@ def _materialize_onnx_external_data(model_path: Path, artifact: dict, artifact_u
             if explicit:
                 return False
             continue
-        if destination.exists() and destination.is_file():
-            continue
         sidecar_uri = _external_data_s3_uri(artifact_uri, candidate, relative_path)
+        if destination.exists() and destination.is_file() and _external_data_file_matches(candidate, destination):
+            continue
         if sidecar_uri:
             try:
                 downloaded = download_s3_uri(sidecar_uri, destination)
@@ -1054,6 +1053,41 @@ def _materialize_onnx_external_data(model_path: Path, artifact: dict, artifact_u
         if explicit:
             return False
     return True
+
+
+def _s3_artifact_cache_path(artifact_uri: str) -> Path:
+    parsed = urlparse(artifact_uri)
+    key = _storage_relative_path(parsed.path.lstrip("/"))
+    parts = [_safe_cache_path_part(part) for part in key.split("/") if part]
+    if not parts:
+        parts = ["artifact"]
+    return Path(".cache/artifacts") / _safe_cache_path_part(parsed.netloc) / Path(*parts)
+
+
+def _safe_cache_path_part(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in str(value))
+    return safe if safe and safe not in {".", ".."} else "artifact"
+
+
+def _external_data_file_matches(candidate: dict, destination: Path) -> bool:
+    expected = _external_data_expected_bytes(candidate)
+    if expected > 0:
+        try:
+            return destination.stat().st_size == expected
+        except OSError:
+            return False
+    return bool(candidate.get("explicit"))
+
+
+def _external_data_expected_bytes(candidate: dict) -> int:
+    for key in ("bytes", "size_bytes"):
+        try:
+            value = int(candidate.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
 
 
 def _is_onnx_artifact(model_path: Path, artifact: dict) -> bool:

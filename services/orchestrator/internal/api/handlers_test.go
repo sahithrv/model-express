@@ -1286,13 +1286,15 @@ func TestCreateChampionDemoPredictionAuditsRuntimeUnavailable(t *testing.T) {
 	dataset, err = memoryStore.UpdateDatasetProfile(dataset.ID, map[string]any{
 		"demo_images": []map[string]any{
 			{
-				"id":         "image_1",
-				"uri":        "file:///dataset/test/cat/1.jpg",
-				"class_name": "cat",
-				"label":      "cat",
-				"split":      "test",
-				"width":      224,
-				"height":     224,
+				"id":                  "image_1",
+				"uri":                 "file:///dataset/test/cat/1.jpg",
+				"original_image_uri":  "file:///dataset/test/cat/1.jpg",
+				"source_artifact_uri": "file:///dataset/test/cat/1.jpg",
+				"class_name":          "cat",
+				"label":               "cat",
+				"split":               "test",
+				"width":               224,
+				"height":              224,
 			},
 		},
 	})

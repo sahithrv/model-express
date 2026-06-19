@@ -231,12 +231,61 @@ class DemoInferenceTests(unittest.TestCase):
             self.assertIsNotNone(model_path)
             assert model_path is not None
             self.assertTrue(model_path.exists())
+            self.assertTrue(str(model_path).replace("\\", "/").endswith(".cache/artifacts/bucket/model-express/artifacts/job_1/model.onnx"))
             self.assertEqual((model_path.parent / "model.onnx.data").read_bytes(), b"external tensor bytes")
             self.assertEqual(
                 calls,
                 [
                     "s3://bucket/model-express/artifacts/job_1/model.onnx",
                     "s3://bucket/model-express/artifacts/job_1/model.onnx.data",
+                ],
+            )
+
+    def test_s3_onnx_resolution_redownloads_stale_external_data_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            original_cwd = Path.cwd()
+            calls: list[str] = []
+            fresh_sidecar = b"fresh external tensor bytes"
+
+            def fake_download(uri: str, destination: Path) -> Path:
+                calls.append(uri)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(fresh_sidecar if uri.endswith(".data") else b"onnx bytes")
+                return destination
+
+            try:
+                os.chdir(root)
+                stale_sidecar = root / ".cache" / "artifacts" / "bucket" / "model-express" / "artifacts" / "job_2" / "model.onnx.data"
+                stale_sidecar.parent.mkdir(parents=True, exist_ok=True)
+                stale_sidecar.write_bytes(b"stale")
+                with patch("worker.exporting.inference.download_s3_uri", fake_download):
+                    model_path = _resolve_artifact_path(
+                        None,
+                        {
+                            "format": "onnx",
+                            "status": "created",
+                            "uri": "s3://bucket/model-express/artifacts/job_2/model.onnx",
+                            "external_data": [
+                                {
+                                    "path": "model.onnx.data",
+                                    "uri": "s3://bucket/model-express/artifacts/job_2/model.onnx.data",
+                                    "bytes": len(fresh_sidecar),
+                                }
+                            ],
+                        },
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertIsNotNone(model_path)
+            assert model_path is not None
+            self.assertEqual((model_path.parent / "model.onnx.data").read_bytes(), fresh_sidecar)
+            self.assertEqual(
+                calls,
+                [
+                    "s3://bucket/model-express/artifacts/job_2/model.onnx",
+                    "s3://bucket/model-express/artifacts/job_2/model.onnx.data",
                 ],
             )
 

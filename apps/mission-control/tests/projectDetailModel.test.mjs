@@ -41,7 +41,7 @@ test("stale failed worker state does not block export-ready champion demo availa
 });
 
 test("demo image runnable guard treats thumbnails as display-only for stored records", async () => {
-  const { demoImageInferenceURI, demoImageIsRunnable } = await loadMissionModel();
+  const { demoImageInferenceURI, demoImageIsRunnable, demoImagePreviewURI } = await loadMissionModel();
   const thumbnailURI = "data:image/jpeg;base64,THUMB";
   const originalURI = "s3://bucket/model-express/artifacts/job_1/heldout_demo_images/cat.png";
 
@@ -65,6 +65,16 @@ test("demo image runnable guard treats thumbnails as display-only for stored rec
     source_artifact_uri: originalURI,
     metadata: { demo_source_type: "heldout_test_original_artifact" },
   };
+  const metadataOnlyStoredPreview = {
+    uri: originalURI,
+    split: "test",
+    metadata: {
+      preview_uri: thumbnailURI,
+      thumbnail_uri: thumbnailURI,
+      source_artifact_uri: originalURI,
+      demo_source_type: "heldout_test_original_artifact",
+    },
+  };
   const customDataImage = { uri: "data:image/png;base64,AAAA", image_uri: "data:image/png;base64,AAAA", split: "custom" };
   const customFileImage = { uri: "file:///tmp/cat.png", image_uri: "file:///tmp/cat.png", split: "custom" };
 
@@ -72,10 +82,59 @@ test("demo image runnable guard treats thumbnails as display-only for stored rec
   assert.equal(demoImageInferenceURI(thumbnailOnlyStored), "");
   assert.equal(demoImageIsRunnable(originalStored), true);
   assert.equal(demoImageIsRunnable(sourceOnlyStored), true);
+  assert.equal(demoImagePreviewURI(metadataOnlyStoredPreview), thumbnailURI);
+  assert.equal(demoImageInferenceURI(metadataOnlyStoredPreview), "");
   assert.equal(demoImageIsRunnable(customDataImage), true);
   assert.equal(demoImageInferenceURI(customDataImage), customDataImage.uri);
   assert.equal(demoImageIsRunnable(customFileImage), true);
   assert.equal(demoImageInferenceURI(customFileImage), customFileImage.uri);
+});
+
+test("results summary keeps backend champion first even when display score is lower", async () => {
+  const { buildResultsSummary } = await loadMissionModel();
+  const detail = completedChampionDetail();
+  const exportDemo = exportDemoFixture();
+  const summary = buildResultsSummary(detail, [
+    comparisonRowFixture({
+      jobId: "job-champion",
+      model: "convnext_tiny",
+      rankScore: 0.62,
+      primaryMetricValue: 0.876,
+      secondaryMetricValue: 0.883,
+      isChampion: true,
+    }),
+    comparisonRowFixture({
+      jobId: "job-cheap",
+      model: "convnext_tiny",
+      rankScore: 0.91,
+      primaryMetricValue: 0.639,
+      secondaryMetricValue: 0.652,
+      isChampion: false,
+    }),
+  ], exportDemo);
+
+  assert.equal(summary.topCandidates[0].jobId, "job-champion");
+  assert.equal(summary.topCandidates[0].rank, 1);
+  assert.equal(summary.topCandidates[0].status, "Best model so far");
+});
+
+test("demo images put known-correct held-out examples before hard failures", async () => {
+  const { demoImagesFromUnknown } = await loadMissionModel();
+  const ordered = demoImagesFromUnknown([
+    { id: "wrong-high-confidence", metadata: { correct_at_training: false } },
+    { id: "correct-a", metadata: { correct_at_training: true } },
+    { id: "wrong-low-confidence", metadata: { correct_at_training: "false" } },
+    { id: "correct-b", metadata: { correct_at_training: "true" } },
+    { id: "unknown" },
+  ]);
+
+  assert.deepEqual(ordered.map((image) => image.id), [
+    "correct-a",
+    "wrong-high-confidence",
+    "correct-b",
+    "wrong-low-confidence",
+    "unknown",
+  ]);
 });
 
 test("stale failed worker state does not block completed demo validation", async () => {
@@ -561,6 +620,29 @@ function exportDemoFixture(overrides = {}) {
     demoImages: [],
     demoPredictions: [],
     feedback: [],
+    ...overrides,
+  };
+}
+
+function comparisonRowFixture(overrides = {}) {
+  return {
+    jobId: "job-1",
+    model: "resnet18",
+    rankScore: 0.8,
+    primaryMetricLabel: "Macro-F1",
+    primaryMetricValue: 0.91,
+    secondaryMetricLabel: "Accuracy",
+    secondaryMetricValue: 0.93,
+    runtimeSeconds: 60,
+    costUsd: 0,
+    latencyMs: 14.9,
+    modelSize: "106.8 MB",
+    objectiveFit: 0.9,
+    trainValidationGap: null,
+    divergenceStatus: "Stable",
+    seedVariance: null,
+    seedRunCount: 0,
+    isChampion: true,
     ...overrides,
   };
 }
