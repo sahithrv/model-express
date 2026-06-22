@@ -156,6 +156,7 @@ import {
   buildMissionStages,
   buildActivityFeed,
   buildResultsSummary,
+  buildModelImprovementData,
   buildExportSummary,
   userFacingActivityText,
   userFacingActionLabel,
@@ -960,6 +961,7 @@ export function App() {
     () => buildResultsSummary(detail, championComparison, championExportDemo),
     [championComparison, championExportDemo, detail],
   );
+  const modelImprovement = useMemo(() => buildModelImprovementData(detail), [detail]);
   const exportSummary = useMemo(
     () => buildExportSummary(detail, championExportDemo),
     [championExportDemo, detail],
@@ -2853,6 +2855,7 @@ export function App() {
         <section className="results-route" id="results" data-project-tab="results">
           <ResultsRoute
             summary={resultsSummary}
+            modelImprovement={modelImprovement}
             onSelectCandidate={setSelectedJobId}
             onOpenExport={() => openProjectTab("export", "export-package")}
             onOpenDeveloper={() => openProjectTab("developer", "champion-comparison")}

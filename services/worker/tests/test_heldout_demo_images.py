@@ -10,6 +10,7 @@ from PIL import Image
 from worker.training.modal_app import (
     _compact_training_run_evaluation_payload,
     _demo_images_from_test_examples,
+    _demo_images_from_yolo_split,
     _training_evaluation_payload_size_bytes,
 )
 
@@ -158,6 +159,57 @@ class HeldoutDemoImageTests(unittest.TestCase):
         self.assertEqual(records[1]["metadata"]["demo_role"], "challenge")
         self.assertEqual(records[1]["metadata"]["confidence_at_training"], 0.99)
 
+    def test_yolo_split_demo_images_include_original_artifact_and_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_dir = root / "images" / "val"
+            label_dir = root / "labels" / "val"
+            image_dir.mkdir(parents=True)
+            label_dir.mkdir(parents=True)
+            image_path = image_dir / "cat.png"
+            Image.new("RGB", (16, 10), (20, 40, 60)).save(image_path)
+            (label_dir / "cat.txt").write_text("0 0.5 0.5 0.25 0.4\n", encoding="utf-8")
+            data_yaml = root / "data.yaml"
+            data_yaml.write_text(
+                "path: .\ntrain: images/val\nval: images/val\nnames: [cat, dog]\n",
+                encoding="utf-8",
+            )
+            uploads = []
+
+            def fake_upload(source: Path, destination: str) -> None:
+                uploads.append((Path(source), destination))
+
+            with patch.dict(
+                "os.environ",
+                {"MODEL_EXPRESS_ARTIFACT_BUCKET": "", "MODEL_EXPRESS_ARTIFACT_PREFIX": "model-express/artifacts"},
+            ):
+                records = _demo_images_from_yolo_split(
+                    data_yaml,
+                    root,
+                    "val",
+                    ["cat", "dog"],
+                    dataset={"storage_uri": "s3://bucket/dataset.zip"},
+                    job_id="job/1",
+                    artifact_uploader=fake_upload,
+                )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0][0], image_path)
+        image = records[0]
+        self.assertEqual(image["uri"], uploads[0][1])
+        self.assertEqual(image["original_image_uri"], uploads[0][1])
+        self.assertEqual(image["source_artifact_uri"], uploads[0][1])
+        self.assertEqual(image["class_name"], "cat")
+        self.assertEqual(image["split"], "val")
+        self.assertTrue(image["thumbnail_uri"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(image["metadata"]["demo_source_type"], "heldout_test_original_artifact")
+        self.assertTrue(image["metadata"]["parity_safe"])
+        self.assertEqual(image["metadata"]["task_type"], "object_detection")
+        self.assertEqual(image["metadata"]["object_count"], 1)
+        self.assertEqual(image["metadata"]["object_class_names"], ["cat"])
+        self.assertEqual(image["metadata"]["yolo_annotations"][0]["class_name"], "cat")
+        self.assertEqual(image["metadata"]["yolo_annotations"][0]["bbox_format"], "yolo_xywh_normalized")
     def test_compacted_evaluation_payload_stays_below_safe_threshold_for_many_demo_images(self) -> None:
         thumbnail = "data:image/jpeg;base64," + ("B" * 8_000)
         original = "data:image/png;base64," + ("A" * 100_000)

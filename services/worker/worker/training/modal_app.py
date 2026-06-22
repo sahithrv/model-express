@@ -877,6 +877,15 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     cls_loss = _metric_float(final_metrics, "cls_loss", default=max(0.02, 0.75 - map50_95 * 0.5))
     dfl_loss = _metric_float(final_metrics, "dfl_loss", default=max(0.02, 0.55 - map50_95 * 0.35))
     val_loss = round(box_loss + cls_loss + dfl_loss, 6)
+    heldout_split = "test" if test_metrics else "val"
+    heldout_demo_images = _demo_images_from_yolo_split(
+        data_config_path,
+        dataset_dir,
+        heldout_split,
+        class_names,
+        dataset=dataset,
+        job_id=job_id,
+    )
     runtime_seconds = time.time() - started_at
     estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
     model_profile = _yolo_model_profile(
@@ -981,7 +990,8 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 "task_type": "object_detection",
                 "metric_preferences": ["mAP50_95", "mAP50", "precision", "recall", "latency_p95_ms"],
                 "split_strategy": "official_yolo_train_val_test_when_present",
-                "heldout_split": "test" if test_metrics else "val",
+                "heldout_split": heldout_split,
+                "heldout_demo_images": heldout_demo_images,
                 "heldout_test_map50_95": round(map50_95, 6),
                 "heldout_test_map50": round(map50, 6),
                 "heldout_test_precision": round(precision, 6),
@@ -3726,6 +3736,241 @@ def _class_label_order_hash(class_names: list[str]) -> str:
     return class_label_order_hash(class_names)
 
 
+def _demo_images_from_yolo_split(
+    data_config_path: Path,
+    dataset_dir: Path,
+    split: str,
+    class_names: list[str],
+    max_total: int = 32,
+    *,
+    dataset: dict | None = None,
+    job_id: str = "",
+    artifact_uploader=None,
+) -> list[dict]:
+    image_paths = _yolo_demo_split_image_paths(
+        data_config_path,
+        dataset_dir,
+        split,
+        max_total=max_total * 4,
+    )
+    demo_images: list[dict] = []
+    seen_paths: set[str] = set()
+    normalized_split = "test" if str(split).strip().lower() in {"test", "testing", "heldout", "holdout"} else "val"
+    for image_path in image_paths:
+        path = str(image_path)
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        thumbnail_uri, thumbnail_width, thumbnail_height, thumbnail_bytes = _thumbnail_data_uri(path)
+        original_width, original_height, original_bytes, original_mime_type, image_format, original_error = _original_image_metadata(path)
+        original_artifact_uri = ""
+        artifact_error = ""
+        if not original_error:
+            original_artifact_uri, artifact_error = _upload_heldout_demo_original_image(
+                path,
+                dataset=dataset,
+                job_id=job_id,
+                image_format=image_format,
+                artifact_uploader=artifact_uploader,
+            )
+        if not thumbnail_uri and not original_artifact_uri:
+            continue
+        annotations, label_path = _yolo_demo_annotations_for_image(image_path, dataset_dir, class_names, normalized_split)
+        class_label = _yolo_demo_primary_label(annotations)
+        inference_uri = original_artifact_uri or thumbnail_uri
+        parity_safe = bool(original_artifact_uri)
+        parity_failure_reason = ""
+        if not parity_safe:
+            parity_failure_reason = artifact_error or original_error or "original_image_artifact_unavailable"
+        demo_images.append(
+            {
+                "id": f"{normalized_split}:{Path(path).stem}",
+                "image_id": Path(path).name,
+                "uri": inference_uri,
+                "image_uri": inference_uri,
+                "preview_uri": thumbnail_uri or original_artifact_uri,
+                "thumbnail_uri": thumbnail_uri,
+                "original_image_uri": original_artifact_uri,
+                "source_artifact_uri": original_artifact_uri,
+                "class_name": class_label,
+                "label": class_label,
+                "true_label": class_label,
+                "split": normalized_split,
+                "width": original_width or thumbnail_width,
+                "height": original_height or thumbnail_height,
+                "size_bytes": original_bytes or thumbnail_bytes,
+                "mime_type": original_mime_type,
+                "metadata": {
+                    "source": "heldout_test",
+                    "demo_source_type": "heldout_test_original_artifact" if parity_safe else "heldout_test_thumbnail_fallback",
+                    "parity_safe": parity_safe,
+                    "parity_status": "ok" if parity_safe else "unsafe",
+                    "parity_failure_reason": "" if parity_safe else parity_failure_reason,
+                    "original_image_uri": original_artifact_uri,
+                    "source_artifact_uri": original_artifact_uri,
+                    "source_path": path,
+                    "source_size_bytes": original_bytes,
+                    "source_width": original_width,
+                    "source_height": original_height,
+                    "source_mime_type": original_mime_type,
+                    "thumbnail_size_bytes": thumbnail_bytes,
+                    "thumbnail_width": thumbnail_width,
+                    "thumbnail_height": thumbnail_height,
+                    "task_type": "object_detection",
+                    "model_family": "yolo",
+                    "heldout_split": normalized_split,
+                    "yolo_label_path": str(label_path) if label_path else "",
+                    "yolo_annotations": annotations,
+                    "object_count": len(annotations),
+                    "object_class_names": sorted({str(annotation.get("class_name") or "") for annotation in annotations if annotation.get("class_name")}),
+                    "demo_role": "representative",
+                    "demo_set": "representative_heldout",
+                    "class_label_order_hash": _class_label_order_hash(class_names),
+                },
+            }
+        )
+        if len(demo_images) >= max_total:
+            break
+    return demo_images
+
+
+def _yolo_demo_split_image_paths(data_config_path: Path, dataset_dir: Path, split: str, max_total: int) -> list[Path]:
+    try:
+        config = _load_yolo_training_config(data_config_path)
+    except Exception:
+        return []
+    keys = ["test"] if str(split).strip().lower() in {"test", "testing", "heldout", "holdout"} else ["val", "valid"]
+    paths: list[Path] = []
+    for key in keys:
+        if key not in config:
+            continue
+        for image_path in _yolo_demo_paths_from_split_value(data_config_path, dataset_dir, config, config.get(key)):
+            if image_path.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            paths.append(image_path)
+            if len(paths) >= max_total:
+                return _unique_paths(paths)
+    return _unique_paths(paths)
+
+
+def _yolo_demo_paths_from_split_value(data_config_path: Path, dataset_dir: Path, config: dict, value: object) -> list[Path]:
+    values = value if isinstance(value, list) else [value]
+    paths: list[Path] = []
+    for item in values:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        try:
+            resolved = _resolve_existing_yolo_path(dataset_dir, data_config_path, config, text)
+        except Exception:
+            continue
+        if resolved.is_dir():
+            paths.extend(sorted(path.resolve() for path in resolved.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES))
+        elif resolved.is_file() and resolved.suffix.lower() in IMAGE_SUFFIXES:
+            paths.append(resolved.resolve())
+        elif resolved.is_file():
+            paths.extend(_yolo_demo_paths_from_list_file(resolved, data_config_path, dataset_dir, config))
+    return _unique_paths(paths)
+
+
+def _yolo_demo_paths_from_list_file(list_path: Path, data_config_path: Path, dataset_dir: Path, config: dict) -> list[Path]:
+    try:
+        lines = list_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+    paths: list[Path] = []
+    for line in lines:
+        text = _strip_yaml_comment(line).strip()
+        if not text:
+            continue
+        image_path = _resolve_yolo_demo_list_image_path(text, list_path, data_config_path, dataset_dir, config)
+        if image_path is not None and image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES:
+            paths.append(image_path.resolve())
+    return _unique_paths(paths)
+
+
+def _resolve_yolo_demo_list_image_path(
+    value: str,
+    list_path: Path,
+    data_config_path: Path,
+    dataset_dir: Path,
+    config: dict,
+) -> Path | None:
+    path = Path(value)
+    direct_candidates = [path] if path.is_absolute() else [list_path.parent / path]
+    for candidate in direct_candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.exists() and _path_is_within(resolved, dataset_dir):
+            return resolved
+    try:
+        return _resolve_existing_yolo_path(dataset_dir, data_config_path, config, value)
+    except Exception:
+        return None
+
+
+def _yolo_demo_annotations_for_image(image_path: Path, dataset_dir: Path, class_names: list[str], split: str) -> tuple[list[dict], Path | None]:
+    label_path = _yolo_demo_label_path_for_image(image_path, dataset_dir, split)
+    if label_path is None:
+        return [], None
+    try:
+        lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return [], label_path
+    annotations: list[dict] = []
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+        try:
+            class_id = int(float(parts[0]))
+            x_center, y_center, width, height = [float(value) for value in parts[1:5]]
+        except ValueError:
+            continue
+        class_name = class_names[class_id] if 0 <= class_id < len(class_names) else f"class_{class_id}"
+        annotations.append(
+            {
+                "class_id": class_id,
+                "class_name": class_name,
+                "bbox_format": "yolo_xywh_normalized",
+                "x_center": round(x_center, 6),
+                "y_center": round(y_center, 6),
+                "width": round(width, 6),
+                "height": round(height, 6),
+            }
+        )
+    return annotations, label_path
+
+
+def _yolo_demo_label_path_for_image(image_path: Path, dataset_dir: Path, split: str) -> Path | None:
+    candidates: list[Path] = []
+    try:
+        relative_parts = list(image_path.resolve().relative_to(dataset_dir.resolve()).parts)
+    except (OSError, ValueError):
+        relative_parts = []
+    for index, part in enumerate(relative_parts):
+        if part.lower() == "images":
+            candidates.append(dataset_dir.joinpath(*(relative_parts[:index] + ["labels"] + relative_parts[index + 1 :])).with_suffix(".txt"))
+    if split:
+        candidates.append(dataset_dir / "labels" / split / image_path.with_suffix(".txt").name)
+    candidates.append(image_path.with_suffix(".txt"))
+    for candidate in _unique_paths(candidates):
+        if candidate.is_file() and _path_is_within(candidate, dataset_dir):
+            return candidate.resolve()
+    return None
+
+
+def _yolo_demo_primary_label(annotations: list[dict]) -> str:
+    names = sorted({str(annotation.get("class_name") or "") for annotation in annotations if annotation.get("class_name")})
+    if len(names) == 1:
+        return names[0]
+    if len(names) > 1:
+        return "multiple_objects"
+    if annotations:
+        return "objects"
+    return "object_detection"
 def _demo_images_from_test_examples(
     eval_details: dict,
     class_names: list[str],

@@ -471,6 +471,50 @@ export type ResultsSummary = {
   confusionMatrix: number[][];
 };
 
+export type ModelImprovementState = "no_plans" | "no_completed_plans" | "no_scored_models" | "ready";
+
+export type ModelImprovementPoint = {
+  planId: string;
+  planIndex: number;
+  planLabel: string;
+  targetMetric: string;
+  status: string;
+  createdAt: string;
+  experimentCount: number;
+  totalRunCount: number;
+  completedRunCount: number;
+  bestScore: number | null;
+  cumulativeBestScore: number | null;
+  bestModel: string;
+  provider: string;
+  jobId: string;
+  completedAt: string;
+  source: string;
+  scoreBasis: string;
+  missingReason: string;
+};
+
+export type ModelImprovementData = {
+  points: ModelImprovementPoint[];
+  totalPlans: number;
+  completedPlanCount: number;
+  scoredPlanCount: number;
+  missingScorePlanCount: number;
+  firstScore: number | null;
+  bestScore: number | null;
+  improvementDelta: number | null;
+  state: ModelImprovementState;
+};
+
+type ModelImprovementScoreCandidate = {
+  score: number;
+  model: string;
+  provider: string;
+  jobId: string;
+  completedAt: string;
+  source: string;
+  scoreBasis: string;
+};
 export type ExportSummary = {
   hasChampion: boolean;
   title: string;
@@ -1494,6 +1538,441 @@ export function buildResultsSummary(
   };
 }
 
+export function buildModelImprovementData(detail: ProjectDetail): ModelImprovementData {
+  const orderedPlans = detail.plans
+    .map((plan, originalIndex) => ({ plan, originalIndex }))
+    .sort((left, right) => compareModelImprovementPlans(left.plan, right.plan, left.originalIndex, right.originalIndex))
+    .map((item) => item.plan);
+  const jobById = new Map(detail.jobs.map((job) => [job.id, job]));
+  const evaluationByJob = new Map(detail.runEvaluations.map((evaluation) => [evaluation.job_id, evaluation]));
+  const summariesByPlan = new Map<string, TrainingRunSummary[]>();
+  const jobsByPlan = new Map<string, Job[]>();
+
+  for (const summary of detail.runSummaries) {
+    const planId = trainingRunPlanId(summary, jobById.get(summary.job_id) ?? null);
+    if (!planId) continue;
+    const rows = summariesByPlan.get(planId) ?? [];
+    rows.push(summary);
+    summariesByPlan.set(planId, rows);
+  }
+
+  for (const job of detail.jobs) {
+    const planId = jobPlanId(job);
+    if (!planId) continue;
+    const rows = jobsByPlan.get(planId) ?? [];
+    rows.push(job);
+    jobsByPlan.set(planId, rows);
+  }
+
+  let cumulativeBest: number | null = null;
+  let firstScore: number | null = null;
+  const points = orderedPlans.map((plan, index) => {
+    const summaries = summariesByPlan.get(plan.id) ?? [];
+    const jobs = jobsByPlan.get(plan.id) ?? [];
+    const completedRunIds = new Set<string>();
+    const runIds = new Set<string>();
+    const candidates: ModelImprovementScoreCandidate[] = [];
+
+    for (const summary of summaries) {
+      const job = jobById.get(summary.job_id) ?? null;
+      runIds.add(summary.job_id);
+      if (effectiveTrainingRunStatus(summary, job) === "SUCCEEDED") {
+        completedRunIds.add(summary.job_id);
+      }
+      const candidate = modelImprovementRunCandidate(summary, evaluationByJob.get(summary.job_id) ?? null, job, plan.target_metric);
+      if (candidate) candidates.push(candidate);
+    }
+
+    for (const job of jobs) {
+      runIds.add(job.id);
+      if (normalizedStatus(job.status) === "SUCCEEDED") {
+        completedRunIds.add(job.id);
+      }
+    }
+
+    const championCandidate = modelImprovementChampionCandidate(detail.champion, plan.id);
+    if (championCandidate) candidates.push(championCandidate);
+    candidates.push(...modelImprovementDecisionCandidates(detail.decisions, plan.id));
+    candidates.push(...modelImprovementScorecardCandidates(detail.strategyScorecards, plan.id));
+
+    const bestCandidate = candidates.sort(compareModelImprovementCandidates)[0] ?? null;
+    const bestScore = bestCandidate?.score ?? null;
+    if (bestScore !== null) {
+      if (firstScore === null) firstScore = bestScore;
+      cumulativeBest = cumulativeBest === null ? bestScore : Math.max(cumulativeBest, bestScore);
+    }
+
+    return {
+      planId: plan.id,
+      planIndex: index + 1,
+      planLabel: `Plan ${index + 1}`,
+      targetMetric: plan.target_metric,
+      status: plan.status,
+      createdAt: plan.created_at,
+      experimentCount: plan.experiments.length,
+      totalRunCount: runIds.size,
+      completedRunCount: completedRunIds.size,
+      bestScore,
+      cumulativeBestScore: cumulativeBest,
+      bestModel: bestCandidate?.model ?? "",
+      provider: bestCandidate?.provider ?? "",
+      jobId: bestCandidate?.jobId ?? "",
+      completedAt: bestCandidate?.completedAt ?? "",
+      source: bestCandidate?.source ?? "",
+      scoreBasis: bestCandidate?.scoreBasis ?? "",
+      missingReason: modelImprovementMissingReason(completedRunIds.size, runIds.size),
+    } satisfies ModelImprovementPoint;
+  });
+
+  const scoredPlanCount = points.filter((point) => point.bestScore !== null).length;
+  const completedPlanCount = points.filter((point) => point.completedRunCount > 0 || point.bestScore !== null).length;
+  const missingScorePlanCount = points.filter((point) => point.completedRunCount > 0 && point.bestScore === null).length;
+  const bestScore = points.reduce<number | null>((currentBest, point) => {
+    if (point.bestScore === null) return currentBest;
+    return currentBest === null ? point.bestScore : Math.max(currentBest, point.bestScore);
+  }, null);
+  const state: ModelImprovementState =
+    points.length === 0
+      ? "no_plans"
+      : scoredPlanCount > 0
+        ? "ready"
+        : completedPlanCount === 0
+          ? "no_completed_plans"
+          : "no_scored_models";
+
+  return {
+    points,
+    totalPlans: points.length,
+    completedPlanCount,
+    scoredPlanCount,
+    missingScorePlanCount,
+    firstScore,
+    bestScore,
+    improvementDelta: firstScore !== null && bestScore !== null ? bestScore - firstScore : null,
+    state,
+  };
+}
+
+function compareModelImprovementPlans(
+  left: ExperimentPlan,
+  right: ExperimentPlan,
+  leftIndex: number,
+  rightIndex: number,
+) {
+  const leftTimestamp = timestampSortScore(left.created_at);
+  const rightTimestamp = timestampSortScore(right.created_at);
+  if (leftTimestamp !== rightTimestamp) return leftTimestamp - rightTimestamp;
+  if (left.id !== right.id) return left.id.localeCompare(right.id);
+  return leftIndex - rightIndex;
+}
+
+function compareModelImprovementCandidates(left: ModelImprovementScoreCandidate, right: ModelImprovementScoreCandidate) {
+  if (left.score !== right.score) return right.score - left.score;
+  const sourceDelta = modelImprovementSourceRank(left.source) - modelImprovementSourceRank(right.source);
+  if (sourceDelta !== 0) return sourceDelta;
+  return timestampSortScore(right.completedAt) - timestampSortScore(left.completedAt);
+}
+
+function modelImprovementSourceRank(source: string) {
+  switch (source) {
+    case "Training evaluation":
+      return 0;
+    case "Champion decision":
+      return 1;
+    case "Champion record":
+      return 2;
+    case "Training summary":
+      return 3;
+    case "Strategy scorecard":
+      return 4;
+    default:
+      return 10;
+  }
+}
+
+function modelImprovementRunCandidate(
+  summary: TrainingRunSummary,
+  evaluation: TrainingRunEvaluation | null,
+  job: Job | null,
+  targetMetric: string,
+): ModelImprovementScoreCandidate | null {
+  if (effectiveTrainingRunStatus(summary, job) !== "SUCCEEDED") return null;
+  const explicitScore = modelImprovementEvaluationScore(evaluation);
+  if (explicitScore) {
+    return {
+      score: explicitScore.score,
+      model: summary.model,
+      provider: summary.provider,
+      jobId: summary.job_id,
+      completedAt: job?.completed_at || summary.updated_at || summary.created_at,
+      source: "Training evaluation",
+      scoreBasis: modelImprovementScoreBasis(explicitScore.key),
+    };
+  }
+
+  const metricScore = modelImprovementPrimaryMetricScore(summary, evaluation, job, targetMetric);
+  if (!metricScore) return null;
+  return {
+    score: metricScore.score,
+    model: summary.model,
+    provider: summary.provider,
+    jobId: summary.job_id,
+    completedAt: job?.completed_at || summary.updated_at || summary.created_at,
+    source: metricScore.source,
+    scoreBasis: metricScore.basis,
+  };
+}
+
+function modelImprovementEvaluationScore(evaluation: TrainingRunEvaluation | null) {
+  if (!evaluation) return null;
+  const holisticScores = recordObject(evaluation.holistic_scores);
+  const score = firstModelImprovementScore([holisticScores], [
+    "score",
+    "overall_score",
+    "model_score",
+    "holistic_score",
+    "deployment_readiness_score",
+    "objective_fit",
+    "quality_score",
+  ]);
+  return score;
+}
+
+function modelImprovementPrimaryMetricScore(
+  summary: TrainingRunSummary,
+  evaluation: TrainingRunEvaluation | null,
+  job: Job | null,
+  targetMetric: string,
+): { score: number; source: string; basis: string } | null {
+  const summaryRecord = summary as unknown as Record<string, unknown>;
+  const objectiveProfile = recordObject(evaluation?.objective_profile);
+  const holisticScores = recordObject(evaluation?.holistic_scores);
+  const detectionMetrics = recordObject(holisticScores.detection_metrics);
+  const perClassMetrics = recordObject(evaluation?.per_class_metrics);
+  const macroAverage = recordObject(perClassMetrics["macro avg"]);
+
+  if (isDetectionRun(summary, evaluation, job)) {
+    const detectionEvaluation = firstModelImprovementScore([objectiveProfile, detectionMetrics], [
+      "heldout_test_map50_95",
+      "heldout_test_map",
+      "mAP50_95",
+      "map50_95",
+      "map",
+    ]);
+    if (detectionEvaluation) {
+      return { score: detectionEvaluation.score, source: "Training evaluation", basis: "mAP50-95" };
+    }
+    const detectionSummary = firstModelImprovementScore([summaryRecord], ["best_map50_95", "best_macro_f1"]);
+    if (detectionSummary) {
+      return { score: detectionSummary.score, source: "Training summary", basis: "mAP50-95" };
+    }
+    const map50Evaluation = firstModelImprovementScore([objectiveProfile, detectionMetrics], ["heldout_test_map50", "mAP50", "map50"]);
+    if (map50Evaluation) {
+      return { score: map50Evaluation.score, source: "Training evaluation", basis: "mAP50" };
+    }
+    const map50Summary = firstModelImprovementScore([summaryRecord], ["best_map50", "best_accuracy"]);
+    if (map50Summary) {
+      return { score: map50Summary.score, source: "Training summary", basis: "mAP50" };
+    }
+    return null;
+  }
+
+  const macroEvaluation = firstModelImprovementScore([objectiveProfile, macroAverage], [
+    "heldout_test_macro_f1",
+    "macro_f1",
+    "f1-score",
+    "f1",
+  ]);
+  if (macroEvaluation) {
+    return { score: macroEvaluation.score, source: "Training evaluation", basis: "Balanced score" };
+  }
+  const macroSummary = firstModelImprovementScore([summaryRecord], ["best_macro_f1"]);
+  if (macroSummary) {
+    return { score: macroSummary.score, source: "Training summary", basis: "Balanced score" };
+  }
+  const accuracyEvaluation = firstModelImprovementScore([objectiveProfile], ["heldout_test_accuracy", "accuracy"]);
+  if (accuracyEvaluation) {
+    return { score: accuracyEvaluation.score, source: "Training evaluation", basis: "Accuracy" };
+  }
+  const accuracySummary = firstModelImprovementScore([summaryRecord], ["best_accuracy"]);
+  if (accuracySummary) {
+    return { score: accuracySummary.score, source: "Training summary", basis: "Accuracy" };
+  }
+  return null;
+}
+
+function modelImprovementChampionCandidate(champion: ProjectChampion | null, planId: string): ModelImprovementScoreCandidate | null {
+  if (!champion || champion.plan_id !== planId) return null;
+  const metrics = recordObject(champion.metrics);
+  const evaluation = recordObject(champion.evaluation);
+  const holisticScores = recordObject(evaluation.holistic_scores);
+  const score = firstModelImprovementScore([metrics, holisticScores, evaluation], [
+    "champion_score",
+    "score",
+    "overall_score",
+    "model_score",
+    "deployment_readiness_score",
+    "primary_metric_value",
+    "best_score",
+  ]);
+  if (!score) return null;
+  return {
+    score: score.score,
+    model: recordString(metrics, "model") || recordString(metrics, "champion_model") || champion.job_id,
+    provider: recordString(metrics, "provider"),
+    jobId: champion.job_id,
+    completedAt: champion.updated_at || champion.created_at,
+    source: "Champion record",
+    scoreBasis: modelImprovementScoreBasis(score.key),
+  };
+}
+
+function modelImprovementDecisionCandidates(decisions: AgentDecision[], planId: string): ModelImprovementScoreCandidate[] {
+  return decisions.flatMap((decision) => {
+    if (!modelImprovementDecisionMatchesPlan(decision, planId)) return [];
+    const payload = recordObject(decision.payload);
+    const actualBestRun = recordObject(payload.actual_best_run);
+    const selectedModel = recordObject(payload.selected_model);
+    const bestModel = recordObject(payload.best_model);
+    const score = firstModelImprovementScore([payload, actualBestRun, selectedModel, bestModel], [
+      "champion_score",
+      "selected_model_score",
+      "best_score",
+      "score",
+      "model_score",
+      "deployment_readiness_score",
+      "primary_metric_value",
+    ]);
+    if (!score) return [];
+    return [
+      {
+        score: score.score,
+        model:
+          recordString(payload, "champion_model") ||
+          recordString(actualBestRun, "model") ||
+          recordString(selectedModel, "model") ||
+          recordString(bestModel, "model"),
+        provider: recordString(payload, "provider") || recordString(actualBestRun, "provider"),
+        jobId:
+          recordString(payload, "champion_job_id") ||
+          recordString(actualBestRun, "job_id") ||
+          recordString(selectedModel, "job_id") ||
+          recordString(bestModel, "job_id"),
+        completedAt: decision.created_at,
+        source: "Champion decision",
+        scoreBasis: modelImprovementScoreBasis(score.key),
+      },
+    ];
+  });
+}
+
+function modelImprovementDecisionMatchesPlan(decision: AgentDecision, planId: string) {
+  if (decision.plan_id === planId) return true;
+  const payload = recordObject(decision.payload);
+  return (
+    recordFirstString(payload, ["plan_id", "source_plan_id", "followup_plan_id", "follow_up_plan_id"]) === planId ||
+    recordFirstString(recordObject(payload.actual_best_run), ["plan_id", "source_plan_id", "followup_plan_id", "follow_up_plan_id"]) === planId
+  );
+}
+
+function modelImprovementScorecardCandidates(scorecards: StrategyScorecard[], planId: string): ModelImprovementScoreCandidate[] {
+  return scorecards.flatMap((scorecard) => {
+    if (scorecard.followup_plan_id !== planId && scorecard.source_plan_id !== planId) return [];
+    const objectiveProfile = recordObject(scorecard.objective_profile);
+    const proposedChanges = recordObject(scorecard.proposed_changes);
+    const actualBestRun = recordObject(proposedChanges.actual_best_run);
+    const bestRun = recordObject(proposedChanges.best_run);
+    const score = firstModelImprovementScore([actualBestRun, bestRun, proposedChanges, objectiveProfile], [
+      "actual_best_score",
+      "best_model_score",
+      "plan_best_score",
+      "best_score",
+      "model_score",
+      "deployment_readiness_score",
+      "score",
+    ]);
+    if (!score) return [];
+    return [
+      {
+        score: score.score,
+        model: recordString(actualBestRun, "model") || recordString(bestRun, "model"),
+        provider: recordString(actualBestRun, "provider") || recordString(bestRun, "provider"),
+        jobId: recordString(actualBestRun, "job_id") || recordString(bestRun, "job_id"),
+        completedAt: scorecard.created_at,
+        source: "Strategy scorecard",
+        scoreBasis: modelImprovementScoreBasis(score.key),
+      },
+    ];
+  });
+}
+
+
+function trainingRunPlanId(summary: TrainingRunSummary, job: Job | null) {
+  return summary.plan_id || (job ? jobPlanId(job) : "");
+}
+
+function jobPlanId(job: Job) {
+  return recordFirstString(recordObject(job.config), ["plan_id", "planId", "source_plan_id", "followup_plan_id", "follow_up_plan_id"]);
+}
+
+function firstModelImprovementScore(records: Record<string, unknown>[], keys: string[]) {
+  for (const record of records) {
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+      const score = normalizeModelImprovementScore(record[key]);
+      if (score !== null) return { score, key };
+    }
+  }
+  return null;
+}
+
+function normalizeModelImprovementScore(value: unknown) {
+  let numeric: number | null = null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    numeric = value;
+  } else if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.endsWith("%")) {
+      const parsed = Number(trimmed.slice(0, -1));
+      numeric = Number.isFinite(parsed) ? parsed / 100 : null;
+    } else {
+      const parsed = Number(trimmed);
+      numeric = Number.isFinite(parsed) ? parsed : null;
+    }
+  }
+  if (numeric === null || !Number.isFinite(numeric) || numeric < 0) return null;
+  if (numeric <= 1) return numeric;
+  if (numeric <= 100) return numeric / 100;
+  return null;
+}
+
+function modelImprovementScoreBasis(key: string) {
+  switch (key) {
+    case "overall_score":
+      return "Holistic score";
+    case "champion_score":
+      return "Champion score";
+    case "primary_metric_value":
+      return "Primary metric";
+    case "best_macro_f1":
+      return "Balanced score";
+    case "best_map50_95":
+      return "mAP50-95";
+    case "best_map50":
+      return "mAP50";
+    case "best_accuracy":
+      return "Accuracy";
+    default:
+      return humanizeAuditKey(key);
+  }
+}
+
+function modelImprovementMissingReason(completedRunCount: number, totalRunCount: number) {
+  if (completedRunCount === 0) {
+    return totalRunCount > 0 ? "Runs are still pending or did not complete successfully." : "No training runs have been reported for this plan yet.";
+  }
+  return "Completed runs exist, but no score field was reported for this plan.";
+}
 export function buildExportSummary(detail: ProjectDetail, exportDemo: ChampionExportDemo): ExportSummary {
   const readyExport = readyONNXExport(exportDemo.exports);
   const hasChampion = Boolean(detail.champion);
@@ -1784,7 +2263,7 @@ export function buildMissionDigest({
   const liveRefreshUnhealthy = ["stale", "error"].includes(detail.loadStatus.liveRefresh.status);
   const orchestratorUnhealthy = Boolean((health && health.status !== "ok") || liveRefreshUnhealthy);
   const workerCapacityBlocked = workerSummary.failed && (queuedJobs > 0 || activeJobs > 0);
-  const hardBlocked = orchestratorUnhealthy || Boolean(activeFailedEvent) || Boolean(blockingDecision) || failedWithoutProgress;
+  const hardBlocked = orchestratorUnhealthy || workerCapacityBlocked || Boolean(activeFailedEvent) || Boolean(blockingDecision) || failedWithoutProgress;
 
   let state: MissionDigestState = "plan_ready";
   if (hardBlocked) {
@@ -1814,6 +2293,7 @@ export function buildMissionDigest({
     activeFailedEvent,
     blockingDecision: Boolean(blockingDecision),
     failedWithoutProgress,
+    workerCapacityBlocked,
     selectedProject,
     dataset,
   });
@@ -1906,6 +2386,7 @@ function stateRequiresUserAction({
   activeFailedEvent,
   blockingDecision,
   failedWithoutProgress,
+  workerCapacityBlocked,
   selectedProject,
   dataset,
 }: {
@@ -1914,13 +2395,14 @@ function stateRequiresUserAction({
   activeFailedEvent?: AgentActivityEvent;
   blockingDecision: boolean;
   failedWithoutProgress: boolean;
+  workerCapacityBlocked: boolean;
   selectedProject: Project | null;
   dataset: Dataset | null;
 }) {
   if (state === "empty") return false;
   if (state === "dataset_needed") return Boolean(selectedProject && !dataset);
   if (state !== "blocked") return false;
-  return orchestratorUnhealthy || Boolean(activeFailedEvent) || blockingDecision || failedWithoutProgress;
+  return orchestratorUnhealthy || workerCapacityBlocked || Boolean(activeFailedEvent) || blockingDecision || failedWithoutProgress;
 }
 
 export function buildMissionLiveActivity({
@@ -2183,7 +2665,7 @@ export function missionStateCopy({
     }
     if (workerCapacityBlocked) {
       return {
-        headline: "Waiting for training capacity.",
+        headline: "Worker supervision needs attention.",
         detail: "A worker or requirement needs review, but completed results remain safe and queued model trials can continue when capacity returns.",
       };
     }

@@ -407,6 +407,172 @@ test("terminal job status overrides stale running training summary state", async
   assert.equal(card.status, "succeeded");
 });
 
+test("model improvement data orders plans and uses holistic evaluation scores", async () => {
+  const { buildModelImprovementData } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    champion: null,
+    championExports: [],
+    decisions: [],
+    strategyScorecards: [],
+    plans: [
+      planFixture({ id: "plan-2", created_at: "2026-06-16T12:00:00.000Z" }),
+      planFixture({ id: "plan-1", created_at: "2026-06-15T12:00:00.000Z" }),
+    ],
+    jobs: [
+      jobFixture({ id: "job-p1", config: { plan_id: "plan-1", model: "resnet18" }, completed_at: "2026-06-15T12:10:00.000Z" }),
+      jobFixture({ id: "job-p2", config: { plan_id: "plan-2", model: "convnext_tiny" }, completed_at: "2026-06-16T12:10:00.000Z" }),
+    ],
+    runSummaries: [
+      runSummaryFixture({ job_id: "job-p1", plan_id: "plan-1", model: "resnet18", best_macro_f1: 0.71, best_accuracy: 0.74 }),
+      runSummaryFixture({ job_id: "job-p2", plan_id: "plan-2", model: "convnext_tiny", best_macro_f1: 0.82, best_accuracy: 0.84 }),
+    ],
+    runEvaluations: [
+      runEvaluationFixture({ job_id: "job-p1", plan_id: "plan-1", holistic_scores: { overall_score: 0.62 } }),
+      runEvaluationFixture({ job_id: "job-p2", plan_id: "plan-2", holistic_scores: { overall_score: 0.79 } }),
+    ],
+  });
+
+  const data = buildModelImprovementData(detail);
+
+  assert.equal(data.state, "ready");
+  assert.deepEqual(data.points.map((point) => point.planId), ["plan-1", "plan-2"]);
+  assert.deepEqual(data.points.map((point) => point.bestScore), [0.62, 0.79]);
+  assert.deepEqual(data.points.map((point) => point.cumulativeBestScore), [0.62, 0.79]);
+  assert.equal(data.points[0].source, "Training evaluation");
+  assert.equal(data.points[0].scoreBasis, "Holistic score");
+  assert.equal(Number(data.improvementDelta.toFixed(3)), 0.17);
+});
+
+test("model improvement data leaves completed plans without score as missing", async () => {
+  const { buildModelImprovementData } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    champion: null,
+    championExports: [],
+    decisions: [],
+    strategyScorecards: [],
+    plans: [planFixture({ id: "plan-missing" })],
+    jobs: [jobFixture({ id: "job-missing", config: { plan_id: "plan-missing", model: "resnet18" }, status: "SUCCEEDED" })],
+    runSummaries: [
+      runSummaryFixture({
+        job_id: "job-missing",
+        plan_id: "plan-missing",
+        best_macro_f1: undefined,
+        best_accuracy: undefined,
+      }),
+    ],
+    runEvaluations: [runEvaluationFixture({ job_id: "job-missing", plan_id: "plan-missing", holistic_scores: {}, objective_profile: {}, per_class_metrics: {} })],
+  });
+
+  const data = buildModelImprovementData(detail);
+
+  assert.equal(data.state, "no_scored_models");
+  assert.equal(data.completedPlanCount, 1);
+  assert.equal(data.scoredPlanCount, 0);
+  assert.equal(data.points[0].bestScore, null);
+  assert.equal(data.points[0].cumulativeBestScore, null);
+  assert.match(data.points[0].missingReason, /no score field/);
+});
+
+test("model improvement data uses champion decision score and ignores scorecard deltas", async () => {
+  const { buildModelImprovementData } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    champion: null,
+    championExports: [],
+    plans: [planFixture({ id: "plan-decision" })],
+    jobs: [jobFixture({ id: "job-decision", config: { plan_id: "plan-decision", model: "resnet18" }, status: "SUCCEEDED" })],
+    runSummaries: [],
+    runEvaluations: [],
+    decisions: [
+      decisionFixture({
+        plan_id: "plan-decision",
+        decision_type: "SELECT_CHAMPION",
+        payload: {
+          champion_score: 0.74,
+          champion_model: "resnet18",
+          champion_job_id: "job-decision",
+        },
+      }),
+    ],
+    strategyScorecards: [
+      {
+        id: "scorecard-1",
+        project_id: "project-1",
+        dataset_id: "dataset-1",
+        source_decision_id: "decision-1",
+        source_plan_id: "plan-0",
+        followup_plan_id: "plan-decision",
+        strategy_type: "planner_followup",
+        planning_mode: "planner_followup",
+        dataset_traits: {},
+        objective_profile: {},
+        proposed_changes: {},
+        expected_delta: 0.12,
+        actual_delta: 0.99,
+        confidence_before: 0.4,
+        confidence_after: 0.99,
+        cost_usd: 0,
+        runtime_seconds: 0,
+        outcome: "improved_champion",
+        lesson: "delta only",
+        tags: [],
+        created_at: timestamp,
+      },
+    ],
+  });
+
+  const data = buildModelImprovementData(detail);
+
+  assert.equal(data.state, "ready");
+  assert.equal(data.points[0].bestScore, 0.74);
+  assert.equal(data.points[0].source, "Champion decision");
+  assert.equal(data.points[0].scoreBasis, "Champion score");
+});
+
+test("model improvement data preserves YOLO detection score fallback", async () => {
+  const { buildModelImprovementData } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    champion: null,
+    championExports: [],
+    decisions: [],
+    strategyScorecards: [],
+    plans: [planFixture({ id: "plan-yolo", target_metric: "mAP50_95" })],
+    jobs: [
+      jobFixture({
+        id: "job-yolo",
+        template: "yolo11n",
+        config: { plan_id: "plan-yolo", task: "object_detection", model: "yolo11n" },
+        status: "SUCCEEDED",
+      }),
+    ],
+    runSummaries: [
+      runSummaryFixture({
+        job_id: "job-yolo",
+        plan_id: "plan-yolo",
+        model: "yolo11n",
+        best_macro_f1: 0.31,
+        best_accuracy: 0.44,
+        best_map50_95: 0.52,
+        best_map50: 0.67,
+        target_metric: "mAP50_95",
+      }),
+    ],
+    runEvaluations: [
+      runEvaluationFixture({
+        job_id: "job-yolo",
+        plan_id: "plan-yolo",
+        objective_profile: { task_type: "object_detection", heldout_test_map50_95: 0.61, heldout_test_map50: 0.72 },
+        holistic_scores: {},
+      }),
+    ],
+  });
+
+  const data = buildModelImprovementData(detail);
+
+  assert.equal(data.state, "ready");
+  assert.equal(data.points[0].bestScore, 0.61);
+  assert.equal(data.points[0].source, "Training evaluation");
+  assert.equal(data.points[0].scoreBasis, "mAP50-95");
+});
 function buildDigest(buildMissionDigest, selectedProject, detail) {
   return buildMissionDigest({
     health: { status: "ok", service: "orchestrator", timestamp },
@@ -447,6 +613,7 @@ function completedChampionDetail(overrides = {}) {
       status: "available",
       message: "Fixture export records loaded.",
     },
+    loadStatus: projectDetailLoadStatusFixture(),
     championDemoImages: [],
     championDemoPredictions: [],
     championFeedback: [],
@@ -485,7 +652,7 @@ function datasetFixture() {
   };
 }
 
-function planFixture() {
+function planFixture(overrides = {}) {
   return {
     id: "plan-1",
     project_id: "project-1",
@@ -497,6 +664,7 @@ function planFixture() {
     experiments: [{ template: "resnet", model: "resnet18", epochs: 1, batch_size: 8, learning_rate: 0.001, reason: "fixture" }],
     warnings: [],
     created_at: timestamp,
+    ...overrides,
   };
 }
 
@@ -537,7 +705,7 @@ function runSummaryFixture(overrides = {}) {
   };
 }
 
-function runEvaluationFixture() {
+function runEvaluationFixture(overrides = {}) {
   return {
     job_id: "job-1",
     project_id: "project-1",
@@ -551,6 +719,7 @@ function runEvaluationFixture() {
     recommendation_summary: "fixture",
     created_at: timestamp,
     updated_at: timestamp,
+    ...overrides,
   };
 }
 
@@ -596,6 +765,18 @@ function workerRequirementFixture() {
     last_error: "stale worker startup failure",
     created_at: timestamp,
     updated_at: timestamp,
+  };
+}
+
+function projectDetailLoadStatusFixture() {
+  return {
+    runEvaluations: { status: "available", message: "Fixture evaluations loaded." },
+    decisions: { status: "available", message: "Fixture decisions loaded." },
+    workerRequirements: { status: "available", message: "Fixture worker requirements loaded." },
+    championExports: { status: "available", message: "Fixture export records loaded." },
+    championDemoPredictions: { status: "available", message: "Fixture demo predictions loaded." },
+    championFeedback: { status: "available", message: "Fixture feedback loaded." },
+    liveRefresh: { status: "available", message: "Fixture detail loaded." },
   };
 }
 

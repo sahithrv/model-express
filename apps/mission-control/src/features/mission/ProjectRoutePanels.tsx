@@ -123,6 +123,7 @@ import {
   ActivityCardModel,
   ResultsCandidate,
   ResultsSummary,
+  ModelImprovementData,
   ExportSummary,
   TelemetryWindowKey,
   TelemetryWindowSummary,
@@ -1127,11 +1128,13 @@ export function ActivityCard({ card, onOpenDeveloper }: { card: ActivityCardMode
 
 export function ResultsRoute({
   summary,
+  modelImprovement,
   onSelectCandidate,
   onOpenExport,
   onOpenDeveloper,
 }: {
   summary: ResultsSummary;
+  modelImprovement: ModelImprovementData;
   onSelectCandidate: (jobId: string) => void;
   onOpenExport: () => void;
   onOpenDeveloper: () => void;
@@ -1151,6 +1154,8 @@ export function ResultsRoute({
           <span>{summary.improvementLabel}</span>
         </div>
       </section>
+
+      <ModelImprovementChart data={modelImprovement} />
 
       <section className="candidate-section">
         <div className="mission-section-head">
@@ -1281,6 +1286,272 @@ export function ResultsRoute({
   );
 }
 
+export function ModelImprovementChart({ data }: { data: ModelImprovementData }) {
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const points = data.points;
+  const scoredPoints = points.filter((point) => point.bestScore !== null);
+  const bestPoint = scoredPoints.reduce<ModelImprovementData["points"][number] | null>((currentBest, point) => {
+    if (!currentBest || (point.bestScore ?? -1) > (currentBest.bestScore ?? -1)) return point;
+    return currentBest;
+  }, null);
+  const latestScoredPoint = scoredPoints[scoredPoints.length - 1] ?? null;
+
+  if (data.state !== "ready") {
+    const empty = modelImprovementEmptyCopy(data);
+    return (
+      <section className="model-improvement-section">
+        <div className="mission-section-head">
+          <div>
+            <div className="eyebrow">Model Improvement</div>
+            <strong>{empty.title}</strong>
+            <small>{empty.detail}</small>
+          </div>
+          <Badge value={empty.badge} />
+        </div>
+        <div className="model-improvement-empty">
+          <span className="results-empty-mark" aria-hidden="true">
+            <BarChart3 size={18} />
+          </span>
+          <div>
+            <strong>{empty.title}</strong>
+            <p>{empty.detail}</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  const width = 840;
+  const height = 300;
+  const paddingLeft = 50;
+  const paddingRight = 24;
+  const paddingTop = 26;
+  const paddingBottom = 58;
+  const plotWidth = width - paddingLeft - paddingRight;
+  const plotHeight = height - paddingTop - paddingBottom;
+  const xForIndex = (index: number) =>
+    points.length === 1 ? paddingLeft + plotWidth / 2 : paddingLeft + (index / Math.max(1, points.length - 1)) * plotWidth;
+  const yForScore = (score: number) => paddingTop + (1 - Math.max(0, Math.min(1, score))) * plotHeight;
+  const cumulativePoints = points
+    .map((point, index) =>
+      point.cumulativeBestScore === null
+        ? null
+        : { point, x: xForIndex(index), y: yForScore(point.cumulativeBestScore) },
+    )
+    .filter((point): point is { point: ModelImprovementData["points"][number]; x: number; y: number } => Boolean(point));
+  const bestSegments = points.slice(1).flatMap((point, index) => {
+    const previous = points[index];
+    if (previous.bestScore === null || point.bestScore === null) return [];
+    return [
+      {
+        from: { x: xForIndex(index), y: yForScore(previous.bestScore) },
+        to: { x: xForIndex(index + 1), y: yForScore(point.bestScore) },
+      },
+    ];
+  });
+  const cumulativePath = modelImprovementLinePath(cumulativePoints);
+  const labelEvery = Math.max(1, Math.ceil(points.length / 8));
+  const hovered = hoveredIndex === null ? null : points[hoveredIndex] ?? null;
+  const hoveredScore = hovered?.bestScore ?? hovered?.cumulativeBestScore ?? 0.5;
+  const hoveredX = hoveredIndex === null ? 0 : xForIndex(hoveredIndex);
+  const hoveredY = yForScore(hoveredScore);
+  const tooltipWidth = 214;
+  const tooltipHeight = 106;
+  const tooltipX = Math.min(Math.max(hoveredX - tooltipWidth / 2, paddingLeft), width - paddingRight - tooltipWidth);
+  const tooltipY = Math.max(8, hoveredY - tooltipHeight - 12);
+  const improvementLabel =
+    data.improvementDelta === null ? "-" : `${data.improvementDelta >= 0 ? "+" : ""}${formatModelImprovementScore(data.improvementDelta)}`;
+
+  return (
+    <section className="model-improvement-section">
+      <div className="mission-section-head">
+        <div>
+          <div className="eyebrow">Model Improvement</div>
+          <strong>{bestPoint ? `${bestPoint.planLabel} holds the best score` : "Waiting for scored models"}</strong>
+          <small>Best plan score and cumulative best across experiment plans.</small>
+        </div>
+        <Badge value={`${data.scoredPlanCount}/${data.totalPlans} scored`} />
+      </div>
+
+      <div className="model-improvement-stats">
+        <span>
+          <small>Best score</small>
+          <strong>{formatModelImprovementScore(data.bestScore)}</strong>
+          <em>{bestPoint?.bestModel || bestPoint?.jobId || "No scored model"}</em>
+        </span>
+        <span>
+          <small>Latest scored plan</small>
+          <strong>{latestScoredPoint ? latestScoredPoint.planLabel : "-"}</strong>
+          <em>{latestScoredPoint?.source || "Score pending"}</em>
+        </span>
+        <span>
+          <small>Improvement</small>
+          <strong>{improvementLabel}</strong>
+          <em>from first scored plan</em>
+        </span>
+      </div>
+
+      <div className="model-improvement-chart-wrap">
+        <svg className="model-improvement-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Model improvement by experiment plan">
+          <defs>
+            <linearGradient id="model-improvement-fill" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stopColor="#00d47e" stopOpacity="0.18" />
+              <stop offset="100%" stopColor="#00d47e" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          {[0, 0.25, 0.5, 0.75, 1].map((value) => {
+            const y = yForScore(value);
+            return (
+              <g key={value}>
+                <line className="model-improvement-grid" x1={paddingLeft} x2={width - paddingRight} y1={y} y2={y} />
+                <text className="model-improvement-axis-label" x={12} y={y + 4}>
+                  {value.toFixed(2)}
+                </text>
+              </g>
+            );
+          })}
+          <line className="model-improvement-axis" x1={paddingLeft} x2={width - paddingRight} y1={height - paddingBottom} y2={height - paddingBottom} />
+          <line className="model-improvement-axis" x1={paddingLeft} x2={paddingLeft} y1={paddingTop} y2={height - paddingBottom} />
+          {cumulativePath && (
+            <>
+              <path className="model-improvement-cumulative-fill" d={`${cumulativePath} L ${cumulativePoints[cumulativePoints.length - 1].x.toFixed(2)} ${(height - paddingBottom).toFixed(2)} L ${cumulativePoints[0].x.toFixed(2)} ${(height - paddingBottom).toFixed(2)} Z`} />
+              <path className="model-improvement-line cumulative" d={cumulativePath} />
+            </>
+          )}
+          {bestSegments.map((segment, index) => (
+            <line
+              className="model-improvement-line best"
+              key={`best-${index}`}
+              x1={segment.from.x}
+              y1={segment.from.y}
+              x2={segment.to.x}
+              y2={segment.to.y}
+            />
+          ))}
+          {points.map((point, index) => {
+            const x = xForIndex(index);
+            const slotWidth = points.length === 1 ? plotWidth : plotWidth / Math.max(1, points.length - 1);
+            const hitWidth = Math.max(34, Math.min(96, slotWidth));
+            const hasScore = point.bestScore !== null;
+            const cumulativeY = point.cumulativeBestScore === null ? null : yForScore(point.cumulativeBestScore);
+            return (
+              <g className="model-improvement-point" key={point.planId || index}>
+                <title>{modelImprovementPointTitle(point)}</title>
+                {cumulativeY !== null && <circle className="model-improvement-dot cumulative" cx={x} cy={cumulativeY} r="3" />}
+                {hasScore ? (
+                  <circle className={hoveredIndex === index ? "model-improvement-dot best active" : "model-improvement-dot best"} cx={x} cy={yForScore(point.bestScore ?? 0)} r="5" />
+                ) : (
+                  <g className="model-improvement-missing" transform={`translate(${x} ${height - paddingBottom + 18})`}>
+                    <line x1="-5" x2="5" y1="-5" y2="5" />
+                    <line x1="-5" x2="5" y1="5" y2="-5" />
+                  </g>
+                )}
+                {(index % labelEvery === 0 || index === points.length - 1) && (
+                  <text className="model-improvement-x-label" x={x} y={height - 14} textAnchor="middle">
+                    {point.planIndex}
+                  </text>
+                )}
+                <rect
+                  className="model-improvement-hit"
+                  x={x - hitWidth / 2}
+                  y={paddingTop}
+                  width={hitWidth}
+                  height={height - paddingTop - 8}
+                  tabIndex={0}
+                  onFocus={() => setHoveredIndex(index)}
+                  onBlur={() => setHoveredIndex(null)}
+                  onMouseEnter={() => setHoveredIndex(index)}
+                  onMouseLeave={() => setHoveredIndex(null)}
+                />
+              </g>
+            );
+          })}
+          {hovered && (
+            <g className="model-improvement-tooltip" transform={`translate(${tooltipX} ${tooltipY})`}>
+              <rect width={tooltipWidth} height={tooltipHeight} rx="7" />
+              {modelImprovementTooltipLines(hovered).map((line, index) => (
+                <text key={`${hovered.planId}-${index}`} x="10" y={18 + index * 19} className={index === 1 ? "tooltip-value" : ""}>
+                  {line}
+                </text>
+              ))}
+            </g>
+          )}
+        </svg>
+      </div>
+
+      <div className="model-improvement-legend">
+        <span><i className="best" /> Best score per plan</span>
+        <span><i className="cumulative" /> Cumulative best</span>
+        {data.missingScorePlanCount > 0 && <span><i className="missing" /> Missing plan score</span>}
+      </div>
+      {data.missingScorePlanCount > 0 && (
+        <div className="model-improvement-note">
+          {data.missingScorePlanCount} completed plan{data.missingScorePlanCount === 1 ? "" : "s"} had no score field, so the best-score line leaves a gap instead of plotting zero.
+        </div>
+      )}
+    </section>
+  );
+}
+
+function modelImprovementEmptyCopy(data: ModelImprovementData) {
+  if (data.state === "no_plans") {
+    return {
+      title: "No plans yet",
+      detail: "The improvement chart appears after Model Express creates an experiment plan.",
+      badge: "No plans",
+    };
+  }
+  if (data.state === "no_completed_plans") {
+    return {
+      title: "No completed plans yet",
+      detail: "Plans exist, but no successful training runs have completed for charting.",
+      badge: `${data.totalPlans} plan${data.totalPlans === 1 ? "" : "s"}`,
+    };
+  }
+  return {
+    title: "Plans exist, but no scored models yet",
+    detail: "Completed runs were found, but the available records do not include model score fields. Missing scores stay blank rather than becoming zero.",
+    badge: "Scores missing",
+  };
+}
+
+function modelImprovementLinePath(points: Array<{ x: number; y: number }>) {
+  if (points.length === 0) return "";
+  return points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
+}
+
+function formatModelImprovementScore(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return "-";
+  return value.toFixed(3);
+}
+
+function shortModelImprovementText(value: unknown, maxLength = 58) {
+  const text = shortValue(value);
+  return text.length <= maxLength ? text : `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+function modelImprovementPointTitle(point: ModelImprovementData["points"][number]) {
+  return modelImprovementTooltipLines(point).join("; ");
+}
+
+function modelImprovementTooltipLines(point: ModelImprovementData["points"][number]) {
+  const model = point.bestModel || point.jobId || "model pending";
+  const provider = point.provider || "provider pending";
+  const completion = point.completedAt ? formatTimestamp(point.completedAt) : "completion time pending";
+  if (point.bestScore === null) {
+    return [
+      `${point.planLabel} (${point.targetMetric || "target pending"})`,
+      "Score missing",
+      shortModelImprovementText(point.missingReason),
+      `${point.completedRunCount}/${point.totalRunCount || point.completedRunCount} completed`,
+    ];
+  }
+  return [
+    `${point.planLabel} (${point.targetMetric || "target pending"})`,
+    `Score ${formatModelImprovementScore(point.bestScore)}`,
+    shortModelImprovementText([model, provider].filter(Boolean).join(" - ")),
+    shortModelImprovementText([point.source, point.scoreBasis, completion].filter(Boolean).join(" - ")),
+  ];
+}
 export function ResultsEmptyState({ hasResults }: { hasResults: boolean }) {
   return (
     <section className="results-empty-state">

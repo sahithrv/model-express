@@ -7,11 +7,95 @@ import (
 	"strings"
 	"testing"
 
+	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
 
+func TestChampionDemoImagesExposeYOLOHeldoutEvaluationImages(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	trainingJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := memoryStore.CompleteJob(trainingJob.ID, "mlflow-run"); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+	originalURI := "s3://bucket/model-express/artifacts/job_1/heldout_demo_images/cat.png"
+	if _, err := memoryStore.UpsertProjectChampion(runs.ProjectChampionUpsert{
+		ProjectID:       project.ID,
+		DatasetID:       dataset.ID,
+		JobID:           trainingJob.ID,
+		SelectionReason: "best detection score",
+		Evaluation: map[string]any{
+			"objective_profile": map[string]any{
+				"task_type": "object_detection",
+				"heldout_demo_images": []map[string]any{
+					{
+						"id":                  "val:cat",
+						"image_id":            "cat.png",
+						"uri":                 originalURI,
+						"image_uri":           originalURI,
+						"preview_uri":         "data:image/jpeg;base64,THUMB",
+						"thumbnail_uri":       "data:image/jpeg;base64,THUMB",
+						"original_image_uri":  originalURI,
+						"source_artifact_uri": originalURI,
+						"class_name":          "cat",
+						"label":               "cat",
+						"split":               "val",
+						"metadata": map[string]any{
+							"source":              "heldout_test",
+							"demo_source_type":    "heldout_test_original_artifact",
+							"parity_safe":         true,
+							"task_type":           "object_detection",
+							"object_count":        1,
+							"source_artifact_uri": originalURI,
+						},
+					},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("upsert champion: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	req := httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/champion/demo-images", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		SourceOfTruth string                    `json:"source_of_truth"`
+		Images        []datasets.VisualExemplar `json:"images"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.SourceOfTruth != "champion.evaluation.heldout_demo_images" {
+		t.Fatalf("expected champion evaluation source, got %q", payload.SourceOfTruth)
+	}
+	if len(payload.Images) != 1 {
+		t.Fatalf("expected one YOLO heldout demo image, got %#v", payload.Images)
+	}
+	image := payload.Images[0]
+	if image.URI != originalURI || image.ClassName != "cat" || image.Split != "val" {
+		t.Fatalf("expected YOLO heldout image to be exposed, got %#v", image)
+	}
+	if image.Metadata["task_type"] != "object_detection" || image.Metadata["source_artifact_uri"] != originalURI {
+		t.Fatalf("expected YOLO demo metadata, got %#v", image.Metadata)
+	}
+}
 func TestChampionDemoPredictionCarriesHeldoutImageMetadataToWorkerJob(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
