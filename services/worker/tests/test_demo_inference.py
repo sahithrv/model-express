@@ -9,7 +9,12 @@ from unittest.mock import patch
 from PIL import Image
 
 from worker.exporting.artifacts import produce_champion_export_artifacts
-from worker.exporting.inference import _postprocess_detection_outputs, _resolve_artifact_path, run_demo_inference_from_manifest
+from worker.exporting.inference import (
+    _detection_thresholds,
+    _postprocess_detection_outputs,
+    _resolve_artifact_path,
+    run_demo_inference_from_manifest,
+)
 from worker.exporting.preprocessing import prepare_image_for_inference, preprocessing_parity_diagnostics
 
 
@@ -448,6 +453,34 @@ class DemoInferenceTests(unittest.TestCase):
         self.assertGreater(detections[0]["confidence"], 0.9)
         self.assertAlmostEqual(detections[0]["box"]["x"], 0.25, places=2)
         self.assertAlmostEqual(detections[0]["box"]["width"], 0.5, places=2)
+
+    def test_yolo_detection_thresholds_parse_max_detections(self) -> None:
+        metadata = {
+            "model_kind": "detection",
+            "confidence_threshold_defaults": {
+                "detection": {
+                    "confidence_threshold": "0.31",
+                    "iou_threshold": "0.62",
+                    "max_detections": "25",
+                }
+            },
+        }
+
+        thresholds = _detection_thresholds(
+            metadata,
+            confidence_threshold=None,
+            iou_threshold=None,
+            max_detections=None,
+        )
+
+        self.assertEqual(
+            thresholds,
+            {
+                "confidence_threshold": 0.31,
+                "iou_threshold": 0.62,
+                "max_detections": 25,
+            },
+        )
 
 
 if __name__ == "__main__":

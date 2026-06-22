@@ -43,6 +43,9 @@ const electronRuntimeAvailable = Boolean(app && BrowserWindow && dialog && ipcMa
 let missionControlEnvCache = null;
 let missionControlEnvCacheKey = "";
 let localRuntimeBootstrap = null;
+let championDemoRuntime = null;
+const CHAMPION_DEMO_RUNTIME_IDLE_TTL_MS = 3 * 60 * 1000;
+const CHAMPION_DEMO_RUNTIME_TIMEOUT_MS = 45_000;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -1068,6 +1071,7 @@ if (electronRuntimeAvailable) {
     }
     projectWorkers.clear();
     stopAllProjectTunnels();
+    stopChampionDemoRuntime({ reason: "app_before_quit" });
   });
 
   ipcMain.handle("orchestrator:request", async (_event, request) => {
@@ -1156,6 +1160,14 @@ if (electronRuntimeAvailable) {
 
   ipcMain.handle("cloud:preflight", async (_event, options) => {
     return preflightCloud(options);
+  });
+
+  ipcMain.handle("demo:predictChampionLocal", async (_event, request) => {
+    return predictChampionDemoLocal(request);
+  });
+
+  ipcMain.handle("demo:disposeChampionLocalRuntime", async (_event, request) => {
+    return stopChampionDemoRuntime({ ...(request ?? {}), reason: request?.reason || "ipc_dispose" });
   });
 
   ipcMain.handle("demo:selectImage", async () => {
@@ -1714,6 +1726,223 @@ async function streamToBuffer(stream) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
+}
+
+async function predictChampionDemoLocal(request = {}, runtime = {}) {
+  const session = ensureChampionDemoRuntime(request, runtime);
+  cancelChampionDemoRuntimeIdleTimer(session);
+  let response;
+  try {
+    response = await sendChampionDemoRuntimeMessage(session, {
+      ...request,
+      op: "predict",
+    });
+  } finally {
+    scheduleChampionDemoRuntimeIdleCleanup(session);
+  }
+  if (!response || response.ok !== true) {
+    throw new Error(localChampionDemoRuntimeError(response, session));
+  }
+  if (!response.prediction || typeof response.prediction !== "object") {
+    throw new Error("Local Python demo runtime returned no prediction payload.");
+  }
+  return response;
+}
+
+function ensureChampionDemoRuntime(request = {}, runtime = {}) {
+  const key = championDemoRuntimeKey(request);
+  if (!key) {
+    throw new Error("A champion/export runtime key is required for local demo inference.");
+  }
+  if (championDemoRuntime && championDemoRuntime.key === key && isWorkerRunning(championDemoRuntime.child)) {
+    return championDemoRuntime;
+  }
+  stopChampionDemoRuntime({ reason: "runtime_key_changed" });
+
+  const env = missionControlEnv(runtime.env ?? process.env);
+  const root = repoRoot(env);
+  const workerDir = workerRoot(root);
+  if (!fs.existsSync(workerDir)) {
+    throw new Error(`Worker directory does not exist: ${workerDir}`);
+  }
+  const logDir = resolveLogDir(root, env);
+  fs.mkdirSync(logDir, { recursive: true });
+  const childEnv = {
+    ...env,
+    MODEL_EXPRESS_ROOT: root,
+    MODEL_EXPRESS_LOG_DIR: env.MODEL_EXPRESS_LOG_DIR ?? logDir,
+    PYTHONUNBUFFERED: "1",
+  };
+  const python = runtime.python ?? resolveWorkerPython(workerDir, childEnv);
+  const spawnFn = runtime.spawnFn ?? spawn;
+  const child = spawnFn(python, ["-m", "worker.exporting.demo_runtime"], {
+    cwd: workerDir,
+    env: childEnv,
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const session = {
+    key,
+    child,
+    pending: new Map(),
+    nextId: 1,
+    stdoutBuffer: "",
+    stderrTail: "",
+    logDir,
+    timeoutMs: positiveDurationMs(runtime.timeoutMs ?? request.timeoutMs, CHAMPION_DEMO_RUNTIME_TIMEOUT_MS),
+    idleTtlMs: positiveDurationMs(runtime.idleTtlMs ?? request.idleTtlMs, CHAMPION_DEMO_RUNTIME_IDLE_TTL_MS),
+    idleTimer: null,
+  };
+  championDemoRuntime = session;
+
+  child.stdout?.on("data", (data) => handleChampionDemoRuntimeStdout(session, data));
+  child.stderr?.on("data", (data) => {
+    const text = safeLogText(data.toString());
+    session.stderrTail = `${session.stderrTail}${text}`.slice(-4000);
+    console.error(`[demo-runtime:${key}] ${text.trimEnd()}`);
+    appendDiagnosticLog(logDir, "warn", "champion_demo_runtime_stderr", { runtime_key: key, message: text.trim().slice(0, 1000) });
+  });
+  child.on("exit", (code, signal) => {
+    rejectChampionDemoRuntimePending(session, new Error(`Local Python demo runtime exited code=${code} signal=${signal || ""}`.trim()));
+    if (championDemoRuntime === session) {
+      championDemoRuntime = null;
+    }
+    appendDiagnosticLog(logDir, "warn", "champion_demo_runtime_exited", { runtime_key: key, code, signal });
+  });
+  child.on("error", (error) => {
+    rejectChampionDemoRuntimePending(session, error);
+    if (championDemoRuntime === session) {
+      championDemoRuntime = null;
+    }
+    appendDiagnosticLog(logDir, "error", "champion_demo_runtime_start_failed", { runtime_key: key, error: error.message });
+  });
+
+  if (!child.pid) {
+    throw new Error("Local Python demo runtime did not start. Check that Python and worker dependencies are installed.");
+  }
+  appendDiagnosticLog(logDir, "info", "champion_demo_runtime_started", { runtime_key: key, pid: child.pid, python });
+  return session;
+}
+
+function championDemoRuntimeKey(request = {}) {
+  const explicit = String(request.runtimeKey ?? request.runtime_key ?? "").trim();
+  if (explicit) return explicit;
+  return [request.projectId, request.championId, request.exportId, request.exportArtifactUri]
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean)
+    .join(":");
+}
+
+function sendChampionDemoRuntimeMessage(session, message) {
+  if (!isWorkerRunning(session.child) || !session.child.stdin) {
+    throw new Error("Local Python demo runtime is not running.");
+  }
+  const id = String(message.id ?? message.request_id ?? `demo-${session.nextId++}`);
+  const payload = { ...message, id };
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      session.pending.delete(id);
+      reject(new Error(`Local Python demo inference timed out after ${session.timeoutMs}ms.${session.stderrTail ? ` ${session.stderrTail}` : ""}`));
+    }, session.timeoutMs);
+    session.pending.set(id, { resolve, reject, timeout });
+    session.child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+      if (!error) return;
+      clearTimeout(timeout);
+      session.pending.delete(id);
+      reject(error);
+    });
+  });
+}
+
+function handleChampionDemoRuntimeStdout(session, data) {
+  session.stdoutBuffer += data.toString();
+  const lines = session.stdoutBuffer.split(/\r?\n/);
+  session.stdoutBuffer = lines.pop() ?? "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let response;
+    try {
+      response = JSON.parse(trimmed);
+    } catch {
+      session.stderrTail = `${session.stderrTail}\nNon-JSON runtime output: ${safeLogText(trimmed)}`.slice(-4000);
+      continue;
+    }
+    const id = String(response.id ?? "");
+    const pending = session.pending.get(id);
+    if (!pending) continue;
+    clearTimeout(pending.timeout);
+    session.pending.delete(id);
+    pending.resolve(response);
+  }
+}
+
+function scheduleChampionDemoRuntimeIdleCleanup(session) {
+  cancelChampionDemoRuntimeIdleTimer(session);
+  if (session.idleTtlMs <= 0) return;
+  session.idleTimer = setTimeout(() => {
+    if (championDemoRuntime === session && session.pending.size === 0) {
+      stopChampionDemoRuntime({ reason: "idle_ttl" });
+    }
+  }, session.idleTtlMs);
+}
+
+function cancelChampionDemoRuntimeIdleTimer(session) {
+  if (session?.idleTimer) {
+    clearTimeout(session.idleTimer);
+    session.idleTimer = null;
+  }
+}
+
+function stopChampionDemoRuntime(options = {}) {
+  const session = championDemoRuntime;
+  if (!session) {
+    return { stopped: false, status: "not_running" };
+  }
+  championDemoRuntime = null;
+  cancelChampionDemoRuntimeIdleTimer(session);
+  rejectChampionDemoRuntimePending(session, new Error("Local Python demo runtime was stopped."));
+  try {
+    if (isWorkerRunning(session.child) && session.child.stdin?.writable) {
+      session.child.stdin.write(`${JSON.stringify({ id: `shutdown-${Date.now()}`, op: "shutdown" })}\n`);
+    }
+  } catch {
+    // Best-effort graceful shutdown; kill below if the process remains alive.
+  }
+  if (isWorkerRunning(session.child)) {
+    session.child.kill();
+  }
+  appendDiagnosticLog(session.logDir, "info", "champion_demo_runtime_stopped", { runtime_key: session.key, reason: options.reason || "explicit" });
+  return { stopped: true, status: "stopped", runtime_key: session.key };
+}
+
+function rejectChampionDemoRuntimePending(session, error) {
+  for (const [id, pending] of session.pending.entries()) {
+    clearTimeout(pending.timeout);
+    pending.reject(error);
+    session.pending.delete(id);
+  }
+}
+
+function localChampionDemoRuntimeError(response, session) {
+  const message = response && typeof response === "object" ? response.error || response.message : "";
+  const code = response && typeof response === "object" ? response.code || response.error_code : "";
+  const details = [code, message, session?.stderrTail].filter(Boolean).join(": ");
+  return details || "Local Python demo inference failed.";
+}
+
+function positiveDurationMs(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.trunc(parsed);
+}
+
+function championDemoRuntimeSnapshot() {
+  return championDemoRuntime
+    ? { key: championDemoRuntime.key, pid: championDemoRuntime.child?.pid ?? 0, pending: championDemoRuntime.pending.size }
+    : null;
 }
 
 async function ensureProjectWorker(options = {}) {
@@ -3184,6 +3413,7 @@ module.exports = {
     appLocalRuntimeEnv,
     appManagedLocalRuntimeEnabled,
     bootstrapAppLocalRuntime,
+    championDemoRuntimeSnapshot,
     configuredLocalArtifactRoots,
     dockerComposeLocalServicesSpec,
     ensureAppLocalRuntime,
@@ -3196,6 +3426,7 @@ module.exports = {
     localConfigPath,
     missionControlEnv,
     parseCloudflaredTunnelUrl,
+    predictChampionDemoLocal,
     preflightCloud,
     preflightDatasetFolder,
     rememberDatasetFolder,
@@ -3208,6 +3439,7 @@ module.exports = {
     saveExportArtifact,
     selectedDatasetFolders,
     startDockerComposeLocalServices,
+    stopChampionDemoRuntime,
     stopProjectTunnels,
     waitForMinioBucket,
     validateAppRequestPath,

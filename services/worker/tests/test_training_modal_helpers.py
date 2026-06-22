@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -714,6 +716,27 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertTrue(calls[0]["payload"]["retryable"])
             self.assertIn("container exited unexpectedly", calls[0]["payload"]["error"])
 
+    def test_modal_training_complete_conflict_reports_non_retryable_failure(self) -> None:
+        calls = []
+
+        def fake_post(url: str, payload: dict) -> None:
+            calls.append({"url": url, "payload": payload})
+
+        payload = {
+            "job": {"id": "job_1"},
+            "orchestrator_url": "https://orchestrator.test",
+        }
+        conflict = RuntimeError(
+            "409 Client Error: Conflict for url: https://orchestrator.test/jobs/job_1/complete"
+        )
+        with patch.object(self.modal_app, "_post_json", fake_post):
+            reported = self.modal_app._report_modal_training_retryable_failure(payload, conflict)
+
+        self.assertTrue(reported)
+        self.assertEqual(calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")
+        self.assertFalse(calls[0]["payload"]["retryable"])
+        self.assertEqual(calls[0]["payload"]["failure_class"], "validation")
+
     def test_modal_yolo_path_resolver_rejects_paths_outside_materialized_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -729,6 +752,60 @@ class ModalTrainingHelperTests(unittest.TestCase):
                     {"path": "."},
                     "../outside/images",
                 )
+
+    def test_modal_yolo_export_stages_run_artifact_before_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "runs"
+            run_root.mkdir()
+            checkpoint = run_root / "best.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            exported_onnx = run_root / "best.onnx"
+            export_root = root / "exports"
+            uploads = []
+
+            class FakeYOLO:
+                def __init__(self, path: str) -> None:
+                    self.path = path
+
+                def export(self, **_kwargs):
+                    exported_onnx.write_bytes(b"onnx bytes")
+                    return str(exported_onnx)
+
+            def fake_upload(path: Path, uri: str) -> None:
+                uploads.append({"path": Path(path), "uri": uri})
+
+            fake_ultralytics = types.ModuleType("ultralytics")
+            fake_ultralytics.YOLO = FakeYOLO
+            with patch.dict(sys.modules, {"ultralytics": fake_ultralytics}):
+                with patch("worker.datasets.storage.upload_file_to_s3_uri", fake_upload):
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "WORKER_CHAMPION_EXPORT_ROOT": str(export_root),
+                            "MODEL_EXPRESS_ARTIFACT_BUCKET": "artifact-bucket",
+                        },
+                    ):
+                        bundle = self.modal_app._export_yolo_detector_bundle(
+                            model_path=checkpoint,
+                            model_name="yolo11n.pt",
+                            class_names=["creeper", "zombie"],
+                            image_size=640,
+                            model_profile={"task_type": "object_detection"},
+                            training_config={"task_type": "object_detection"},
+                            dataset={"id": "dataset_1", "storage_uri": "s3://datasets/project.zip"},
+                            job_id="job_1",
+                        )
+            staged_exists = (export_root / "job_1" / "yolo" / "source" / "best.onnx").exists()
+
+        self.assertEqual(bundle["status"], "READY")
+        self.assertEqual(
+            bundle["onnx_artifact_uri"],
+            "s3://artifact-bucket/model-express/artifacts/job_1/model.onnx",
+        )
+        self.assertTrue(staged_exists)
+        self.assertTrue(any(upload["path"].name == "model.onnx" for upload in uploads))
+
     def test_modal_preview_batch_shell_materializes_once_and_runs_classification_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_dir = Path(temp_dir) / "dataset"

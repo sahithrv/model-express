@@ -351,6 +351,68 @@ test("dataset upload endpoints reject remote origins unless allowlisted", () => 
   );
 });
 
+
+test("champion demo local runtime reuses one Python process for repeated predictions", async () => {
+  const repo = tempDir("mx-demo-runtime-repo-");
+  const userDataDir = tempDir("mx-demo-runtime-user-data-");
+  fs.mkdirSync(path.join(repo, "services", "worker"), { recursive: true });
+  let spawnCount = 0;
+  const children = [];
+  const spawnFn = () => {
+    spawnCount += 1;
+    const child = fakeChildProcess();
+    child.stdin = {
+      writable: true,
+      write(chunk, callback) {
+        const message = JSON.parse(String(chunk).trim());
+        setImmediate(() => {
+          child.stdout.emit(
+            "data",
+            Buffer.from(
+              JSON.stringify({
+                id: message.id,
+                ok: true,
+                prediction: {
+                  status: "SUCCEEDED",
+                  image_uri: message.image_uri,
+                  image_id: message.image_id,
+                  predicted_label: "cat",
+                  confidence: 0.9,
+                  top_k: [{ label: "cat", confidence: 0.9 }],
+                  latency_ms: 9,
+                  image_metadata: { runtime: "fake-python" },
+                },
+                pid: child.pid,
+              }) + "\n",
+            ),
+          );
+        });
+        if (callback) callback();
+        return true;
+      },
+    };
+    children.push(child);
+    return child;
+  };
+  const runtime = {
+    spawnFn,
+    env: { MODEL_EXPRESS_ROOT: repo, MODEL_EXPRESS_USER_DATA_DIR: userDataDir },
+    idleTtlMs: 0,
+    timeoutMs: 1000,
+  };
+
+  const first = await __test.predictChampionDemoLocal({ runtimeKey: "project:champion:export", image_uri: "file:///demo/cat-1.jpg", image_id: "cat-1" }, runtime);
+  const second = await __test.predictChampionDemoLocal({ runtimeKey: "project:champion:export", image_uri: "file:///demo/cat-2.jpg", image_id: "cat-2" }, runtime);
+
+  assert.equal(spawnCount, 1);
+  assert.equal(first.prediction.predicted_label, "cat");
+  assert.equal(second.prediction.image_id, "cat-2");
+  assert.deepEqual(__test.championDemoRuntimeSnapshot()?.key, "project:champion:export");
+  const stopped = __test.stopChampionDemoRuntime({ reason: "test_cleanup" });
+  assert.equal(stopped.stopped, true);
+  assert.equal(children[0].killed, true);
+});
+
 test("artifact paths are limited to configured artifact roots", () => {
   const allowedRoot = tempDir("mx-artifacts-");
   const outsideRoot = tempDir("mx-outside-");

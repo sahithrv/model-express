@@ -143,23 +143,35 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
         return
     except Exception as exc:
         message = _modal_training_error_message(exc)
+        retryable = _modal_training_failure_retryable(exc)
+        failure_payload = failure_callback_payload(
+            job_payload,
+            message,
+            modal_resources,
+            retryable=retryable,
+        )
+        if not retryable:
+            failure_payload["failure_class"] = "validation"
+            failure_payload["failure_type"] = "validation"
         client.fail_job(
             job["id"],
             message,
-            retryable=True,
-            metadata=failure_callback_payload(job_payload, message, modal_resources),
+            retryable=retryable,
+            metadata=failure_payload,
             job=job_payload,
         )
         log_event(
             "warn",
-            "modal_training_retry_queued",
+            "modal_training_retry_queued" if retryable else "modal_training_failure_reported",
             job_id=job["id"],
             project_id=job.get("project_id", ""),
             error=message,
-            failure_class=failure_callback_payload(job_payload, message, modal_resources).get("failure_class"),
+            retryable=retryable,
+            failure_class=failure_payload.get("failure_class"),
             modal_resource_signature=modal_resources.get("resource_signature", ""),
         )
-        print(f"Modal training reported retryable failure for {job['id']}: {message}")
+        failure_label = "retryable failure" if retryable else "failure"
+        print(f"Modal training reported {failure_label} for {job['id']}: {message}")
         return
 
     if isinstance(result, dict) and result.get("status") == "retryable_failure_reported":
@@ -875,6 +887,15 @@ def _modal_training_error_message(exc: Exception) -> str:
     if not message:
         message = exc.__class__.__name__
     return f"Modal training invocation failed before completion: {message}"[:2000]
+
+
+def _modal_training_failure_retryable(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    if "409 client error" in message and "/complete" in message:
+        return False
+    if "training completion requires a succeeded summary and exportable evaluation artifact" in message:
+        return False
+    return True
 
 
 def _modal_training_batch_error_message(exc: Exception) -> str:

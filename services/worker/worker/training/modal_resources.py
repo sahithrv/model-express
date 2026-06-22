@@ -202,14 +202,20 @@ def classify_oom_failure(exc_or_message: object) -> dict:
     }
 
 
-def failure_callback_payload(job: dict, error: str, modal_resources: dict | None = None) -> dict:
+def failure_callback_payload(
+    job: dict,
+    error: str,
+    modal_resources: dict | None = None,
+    *,
+    retryable: bool = True,
+) -> dict:
     config = job.get("config") if isinstance(job.get("config"), dict) else {}
     resources = modal_resources if isinstance(modal_resources, dict) else modal_resources_from_payload({}, config)
     classification = classify_oom_failure(error)
     telemetry = resource_telemetry(resources)
     payload = {
         "error": error,
-        "retryable": True,
+        "retryable": bool(retryable),
         "training_attempt_id": training_attempt_id(job),
         "failure_class": classification["failure_class"],
         "failure_type": classification["failure_class"],

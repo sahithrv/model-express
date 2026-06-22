@@ -118,6 +118,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/projects/:id/champion/demo-images", server.listProjectChampionDemoImages)
 	router.GET("/projects/:id/champion/demo-predictions", server.listProjectChampionDemoPredictions)
 	router.POST("/projects/:id/champion/demo-predictions", server.createProjectChampionDemoPrediction)
+	router.POST("/projects/:id/champion/demo-predictions/local-result", server.createProjectChampionDemoPredictionLocalResult)
 	router.GET("/projects/:id/champion/feedback", server.listProjectChampionFeedback)
 	router.POST("/projects/:id/champion/feedback", server.createProjectChampionFeedback)
 	router.POST("/projects/:id/experimentation/reopen", server.reopenProjectExperimentation)

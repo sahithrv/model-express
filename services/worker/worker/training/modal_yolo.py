@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 from worker.training.modal_common import (
@@ -865,9 +866,10 @@ def _export_yolo_detector_bundle(
     source_path = onnx_path or model_path
     artifact_format = "onnx" if onnx_path is not None else "pytorch"
     try:
+        staged_source_path = _stage_yolo_export_source(source_path, export_dir, artifact_format=artifact_format)
         manifest = produce_existing_champion_export_manifest(
             export_dir=export_dir,
-            source_artifact_path=source_path,
+            source_artifact_path=staged_source_path,
             artifact_format=artifact_format,
             model_name=model_name,
             class_names=class_names,
@@ -907,6 +909,39 @@ def _export_yolo_detector_bundle(
             "manifest": {},
             "validation_errors": validation_errors,
         }
+
+
+def _stage_yolo_export_source(source_path: Path, export_dir: Path, *, artifact_format: str) -> Path:
+    """Move Ultralytics outputs into a controlled export root before packaging."""
+    source_path = Path(source_path).resolve(strict=False)
+    staging_dir = export_dir / "source"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged_path = staging_dir / _staged_yolo_source_name(source_path, artifact_format)
+    if source_path.resolve(strict=False) != staged_path.resolve(strict=False):
+        shutil.copy2(source_path, staged_path)
+    if str(artifact_format).lower() == "onnx":
+        _stage_yolo_onnx_sidecar(source_path, staged_path)
+    return staged_path
+
+
+def _staged_yolo_source_name(source_path: Path, artifact_format: str) -> str:
+    normalized = str(artifact_format).lower()
+    if normalized == "onnx":
+        suffix = ".onnx"
+    elif normalized in {"pytorch", "checkpoint", "framework_native"}:
+        suffix = source_path.suffix if source_path.suffix.lower() in {".pt", ".pth"} else ".pt"
+    else:
+        suffix = source_path.suffix or ".bin"
+    return f"{_safe_path_part(source_path.stem)}{suffix}"
+
+
+def _stage_yolo_onnx_sidecar(source_path: Path, staged_path: Path) -> None:
+    source_sidecar = source_path.with_name(f"{source_path.name}.data")
+    if not source_sidecar.exists() or not source_sidecar.is_file():
+        return
+    staged_sidecar = staged_path.with_name(f"{staged_path.name}.data")
+    if source_sidecar.resolve(strict=False) != staged_sidecar.resolve(strict=False):
+        shutil.copy2(source_sidecar, staged_sidecar)
 
 
 def _yolo_per_class_metrics(class_names: list[str], metrics: dict) -> dict:

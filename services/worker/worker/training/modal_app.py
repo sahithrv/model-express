@@ -4266,10 +4266,15 @@ def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> b
         config,
         detection_job=_modal_failure_detection_job(config),
     )
+    retryable = _modal_training_failure_retryable(exc)
+    failure_payload = failure_callback_payload(job, message, modal_resources, retryable=retryable)
+    if not retryable:
+        failure_payload["failure_class"] = "validation"
+        failure_payload["failure_type"] = "validation"
     try:
         _post_callback_json(
             f"{orchestrator_url}/jobs/{job_id}/fail",
-            failure_callback_payload(job, message, modal_resources),
+            failure_payload,
             callback_token(job),
         )
         return True
@@ -4277,8 +4282,13 @@ def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> b
         return False
 
 
-
-
+def _modal_training_failure_retryable(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    if "409 client error" in message and "/complete" in message:
+        return False
+    if "training completion requires a succeeded summary and exportable evaluation artifact" in message:
+        return False
+    return True
 
 
 def _post_job_json(

@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld("missionControl", {
   preflightCloud: (options) => ipcRenderer.invoke("cloud:preflight", options),
   uploadDatasetFolder: (options) => ipcRenderer.invoke("dataset:uploadFolder", options),
   selectDemoImage: () => ipcRenderer.invoke("demo:selectImage"),
+  predictChampionDemoLocal: (options) => ipcRenderer.invoke("demo:predictChampionLocal", options),
+  disposeChampionDemoLocalRuntime: (options) => ipcRenderer.invoke("demo:disposeChampionLocalRuntime", options),
   loadModelArtifact: (options) => ipcRenderer.invoke("artifact:loadModel", options),
   saveArtifact: (options) => ipcRenderer.invoke("artifact:save", options),
   saveExportArtifact: (options) => ipcRenderer.invoke("artifact:saveExport", options),

@@ -41,6 +41,20 @@ type createChampionDemoPredictionRequest struct {
 	MaxDetections       int            `json:"max_detections"`
 }
 
+type createLocalChampionDemoPredictionRequest struct {
+	ImageURI       string                    `json:"image_uri" binding:"required"`
+	ImageID        string                    `json:"image_id"`
+	TrueLabel      string                    `json:"true_label"`
+	Status         string                    `json:"status"`
+	PredictedLabel string                    `json:"predicted_label"`
+	Confidence     *float64                  `json:"confidence"`
+	TopK           []runs.DemoPredictionTopK `json:"top_k"`
+	LatencyMS      *float64                  `json:"latency_ms"`
+	Correct        *bool                     `json:"correct"`
+	Error          string                    `json:"error"`
+	ImageMetadata  map[string]any            `json:"image_metadata"`
+}
+
 type createChampionFeedbackRequest struct {
 	PredictionID       string         `json:"prediction_id"`
 	ImageURI           string         `json:"image_uri"`
@@ -808,6 +822,69 @@ func (s *Server) listProjectChampionDemoPredictions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"predictions": predictions})
 }
 
+func (s *Server) createProjectChampionDemoPredictionLocalResult(c *gin.Context) {
+	var req createLocalChampionDemoPredictionRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	imageURI := strings.TrimSpace(req.ImageURI)
+	if imageURI == "" {
+		writeStoreError(c, fmt.Errorf("%w: image_uri is required", store.ErrInvalidRequest))
+		return
+	}
+	status := normalizeChampionDemoPredictionResultStatus(req.Status)
+	if status == "" {
+		writeStoreError(c, fmt.Errorf("%w: local prediction status must be SUCCEEDED, FAILED, or RUNTIME_UNAVAILABLE", store.ErrInvalidRequest))
+		return
+	}
+	if status == runs.ChampionDemoPredictionStatusSucceeded && strings.TrimSpace(req.PredictedLabel) == "" && !championDemoPredictionHasDetectionMetadata(req.ImageMetadata) {
+		writeStoreError(c, fmt.Errorf("%w: predicted_label is required for successful local prediction", store.ErrInvalidRequest))
+		return
+	}
+	champion, err := s.store.GetProjectChampion(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	imageMetadata := copyPayloadMap(req.ImageMetadata)
+	imageMetadata["local_runtime"] = true
+	if strings.TrimSpace(payloadString(imageMetadata, "inference_transport")) == "" {
+		imageMetadata["inference_transport"] = "mission_control_local_runtime"
+	}
+	prediction, err := s.store.CreateChampionDemoPrediction(runs.ChampionDemoPredictionCreate{
+		ProjectID:      champion.ProjectID,
+		ChampionID:     champion.ID,
+		JobID:          champion.JobID,
+		DatasetID:      champion.DatasetID,
+		ImageURI:       imageURI,
+		ImageID:        strings.TrimSpace(req.ImageID),
+		ImageMetadata:  imageMetadata,
+		Status:         status,
+		PredictedLabel: strings.TrimSpace(req.PredictedLabel),
+		TrueLabel:      strings.TrimSpace(req.TrueLabel),
+		Confidence:     req.Confidence,
+		TopK:           req.TopK,
+		LatencyMS:      req.LatencyMS,
+		Correct:        req.Correct,
+		Error:          strings.TrimSpace(req.Error),
+	})
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if _, err := s.store.CreateExecutionEvent(champion.ProjectID, champion.PlanID, execution.EventChampionDemoPrediction, fmt.Sprintf("Local champion demo prediction recorded for job %s.", champion.JobID), map[string]any{
+		"champion_id":   champion.ID,
+		"prediction_id": prediction.ID,
+		"job_id":        champion.JobID,
+		"status":        prediction.Status,
+		"image_uri":     prediction.ImageURI,
+		"local_runtime": true,
+	}); err != nil {
+		log.Printf("record local champion demo prediction event failed: %v", err)
+	}
+	c.JSON(http.StatusCreated, gin.H{"prediction": prediction, "runtime_available": status == runs.ChampionDemoPredictionStatusSucceeded})
+}
+
 func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 	var req createChampionDemoPredictionRequest
 	if !bindJSON(c, &req) {
@@ -1453,23 +1530,21 @@ func (s *Server) reportChampionDemoPredictionResult(c *gin.Context) {
 	}
 	if status == runs.ChampionDemoPredictionStatusSucceeded {
 		job, err = s.store.CompleteJob(job.ID, "")
-	} else if status == runs.ChampionDemoPredictionStatusFailed {
+	} else {
 		message := strings.TrimSpace(req.Error)
 		if message == "" {
 			message = "champion demo prediction failed"
 		}
 		job, err = s.store.FailJob(job.ID, message)
-	} else {
-		job, err = s.store.CompleteJob(job.ID, "")
 	}
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
-	if status == runs.ChampionDemoPredictionStatusFailed {
-		s.closeRemoteTrainingSession(job, jobs.StatusFailed)
-	} else {
+	if status == runs.ChampionDemoPredictionStatusSucceeded {
 		s.closeRemoteTrainingSession(job, jobs.StatusSucceeded)
+	} else {
+		s.closeRemoteTrainingSession(job, jobs.StatusFailed)
 	}
 	c.JSON(http.StatusOK, gin.H{"prediction": prediction, "job": job})
 }

@@ -71,6 +71,33 @@ interface Window {
       size_bytes?: number;
       metadata?: Record<string, unknown>;
     } | null>;
+    predictChampionDemoLocal(options: {
+      runtimeKey: string;
+      request_id?: string;
+      projectId?: string;
+      championId?: string;
+      exportId?: string;
+      exportArtifactUri?: string;
+      export_artifact_uri?: string;
+      export_metadata?: Record<string, unknown>;
+      manifest_path?: string;
+      image_uri: string;
+      image_id?: string;
+      true_label?: string;
+      image_metadata?: Record<string, unknown>;
+      top_k?: number;
+      confidence_threshold?: number;
+      iou_threshold?: number;
+      max_detections?: number;
+    }): Promise<{
+      prediction: import("./types").ChampionDemoPrediction;
+      pid?: number;
+    }>;
+    disposeChampionDemoLocalRuntime(options?: { runtimeKey?: string; reason?: string }): Promise<{
+      stopped: boolean;
+      status: string;
+      runtime_key?: string;
+    }>;
     loadModelArtifact(options: {
       artifactUri: string;
       externalData?: Array<{

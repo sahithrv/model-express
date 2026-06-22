@@ -408,8 +408,6 @@ import {
   demoImageLabel,
   demoImageDetail,
   demoPredictionRequestMetadata,
-  isTerminalDemoPredictionStatus,
-  sleep,
   nextDemoImageIndex,
   randomDemoImageIndex,
   uniqueBy,
@@ -702,6 +700,70 @@ const defaultAutomationSettings: AutomationSettings = {
   updated_at: "",
 };
 
+function readyLocalPythonExport(exports: ChampionExport[]) {
+  return exports.find((exportRecord) => {
+    const status = normalizedStatus(exportRecord.status || "");
+    if (status !== "READY") return false;
+    const artifactURI = championExportArtifactURI(exportRecord);
+    const manifest = championExportManifest(exportRecord);
+    const manifestHasCreatedArtifact = Array.isArray(manifest.artifacts)
+      ? manifest.artifacts.some((item) => recordString(recordObject(item), "status").toLowerCase() === "created")
+      : false;
+    return Boolean(artifactURI || manifestHasCreatedArtifact);
+  });
+}
+
+function championExportArtifactURI(exportRecord: ChampionExport) {
+  return exportRecord.artifact_uri || exportRecord.model_uri || exportRecord.download_url || "";
+}
+
+function championExportManifest(exportRecord: ChampionExport) {
+  const metadata = recordObject(exportRecord.metadata);
+  const manifest = recordObject(metadata.manifest);
+  if (Object.keys(manifest).length > 0) return manifest;
+  const deploymentManifest = recordObject(recordObject(metadata.deployment_profile).export_manifest);
+  if (Object.keys(deploymentManifest).length > 0) return deploymentManifest;
+  return recordObject(recordObject(metadata.model_profile).export_manifest);
+}
+
+function championExportManifestPath(exportRecord: ChampionExport) {
+  const metadata = recordObject(exportRecord.metadata);
+  const manifest = championExportManifest(exportRecord);
+  return (
+    recordFirstString(manifest, ["manifest_path", "local_manifest_path", "manifest_uri", "export_manifest_uri"]) ||
+    recordFirstString(metadata, ["manifest_path", "local_manifest_path", "export_manifest_path", "manifest_uri", "export_manifest_uri"])
+  );
+}
+
+function championDemoPythonRuntimeKey(projectId: string, championId: string, exportRecord: ChampionExport) {
+  return [projectId, championId, exportRecord.id || "export", championExportArtifactURI(exportRecord) || championExportManifestPath(exportRecord)]
+    .filter(Boolean)
+    .join(":");
+}
+
+function failedLocalDemoPrediction(image: ChampionDemoImage, error: unknown, exportRecord: ChampionExport | null): ChampionDemoPrediction {
+  const message = error instanceof Error ? error.message : String(error);
+  const imageURI = demoImageURI(image);
+  return {
+    id: `local-failed-${Date.now()}`,
+    image_uri: imageURI,
+    image_id: image.image_id || image.id || "",
+    status: "FAILED",
+    predicted_label: "",
+    true_label: demoImageLabel(image),
+    confidence: 0,
+    latency_ms: 0,
+    top_k: [],
+    error: message,
+    image_metadata: {
+      ...demoPredictionRequestMetadata(image),
+      local_runtime: true,
+      runtime_host: "mission_control_python",
+      export_id: exportRecord?.id || "",
+      export_artifact_uri: exportRecord ? championExportArtifactURI(exportRecord) : "",
+    },
+  };
+}
 export function App() {
   const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
   const [health, setHealth] = useState<Health | null>(null);
@@ -863,6 +925,12 @@ export function App() {
     [detail.champion, detail.jobs, detail.runEvaluations, detail.runSummaries],
   );
   const championExportDemo = useMemo(() => buildChampionExportDemo(detail), [detail]);
+  const championPythonRuntimeKey = useMemo(() => {
+    const exportRecord = readyLocalPythonExport(championExportDemo.exports);
+    return selectedProjectId && detail.champion && exportRecord
+      ? championDemoPythonRuntimeKey(selectedProjectId, detail.champion.id, exportRecord)
+      : "";
+  }, [championExportDemo.exports, detail.champion, selectedProjectId]);
   const missionBrief = useMemo(
     () => buildMissionBrief(selectedProject, detail, missionDigest, automationSettings),
     [automationSettings, detail, missionDigest, selectedProject],
@@ -1593,6 +1661,7 @@ export function App() {
       setActivityEvents([]);
       setActivityStreamState("connecting");
       localRuntime.current = null;
+      window.missionControl.disposeChampionDemoLocalRuntime({ reason: "project_changed" }).catch(() => undefined);
       resetWorkerSupervisor();
       setJobPage(0);
       refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch((error) =>
@@ -1619,13 +1688,22 @@ export function App() {
         modelProfile: championExportDemo.modelProfile,
       })
     ) {
-      setLocalInferenceStatus((status) => (status === "not_ready" ? "available" : status));
+      setLocalInferenceStatus((status) => (status === "not_ready" || status === "python_available" ? "available" : status));
+    } else if (readyLocalPythonExport(championExportDemo.exports)) {
+      localRuntime.current = null;
+      setLocalInferenceStatus((status) => (status === "not_ready" ? "python_available" : status));
+      setLocalInferenceError("");
     } else {
       localRuntime.current = null;
       setLocalInferenceStatus("not_ready");
       setLocalInferenceError("");
     }
   }, [championExportDemo.deploymentProfile, championExportDemo.exports, championExportDemo.modelProfile]);
+
+  useEffect(() => {
+    localRuntime.current = null;
+    window.missionControl.disposeChampionDemoLocalRuntime({ runtimeKey: championPythonRuntimeKey, reason: "champion_export_changed" }).catch(() => undefined);
+  }, [championPythonRuntimeKey]);
 
   useEffect(() => {
     if (!championDetectionDefaults.isDetection) return;
@@ -2222,7 +2300,102 @@ export function App() {
       iouThreshold: detectionIouThreshold,
       maxDetections: 100,
     });
-    setDemoPrediction(attachDemoPredictionPreview(prediction, { ...image, thumbnail_uri: imageSource }));
+    const normalized = attachDemoPredictionPreview(prediction, { ...image, thumbnail_uri: imageSource });
+    setDemoPrediction(normalized);
+    return normalized;
+  }
+
+  async function runChampionPythonPrediction(image: ChampionDemoImage) {
+    if (!selectedProjectId || !detail.champion) return null;
+    const exportRecord = readyLocalPythonExport(championExportDemo.exports);
+    if (!exportRecord) {
+      throw new Error("No READY champion export is available for local Python demo inference. Prepare a champion export before running the demo.");
+    }
+    const imageURI = demoImageURI(image);
+    if (!imageURI) {
+      throw new Error("Demo image has no URI for local Python inference.");
+    }
+    const artifactURI = championExportArtifactURI(exportRecord);
+    setLocalInferenceStatus("loading");
+    const response = await window.missionControl.predictChampionDemoLocal({
+      runtimeKey: championDemoPythonRuntimeKey(selectedProjectId, detail.champion.id, exportRecord),
+      request_id: `local-${Date.now()}`,
+      projectId: selectedProjectId,
+      championId: detail.champion.id,
+      exportId: exportRecord.id || "",
+      exportArtifactUri: artifactURI,
+      export_artifact_uri: artifactURI,
+      export_metadata: recordObject(exportRecord.metadata),
+      manifest_path: championExportManifestPath(exportRecord),
+      image_uri: imageURI,
+      image_id: image.image_id || image.id || "",
+      true_label: demoImageLabel(image),
+      image_metadata: {
+        ...demoPredictionRequestMetadata(image),
+        inference_transport: "mission_control_local_python",
+      },
+      top_k: 5,
+      confidence_threshold: detectionConfidenceThreshold,
+      iou_threshold: detectionIouThreshold,
+      max_detections: 100,
+    });
+    const prediction = attachDemoPredictionPreview(normalizeDemoPredictionResponse(response.prediction), image);
+    const status = normalizedStatus(prediction.status || "");
+    setDemoPrediction(prediction);
+    if (status === "SUCCEEDED") {
+      setLocalInferenceStatus("ready");
+      setLocalInferenceError("");
+    } else {
+      const message = prediction.error || prediction.error_message || predictionStatusMessage(status);
+      setLocalInferenceStatus("error");
+      setLocalInferenceError(message);
+      setDemoPredictionError(message);
+    }
+    await persistChampionLocalDemoPrediction(prediction, image);
+    return prediction;
+  }
+
+  async function persistChampionLocalDemoPrediction(prediction: ChampionDemoPrediction, image: ChampionDemoImage) {
+    if (!selectedProjectId || !detail.champion) return prediction;
+    const imageURI = prediction.image_uri || demoImageURI(image);
+    if (!imageURI) return prediction;
+    try {
+      const response = await request<ChampionDemoPrediction | { prediction?: ChampionDemoPrediction }>(
+        `/projects/${selectedProjectId}/champion/demo-predictions/local-result`,
+        {
+          method: "POST",
+          body: {
+            image_uri: imageURI,
+            image_id: prediction.image_id || image.image_id || image.id || "",
+            true_label: prediction.true_label || demoImageLabel(image),
+            status: prediction.status || "FAILED",
+            predicted_label: prediction.predicted_label || "",
+            confidence: typeof prediction.confidence === "number" ? prediction.confidence : undefined,
+            top_k: Array.isArray(prediction.top_k) ? prediction.top_k : [],
+            latency_ms: typeof prediction.latency_ms === "number" ? prediction.latency_ms : undefined,
+            correct: typeof prediction.correct === "boolean" ? prediction.correct : undefined,
+            error: prediction.error || prediction.error_message || "",
+            image_metadata: {
+              ...demoPredictionRequestMetadata(image),
+              ...recordObject(prediction.image_metadata),
+              ...recordObject(prediction.metadata),
+              local_runtime: true,
+            },
+          },
+        },
+      );
+      const persisted = attachDemoPredictionPreview(normalizeDemoPredictionResponse(response), image);
+      setDemoPrediction(persisted);
+      setDetail((previous) => ({
+        ...previous,
+        championDemoPredictions: [persisted, ...previous.championDemoPredictions.filter((item) => item.id !== persisted.id)].slice(0, 12),
+      }));
+      await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
+      return persisted;
+    } catch (error) {
+      setLocalInferenceError(`Local prediction ran, but history save failed: ${errorMessage(error)}`);
+      return prediction;
+    }
   }
 
   async function runChampionDemoPrediction(image: ChampionDemoImage) {
@@ -2231,7 +2404,7 @@ export function App() {
     const imageURI = demoImageURI(image);
     if (!imageURI) {
       setDemoPrediction(null);
-      setDemoPredictionError("Demo image has no URI to send to the backend.");
+      setDemoPredictionError("Demo image has no URI for local inference.");
       return;
     }
     if (!demoImageIsRunnable(image)) {
@@ -2243,89 +2416,43 @@ export function App() {
     setDemoPrediction(null);
     setDemoPredictionError("");
     setDemoPredictionLoading(true);
-    let localFallbackUsed = false;
     try {
       const browserSafeExport = readyBrowserONNXExport(championExportDemo.exports, {
         deploymentProfile: championExportDemo.deploymentProfile,
         modelProfile: championExportDemo.modelProfile,
       });
-      if (browserSafeExport) {
-        if (demoImageInferenceURI(image)) {
-          try {
-            await runChampionLocalPrediction(image);
-            return;
-          } catch (error) {
-            if (!isLocalInferenceUnsafeError(error)) {
-              throw error;
-            }
-            localFallbackUsed = true;
-            setLocalInferenceStatus("backend");
-            setLocalInferenceError("");
-          }
-        } else {
-          localFallbackUsed = true;
-          setLocalInferenceStatus("backend");
-          setLocalInferenceError("");
-        }
-      }
-      const response = await request<ChampionDemoPrediction | { prediction?: ChampionDemoPrediction }>(
-        `/projects/${selectedProjectId}/champion/demo-predictions`,
-        {
-          method: "POST",
-          body: {
-            image_uri: imageURI,
-            image_id: image.image_id || image.id || "",
-            true_label: demoImageLabel(image),
-            image_metadata: demoPredictionRequestMetadata(image),
-            top_k: 5,
-            confidence_threshold: detectionConfidenceThreshold,
-            iou_threshold: detectionIouThreshold,
-            max_detections: 100,
-          },
-        },
-      );
-      const normalized = attachDemoPredictionPreview(normalizeDemoPredictionResponse(response), image);
-      setDemoPrediction(normalized);
-      if (normalized.id && !isTerminalDemoPredictionStatus(normalized.status)) {
+      if (browserSafeExport && demoImageInferenceURI(image)) {
         try {
-          await ensureChampionBackendWorker("champion-demo");
+          const prediction = await runChampionLocalPrediction(image);
+          await persistChampionLocalDemoPrediction(
+            {
+              ...prediction,
+              image_metadata: {
+                ...recordObject(prediction.image_metadata),
+                inference_transport: "mission_control_browser_onnx",
+              },
+            },
+            image,
+          );
+          return;
         } catch (error) {
-          setDemoPredictionError(`Backend demo prediction was queued, but worker did not start: ${errorMessage(error)}`);
+          localRuntime.current = null;
+          setLocalInferenceStatus("python_available");
+          setLocalInferenceError(`Browser ONNX unavailable; using local Python: ${errorMessage(error)}`);
         }
-        await pollChampionDemoPrediction(normalized.id, image);
-      } else {
-        await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
       }
+      await runChampionPythonPrediction(image);
     } catch (error) {
-      if (!localFallbackUsed && readyONNXExport(championExportDemo.exports) && !isLocalInferenceUnsafeError(error)) {
-        setLocalInferenceStatus("error");
-        setLocalInferenceError(error instanceof Error ? error.message : String(error));
-      }
-      setDemoPredictionError(error instanceof Error ? error.message : String(error));
+      const exportRecord = readyLocalPythonExport(championExportDemo.exports) ?? null;
+      const failed = attachDemoPredictionPreview(failedLocalDemoPrediction(image, error, exportRecord), image);
+      setDemoPrediction(failed);
+      setDemoPredictionError(failed.error || errorMessage(error));
+      setLocalInferenceStatus("error");
+      setLocalInferenceError(failed.error || errorMessage(error));
+      await persistChampionLocalDemoPrediction(failed, image);
     } finally {
       setDemoPredictionLoading(false);
     }
-  }
-
-  async function pollChampionDemoPrediction(predictionId: string, image: ChampionDemoImage) {
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      await sleep(attempt === 0 ? 700 : 1500);
-      if (!selectedProjectId) return;
-
-      const response = await request<{
-        predictions?: ChampionDemoPrediction[];
-        history?: ChampionDemoPrediction[];
-        demo_predictions?: ChampionDemoPrediction[];
-      }>(`/projects/${selectedProjectId}/champion/demo-predictions?limit=12`);
-      const predictions = response.predictions ?? response.history ?? response.demo_predictions ?? [];
-      const matched = predictions.find((item) => item.id === predictionId);
-      if (!matched) continue;
-
-      const normalized = attachDemoPredictionPreview(normalizeDemoPredictionResponse(matched), image);
-      setDemoPrediction(normalized);
-      if (isTerminalDemoPredictionStatus(normalized.status)) break;
-    }
-    await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch(() => undefined);
   }
 
   function openChampionFeedback(rating: ChampionFeedbackRating) {

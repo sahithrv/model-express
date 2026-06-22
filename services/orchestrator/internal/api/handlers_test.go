@@ -1656,6 +1656,59 @@ func TestChampionDemoPredictionQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	}
 }
 
+func TestLocalChampionDemoPredictionPersistsWithoutWorkerJob(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("demo", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	dataset, err := memoryStore.CreateDataset(project.ID, "dataset", "file:///dataset", "", 0)
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	trainingJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID})
+	if err != nil {
+		t.Fatalf("create training job: %v", err)
+	}
+	if _, err := memoryStore.UpsertProjectChampion(runs.ProjectChampionUpsert{
+		ProjectID:       project.ID,
+		DatasetID:       dataset.ID,
+		JobID:           trainingJob.ID,
+		SelectionReason: "best validation score",
+	}); err != nil {
+		t.Fatalf("upsert champion: %v", err)
+	}
+
+	router := NewRouter(memoryStore)
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/demo-predictions/local-result", strings.NewReader(`{"image_uri":"file:///dataset/test/cat/1.jpg","image_id":"cat-1","true_label":"cat","status":"SUCCEEDED","predicted_label":"cat","confidence":0.97,"top_k":[{"label":"cat","confidence":0.97}],"latency_ms":14,"correct":true,"image_metadata":{"runtime":"onnx"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Prediction runs.ChampionDemoPrediction `json:"prediction"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode local prediction response: %v", err)
+	}
+	if payload.Prediction.Status != runs.ChampionDemoPredictionStatusSucceeded || payload.Prediction.PredictedLabel != "cat" {
+		t.Fatalf("expected succeeded local prediction, got %#v", payload.Prediction)
+	}
+	if payload.Prediction.ImageMetadata["inference_transport"] != "mission_control_local_runtime" || payload.Prediction.ImageMetadata["local_runtime"] != true {
+		t.Fatalf("expected local runtime metadata, got %#v", payload.Prediction.ImageMetadata)
+	}
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	for _, job := range projectJobs {
+		if job.Template == jobs.TemplateChampionDemoPrediction {
+			t.Fatalf("local demo result must not create champion demo prediction jobs: %#v", job)
+		}
+	}
+}
 func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
@@ -1810,8 +1863,8 @@ func TestChampionDemoPredictionAcceptsRuntimeUnavailableWorkerResult(t *testing.
 	if err != nil {
 		t.Fatalf("get prediction job: %v", err)
 	}
-	if updatedJob.Status != jobs.StatusSucceeded {
-		t.Fatalf("runtime-unavailable result should complete audit job, got %s", updatedJob.Status)
+	if updatedJob.Status != jobs.StatusFailed {
+		t.Fatalf("runtime-unavailable result should fail audit job, got %s", updatedJob.Status)
 	}
 }
 

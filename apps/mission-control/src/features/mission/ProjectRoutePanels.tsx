@@ -1425,6 +1425,7 @@ export function ExportRoute({
   const topK = Array.isArray(prediction?.top_k) ? prediction.top_k : [];
   const portableBundle = data.portableBundle;
   const canSavePortableBundle = Boolean(portableBundle && portableBundleDownloadable(portableBundle));
+  const localDemoAvailable = localChampionDemoRuntimeAvailable(data);
 
   if (!summary.hasChampion) {
     return (
@@ -1527,7 +1528,7 @@ export function ExportRoute({
             <div className="demo-block-head">
               <strong>Images</strong>
               <span>
-                <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={data.demoImages.length < 2 || predictionLoading}>
+                <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={!localDemoAvailable || data.demoImages.length < 2 || predictionLoading}>
                   {slideshowEnabled ? <Pause size={15} /> : <Play size={15} />}
                   {slideshowEnabled ? "Pause" : "Slideshow"}
                 </button>
@@ -3187,6 +3188,7 @@ export function ChampionExportDemoPanel({
       ? `${portableBundle.contents.length} file(s)`
       : portableBundle?.error || "";
   const canSavePortableBundle = Boolean(portableBundle && portableBundleDownloadable(portableBundle));
+  const localDemoAvailable = localChampionDemoRuntimeAvailable(data);
 
   return (
     <div className="export-demo-panel">
@@ -3338,8 +3340,8 @@ export function ChampionExportDemoPanel({
           <div className="demo-block-head">
             <strong>Try Model</strong>
             <span>
-              <Badge value={localInferenceStatus === "ready" || localInferenceStatus === "available" ? "LOCAL_ONNX" : localInferenceStatus === "loading" ? "LOADING_ONNX" : "WORKER_FALLBACK"} />
-              <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={data.demoImages.length < 2 || predictionLoading}>
+              <Badge value={localInferenceStatus === "ready" || localInferenceStatus === "available" ? "LOCAL_ONNX" : localInferenceStatus === "loading" ? "PREPARING_LOCAL" : localInferenceStatus === "error" ? "LOCAL_ERROR" : "LOCAL_PYTHON"} />
+              <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={!localDemoAvailable || data.demoImages.length < 2 || predictionLoading}>
                 {slideshowEnabled ? <Pause size={15} /> : <Play size={15} />}
                 {slideshowEnabled ? "Pause" : "Slideshow"}
               </button>
@@ -3449,7 +3451,7 @@ export function ChampionExportDemoPanel({
               </div>
             </details>
           )}
-          {predictionLoading && <div className="empty compact">{readyONNXExport(data.exports) ? "Running local ONNX inference..." : "Waiting for inference..."}</div>}
+          {predictionLoading && <div className="empty compact">{readyONNXExport(data.exports) ? "Running local ONNX inference..." : "Running local Python inference..."}</div>}
           {prediction ? (
             <>
               <PredictionRow prediction={prediction} index={0} />
@@ -3680,11 +3682,15 @@ export function DetectionOverlay({ detections }: { detections: ChampionDetection
   );
 }
 
+function localChampionDemoRuntimeAvailable(data: ChampionExportDemo) {
+  return data.exports.some((exportRecord) => normalizedStatus(exportRecord.status || "") === "READY");
+}
 function demoRuntimeLabel(status: string) {
   if (status === "ready" || status === "available") return "Browser inference ready";
-  if (status === "loading") return "Preparing browser inference";
-  if (status === "error") return "Browser inference unavailable";
-  return "Backend inference";
+  if (status === "loading") return "Preparing local inference";
+  if (status === "error") return "Local inference unavailable";
+  if (status === "python_available") return "Local Python inference ready";
+  return "Local Python inference";
 }
 
 export function TopKConfidenceBars({
