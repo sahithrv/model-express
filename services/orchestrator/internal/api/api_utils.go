@@ -132,20 +132,29 @@ func mapFromAny(value any) map[string]any {
 }
 
 func payloadFloat(payload map[string]any, key string) float64 {
+	value, ok := payloadFloatValue(payload, key)
+	if !ok {
+		return 0
+	}
+	return value
+}
+
+func payloadFloatValue(payload map[string]any, key string) (float64, bool) {
 	switch value := payload[key].(type) {
 	case float64:
-		return value
+		return value, isFiniteFloat(value)
 	case float32:
-		return float64(value)
+		out := float64(value)
+		return out, isFiniteFloat(out)
 	case int:
-		return float64(value)
+		return float64(value), true
 	case int64:
-		return float64(value)
+		return float64(value), true
 	case json.Number:
-		out, _ := value.Float64()
-		return out
+		out, err := value.Float64()
+		return out, err == nil && isFiniteFloat(out)
 	default:
-		return 0
+		return 0, false
 	}
 }
 

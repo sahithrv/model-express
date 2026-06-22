@@ -502,6 +502,66 @@ class ModalTrainingHelperTests(unittest.TestCase):
 
         self.assertEqual(per_class, {})
 
+    def test_yolo_metric_extraction_preserves_zero_values(self) -> None:
+        box = SimpleNamespace(
+            map=0.0,
+            map50=0.0,
+            mp=0.0,
+            mr=0.0,
+            p=[0.0, 0.0],
+            r=[0.0, 0.0],
+            ap50=[0.0, 0.0],
+            maps=[0.0, 0.0],
+            ap_class_index=[0, 1],
+        )
+        metrics = SimpleNamespace(
+            results_dict={
+                "metrics/mAP50-95(B)": 0.0,
+                "metrics/mAP50(B)": 0.0,
+                "metrics/precision(B)": 0.0,
+                "metrics/recall(B)": 0.0,
+                "val/box_loss": 0.0,
+                "val/cls_loss": 0.0,
+                "val/dfl_loss": 0.0,
+            },
+            box=box,
+            speed={},
+            names={0: "cat", 1: "dog"},
+        )
+
+        parsed = self.modal_app._yolo_metrics_from_object(metrics, class_names=["cat", "dog"])
+
+        for key in ("mAP50_95", "mAP50", "precision", "recall", "box_loss", "cls_loss", "dfl_loss"):
+            self.assertIn(key, parsed)
+            self.assertEqual(parsed[key], 0.0)
+        self.assertEqual(parsed["per_class_metrics"]["cat"]["AP50_95"], 0.0)
+        self.assertEqual(parsed["per_class_metrics"]["dog"]["AP50"], 0.0)
+        self.assertEqual(parsed["per_class_metrics"]["macro avg"]["recall"], 0.0)
+
+    def test_yolo_epoch_metrics_preserve_zero_values(self) -> None:
+        row = {
+            "epoch": "1",
+            "metrics/mAP50-95(B)": "0",
+            "metrics/mAP50(B)": "0",
+            "metrics/precision(B)": "0",
+            "metrics/recall(B)": "0",
+            "train/box_loss": "0",
+            "train/cls_loss": "0",
+            "train/dfl_loss": "0",
+            "val/box_loss": "0",
+            "val/cls_loss": "0",
+            "val/dfl_loss": "0",
+        }
+
+        parsed = self.modal_app._yolo_epoch_metrics_from_row(row, learning_rate=0.01, image_size=640)
+
+        for key in ("mAP50_95", "map50_95", "mAP50", "map50", "precision", "recall", "box_loss", "cls_loss", "dfl_loss", "train_loss", "val_loss"):
+            self.assertIn(key, parsed)
+            self.assertEqual(parsed[key], 0.0)
+        self.assertEqual(parsed["learning_rate"], 0.01)
+        self.assertEqual(parsed["image_size"], 640)
+        self.assertEqual(self.modal_app._metric_float({"mAP50_95": 0.0}, "mAP50_95", default=0.5), 0.0)
+
     def test_yolo_epoch_metric_posting_skips_previously_posted_epochs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             run_root = Path(temp_dir)
@@ -872,6 +932,8 @@ class ModalTrainingHelperTests(unittest.TestCase):
                     with patch.object(self.modal_app, "_post_json", fake_post):
                         result = self.modal_app._train_modal_preview_batch_impl(self._modal_preview_batch_payload())
 
+        self.assertEqual(result["status"], "partial_retryable_failure")
+        self.assertEqual(result["runner_status"], "classification_batch_partial_retryable_failure")
         self.assertEqual([job["status"] for job in result["job_results"]], ["retryable_failure_reported", "succeeded"])
         self.assertEqual(len(fail_calls), 1)
         self.assertEqual(fail_calls[0]["url"], "https://orchestrator.test/jobs/job_1/fail")

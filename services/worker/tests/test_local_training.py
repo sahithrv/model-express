@@ -53,5 +53,10 @@ def test_local_training_reports_yolo_detection_metrics(monkeypatch):
     evaluation = client.evaluations[-1]["evaluation"]
     assert evaluation["objective_profile"]["task_type"] == "object_detection"
     assert evaluation["model_profile"]["model_kind"] == "ultralytics_yolo_detector"
+    assert evaluation["model_profile"]["simulation"] is True
+    assert evaluation["model_profile"]["exportable"] is False
+    assert evaluation["model_profile"]["deployment_ready"] is False
+    assert evaluation["model_profile"]["export_status"] == "SIMULATED_UNEXPORTABLE"
+    assert evaluation["preprocessing_summary"]["simulation"] is True
     assert evaluation["holistic_scores"]["detection_metrics"]["mAP50_95"] > 0
     assert client.completed[-1]["mlflow_run_id"].startswith("local-yolo-training-")

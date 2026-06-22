@@ -379,15 +379,17 @@ func validationMetricScore(targetMetric string, summary runs.TrainingRunSummary,
 	case "accuracy":
 		return weightedMetricAverage([]metricComponent{{accuracy, 0.55}, {macroF1, 0.45}}, maxFloat(accuracy, macroF1))
 	case "map50_95", "map50", "map":
-		map50_95 := detectionMetricFromEvaluation(evaluation, "map50_95")
-		map50 := detectionMetricFromEvaluation(evaluation, "map50")
-		precision := detectionMetricFromEvaluation(evaluation, "precision")
-		recall := detectionMetricFromEvaluation(evaluation, "recall")
-		if map50_95 > 0 || map50 > 0 {
-			return weightedMetricAverage(
-				[]metricComponent{{map50_95, 0.66}, {map50, 0.20}, {recall, 0.09}, {precision, 0.05}},
-				maxFloat(map50_95, map50),
-			)
+		map50_95, hasMap50_95 := detectionMetricFromEvaluation(evaluation, "map50_95")
+		map50, hasMap50 := detectionMetricFromEvaluation(evaluation, "map50")
+		precision, hasPrecision := detectionMetricFromEvaluation(evaluation, "precision")
+		recall, hasRecall := detectionMetricFromEvaluation(evaluation, "recall")
+		if hasMap50_95 || hasMap50 {
+			weighted := weightedScore{}
+			weighted.add(map50_95, 0.66, hasMap50_95)
+			weighted.add(map50, 0.20, hasMap50)
+			weighted.add(recall, 0.09, hasRecall)
+			weighted.add(precision, 0.05, hasPrecision)
+			return weighted.value(maxFloat(map50_95, map50))
 		}
 		return weightedMetricAverage([]metricComponent{{macroF1, 0.65}, {accuracy, 0.35}}, maxFloat(macroF1, accuracy))
 	default:
@@ -467,7 +469,7 @@ func catastrophicLossThreshold(classCount int) float64 {
 	return maxFloat(catastrophicAbsoluteLossThreshold, randomBaseline*catastrophicRandomLossRatioThreshold)
 }
 
-func detectionMetricFromEvaluation(evaluation runs.TrainingRunEvaluation, metric string) float64 {
+func detectionMetricFromEvaluation(evaluation runs.TrainingRunEvaluation, metric string) (float64, bool) {
 	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(metric), "-", "_"))
 	objectiveKeys := map[string][]string{
 		"map50_95":  {"heldout_test_map50_95", "heldout_test_map"},
@@ -475,10 +477,8 @@ func detectionMetricFromEvaluation(evaluation runs.TrainingRunEvaluation, metric
 		"precision": {"heldout_test_precision"},
 		"recall":    {"heldout_test_recall"},
 	}
-	for _, key := range objectiveKeys[normalized] {
-		if value := payloadFloat(evaluation.ObjectiveProfile, key); value > 0 {
-			return clamp01(value)
-		}
+	if value, ok := firstPayloadFloatValue(evaluation.ObjectiveProfile, objectiveKeys[normalized]...); ok {
+		return clamp01(value), true
 	}
 	detectionMetrics := payloadMap(evaluation.HolisticScores, "detection_metrics")
 	holisticKeys := map[string][]string{
@@ -487,34 +487,35 @@ func detectionMetricFromEvaluation(evaluation runs.TrainingRunEvaluation, metric
 		"precision": {"precision"},
 		"recall":    {"recall"},
 	}
-	for _, key := range holisticKeys[normalized] {
-		if value := payloadFloat(detectionMetrics, key); value > 0 {
-			return clamp01(value)
-		}
+	if value, ok := firstPayloadFloatValue(detectionMetrics, holisticKeys[normalized]...); ok {
+		return clamp01(value), true
 	}
-	return 0
+	return 0, false
 }
 
 func addDetectionChampionMetrics(metrics map[string]any, evaluation runs.TrainingRunEvaluation) {
-	map50_95 := detectionMetricFromEvaluation(evaluation, "map50_95")
-	map50 := detectionMetricFromEvaluation(evaluation, "map50")
-	precision := detectionMetricFromEvaluation(evaluation, "precision")
-	recall := detectionMetricFromEvaluation(evaluation, "recall")
-	if map50_95 <= 0 && map50 <= 0 {
+	map50_95, hasMap50_95 := detectionMetricFromEvaluation(evaluation, "map50_95")
+	map50, hasMap50 := detectionMetricFromEvaluation(evaluation, "map50")
+	precision, hasPrecision := detectionMetricFromEvaluation(evaluation, "precision")
+	recall, hasRecall := detectionMetricFromEvaluation(evaluation, "recall")
+	if !hasMap50_95 && !hasMap50 {
 		return
 	}
-	if map50_95 > 0 {
+	if hasMap50_95 {
 		metrics["best_map50_95"] = map50_95
 		metrics["primary_metric_value"] = map50_95
 		metrics["primary_metric_label"] = "mAP50-95"
+	} else if hasMap50 {
+		metrics["primary_metric_value"] = map50
+		metrics["primary_metric_label"] = "mAP50"
 	}
-	if map50 > 0 {
+	if hasMap50 {
 		metrics["best_map50"] = map50
 	}
-	if precision > 0 {
+	if hasPrecision {
 		metrics["best_precision"] = precision
 	}
-	if recall > 0 {
+	if hasRecall {
 		metrics["best_recall"] = recall
 	}
 	metrics["target_metric"] = "mAP50_95"
@@ -522,19 +523,16 @@ func addDetectionChampionMetrics(metrics map[string]any, evaluation runs.Trainin
 }
 
 func heldoutMetricScore(targetMetric string, objectiveProfile map[string]any) (float64, bool) {
-	map50_95 := payloadFloat(objectiveProfile, "heldout_test_map50_95")
-	if map50_95 <= 0 {
-		map50_95 = payloadFloat(objectiveProfile, "heldout_test_map")
-	}
-	map50 := payloadFloat(objectiveProfile, "heldout_test_map50")
-	recall := payloadFloat(objectiveProfile, "heldout_test_recall")
-	precision := payloadFloat(objectiveProfile, "heldout_test_precision")
-	if map50_95 > 0 || map50 > 0 {
+	map50_95, hasMap50_95 := firstPayloadFloatValue(objectiveProfile, "heldout_test_map50_95", "heldout_test_map")
+	map50, hasMap50 := payloadFloatValue(objectiveProfile, "heldout_test_map50")
+	recall, hasRecall := payloadFloatValue(objectiveProfile, "heldout_test_recall")
+	precision, hasPrecision := payloadFloatValue(objectiveProfile, "heldout_test_precision")
+	if hasMap50_95 || hasMap50 {
 		weighted := weightedScore{}
-		weighted.add(map50_95, 0.62, map50_95 > 0)
-		weighted.add(map50, 0.20, map50 > 0)
-		weighted.add(recall, 0.12, recall > 0)
-		weighted.add(precision, 0.06, precision > 0)
+		weighted.add(map50_95, 0.62, hasMap50_95)
+		weighted.add(map50, 0.20, hasMap50)
+		weighted.add(recall, 0.12, hasRecall)
+		weighted.add(precision, 0.06, hasPrecision)
 		return weighted.value(maxFloat(map50_95, map50)), true
 	}
 	macroF1 := payloadFloat(objectiveProfile, "heldout_test_macro_f1")
@@ -572,15 +570,17 @@ func detectionPerClassMetricScore(metrics map[string]any) (float64, bool) {
 	total := 0.0
 	count := 0
 	macroAvg := 0.0
+	hasMacroAvg := false
 	for label, rawStats := range metrics {
 		normalizedLabel := strings.ToLower(strings.TrimSpace(label))
 		stats := mapFromAny(rawStats)
-		quality := detectionPerClassQuality(stats)
+		quality, hasQuality := detectionPerClassQuality(stats)
 		if normalizedLabel == "macro avg" {
 			macroAvg = quality
+			hasMacroAvg = hasQuality
 			continue
 		}
-		if normalizedLabel == "" || normalizedLabel == "accuracy" || strings.Contains(normalizedLabel, "avg") || quality <= 0 {
+		if normalizedLabel == "" || normalizedLabel == "accuracy" || strings.Contains(normalizedLabel, "avg") || !hasQuality {
 			continue
 		}
 		if quality < worst {
@@ -589,31 +589,33 @@ func detectionPerClassMetricScore(metrics map[string]any) (float64, bool) {
 		total += quality
 		count++
 	}
-	if count == 0 && macroAvg <= 0 {
+	if count == 0 && !hasMacroAvg {
 		return 0, false
 	}
 	mean := macroAvg
-	if mean <= 0 && count > 0 {
+	if !hasMacroAvg && count > 0 {
 		mean = total / float64(count)
 	}
 	weighted := weightedScore{}
 	weighted.add(worst, 0.45, count > 0)
-	weighted.add(mean, 0.55, mean > 0)
+	weighted.add(mean, 0.55, hasMacroAvg || count > 0)
 	return weighted.value(maxFloat(worst, mean)), true
 }
 
-func detectionPerClassQuality(stats map[string]any) float64 {
-	map50_95 := firstPayloadFloat(stats, "AP50_95", "mAP50_95", "map50_95", "map")
-	map50 := firstPayloadFloat(stats, "AP50", "mAP50", "map50")
-	recall := firstPayloadFloat(stats, "recall")
-	precision := firstPayloadFloat(stats, "precision")
-	if map50_95 <= 0 && map50 <= 0 && recall <= 0 && precision <= 0 {
-		return 0
+func detectionPerClassQuality(stats map[string]any) (float64, bool) {
+	map50_95, hasMap50_95 := firstPayloadFloatValue(stats, "AP50_95", "mAP50_95", "map50_95", "map")
+	map50, hasMap50 := firstPayloadFloatValue(stats, "AP50", "mAP50", "map50")
+	recall, hasRecall := firstPayloadFloatValue(stats, "recall")
+	precision, hasPrecision := firstPayloadFloatValue(stats, "precision")
+	if !hasMap50_95 && !hasMap50 && !hasRecall && !hasPrecision {
+		return 0, false
 	}
-	return weightedMetricAverage(
-		[]metricComponent{{map50_95, 0.66}, {map50, 0.20}, {recall, 0.09}, {precision, 0.05}},
-		maxFloat(map50_95, map50),
-	)
+	weighted := weightedScore{}
+	weighted.add(map50_95, 0.66, hasMap50_95)
+	weighted.add(map50, 0.20, hasMap50)
+	weighted.add(recall, 0.09, hasRecall)
+	weighted.add(precision, 0.05, hasPrecision)
+	return weighted.value(maxFloat(map50_95, map50)), true
 }
 
 func perClassAggregateMetric(metrics map[string]any, key string) float64 {
@@ -629,12 +631,20 @@ func perClassAggregateMetric(metrics map[string]any, key string) float64 {
 }
 
 func firstPayloadFloat(payload map[string]any, keys ...string) float64 {
+	value, ok := firstPayloadFloatValue(payload, keys...)
+	if !ok {
+		return 0
+	}
+	return value
+}
+
+func firstPayloadFloatValue(payload map[string]any, keys ...string) (float64, bool) {
 	for _, key := range keys {
-		if value := payloadFloat(payload, key); value > 0 {
-			return value
+		if value, ok := payloadFloatValue(payload, key); ok {
+			return value, true
 		}
 	}
-	return 0
+	return 0, false
 }
 
 func lossHealthScore(summary runs.TrainingRunSummary, evaluation runs.TrainingRunEvaluation) (float64, bool) {
@@ -781,10 +791,10 @@ func plannerTargetMetricValue(targetMetric string, summary runs.TrainingRunSumma
 	case "accuracy":
 		return summary.BestAccuracy
 	case "map50_95", "map50", "map":
-		if value := detectionMetricFromEvaluation(evaluation, "map50_95"); value > 0 {
+		if value, ok := detectionMetricFromEvaluation(evaluation, "map50_95"); ok {
 			return value
 		}
-		if value := detectionMetricFromEvaluation(evaluation, "map50"); value > 0 {
+		if value, ok := detectionMetricFromEvaluation(evaluation, "map50"); ok {
 			return value
 		}
 		return summary.BestMacroF1

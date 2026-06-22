@@ -75,6 +75,12 @@ type ImageGeometry = {
   padY: number;
 };
 
+export type ChampionDetectionDecodeResult = {
+  supported: boolean;
+  detections: ChampionDetection[];
+  error?: string;
+};
+
 export function readyONNXExport(exports: ChampionExport[]) {
   return exports.find((item) => {
     const status = String(item.status || "").toUpperCase();
@@ -217,7 +223,14 @@ export async function predictChampionImage(
       iouThreshold: clamp01(options.iouThreshold ?? runtime.iouThreshold),
       maxDetections: positiveInt(options.maxDetections, runtime.maxDetections),
     };
-    const detections = decodeDetections(outputs, runtime, input.geometry, thresholds);
+    const decoded = decodeChampionDetections(outputs, runtime, input.geometry, thresholds);
+    if (!decoded.supported) {
+      throw new LocalInferenceUnsafeError(
+        "LOCAL_YOLO_OUTPUT_UNSUPPORTED",
+        decoded.error || "Browser YOLO inference does not support this output tensor layout; use backend Python inference.",
+      );
+    }
+    const detections = decoded.detections;
     const postprocessMs = performance.now() - postprocessStarted;
     const predicted = detections[0];
     const trueLabel = demoImageLabel(image);
@@ -607,19 +620,26 @@ function softmax(values: number[]) {
   return exps.map((value) => value / Math.max(sum, Number.EPSILON));
 }
 
-function decodeDetections(
+export function decodeChampionDetections(
   outputs: ort.InferenceSession.ReturnType,
   runtime: ChampionLocalRuntime,
   geometry: ImageGeometry,
   thresholds: { confidenceThreshold: number; iouThreshold: number; maxDetections: number },
-): ChampionDetection[] {
+): ChampionDetectionDecodeResult {
   const named = detectionsFromNamedOutputs(outputs, runtime, geometry, thresholds);
-  if (named.length > 0) return named;
+  if (named) return { supported: true, detections: named };
   const rows = yoloRowsFromOutputs(outputs, runtime.labels.length);
+  if (!rows) {
+    return {
+      supported: false,
+      detections: [],
+      error: "Unsupported YOLO output tensor layout for browser inference; use backend Python inference.",
+    };
+  }
   const detections = rows
     .map((row) => detectionFromYoloRow(row, runtime, geometry, thresholds.confidenceThreshold))
     .filter((item): item is ChampionDetection => Boolean(item));
-  return classAwareNMS(detections, thresholds.iouThreshold, thresholds.maxDetections);
+  return { supported: true, detections: classAwareNMS(detections, thresholds.iouThreshold, thresholds.maxDetections) };
 }
 
 function detectionsFromNamedOutputs(
@@ -632,7 +652,7 @@ function detectionsFromNamedOutputs(
   const boxes = outputMap.boxes || outputMap.output_boxes;
   const scores = outputMap.scores || outputMap.output_scores;
   const classes = outputMap.classes || outputMap.class_ids || outputMap.labels;
-  if (!boxes || !scores || !classes) return [];
+  if (!boxes || !scores || !classes) return null;
   const boxValues = Array.from(boxes.data as Iterable<number>);
   const scoreValues = Array.from(scores.data as Iterable<number>);
   const classValues = Array.from(classes.data as Iterable<number>);
@@ -654,15 +674,22 @@ function yoloRowsFromOutputs(outputs: ort.InferenceSession.ReturnType, classCoun
     const dims = tensor.dims;
     const values = Array.from(tensor.data as Iterable<number>);
     if (values.length === 0 || dims.length < 2) continue;
-    let rows = dims[dims.length - 2] ?? 0;
-    let features = dims[dims.length - 1] ?? 0;
-    if (dims.length === 3 && dims[0] === 1) {
-      rows = dims[1] ?? rows;
-      features = dims[2] ?? features;
+    let rows = 0;
+    let features = 0;
+    if (dims.length === 2) {
+      rows = dims[0] ?? 0;
+      features = dims[1] ?? 0;
+    } else if (dims.length === 3 && dims[0] === 1) {
+      rows = dims[1] ?? 0;
+      features = dims[2] ?? 0;
+    } else {
+      continue;
     }
-    if (rows <= 0 || features <= 0 || rows * features > values.length) continue;
+    if (rows < 0 || features <= 0 || rows * features !== values.length) continue;
     const expectedFeatures = Math.max(6, classCount + 4);
-    const transpose = (rows <= expectedFeatures + 8 && features > rows) || (features < expectedFeatures && rows >= expectedFeatures);
+    const transpose = rows <= expectedFeatures + 8 && features > rows;
+    const rowMajor = !transpose && features >= expectedFeatures;
+    if (!rowMajor && !transpose) continue;
     const out: number[][] = [];
     if (transpose) {
       for (let anchor = 0; anchor < features; anchor += 1) {
@@ -679,7 +706,7 @@ function yoloRowsFromOutputs(outputs: ort.InferenceSession.ReturnType, classCoun
     }
     return out;
   }
-  return [];
+  return null;
 }
 
 function detectionFromYoloRow(

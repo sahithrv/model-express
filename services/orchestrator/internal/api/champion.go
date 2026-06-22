@@ -171,18 +171,24 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		deploymentProfile["model_profile"] = evaluation.ModelProfile
 		deploymentProfile["holistic_scores"] = evaluation.HolisticScores
 		deploymentProfile["diagnostics"] = "available"
-		if artifactURI := championArtifactURIFromEvaluation(evaluation.ModelProfile); artifactURI != "" {
-			deploymentProfile["artifact_uri"] = artifactURI
-			if artifactMatchesChampionExportFormat(artifactURI, "onnx") {
-				deploymentProfile["onnx_artifact_uri"] = artifactURI
+		if unexportable, reason := championModelProfileUnexportable(evaluation.ModelProfile); unexportable {
+			deploymentProfile["export_status"] = "simulated_unexportable"
+			deploymentProfile["deployment_ready"] = false
+			deploymentProfile["export_validation_errors"] = []string{reason}
+		} else {
+			if artifactURI := championArtifactURIFromEvaluation(evaluation.ModelProfile); artifactURI != "" {
+				deploymentProfile["artifact_uri"] = artifactURI
+				if artifactMatchesChampionExportFormat(artifactURI, "onnx") {
+					deploymentProfile["onnx_artifact_uri"] = artifactURI
+				}
+				deploymentProfile["export_status"] = firstString(evaluation.ModelProfile, "export_status")
 			}
-			deploymentProfile["export_status"] = firstString(evaluation.ModelProfile, "export_status")
-		}
-		if manifestURI := firstString(evaluation.ModelProfile, "export_manifest_uri", "manifest_uri"); manifestURI != "" {
-			deploymentProfile["export_manifest_uri"] = manifestURI
-		}
-		if manifest := payloadMap(evaluation.ModelProfile, "export_manifest"); len(manifest) > 0 {
-			deploymentProfile["export_manifest"] = manifest
+			if manifestURI := firstString(evaluation.ModelProfile, "export_manifest_uri", "manifest_uri"); manifestURI != "" {
+				deploymentProfile["export_manifest_uri"] = manifestURI
+			}
+			if manifest := payloadMap(evaluation.ModelProfile, "export_manifest"); len(manifest) > 0 {
+				deploymentProfile["export_manifest"] = manifest
+			}
 		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -649,7 +655,8 @@ func (s *Server) ensureChampionExport(
 		sourceArtifactURI = championArtifactURIForFormat(champion.DeploymentProfile, format)
 	}
 	artifactURI := ""
-	if requestArtifactURI != "" || (artifactMatchesChampionExportFormat(sourceArtifactURI, format) && trustedChampionExportArtifactURI(sourceArtifactURI)) {
+	profileReady := championDeploymentProfileHasReadyExport(champion.DeploymentProfile, format, sourceArtifactURI)
+	if requestArtifactURI != "" || (artifactMatchesChampionExportFormat(sourceArtifactURI, format) && trustedChampionExportArtifactURI(sourceArtifactURI) && profileReady) {
 		artifactURI = sourceArtifactURI
 	}
 	status := runs.ChampionExportStatusPending
@@ -660,7 +667,7 @@ func (s *Server) ensureChampionExport(
 	} else if artifactURI != "" {
 		status = runs.ChampionExportStatusReady
 	} else if artifactMatchesChampionExportFormat(sourceArtifactURI, format) {
-		validationErrors = append(validationErrors, fmt.Sprintf("selected champion artifact lacks worker provenance for %s export; worker export required", format))
+		validationErrors = append(validationErrors, fmt.Sprintf("selected champion artifact needs a valid worker export manifest, passed self-test, and empty validation errors before READY %s export; worker export required", format))
 	} else {
 		validationErrors = append(validationErrors, fmt.Sprintf("selected champion artifact does not match requested %s export; worker export required", format))
 	}
@@ -1727,6 +1734,125 @@ func trustedChampionExportArtifactURI(artifactURI string) bool {
 	return strings.HasPrefix(strings.TrimLeft(key, "/"), "model-express/artifacts/")
 }
 
+func championModelProfileUnexportable(modelProfile map[string]any) (bool, string) {
+	if value, ok := modelProfile["exportable"].(bool); ok && !value {
+		return true, "model profile is marked unexportable"
+	}
+	if payloadBool(modelProfile, "simulation") || payloadBool(modelProfile, "simulated_training") {
+		return true, "local YOLO simulator output is not a deployable trained artifact"
+	}
+	status := strings.ToLower(strings.TrimSpace(firstString(modelProfile, "export_status", "artifact_profile_status")))
+	if strings.Contains(status, "simulated") || strings.Contains(status, "unexportable") || strings.Contains(status, "simulation_only") {
+		return true, "model profile export status is simulation-only"
+	}
+	runtime := strings.ToLower(strings.TrimSpace(firstString(modelProfile, "runtime")))
+	if strings.Contains(runtime, "simulated") {
+		return true, "model profile runtime is simulated"
+	}
+	return false, ""
+}
+
+func championDeploymentProfileHasReadyExport(deploymentProfile map[string]any, format string, artifactURI string) bool {
+	if !artifactMatchesChampionExportFormat(artifactURI, format) || !trustedChampionExportArtifactURI(artifactURI) {
+		return false
+	}
+	modelProfile := payloadMap(deploymentProfile, "model_profile")
+	if unexportable, _ := championModelProfileUnexportable(modelProfile); unexportable {
+		return false
+	}
+	manifest := payloadMap(deploymentProfile, "export_manifest")
+	if len(manifest) == 0 {
+		manifest = payloadMap(modelProfile, "export_manifest")
+	}
+	if len(manifest) == 0 || payloadString(manifest, "schema_version") != "champion_export_manifest_v1" {
+		return false
+	}
+	if !championExportManifestHasCreatedArtifact(manifest, format) {
+		return false
+	}
+	if championExportManifestSelfTestFailed(manifest) {
+		return false
+	}
+	if !championExportManifestHasWorkerProvenance(manifest) {
+		return false
+	}
+	if !championProfileExportStatusReady(deploymentProfile) && !championProfileExportStatusReady(modelProfile) {
+		return false
+	}
+	return championExportValidationErrorsEmpty(deploymentProfile, modelProfile, manifest)
+}
+
+func championProfileExportStatusReady(profile map[string]any) bool {
+	if len(profile) == 0 {
+		return false
+	}
+	for _, key := range []string{"export_status", "status"} {
+		if championExportStatusReadyValue(profile[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func championExportStatusReadyValue(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(typed))
+		switch normalized {
+		case "ready", "succeeded", "success", "created", "self_test_passed":
+			return true
+		default:
+			return false
+		}
+	case map[string]any:
+		return championExportStatusReadyValue(payloadString(typed, "status"))
+	default:
+		mapped := mapFromAny(value)
+		return len(mapped) > 0 && championExportStatusReadyValue(payloadString(mapped, "status"))
+	}
+}
+
+func championExportValidationErrorsEmpty(containers ...map[string]any) bool {
+	for _, container := range containers {
+		if len(nonEmptyStringValues(payloadStringSlice(container, "validation_errors"))) > 0 ||
+			len(nonEmptyStringValues(payloadStringSlice(container, "export_validation_errors"))) > 0 {
+			return false
+		}
+		metadata := payloadMap(container, "metadata")
+		if len(metadata) > 0 && !championExportValidationErrorsEmpty(metadata) {
+			return false
+		}
+		provenance := payloadMap(container, "provenance")
+		if len(provenance) > 0 && len(nonEmptyStringValues(payloadStringSlice(provenance, "validation_errors"))) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func championExportManifestHasWorkerProvenance(manifest map[string]any) bool {
+	metadata := payloadMap(manifest, "metadata")
+	if championExportWorkerProvenance(payloadMap(metadata, "provenance")) {
+		return true
+	}
+	artifacts, ok := manifest["artifacts"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range artifacts {
+		artifact := mapFromAny(item)
+		if championExportWorkerProvenance(payloadMap(artifact, "provenance")) {
+			return true
+		}
+	}
+	return false
+}
+
+func championExportWorkerProvenance(provenance map[string]any) bool {
+	return payloadString(provenance, "schema_version") == "worker_artifact_provenance_v1" &&
+		payloadString(provenance, "generated_by") == "model-express-worker"
+}
+
 func championExportMetadata(champion runs.ProjectChampion, format string, requestMetadata map[string]any) map[string]any {
 	metadata := map[string]any{
 		"format":             format,
@@ -1830,6 +1956,9 @@ func championDeploymentProfileExport(champion runs.ProjectChampion) (runs.Champi
 	format := championExportFormatFromArtifactURI(artifactURI)
 	if format == "" {
 		format = "pytorch"
+	}
+	if !championDeploymentProfileHasReadyExport(champion.DeploymentProfile, format, artifactURI) {
+		return runs.ChampionExport{}, false
 	}
 	metadata := championDeploymentExportMetadata(champion, format)
 	return runs.ChampionExport{

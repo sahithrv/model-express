@@ -248,6 +248,9 @@ def profile_image_folder(
     metadata_summary["bbox_count"] = bbox_count
     metadata_summary["bbox_per_class"] = bbox_per_class
     metadata_summary["yolo_summary"] = yolo_summary
+    metadata_summary["yolo_format"] = yolo_available
+    metadata_summary["yolo_config_count"] = int(yolo_summary.get("config_count") or 0)
+    metadata_summary["yolo_label_file_count"] = int(yolo_summary.get("label_file_count") or 0)
     if yolo_available:
         metadata_summary["bbox_available"] = True
         metadata_summary["object_detection_available"] = True
@@ -1551,6 +1554,9 @@ def _metadata_summary(artifacts: list[dict]) -> dict:
         "bbox_available": bbox_available,
         "object_detection_available": yolo_available or bbox_available,
         "yolo_available": yolo_available,
+        "yolo_format": yolo_available,
+        "yolo_config_count": counts.get("yolo_dataset_config", 0),
+        "yolo_label_file_count": counts.get("yolo_label_file", 0),
     }
 
 

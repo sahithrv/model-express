@@ -502,6 +502,8 @@ def _local_detection_evaluation_payload(
         "preprocessing_summary": {
             "task_type": "object_detection",
             "preserves_yolo_splits": True,
+            "simulation": True,
+            "exportable": False,
             "preprocessing": config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {},
             "training_hyperparameters": {
                 "learning_rate": _positive_float(config.get("learning_rate"), default=0.001),
@@ -563,7 +565,13 @@ def _local_detection_model_profile(model: str, config: dict) -> dict:
     return {
         "task_type": "object_detection",
         "model_kind": "ultralytics_yolo_detector",
-        "runtime": "onnx",
+        "runtime": "simulated_local_yolo",
+        "simulation": True,
+        "simulated_training": True,
+        "exportable": False,
+        "deployment_ready": False,
+        "export_status": "SIMULATED_UNEXPORTABLE",
+        "artifact_profile_status": "simulation_only",
         "parameter_count": parameter_count,
         "estimated_model_size_mb": round(size_mb, 2),
         "estimated_latency_ms": round(latency_ms * latency_scale, 2),

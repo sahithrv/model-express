@@ -320,8 +320,18 @@ def _modal_batch_invocation_resources(enriched_jobs: list[dict], resources_by_jo
 
 
 def _remote_modal_training_batch_completed(result: dict) -> bool:
-    status = str(result.get("status") or "").strip().lower() if isinstance(result, dict) else ""
-    return status in {"succeeded", "success", "completed", "complete"}
+    if not isinstance(result, dict):
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    if status not in {"succeeded", "success", "completed", "complete"}:
+        return False
+    job_results = result.get("job_results")
+    if not isinstance(job_results, list) or not job_results:
+        return False
+    return all(
+        isinstance(job_result, dict) and str(job_result.get("status") or "").strip().lower() == "succeeded"
+        for job_result in job_results
+    )
 
 
 def _remote_modal_training_batch_status(result: dict) -> str:

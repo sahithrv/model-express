@@ -111,7 +111,7 @@ func datasetHasYOLODetectionEvidence(dataset datasets.Dataset, agentSafeMetadata
 }
 
 func profileHasYOLODetectionEvidence(profile map[string]any) bool {
-	if profileBool(profile, "yolo_available") {
+	if profileBool(profile, "yolo_available") || profileBool(profile, "yolo_format") {
 		return true
 	}
 	if containsString(profileStringSlice(profile, "dataset_traits"), "yolo_format") {
@@ -126,17 +126,16 @@ func metadataSummaryHasYOLOEvidence(summary map[string]any) bool {
 	if len(summary) == 0 {
 		return false
 	}
-	if metadataBool(summary, "yolo_available") {
+	format := strings.ToLower(strings.TrimSpace(profileString(summary, "format")))
+	formatIsYOLO := format == "yolo" || metadataBool(summary, "yolo_format")
+	if metadataBool(summary, "yolo_available") || formatIsYOLO {
 		return true
 	}
-	if metadataBool(summary, "available") && strings.EqualFold(strings.TrimSpace(profileString(summary, "format")), "yolo") {
+	if payloadNumber(summary["yolo_config_count"]) > 0 || payloadNumber(summary["yolo_dataset_config_count"]) > 0 ||
+		payloadNumber(summary["yolo_label_file_count"]) > 0 || payloadNumber(summary["yolo_label_count"]) > 0 {
 		return true
 	}
-	if payloadNumber(summary["yolo_label_file_count"]) > 0 || payloadNumber(summary["yolo_label_count"]) > 0 ||
-		payloadNumber(summary["label_file_count"]) > 0 {
-		return true
-	}
-	if metadataBool(summary, "available") && (payloadNumber(summary["bbox_count"]) > 0 || len(profileMap(summary, "bbox_per_class")) > 0 || len(profileMap(summary, "box_distribution")) > 0) {
+	if formatIsYOLO && (payloadNumber(summary["config_count"]) > 0 || payloadNumber(summary["label_file_count"]) > 0 || payloadNumber(summary["label_count"]) > 0) {
 		return true
 	}
 	if nested := profileMap(summary, "yolo_summary"); len(nested) > 0 && metadataSummaryHasYOLOEvidence(nested) {
@@ -147,7 +146,7 @@ func metadataSummaryHasYOLOEvidence(summary map[string]any) bool {
 		return true
 	}
 	capabilities := profileMap(summary, "capabilities")
-	return metadataBool(capabilities, "yolo")
+	return metadataBool(capabilities, "yolo") || metadataBool(capabilities, "yolo_format")
 }
 
 func experimentSignaturesForPlans(projectPlans []plans.ExperimentPlan) []string {

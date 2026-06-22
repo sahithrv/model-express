@@ -119,6 +119,70 @@ test("browser ONNX inference refuses artifact-backed held-out thumbnails", async
   );
 });
 
+test("browser YOLO decoder marks unknown tensor layout unsupported", async () => {
+  const { decodeChampionDetections } = await loadLocalInference();
+  const runtime = {
+    artifactURI: "file:///exports/yolo.onnx",
+    session: {},
+    metadata: {},
+    labels: ["cat", "dog"],
+    imageSize: 8,
+    normalization: null,
+    resizeStrategy: "letterbox",
+    cropStrategy: "none",
+    modelKind: "ultralytics_yolo_detector",
+    taskType: "object_detection",
+    confidenceThreshold: 0.25,
+    iouThreshold: 0.7,
+    maxDetections: 100,
+  };
+  const geometry = {
+    inputWidth: 8,
+    inputHeight: 8,
+    naturalWidth: 8,
+    naturalHeight: 8,
+    scaleX: 1,
+    scaleY: 1,
+    padX: 0,
+    padY: 0,
+  };
+  const thresholds = { confidenceThreshold: 0.9, iouThreshold: 0.7, maxDetections: 100 };
+
+  const knownZero = decodeChampionDetections(
+    { output0: { dims: [1, 1, 6], data: new Float32Array([0.5, 0.5, 0.25, 0.25, 0.1, 0.2]) } },
+    runtime,
+    geometry,
+    thresholds,
+  );
+  const transposedYolo = new Float32Array(60);
+  transposedYolo[0] = 0.5;
+  transposedYolo[10] = 0.5;
+  transposedYolo[20] = 0.25;
+  transposedYolo[30] = 0.25;
+  transposedYolo[40] = 0.95;
+  transposedYolo[50] = 0.05;
+  const knownTransposed = decodeChampionDetections(
+    { output0: { dims: [1, 6, 10], data: transposedYolo } },
+    runtime,
+    geometry,
+    thresholds,
+  );
+  const unknown = decodeChampionDetections(
+    { output0: { dims: [1, 3, 20, 20], data: new Float32Array(1200) } },
+    runtime,
+    geometry,
+    thresholds,
+  );
+
+  assert.equal(knownZero.supported, true);
+  assert.equal(knownZero.detections.length, 0);
+  assert.equal(knownTransposed.supported, true);
+  assert.equal(knownTransposed.detections.length, 1);
+  assert.equal(knownTransposed.detections[0].label, "cat");
+  assert.equal(unknown.supported, false);
+  assert.match(unknown.error, /Unsupported YOLO output tensor layout/);
+});
+
 function exportFixture(metadataOverrides = {}) {
   return {
     id: "export-1",

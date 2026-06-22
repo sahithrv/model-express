@@ -1258,9 +1258,16 @@ func TestCreateChampionExportIsIdempotentByChampionAndFormat(t *testing.T) {
 	if second.ID != first.ID {
 		t.Fatalf("expected existing export %s to be updated, got new export %s", first.ID, second.ID)
 	}
-	if second.ChampionID != champion.ID || second.ArtifactURI != "s3://bucket/model-express/artifacts/train_1/model.onnx" {
-		t.Fatalf("unexpected updated export: %#v", second)
+	if second.ChampionID != champion.ID || second.Status != runs.ChampionExportStatusPending || second.ArtifactURI != "" {
+		t.Fatalf("unexpected pending export for bare artifact: %#v", second)
 	}
+	if got := second.Metadata["source_artifact_uri"]; got != "s3://bucket/model-express/artifacts/train_1/model.onnx" {
+		t.Fatalf("expected source artifact metadata to preserve bare artifact, got %#v", got)
+	}
+	if len(second.ValidationErrors) == 0 {
+		t.Fatalf("expected bare artifact validation error before export job, got %#v", second)
+	}
+	assertExportJobQueued(t, memoryStore, project.ID, second.ID)
 	exports, err := memoryStore.ListProjectChampionExports(project.ID)
 	if err != nil {
 		t.Fatalf("list exports: %v", err)
@@ -3399,9 +3406,16 @@ func TestBudgetCapSelectsBestAvailableChampionWhenAllQueuedFullTrainIsBlocked(t 
 	if err != nil {
 		t.Fatalf("list champion exports: %v", err)
 	}
-	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI == "" {
-		t.Fatalf("expected ready champion export, got %#v", exports)
+	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusPending || exports[0].ArtifactURI != "" {
+		t.Fatalf("expected pending champion export until worker manifest validation, got %#v", exports)
 	}
+	if got := exports[0].Metadata["source_artifact_uri"]; got != "s3://model-express/model-express/artifacts/fast/model.onnx" {
+		t.Fatalf("expected source artifact metadata to preserve selected model, got %#v", got)
+	}
+	if len(exports[0].ValidationErrors) == 0 {
+		t.Fatalf("expected validation error for bare selected artifact, got %#v", exports[0])
+	}
+	assertExportJobQueued(t, memoryStore, project.ID, exports[0].ID)
 }
 
 func TestBudgetCapExhaustionNoSuccessfulRunRecordsTerminalEvent(t *testing.T) {
@@ -3559,9 +3573,16 @@ func TestCostPolicySkippedFullTrainSelectsChampionAfterAllowedJobsFinish(t *test
 	if err != nil {
 		t.Fatalf("list champion exports: %v", err)
 	}
-	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady || exports[0].ArtifactURI != "s3://model-express/model-express/artifacts/preview/model.onnx" {
-		t.Fatalf("expected ready preview export, got %#v", exports)
+	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusPending || exports[0].ArtifactURI != "" {
+		t.Fatalf("expected pending preview export until worker manifest validation, got %#v", exports)
 	}
+	if got := exports[0].Metadata["source_artifact_uri"]; got != "s3://model-express/model-express/artifacts/preview/model.onnx" {
+		t.Fatalf("expected source artifact metadata to preserve selected model, got %#v", got)
+	}
+	if len(exports[0].ValidationErrors) == 0 {
+		t.Fatalf("expected validation error for bare preview artifact, got %#v", exports[0])
+	}
+	assertExportJobQueued(t, memoryStore, project.ID, exports[0].ID)
 }
 
 func TestPersistentGPUProviderSchedulesOnlyWhenConfigured(t *testing.T) {
@@ -8258,9 +8279,13 @@ func TestPlanningLoopAfterLLMPlannerFailureFallsBackToChampionSelection(t *testi
 	if err != nil {
 		t.Fatalf("list champion exports: %v", err)
 	}
-	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusReady {
-		t.Fatalf("expected visible ready export after degraded fallback, got %#v", exports)
+	if len(exports) != 1 || exports[0].Status != runs.ChampionExportStatusPending || exports[0].ArtifactURI != "" {
+		t.Fatalf("expected visible pending export after degraded fallback until worker manifest validation, got %#v", exports)
 	}
+	if len(exports[0].ValidationErrors) == 0 {
+		t.Fatalf("expected validation error for bare degraded fallback artifact, got %#v", exports[0])
+	}
+	assertExportJobQueued(t, server.store, projectID, exports[0].ID)
 	events, err := server.store.ListProjectExecutionEvents(projectID, 10)
 	if err != nil {
 		t.Fatalf("list execution events: %v", err)

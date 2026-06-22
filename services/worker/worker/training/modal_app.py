@@ -1241,10 +1241,11 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
                 "result": _modal_preview_batch_public_job_result(result),
             }
         )
+    aggregate_status, aggregate_runner_status = _modal_preview_batch_aggregate_status(job_results, runner_status)
     return {
         "schema_version": "modal_preview_batch_result.v1",
-        "status": "completed",
-        "runner_status": runner_status,
+        "status": aggregate_status,
+        "runner_status": aggregate_runner_status,
         "batch_id": batch["batch_id"],
         "batch_key": batch["batch_key"],
         "project_id": batch["project_id"],
@@ -1268,6 +1269,20 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
         },
         "job_results": job_results,
     }
+
+
+def _modal_preview_batch_aggregate_status(job_results: list[dict], completed_runner_status: str) -> tuple[str, str]:
+    statuses = [str(result.get("status") or "").strip().lower() for result in job_results]
+    if statuses and all(status == "succeeded" for status in statuses):
+        return "completed", completed_runner_status
+    prefix = completed_runner_status.removesuffix("_completed")
+    if any(status == "failed" for status in statuses):
+        return "failed", f"{prefix}_failed"
+    if any(status == "retryable_failure_reported" for status in statuses):
+        return "partial_retryable_failure", f"{prefix}_partial_retryable_failure"
+    if any(status and status != "succeeded" for status in statuses):
+        return "partial", f"{prefix}_partial"
+    return "failed", f"{prefix}_empty"
 
 
 def _unsupported_modal_preview_batch_result(batch: dict, jobs: list[dict], *, reason: str) -> dict:
@@ -1556,7 +1571,8 @@ def _post_yolo_epoch_metrics(
     try:
         with results_path.open("r", encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
-                epoch = int(_first_metric_value(row, "epoch")) or posted + 1
+                epoch_value = _first_metric_value(row, "epoch")
+                epoch = int(epoch_value) if epoch_value is not None else posted + 1
                 metrics = _yolo_epoch_metrics_from_row(row, learning_rate=learning_rate, image_size=image_size)
                 if not metrics:
                     continue

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -514,10 +515,14 @@ def _yolo_metrics_from_object(metrics: object, *, class_names: list[str] | None 
         "dfl_loss": _first_metric_value(results_dict, "val/dfl_loss", "dfl_loss"),
     }
     if box is not None:
-        out["mAP50_95"] = out["mAP50_95"] or _object_float(box, "map")
-        out["mAP50"] = out["mAP50"] or _object_float(box, "map50")
-        out["precision"] = out["precision"] or _object_float(box, "mp")
-        out["recall"] = out["recall"] or _object_float(box, "mr")
+        if out["mAP50_95"] is None:
+            out["mAP50_95"] = _object_float_or_none(box, "map")
+        if out["mAP50"] is None:
+            out["mAP50"] = _object_float_or_none(box, "map50")
+        if out["precision"] is None:
+            out["precision"] = _object_float_or_none(box, "mp")
+        if out["recall"] is None:
+            out["recall"] = _object_float_or_none(box, "mr")
         per_class_metrics = _yolo_per_class_metrics_from_box(box, class_names or _yolo_class_names_from_metrics(metrics))
         if per_class_metrics:
             out["per_class_metrics"] = per_class_metrics
@@ -537,8 +542,9 @@ def _yolo_metrics_from_object(metrics: object, *, class_names: list[str] | None 
             if isinstance(value, dict) and value:
                 cleaned[key] = value
             continue
-        if _number(value) > 0:
-            cleaned[key] = round(float(value), 6)
+        number = _number_or_none(value)
+        if number is not None and number >= 0:
+            cleaned[key] = round(number, 6)
     return cleaned
 
 
@@ -570,32 +576,46 @@ def _yolo_epoch_metrics_from_row(row: dict, *, learning_rate: float, image_size:
     val_box = _first_metric_value(row, "val/box_loss")
     val_cls = _first_metric_value(row, "val/cls_loss")
     val_dfl = _first_metric_value(row, "val/dfl_loss")
-    if train_box > 0 or train_cls > 0 or train_dfl > 0:
-        metrics["train_loss"] = train_box + train_cls + train_dfl
-    if val_box > 0 or val_cls > 0 or val_dfl > 0:
-        metrics["val_loss"] = val_box + val_cls + val_dfl
-    metrics["learning_rate"] = _first_metric_value(row, "lr/pg0", "lr/pg1", "lr/pg2", "learning_rate") or learning_rate
+    train_components = [value for value in (train_box, train_cls, train_dfl) if value is not None]
+    val_components = [value for value in (val_box, val_cls, val_dfl) if value is not None]
+    if train_components:
+        metrics["train_loss"] = sum(train_components)
+    if val_components:
+        metrics["val_loss"] = sum(val_components)
+    reported_learning_rate = _first_metric_value(row, "lr/pg0", "lr/pg1", "lr/pg2", "learning_rate")
+    metrics["learning_rate"] = learning_rate if reported_learning_rate is None else reported_learning_rate
     metrics["image_size"] = image_size
-    if metrics["mAP50_95"] > 0:
+    if metrics["mAP50_95"] is not None:
         metrics["map50_95"] = metrics["mAP50_95"]
-    if metrics["mAP50"] > 0:
+    if metrics["mAP50"] is not None:
         metrics["map50"] = metrics["mAP50"]
-    return {key: round(float(value), 6) for key, value in metrics.items() if _number(value) > 0}
+    cleaned: dict[str, float] = {}
+    for key, value in metrics.items():
+        number = _number_or_none(value)
+        if number is not None and number >= 0:
+            cleaned[key] = round(number, 6)
+    return cleaned
 
 
-def _first_metric_value(values: dict, *keys: str) -> float:
+def _first_metric_value(values: dict, *keys: str) -> float | None:
     normalized_values = {}
     for raw_key, raw_value in values.items():
         normalized_values[str(raw_key).strip()] = raw_value
     for key in keys:
-        number = _number(normalized_values.get(key))
-        if number > 0:
+        if key not in normalized_values:
+            continue
+        number = _number_or_none(normalized_values.get(key))
+        if number is not None:
             return number
-    return 0.0
+    return None
 
 
 def _object_float(obj: object, attr: str) -> float:
     return _number(getattr(obj, attr, None))
+
+
+def _object_float_or_none(obj: object, attr: str) -> float | None:
+    return _number_or_none(getattr(obj, attr, None))
 
 
 def _numeric_sequence(value: object) -> list[float]:
@@ -621,12 +641,12 @@ def _numeric_sequence(value: object) -> list[float]:
         for item in value:
             if isinstance(item, (list, tuple)):
                 continue
-            number = _number(item)
-            if number >= 0:
+            number = _number_or_none(item)
+            if number is not None and number >= 0:
                 out.append(number)
         return out
-    number = _number(value)
-    return [number] if number > 0 else []
+    number = _number_or_none(value)
+    return [number] if number is not None and number >= 0 else []
 
 
 def _numeric_matrix(value: object) -> list[list[float]]:
@@ -654,7 +674,7 @@ def _numeric_matrix(value: object) -> list[list[float]]:
         if not isinstance(row, (list, tuple)):
             continue
         numbers = [_number(item) for item in row]
-        if any(number > 0 for number in numbers):
+        if numbers:
             out.append(numbers)
     return out
 
@@ -691,6 +711,10 @@ def _yolo_metric_at(values: list[float], row_index: int, class_index: int) -> fl
     return 0.0
 
 
+def _yolo_metric_present_at(values: list[float], row_index: int, class_index: int) -> bool:
+    return (0 <= class_index < len(values)) or (0 <= row_index < len(values))
+
+
 def _yolo_per_class_metrics_from_box(box: object, class_names: list[str]) -> dict:
     precision_values = _numeric_sequence(getattr(box, "p", None))
     recall_values = _numeric_sequence(getattr(box, "r", None))
@@ -706,17 +730,15 @@ def _yolo_per_class_metrics_from_box(box: object, class_names: list[str]) -> dic
         class_index = class_indices[row_index] if row_index < len(class_indices) else row_index
         ap_row = all_ap[row_index] if row_index < len(all_ap) else []
         ap50 = _yolo_metric_at(ap50_values, row_index, class_index)
-        if ap50 <= 0 and ap_row:
+        if ap50 <= 0 and ap_row and not _yolo_metric_present_at(ap50_values, row_index, class_index):
             ap50 = ap_row[0]
         map50_95 = _yolo_metric_at(map_values, row_index, class_index)
-        if map50_95 <= 0 and ap_row:
+        if map50_95 <= 0 and ap_row and not _yolo_metric_present_at(map_values, row_index, class_index):
             positive_ap = [value for value in ap_row if value > 0]
             if positive_ap:
                 map50_95 = sum(positive_ap) / len(positive_ap)
         precision = _yolo_metric_at(precision_values, row_index, class_index)
         recall = _yolo_metric_at(recall_values, row_index, class_index)
-        if precision <= 0 and recall <= 0 and ap50 <= 0 and map50_95 <= 0:
-            continue
         out[_yolo_class_name(class_names, class_index, row_index)] = {
             "precision": round(precision, 6),
             "recall": round(recall, 6),
@@ -728,17 +750,27 @@ def _yolo_per_class_metrics_from_box(box: object, class_names: list[str]) -> dic
 
 def _metric_float(values: dict, *keys: str, default: float) -> float:
     for key in keys:
-        number = _number(values.get(key))
-        if number > 0:
+        if key not in values:
+            continue
+        number = _number_or_none(values.get(key))
+        if number is not None and number >= 0:
             return float(number)
     return float(default)
 
 
 def _number(value: object) -> float:
+    number = _number_or_none(value)
+    return number if number is not None else 0.0
+
+
+def _number_or_none(value: object) -> float | None:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
-        return 0.0
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
 
 
 def _yolo_best_model_path(run_root: Path) -> Path | None:
@@ -967,13 +999,14 @@ def _yolo_per_class_metrics_with_macro_average(per_class: dict) -> dict:
     for class_name, metric_values in per_class.items():
         if not isinstance(metric_values, dict):
             continue
-        normalized = {
-            "precision": round(_number(metric_values.get("precision")), 6),
-            "recall": round(_number(metric_values.get("recall")), 6),
-            "AP50": round(_number(metric_values.get("AP50")), 6),
-            "AP50_95": round(_number(metric_values.get("AP50_95")), 6),
-        }
-        if any(value > 0 for value in normalized.values()):
+        normalized: dict[str, float] = {}
+        has_metric = False
+        for key in ("precision", "recall", "AP50", "AP50_95"):
+            number = _number_or_none(metric_values.get(key))
+            if number is not None:
+                has_metric = True
+            normalized[key] = round(number or 0.0, 6)
+        if has_metric:
             cleaned[str(class_name).strip()] = normalized
     values = list(cleaned.values())
     if values:
