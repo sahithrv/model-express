@@ -1566,7 +1566,7 @@ func TestChampionArtifactURIForFormatPrefersMatchingArtifact(t *testing.T) {
 	}
 }
 
-func TestChampionDemoPredictionQueuesWorkerJobAndAcceptsResult(t *testing.T) {
+func TestChampionDemoPredictionLegacyEndpointDoesNotQueueWorkerJob(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
 	if err != nil {
@@ -1626,36 +1626,25 @@ func TestChampionDemoPredictionQueuesWorkerJobAndAcceptsResult(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if !payload.RuntimeAvailable || payload.Prediction.Status != runs.ChampionDemoPredictionStatusPending {
-		t.Fatalf("expected pending runtime-backed prediction, got %#v", payload)
+	if payload.RuntimeAvailable || payload.Prediction.Status != runs.ChampionDemoPredictionStatusRuntimeUnavailable {
+		t.Fatalf("expected local-only runtime-unavailable prediction, got %#v", payload)
 	}
-	predictionJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateChampionDemoPrediction)
-	if predictionJob.Config["prediction_id"] != payload.Prediction.ID {
-		t.Fatalf("unexpected prediction job config: %#v", predictionJob.Config)
+	if !strings.Contains(payload.Prediction.Error, "local-only") {
+		t.Fatalf("expected local-only error, got %q", payload.Prediction.Error)
 	}
-
-	worker, err := memoryStore.RegisterWorker(project.ID, "demo worker", "")
+	if payload.Prediction.ImageMetadata["local_runtime_required"] != true || payload.Prediction.ImageMetadata["legacy_queued_demo_disabled"] != true {
+		t.Fatalf("expected local-only metadata, got %#v", payload.Prediction.ImageMetadata)
+	}
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
 	if err != nil {
-		t.Fatalf("register demo worker: %v", err)
+		t.Fatalf("list project jobs: %v", err)
 	}
-	assignedPrediction := pollJobForCallback(t, router, worker.ID, `{"templates":["champion_demo_prediction"]}`)
-	resultReq := httptest.NewRequest(http.MethodPost, "/jobs/"+predictionJob.ID+"/champion-demo-prediction-result", strings.NewReader(`{"training_attempt_id":"`+callbackAttemptID(t, assignedPrediction)+`","status":"SUCCEEDED","predicted_label":"cat","confidence":0.97,"top_k":[{"label":"cat","confidence":0.97}],"latency_ms":12.5,"correct":true}`))
-	resultReq.Header.Set("Content-Type", "application/json")
-	setCallbackToken(t, resultReq, assignedPrediction)
-	resultResp := httptest.NewRecorder()
-	router.ServeHTTP(resultResp, resultReq)
-	if resultResp.Code != http.StatusOK {
-		t.Fatalf("expected result status %d, got %d: %s", http.StatusOK, resultResp.Code, resultResp.Body.String())
-	}
-	predictions, err := memoryStore.ListProjectChampionDemoPredictions(project.ID)
-	if err != nil {
-		t.Fatalf("list predictions: %v", err)
-	}
-	if predictions[0].Status != runs.ChampionDemoPredictionStatusSucceeded || predictions[0].PredictedLabel != "cat" || predictions[0].Correct == nil || !*predictions[0].Correct {
-		t.Fatalf("expected succeeded prediction result, got %#v", predictions[0])
+	for _, job := range projectJobs {
+		if job.Template == jobs.TemplateChampionDemoPrediction {
+			t.Fatalf("legacy demo endpoint must not create champion demo prediction jobs: %#v", job)
+		}
 	}
 }
-
 func TestLocalChampionDemoPredictionPersistsWithoutWorkerJob(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
@@ -1709,7 +1698,7 @@ func TestLocalChampionDemoPredictionPersistsWithoutWorkerJob(t *testing.T) {
 		}
 	}
 }
-func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t *testing.T) {
+func TestChampionDemoPredictionLegacyEndpointDoesNotQueueDeploymentArtifact(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
 	if err != nil {
@@ -1751,20 +1740,6 @@ func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t 
 	}); err != nil {
 		t.Fatalf("upsert champion: %v", err)
 	}
-	champion, err := memoryStore.GetProjectChampion(project.ID)
-	if err != nil {
-		t.Fatalf("get champion: %v", err)
-	}
-	if _, err := memoryStore.CreateChampionExport(runs.ChampionExportCreate{
-		ProjectID:   project.ID,
-		ChampionID:  champion.ID,
-		JobID:       trainingJob.ID,
-		Status:      runs.ChampionExportStatusReady,
-		Format:      "onnx",
-		ArtifactURI: "s3://model-express/model-express/artifacts/job_1/model.pt",
-	}); err != nil {
-		t.Fatalf("create stale mismatched export: %v", err)
-	}
 
 	router := NewRouter(memoryStore)
 	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/demo-predictions", strings.NewReader(`{"image_uri":"data:image/jpeg;base64,/9j/4AAQSkZJRg==","true_label":"cat"}`))
@@ -1774,15 +1749,25 @@ func TestChampionDemoPredictionUsesDeploymentArtifactWhenNoExportRecordExists(t 
 	if resp.Code != http.StatusAccepted {
 		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, resp.Code, resp.Body.String())
 	}
-	predictionJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateChampionDemoPrediction)
-	if artifactURI := jobConfigString(predictionJob.Config, "export_artifact_uri"); artifactURI != "s3://model-express/model-express/artifacts/job_1/model.pt" {
-		t.Fatalf("expected deployment checkpoint artifact, got %q", artifactURI)
+	var payload struct {
+		Prediction runs.ChampionDemoPrediction `json:"prediction"`
 	}
-	if manifest := payloadMap(payloadMap(predictionJob.Config, "export_metadata"), "manifest"); len(manifest) == 0 {
-		t.Fatalf("expected deployment manifest metadata in prediction job config: %#v", predictionJob.Config)
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Prediction.Status != runs.ChampionDemoPredictionStatusRuntimeUnavailable {
+		t.Fatalf("expected local-only runtime unavailable prediction, got %#v", payload.Prediction)
+	}
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	for _, job := range projectJobs {
+		if job.Template == jobs.TemplateChampionDemoPrediction {
+			t.Fatalf("legacy demo endpoint must not queue deployment artifact inference: %#v", job)
+		}
 	}
 }
-
 func TestChampionDemoPredictionAcceptsRuntimeUnavailableWorkerResult(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")
@@ -1809,36 +1794,30 @@ func TestChampionDemoPredictionAcceptsRuntimeUnavailableWorkerResult(t *testing.
 	if err != nil {
 		t.Fatalf("upsert champion: %v", err)
 	}
-	if _, err := memoryStore.CreateChampionExport(runs.ChampionExportCreate{
-		ProjectID:   project.ID,
-		ChampionID:  champion.ID,
-		JobID:       trainingJob.ID,
-		Status:      runs.ChampionExportStatusReady,
-		Format:      "onnx",
-		ArtifactURI: "file:///exports/champion.onnx",
-	}); err != nil {
-		t.Fatalf("create ready export: %v", err)
+	prediction, err := memoryStore.CreateChampionDemoPrediction(runs.ChampionDemoPredictionCreate{
+		ProjectID:     project.ID,
+		ChampionID:    champion.ID,
+		JobID:         champion.JobID,
+		DatasetID:     dataset.ID,
+		ImageURI:      "file:///dataset/test/cat/1.jpg",
+		ImageMetadata: map[string]any{"legacy_worker_result_test": true},
+		Status:        runs.ChampionDemoPredictionStatusPending,
+		TopK:          []runs.DemoPredictionTopK{},
+	})
+	if err != nil {
+		t.Fatalf("create prediction: %v", err)
+	}
+	predictionJob, err := memoryStore.CreateJob(project.ID, jobs.TemplateChampionDemoPrediction, map[string]any{
+		"dataset_id":      dataset.ID,
+		"prediction_id":   prediction.ID,
+		"champion_id":     champion.ID,
+		"champion_job_id": champion.JobID,
+	})
+	if err != nil {
+		t.Fatalf("create legacy prediction job: %v", err)
 	}
 
 	router := NewRouter(memoryStore)
-	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/champion/demo-predictions", strings.NewReader(`{"image_uri":"file:///dataset/test/cat/1.jpg","top_k":3}`))
-	req.Header.Set("Content-Type", "application/json")
-	resp := httptest.NewRecorder()
-	router.ServeHTTP(resp, req)
-	if resp.Code != http.StatusAccepted {
-		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, resp.Code, resp.Body.String())
-	}
-	var payload struct {
-		Prediction runs.ChampionDemoPrediction `json:"prediction"`
-	}
-	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	predictionJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateChampionDemoPrediction)
-	if predictionJob.Config["dataset_id"] != dataset.ID {
-		t.Fatalf("expected dataset_id in prediction job config, got %#v", predictionJob.Config)
-	}
-
 	worker, err := memoryStore.RegisterWorker(project.ID, "demo worker", "")
 	if err != nil {
 		t.Fatalf("register demo worker: %v", err)
@@ -1867,7 +1846,6 @@ func TestChampionDemoPredictionAcceptsRuntimeUnavailableWorkerResult(t *testing.
 		t.Fatalf("runtime-unavailable result should fail audit job, got %s", updatedJob.Status)
 	}
 }
-
 func TestMergeDatasetVisualExemplarsEnforcesCaps(t *testing.T) {
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("demo", "")

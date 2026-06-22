@@ -96,11 +96,11 @@ def run_demo_inference_from_manifest(
             "Demo inference requires a created ONNX, TorchScript, or framework-native checkpoint artifact in the export manifest.",
         )
 
-    model_path = _resolve_artifact_path(manifest_path, artifact)
+    model_path, artifact_error = _resolve_artifact_path_with_error(manifest_path, artifact)
     if model_path is None or not model_path.exists():
         return _pending_payload(
             "MODEL_ARTIFACT_NOT_FOUND",
-            "The model artifact referenced by the manifest is not available.",
+            artifact_error or "The model artifact referenced by the manifest is not available.",
         )
 
     if runtime == "onnx":
@@ -119,7 +119,7 @@ def run_demo_inference_from_manifest(
         import torch
         from PIL import Image
     except Exception as exc:
-        return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", str(exc))
+        return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", _dependency_error_message(exc))
 
     try:
         load_started = time.perf_counter()
@@ -199,7 +199,7 @@ def _run_classification_onnx_inference(
         import onnxruntime as ort
         from PIL import Image
     except Exception as exc:
-        return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", str(exc))
+        return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", _dependency_error_message(exc))
 
     try:
         load_started = time.perf_counter()
@@ -288,11 +288,11 @@ def _run_detection_inference_from_manifest(
             "YOLO demo inference requires a created ONNX detector artifact.",
         )
 
-    model_path = _resolve_artifact_path(manifest_path, artifact)
+    model_path, artifact_error = _resolve_artifact_path_with_error(manifest_path, artifact)
     if model_path is None or not model_path.exists():
         return _pending_payload(
             "MODEL_ARTIFACT_NOT_FOUND",
-            "The ONNX detector artifact referenced by the manifest is not available.",
+            artifact_error or "The ONNX detector artifact referenced by the manifest is not available.",
         )
 
     try:
@@ -300,7 +300,7 @@ def _run_detection_inference_from_manifest(
         import onnxruntime as ort
         from PIL import Image
     except Exception as exc:
-        return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", str(exc))
+        return _pending_payload("INFERENCE_DEPENDENCY_UNAVAILABLE", _dependency_error_message(exc))
 
     thresholds = _detection_thresholds(
         metadata,
@@ -1010,49 +1010,54 @@ def _find_created_artifact(manifest: dict, format_name: str) -> dict | None:
 
 
 def _resolve_artifact_path(manifest_path: Path | None, path_value: object) -> Path | None:
+    path, _error = _resolve_artifact_path_with_error(manifest_path, path_value)
+    return path
+
+
+def _resolve_artifact_path_with_error(manifest_path: Path | None, path_value: object) -> tuple[Path | None, str]:
     artifact = path_value if isinstance(path_value, dict) else {}
     value = _artifact_reference(path_value)
     if not value:
-        return None
+        return None, "READY export manifest is missing a usable model artifact path."
     export_dir = manifest_path.parent if manifest_path is not None else None
+
+    def validate_resolved(resolved: Path, artifact_uri: str) -> tuple[Path | None, str]:
+        if not resolved.exists() or not resolved.is_file():
+            return None, f"Model artifact not found: {resolved}"
+        external_error = _materialize_onnx_external_data_error(resolved, artifact, artifact_uri)
+        if external_error:
+            return None, external_error
+        return resolved, ""
+
     if value.startswith("s3://"):
-        parsed = urlparse(value)
         destination = _s3_artifact_cache_path(value)
         try:
             downloaded = download_s3_uri(value, destination)
             resolved = validate_controlled_artifact_path(downloaded, export_dir=destination.parent)
-            if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
-                return None
-            return resolved
-        except Exception:
-            return None
+            return validate_resolved(resolved, _artifact_s3_uri(artifact, value))
+        except Exception as exc:
+            return None, f"S3 artifact unavailable or credentials missing: {exc}"
     try:
         if value.startswith("file://"):
             resolved = resolve_controlled_artifact_reference(value, export_dir=export_dir)
-            if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
-                return None
-            return resolved
-    except ArtifactPathValidationError:
-        return None
+            return validate_resolved(resolved, _artifact_s3_uri(artifact, value))
+    except ArtifactPathValidationError as exc:
+        return None, f"Local artifact is outside allowed roots: {exc}"
     path = Path(value)
     if manifest_path is None:
         try:
             resolved = resolve_controlled_artifact_reference(value)
-            if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
-                return None
-            return resolved
-        except ArtifactPathValidationError:
-            return None
+            return validate_resolved(resolved, _artifact_s3_uri(artifact, value))
+        except ArtifactPathValidationError as exc:
+            return None, f"Local artifact is outside allowed roots: {exc}"
     try:
         if path.is_absolute():
             resolved = validate_controlled_artifact_path(path, export_dir=export_dir)
         else:
             resolved = validate_controlled_artifact_path(manifest_path.parent / path, export_dir=export_dir)
-        if not _materialize_onnx_external_data(resolved, artifact, _artifact_s3_uri(artifact, value)):
-            return None
-        return resolved
-    except ArtifactPathValidationError:
-        return None
+        return validate_resolved(resolved, _artifact_s3_uri(artifact, value))
+    except ArtifactPathValidationError as exc:
+        return None, f"Local artifact is outside allowed roots: {exc}"
 
 
 def _artifact_reference(value: object) -> str:
@@ -1066,19 +1071,23 @@ def _artifact_reference(value: object) -> str:
 
 
 def _materialize_onnx_external_data(model_path: Path, artifact: dict, artifact_uri: str) -> bool:
+    return _materialize_onnx_external_data_error(model_path, artifact, artifact_uri) == ""
+
+
+def _materialize_onnx_external_data_error(model_path: Path, artifact: dict, artifact_uri: str) -> str:
     if not _is_onnx_artifact(model_path, artifact):
-        return True
+        return ""
     for candidate in _external_data_candidates(model_path, artifact):
         relative_path = _external_data_relative_path(candidate.get("path"))
         explicit = bool(candidate.get("explicit"))
         if not relative_path:
             if explicit:
-                return False
+                return "ONNX external data file missing: manifest entry does not include a safe relative path."
             continue
         destination = _safe_external_data_path(model_path.parent, relative_path)
         if destination is None:
             if explicit:
-                return False
+                return f"ONNX external data file missing or outside allowed roots: {relative_path}"
             continue
         sidecar_uri = _external_data_s3_uri(artifact_uri, candidate, relative_path)
         if destination.exists() and destination.is_file() and _external_data_file_matches(candidate, destination):
@@ -1088,9 +1097,9 @@ def _materialize_onnx_external_data(model_path: Path, artifact: dict, artifact_u
                 downloaded = download_s3_uri(sidecar_uri, destination)
                 validate_controlled_artifact_path(downloaded, export_dir=model_path.parent)
                 continue
-            except Exception:
+            except Exception as exc:
                 if explicit:
-                    return False
+                    return f"ONNX external data file missing: {relative_path} ({exc})"
                 continue
         source = _external_data_local_source(candidate, model_path.parent)
         if source is not None:
@@ -1099,13 +1108,13 @@ def _materialize_onnx_external_data(model_path: Path, artifact: dict, artifact_u
                 if source.resolve() != destination.resolve():
                     shutil.copy2(source, destination)
                 continue
-            except OSError:
+            except OSError as exc:
                 if explicit:
-                    return False
+                    return f"ONNX external data file missing: {relative_path} ({exc})"
                 continue
         if explicit:
-            return False
-    return True
+            return f"ONNX external data file missing: {relative_path}"
+    return ""
 
 
 def _s3_artifact_cache_path(artifact_uri: str) -> Path:
@@ -1310,6 +1319,14 @@ def _external_data_local_source(candidate: dict, artifact_dir: Path) -> Path | N
 def _safe_path_part(value: str) -> str:
     safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(value))
     return safe or "artifact"
+
+
+def _dependency_error_message(exc: Exception) -> str:
+    missing = getattr(exc, "name", "") if isinstance(exc, ModuleNotFoundError) else ""
+    if missing:
+        package = "Pillow" if missing == "PIL" else missing
+        return f"Install worker dependencies in services/worker/.venv. Missing Python package: {package}."
+    return f"Install worker dependencies in services/worker/.venv. {exc}"
 
 
 def _pending_payload(error_code: str, error: str, image_metadata: dict | None = None) -> dict:

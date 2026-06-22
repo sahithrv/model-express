@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -925,10 +924,6 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
-	datasetID := champion.DatasetID
-	if err == nil {
-		datasetID = dataset.ID
-	}
 	imageID := strings.TrimSpace(req.ImageID)
 	trueLabel := strings.TrimSpace(req.TrueLabel)
 	imageMetadata := map[string]any{}
@@ -980,12 +975,18 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		imageMetadata["backend_image_uri"] = backendImageURI
 	}
 	storedOriginalUnavailable := matchedStoredDemoImage && !championDemoHasOriginalInferenceURI(imageMetadata)
-	predictionStatus := runs.ChampionDemoPredictionStatusPending
-	predictionError := ""
+	predictionStatus := runs.ChampionDemoPredictionStatusRuntimeUnavailable
+	predictionError := "champion demo inference is local-only in Mission Control; run local Python inference and record results through /champion/demo-predictions/local-result"
 	if storedOriginalUnavailable {
 		imageMetadata["error_code"] = championDemoOriginalUnavailableCode
 		predictionStatus = runs.ChampionDemoPredictionStatusFailed
 		predictionError = championDemoOriginalUnavailableCode + ": stored demo images need original_image_uri or source_artifact_uri for inference; preview_uri and thumbnail_uri are display-only"
+	} else {
+		imageMetadata["local_runtime_required"] = true
+		imageMetadata["legacy_queued_demo_disabled"] = true
+		if strings.TrimSpace(payloadString(imageMetadata, "inference_transport")) == "" {
+			imageMetadata["inference_transport"] = "mission_control_local_python"
+		}
 	}
 
 	prediction, err := s.store.CreateChampionDemoPrediction(runs.ChampionDemoPredictionCreate{
@@ -1005,59 +1006,14 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
-	readyExport, hasReadyExport := usableChampionExport(s.store, champion)
-	runtimeAvailable := hasReadyExport && !storedOriginalUnavailable
-	if hasReadyExport && !storedOriginalUnavailable {
-		jobConfig := map[string]any{
-			"dataset_id":             datasetID,
-			"champion_id":            champion.ID,
-			"champion_job_id":        champion.JobID,
-			"prediction_id":          prediction.ID,
-			"export_id":              readyExport.ID,
-			"export_format":          readyExport.Format,
-			"export_artifact_uri":    readyExport.ArtifactURI,
-			"manifest_path":          championExportManifestPath(readyExport.Metadata),
-			"export_metadata":        readyExport.Metadata,
-			"image_uri":              backendImageURI,
-			"image_id":               imageID,
-			"true_label":             trueLabel,
-			"image_metadata":         imageMetadata,
-			"top_k":                  req.TopK,
-			"requested_at":           time.Now().UTC().Format(time.RFC3339),
-			"prediction_contract":    "worker reports via /jobs/:id/champion-demo-prediction-result",
-			"backend_runs_inference": true,
-		}
-		if req.ConfidenceThreshold != nil {
-			jobConfig["confidence_threshold"] = *req.ConfidenceThreshold
-		}
-		if req.IOUThreshold != nil {
-			jobConfig["iou_threshold"] = *req.IOUThreshold
-		}
-		if req.MaxDetections > 0 {
-			jobConfig["max_detections"] = req.MaxDetections
-		}
-		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateChampionDemoPrediction, jobConfig, func(existing jobs.ExperimentJob) bool {
-			return jobConfigString(existing.Config, "prediction_id") == prediction.ID
-		}); err != nil {
-			writeStoreError(c, err)
-			return
-		}
-	} else if !storedOriginalUnavailable {
-		prediction, err = s.store.UpdateChampionDemoPrediction(prediction.ID, runs.ChampionDemoPredictionUpdate{
-			Status: runs.ChampionDemoPredictionStatusRuntimeUnavailable,
-			Error:  "no READY champion export is available for worker-backed demo prediction",
-		})
-		if err != nil {
-			writeStoreError(c, err)
-			return
-		}
-	}
+	runtimeAvailable := false
 	if _, err := s.store.CreateExecutionEvent(champion.ProjectID, champion.PlanID, execution.EventChampionDemoPrediction, fmt.Sprintf("Champion demo prediction requested for job %s.", champion.JobID), map[string]any{
 		"champion_id":   champion.ID,
 		"prediction_id": prediction.ID,
 		"job_id":        champion.JobID,
 		"status":        prediction.Status,
 		"image_uri":     prediction.ImageURI,
+		"local_only":    true,
 	}); err != nil {
 		log.Printf("record champion demo prediction event failed: %v", err)
 	}
@@ -1068,6 +1024,7 @@ func (s *Server) createProjectChampionDemoPrediction(c *gin.Context) {
 		"contract": gin.H{
 			"champion_job_id": champion.JobID,
 			"image_uri":       imageURI,
+			"local_only":      true,
 			"top_k":           req.TopK,
 			"returns":         []string{"predicted_label", "true_label", "confidence", "top_k", "latency_ms", "correct", "image_metadata.detections"},
 		},

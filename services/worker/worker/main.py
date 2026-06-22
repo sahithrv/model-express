@@ -31,7 +31,6 @@ GENERIC_PROVIDER_FALLBACK_TEMPLATES = [
     "profile_dataset",
     "analyze_dataset_visuals",
     "export_champion",
-    "champion_demo_prediction",
     "generate_visual_exemplars",
 ]
 

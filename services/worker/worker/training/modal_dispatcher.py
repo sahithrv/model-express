@@ -30,14 +30,12 @@ MODAL_DISPATCHER_TEMPLATES = [
     "profile_dataset",
     "analyze_dataset_visuals",
     "export_champion",
-    "champion_demo_prediction",
     "generate_visual_exemplars",
 ]
 MODAL_DISPATCHER_UNSPECIFIED_PROVIDER_TEMPLATES = [
     "profile_dataset",
     "analyze_dataset_visuals",
     "export_champion",
-    "champion_demo_prediction",
     "generate_visual_exemplars",
 ]
 DEFAULT_DISPATCHER_SLOTS = 1

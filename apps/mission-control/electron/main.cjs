@@ -1733,10 +1733,13 @@ async function predictChampionDemoLocal(request = {}, runtime = {}) {
   cancelChampionDemoRuntimeIdleTimer(session);
   let response;
   try {
+    await ensureChampionDemoRuntimeReady(session);
     response = await sendChampionDemoRuntimeMessage(session, {
       ...request,
       op: "predict",
     });
+  } catch (error) {
+    throw new Error(championDemoRuntimeUserError(error, session));
   } finally {
     scheduleChampionDemoRuntimeIdleCleanup(session);
   }
@@ -1775,15 +1778,22 @@ function ensureChampionDemoRuntime(request = {}, runtime = {}) {
   };
   const python = runtime.python ?? resolveWorkerPython(workerDir, childEnv);
   const spawnFn = runtime.spawnFn ?? spawn;
-  const child = spawnFn(python, ["-m", "worker.exporting.demo_runtime"], {
-    cwd: workerDir,
-    env: childEnv,
-    windowsHide: true,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  let child;
+  try {
+    child = spawnFn(python, ["-m", "worker.exporting.demo_runtime"], {
+      cwd: workerDir,
+      env: childEnv,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (error) {
+    throw new Error(championDemoRuntimeStartupMessage(error, { python, workerDir }));
+  }
   const session = {
     key,
     child,
+    python,
+    workerDir,
     pending: new Map(),
     nextId: 1,
     stdoutBuffer: "",
@@ -1792,6 +1802,8 @@ function ensureChampionDemoRuntime(request = {}, runtime = {}) {
     timeoutMs: positiveDurationMs(runtime.timeoutMs ?? request.timeoutMs, CHAMPION_DEMO_RUNTIME_TIMEOUT_MS),
     idleTtlMs: positiveDurationMs(runtime.idleTtlMs ?? request.idleTtlMs, CHAMPION_DEMO_RUNTIME_IDLE_TTL_MS),
     idleTimer: null,
+    ready: false,
+    readyPromise: null,
   };
   championDemoRuntime = session;
 
@@ -1803,14 +1815,14 @@ function ensureChampionDemoRuntime(request = {}, runtime = {}) {
     appendDiagnosticLog(logDir, "warn", "champion_demo_runtime_stderr", { runtime_key: key, message: text.trim().slice(0, 1000) });
   });
   child.on("exit", (code, signal) => {
-    rejectChampionDemoRuntimePending(session, new Error(`Local Python demo runtime exited code=${code} signal=${signal || ""}`.trim()));
+    rejectChampionDemoRuntimePending(session, championDemoRuntimeExitError(session, code, signal));
     if (championDemoRuntime === session) {
       championDemoRuntime = null;
     }
     appendDiagnosticLog(logDir, "warn", "champion_demo_runtime_exited", { runtime_key: key, code, signal });
   });
   child.on("error", (error) => {
-    rejectChampionDemoRuntimePending(session, error);
+    rejectChampionDemoRuntimePending(session, new Error(championDemoRuntimeStartupMessage(error, session)));
     if (championDemoRuntime === session) {
       championDemoRuntime = null;
     }
@@ -1818,7 +1830,10 @@ function ensureChampionDemoRuntime(request = {}, runtime = {}) {
   });
 
   if (!child.pid) {
-    throw new Error("Local Python demo runtime did not start. Check that Python and worker dependencies are installed.");
+    if (championDemoRuntime === session) {
+      championDemoRuntime = null;
+    }
+    throw new Error(championDemoRuntimeStartupMessage(new Error("runtime process has no pid"), session));
   }
   appendDiagnosticLog(logDir, "info", "champion_demo_runtime_started", { runtime_key: key, pid: child.pid, python });
   return session;
@@ -1837,18 +1852,26 @@ function sendChampionDemoRuntimeMessage(session, message) {
   if (!isWorkerRunning(session.child) || !session.child.stdin) {
     throw new Error("Local Python demo runtime is not running.");
   }
-  const id = String(message.id ?? message.request_id ?? `demo-${session.nextId++}`);
+  const id = `demo-${session.nextId++}`;
   const payload = { ...message, id };
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       session.pending.delete(id);
-      reject(new Error(`Local Python demo inference timed out after ${session.timeoutMs}ms.${session.stderrTail ? ` ${session.stderrTail}` : ""}`));
+      const error = new Error(`Local Python demo inference timed out after ${session.timeoutMs}ms.${session.stderrTail ? ` ${session.stderrTail}` : ""}`);
+      error.code = "LOCAL_RUNTIME_TIMEOUT";
+      if (championDemoRuntime === session) {
+        stopChampionDemoRuntime({ reason: "request_timeout", error });
+      }
+      reject(error);
     }, session.timeoutMs);
     session.pending.set(id, { resolve, reject, timeout });
     session.child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
       if (!error) return;
       clearTimeout(timeout);
       session.pending.delete(id);
+      if (championDemoRuntime === session) {
+        stopChampionDemoRuntime({ reason: "stdin_write_failed", error });
+      }
       reject(error);
     });
   });
@@ -1885,6 +1908,7 @@ function scheduleChampionDemoRuntimeIdleCleanup(session) {
       stopChampionDemoRuntime({ reason: "idle_ttl" });
     }
   }, session.idleTtlMs);
+  session.idleTimer.unref?.();
 }
 
 function cancelChampionDemoRuntimeIdleTimer(session) {
@@ -1901,7 +1925,10 @@ function stopChampionDemoRuntime(options = {}) {
   }
   championDemoRuntime = null;
   cancelChampionDemoRuntimeIdleTimer(session);
-  rejectChampionDemoRuntimePending(session, new Error("Local Python demo runtime was stopped."));
+  const pendingError = options.error instanceof Error
+    ? options.error
+    : new Error(`Local Python demo runtime was stopped${options.reason ? ` (${options.reason})` : ""}.`);
+  rejectChampionDemoRuntimePending(session, pendingError);
   try {
     if (isWorkerRunning(session.child) && session.child.stdin?.writable) {
       session.child.stdin.write(`${JSON.stringify({ id: `shutdown-${Date.now()}`, op: "shutdown" })}\n`);
@@ -1924,11 +1951,68 @@ function rejectChampionDemoRuntimePending(session, error) {
   }
 }
 
+function ensureChampionDemoRuntimeReady(session) {
+  if (session.ready) {
+    return Promise.resolve();
+  }
+  if (!session.readyPromise) {
+    session.readyPromise = sendChampionDemoRuntimeMessage(session, { op: "ping" })
+      .then((response) => {
+        if (!response || response.ok !== true) {
+          throw new Error(localChampionDemoRuntimeError(response, session));
+        }
+        session.ready = true;
+      })
+      .catch((error) => {
+        if (championDemoRuntime === session) {
+          stopChampionDemoRuntime({ reason: "startup_preflight_failed", error });
+        }
+        throw error;
+      })
+      .finally(() => {
+        session.readyPromise = null;
+      });
+  }
+  return session.readyPromise;
+}
+
 function localChampionDemoRuntimeError(response, session) {
   const message = response && typeof response === "object" ? response.error || response.message : "";
   const code = response && typeof response === "object" ? response.code || response.error_code : "";
   const details = [code, message, session?.stderrTail].filter(Boolean).join(": ");
   return details || "Local Python demo inference failed.";
+}
+
+function championDemoRuntimeExitError(session, code, signal) {
+  const detail = `Local Python demo runtime exited code=${code} signal=${signal || ""}`.trim();
+  const stderr = session?.stderrTail ? ` ${session.stderrTail}` : "";
+  return new Error(`${detail}.${stderr}`.trim());
+}
+
+function championDemoRuntimeUserError(error, session) {
+  if (error instanceof Error) {
+    return championDemoRuntimeStartupMessage(error, session);
+  }
+  return championDemoRuntimeStartupMessage(new Error(String(error)), session);
+}
+
+function championDemoRuntimeStartupMessage(error, context = {}) {
+  const raw = errorMessage(error);
+  const stderr = String(context?.stderrTail ?? "").trim();
+  const detail = [raw, stderr].filter(Boolean).join(" ");
+  if (error?.code === "ENOENT" || /spawn .*ENOENT/i.test(detail) || /not recognized|not found/i.test(detail)) {
+    return "Python runtime not found. Install worker dependencies in services/worker/.venv or set MODEL_EXPRESS_PYTHON to a valid interpreter.";
+  }
+  if (/ModuleNotFoundError|No module named ['"]?worker|cannot import name/i.test(detail)) {
+    return "Install worker dependencies in services/worker/.venv. The local Python demo runtime could not import the Model Express worker package.";
+  }
+  if (/No module named ['"]?(onnxruntime|PIL|numpy|torch|torchvision|onnx)['"]?/i.test(detail)) {
+    return `Install worker dependencies in services/worker/.venv. ${detail}`;
+  }
+  if (/LOCAL_RUNTIME_TIMEOUT/i.test(String(error?.code ?? "")) || /timed out/i.test(detail)) {
+    return detail || "Local Python demo inference timed out.";
+  }
+  return detail || "Local Python demo runtime failed before it became ready.";
 }
 
 function positiveDurationMs(value, fallback) {
@@ -1941,7 +2025,7 @@ function positiveDurationMs(value, fallback) {
 
 function championDemoRuntimeSnapshot() {
   return championDemoRuntime
-    ? { key: championDemoRuntime.key, pid: championDemoRuntime.child?.pid ?? 0, pending: championDemoRuntime.pending.size }
+    ? { key: championDemoRuntime.key, pid: championDemoRuntime.child?.pid ?? 0, pending: championDemoRuntime.pending.size, ready: championDemoRuntime.ready }
     : null;
 }
 

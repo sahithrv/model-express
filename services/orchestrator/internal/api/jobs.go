@@ -1536,7 +1536,6 @@ func defaultProviderPollFallbackTemplates() []string {
 		jobs.TemplateProfileDataset,
 		jobs.TemplateAnalyzeDatasetVisuals,
 		jobs.TemplateExportChampion,
-		jobs.TemplateChampionDemoPrediction,
 		jobs.TemplateGenerateVisualExemplars,
 	}
 }
@@ -1906,7 +1905,6 @@ func validDirectJobTemplate(template string) bool {
 		jobs.TemplateTrainExperiment,
 		jobs.TemplateLabelQualityAudit,
 		jobs.TemplateExportChampion,
-		jobs.TemplateChampionDemoPrediction,
 		jobs.TemplateGenerateVisualExemplars,
 		jobs.TemplateAnalyzeDatasetVisuals:
 		return true

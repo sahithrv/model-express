@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -35,10 +36,13 @@ def predict_from_request(request: dict) -> dict:
     if manifest_path is None and manifest_payload is None:
         result = _failed_result(
             "MANIFEST_NOT_CONFIGURED",
-            "No READY champion export manifest or artifact metadata is available for local demo inference.",
+            "READY export manifest is missing. Prepare a READY local export with manifest metadata before running the demo.",
         )
     elif image_path is None:
-        result = _failed_result("IMAGE_UNAVAILABLE", image_error or "Demo image is unavailable to the local runtime.")
+        error_code = "IMAGE_UNAVAILABLE"
+        if str(image_error).startswith("ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO"):
+            error_code = "ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO"
+        result = _failed_result(error_code, _local_demo_error_message(error_code, image_error))
     else:
         inference = run_demo_inference_from_manifest(
             manifest_path=manifest_path,
@@ -97,11 +101,41 @@ def _failed_result(error_code: str, error: str) -> dict:
     }
 
 
+def _local_demo_error_message(error_code: str, error: str) -> str:
+    detail = str(error or "").strip()
+    if error_code == "ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO":
+        return (
+            "Original image bytes are required for local demo inference. "
+            "Stored preview_uri and thumbnail_uri values are display-only."
+        )
+    if detail.startswith("S3") or "credential" in detail.lower():
+        return f"S3 artifact or image is unavailable to the local runtime: {detail}"
+    return detail or "Demo image is unavailable to the local runtime."
+
+
+def runtime_preflight() -> dict:
+    modules = {
+        "PIL": "Pillow",
+        "numpy": "numpy",
+        "onnxruntime": "onnxruntime",
+        "torch": "torch",
+    }
+    missing = [package for module, package in modules.items() if importlib.util.find_spec(module) is None]
+    return {
+        "runtime_host": "mission_control_python",
+        "pid": os.getpid(),
+        "missing_dependencies": missing,
+        "dependencies_available": len(missing) == 0,
+    }
+
+
 def handle_message(message: dict) -> dict:
     operation = str(message.get("op") or message.get("operation") or "predict").strip().lower()
     message_id = message.get("id")
     if operation == "ping":
-        return {"id": message_id, "ok": True, "status": "ready", "pid": os.getpid()}
+        return {"id": message_id, "ok": True, "status": "ready", "pid": os.getpid(), "preflight": runtime_preflight()}
+    if operation == "preflight":
+        return {"id": message_id, "ok": True, "status": "ready", "pid": os.getpid(), "preflight": runtime_preflight()}
     if operation == "dispose":
         clear_demo_inference_cache()
         return {"id": message_id, "ok": True, "status": "disposed", "pid": os.getpid()}

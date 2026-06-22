@@ -121,6 +121,42 @@ class DemoInferenceTests(unittest.TestCase):
             self.assertEqual(payload["error_code"], "MODEL_ARTIFACT_UNAVAILABLE")
             self.assertEqual(payload["top_k"], [])
 
+    def test_explicit_onnx_external_data_missing_returns_clear_pending_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            export_dir = Path(temp_dir)
+            model_path = export_dir / "model.onnx"
+            model_path.write_bytes(b"onnx bytes")
+            image_path = export_dir / "demo.jpg"
+            Image.new("RGB", (16, 16), (255, 0, 0)).save(image_path)
+            manifest = {
+                "schema_version": "champion_export_manifest_v1",
+                "status": "created",
+                "metadata": {
+                    "model": "tiny",
+                    "class_labels": ["cat", "dog"],
+                    "input_shape": [1, 3, 16, 16],
+                    "preprocessing": {"normalization": "none"},
+                },
+                "artifacts": [
+                    {
+                        "format": "onnx",
+                        "status": "created",
+                        "path": str(model_path),
+                        "external_data": [{"path": "model.onnx.data", "bytes": 128}],
+                    }
+                ],
+            }
+
+            payload = run_demo_inference_from_manifest(
+                manifest_path=export_dir / "manifest.json",
+                manifest=manifest,
+                image_path=image_path,
+                image_metadata={"parity_safe": True, "demo_source_type": "custom_original_bytes"},
+            )
+
+        self.assertEqual(payload["status"], "pending")
+        self.assertEqual(payload["error_code"], "MODEL_ARTIFACT_NOT_FOUND")
+        self.assertIn("ONNX external data file missing", payload["error"])
     def test_torchscript_inference_returns_ranked_payload_when_available(self) -> None:
         try:
             import torch

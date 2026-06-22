@@ -86,13 +86,20 @@ func TestChampionDemoPredictionCarriesHeldoutImageMetadataToWorkerJob(t *testing
 	if payload.Prediction.TrueLabel != "cat" || payload.Prediction.ImageID != "test:cat" {
 		t.Fatalf("expected heldout image metadata on prediction, got %#v", payload.Prediction)
 	}
-	predictionJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateChampionDemoPrediction)
-	imageMetadata, ok := predictionJob.Config["image_metadata"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected image_metadata in prediction job config, got %#v", predictionJob.Config)
+	if payload.Prediction.Status != runs.ChampionDemoPredictionStatusRuntimeUnavailable {
+		t.Fatalf("expected local-only runtime unavailable prediction, got %#v", payload.Prediction)
 	}
-	if imageMetadata["demo_source_type"] != "heldout_test_original_bytes" || imageMetadata["parity_safe"] != true {
-		t.Fatalf("expected parity-safe heldout metadata, got %#v", imageMetadata)
+	if payload.Prediction.ImageMetadata["demo_source_type"] != "heldout_test_original_bytes" || payload.Prediction.ImageMetadata["parity_safe"] != true {
+		t.Fatalf("expected parity-safe heldout metadata, got %#v", payload.Prediction.ImageMetadata)
+	}
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	for _, job := range projectJobs {
+		if job.Template == jobs.TemplateChampionDemoPrediction {
+			t.Fatalf("legacy demo endpoint must not create worker prediction job, got %#v", job)
+		}
 	}
 }
 
@@ -177,16 +184,20 @@ func TestChampionDemoPredictionUsesOriginalArtifactForCompactHeldoutImage(t *tes
 	if payload.Prediction.TrueLabel != "cat" || payload.Prediction.ImageURI != thumbnailURI {
 		t.Fatalf("expected requested thumbnail to stay on prediction with heldout label, got %#v", payload.Prediction)
 	}
-	predictionJob := findProjectJob(t, memoryStore, project.ID, jobs.TemplateChampionDemoPrediction)
-	if imageURI := jobConfigString(predictionJob.Config, "image_uri"); imageURI != originalURI {
-		t.Fatalf("expected worker job to use original artifact URI, got %q", imageURI)
+	if payload.Prediction.Status != runs.ChampionDemoPredictionStatusRuntimeUnavailable {
+		t.Fatalf("expected local-only runtime unavailable prediction, got %#v", payload.Prediction)
 	}
-	imageMetadata, ok := predictionJob.Config["image_metadata"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected image_metadata in prediction job config, got %#v", predictionJob.Config)
+	if payload.Prediction.ImageMetadata["requested_image_uri"] != thumbnailURI || payload.Prediction.ImageMetadata["backend_image_uri"] != originalURI {
+		t.Fatalf("expected thumbnail request and backend original URI metadata, got %#v", payload.Prediction.ImageMetadata)
 	}
-	if imageMetadata["requested_image_uri"] != thumbnailURI || imageMetadata["backend_image_uri"] != originalURI {
-		t.Fatalf("expected thumbnail request and backend original URI metadata, got %#v", imageMetadata)
+	projectJobs, err := memoryStore.ListProjectJobs(project.ID)
+	if err != nil {
+		t.Fatalf("list project jobs: %v", err)
+	}
+	for _, job := range projectJobs {
+		if job.Template == jobs.TemplateChampionDemoPrediction {
+			t.Fatalf("legacy demo endpoint must not create worker prediction job, got %#v", job)
+		}
 	}
 }
 

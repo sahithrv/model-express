@@ -193,14 +193,12 @@ def test_modal_dispatcher_registers_logical_slots_and_filters_modal_polling():
         "profile_dataset",
         "analyze_dataset_visuals",
         "export_champion",
-        "champion_demo_prediction",
         "generate_visual_exemplars",
     ]
     assert client.polls[0]["include_unspecified_provider_templates"] == [
         "profile_dataset",
         "analyze_dataset_visuals",
         "export_champion",
-        "champion_demo_prediction",
         "generate_visual_exemplars",
     ]
 
@@ -226,7 +224,6 @@ def test_modal_dispatcher_zero_requirement_poll_slot_claims_profile_dataset():
         "profile_dataset",
         "analyze_dataset_visuals",
         "export_champion",
-        "champion_demo_prediction",
         "generate_visual_exemplars",
     ]
 
@@ -252,7 +249,6 @@ def test_modal_dispatcher_zero_requirement_poll_slot_claims_visual_analysis():
         "profile_dataset",
         "analyze_dataset_visuals",
         "export_champion",
-        "champion_demo_prediction",
         "generate_visual_exemplars",
     ]
 
@@ -276,7 +272,6 @@ def test_modal_dispatcher_zero_requirement_poll_slot_does_not_claim_training_job
         "profile_dataset",
         "analyze_dataset_visuals",
         "export_champion",
-        "champion_demo_prediction",
         "generate_visual_exemplars",
     ]
 

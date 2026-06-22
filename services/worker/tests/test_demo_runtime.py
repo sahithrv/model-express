@@ -115,6 +115,41 @@ class DemoRuntimeTests(unittest.TestCase):
             self.assertEqual(result["error_code"], "INFERENCE_DEPENDENCY_UNAVAILABLE")
             self.assertTrue(result["image_metadata"]["local_runtime_unavailable"])
 
+    def test_missing_manifest_returns_terminal_failed_prediction(self) -> None:
+        with patch("worker.exporting.demo_runtime._manifest_path", return_value=None), patch(
+            "worker.exporting.demo_runtime._manifest_payload", return_value=None
+        ), patch("worker.exporting.demo_runtime._demo_image_path", return_value=(Path("demo.jpg"), "")):
+            result = predict_from_request({"request_id": "missing-manifest", "image_uri": "file:///demo.jpg"})
+
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error_code"], "MANIFEST_NOT_CONFIGURED")
+        self.assertIn("READY export manifest is missing", result["error"])
+        self.assertTrue(result["image_metadata"]["local_runtime"])
+
+    def test_original_image_unavailable_returns_clear_terminal_failed_prediction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("worker.exporting.demo_runtime._manifest_path", return_value=Path(temp_dir) / "manifest.json"), patch(
+                "worker.exporting.demo_runtime._demo_image_path",
+                return_value=(None, "ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO: preview_uri and thumbnail_uri are display-only"),
+            ):
+                result = predict_from_request(
+                    {
+                        "request_id": "missing-original",
+                        "image_uri": "data:image/jpeg;base64,THUMB",
+                        "image_metadata": {"demo_source_type": "heldout_test_thumbnail_preview"},
+                    }
+                )
+
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error_code"], "ORIGINAL_IMAGE_UNAVAILABLE_FOR_DEMO")
+        self.assertIn("Original image bytes are required", result["error"])
+
+    def test_preflight_reports_dependency_status(self) -> None:
+        response = handle_message({"id": "preflight-1", "op": "preflight"})
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["status"], "ready")
+        self.assertIn("missing_dependencies", response["preflight"])
     def test_dispose_clears_cached_runtime(self) -> None:
         with patch("worker.exporting.demo_runtime.clear_demo_inference_cache") as clear_cache:
             response = handle_message({"id": "dispose-1", "op": "dispose"})

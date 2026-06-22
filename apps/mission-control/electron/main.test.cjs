@@ -413,6 +413,119 @@ test("champion demo local runtime reuses one Python process for repeated predict
   assert.equal(children[0].killed, true);
 });
 
+test("champion demo runtime startup errors clear cached session", async () => {
+  const repo = tempDir("mx-demo-runtime-start-error-");
+  const userDataDir = tempDir("mx-demo-runtime-start-user-");
+  fs.mkdirSync(path.join(repo, "services", "worker"), { recursive: true });
+  const spawnFn = () => {
+    const child = fakeChildProcess();
+    child.stdin = {
+      writable: true,
+      write(_chunk, callback) {
+        if (callback) callback();
+        return true;
+      },
+    };
+    process.nextTick(() => {
+      const error = new Error("spawn python ENOENT");
+      error.code = "ENOENT";
+      child.emit("error", error);
+    });
+    return child;
+  };
+
+  await assert.rejects(
+    () =>
+      __test.predictChampionDemoLocal(
+        { runtimeKey: "project:champion:broken", image_uri: "file:///demo/cat.jpg" },
+        { spawnFn, env: { MODEL_EXPRESS_ROOT: repo, MODEL_EXPRESS_USER_DATA_DIR: userDataDir }, idleTtlMs: 0, timeoutMs: 1000 },
+      ),
+    /Python runtime not found/,
+  );
+  assert.equal(__test.championDemoRuntimeSnapshot(), null);
+});
+
+test("champion demo runtime timeout disposes broken session", async () => {
+  const repo = tempDir("mx-demo-runtime-timeout-");
+  const userDataDir = tempDir("mx-demo-runtime-timeout-user-");
+  fs.mkdirSync(path.join(repo, "services", "worker"), { recursive: true });
+  let child;
+  const spawnFn = () => {
+    child = fakeChildProcess();
+    child.stdin = {
+      writable: true,
+      write(_chunk, callback) {
+        if (callback) callback();
+        return true;
+      },
+    };
+    return child;
+  };
+
+  await assert.rejects(
+    () =>
+      __test.predictChampionDemoLocal(
+        { runtimeKey: "project:champion:timeout", image_uri: "file:///demo/cat.jpg" },
+        { spawnFn, env: { MODEL_EXPRESS_ROOT: repo, MODEL_EXPRESS_USER_DATA_DIR: userDataDir }, idleTtlMs: 0, timeoutMs: 20 },
+      ),
+    /timed out/,
+  );
+  assert.equal(__test.championDemoRuntimeSnapshot(), null);
+  assert.equal(child.killed, true);
+});
+
+test("champion demo runtime key changes dispose previous warm session", async () => {
+  const repo = tempDir("mx-demo-runtime-key-");
+  const userDataDir = tempDir("mx-demo-runtime-key-user-");
+  fs.mkdirSync(path.join(repo, "services", "worker"), { recursive: true });
+  const children = [];
+  const spawnFn = () => {
+    const child = fakeChildProcess();
+    child.stdin = {
+      writable: true,
+      write(chunk, callback) {
+        const message = JSON.parse(String(chunk).trim());
+        setImmediate(() => {
+          child.stdout.emit(
+            "data",
+            Buffer.from(
+              JSON.stringify(
+                message.op === "ping"
+                  ? { id: message.id, ok: true, status: "ready", pid: child.pid }
+                  : {
+                      id: message.id,
+                      ok: true,
+                      prediction: {
+                        status: "SUCCEEDED",
+                        image_uri: message.image_uri,
+                        predicted_label: "cat",
+                        confidence: 0.9,
+                        top_k: [{ label: "cat", confidence: 0.9 }],
+                        latency_ms: 9,
+                      },
+                      pid: child.pid,
+                    },
+              ) + "\n",
+            ),
+          );
+        });
+        if (callback) callback();
+        return true;
+      },
+    };
+    children.push(child);
+    return child;
+  };
+  const runtime = { spawnFn, env: { MODEL_EXPRESS_ROOT: repo, MODEL_EXPRESS_USER_DATA_DIR: userDataDir }, idleTtlMs: 0, timeoutMs: 1000 };
+
+  await __test.predictChampionDemoLocal({ runtimeKey: "project:champion:export-a", image_uri: "file:///demo/cat-a.jpg" }, runtime);
+  await __test.predictChampionDemoLocal({ runtimeKey: "project:champion:export-b", image_uri: "file:///demo/cat-b.jpg" }, runtime);
+
+  assert.equal(children.length, 2);
+  assert.equal(children[0].killed, true);
+  assert.equal(__test.championDemoRuntimeSnapshot()?.key, "project:champion:export-b");
+  __test.stopChampionDemoRuntime({ reason: "test_cleanup" });
+});
 test("artifact paths are limited to configured artifact roots", () => {
   const allowedRoot = tempDir("mx-artifacts-");
   const outsideRoot = tempDir("mx-outside-");

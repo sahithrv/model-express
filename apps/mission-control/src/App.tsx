@@ -703,16 +703,9 @@ const defaultAutomationSettings: AutomationSettings = {
 function readyLocalPythonExport(exports: ChampionExport[]) {
   return exports.find((exportRecord) => {
     const status = normalizedStatus(exportRecord.status || "");
-    if (status !== "READY") return false;
-    const artifactURI = championExportArtifactURI(exportRecord);
-    const manifest = championExportManifest(exportRecord);
-    const manifestHasCreatedArtifact = Array.isArray(manifest.artifacts)
-      ? manifest.artifacts.some((item) => recordString(recordObject(item), "status").toLowerCase() === "created")
-      : false;
-    return Boolean(artifactURI || manifestHasCreatedArtifact);
+    return status === "READY" && localPythonExportHasManifest(exportRecord);
   });
 }
-
 function championExportArtifactURI(exportRecord: ChampionExport) {
   return exportRecord.artifact_uri || exportRecord.model_uri || exportRecord.download_url || "";
 }
@@ -735,6 +728,22 @@ function championExportManifestPath(exportRecord: ChampionExport) {
   );
 }
 
+function localPythonExportHasManifest(exportRecord: ChampionExport) {
+  const manifestPath = championExportManifestPath(exportRecord);
+  const manifest = championExportManifest(exportRecord);
+  const manifestHasCreatedArtifact = Array.isArray(manifest.artifacts)
+    ? manifest.artifacts.some((item) => recordString(recordObject(item), "status").toLowerCase() === "created")
+    : false;
+  return Boolean(manifestPath || manifestHasCreatedArtifact);
+}
+
+function readyExportMissingLocalManifest(exports: ChampionExport[]) {
+  return exports.some((exportRecord) => normalizedStatus(exportRecord.status || "") === "READY" && !localPythonExportHasManifest(exportRecord));
+}
+
+function localPythonExportMissingManifestMessage() {
+  return "READY export manifest is missing. Prepare a READY local export with manifest metadata before running the demo.";
+}
 function championDemoPythonRuntimeKey(projectId: string, championId: string, exportRecord: ChampionExport) {
   return [projectId, championId, exportRecord.id || "export", championExportArtifactURI(exportRecord) || championExportManifestPath(exportRecord)]
     .filter(Boolean)
@@ -1693,6 +1702,11 @@ export function App() {
       localRuntime.current = null;
       setLocalInferenceStatus((status) => (status === "not_ready" ? "python_available" : status));
       setLocalInferenceError("");
+    } else if (readyExportMissingLocalManifest(championExportDemo.exports)) {
+      localRuntime.current = null;
+      setLocalInferenceStatus("error");
+      setLocalInferenceError(localPythonExportMissingManifestMessage());
+      setDemoSlideshowEnabled(false);
     } else {
       localRuntime.current = null;
       setLocalInferenceStatus("not_ready");
@@ -1717,15 +1731,31 @@ export function App() {
 
   useEffect(() => {
     if (!demoSlideshowEnabled) return;
+    const blocker = championDemoSlideshowBlocker();
+    if (blocker) {
+      setDemoSlideshowEnabled(false);
+      setDemoPredictionError(blocker);
+      return;
+    }
     const runNextSlide = () => {
       if (demoSlideshowInFlight.current) return;
       const images = demoImagesRef.current;
-      if (images.length === 0) return;
+      if (images.length === 0 || !images.some(demoImageIsRunnable)) {
+        setDemoSlideshowEnabled(false);
+        setDemoPredictionError("Original image unavailable for slideshow demo inference.");
+        return;
+      }
       let imageToRun: ChampionDemoImage | null = null;
       setSelectedDemoImageIndex((current) => {
-        const next = nextDemoImageIndex(current, images.length);
-        imageToRun = images[next] ?? null;
-        return next;
+        for (let offset = 1; offset <= images.length; offset += 1) {
+          const next = nextDemoImageIndex(current + offset - 1, images.length);
+          const candidate = images[next] ?? null;
+          if (demoImageIsRunnable(candidate)) {
+            imageToRun = candidate;
+            return next;
+          }
+        }
+        return current;
       });
       if (!imageToRun) return;
       demoSlideshowInFlight.current = true;
@@ -1739,8 +1769,7 @@ export function App() {
     runNextSlide();
     const timer = window.setInterval(runNextSlide, demoSlideshowIntervalMs);
     return () => window.clearInterval(timer);
-  }, [demoSlideshowEnabled, demoSlideshowIntervalMs, selectedProjectId]);
-
+  }, [championExportDemo.deploymentProfile, championExportDemo.exports, championExportDemo.modelProfile, demoSlideshowEnabled, demoSlideshowIntervalMs, selectedProjectId]);
   useEffect(() => {
     refreshSelectedJobMetrics().catch((error) =>
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
@@ -2309,6 +2338,9 @@ export function App() {
     if (!selectedProjectId || !detail.champion) return null;
     const exportRecord = readyLocalPythonExport(championExportDemo.exports);
     if (!exportRecord) {
+      if (readyExportMissingLocalManifest(championExportDemo.exports)) {
+        throw new Error(localPythonExportMissingManifestMessage());
+      }
       throw new Error("No READY champion export is available for local Python demo inference. Prepare a champion export before running the demo.");
     }
     const imageURI = demoImageURI(image);
@@ -2398,6 +2430,39 @@ export function App() {
     }
   }
 
+  function championDemoSlideshowBlocker() {
+    if (!selectedProjectId || !detail.champion) return "Select a project champion before starting the demo slideshow.";
+    const hasBrowserExport = Boolean(
+      readyBrowserONNXExport(championExportDemo.exports, {
+        deploymentProfile: championExportDemo.deploymentProfile,
+        modelProfile: championExportDemo.modelProfile,
+      }),
+    );
+    if (!hasBrowserExport && !readyLocalPythonExport(championExportDemo.exports)) {
+      return readyExportMissingLocalManifest(championExportDemo.exports)
+        ? localPythonExportMissingManifestMessage()
+        : "No READY champion export is available for local demo inference.";
+    }
+    if (!championExportDemo.demoImages.some(demoImageIsRunnable)) {
+      return "Original image unavailable for slideshow demo inference.";
+    }
+    return "";
+  }
+
+  function toggleDemoSlideshow() {
+    if (demoSlideshowEnabled) {
+      setDemoSlideshowEnabled(false);
+      return;
+    }
+    const blocker = championDemoSlideshowBlocker();
+    if (blocker) {
+      setDemoPredictionError(blocker);
+      setDemoSlideshowEnabled(false);
+      return;
+    }
+    setDemoPredictionError("");
+    setDemoSlideshowEnabled(true);
+  }
   async function runChampionDemoPrediction(image: ChampionDemoImage) {
     if (!selectedProjectId || !detail.champion) return;
 
@@ -2815,7 +2880,7 @@ export function App() {
             onCustomTrueLabelChange={setCustomDemoTrueLabel}
             onChooseCustomImage={chooseChampionDemoImage}
             onRunCustomPrediction={runCustomChampionDemoPrediction}
-            onToggleSlideshow={() => setDemoSlideshowEnabled((enabled) => !enabled)}
+            onToggleSlideshow={toggleDemoSlideshow}
             onSelectImage={(index) => {
               setSelectedDemoImageIndex(index);
               setCustomDemoImage(null);
@@ -3264,7 +3329,7 @@ export function App() {
               onCustomTrueLabelChange={setCustomDemoTrueLabel}
               onChooseCustomImage={chooseChampionDemoImage}
               onRunCustomPrediction={runCustomChampionDemoPrediction}
-              onToggleSlideshow={() => setDemoSlideshowEnabled((enabled) => !enabled)}
+              onToggleSlideshow={toggleDemoSlideshow}
               onSelectImage={(index) => {
                 setSelectedDemoImageIndex(index);
                 setCustomDemoImage(null);
