@@ -111,7 +111,13 @@ Modal's own getting started docs currently recommend installing the Modal Python
 
 ## Dataset Format
 
-For the smoothest first run, start with an image classification dataset laid out by class folder:
+Model Express supports image classification datasets and YOLO-style object detection datasets. For the first Modal smoke test, use a small dataset so you can verify upload, profiling, planning, Modal dispatch, metrics, champion selection, and export before spending more GPU budget.
+
+Supported image extensions are `.jpg`, `.jpeg`, `.png`, `.bmp`, and `.webp`.
+
+### Image Classification: Direct Class Folders
+
+The simplest classification layout is one folder per class:
 
 ```text
 my-dataset/
@@ -125,11 +131,184 @@ my-dataset/
     +-- image-001.jpg
 ```
 
-Use normal image files such as `.jpg`, `.jpeg`, `.png`, or `.webp`.
+Each immediate child folder is treated as a class name. Use readable folder names because those names become class labels in the profile and training run.
 
-For the first Modal run, keep the dataset small enough that you can tell whether the system is working quickly. A smoke dataset with 2-5 classes and a few dozen images per class is enough to verify upload, profiling, planning, Modal dispatch, metrics, champion selection, and export.
+### Image Classification: Explicit Train/Val/Test Splits
 
-Object detection / YOLO-style datasets are supported by the worker path, but classification is the recommended first setup test because it has fewer moving pieces.
+Classification datasets can also be split first, then class folders inside each split:
+
+```text
+my-dataset/
++-- train/
+|   +-- class-a/
+|   |   +-- image-001.jpg
+|   +-- class-b/
+|       +-- image-001.jpg
++-- val/
+|   +-- class-a/
+|   |   +-- image-002.jpg
+|   +-- class-b/
+|       +-- image-002.jpg
++-- test/
+    +-- class-a/
+    |   +-- image-003.jpg
+    +-- class-b/
+        +-- image-003.jpg
+```
+
+Accepted split folder names:
+
+| Canonical split | Accepted folder names |
+| --- | --- |
+| `train` | `train`, `training` |
+| `val` | `val`, `valid`, `validation`, `dev` |
+| `test` | `test`, `testing`, `holdout`, `heldout` |
+
+The same class names should appear consistently across splits. Missing classes in a split are allowed, but they may lead to weaker validation or test results.
+
+### Image Classification: Common Image Root or Wrapper Folder
+
+Model Express can also detect a class-folder dataset under a common image root:
+
+```text
+my-dataset/
++-- images/
+    +-- class-a/
+    |   +-- one.jpg
+    +-- class-b/
+        +-- two.jpg
+```
+
+Common image root folder names include `images`, `image`, `imgs`, `img`, `jpegimages`, and `data`.
+
+It can also unwrap a single top-level wrapper folder, which is common in downloaded datasets:
+
+```text
+downloaded-dataset/
++-- dataset-name/
+    +-- images/
+        +-- class-a/
+        +-- class-b/
+```
+
+Avoid naming class folders `labels`, `annotations`, `metadata`, `splits`, `parts`, `bboxes`, or similar metadata names. Those are intentionally treated as annotation/metadata folders instead of class folders.
+
+### YOLO Object Detection: Recommended Layout
+
+For object detection training, use a standard YOLO dataset with a data config file plus parallel `images/` and `labels/` folders:
+
+```text
+my-yolo-dataset/
++-- data.yaml
++-- images/
+|   +-- train/
+|   |   +-- image-001.jpg
+|   |   +-- image-002.jpg
+|   +-- val/
+|   |   +-- image-003.jpg
+|   +-- test/
+|       +-- image-004.jpg
++-- labels/
+    +-- train/
+    |   +-- image-001.txt
+    |   +-- image-002.txt
+    +-- val/
+    |   +-- image-003.txt
+    +-- test/
+        +-- image-004.txt
+```
+
+A minimal `data.yaml` should look like this:
+
+```yaml
+path: .
+train: images/train
+val: images/val
+test: images/test
+nc: 2
+names: [cat, dog]
+```
+
+`test` is optional, but `train` and `val` are required for training. `valid` is accepted as an alias for `val` in YOLO configs.
+
+Accepted YOLO config filenames:
+
+- `data.yaml`
+- `data.yml`
+- `dataset.yaml`
+- `dataset.yml`
+
+The config can be at the dataset root or nested inside the uploaded folder. For least confusion, put it at the dataset root and select that root folder during upload.
+
+### YOLO Label Files
+
+Each YOLO label file should match the image filename stem:
+
+```text
+images/train/image-001.jpg
+labels/train/image-001.txt
+```
+
+Each non-empty label line should use normalized YOLO box format:
+
+```text
+<class_id> <x_center> <y_center> <width> <height>
+```
+
+Example:
+
+```text
+0 0.5000 0.5000 0.2500 0.3000
+1 0.2500 0.2500 0.1000 0.1000
+```
+
+Rules:
+
+- `class_id` is zero-based and must match the order in `names`.
+- Box coordinates should be normalized from `0.0` to `1.0`.
+- `width` and `height` must be greater than zero.
+- Empty `.txt` files are allowed for images with no objects.
+- If an image has objects, keep the label file in the matching `labels/<split>/` folder.
+
+### YOLO Config Variants That Work
+
+Class names can be written as an inline list:
+
+```yaml
+names: [cat, dog]
+```
+
+Or as a YAML list:
+
+```yaml
+names:
+  - cat
+  - dog
+```
+
+Or as an id-to-name mapping:
+
+```yaml
+names:
+  0: cat
+  1: dog
+```
+
+YOLO split paths can be relative to `path`, relative to the config file, or relative to the uploaded dataset root. The worker also tries to normalize stale absolute paths from downloaded archives when the matching folders exist inside the uploaded dataset.
+
+Do not use YOLO config paths that point outside the uploaded dataset, use parent traversal such as `..`, or reference remote URIs such as `s3://`, `gs://`, `http://`, or `https://`. Modal training expects the dataset files to be inside the uploaded dataset materialization.
+
+### YOLO Profiling vs YOLO Training
+
+Model Express can often detect YOLO labels even when no data config exists. That is useful for profiling, but it is not enough for actual YOLO training.
+
+For Modal YOLO training, include a valid `data.yaml`, `data.yml`, `dataset.yaml`, or `dataset.yml` with:
+
+- `train`
+- `val` or `valid`
+- `names` or `nc`
+
+COCO JSON, Pascal VOC XML, and other annotation files may be detected as metadata, but the YOLO training path expects YOLO-format `.txt` labels and a YOLO data config. Convert those datasets to YOLO format before using them for object detection training.
 
 ## Fresh Clone Setup: Cloud / Modal Path
 
@@ -915,9 +1094,24 @@ Use T4 for initial tests before trying larger GPUs.
 
 ## License
 
-Add the project license before public release.
+MIT License
 
+Copyright (c) 2026 Model Express contributors
 
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
