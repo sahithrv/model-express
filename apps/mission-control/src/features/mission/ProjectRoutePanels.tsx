@@ -1,33 +1,40 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
   BarChart3,
   BrainCircuit,
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
   ClipboardList,
   Database,
   Download,
   DollarSign,
   Eye,
+  FlaskConical,
   FolderOpen,
   HardDriveUpload,
   ImageIcon,
   Link2,
   ListRestart,
+  Lightbulb,
   MonitorDot,
   Pause,
   Play,
   Plus,
   RefreshCcw,
+  Rocket,
   Server,
   Shuffle,
   SlidersHorizontal,
   SquareTerminal,
+  Star,
   StepForward,
   MessageSquare,
   Timer,
+  TrendingUp,
   ThumbsDown,
   ThumbsUp,
   Trophy,
@@ -174,6 +181,7 @@ import {
   firstPositiveMetric,
   yoloMetricFromEvaluation,
   runPrimaryMetric,
+  effectiveTrainingRunStatus,
   championPrimaryMetric,
   metricTabOptions,
   metricTechnicalLabel,
@@ -466,6 +474,63 @@ import {
   formatModelSize,
 } from "./projectDetailModel";
 
+const missionPlanetAssetUrl = new URL("../../../moon1.png", import.meta.url).href;
+const routePlanetAssetUrls = {
+  activity: new URL("../../../moon2.png", import.meta.url).href,
+  results: new URL("../../../moon3.png", import.meta.url).href,
+  export: new URL("../../../moon4.png", import.meta.url).href,
+};
+const EXPERIMENT_RUNS_PAGE_SIZE = 10;
+type RouteHeroFact = {
+  label: string;
+  value: string;
+};
+
+function RoutePlanetHero({
+  assetSrc,
+  eyebrow,
+  title,
+  description,
+  icon,
+  facts,
+  action,
+  tone = "green",
+}: {
+  assetSrc: string;
+  eyebrow: string;
+  title: string;
+  description: string;
+  icon: ReactNode;
+  facts?: RouteHeroFact[];
+  action?: ReactNode;
+  tone?: "green" | "amber" | "blue";
+}) {
+  return (
+    <section className={`route-planet-hero ${tone}`}>
+      <img className="route-planet-asset" src={assetSrc} alt="" aria-hidden="true" />
+      <div className="route-hero-copy">
+        <span className="route-hero-icon" aria-hidden="true">{icon}</span>
+        <div>
+          <div className="eyebrow">{eyebrow}</div>
+          <h3>{title}</h3>
+          <p>{description}</p>
+        </div>
+      </div>
+      {facts && facts.length > 0 && (
+        <div className="route-hero-facts">
+          {facts.map((fact) => (
+            <span key={`${fact.label}-${fact.value}`}>
+              <small>{fact.label}</small>
+              <strong>{fact.value}</strong>
+            </span>
+          ))}
+        </div>
+      )}
+      {action && <div className="route-hero-actions">{action}</div>}
+    </section>
+  );
+}
+
 export function Panel({
 	id,
 	title,
@@ -500,6 +565,9 @@ export function MissionRoute({
   results,
   exportSummary,
   actions,
+  selectedProject,
+  detail,
+  health,
   onAction,
   onOpenTab,
 }: {
@@ -510,210 +578,503 @@ export function MissionRoute({
   results: ResultsSummary;
   exportSummary: ExportSummary;
   actions: MissionNextAction[];
+  selectedProject: Project | null;
+  detail: ProjectDetail;
+  health: Health | null;
   onAction: (action: MissionNextAction) => void;
   onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
 }) {
   const primaryAction = actions.find((action) => action.priority === "primary") ?? actions[0];
-  const latestActivity = activity[0] ?? null;
   const activeStage = currentMissionStage(stages);
-  const completedStageCount = stages.filter((stage) => stage.status === "done").length;
-  const flowProgress = missionStageProgress(stages);
-  const trialRows = missionTrialProgressRows(brief.trialProgress);
-  const hasTrialProgress = brief.trialProgress.total > 0;
+  const runRows = useMemo(() => buildMissionRunRows(detail), [detail]);
+  const primaryMetricLabel = runRows[0]?.primaryMetricLabel || results.primaryMetricLabel || brief.bestMetricLabel;
 
   if (brief.id === "no-mission") {
     return <MissionEmptyState brief={brief} stages={stages} actions={actions} onAction={onAction} />;
   }
 
   return (
-    <div className="mission-workspace">
-      <section className={`mission-stage-panel mission-flow-board ${activeStage.status}`}>
-        <div className="mission-flow-head">
-          <div className="mission-now-state">
-            <span className={`mission-now-icon ${activeStage.status}`}>{missionStageIcon(activeStage.status)}</span>
-            <div>
-              <div className="eyebrow">Realtime project state</div>
-              <h3>{activeStage.label}</h3>
-              <p>{activeStage.detail}</p>
-            </div>
-          </div>
-          <div className="mission-flow-meta">
-            <Badge value={brief.statusLabel} />
-            <small>
-              {completedStageCount}/{stages.length} steps complete
-            </small>
-            <button className="mission-link-button" type="button" onClick={() => onOpenTab("activity", "activity")}>
-              <Activity size={13} />
-              Open journal
-            </button>
-          </div>
-        </div>
-        <div className="mission-flow-progress" aria-hidden="true">
-          <span style={{ width: `${flowProgress}%` }} />
-        </div>
-        <div className="mission-live-briefing">
-          <div className="mission-briefing-copy">
-            <div className="eyebrow">Live briefing</div>
-            <strong>{brief.plainSummary}</strong>
-            <span>{brief.rightNow}</span>
-          </div>
-          <div className="trial-progress-visual" aria-label="Model trial progress distribution">
-            <div className="trial-progress-head">
-              <span>
-                <small>Model trial progress</small>
-                <strong>{hasTrialProgress ? `${brief.trialProgress.completed}/${brief.trialProgress.total} complete` : "Waiting for plan"}</strong>
-              </span>
-              <Badge value={brief.statusLabel} />
-            </div>
-            <div className="trial-distribution-bar" aria-hidden="true">
-              {trialRows.map((row) => (
-                <span
-                  className={row.key}
-                  key={row.key}
-                  style={{ width: `${hasTrialProgress ? Math.max(5, (row.value / Math.max(1, brief.trialProgress.total)) * 100) : 25}%` }}
-                />
-              ))}
-            </div>
-            <div className="trial-distribution-table">
-              {trialRows.map((row) => (
-                <span className={row.key} key={row.key}>
-                  <small>{row.label}</small>
-                  <strong>{row.value}</strong>
-                </span>
-              ))}
-            </div>
-          </div>
-          <div className="mission-next-decision">
-            <small>Next decision</small>
-            <strong>{brief.nextDecision}</strong>
-          </div>
-        </div>
-        <div className="mission-flow-console" aria-label="Mission state console">
-          <span className={`mission-console-cell ${activeStage.status}`}>
-            <small>Now</small>
-            <strong>{activeStage.label}</strong>
-          </span>
-          <span className="mission-console-cell">
-            <small>Next</small>
-            <strong>{primaryAction ? userFacingActionLabel(primaryAction.label) : "Monitoring"}</strong>
-          </span>
-          <button className="mission-console-cell interactive" type="button" onClick={() => onOpenTab("activity", "activity")}>
-            <small>Latest</small>
-            <strong>{latestActivity ? userFacingActivityText(latestActivity.title, 52) : "No journal entries yet"}</strong>
-          </button>
-        </div>
-        <MissionStageTimeline stages={stages} />
-      </section>
-
-      <section className="mission-card">
-        <div className="mission-card-head">
-          <div>
-            <div className="eyebrow">Mission</div>
-            <h3>{brief.title}</h3>
-            <p>{brief.goal}</p>
-          </div>
-          <Badge value={brief.statusLabel} />
-        </div>
-        <div className="mission-card-metrics">
-          <span>
-            <small>Progress</small>
-            <strong>{brief.progressLabel}</strong>
-          </span>
-          <span>
-            <small>{brief.bestMetricLabel}</small>
-            <strong>{brief.bestMetricValue}</strong>
-            <em>{metricTechnicalLabel(brief.bestMetricLabel)}</em>
-          </span>
-          <span>
-            <small>ETA</small>
-            <strong>{brief.etaLabel}</strong>
-          </span>
-        </div>
-        {brief.blocker && (
-          <div className="mission-blocker">
-            <AlertTriangle size={15} />
-            <span>{brief.blocker}</span>
-          </div>
-        )}
-      </section>
-
-      <section className="ai-thinking-card">
-        <div className="mission-section-head">
-          <div>
-            <div className="eyebrow">Why this step</div>
-            <strong>{thinking.state}</strong>
-          </div>
-          <small>{thinking.updatedAt ? formatRelativeTime(thinking.updatedAt) : thinking.confidenceLabel}</small>
-        </div>
-        <div className="thinking-grid">
-          <ThinkingRow label="Observation" value={thinking.observation} />
-          <ThinkingRow label="Decision" value={thinking.decision} />
-          <ThinkingRow label="Impact" value={thinking.expectedOutcome} />
-        </div>
-        <details className="activity-details">
-          <summary>Developer reasoning</summary>
-          <ThinkingRow label="Reasoning" value={thinking.reasoning} />
-        </details>
-      </section>
-
-      <aside className="mission-inspector">
-        <section className="result-snapshot-card">
-          <div className="mission-section-head">
-            <div>
-              <div className="eyebrow">Best model so far</div>
-              <strong>{results.championModel}</strong>
-            </div>
-            <Badge value={exportSummary.statusLabel} />
-          </div>
-          <div className="champion-outcome-primary">
-            <small>{results.primaryMetricLabel}</small>
-            <strong>{results.primaryMetricValue}</strong>
-          </div>
-          <p>{results.leaderComparison}</p>
-          <button className="command compact" type="button" onClick={() => onOpenTab("results", "results")}>
-            View results
-          </button>
-        </section>
-
-        <section className="next-action-card">
-          <div className="eyebrow">Next action</div>
-          {primaryAction ? (
-            <button
-              className="mission-primary-action"
-              type="button"
-              onClick={() => onAction(primaryAction)}
-              disabled={primaryAction.disabled}
-            >
-              <span>
-                <strong>{userFacingActionLabel(primaryAction.label)}</strong>
-                <small>{userFacingActivityText(primaryAction.reason, 140)}</small>
-              </span>
-              <StepForward size={17} />
-            </button>
-          ) : (
-            <div className="empty compact">No action is needed right now.</div>
-          )}
-        </section>
-
-        <section className="activity-snapshot-card">
-          <div className="eyebrow">Latest update</div>
-          {latestActivity ? (
-            <button className="mission-signal info" type="button" onClick={() => onOpenTab("activity", "activity")}>
-              <span>
-                <strong>{latestActivity.title}</strong>
-                <small>{latestActivity.summary}</small>
-              </span>
-              <small>{formatRelativeTime(latestActivity.timestamp)}</small>
-            </button>
-          ) : (
-            <div className="empty compact">The work journal will fill in as the mission starts.</div>
-          )}
-        </section>
-      </aside>
+    <div className="mission-workspace mission-command-dashboard">
+      <ChampionOrbitHero
+        brief={brief}
+        results={results}
+        detail={detail}
+        selectedProject={selectedProject}
+        rows={runRows}
+        exportSummary={exportSummary}
+      />
+      <LaunchPipeline stages={stages} progress={brief.trialProgress} />
+      <PerformanceTrendPanel rows={runRows} metricLabel={primaryMetricLabel} results={results} />
+      <ExperimentRunsPanel rows={runRows} metricLabel={primaryMetricLabel} onOpenResults={() => onOpenTab("results", "results")} />
+      <AgentRail
+        thinking={thinking}
+        activeStage={activeStage}
+        activity={activity}
+        primaryAction={primaryAction}
+        health={health}
+        onAction={onAction}
+        onOpenTab={onOpenTab}
+      />
     </div>
   );
 }
 
+type MissionRunRow = {
+  id: string;
+  trial: number;
+  model: string;
+  dataset: string;
+  primaryMetricLabel: string;
+  primaryMetricValue: number | null;
+  primaryMetricDisplay: string;
+  map50Display: string;
+  macroF1Display: string;
+  precisionDisplay: string;
+  recallDisplay: string;
+  status: string;
+  statusClass: string;
+  age: string;
+  timestamp: string;
+  isChampion: boolean;
+  isBaseline: boolean;
+};
+
+function ChampionOrbitHero({
+  brief,
+  results,
+  detail,
+  selectedProject,
+  rows,
+  exportSummary,
+}: {
+  brief: MissionBrief;
+  results: ResultsSummary;
+  detail: ProjectDetail;
+  selectedProject: Project | null;
+  rows: MissionRunRow[];
+  exportSummary: ExportSummary;
+}) {
+  const championRow = rows.find((row) => row.isChampion) ?? rows.find((row) => row.primaryMetricValue !== null) ?? rows[0] ?? null;
+  const championName = results.championModel && results.championModel !== "No champion yet"
+    ? results.championModel
+    : championRow?.model || "Awaiting champion";
+  const datasetName = championRow?.dataset || detail.datasets[0]?.name || selectedProject?.name || "Dataset pending";
+  const updatedAt = detail.champion?.updated_at || championRow?.timestamp || brief.updatedAt;
+  const improving = results.improvementLabel.startsWith("+") || rows.some((row) => row.isChampion);
+  const facts = heroMetricFacts(championRow, results);
+
+  return (
+    <section className="champion-orbit-hero">
+      <img className="hero-planet-asset" src={missionPlanetAssetUrl} alt="" aria-hidden="true" />
+      <div className="hero-asset-shade" aria-hidden="true" />
+      <div className="champion-hero-copy">
+        <div className="hero-badges">
+          <span className="mission-green-pill">Champion Model</span>
+          <span className={`mission-green-pill subdued ${improving ? "improving" : "monitoring"}`}>{improving ? "Improving" : exportSummary.statusLabel}</span>
+        </div>
+        <h3>
+          {championName}
+          <Rocket size={20} aria-hidden="true" />
+        </h3>
+        <div className="hero-primary-metric">
+          <small>{results.primaryMetricLabel || brief.bestMetricLabel}</small>
+          <strong>{results.primaryMetricValue || brief.bestMetricValue}</strong>
+          <span>{results.improvementLabel || brief.progressLabel}</span>
+        </div>
+        <div className="hero-meta-line">
+          <span>Dataset: <strong>{datasetName}</strong></span>
+          <span>Updated: <strong>{updatedAt ? formatRelativeTime(updatedAt) : "Pending"}</strong></span>
+          <span>Trials: <strong>{rows.length || brief.totalExperiments || 0}</strong></span>
+        </div>
+      </div>
+      <div className="hero-metric-cluster" aria-label="Champion metric summary">
+        {facts.map((fact) => (
+          <span key={fact.label}>
+            <small>{fact.label}</small>
+            <strong>{fact.value}</strong>
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function LaunchPipeline({ stages, progress }: { stages: MissionStage[]; progress: MissionBrief["trialProgress"] }) {
+  const steps = missionLaunchSteps(stages, progress);
+  return (
+    <section className="launch-pipeline" aria-label="Mission launch sequence">
+      {steps.map((step, index) => (
+        <div className={`launch-step ${step.status}`} key={step.id} aria-current={step.status === "active" ? "step" : undefined}>
+          <span className="launch-step-index">{index + 1}</span>
+          <span className="launch-step-copy">
+            <strong>{step.label}</strong>
+            <small>{step.detail}</small>
+          </span>
+          <span className="launch-step-mark" aria-hidden="true">
+            {step.status === "done" ? <CheckCircle2 size={16} /> : step.status === "blocked" ? <AlertTriangle size={16} /> : <Rocket size={16} />}
+          </span>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function PerformanceTrendPanel({ rows, metricLabel, results }: { rows: MissionRunRow[]; metricLabel: string; results: ResultsSummary }) {
+  const chartRows = rows
+    .filter((row) => row.primaryMetricValue !== null)
+    .sort((left, right) => timestampSortScore(left.timestamp) - timestampSortScore(right.timestamp));
+  const values = chartRows.map((row) => row.primaryMetricValue ?? 0);
+  const first = values[0] ?? null;
+  const best = values.length > 0 ? Math.max(...values) : null;
+  const delta = first !== null && best !== null ? best - first : null;
+  const insight = delta !== null && delta > 0
+    ? `Best score improved ${formatMetricNumber(delta)} over baseline`
+    : chartRows.length > 1
+      ? "Comparable trials are available for review"
+      : "Waiting for comparable runs";
+
+  return (
+    <section className="performance-panel">
+      <div className="mission-panel-head">
+        <div>
+          <small>Performance over time</small>
+          <strong>{metricLabel || "Primary metric"}</strong>
+        </div>
+        <span className="metric-selector-chip">{metricLabel || results.primaryMetricLabel}</span>
+      </div>
+      {chartRows.length > 0 ? <MissionTrendChart rows={chartRows} /> : <div className="mission-empty-surface">Scored runs will draw the performance trajectory here.</div>}
+      <div className="trend-insight-card">
+        <span><TrendingUp size={22} /></span>
+        <div>
+          <strong>{delta !== null && delta > 0 ? "Consistent improvement" : "Evidence building"}</strong>
+          <small>{insight}</small>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function MissionTrendChart({ rows }: { rows: MissionRunRow[] }) {
+  const width = 620;
+  const height = 270;
+  const paddingX = 44;
+  const paddingY = 34;
+  const values = rows.map((row) => row.primaryMetricValue ?? 0);
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const range = Math.max(max - min, 0.001);
+  const points = rows.map((row, index) => {
+    const x = rows.length === 1 ? width / 2 : paddingX + (index / (rows.length - 1)) * (width - paddingX * 2);
+    const y = height - paddingY - (((row.primaryMetricValue ?? 0) - min) / range) * (height - paddingY * 2);
+    return { x, y, row };
+  });
+  const bestPoints = points.map((point, index) => {
+    const bestValue = Math.max(...values.slice(0, index + 1));
+    const y = height - paddingY - ((bestValue - min) / range) * (height - paddingY * 2);
+    return { ...point, y, value: bestValue };
+  });
+  const allRunsPath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
+  const bestPath = bestPoints.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
+  const latest = bestPoints[bestPoints.length - 1];
+
+  return (
+    <div className="mission-chart-wrap">
+      <div className="mission-chart-legend">
+        <span className="best">Best Score</span>
+        <span className="all">All Runs</span>
+        <span className="base">Baseline</span>
+      </div>
+      <svg className="mission-trend-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Run metric trend">
+        {[0, 1, 2, 3].map((line) => {
+          const y = paddingY + (line / 3) * (height - paddingY * 2);
+          return <line key={line} className="trend-grid" x1={paddingX} x2={width - paddingX} y1={y} y2={y} />;
+        })}
+        {values[0] !== undefined && (
+          <line className="trend-baseline" x1={paddingX} x2={width - paddingX} y1={points[0].y} y2={points[0].y} />
+        )}
+        <path className="trend-all-path" d={allRunsPath} />
+        <path className="trend-best-fill" d={`${bestPath} L ${latest.x.toFixed(1)} ${height - paddingY} L ${paddingX} ${height - paddingY} Z`} />
+        <path className="trend-best-path" d={bestPath} />
+        {bestPoints.map((point, index) => (
+          <g key={point.row.id}>
+            <circle className="trend-point" cx={point.x} cy={point.y} r={index === bestPoints.length - 1 ? 6 : 4} />
+            <text className="trend-x-label" x={point.x} y={height - 8} textAnchor="middle">{point.row.trial}</text>
+          </g>
+        ))}
+        {latest && (
+          <g className="trend-callout" transform={`translate(${Math.max(12, latest.x - 38)} ${Math.max(12, latest.y - 62)})`}>
+            <rect width="78" height="48" rx="8" />
+            <text x="10" y="18">{formatChartValue(latest.value)}</text>
+            <text x="10" y="35">Trial {latest.row.trial}</text>
+          </g>
+        )}
+      </svg>
+    </div>
+  );
+}
+
+function ExperimentRunsPanel({ rows, metricLabel, onOpenResults }: { rows: MissionRunRow[]; metricLabel: string; onOpenResults: () => void }) {
+  const [page, setPage] = useState(1);
+  const pageCount = Math.max(1, Math.ceil(rows.length / EXPERIMENT_RUNS_PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount);
+  const startIndex = (currentPage - 1) * EXPERIMENT_RUNS_PAGE_SIZE;
+  const visibleRows = rows.slice(startIndex, startIndex + EXPERIMENT_RUNS_PAGE_SIZE);
+  const visibleStart = rows.length > 0 ? startIndex + 1 : 0;
+  const visibleEnd = Math.min(startIndex + visibleRows.length, rows.length);
+  const canPage = rows.length > EXPERIMENT_RUNS_PAGE_SIZE;
+
+  useEffect(() => {
+    setPage(1);
+  }, [rows]);
+
+  return (
+    <section className="experiment-runs-panel">
+      <div className="mission-panel-head">
+        <div>
+          <small>Experiment runs</small>
+          <strong>{rows.length > 0 ? `${rows.length} trials` : "No trials yet"}</strong>
+        </div>
+        <button className="mission-link-button" type="button" onClick={onOpenResults}>
+          View All Runs
+          <StepForward size={14} />
+        </button>
+      </div>
+      {rows.length > 0 ? (
+        <div className="experiment-runs-table" role="table" aria-label="Experiment runs">
+          <div className="experiment-run-row head" role="row">
+            <span>Trial</span>
+            <span>Model</span>
+            <span>Dataset</span>
+            <span>{metricLabel || "Metric"}</span>
+            <span>Macro F1</span>
+            <span>Status</span>
+          </div>
+          {visibleRows.map((row) => (
+            <div className={`experiment-run-row ${row.isChampion ? "champion" : ""}`} role="row" key={row.id}>
+              <span>{row.trial}{row.isChampion && <Star size={15} />}{row.isBaseline && <small className="baseline-tag">Baseline</small>}</span>
+              <span><strong>{row.model}</strong></span>
+              <span>{row.dataset}</span>
+              <span className="metric-value">{row.primaryMetricDisplay}</span>
+              <span>{row.macroF1Display}</span>
+              <span><Badge value={row.status} /></span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="mission-empty-surface">Training runs will appear as soon as jobs report metrics.</div>
+      )}
+      <div className="experiment-runs-footer">
+        <span>Auto-sorting by {metricLabel || "primary metric"}</span>
+        <div className="experiment-runs-pager" aria-label="Experiment run pages">
+          <span>
+            Showing {visibleStart}-{visibleEnd} of {rows.length} trials
+          </span>
+          {canPage && (
+            <div>
+              <button
+                className="icon-command compact pager-command"
+                type="button"
+                aria-label="Previous experiment runs"
+                disabled={currentPage <= 1}
+                onClick={() => setPage((value) => Math.max(1, value - 1))}
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <span>Page {currentPage} of {pageCount}</span>
+              <button
+                className="icon-command compact pager-command"
+                type="button"
+                aria-label="Next experiment runs"
+                disabled={currentPage >= pageCount}
+                onClick={() => setPage((value) => Math.min(pageCount, value + 1))}
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AgentRail({
+  thinking,
+  activeStage,
+  activity,
+  primaryAction,
+  health,
+  onAction,
+  onOpenTab,
+}: {
+  thinking: AIThinking;
+  activeStage: MissionStage;
+  activity: ActivityCardModel[];
+  primaryAction?: MissionNextAction;
+  health: Health | null;
+  onAction: (action: MissionNextAction) => void;
+  onOpenTab: (tab: ProjectTabTarget, targetId?: string) => void;
+}) {
+  const latest = activity[0] ?? null;
+  return (
+    <aside className="agent-rail">
+      <section className="agent-decision-card">
+        <div className="agent-rail-head">
+          <strong>Agent Decisions</strong>
+          <span className={health?.status === "ok" ? "live-dot online" : "live-dot"}>Live</span>
+        </div>
+        <div className="latest-decision-box">
+          <div>
+            <small>Latest Decision</small>
+            <small>{thinking.updatedAt ? formatRelativeTime(thinking.updatedAt) : activeStage.label}</small>
+          </div>
+          <h3>{thinking.decision || activeStage.label}</h3>
+          <p>{thinking.reasoning || thinking.observation}</p>
+          <div className="expected-impact-row">
+            <span>Expected Impact</span>
+            <Badge value={thinking.expectedOutcome ? "high" : "pending"} />
+          </div>
+          <strong className="impact-copy">{thinking.expectedOutcome || "Impact pending"}</strong>
+          {primaryAction && (
+            <button className="command compact" type="button" onClick={() => onAction(primaryAction)} disabled={primaryAction.disabled}>
+              {userFacingActionLabel(primaryAction.label)}
+            </button>
+          )}
+        </div>
+      </section>
+      <section className="mission-log-card">
+        <div className="agent-rail-head">
+          <strong>Mission Log</strong>
+          <button className="icon-command compact-icon" type="button" onClick={() => onOpenTab("activity", "activity")} aria-label="Open full mission log">
+            <ListRestart size={14} />
+          </button>
+        </div>
+        {activity.length > 0 ? (
+          <div className="mission-log-timeline">
+            {activity.slice(0, 6).map((item) => (
+              <button className={`mission-log-item ${item.type}`} key={item.id} type="button" onClick={() => onOpenTab("activity", "activity")}>
+                <span className="mission-log-icon">{missionLogIcon(item)}</span>
+                <span>
+                  <small>{formatRelativeTime(item.timestamp)}</small>
+                  <strong>{item.title}</strong>
+                  <em>{item.summary}</em>
+                </span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="mission-empty-surface compact">Mission events will stream here.</div>
+        )}
+        <button className="mission-full-log" type="button" onClick={() => onOpenTab("activity", "activity")}>
+          View Full Log
+          <StepForward size={15} />
+        </button>
+      </section>
+    </aside>
+  );
+}
+
+function buildMissionRunRows(detail: ProjectDetail): MissionRunRow[] {
+  const jobById = new Map(detail.jobs.map((job) => [job.id, job]));
+  const evaluationByJob = new Map(detail.runEvaluations.map((evaluation) => [evaluation.job_id, evaluation]));
+  const summaryByJob = new Map(detail.runSummaries.map((summary) => [summary.job_id, summary]));
+  const datasetById = new Map(detail.datasets.map((dataset) => [dataset.id, dataset]));
+  const candidateIds = new Set<string>();
+  for (const summary of detail.runSummaries) candidateIds.add(summary.job_id);
+  for (const job of detail.jobs) {
+    if (isTrainingLikeJob(job) || evaluationByJob.has(job.id)) candidateIds.add(job.id);
+  }
+  const chronological = Array.from(candidateIds)
+    .map((jobId) => {
+      const summary = summaryByJob.get(jobId) ?? null;
+      const job = jobById.get(jobId) ?? null;
+      const evaluation = evaluationByJob.get(jobId) ?? null;
+      const timestamp = summary?.updated_at || job?.completed_at || evaluation?.updated_at || job?.started_at || job?.created_at || summary?.created_at || "";
+      return { jobId, summary, job, evaluation, timestamp };
+    })
+    .sort((left, right) => timestampSortScore(left.timestamp) - timestampSortScore(right.timestamp));
+  const trialByJob = new Map(chronological.map((item, index) => [item.jobId, index + 1]));
+
+  return chronological
+    .map((item) => {
+      const metric = runPrimaryMetric(item.summary, item.evaluation, item.job);
+      const datasetId = item.summary?.dataset_id || item.evaluation?.dataset_id || recordString(item.job?.config ?? {}, "dataset_id") || detail.champion?.dataset_id || "";
+      const dataset = datasetById.get(datasetId);
+      const map50 = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "map50"), item.summary?.best_map50, item.summary?.best_accuracy]);
+      const precision = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "precision"), item.summary?.best_precision]);
+      const recall = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "recall"), item.summary?.best_recall]);
+      const macroF1 = firstPositiveMetric([item.summary?.best_macro_f1, recordNumber(item.evaluation?.objective_profile ?? {}, "macro_f1")]);
+      const status = effectiveTrainingRunStatus(item.summary, item.job);
+      return {
+        id: item.jobId,
+        trial: trialByJob.get(item.jobId) ?? 0,
+        model: item.summary?.model || recordString(item.job?.config ?? {}, "model") || item.job?.template || "Training job",
+        dataset: dataset?.name || datasetId || "Dataset pending",
+        primaryMetricLabel: metric.label,
+        primaryMetricValue: metric.value > 0 ? metric.value : null,
+        primaryMetricDisplay: metric.value > 0 ? formatMetricNumber(metric.value) : "-",
+        map50Display: map50 > 0 ? formatMetricNumber(map50) : "-",
+        macroF1Display: macroF1 > 0 ? formatMetricNumber(macroF1) : "-",
+        precisionDisplay: precision > 0 ? formatMetricNumber(precision) : "-",
+        recallDisplay: recall > 0 ? formatMetricNumber(recall) : "-",
+        status,
+        statusClass: classToken(status),
+        age: item.timestamp ? formatRelativeTime(item.timestamp) : "-",
+        timestamp: item.timestamp,
+        isChampion: detail.champion?.job_id === item.jobId,
+        isBaseline: (trialByJob.get(item.jobId) ?? 0) === 1,
+      } satisfies MissionRunRow;
+    })
+    .sort((left, right) => {
+      if (left.isChampion !== right.isChampion) return left.isChampion ? -1 : 1;
+      const leftRunning = ["RUNNING", "ACTIVE", "ASSIGNED", "QUEUED"].includes(left.status);
+      const rightRunning = ["RUNNING", "ACTIVE", "ASSIGNED", "QUEUED"].includes(right.status);
+      if (leftRunning !== rightRunning) return leftRunning ? -1 : 1;
+      return (right.primaryMetricValue ?? -1) - (left.primaryMetricValue ?? -1) || right.trial - left.trial;
+    });
+}
+
+function heroMetricFacts(row: MissionRunRow | null, results: ResultsSummary) {
+  return [
+    { label: "mAP50", value: row?.map50Display && row.map50Display !== "-" ? row.map50Display : results.primaryMetricLabel.includes("mAP") ? results.primaryMetricValue : "-" },
+    { label: "Macro F1", value: row?.macroF1Display || "-" },
+    { label: "Precision", value: row?.precisionDisplay || "-" },
+    { label: "Recall", value: row?.recallDisplay || "-" },
+  ];
+}
+
+function missionLaunchSteps(stages: MissionStage[], progress: MissionBrief["trialProgress"]) {
+  const stageById = new Map(stages.map((stage) => [stage.id, stage]));
+  const stageState = (ids: string[]): MissionStage["status"] => summarizeWorkflowStageState(stages.filter((stage) => ids.includes(stage.id)));
+  const experimentDetail = progress.total > 0 ? `${progress.completed}/${progress.total} complete` : stageById.get("experiments")?.detail || "Waiting for trials";
+  return [
+    { id: "baseline", label: "Baseline", detail: stageById.get("dataset")?.detail || "Baseline established", status: stageState(["created", "dataset", "plan"]) },
+    { id: "experiments", label: "Experiment Runs", detail: experimentDetail, status: stageState(["experiments", "refinement"]) },
+    { id: "evaluation", label: "Evaluation", detail: stageById.get("evaluation")?.detail || "Scoring and comparison", status: stageState(["evaluation"]) },
+    { id: "champion", label: "Champion Selection", detail: stageById.get("champion")?.detail || "Selecting best model", status: stageState(["champion", "export", "demo"]) },
+  ];
+}
+
+function missionLogIcon(item: ActivityCardModel) {
+  if (item.type === "experiment") return <FlaskConical size={15} />;
+  if (item.type === "decision") return <Lightbulb size={15} />;
+  if (item.type === "result") return <Trophy size={15} />;
+  if (item.type === "blocker") return <AlertTriangle size={15} />;
+  if (item.type === "export") return <Download size={15} />;
+  if (item.type === "mission") return <Rocket size={15} />;
+  return <Database size={15} />;
+}
+
+function isTrainingLikeJob(job: Job) {
+  const values = [job.template, recordString(job.config, "model"), recordString(job.config, "task"), recordString(job.config, "task_type")]
+    .join(" ")
+    .toLowerCase();
+  return values.includes("train") || values.includes("yolo") || values.includes("cnn") || values.includes("transfer") || values.includes("mobilenet") || values.includes("resnet");
+}
+
+function classToken(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+}
 export function MissionEmptyState({
   brief,
   stages,
@@ -893,7 +1254,7 @@ export function buildProjectWorkflowTabs({
     missionDigest.liveActivity.status === "idle" && activityFeed.length > 0
       ? `${activityFeed.length} journal ${activityFeed.length === 1 ? "entry" : "entries"}`
       : missionDigest.liveActivity.label || activityStreamBadge(activityStreamState);
-  const details: Record<Exclude<ProjectTabKey, "developer">, { state: ProjectWorkflowTabState; detail: string }> = {
+  const details: Record<Exclude<ProjectTabKey, "settings" | "developer">, { state: ProjectWorkflowTabState; detail: string }> = {
     mission: {
       state: missionDigest.state === "empty" ? "active" : stageState(["created", "dataset", "plan"]),
       detail: missionDigest.stateLabel,
@@ -961,19 +1322,28 @@ export function ActivityRoute({
   onOpenDeveloper: () => void;
 }) {
   const visibleCards = cards.filter((card) => activityCardMatchesFilter(card, filter));
+  const activeFilterLabel = activityFilters.find((item) => item.key === filter)?.label ?? "All";
 
   return (
     <div className="activity-journal">
-      <header className="route-heading">
-        <div>
-          <div className="eyebrow">AI work journal</div>
-          <h3>Activity</h3>
-          <p>Readable updates from the mission, summarized from project events, decisions, experiments, and results.</p>
-        </div>
-        <button className="command compact" type="button" onClick={onOpenDeveloper}>
-          Developer View
-        </button>
-      </header>
+      <RoutePlanetHero
+        assetSrc={routePlanetAssetUrls.activity}
+        eyebrow="Mission log"
+        title="Experiments & Logs"
+        description="Review every experiment, agent decision, result, and blocker in one mission timeline."
+        icon={<ListRestart size={22} />}
+        facts={[
+          { label: "Visible entries", value: String(visibleCards.length) },
+          { label: "All entries", value: String(cards.length) },
+          { label: "Filter", value: activeFilterLabel },
+        ]}
+        action={(
+          <button className="command compact" type="button" onClick={onOpenDeveloper}>
+            <SquareTerminal size={15} />
+            Developer View
+          </button>
+        )}
+      />
       <div className="activity-filter-bar" role="tablist" aria-label="Activity filters">
         {activityFilters.map((item) => (
           <button
@@ -1142,19 +1512,31 @@ export function ResultsRoute({
   const leader = summary.topCandidates[0] ?? null;
   return (
     <div className="results-page">
-      <section className="results-hero">
-        <div>
-          <div className="eyebrow">Best model so far</div>
-          <h3>{summary.championModel}</h3>
-          <p>{summary.leaderComparison}</p>
-        </div>
-        <div className="results-primary-metric">
-          <small>{summary.primaryMetricLabel}</small>
-          <strong>{summary.primaryMetricValue}</strong>
-          <span>{summary.improvementLabel}</span>
-        </div>
-      </section>
-
+      <RoutePlanetHero
+        assetSrc={routePlanetAssetUrls.results}
+        eyebrow="Model evidence"
+        title="Models & Metrics"
+        description="Compare scored candidates, improvement history, and per-class evidence before selecting the champion."
+        icon={<Trophy size={22} />}
+        facts={[
+          { label: "Champion", value: summary.championModel || "Pending" },
+          { label: summary.primaryMetricLabel || "Primary metric", value: summary.primaryMetricValue || "-" },
+          { label: "Improvement", value: summary.improvementLabel || "Pending" },
+          { label: "Candidates", value: String(summary.topCandidates.length) },
+        ]}
+        action={(
+          <>
+            <button className="command compact" type="button" onClick={onOpenExport}>
+              <HardDriveUpload size={15} />
+              Test & Export
+            </button>
+            <button className="command compact" type="button" onClick={onOpenDeveloper}>
+              <SquareTerminal size={15} />
+              Developer comparison
+            </button>
+          </>
+        )}
+      />
       <ModelImprovementChart data={modelImprovement} />
 
       <section className="candidate-section">
@@ -1167,9 +1549,11 @@ export function ResultsRoute({
           <span className="results-actions">
             <Badge value={summary.exportStatus} />
             <button className="command compact" type="button" onClick={onOpenExport}>
+              <HardDriveUpload size={15} />
               Test & Export
             </button>
             <button className="command compact" type="button" onClick={onOpenDeveloper}>
+              <SquareTerminal size={15} />
               Developer comparison
             </button>
           </span>
@@ -1676,19 +2060,9 @@ export function ExportRoute({
 }) {
   const selectedImage = data.demoImages[selectedImageIndex] ?? data.demoImages[0] ?? null;
   const selectedImageRunnable = demoImageIsRunnable(selectedImage);
-  const customURI = customImageURI.trim();
-  const customImageMatchesPicker = customImage ? customURI === demoImageURI(customImage) : false;
-  const customPreviewImage = customURI
-    ? ({
-        ...(customImage ?? {}),
-        uri: customURI,
-        image_uri: customURI,
-        thumbnail_uri: customImageMatchesPicker ? customImage?.thumbnail_uri : undefined,
-        true_label: customTrueLabel.trim() || customImage?.true_label || customImage?.label || customImage?.class_name,
-        split: customImage?.split || "custom",
-      } satisfies ChampionDemoImage)
-    : null;
-  const activeImage = customPreviewImage ?? selectedImage;
+  const previousImageIndex = data.demoImages.length > 0 ? (selectedImageIndex <= 0 ? data.demoImages.length - 1 : selectedImageIndex - 1) : 0;
+  const currentImagePosition = selectedImage ? Math.min(selectedImageIndex + 1, data.demoImages.length) : 0;
+  const activeImage = selectedImage;
   const previewURI = demoImagePreviewURI(activeImage);
   const predictionStatus = prediction ? normalizedStatus(prediction.status || "PENDING") : "";
   const confidence = prediction ? numericValue(prediction.confidence) : 0;
@@ -1701,6 +2075,25 @@ export function ExportRoute({
   if (!summary.hasChampion) {
     return (
       <div className="export-page" id="export-package">
+        <RoutePlanetHero
+          assetSrc={routePlanetAssetUrls.export}
+          eyebrow="Handoff"
+          title="Test & Export"
+          description="Package the selected champion and validate demo predictions before the model leaves mission control."
+          icon={<HardDriveUpload size={22} />}
+          tone="amber"
+          facts={[
+            { label: "Readiness", value: summary.statusLabel },
+            { label: "Package", value: summary.primaryFormat },
+            { label: "Demo", value: summary.demoStatus },
+          ]}
+          action={(
+            <button className="command compact" type="button" onClick={onOpenDeveloper}>
+              <SquareTerminal size={15} />
+              Advanced details
+            </button>
+          )}
+        />
         <ExportWaitingState readinessLabel={summary.readinessLabel} />
       </div>
     );
@@ -1708,6 +2101,31 @@ export function ExportRoute({
 
   return (
     <div className="export-page" id="export-package">
+      <RoutePlanetHero
+        assetSrc={routePlanetAssetUrls.export}
+        eyebrow="Champion handoff"
+        title="Test & Export"
+        description="Run validation images, review confidence, and prepare a portable model package for handoff."
+        icon={<HardDriveUpload size={22} />}
+        facts={[
+          { label: "Package", value: summary.statusLabel },
+          { label: "Demo", value: summary.demoStatus },
+          { label: "Format", value: summary.primaryFormat },
+          { label: "Runtime", value: demoRuntimeLabel(localInferenceStatus) },
+        ]}
+        action={(
+          <>
+            <button className="command compact" type="button" onClick={onRequestExport}>
+              <HardDriveUpload size={15} />
+              Prepare package
+            </button>
+            <button className="command compact" type="button" onClick={onOpenDeveloper}>
+              <SquareTerminal size={15} />
+              Advanced details
+            </button>
+          </>
+        )}
+      />
       <section className="export-demo-simple test-export-hero">
         <div className="mission-section-head">
           <div>
@@ -1717,12 +2135,6 @@ export function ExportRoute({
           </div>
           <span>
             <Badge value={predictionLoading ? "Running" : summary.demoStatus} />
-            <button className="icon-command" type="button" onClick={onRandomImage} disabled={data.demoImages.length < 2} title="Random held-out image">
-              <Shuffle size={14} />
-            </button>
-            <button className="icon-command" type="button" onClick={onNextImage} disabled={data.demoImages.length < 2} title="Next held-out image">
-              <StepForward size={14} />
-            </button>
           </span>
         </div>
         <div className="demo-simple-grid">
@@ -1745,7 +2157,7 @@ export function ExportRoute({
                 <Badge value={activeImage?.split || "TEST"} />
                 <strong>{demoImageLabel(activeImage) || activeImage?.image_id || "Select an image"}</strong>
               </span>
-              <small>{demoImageDetail(activeImage) || "Held-out image or custom URI"}</small>
+              <small>{demoImageDetail(activeImage) || "Held-out demo image"}</small>
             </div>
           </div>
 
@@ -1791,92 +2203,71 @@ export function ExportRoute({
                 </div>
               </>
             ) : (
-              <div className="empty compact">Run a held-out image or choose your own image to see the prediction.</div>
+              <div className="empty compact">Run the selected held-out image to see the prediction.</div>
             )}
           </div>
 
-          <div className="test-controls export-test-controls">
+          <div className="test-controls export-test-controls demo-carousel-panel">
             <div className="demo-block-head">
               <strong>Images</strong>
-              <span>
-                <button className="command compact" type="button" onClick={onToggleSlideshow} disabled={!localDemoAvailable || data.demoImages.length < 2 || predictionLoading}>
-                  {slideshowEnabled ? <Pause size={15} /> : <Play size={15} />}
-                  {slideshowEnabled ? "Pause" : "Slideshow"}
-                </button>
-                <button
-                  className="command primary compact"
-                  type="button"
-                  onClick={() => selectedImage && onRunPrediction(selectedImage)}
-                  disabled={!selectedImage || !selectedImageRunnable || predictionLoading}
-                  title={selectedImageRunnable ? "Run held-out image" : "Original image unavailable for this held-out image"}
-                >
-                  <Play size={15} />
-                  Run held-out
-                </button>
-              </span>
+              <Badge value={data.demoImages.length > 0 ? `${currentImagePosition}/${data.demoImages.length}` : "0 images"} />
             </div>
             {data.demoImages.length > 0 ? (
-              <div className="demo-image-strip">
-                {data.demoImages.slice(0, 8).map((image, index) => (
+              <>
+                <div className="demo-carousel-current" aria-label="Held-out image carousel">
                   <button
-                    className={index === selectedImageIndex && !customURI ? "selected" : ""}
-                    key={image.id || image.image_id || `${demoImageURI(image)}-${index}`}
+                    className="icon-command carousel-arrow"
                     type="button"
-                    onClick={() => onSelectImage(index)}
+                    onClick={() => onSelectImage(previousImageIndex)}
+                    disabled={data.demoImages.length < 2}
+                    title="Previous held-out image"
                   >
-                    {demoImagePreviewURI(image) ? <img src={demoImagePreviewURI(image)} alt={demoImageLabel(image) || "held-out image"} /> : <span>image</span>}
-                    <small>{demoImageLabel(image) || image.image_id || "unlabeled"}</small>
+                    <ChevronLeft size={16} />
                   </button>
-                ))}
-              </div>
+                  <div className="demo-carousel-preview">
+                    {demoImagePreviewURI(selectedImage) ? (
+                      <img src={demoImagePreviewURI(selectedImage)} alt={demoImageLabel(selectedImage) || "held-out image"} />
+                    ) : (
+                      <span>image</span>
+                    )}
+                  </div>
+                  <button
+                    className="icon-command carousel-arrow"
+                    type="button"
+                    onClick={onNextImage}
+                    disabled={data.demoImages.length < 2}
+                    title="Next held-out image"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+                <div className="demo-carousel-copy">
+                  <small>{currentImagePosition} of {data.demoImages.length}</small>
+                  <strong>{demoImageLabel(selectedImage) || selectedImage?.image_id || "Unlabeled image"}</strong>
+                  <span>{demoImageDetail(selectedImage) || "Held-out demo image"}</span>
+                </div>
+                <div className="demo-carousel-actions">
+                  <button
+                    className="command primary compact"
+                    type="button"
+                    onClick={() => selectedImage && onRunPrediction(selectedImage)}
+                    disabled={!selectedImage || !selectedImageRunnable || predictionLoading}
+                    title={selectedImageRunnable ? "Run held-out image" : "Original image unavailable for this held-out image"}
+                  >
+                    <Play size={15} />
+                    Run held-out
+                  </button>
+                </div>
+              </>
             ) : (
               <div className="empty compact">No demo-ready held-out images are available yet.</div>
             )}
-            {selectedImage && !selectedImageRunnable && !customURI && (
+            {selectedImage && !selectedImageRunnable && (
               <div className="mission-blocker">
                 <AlertTriangle size={15} />
-                <span>Original image unavailable. Choose another held-out image or use your own image.</span>
+                <span>Original image unavailable. Choose another held-out image.</span>
               </div>
             )}
-            <div className="custom-image-actions">
-              <button className="command compact" type="button" onClick={onChooseCustomImage}>
-                <Upload size={15} />
-                Choose Image
-              </button>
-              <button
-                className="command compact"
-                type="button"
-                onClick={onRunCustomPrediction}
-                disabled={!customURI || predictionLoading}
-              >
-                <Play size={15} />
-                Run custom
-              </button>
-            </div>
-            <label className="field">
-              <span><Link2 size={12} /> Image URI</span>
-              <input
-                value={customImageURI}
-                onChange={(event) => onCustomImageURIChange(event.target.value)}
-                placeholder="file://, data:image, s3://, or worker-visible URI"
-              />
-            </label>
-            <label className="field">
-              <span>Known label</span>
-              <input value={customTrueLabel} onChange={(event) => onCustomTrueLabelChange(event.target.value)} placeholder="optional" />
-            </label>
-            <label className="field compact-range">
-              <span><Timer size={12} /> Slideshow speed</span>
-              <input
-                type="range"
-                min={1200}
-                max={10000}
-                step={400}
-                value={slideshowIntervalMs}
-                onChange={(event) => onSlideshowIntervalChange(Number(event.target.value))}
-              />
-              <small>{(slideshowIntervalMs / 1000).toFixed(1)}s</small>
-            </label>
             {championExportDemoIsDetection(data) && (
               <div className="detector-controls">
                 <label className="field compact-range">
@@ -1934,6 +2325,7 @@ export function ExportRoute({
             </button>
           )}
           <button className="command" type="button" onClick={onOpenDeveloper}>
+            <SquareTerminal size={16} />
             Advanced details
           </button>
         </div>
@@ -4286,4 +4678,3 @@ export function MetricChart({ metrics, metricKey, label }: { metrics: EpochMetri
     </div>
   );
 }
-

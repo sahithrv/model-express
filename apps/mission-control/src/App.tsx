@@ -5,7 +5,9 @@ import {
   AlertTriangle,
   BarChart3,
   BrainCircuit,
+  Check,
   CheckCircle2,
+  ChevronDown,
   ClipboardList,
   Database,
   DollarSign,
@@ -525,6 +527,7 @@ import type {
 } from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://127.0.0.1:8080";
+const brandAssetUrl = new URL("../logo.svg", import.meta.url).href;
 const jobsPerPage = 10;
 const activeLiveRefreshIntervalMs = 10_000;
 const idleLiveRefreshIntervalMs = 30_000;
@@ -542,6 +545,94 @@ function missionControlErrorMessage(error: unknown): string {
     return "The backend is in LAN or tunnel mode but is not using the same generated local API token as Mission Control. Restart the backend and Mission Control from the same cloud profile.";
   }
   return message;
+}
+
+type ProjectCommandPickerProps = {
+  projects: Project[];
+  selectedProjectId: string;
+  onSelect: (projectId: string) => void;
+};
+
+function ProjectCommandPicker({ projects, selectedProjectId, onSelect }: ProjectCommandPickerProps) {
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement | null>(null);
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+
+  useEffect(() => {
+    if (!open) return;
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const chooseProject = (projectId: string) => {
+    onSelect(projectId);
+    setOpen(false);
+  };
+
+  return (
+    <div className="project-command-picker" ref={pickerRef}>
+      <button
+        className="project-picker-trigger"
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Database size={19} aria-hidden="true" />
+        <span className="project-picker-copy">
+          <small>Project</small>
+          <strong>{selectedProject?.name ?? "No mission selected"}</strong>
+        </span>
+        <ChevronDown className={open ? "open" : ""} size={17} aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="project-picker-menu" role="listbox" aria-label="Selected project">
+          <button
+            className={!selectedProjectId ? "selected" : ""}
+            type="button"
+            role="option"
+            aria-selected={!selectedProjectId}
+            onClick={() => chooseProject("")}
+          >
+            <span>No mission selected</span>
+            {!selectedProjectId && <Check size={14} aria-hidden="true" />}
+          </button>
+          {projects.map((project) => {
+            const selected = project.id === selectedProjectId;
+            return (
+              <button
+                className={selected ? "selected" : ""}
+                key={project.id}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                onClick={() => chooseProject(project.id)}
+              >
+                <span>{project.name}</span>
+                {selected && <Check size={14} aria-hidden="true" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 type CloudPreflightStage = "dataset_upload" | "plan_execution" | "worker_start" | "manual";
@@ -779,6 +870,7 @@ export function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>(() => localStorage.getItem(selectedProjectStorageKey) ?? "");
+  const [workerSupervisorArmedProjectId, setWorkerSupervisorArmedProjectId] = useState("");
   const [detail, setDetail] = useState<ProjectDetail>(() => emptyProjectDetail());
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
@@ -825,6 +917,23 @@ export function App() {
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
     [projects, selectedProjectId],
   );
+  const workerSupervisorEnabled = selectedProjectId !== "" && workerSupervisorArmedProjectId === selectedProjectId;
+
+  const armWorkerSupervisor = useCallback((projectId: string) => {
+    const nextProjectId = projectId.trim();
+    if (nextProjectId) {
+      setWorkerSupervisorArmedProjectId(nextProjectId);
+    }
+  }, []);
+
+  const disarmWorkerSupervisor = useCallback((projectId?: string) => {
+    setWorkerSupervisorArmedProjectId((current) => (!projectId || current === projectId ? "" : current));
+  }, []);
+
+  const selectProjectForViewing = useCallback((projectId: string) => {
+    disarmWorkerSupervisor();
+    setSelectedProjectId(projectId);
+  }, [disarmWorkerSupervisor]);
 
   useEffect(() => {
     if (selectedProjectId) {
@@ -1638,6 +1747,7 @@ export function App() {
   }, [baseUrl]);
 
   const { resetWorkerSupervisor, superviseWorkerRequirements } = useWorkerSupervisor({
+    enabled: workerSupervisorEnabled,
     baseUrl,
     selectedProjectId,
     workerRequirements: detail.workerRequirements,
@@ -1857,13 +1967,14 @@ export function App() {
   }, [baseUrl, projectHasOpenWork, refreshLive, selectedProjectId]);
 
   useEffect(() => {
+    if (!workerSupervisorEnabled) return;
     const timer = window.setInterval(() => {
       superviseWorkerRequirements().catch(() => undefined);
     }, 3000);
 
     superviseWorkerRequirements().catch(() => undefined);
     return () => window.clearInterval(timer);
-  }, [superviseWorkerRequirements]);
+  }, [superviseWorkerRequirements, workerSupervisorEnabled]);
 
   async function chooseNewProjectFolder() {
     setNewProjectError("");
@@ -1937,6 +2048,7 @@ export function App() {
         workerMessage = `Worker did not start: ${error instanceof Error ? error.message : String(error)}`;
       }
 
+      armWorkerSupervisor(project.id);
       setSelectedProjectId(project.id);
       setNewProjectFolder(null);
       setNewProjectError("");
@@ -1968,6 +2080,7 @@ export function App() {
     });
 
     setSelectedJobId(job.id);
+    armWorkerSupervisor(selectedProjectId);
     await refreshProjectDetail(selectedProjectId, { includeSlowData: false });
   }
 
@@ -1986,6 +2099,7 @@ export function App() {
         method: "POST",
         body: { trigger_reason: "manual", provider },
       });
+      armWorkerSupervisor(selectedProjectId);
       let workerMessage = "Worker is ready to pick it up.";
       try {
         const workerProcess = await window.missionControl.ensureProjectWorker({
@@ -2041,6 +2155,7 @@ export function App() {
         method: "POST",
         body: { provider, gpu_type: gpuType, max_concurrent_jobs: workerCount },
       });
+      armWorkerSupervisor(selectedProjectId);
 
       const targetCount = Math.max(1, response.worker_requirement?.target_count ?? workerCount);
       const workerProvider = response.worker_requirement?.provider || provider;
@@ -2073,6 +2188,7 @@ export function App() {
     const confirmed = window.confirm(`Stop active run for ${stoppablePlan.id}? Queued and active work will be cancelled.`);
     if (!confirmed) return;
 
+    disarmWorkerSupervisor(selectedProjectId);
     setLoading(true);
     setNotice(null);
     try {
@@ -2103,6 +2219,7 @@ export function App() {
     if (provider === "modal") {
       await ensureCloudPreflight("worker_start");
     }
+    armWorkerSupervisor(selectedProjectId);
     const workerPool = await window.missionControl.ensureProjectWorker({
       projectId: selectedProjectId,
       baseUrl,
@@ -2124,6 +2241,7 @@ export function App() {
         method: "POST",
         body: {},
       });
+      armWorkerSupervisor(selectedProjectId);
 
       await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
       setNotice({ kind: "info", text: `Reviewer decision: ${decision.decision_type}` });
@@ -2163,6 +2281,7 @@ export function App() {
         method: "POST",
         body: { provider, gpu_type: gpuType, max_concurrent_jobs: workerCount },
       });
+      armWorkerSupervisor(selectedProjectId);
 
       const targetCount = Math.max(1, execution.worker_requirement?.target_count ?? workerCount);
       const workerProvider = execution.worker_requirement?.provider || provider;
@@ -2665,108 +2784,145 @@ export function App() {
     }
   }
 
+  const commandActiveStage =
+    missionStages.find((stage) => stage.status === "blocked") ??
+    missionStages.find((stage) => stage.status === "active") ??
+    missionStages.find((stage) => stage.status === "waiting") ??
+    missionStages[missionStages.length - 1];
+  const commandStageId = commandActiveStage?.id ?? "";
+  const commandStageIndex = ["created", "dataset", "plan"].includes(commandStageId)
+    ? 0
+    : ["experiments", "refinement"].includes(commandStageId)
+      ? 1
+      : commandStageId === "evaluation"
+        ? 2
+        : 3;
+  const commandStepTotal = 4;
+  const commandPhaseLabel = ["Baseline", "Experiment Runs", "Evaluation", "Champion Selection"][commandStageIndex];
+  const engineOnline = health?.status === "ok" && !detailLiveRefreshUnhealthy;
+  const runProgressLabel = missionBrief.trialProgress.total > 0
+    ? `${missionBrief.trialProgress.completed}/${missionBrief.trialProgress.total} complete`
+    : missionBrief.progressLabel;
+  const runningLabel = missionBrief.trialProgress.running > 0 ? "Running" : missionDigest.stateLabel;
+  const queuedJobs = detail.jobs.filter((job) => ["QUEUED", "PENDING", "REQUESTED", "ASSIGNED"].includes(normalizedStatus(job.status))).length;
+
   return (
     <main className="shell">
       <header className="app-chrome">
         <div className="chrome-left">
-          <span className="chrome-mark">
-            <BrainCircuit size={16} />
-          </span>
+          <span className="chrome-mark asset-mark" style={{ backgroundImage: `url("${brandAssetUrl}")` }} aria-hidden="true" />
           <span>
             <strong>Model Express</strong>
-            <small>Cloud Agentic Demo / Modal + OpenAI required</small>
+            <small>Mission Control</small>
           </span>
         </div>
         <div className="chrome-right">
-          <span>{health?.status === "ok" ? "AI engine ready" : "AI engine offline"}</span>
+          <span>{engineOnline ? "agent online" : "agent offline"}</span>
         </div>
       </header>
 
-      <aside className="sidebar">
-        <label className="field compact">
-          <span>Engine URL</span>
-          <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
-        </label>
-
-        <div className="sidebar-actions">
-          <button
-            className="command primary"
-            onClick={() => {
-              setNewProjectError("");
-              setNewProjectOpen(true);
-            }}
-            disabled={loading}
-          >
-            <Plus size={16} />
-            New Mission
-          </button>
-          <button className="icon-command" onClick={refreshAll} disabled={loading} title="Refresh now">
-            <RefreshCcw size={16} />
-          </button>
+      <aside className="sidebar mission-sidebar">
+        <div className="brand">
+          <span className="brand-mark asset-mark" style={{ backgroundImage: `url("${brandAssetUrl}")` }} aria-hidden="true" />
+          <span>
+            <h1>MODEL<br />EXPRESS</h1>
+            <p>Mission Control</p>
+          </span>
         </div>
 
-        <section className="nav-section">
-          <div className="section-title mission-queue-title">
-            <span>
-              <Database size={15} />
-              Missions
-            </span>
-            <small>{projects.length}</small>
+        <nav className="primary-nav" aria-label="Mission navigation">
+          <button className={`nav-item ${activeProjectTab === "mission" ? "selected" : ""}`} type="button" onClick={() => setActiveProjectTab("mission")}>
+            <MonitorDot size={17} />
+            <span>Mission Control</span>
+          </button>
+        </nav>
+
+        <section className="nav-section compact-nav-section">
+          <div className="section-title">Project</div>
+          <nav className="secondary-nav" aria-label="Project sections">
+            <button className={`nav-item ${activeProjectTab === "mission" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("mission")}>
+              <Eye size={16} />
+              <span>Overview</span>
+            </button>
+            <button className="nav-item" type="button" onClick={() => openProjectTab("developer", "datasets")}>
+              <Database size={16} />
+              <span>Datasets</span>
+            </button>
+            <button className={`nav-item ${activeProjectTab === "results" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("results")}>
+              <Trophy size={16} />
+              <span>Models</span>
+            </button>
+            <button className={`nav-item ${activeProjectTab === "activity" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("activity")}>
+              <ClipboardList size={16} />
+              <span>Experiments</span>
+            </button>
+            <button className={`nav-item ${activeProjectTab === "export" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("export")}>
+              <HardDriveUpload size={16} />
+              <span>Test / Export</span>
+            </button>
+            <button className={`nav-item ${activeProjectTab === "settings" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("settings")}>
+              <SlidersHorizontal size={16} />
+              <span>Settings</span>
+            </button>
+          </nav>
+        </section>
+
+        <section className="system-status-card">
+          <div className="section-title">System Status</div>
+          <div className="system-status-rows">
+            <span><Server size={14} />Engine<strong>{engineOnline ? "Online" : "Offline"}</strong></span>
+            <span><MonitorDot size={14} />Workers<strong>{detail.workers.length} Active</strong></span>
+            <span><ListRestart size={14} />Queue<strong>{queuedJobs} Pending</strong></span>
+            <span><Database size={14} />Storage<strong>{detail.datasets.length === 0 && detail.loadStatus.liveRefresh.status === "error" ? "Check" : "Healthy"}</strong></span>
+            <span><Activity size={14} />API<strong>{detailLiveRefreshUnhealthy ? "Stale" : "Healthy"}</strong></span>
           </div>
-          <div className="project-list">
-            {projects.map((project) => (
-              <button
-                key={project.id}
-                className={project.id === selectedProjectId ? "project active" : "project"}
-                aria-current={project.id === selectedProjectId ? "true" : undefined}
-                onClick={() => setSelectedProjectId(project.id)}
-                title={project.goal || missionStateLabelFromProject(project)}
-              >
-                <span className={`project-status-dot ${missionStateToneFromProject(project)}`} aria-hidden="true" />
-                <span className="project-copy">
-                  <strong>{project.name}</strong>
-                  <small>{project.goal || "Ready for mission setup"}</small>
-                </span>
-                <span className={`project-state ${missionStateToneFromProject(project)}`}>{missionStateLabelFromProject(project)}</span>
-              </button>
-            ))}
-            {projects.length === 0 && (
-              <div className="project-list-empty">
-                <span className="project-empty-mark" aria-hidden="true">
-                  <Database size={14} />
-                </span>
-                <strong>No missions yet</strong>
-                <small>Create a mission to start the workflow.</small>
-              </div>
-            )}
-          </div>
+          <button className="command compact diagnostics-wide" type="button" onClick={() => setActiveProjectTab("developer")}>
+            <SquareTerminal size={15} />
+            View Diagnostics
+          </button>
+          <details className="connection-details">
+            <summary>Connection</summary>
+            <label className="field compact">
+              <span>Engine URL</span>
+              <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
+            </label>
+            <button className="command compact" onClick={refreshAll} disabled={loading} type="button">
+              <RefreshCcw size={14} />
+              Refresh
+            </button>
+          </details>
         </section>
       </aside>
 
-			<section className="workspace" data-active-tab={activeProjectTab}>
-        <header className={`topbar ${activeProjectTab === "developer" ? "developer-topbar" : "mission-command-topbar"}`}>
-          <div className="topbar-copy">
-            <div className="topbar-kicker">
-              <div className="eyebrow">{activeProjectTab === "developer" ? "Developer View" : "Mission"}</div>
-              {activeProjectTab !== "developer" && <span className={`mission-state-pill ${missionDigest.state}`}>{missionDigest.stateLabel}</span>}
-            </div>
-            <h2>{selectedProject ? selectedProject.name : "No Mission Selected"}</h2>
-            {activeProjectTab !== "developer" && <p>{selectedProject?.goal || missionDigest.detail}</p>}
+      <section className="workspace" data-active-tab={activeProjectTab}>
+        <header className={`topbar ${activeProjectTab === "developer" ? "developer-topbar" : "mission-command-header"}`}>
+          <div className="command-card project-command-card">
+            <ProjectCommandPicker projects={projects} selectedProjectId={selectedProjectId} onSelect={selectProjectForViewing} />
           </div>
-          <div className="topbar-actions">
-            {activeProjectTab !== "developer" && (
-              <div
-                className={health?.status === "ok" && !detailLiveRefreshUnhealthy ? "engine-chip ok" : "engine-chip bad"}
-                aria-label={health?.status === "ok" && !detailLiveRefreshUnhealthy ? "Engine ready" : "Engine needs attention"}
-              >
-                <span className="engine-chip-light" aria-hidden="true" />
-                <Server size={15} />
-                <span>
-                  <strong>Engine</strong>
-                  <small>{detailLiveRefreshUnhealthy ? "Stale" : health?.status === "ok" ? "Ready" : "Offline"}</small>
-                </span>
-              </div>
-            )}
+          <div className="command-card mission-phase-card">
+            <div>
+              <span>Mission Phase</span>
+              <strong>{commandPhaseLabel || missionDigest.stateLabel}</strong>
+            </div>
+            <div className="phase-progress" aria-label={`Step ${commandStageIndex + 1} of ${commandStepTotal}`}>
+              <small>Step {commandStageIndex + 1} of {commandStepTotal}</small>
+              <span>
+                {Array.from({ length: commandStepTotal }).map((_, index) => (
+                  <i key={index} className={index <= commandStageIndex ? "done" : ""} />
+                ))}
+              </span>
+            </div>
+          </div>
+          <div className="command-card status-command-card">
+            <span>Engine Status</span>
+            <strong className={engineOnline ? "online" : "offline"}>{engineOnline ? "Agent Online" : "Agent Offline"}</strong>
+          </div>
+          <div className="command-card status-command-card">
+            <span>Run Status</span>
+            <strong className={missionBrief.trialProgress.running > 0 ? "online" : ""}>{runningLabel}</strong>
+            <small>{runProgressLabel}</small>
+          </div>
+          <div className="command-actions">
             {stoppablePlan && (
               <button className="command compact danger" type="button" onClick={stopActiveRun} disabled={loading}>
                 <X size={15} />
@@ -2774,32 +2930,27 @@ export function App() {
               </button>
             )}
             <button
-              className={activeProjectTab === "developer" ? "command compact back-to-mission" : "diagnostics-toggle"}
+              className="command primary new-mission-command"
+              onClick={() => {
+                setNewProjectError("");
+                setNewProjectOpen(true);
+              }}
+              disabled={loading}
+              type="button"
+            >
+              <Plus size={17} />
+              New Mission
+            </button>
+            <button
+              className={activeProjectTab === "developer" ? "icon-command user-command active" : "icon-command user-command"}
               type="button"
               aria-label={activeProjectTab === "developer" ? "Back to Mission" : "Open Developer View diagnostics"}
               onClick={() => setActiveProjectTab(activeProjectTab === "developer" ? "mission" : "developer")}
             >
-              {activeProjectTab === "developer" ? (
-                "Back to Mission"
-              ) : (
-                <>
-                  <SquareTerminal size={15} />
-                  <span>
-                    <strong>Diagnostics</strong>
-                    <small>Developer View</small>
-                  </span>
-                </>
-              )}
+              <SquareTerminal size={17} />
             </button>
-            {activeProjectTab === "developer" && (
-              <div className={health?.status === "ok" && !detailLiveRefreshUnhealthy ? "status ok" : "status bad"}>
-                <Server size={16} />
-                {detailLiveRefreshUnhealthy ? "stale" : health?.status === "ok" ? "ready" : "offline"}
-              </div>
-            )}
           </div>
         </header>
-
         {notice && <NoticeBanner notice={notice} />}
         <DetailLoadStatusNotice status={detail.loadStatus.liveRefresh} />
 
@@ -2838,6 +2989,9 @@ export function App() {
             results={resultsSummary}
             exportSummary={exportSummary}
             actions={missionDigest.nextActions}
+            selectedProject={selectedProject}
+            detail={detail}
+            health={health}
             onAction={handleMissionAction}
             onOpenTab={openProjectTab}
           />
@@ -2915,6 +3069,179 @@ export function App() {
           />
         </section>
 
+        <section className="settings-route" id="settings-route" data-project-tab="settings">
+
+
+					<Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide id="settings" tab="settings">
+            <div className="settings-panel">
+              <div className="settings-grid">
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.auto_review_experiments}
+                    onChange={(event) => updateSettingsDraft({ auto_review_experiments: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>Auto Review</strong>
+                    <small>{automationSettings.auto_review_experiments ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.auto_schedule_followups}
+                    onChange={(event) => updateSettingsDraft({ auto_schedule_followups: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>Auto Follow-ups</strong>
+                    <small>{automationSettings.auto_schedule_followups ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.auto_execute_plans}
+                    onChange={(event) => updateSettingsDraft({ auto_execute_plans: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>Auto Execute</strong>
+                    <small>{automationSettings.auto_execute_plans ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.llm_enabled}
+                    onChange={(event) => updateSettingsDraft({ llm_enabled: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>LLM Agents</strong>
+                    <small>{automationSettings.llm_enabled ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.automl_enabled}
+                    onChange={(event) => updateSettingsDraft({ automl_enabled: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <strong>AutoML HPO</strong>
+                    <small>{automationSettings.automl_enabled ? "on" : "off"}</small>
+                  </span>
+                </label>
+                <label className="setting-field">
+                  <span>Agent Mode</span>
+                  <select
+                    value={settingsDraft.agent_mode}
+                    onChange={(event) => updateSettingsDraft({ agent_mode: event.currentTarget.value })}
+                  >
+                    <option value="propose">propose</option>
+                    <option value="autonomous">autonomous</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>AutoML Sampler</span>
+                  <select
+                    value={settingsDraft.automl_sampler}
+                    onChange={(event) => updateSettingsDraft({ automl_sampler: event.currentTarget.value })}
+                  >
+                    <option value="seeded_random">seeded_random</option>
+                    <option value="grid">grid</option>
+                    <option value="adaptive_bayesian">adaptive_bayesian</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>Follow-up Rounds</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={settingsDraft.max_followup_rounds}
+                    onChange={(event) =>
+                      updateSettingsDraft({ max_followup_rounds: Number.parseInt(event.currentTarget.value, 10) || 0 })
+                    }
+                  />
+                </label>
+                <label className="setting-field">
+                  <span>Cost Mode</span>
+                  <select
+                    value={settingsDraft.cost_mode}
+                    onChange={(event) => updateSettingsDraft({ cost_mode: event.currentTarget.value })}
+                  >
+                    <option value="prototype">prototype/cheap</option>
+                    <option value="balanced">balanced</option>
+                    <option value="quality">quality</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>Budget Cap</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={settingsDraft.budget_cap_usd}
+                    onChange={(event) => updateSettingsDraft({ budget_cap_usd: Number.parseFloat(event.currentTarget.value) || 0 })}
+                  />
+                </label>
+                <label className="setting-field">
+                  <span>Provider</span>
+                  <select
+                    value={settingsDraft.default_training_provider}
+                    onChange={(event) => updateSettingsDraft({ default_training_provider: event.currentTarget.value })}
+                  >
+                    <option value="local">local</option>
+                    <option value="modal">modal</option>
+                    <option value="persistent_gpu">persistent_gpu</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>LLM Provider</span>
+                  <select
+                    value={settingsDraft.llm_provider}
+                    onChange={(event) => updateSettingsDraft({ llm_provider: event.currentTarget.value })}
+                  >
+                    <option value="openai">openai</option>
+                    <option value="openai_compatible">openai_compatible</option>
+                    <option value="local">local</option>
+                  </select>
+                </label>
+                <label className="setting-field">
+                  <span>LLM Model</span>
+                  <input
+                    value={settingsDraft.llm_model}
+                    placeholder="model id from .env"
+                    onChange={(event) => updateSettingsDraft({ llm_model: event.currentTarget.value })}
+                  />
+                </label>
+                <label className="setting-field">
+                  <span>GPU</span>
+                  <input
+                    value={settingsDraft.default_gpu_type}
+                    placeholder="T4"
+                    onChange={(event) => updateSettingsDraft({ default_gpu_type: event.currentTarget.value })}
+                  />
+                </label>
+              </div>
+              <div className={`review-state ${reviewState.tone}`}>
+                <Badge value={reviewState.badge} />
+                <span>
+                  <strong>{reviewState.title}</strong>
+                  <small>{reviewState.detail}</small>
+                </span>
+              </div>
+              <div className="settings-actions">
+                <small>
+                  Updated {automationSettings.updated_at ? new Date(automationSettings.updated_at).toLocaleString() : "from defaults"}
+                </small>
+                <button className="command primary" type="button" onClick={saveAutomationSettings} disabled={loading}>
+                  <CheckCircle2 size={16} />
+                  Apply Settings
+                </button>
+              </div>
+            </div>
+          </Panel>
+        </section>
         <section className="developer-route" id="developer" data-project-tab="developer">
           <DeveloperRoute diagnostics={developerDiagnostics} onBack={() => setActiveProjectTab("mission")} />
         </section>
@@ -3083,176 +3410,6 @@ export function App() {
                   <Badge value={item.status} />
                 </div>
               ))}
-            </div>
-          </Panel>
-
-					<Panel title="Automation Settings" icon={<SlidersHorizontal size={17} />} wide id="operations" tab="developer">
-            <div className="settings-panel">
-              <div className="settings-grid">
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={settingsDraft.auto_review_experiments}
-                    onChange={(event) => updateSettingsDraft({ auto_review_experiments: event.currentTarget.checked })}
-                  />
-                  <span>
-                    <strong>Auto Review</strong>
-                    <small>{automationSettings.auto_review_experiments ? "on" : "off"}</small>
-                  </span>
-                </label>
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={settingsDraft.auto_schedule_followups}
-                    onChange={(event) => updateSettingsDraft({ auto_schedule_followups: event.currentTarget.checked })}
-                  />
-                  <span>
-                    <strong>Auto Follow-ups</strong>
-                    <small>{automationSettings.auto_schedule_followups ? "on" : "off"}</small>
-                  </span>
-                </label>
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={settingsDraft.auto_execute_plans}
-                    onChange={(event) => updateSettingsDraft({ auto_execute_plans: event.currentTarget.checked })}
-                  />
-                  <span>
-                    <strong>Auto Execute</strong>
-                    <small>{automationSettings.auto_execute_plans ? "on" : "off"}</small>
-                  </span>
-                </label>
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={settingsDraft.llm_enabled}
-                    onChange={(event) => updateSettingsDraft({ llm_enabled: event.currentTarget.checked })}
-                  />
-                  <span>
-                    <strong>LLM Agents</strong>
-                    <small>{automationSettings.llm_enabled ? "on" : "off"}</small>
-                  </span>
-                </label>
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={settingsDraft.automl_enabled}
-                    onChange={(event) => updateSettingsDraft({ automl_enabled: event.currentTarget.checked })}
-                  />
-                  <span>
-                    <strong>AutoML HPO</strong>
-                    <small>{automationSettings.automl_enabled ? "on" : "off"}</small>
-                  </span>
-                </label>
-                <label className="setting-field">
-                  <span>Agent Mode</span>
-                  <select
-                    value={settingsDraft.agent_mode}
-                    onChange={(event) => updateSettingsDraft({ agent_mode: event.currentTarget.value })}
-                  >
-                    <option value="propose">propose</option>
-                    <option value="autonomous">autonomous</option>
-                  </select>
-                </label>
-                <label className="setting-field">
-                  <span>AutoML Sampler</span>
-                  <select
-                    value={settingsDraft.automl_sampler}
-                    onChange={(event) => updateSettingsDraft({ automl_sampler: event.currentTarget.value })}
-                  >
-                    <option value="seeded_random">seeded_random</option>
-                    <option value="grid">grid</option>
-                    <option value="adaptive_bayesian">adaptive_bayesian</option>
-                  </select>
-                </label>
-                <label className="setting-field">
-                  <span>Follow-up Rounds</span>
-                  <input
-                    type="number"
-                    min="0"
-                    step="1"
-                    value={settingsDraft.max_followup_rounds}
-                    onChange={(event) =>
-                      updateSettingsDraft({ max_followup_rounds: Number.parseInt(event.currentTarget.value, 10) || 0 })
-                    }
-                  />
-                </label>
-                <label className="setting-field">
-                  <span>Cost Mode</span>
-                  <select
-                    value={settingsDraft.cost_mode}
-                    onChange={(event) => updateSettingsDraft({ cost_mode: event.currentTarget.value })}
-                  >
-                    <option value="prototype">prototype/cheap</option>
-                    <option value="balanced">balanced</option>
-                    <option value="quality">quality</option>
-                  </select>
-                </label>
-                <label className="setting-field">
-                  <span>Budget Cap</span>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    value={settingsDraft.budget_cap_usd}
-                    onChange={(event) => updateSettingsDraft({ budget_cap_usd: Number.parseFloat(event.currentTarget.value) || 0 })}
-                  />
-                </label>
-                <label className="setting-field">
-                  <span>Provider</span>
-                  <select
-                    value={settingsDraft.default_training_provider}
-                    onChange={(event) => updateSettingsDraft({ default_training_provider: event.currentTarget.value })}
-                  >
-                    <option value="local">local</option>
-                    <option value="modal">modal</option>
-                    <option value="persistent_gpu">persistent_gpu</option>
-                  </select>
-                </label>
-                <label className="setting-field">
-                  <span>LLM Provider</span>
-                  <select
-                    value={settingsDraft.llm_provider}
-                    onChange={(event) => updateSettingsDraft({ llm_provider: event.currentTarget.value })}
-                  >
-                    <option value="openai">openai</option>
-                    <option value="openai_compatible">openai_compatible</option>
-                    <option value="local">local</option>
-                  </select>
-                </label>
-                <label className="setting-field">
-                  <span>LLM Model</span>
-                  <input
-                    value={settingsDraft.llm_model}
-                    placeholder="model id from .env"
-                    onChange={(event) => updateSettingsDraft({ llm_model: event.currentTarget.value })}
-                  />
-                </label>
-                <label className="setting-field">
-                  <span>GPU</span>
-                  <input
-                    value={settingsDraft.default_gpu_type}
-                    placeholder="T4"
-                    onChange={(event) => updateSettingsDraft({ default_gpu_type: event.currentTarget.value })}
-                  />
-                </label>
-              </div>
-              <div className={`review-state ${reviewState.tone}`}>
-                <Badge value={reviewState.badge} />
-                <span>
-                  <strong>{reviewState.title}</strong>
-                  <small>{reviewState.detail}</small>
-                </span>
-              </div>
-              <div className="settings-actions">
-                <small>
-                  Updated {automationSettings.updated_at ? new Date(automationSettings.updated_at).toLocaleString() : "from defaults"}
-                </small>
-                <button className="command primary" type="button" onClick={saveAutomationSettings} disabled={loading}>
-                  <CheckCircle2 size={16} />
-                  Apply Settings
-                </button>
-              </div>
             </div>
           </Panel>
 
@@ -4014,4 +4171,3 @@ export function App() {
     </main>
   );
 }
-

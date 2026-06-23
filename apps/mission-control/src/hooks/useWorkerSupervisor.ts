@@ -25,6 +25,7 @@ type RefreshProjectDetail = (
 type CloudPreflightStage = "dataset_upload" | "plan_execution" | "worker_start" | "manual";
 
 type WorkerSupervisorOptions = {
+  enabled: boolean;
   baseUrl: string;
   selectedProjectId: string;
   workerRequirements: SupervisorWorkerRequirement[];
@@ -35,6 +36,7 @@ type WorkerSupervisorOptions = {
 };
 
 export function useWorkerSupervisor({
+  enabled,
   baseUrl,
   selectedProjectId,
   workerRequirements,
@@ -62,12 +64,14 @@ export function useWorkerSupervisor({
   }, []);
 
   const superviseWorkerRequirements = useCallback(async () => {
-    if (!selectedProjectId) return;
+    const actionable = actionableWorkerRequirements({
+      enabled,
+      selectedProjectId,
+      workerRequirements: workerRequirementsRef.current,
+      jobs: jobsRef.current,
+    });
+    if (actionable.length === 0) return;
 
-    const actionable = workerRequirementsRef.current.filter((requirement) =>
-      (requirement.status === "PENDING" || requirement.status === "STARTING" || requirement.status === "ACTIVE") &&
-      workerRequirementHasOpenWork(requirement, jobsRef.current),
-    );
     const now = Date.now();
 
     for (const requirement of actionable) {
@@ -119,9 +123,28 @@ export function useWorkerSupervisor({
         refreshProjectDetail(selectedProjectId, { includeSlowData: false }).catch(() => undefined);
       }
     }
-  }, [baseUrl, preflightCloud, refreshProjectDetail, request, selectedProjectId]);
+  }, [baseUrl, enabled, preflightCloud, refreshProjectDetail, request, selectedProjectId]);
 
   return { resetWorkerSupervisor, superviseWorkerRequirements };
+}
+
+export function actionableWorkerRequirements({
+  enabled,
+  selectedProjectId,
+  workerRequirements,
+  jobs,
+}: {
+  enabled: boolean;
+  selectedProjectId: string;
+  workerRequirements: SupervisorWorkerRequirement[];
+  jobs: SupervisorJob[];
+}) {
+  if (!enabled || !selectedProjectId) return [];
+  return workerRequirements.filter((requirement) =>
+    requirement.project_id === selectedProjectId &&
+    (requirement.status === "PENDING" || requirement.status === "STARTING" || requirement.status === "ACTIVE") &&
+    workerRequirementHasOpenWork(requirement, jobs),
+  );
 }
 
 function workerRequirementHasOpenWork(requirement: SupervisorWorkerRequirement, jobs: SupervisorJob[]) {

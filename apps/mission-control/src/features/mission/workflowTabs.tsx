@@ -1,12 +1,12 @@
 import type { ReactNode } from "react";
 import { Activity, BarChart3, ClipboardList, Trophy } from "lucide-react";
 
-export type ProjectTabKey = "mission" | "activity" | "results" | "export" | "developer";
+export type ProjectTabKey = "mission" | "activity" | "results" | "export" | "settings" | "developer";
 export type LegacyProjectTabKey = "overview" | "data" | "experiments" | "agents" | "operations";
 export type ProjectTabTarget = ProjectTabKey | LegacyProjectTabKey;
 export type ActivityFilterKey = "all" | "decisions" | "experiments" | "results" | "blockers";
 export type ProjectWorkflowTabState = "done" | "active" | "waiting" | "blocked";
-export type ProjectWorkflowTabBase = { key: Exclude<ProjectTabKey, "developer">; label: string; icon: ReactNode };
+export type ProjectWorkflowTabBase = { key: Exclude<ProjectTabKey, "settings" | "developer">; label: string; icon: ReactNode };
 export type ProjectWorkflowTab = ProjectWorkflowTabBase & { state: ProjectWorkflowTabState; detail: string };
 
 export const projectTabs: ProjectWorkflowTabBase[] = [

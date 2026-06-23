@@ -46,13 +46,15 @@ let localRuntimeBootstrap = null;
 let championDemoRuntime = null;
 const CHAMPION_DEMO_RUNTIME_IDLE_TTL_MS = 3 * 60 * 1000;
 const CHAMPION_DEMO_RUNTIME_TIMEOUT_MS = 45_000;
+const MISSION_CONTROL_MIN_WIDTH = 1360;
+const MISSION_CONTROL_MIN_HEIGHT = 760;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1320,
+    width: MISSION_CONTROL_MIN_WIDTH,
     height: 860,
-    minWidth: 1120,
-    minHeight: 720,
+    minWidth: MISSION_CONTROL_MIN_WIDTH,
+    minHeight: MISSION_CONTROL_MIN_HEIGHT,
     backgroundColor: "#050807",
     title: "Model Express",
     autoHideMenuBar: true,

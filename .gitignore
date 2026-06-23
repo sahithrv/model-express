@@ -49,3 +49,5 @@ mlartifacts/**
 !datasets/.gitkeep
 !artifacts/.gitkeep
 !exports/.gitkeep
+
+.tmp/
