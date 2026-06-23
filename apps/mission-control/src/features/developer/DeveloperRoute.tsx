@@ -12,7 +12,7 @@ export type DeveloperDiagnostics = {
 
 export function buildDeveloperDiagnostics(detail: ProjectDetail, events: AgentActivityEvent[]): DeveloperDiagnostics {
   return {
-    summary: "Raw operational detail is preserved here for debugging, audit, and demo backup.",
+    summary: "Expanded operational detail is preserved here for debugging, audit, and mission backup.",
     counts: [
       { label: "Invocations", value: String(detail.agentInvocations.length) },
       { label: "Memory records", value: String(detail.agentMemory.length) },
@@ -35,8 +35,8 @@ export function DeveloperRoute({ diagnostics, onBack }: { diagnostics: Developer
           </span>
           <div>
             <div className="eyebrow">Project systems</div>
-            <h3>Datasets & Configuration</h3>
-            <p>Review dataset intelligence, automation settings, telemetry, and the raw evidence behind each mission.</p>
+            <h3>In-Depth View</h3>
+            <p>Review automation state, telemetry, experiment evidence, and the raw audit trail behind each mission.</p>
           </div>
         </div>
         <div className="route-hero-facts">
@@ -57,7 +57,7 @@ export function DeveloperRoute({ diagnostics, onBack }: { diagnostics: Developer
 
       <section className="developer-intro developer-intro-panel" id="developer-raw-events">
         <div>
-          <div className="eyebrow">Developer View</div>
+          <div className="eyebrow">In-Depth View</div>
           <h3>Technical audit trail</h3>
           <p>{diagnostics.summary}</p>
         </div>

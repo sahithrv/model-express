@@ -495,6 +495,7 @@ function RoutePlanetHero({
   facts,
   action,
   tone = "green",
+  className = "",
 }: {
   assetSrc: string;
   eyebrow: string;
@@ -504,9 +505,10 @@ function RoutePlanetHero({
   facts?: RouteHeroFact[];
   action?: ReactNode;
   tone?: "green" | "amber" | "blue";
+  className?: string;
 }) {
   return (
-    <section className={`route-planet-hero ${tone}`}>
+    <section className={["route-planet-hero", tone, className].filter(Boolean).join(" ")}>
       <img className="route-planet-asset" src={assetSrc} alt="" aria-hidden="true" />
       <div className="route-hero-copy">
         <span className="route-hero-icon" aria-hidden="true">{icon}</span>
@@ -1254,7 +1256,7 @@ export function buildProjectWorkflowTabs({
     missionDigest.liveActivity.status === "idle" && activityFeed.length > 0
       ? `${activityFeed.length} journal ${activityFeed.length === 1 ? "entry" : "entries"}`
       : missionDigest.liveActivity.label || activityStreamBadge(activityStreamState);
-  const details: Record<Exclude<ProjectTabKey, "settings" | "developer">, { state: ProjectWorkflowTabState; detail: string }> = {
+  const details: Record<ProjectWorkflowTabBase["key"], { state: ProjectWorkflowTabState; detail: string }> = {
     mission: {
       state: missionDigest.state === "empty" ? "active" : stageState(["created", "dataset", "plan"]),
       detail: missionDigest.stateLabel,
@@ -1340,7 +1342,7 @@ export function ActivityRoute({
         action={(
           <button className="command compact" type="button" onClick={onOpenDeveloper}>
             <SquareTerminal size={15} />
-            Developer View
+            In-Depth View
           </button>
         )}
       />
@@ -1393,7 +1395,7 @@ export function ActivityRoute({
                     <strong>{card.technicalSource}</strong>
                   </span>
                   <button className="mission-link-button" type="button" onClick={onOpenDeveloper}>
-                    Open Developer View
+                    Open In-Depth View
                   </button>
                 </div>
               </details>
@@ -1484,11 +1486,11 @@ export function ActivityCard({ card, onOpenDeveloper }: { card: ActivityCardMode
             </span>
             <span>
               <small>Raw payload</small>
-              <strong>Available in Developer View</strong>
+              <strong>Available in In-Depth View</strong>
             </span>
           </div>
           <button className="mission-link-button" type="button" onClick={onOpenDeveloper}>
-            Open Developer View
+            Open In-Depth View
           </button>
         </details>
       </div>
@@ -1515,6 +1517,7 @@ export function ResultsRoute({
       <RoutePlanetHero
         assetSrc={routePlanetAssetUrls.results}
         eyebrow="Model evidence"
+        className="summit-moon-hero"
         title="Models & Metrics"
         description="Compare scored candidates, improvement history, and per-class evidence before selecting the champion."
         icon={<Trophy size={22} />}
@@ -1532,7 +1535,7 @@ export function ResultsRoute({
             </button>
             <button className="command compact" type="button" onClick={onOpenDeveloper}>
               <SquareTerminal size={15} />
-              Developer comparison
+              In-depth comparison
             </button>
           </>
         )}
@@ -1554,7 +1557,7 @@ export function ResultsRoute({
             </button>
             <button className="command compact" type="button" onClick={onOpenDeveloper}>
               <SquareTerminal size={15} />
-              Developer comparison
+              In-depth comparison
             </button>
           </span>
         </div>
@@ -2632,7 +2635,7 @@ export function ChampionOutcomeSummary({
         <button className="command compact" type="button" onClick={() => onOpenTab("export", "export-demo")}>
           Test & Export
         </button>
-        <button className="command compact" type="button" onClick={() => onOpenTab("experiments", "champion-comparison")}>
+        <button className="command compact" type="button" onClick={() => onOpenTab("inDepth", "champion-comparison")}>
           Compare Runs
         </button>
       </div>

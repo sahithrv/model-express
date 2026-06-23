@@ -1035,9 +1035,10 @@ export function shortCacheKey(value: string) {
 
 export function projectTabFromTarget(tab: ProjectTabTarget): ProjectTabKey {
   if (tab === "overview") return "mission";
-  if (tab === "agents") return "activity";
-  if (tab === "experiments") return "results";
-  if (tab === "data" || tab === "operations") return "developer";
+  if (tab === "agents") return "inDepth";
+  if (tab === "experiments") return "inDepth";
+  if (tab === "data") return "datasets";
+  if (tab === "operations" || tab === "developer") return "inDepth";
   return tab;
 }
 
@@ -2765,7 +2766,7 @@ export function buildMissionHealth({
       value: health?.status === "ok" ? "Online" : health ? "Offline" : "Checking",
       tone: health?.status === "ok" ? "ok" : health ? "bad" : "warning",
       targetTab: "operations",
-      targetId: "operations",
+      targetId: "in-depth",
     },
     {
       id: "dataset",
@@ -3050,7 +3051,7 @@ export function buildMissionSignals({
       detail: "Refresh or check the configured orchestrator URL.",
       tone: "bad",
       targetTab: "operations",
-      targetId: "operations",
+      targetId: "in-depth",
     });
   }
   if (activeFailedEvent) {

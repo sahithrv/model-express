@@ -1295,20 +1295,24 @@ button {
 }
 
 .workspace[data-active-tab="mission"] [data-project-tab]:not([data-project-tab="mission"]),
+.workspace[data-active-tab="datasets"] [data-project-tab]:not([data-project-tab="datasets"]),
 .workspace[data-active-tab="activity"] [data-project-tab]:not([data-project-tab="activity"]),
 .workspace[data-active-tab="results"] [data-project-tab]:not([data-project-tab="results"]),
 .workspace[data-active-tab="export"] [data-project-tab]:not([data-project-tab="export"]),
-.workspace[data-active-tab="settings"] [data-project-tab]:not([data-project-tab="settings"]),
-.workspace[data-active-tab="developer"] [data-project-tab]:not([data-project-tab="developer"]) {
+.workspace[data-active-tab="inDepth"] [data-project-tab]:not([data-project-tab="inDepth"]),
+.workspace[data-active-tab="settings"] [data-project-tab]:not([data-project-tab="settings"]) {
 	display: none;
 }
 
 #mission,
+#datasets,
+#in-depth,
 #activity,
 #results,
 #export,
 #developer,
 #data,
+#visual-dataset-analysis,
 #agents,
 #runs,
 #operations,
@@ -7589,17 +7593,25 @@ button {
 .decision-quality-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
+  align-content: flex-start;
+  align-items: flex-start;
+  gap: 6px;
 }
 
 .decision-quality-tags small {
-  border: 1px solid rgba(255, 104, 117, 0.2);
-  border-radius: 999px;
-  padding: 5px 8px;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 24px;
+  border: 1px solid rgba(255, 104, 117, 0.24);
+  border-radius: 6px;
+  padding: 4px 7px;
   color: #ff9ca5;
-  background: rgba(255, 104, 117, 0.07);
+  background: rgba(255, 104, 117, 0.075);
   font-size: 11px;
   font-weight: 800;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
 }
 
 .decision-history {
@@ -7629,6 +7641,7 @@ button {
 .automation-grid {
   display: grid;
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  align-items: start;
   gap: 14px;
 }
 
@@ -7641,9 +7654,17 @@ button {
   gap: 9px;
 }
 
+.automation-block,
+.status-list,
+.event-list {
+  align-content: start;
+  min-width: 0;
+}
+
 .automation-block > strong {
   color: #fbfffc;
   font-size: 13px;
+  line-height: 1.25;
 }
 
 .status-row,
@@ -7658,9 +7679,15 @@ button {
   background: #070c0b;
 }
 
+.status-row,
+.event-row {
+  min-width: 0;
+}
+
 .status-row {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
+  column-gap: 12px;
 }
 
 .status-row span,
@@ -7684,8 +7711,22 @@ button {
 }
 
 .event-row {
-  grid-template-columns: 170px minmax(0, 1fr);
-  align-items: center;
+  grid-template-columns: minmax(178px, 220px) minmax(0, 1fr);
+  align-items: start;
+  column-gap: 12px;
+  row-gap: 7px;
+}
+
+.event-row .badge {
+  align-self: start;
+  justify-self: start;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 24px;
+  justify-content: flex-start;
+  overflow-wrap: anywhere;
+  text-align: left;
+  white-space: normal;
 }
 
 .event-row strong,
@@ -7696,6 +7737,14 @@ button {
   font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.event-row strong {
+  overflow: visible;
+  line-height: 1.28;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .agent-audit-row {
@@ -9218,6 +9267,15 @@ html,
   color: #92a3aa;
 }
 
+.nav-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.nav-item.new-project-nav-item svg {
+  color: var(--accent);
+}
+
 .nav-item:hover,
 .nav-item.active,
 .nav-item.selected {
@@ -9308,9 +9366,7 @@ html,
     #03070a;
 }
 
-.workspace:not([data-active-tab="developer"]) .mission-command-header,
-.mission-command-header,
-.developer-topbar {
+.mission-command-header {
   display: grid;
   grid-template-columns: minmax(240px, 1.05fr) minmax(300px, 1.35fr) minmax(160px, 0.62fr) minmax(160px, 0.62fr) auto;
   align-items: stretch;
@@ -10191,9 +10247,7 @@ html,
 }
 
 @media (max-width: 1380px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(240px, 1fr) minmax(280px, 1.1fr) repeat(2, minmax(140px, 0.55fr));
   }
 
@@ -10237,9 +10291,7 @@ html,
     grid-row: 2;
   }
 
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
   .mission-command-header,
-  .developer-topbar,
   .mission-command-dashboard,
   .champion-orbit-hero,
   .launch-pipeline {
@@ -10281,9 +10333,7 @@ html,
   padding-right: 104px;
 }
 
-.workspace:not([data-active-tab="developer"]) .mission-command-header,
-.mission-command-header,
-.developer-topbar {
+.mission-command-header {
   grid-template-columns: minmax(230px, 1.1fr) minmax(280px, 1.25fr) minmax(142px, 0.58fr) minmax(142px, 0.58fr) max-content;
   gap: 10px;
 }
@@ -10439,9 +10489,7 @@ html,
     padding-right: 88px;
   }
 
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(210px, 1fr) minmax(250px, 1.1fr) repeat(2, minmax(132px, 0.5fr)) max-content;
   }
 
@@ -10621,7 +10669,6 @@ html,
 .workspace,
 .mission-command-dashboard,
 .mission-command-header,
-.developer-topbar,
 .command-card,
 .command-actions,
 .champion-orbit-hero,
@@ -10683,9 +10730,7 @@ html,
 }
 
 @media (max-width: 1540px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(220px, 1.08fr) minmax(250px, 1.18fr) repeat(2, minmax(132px, 0.58fr));
     align-items: stretch;
   }
@@ -10706,9 +10751,7 @@ html,
     padding: 18px;
   }
 
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -10745,9 +10788,7 @@ html,
 }
 
 @media (max-width: 980px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
   .mission-command-header,
-  .developer-topbar,
   .champion-orbit-hero,
   .agent-rail {
     grid-template-columns: minmax(0, 1fr);
@@ -10774,7 +10815,7 @@ html,
 
   .command-actions {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 44px;
+    grid-template-columns: minmax(0, 1fr);
     width: 100%;
   }
 
@@ -10829,7 +10870,8 @@ html,
 .activity-journal,
 .results-page,
 .export-page,
-.developer-route-stack {
+.developer-route-stack,
+.in-depth-route {
   display: grid;
   gap: 16px;
   min-width: 0;
@@ -11067,7 +11109,7 @@ html,
 .export-demo-simple,
 .export-waiting-state,
 .developer-intro-panel,
-.workspace[data-active-tab="developer"] .panel {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .panel {
   border-color: var(--border);
   background: linear-gradient(180deg, rgba(10, 20, 27, 0.96), rgba(5, 10, 14, 0.98));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 18px 42px rgba(0, 0, 0, 0.2);
@@ -11130,7 +11172,7 @@ html,
 .topk-bars,
 .technical-runtime-row span,
 .demo-result-summary > .empty,
-.workspace[data-active-tab="developer"] :is(.settings-panel, .dataset-intelligence, .visual-analysis-panel, .champion-panel, .run-summary, .decision-panel, .telemetry-panel, .agent-audit-list, .memory-list, .plan-card, .automation-block, .telemetry-block, .decision-quality-panel) {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) :is(.settings-panel, .dataset-intelligence, .visual-analysis-panel, .champion-panel, .run-summary, .decision-panel, .telemetry-panel, .agent-audit-list, .memory-list, .plan-card, .automation-block, .telemetry-block, .decision-quality-panel) {
   border-color: rgba(166, 205, 220, 0.1);
   background: linear-gradient(180deg, rgba(7, 16, 23, 0.9), rgba(4, 9, 13, 0.92));
 }
@@ -11167,13 +11209,13 @@ html,
 .demo-result-summary span,
 .activity-card-facts span,
 .model-improvement-stats span,
-.workspace[data-active-tab="developer"] :is(.insight-card, .metadata-count-block, .visual-analysis-block, .agent-audit-facts span, .telemetry-invocation-facts span, .run-overview div, .plan-overview div, .champion-grid div) {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) :is(.insight-card, .metadata-count-block, .visual-analysis-block, .agent-audit-facts span, .telemetry-invocation-facts span, .run-overview div, .plan-overview div, .champion-grid div) {
   border-color: rgba(166, 205, 220, 0.11);
   background: rgba(5, 12, 17, 0.72);
 }
 
 .result-list span,
-.workspace[data-active-tab="developer"] .recommendation-list span {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .recommendation-list span {
   border-left-color: rgba(34, 229, 139, 0.44);
 }
 
@@ -11193,20 +11235,20 @@ html,
 
 .demo-image-strip button,
 .technical-package-details summary,
-.workspace[data-active-tab="developer"] :is(.setting-field, .toggle-row, .tag-list small) {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) :is(.setting-field, .toggle-row, .tag-list small) {
   border-color: rgba(166, 205, 220, 0.12);
   background: rgba(5, 12, 17, 0.72);
 }
 
 .demo-image-strip button.selected,
 .demo-image-strip button:hover,
-.workspace[data-active-tab="developer"] .panel header span {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .panel header span {
   border-color: rgba(34, 229, 139, 0.34);
   color: var(--accent);
   background: rgba(34, 229, 139, 0.1);
 }
 
-.workspace[data-active-tab="developer"] .content-grid {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .content-grid {
   gap: 16px;
 }
 
@@ -11223,17 +11265,17 @@ html,
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.workspace[data-active-tab="developer"] .panel {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .panel {
   overflow: hidden;
   padding: 16px;
 }
 
-.workspace[data-active-tab="developer"] .panel header {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .panel header {
   border-bottom: 1px solid rgba(166, 205, 220, 0.09);
   padding-bottom: 10px;
 }
 
-.workspace[data-active-tab="developer"] .panel h3,
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .panel h3,
 .developer-intro-panel h3,
 .model-improvement-section .mission-section-head strong,
 .candidate-section .mission-section-head strong,
@@ -11242,13 +11284,13 @@ html,
   color: #f7fffb;
 }
 
-.workspace[data-active-tab="developer"] :is(.setting-field input, .setting-field select, .field input, .field select) {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) :is(.setting-field input, .setting-field select, .field input, .field select) {
   border-color: rgba(166, 205, 220, 0.13);
   color: #eef5f2;
   background: rgba(2, 4, 6, 0.72);
 }
 
-.workspace[data-active-tab="developer"] :is(.setting-field input:focus, .setting-field select:focus, .field input:focus, .field select:focus) {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) :is(.setting-field input:focus, .setting-field select:focus, .field input:focus, .field select:focus) {
   border-color: rgba(34, 229, 139, 0.46);
   box-shadow: 0 0 0 3px rgba(34, 229, 139, 0.09);
 }
@@ -11314,9 +11356,7 @@ html,
 }
 
 .mission-sidebar .brand,
-.workspace:not([data-active-tab="developer"]) .mission-command-header,
 .mission-command-header,
-.developer-topbar,
 .command-card:not(.project-command-card),
 .status-command-card,
 .mission-phase-card {
@@ -11341,9 +11381,7 @@ textarea,
   -webkit-app-region: no-drag;
 }
 
-.workspace:not([data-active-tab="developer"]) .mission-command-header,
-.mission-command-header,
-.developer-topbar {
+.mission-command-header {
   grid-template-columns: minmax(250px, 1.08fr) minmax(270px, 1.16fr) minmax(148px, 0.54fr) minmax(148px, 0.54fr) minmax(156px, auto);
   padding-right: var(--titlebar-control-safe-right);
   box-sizing: border-box;
@@ -11477,9 +11515,7 @@ textarea,
 }
 
 @media (max-width: 1740px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(230px, 1.05fr) minmax(260px, 1.12fr) repeat(2, minmax(138px, 0.58fr));
   }
 
@@ -11490,16 +11526,14 @@ textarea,
 }
 
 @media (max-width: 1280px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     padding-right: var(--titlebar-control-safe-right);
   }
 
   .command-actions {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 46px;
+    grid-template-columns: minmax(0, 1fr);
     width: 100%;
   }
 
@@ -11510,9 +11544,7 @@ textarea,
 }
 
 @media (max-width: 860px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(0, 1fr);
     padding-top: var(--titlebar-control-safe-height);
     padding-right: 0;
@@ -11554,6 +11586,38 @@ textarea,
   background-color: rgba(2, 4, 6, 0.98);
   background-position: center;
   background-size: 88% 88%;
+  box-shadow:
+    0 0 0 4px rgba(34, 229, 139, 0.08),
+    0 0 34px rgba(34, 229, 139, 0.16);
+}
+
+.chrome-mark.icon-mark,
+.brand-mark.icon-mark {
+  overflow: hidden;
+  color: #22e58b;
+  background:
+    linear-gradient(180deg, rgba(34, 229, 139, 0.13), rgba(34, 229, 139, 0.035)),
+    rgba(2, 4, 6, 0.98);
+}
+
+.chrome-mark.icon-mark svg,
+.brand-mark.icon-mark svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
+.chrome-mark.icon-mark {
+  width: 30px;
+  height: 30px;
+  border-color: rgba(34, 229, 139, 0.34);
+  border-radius: 9px;
+}
+
+.brand-mark.icon-mark {
+  width: 52px;
+  height: 52px;
+  border-color: rgba(34, 229, 139, 0.4);
+  border-radius: 12px;
   box-shadow:
     0 0 0 4px rgba(34, 229, 139, 0.08),
     0 0 34px rgba(34, 229, 139, 0.16);
@@ -11611,6 +11675,27 @@ textarea,
     contrast(1.05)
     brightness(0.86)
     drop-shadow(0 0 42px rgba(79, 155, 255, 0.2));
+}
+
+.summit-moon-hero .route-planet-asset {
+  top: clamp(-154px, -8.4vw, -88px);
+  right: clamp(-78px, -4.2vw, -30px);
+  width: clamp(430px, 34vw, 590px);
+  opacity: 0.88;
+  object-fit: contain;
+  filter:
+    saturate(0.98)
+    contrast(1.08)
+    brightness(0.88)
+    drop-shadow(0 0 44px rgba(122, 184, 225, 0.26));
+}
+
+@media (max-width: 980px) {
+  .summit-moon-hero .route-planet-asset {
+    top: -150px;
+    right: -112px;
+    width: 430px;
+  }
 }
 
 .route-hero-copy,
@@ -11821,9 +11906,7 @@ textarea {
   box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.012);
 }
 
-.workspace:not([data-active-tab="developer"]) .mission-command-header,
-.mission-command-header,
-.developer-topbar {
+.mission-command-header {
   gap: 14px;
   min-height: 70px;
 }
@@ -11907,7 +11990,7 @@ textarea {
 .export-demo-simple,
 .export-waiting-state,
 .developer-intro-panel,
-.workspace[data-active-tab="developer"] .panel {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .panel {
   border-color: var(--premium-border);
   background:
     linear-gradient(180deg, rgba(9, 18, 24, 0.86), rgba(4, 9, 13, 0.88));
@@ -11932,7 +12015,7 @@ textarea {
 .candidate-section,
 .model-improvement-section,
 .developer-intro-panel,
-.workspace[data-active-tab="developer"] .panel {
+.workspace:is([data-active-tab="datasets"], [data-active-tab="inDepth"]) .panel {
   padding: 24px;
 }
 
@@ -12258,13 +12341,11 @@ textarea {
   --titlebar-control-safe-right: clamp(92px, 7vw, 150px);
 }
 
-.workspace:not([data-active-tab="developer"]) {
+.workspace {
   gap: 20px;
 }
 
-.workspace:not([data-active-tab="developer"]) .mission-command-header,
-.mission-command-header,
-.developer-topbar {
+.mission-command-header {
   position: relative;
   z-index: 8;
   overflow: visible;
@@ -12282,9 +12363,7 @@ textarea {
 }
 
 @media (max-width: 1680px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(250px, 1.08fr) minmax(280px, 1.12fr) repeat(2, minmax(145px, 0.62fr));
     grid-auto-rows: minmax(68px, auto);
     row-gap: 12px;
@@ -12306,16 +12385,14 @@ textarea {
 }
 
 @media (max-width: 1340px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .command-actions {
     justify-self: stretch;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 44px;
+    grid-template-columns: minmax(0, 1fr);
     width: 100%;
   }
 
@@ -12335,9 +12412,7 @@ textarea {
 }
 
 @media (max-width: 900px) {
-  .workspace:not([data-active-tab="developer"]) .mission-command-header,
-  .mission-command-header,
-  .developer-topbar {
+  .mission-command-header {
     grid-template-columns: minmax(0, 1fr);
     padding-top: var(--titlebar-control-safe-height);
     padding-right: 0;
@@ -12401,7 +12476,7 @@ textarea {
 }
 /* Desktop app sizing floor: keep the command header above the orbital hero. */
 :root {
-  --mission-control-min-width: 1360px;
+  --mission-control-min-width: 1460px;
   --mission-control-min-height: 760px;
 }
 
@@ -12411,4 +12486,54 @@ body,
 .shell {
   min-width: var(--mission-control-min-width);
   min-height: var(--mission-control-min-height);
+}
+/* Keep the topbar action box on the desktop row until the app reaches its sizing floor. */
+:root {
+  --mission-command-action-min-width: 154px;
+}
+
+.workspace:not([data-active-tab="developer"]) .mission-command-header {
+  grid-template-columns: minmax(250px, 1.08fr) minmax(270px, 1.16fr) minmax(148px, 0.54fr) minmax(148px, 0.54fr) minmax(var(--mission-command-action-min-width), max-content);
+}
+
+.workspace:not([data-active-tab="developer"]) .command-actions {
+  grid-column: auto;
+  display: flex;
+  flex-wrap: nowrap;
+  justify-self: stretch;
+  min-width: var(--mission-command-action-min-width);
+  width: 100%;
+}
+
+.workspace:not([data-active-tab="developer"]) .resume-work-command {
+  min-width: var(--mission-command-action-min-width);
+}
+
+.workspace:not([data-active-tab="developer"]) .run-status-command-card strong {
+  font-size: 13px;
+  line-height: 1.05;
+}
+
+@media (max-width: 1340px) {
+  .workspace:not([data-active-tab="developer"]) .mission-command-header {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace:not([data-active-tab="developer"]) .command-actions {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(var(--mission-command-action-min-width), 1fr);
+    justify-self: stretch;
+  }
+
+  .workspace:not([data-active-tab="developer"]) .resume-work-command {
+    width: 100%;
+    min-width: var(--mission-command-action-min-width);
+  }
+}
+
+@media (max-width: 900px) {
+  .workspace:not([data-active-tab="developer"]) .mission-command-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

@@ -22,6 +22,7 @@ import {
   Play,
   Plus,
   RefreshCcw,
+  Rocket,
   Server,
   Shuffle,
   SlidersHorizontal,
@@ -527,7 +528,7 @@ import type {
 } from "./types";
 
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://127.0.0.1:8080";
-const brandAssetUrl = new URL("../logo.svg", import.meta.url).href;
+const datasetPlanetAssetUrl = new URL("../moon3.png", import.meta.url).href;
 const jobsPerPage = 10;
 const activeLiveRefreshIntervalMs = 10_000;
 const idleLiveRefreshIntervalMs = 30_000;
@@ -2738,11 +2739,32 @@ export function App() {
       document.getElementById(targetId)?.scrollIntoView({ block: "start" });
     });
   }
+  function openNewProjectDialog() {
+    setNewProjectError("");
+    setNewProjectOpen(true);
+  }
+
+  async function resumeProjectWork() {
+    if (!selectedProjectId) {
+      setNotice({ kind: "error", text: "Select a project before resuming work." });
+      return;
+    }
+    if (!projectHasOpenWork) {
+      setNotice({ kind: "info", text: "No queued or running work to resume for this project." });
+      return;
+    }
+
+    armWorkerSupervisor(selectedProjectId);
+    setNotice({ kind: "info", text: "Worker supervision resumed for this project." });
+    await refreshProjectDetail(selectedProjectId, { includeSlowData: false }).catch((error) => {
+      setNotice({ kind: "error", text: `Worker supervision was armed, but refresh failed: ${errorMessage(error)}` });
+    });
+  }
 
   async function handleMissionAction(action: MissionNextAction) {
     if (action.disabled) return;
     if (action.actionKey === "new_project") {
-      setNewProjectOpen(true);
+      openNewProjectDialog();
       return;
     }
     if (action.actionKey === "refresh") {
@@ -2805,12 +2827,19 @@ export function App() {
     : missionBrief.progressLabel;
   const runningLabel = missionBrief.trialProgress.running > 0 ? "Running" : missionDigest.stateLabel;
   const queuedJobs = detail.jobs.filter((job) => ["QUEUED", "PENDING", "REQUESTED", "ASSIGNED"].includes(normalizedStatus(job.status))).length;
+  const profiledDatasetCount = detail.datasets.filter((dataset) => normalizedStatus(dataset.status) === "PROFILED").length;
+  const datasetHeroFacts = [
+    { label: "Datasets", value: String(detail.datasets.length) },
+    { label: "Profiled", value: String(profiledDatasetCount) },
+    { label: "Metadata", value: datasetIntelligence.metadataStatus?.status || "Pending" },
+    { label: "Visual", value: detail.visualAnalysis.status || "Pending" },
+  ];
 
   return (
     <main className="shell">
       <header className="app-chrome">
         <div className="chrome-left">
-          <span className="chrome-mark asset-mark" style={{ backgroundImage: `url("${brandAssetUrl}")` }} aria-hidden="true" />
+          <span className="chrome-mark icon-mark" aria-hidden="true"><Rocket size={16} strokeWidth={2.4} /></span>
           <span>
             <strong>Model Express</strong>
             <small>Mission Control</small>
@@ -2823,7 +2852,7 @@ export function App() {
 
       <aside className="sidebar mission-sidebar">
         <div className="brand">
-          <span className="brand-mark asset-mark" style={{ backgroundImage: `url("${brandAssetUrl}")` }} aria-hidden="true" />
+          <span className="brand-mark icon-mark" aria-hidden="true"><Rocket size={25} strokeWidth={2.35} /></span>
           <span>
             <h1>MODEL<br />EXPRESS</h1>
             <p>Mission Control</p>
@@ -2835,6 +2864,10 @@ export function App() {
             <MonitorDot size={17} />
             <span>Mission Control</span>
           </button>
+          <button className="nav-item new-project-nav-item" type="button" onClick={openNewProjectDialog} disabled={loading}>
+            <Plus size={17} />
+            <span>New Project</span>
+          </button>
         </nav>
 
         <section className="nav-section compact-nav-section">
@@ -2844,7 +2877,7 @@ export function App() {
               <Eye size={16} />
               <span>Overview</span>
             </button>
-            <button className="nav-item" type="button" onClick={() => openProjectTab("developer", "datasets")}>
+            <button className={`nav-item ${activeProjectTab === "datasets" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("datasets")}>
               <Database size={16} />
               <span>Datasets</span>
             </button>
@@ -2859,6 +2892,10 @@ export function App() {
             <button className={`nav-item ${activeProjectTab === "export" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("export")}>
               <HardDriveUpload size={16} />
               <span>Test / Export</span>
+            </button>
+            <button className={`nav-item ${activeProjectTab === "inDepth" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("inDepth")}>
+              <SquareTerminal size={16} />
+              <span>In-Depth View</span>
             </button>
             <button className={`nav-item ${activeProjectTab === "settings" ? "active" : ""}`} type="button" onClick={() => setActiveProjectTab("settings")}>
               <SlidersHorizontal size={16} />
@@ -2876,9 +2913,9 @@ export function App() {
             <span><Database size={14} />Storage<strong>{detail.datasets.length === 0 && detail.loadStatus.liveRefresh.status === "error" ? "Check" : "Healthy"}</strong></span>
             <span><Activity size={14} />API<strong>{detailLiveRefreshUnhealthy ? "Stale" : "Healthy"}</strong></span>
           </div>
-          <button className="command compact diagnostics-wide" type="button" onClick={() => setActiveProjectTab("developer")}>
+          <button className="command compact diagnostics-wide" type="button" onClick={() => setActiveProjectTab("inDepth")}>
             <SquareTerminal size={15} />
-            View Diagnostics
+            In-Depth View
           </button>
           <details className="connection-details">
             <summary>Connection</summary>
@@ -2895,7 +2932,7 @@ export function App() {
       </aside>
 
       <section className="workspace" data-active-tab={activeProjectTab}>
-        <header className={`topbar ${activeProjectTab === "developer" ? "developer-topbar" : "mission-command-header"}`}>
+        <header className="topbar mission-command-header">
           <div className="command-card project-command-card">
             <ProjectCommandPicker projects={projects} selectedProjectId={selectedProjectId} onSelect={selectProjectForViewing} />
           </div>
@@ -2917,7 +2954,7 @@ export function App() {
             <span>Engine Status</span>
             <strong className={engineOnline ? "online" : "offline"}>{engineOnline ? "Agent Online" : "Agent Offline"}</strong>
           </div>
-          <div className="command-card status-command-card">
+          <div className="command-card status-command-card run-status-command-card">
             <span>Run Status</span>
             <strong className={missionBrief.trialProgress.running > 0 ? "online" : ""}>{runningLabel}</strong>
             <small>{runProgressLabel}</small>
@@ -2930,24 +2967,14 @@ export function App() {
               </button>
             )}
             <button
-              className="command primary new-mission-command"
-              onClick={() => {
-                setNewProjectError("");
-                setNewProjectOpen(true);
-              }}
-              disabled={loading}
+              className="command primary new-mission-command resume-work-command"
+              onClick={resumeProjectWork}
+              disabled={loading || !selectedProjectId || !projectHasOpenWork}
+              title={!selectedProjectId ? "Select a project first" : !projectHasOpenWork ? "No queued or running work to resume" : "Resume workers for open project work"}
               type="button"
             >
-              <Plus size={17} />
-              New Mission
-            </button>
-            <button
-              className={activeProjectTab === "developer" ? "icon-command user-command active" : "icon-command user-command"}
-              type="button"
-              aria-label={activeProjectTab === "developer" ? "Back to Mission" : "Open Developer View diagnostics"}
-              onClick={() => setActiveProjectTab(activeProjectTab === "developer" ? "mission" : "developer")}
-            >
-              <SquareTerminal size={17} />
+              <Play size={17} />
+              Resume Work
             </button>
           </div>
         </header>
@@ -3002,7 +3029,7 @@ export function App() {
             cards={activityFeed}
             filter={activityFilter}
             onFilterChange={setActivityFilter}
-            onOpenDeveloper={() => openProjectTab("developer", "developer-raw-events")}
+            onOpenDeveloper={() => openProjectTab("inDepth", "developer-raw-events")}
           />
         </section>
 
@@ -3012,7 +3039,7 @@ export function App() {
             modelImprovement={modelImprovement}
             onSelectCandidate={setSelectedJobId}
             onOpenExport={() => openProjectTab("export", "export-package")}
-            onOpenDeveloper={() => openProjectTab("developer", "champion-comparison")}
+            onOpenDeveloper={() => openProjectTab("inDepth", "champion-comparison")}
           />
         </section>
 
@@ -3065,7 +3092,7 @@ export function App() {
             onSlideshowIntervalChange={setDemoSlideshowIntervalMs}
             onDetectionConfidenceThresholdChange={setDetectionConfidenceThreshold}
             onDetectionIouThresholdChange={setDetectionIouThreshold}
-            onOpenDeveloper={() => openProjectTab("developer", "export-demo")}
+            onOpenDeveloper={() => openProjectTab("export", "export-demo")}
           />
         </section>
 
@@ -3242,12 +3269,41 @@ export function App() {
             </div>
           </Panel>
         </section>
-        <section className="developer-route" id="developer" data-project-tab="developer">
+        <section className="developer-route-stack datasets-route" id="datasets" data-project-tab="datasets">
+          <section className="route-planet-hero blue summit-moon-hero">
+            <img className="route-planet-asset" src={datasetPlanetAssetUrl} alt="" aria-hidden="true" />
+            <div className="route-hero-copy">
+              <span className="route-hero-icon" aria-hidden="true">
+                <Database size={22} />
+              </span>
+              <div>
+                <div className="eyebrow">Dataset evidence</div>
+                <h3>Datasets</h3>
+                <p>Review the dataset profile, metadata import state, class balance, preprocessing recommendations, and visual analysis coverage.</p>
+              </div>
+            </div>
+            <div className="route-hero-facts">
+              {datasetHeroFacts.map((fact) => (
+                <span key={`${fact.label}-${fact.value}`}>
+                  <small>{fact.label}</small>
+                  <strong>{fact.value}</strong>
+                </span>
+              ))}
+            </div>
+            <div className="route-hero-actions">
+              <button className="command compact" type="button" onClick={() => setActiveProjectTab("inDepth")}>
+                <SquareTerminal size={15} />
+                In-Depth View
+              </button>
+            </div>
+          </section>
+        </section>
+        <section className="in-depth-route" id="in-depth" data-project-tab="inDepth">
           <DeveloperRoute diagnostics={developerDiagnostics} onBack={() => setActiveProjectTab("mission")} />
         </section>
 
-				<section className="content-grid developer-grid">
-					<Panel title="Dataset Intelligence" icon={<BarChart3 size={17} />} wide id="data" tab="developer">
+				<section className="content-grid developer-grid datasets-grid" data-project-tab="datasets">
+					<Panel title="Dataset Intelligence" icon={<BarChart3 size={17} />} wide id="data" tab="datasets">
             {datasetIntelligence.dataset ? (
               <div className="dataset-intelligence">
                 <div className="insight-grid">
@@ -3385,7 +3441,7 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Visual Dataset Analysis" icon={<Eye size={17} />} wide tab="developer">
+					<Panel title="Visual Dataset Analysis" icon={<Eye size={17} />} wide id="visual-dataset-analysis" tab="datasets">
             <VisualAnalysisPanel
               dataset={detail.datasets[0] ?? null}
               jobs={detail.jobs}
@@ -3396,8 +3452,8 @@ export function App() {
           </Panel>
         </section>
 
-        <section className="content-grid">
-					<Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide id="experiment-timeline" tab="developer">
+        <section className="content-grid in-depth-grid" data-project-tab="inDepth">
+					<Panel title="Experiment Timeline" icon={<ListRestart size={17} />} wide id="experiment-timeline" tab="inDepth">
             <div className="timeline">
               {timelineItems.map((item) => (
                 <div className={`timeline-item ${item.status}`} key={item.label}>
@@ -3414,7 +3470,7 @@ export function App() {
           </Panel>
 
           {detail.champion && (
-						<Panel title="Champion Details" icon={<Trophy size={17} />} wide id="champion-detail" tab="developer">
+						<Panel title="Champion Details" icon={<Trophy size={17} />} wide id="champion-detail" tab="inDepth">
               <div className="champion-panel">
                 <div className="champion-head">
                   <span>
@@ -3468,59 +3524,7 @@ export function App() {
               </div>
             </Panel>
           )}
-
-					<Panel title="Champion Export / Demo" icon={<Trophy size={17} />} wide id="export-demo" tab="developer">
-            <ChampionExportDemoPanel
-              data={championExportDemo}
-              prediction={demoPrediction}
-              predictionError={demoPredictionError}
-              predictionLoading={demoPredictionLoading}
-              selectedImageIndex={selectedDemoImageIndex}
-              customImage={customDemoImage}
-              customImageURI={customDemoImageURI}
-              customTrueLabel={customDemoTrueLabel}
-              localInferenceStatus={localInferenceStatus}
-              localInferenceError={localInferenceError}
-              slideshowEnabled={demoSlideshowEnabled}
-              slideshowIntervalMs={demoSlideshowIntervalMs}
-              detectionConfidenceThreshold={detectionConfidenceThreshold}
-              detectionIouThreshold={detectionIouThreshold}
-              onCustomImageURIChange={setCustomDemoImageURI}
-              onCustomTrueLabelChange={setCustomDemoTrueLabel}
-              onChooseCustomImage={chooseChampionDemoImage}
-              onRunCustomPrediction={runCustomChampionDemoPrediction}
-              onToggleSlideshow={toggleDemoSlideshow}
-              onSelectImage={(index) => {
-                setSelectedDemoImageIndex(index);
-                setCustomDemoImage(null);
-                setCustomDemoImageURI("");
-                setCustomDemoTrueLabel("");
-                setDemoSlideshowEnabled(false);
-              }}
-              onNextImage={() => {
-                setCustomDemoImage(null);
-                setCustomDemoImageURI("");
-                setCustomDemoTrueLabel("");
-                setSelectedDemoImageIndex((index) => nextDemoImageIndex(index, championExportDemo.demoImages.length));
-              }}
-              onRandomImage={() => {
-                setCustomDemoImage(null);
-                setCustomDemoImageURI("");
-                setCustomDemoTrueLabel("");
-                setSelectedDemoImageIndex((index) => randomDemoImageIndex(index, championExportDemo.demoImages.length));
-              }}
-              onRequestExport={() => requestChampionExport("onnx")}
-              onSavePortableBundle={savePortableBundle}
-              savingPortableBundle={Boolean(savingExportArtifactKey)}
-              onRunPrediction={runChampionDemoPrediction}
-              onOpenFeedback={openChampionFeedback}
-              onSlideshowIntervalChange={setDemoSlideshowIntervalMs}
-              onDetectionConfidenceThresholdChange={setDetectionConfidenceThreshold}
-              onDetectionIouThresholdChange={setDetectionIouThreshold}
-            />
-          </Panel>
-
-					<Panel title="Training Run Summary" icon={<Trophy size={17} />} wide id="runs" tab="developer">
+					<Panel title="Training Run Summary" icon={<Trophy size={17} />} wide id="runs" tab="inDepth">
             <div className="run-summary">
               <div className="run-overview">
                 <div>
@@ -3582,7 +3586,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Champion Comparison" icon={<Trophy size={17} />} wide id="champion-comparison" tab="developer">
+					<Panel title="Champion Comparison" icon={<Trophy size={17} />} wide id="champion-comparison" tab="inDepth">
             {championComparison.length > 0 ? (
               <div className="comparison-table">
                 <div className="comparison-row comparison-head">
@@ -3624,11 +3628,11 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Live Agent Activity" icon={<Activity size={17} />} wide id="agent-activity" tab="developer">
+					<Panel title="Live Agent Activity" icon={<Activity size={17} />} wide id="agent-activity" tab="inDepth">
             <AgentActivityPanel events={visibleActivityEvents} streamState={activityStreamState} detail={detail} />
           </Panel>
 
-					<Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agent-decisions" tab="developer">
+					<Panel title="Agent Decisions" icon={<BrainCircuit size={17} />} wide id="agent-decisions" tab="inDepth">
             <div className="decision-panel">
               <div className="decision-actions">
                 <div>
@@ -3658,15 +3662,15 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Decision Quality" icon={<BarChart3 size={17} />} wide tab="developer">
+					<Panel title="Decision Quality" icon={<BarChart3 size={17} />} wide tab="inDepth">
             <DecisionQualityPanel decisions={detail.decisions} invocations={detail.agentInvocations} />
           </Panel>
 
-					<Panel title="Mission Control Telemetry" icon={<Activity size={17} />} wide tab="developer">
+					<Panel title="Mission Control Telemetry" icon={<Activity size={17} />} wide tab="inDepth">
             <MissionControlTelemetryPanel telemetry={detail.telemetry} fallbackInvocations={detail.agentInvocations} />
           </Panel>
 
-					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide id="automation-timeline" tab="developer">
+					<Panel title="Automation Timeline" icon={<ListRestart size={17} />} wide id="automation-timeline" tab="inDepth">
             <div className="automation-grid">
               <div className="automation-block">
                 <strong>Worker Requirements</strong>
@@ -3712,15 +3716,15 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Agent Invocation Audit" icon={<SquareTerminal size={17} />} wide tab="developer">
+					<Panel title="Agent Invocation Audit" icon={<SquareTerminal size={17} />} wide tab="inDepth">
             <AgentInvocationAuditPanel invocations={detail.agentInvocations} decisions={detail.decisions} />
           </Panel>
 
-					<Panel title="Memory Retrieval Probe" icon={<BrainCircuit size={17} />} wide id="memory-retrieval-probe" tab="developer">
+					<Panel title="Memory Retrieval Probe" icon={<BrainCircuit size={17} />} wide id="memory-retrieval-probe" tab="inDepth">
             <MemoryRetrievalProbePanel snapshots={memoryRetrievalProbe} />
           </Panel>
 
-					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide id="agent-memory" tab="developer">
+					<Panel title="Agent Memory" icon={<BrainCircuit size={17} />} wide id="agent-memory" tab="inDepth">
             {detail.agentMemory.length > 0 ? (
               <div className="memory-list">
                 {detail.agentMemory.map((record) => (
@@ -3746,7 +3750,7 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide id="plans" tab="developer">
+					<Panel title="Experiment Plan" icon={<ClipboardList size={17} />} wide id="plans" tab="inDepth">
             {latestPlan ? (
               <div className="plan-card">
                 <div className="plan-actions">
@@ -3879,7 +3883,7 @@ export function App() {
             )}
           </Panel>
 
-					<Panel title="Manual Job Queue" icon={<Play size={17} />} wide id="manual-job-queue" tab="developer">
+					<Panel title="Manual Job Queue" icon={<Play size={17} />} wide id="manual-job-queue" tab="inDepth">
             <form
               className="job-create-grid"
               onSubmit={(event) => {
@@ -3906,7 +3910,7 @@ export function App() {
             </form>
           </Panel>
 
-					<Panel title="Workers" icon={<MonitorDot size={17} />} wide id="workers" tab="developer">
+					<Panel title="Workers" icon={<MonitorDot size={17} />} wide id="workers" tab="inDepth">
             <div className="table">
               <div className="table-row table-head">
                 <span>Name</span>
@@ -3928,7 +3932,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Datasets" icon={<Database size={17} />} wide tab="developer">
+					<Panel title="Datasets" icon={<Database size={17} />} wide tab="inDepth">
             <div className="table">
               <div className="table-row table-head">
                 <span>Name</span>
@@ -3950,7 +3954,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide id="recent-jobs" tab="developer">
+					<Panel title="Recent Jobs" icon={<SquareTerminal size={17} />} wide id="recent-jobs" tab="inDepth">
             <div className="job-panel-head">
               <span>
                 Showing {visibleJobs.length} of {detail.jobs.length}
@@ -3996,7 +4000,7 @@ export function App() {
             </div>
           </Panel>
 
-					<Panel title="Run Metrics" icon={<Activity size={17} />} wide id="run-metrics" tab="developer">
+					<Panel title="Run Metrics" icon={<Activity size={17} />} wide id="run-metrics" tab="inDepth">
             {selectedJob ? (
               <div className="metric-area">
                 <div className="selected-job">
