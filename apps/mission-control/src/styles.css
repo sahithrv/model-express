@@ -9948,6 +9948,11 @@ html,
   stroke-width: 2;
 }
 
+.trend-point.leader {
+  fill: var(--amber);
+  filter: drop-shadow(0 0 8px rgba(217, 170, 67, 0.42));
+}
+
 .trend-x-label {
   fill: #8b9ba2;
   font-size: 11px;
@@ -12534,6 +12539,71 @@ body,
 
 @media (max-width: 900px) {
   .workspace:not([data-active-tab="developer"]) .mission-command-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Mission hero card fixes: champion metric semantics and long model names */
+.champion-orbit-hero {
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  column-gap: 28px;
+}
+
+.champion-hero-copy {
+  max-width: 760px;
+}
+
+.champion-hero-copy h3 {
+  flex-wrap: wrap;
+  align-items: flex-start;
+  max-width: 100%;
+  min-width: 0;
+  row-gap: 8px;
+}
+
+.hero-model-name {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.hero-model-icon {
+  flex: 0 0 auto;
+  margin-top: 0.18em;
+}
+
+.hero-metric-cluster {
+  justify-self: end;
+  width: min(320px, 100%);
+  transform: none;
+}
+
+@media (max-width: 980px) {
+  .champion-orbit-hero {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .hero-metric-cluster {
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .hero-primary-metric strong {
+    font-size: 46px;
+  }
+}
+
+@media (max-width: 640px) {
+  .champion-hero-copy h3 {
+    font-size: 28px;
+    line-height: 1.12;
+  }
+
+  .hero-primary-metric strong {
+    font-size: 40px;
+  }
+
+  .hero-metric-cluster {
     grid-template-columns: minmax(0, 1fr);
   }
 }

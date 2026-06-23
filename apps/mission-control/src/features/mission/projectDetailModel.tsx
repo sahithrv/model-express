@@ -446,6 +446,31 @@ export type ResultsCandidate = {
   why: string;
   jobId: string;
 };
+export type MissionRunRow = {
+  id: string;
+  trial: number;
+  candidateRank: number | null;
+  model: string;
+  dataset: string;
+  primaryMetricLabel: string;
+  primaryMetricValue: number | null;
+  primaryMetricDisplay: string;
+  secondaryMetricLabel: string;
+  secondaryMetricDisplay: string;
+  map50Display: string;
+  macroF1Display: string;
+  accuracyDisplay: string;
+  precisionDisplay: string;
+  recallDisplay: string;
+  costDisplay: string;
+  runtimeDisplay: string;
+  status: string;
+  statusClass: string;
+  age: string;
+  timestamp: string;
+  isChampion: boolean;
+  isBaseline: boolean;
+};
 
 export type ResultsPerClassRow = {
   label: string;
@@ -717,6 +742,9 @@ export type ChampionComparisonRow = {
   jobId: string;
   model: string;
   rankScore: number;
+  backendRank: number | null;
+  rankSource: "backend_selection" | "frontend_comparison";
+  runStatus: string;
   primaryMetricLabel: string;
   primaryMetricValue: number;
   secondaryMetricLabel: string;
@@ -1462,11 +1490,12 @@ export function buildResultsSummary(
 ): ResultsSummary {
   const runTotals = summarizeTrainingRuns(detail.runSummaries, detail.runEvaluations, detail.jobs);
   const champion = detail.champion ? buildMissionChampionSummary(detail) : undefined;
-  const championRow = comparison.find((row) => row.isChampion) ?? comparison[0] ?? null;
-  const baselineRow = comparison.find((row) => !row.isChampion) ?? comparison[comparison.length - 1] ?? null;
+  const leaderRow = comparison[0] ?? null;
+  const championRow = comparison.find((row) => row.isChampion) ?? null;
+  const baselineRow = comparison.find((row) => row.jobId !== leaderRow?.jobId) ?? comparison[comparison.length - 1] ?? null;
   const improvement =
-    championRow && baselineRow && championRow.jobId !== baselineRow.jobId
-      ? championRow.primaryMetricValue - baselineRow.primaryMetricValue
+    leaderRow && baselineRow && leaderRow.jobId !== baselineRow.jobId
+      ? leaderRow.primaryMetricValue - baselineRow.primaryMetricValue
       : 0;
   const exportReady = Boolean(readyONNXExport(exportDemo.exports));
   const topCandidates = comparison
@@ -1481,8 +1510,8 @@ export function buildResultsSummary(
       latency: formatLatency(row.latencyMs),
       modelSize: row.modelSize || "-",
       cost: formatCurrency(row.costUsd),
-      status: row.isChampion ? "Best model so far" : row.divergenceStatus || "Candidate",
-      why: row.isChampion
+      status: row.isChampion ? "Best model so far" : index === 0 ? "Leader" : row.divergenceStatus || "Candidate",
+      why: row.isChampion || index === 0
         ? "Best balance of mission score and deployment fit."
         : candidateWhyText(row),
       jobId: row.jobId,
@@ -1490,9 +1519,8 @@ export function buildResultsSummary(
   const learningSummary = resultsLearningSummary(detail);
   const remainingRisks = resultsRemainingRisks(detail, exportDemo);
   const resultEvaluation =
-    (detail.champion
-      ? detail.runEvaluations.find((evaluation) => evaluation.job_id === detail.champion?.job_id)
-      : null) ??
+    (leaderRow ? detail.runEvaluations.find((evaluation) => evaluation.job_id === leaderRow.jobId) : null) ??
+    (championRow ? detail.runEvaluations.find((evaluation) => evaluation.job_id === championRow.jobId) : null) ??
     detail.runEvaluations[0] ??
     null;
   const perClassRows = perClassMetricRows(resultEvaluation?.per_class_metrics ?? {})
@@ -1505,19 +1533,18 @@ export function buildResultsSummary(
     }));
   const confusionMatrix = normalizedConfusionMatrix(resultEvaluation?.confusion_matrix).slice(0, 6).map((row) => row.slice(0, 6));
   const leaderComparison =
-    championRow && baselineRow && championRow.jobId !== baselineRow.jobId && improvement > 0
-      ? `${formatMaybeMetric(championRow.primaryMetricValue)} beats the nearest comparison by ${improvement.toFixed(3)}.`
-      : championRow
-        ? `${formatMaybeMetric(championRow.primaryMetricValue)} is the current leading score.`
+    leaderRow && baselineRow && leaderRow.jobId !== baselineRow.jobId && improvement > 0
+      ? `${formatMaybeMetric(leaderRow.primaryMetricValue)} beats the nearest comparison by ${improvement.toFixed(3)}.`
+      : leaderRow
+        ? `${formatMaybeMetric(leaderRow.primaryMetricValue)} is the current leading score.`
         : "Model Express is waiting for comparable scores.";
 
   return {
     hasResults: detail.runSummaries.length > 0 || Boolean(detail.champion),
-    championModel: champion?.model || championRow?.model || (runTotals.bestPrimaryMetricValue > 0 ? "Best candidate emerging" : "No champion yet"),
-    primaryMetricLabel: userFacingMetricLabel(champion?.primaryMetricLabel || championRow?.primaryMetricLabel || runTotals.bestPrimaryMetricLabel),
+    championModel: leaderRow?.model || champion?.model || (runTotals.bestPrimaryMetricValue > 0 ? "Best candidate emerging" : "No champion yet"),
+    primaryMetricLabel: userFacingMetricLabel(leaderRow?.primaryMetricLabel || champion?.primaryMetricLabel || runTotals.bestPrimaryMetricLabel),
     primaryMetricValue:
-      champion?.primaryMetricValue ||
-      (championRow ? formatMaybeMetric(championRow.primaryMetricValue) : runTotals.bestPrimaryMetricValue > 0 ? formatMaybeMetric(runTotals.bestPrimaryMetricValue) : "Pending"),
+      leaderRow ? formatMaybeMetric(leaderRow.primaryMetricValue) : champion?.primaryMetricValue || (runTotals.bestPrimaryMetricValue > 0 ? formatMaybeMetric(runTotals.bestPrimaryMetricValue) : "Pending"),
     improvementLabel:
       improvement > 0
         ? `+${improvement.toFixed(3)} over nearest baseline`
@@ -1528,8 +1555,8 @@ export function buildResultsSummary(
     scoreContext: "Higher is better. The balanced score measures performance across all classes, not just the easy ones.",
     leaderComparison,
     whyItWon:
-      championRow
-        ? `${championRow.model || "The leader"} has the strongest available score and deployment fit among completed model trials.`
+      leaderRow
+        ? `${leaderRow.model || "The leader"} has the strongest available score and deployment fit among completed model trials.`
         : "Model Express is still collecting evidence before choosing the best model.",
     learningSummary,
     remainingRisks,
@@ -1539,6 +1566,116 @@ export function buildResultsSummary(
   };
 }
 
+export function buildMissionRunRows(detail: ProjectDetail): MissionRunRow[] {
+  const comparison = buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.jobs, detail.champion);
+  const candidateRankByJob = new Map(comparison.map((row, index) => [row.jobId, index + 1]));
+  const jobById = new Map(detail.jobs.map((job) => [job.id, job]));
+  const evaluationByJob = new Map(detail.runEvaluations.map((evaluation) => [evaluation.job_id, evaluation]));
+  const summaryByJob = new Map(detail.runSummaries.map((summary) => [summary.job_id, summary]));
+  const datasetById = new Map(detail.datasets.map((dataset) => [dataset.id, dataset]));
+  const candidateIds = new Set<string>();
+  for (const summary of detail.runSummaries) candidateIds.add(summary.job_id);
+  for (const job of detail.jobs) {
+    if (isTrainingLikeJob(job) || evaluationByJob.has(job.id)) candidateIds.add(job.id);
+  }
+  const chronological = Array.from(candidateIds)
+    .map((jobId) => {
+      const summary = summaryByJob.get(jobId) ?? null;
+      const job = jobById.get(jobId) ?? null;
+      const evaluation = evaluationByJob.get(jobId) ?? null;
+      const timestamp = summary?.updated_at || job?.completed_at || evaluation?.updated_at || job?.started_at || job?.created_at || summary?.created_at || "";
+      return { jobId, summary, job, evaluation, timestamp };
+    })
+    .sort((left, right) => timestampSortScore(left.timestamp) - timestampSortScore(right.timestamp));
+  const trialByJob = new Map(chronological.map((item, index) => [item.jobId, index + 1]));
+
+  return chronological
+    .map((item) => {
+      const metric = runPrimaryMetric(item.summary, item.evaluation, item.job);
+      const datasetId = item.summary?.dataset_id || item.evaluation?.dataset_id || recordString(item.job?.config ?? {}, "dataset_id") || detail.champion?.dataset_id || "";
+      const dataset = datasetById.get(datasetId);
+      const map50 = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "map50"), item.summary?.best_map50, item.summary?.best_accuracy]);
+      const precision = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "precision"), item.summary?.best_precision]);
+      const recall = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "recall"), item.summary?.best_recall]);
+      const macroF1 = firstPositiveMetric([item.summary?.best_macro_f1, recordNumber(item.evaluation?.objective_profile ?? {}, "macro_f1")]);
+      const accuracy = firstPositiveMetric([
+        metric.secondaryLabel === "Accuracy" ? metric.secondaryValue : null,
+        item.summary?.best_accuracy,
+        recordNumber(item.evaluation?.objective_profile ?? {}, "accuracy"),
+      ]);
+      const status = effectiveTrainingRunStatus(item.summary, item.job);
+      const candidateRank = candidateRankByJob.get(item.jobId) ?? null;
+      return {
+        id: item.jobId,
+        trial: trialByJob.get(item.jobId) ?? 0,
+        candidateRank,
+        model: item.summary?.model || recordString(item.job?.config ?? {}, "model") || item.job?.template || "Training job",
+        dataset: dataset?.name || datasetId || "Dataset pending",
+        primaryMetricLabel: metric.label,
+        primaryMetricValue: metric.value > 0 ? metric.value : null,
+        primaryMetricDisplay: metric.value > 0 ? formatMetricNumber(metric.value) : "-",
+        secondaryMetricLabel: metric.secondaryLabel,
+        secondaryMetricDisplay: metric.secondaryValue > 0 ? formatMetricNumber(metric.secondaryValue) : "-",
+        map50Display: map50 > 0 ? formatMetricNumber(map50) : "-",
+        macroF1Display: macroF1 > 0 ? formatMetricNumber(macroF1) : "-",
+        accuracyDisplay: accuracy > 0 ? formatMetricNumber(accuracy) : "-",
+        precisionDisplay: precision > 0 ? formatMetricNumber(precision) : "-",
+        recallDisplay: recall > 0 ? formatMetricNumber(recall) : "-",
+        costDisplay: item.summary ? formatCurrency(item.summary.estimated_cost_usd) : "-",
+        runtimeDisplay: item.summary ? formatSeconds(item.summary.runtime_seconds) : "-",
+        status,
+        statusClass: classToken(status),
+        age: item.timestamp ? formatRelativeTime(item.timestamp) : "-",
+        timestamp: item.timestamp,
+        isChampion: detail.champion?.job_id === item.jobId,
+        isBaseline: (trialByJob.get(item.jobId) ?? 0) === 1,
+      } satisfies MissionRunRow;
+    })
+    .sort(compareMissionRunRows);
+}
+
+function compareMissionRunRows(left: MissionRunRow, right: MissionRunRow) {
+  if (left.candidateRank !== null || right.candidateRank !== null) {
+    if (left.candidateRank === null) return 1;
+    if (right.candidateRank === null) return -1;
+    return left.candidateRank - right.candidateRank;
+  }
+  const statusDelta = comparisonStatusRank(left.status) - comparisonStatusRank(right.status);
+  if (statusDelta !== 0) return statusDelta;
+  return timestampSortScore(right.timestamp) - timestampSortScore(left.timestamp) || right.trial - left.trial;
+}
+
+export function heroMetricFacts(row: MissionRunRow | null, results: ResultsSummary) {
+  const primaryLabel = userFacingMetricLabel(row?.primaryMetricLabel || results.primaryMetricLabel || "Primary metric");
+  const primaryValue = row?.primaryMetricDisplay && row.primaryMetricDisplay !== "-" ? row.primaryMetricDisplay : results.primaryMetricValue || "-";
+  const rawPrimaryLabel = row?.primaryMetricLabel ?? results.primaryMetricLabel ?? "";
+  const detection = primaryLabel.toLowerCase().includes("map") || rawPrimaryLabel.toLowerCase().includes("map");
+  if (detection) {
+    return [
+      { label: primaryLabel.includes("mAP") ? primaryLabel : "mAP50-95", value: primaryValue },
+      { label: "mAP50", value: row?.map50Display && row.map50Display !== "-" ? row.map50Display : results.primaryMetricLabel.includes("mAP") ? results.primaryMetricValue : "-" },
+      { label: "Precision", value: row?.precisionDisplay || "-" },
+      { label: "Recall", value: row?.recallDisplay || "-" },
+    ];
+  }
+  return [
+    { label: primaryLabel, value: primaryValue },
+    { label: "Accuracy", value: row?.accuracyDisplay && row.accuracyDisplay !== "-" ? row.accuracyDisplay : row?.secondaryMetricLabel === "Accuracy" ? row.secondaryMetricDisplay : "-" },
+    { label: "Cost", value: row?.costDisplay || "-" },
+    { label: "Runtime", value: row?.runtimeDisplay || "-" },
+  ];
+}
+
+function isTrainingLikeJob(job: Job) {
+  const values = [job.template, recordString(job.config, "model"), recordString(job.config, "task"), recordString(job.config, "task_type")]
+    .join(" ")
+    .toLowerCase();
+  return values.includes("train") || values.includes("yolo") || values.includes("cnn") || values.includes("transfer") || values.includes("mobilenet") || values.includes("resnet");
+}
+
+function classToken(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+}
 export function buildModelImprovementData(detail: ProjectDetail): ModelImprovementData {
   const orderedPlans = detail.plans
     .map((plan, originalIndex) => ({ plan, originalIndex }))
@@ -5331,6 +5468,53 @@ export function timestampSortScore(value?: string) {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
+type ChampionSelectionRank = {
+  rank: number;
+  score: number | null;
+};
+
+function championSelectionCandidateRanks(champion: ProjectChampion | null) {
+  const candidates = Array.isArray(champion?.metrics?.selection_candidates) ? champion.metrics.selection_candidates : [];
+  const ranks = new Map<string, ChampionSelectionRank>();
+  candidates.map(recordObject).forEach((candidate, index) => {
+    const jobId = recordFirstString(candidate, ["job_id", "jobId", "JobID"]);
+    if (!jobId || ranks.has(jobId)) return;
+    ranks.set(jobId, {
+      rank: index,
+      score: recordFirstNumber(candidate, ["deployment_readiness_score", "selection_score", "score", "rank_score"]),
+    });
+  });
+  return ranks;
+}
+
+function compareChampionComparisonRows(left: ChampionComparisonRow, right: ChampionComparisonRow) {
+  const leftBackendRanked = left.backendRank !== null;
+  const rightBackendRanked = right.backendRank !== null;
+  if (leftBackendRanked || rightBackendRanked) {
+    if (leftBackendRanked !== rightBackendRanked) return leftBackendRanked ? -1 : 1;
+    const rankDelta = (left.backendRank ?? 0) - (right.backendRank ?? 0);
+    if (rankDelta !== 0) return rankDelta;
+  }
+  return compareFrontendComparisonRows(left, right);
+}
+
+function compareFrontendComparisonRows(left: ChampionComparisonRow, right: ChampionComparisonRow) {
+  if (left.isChampion !== right.isChampion) return left.isChampion ? -1 : 1;
+  const statusDelta = comparisonStatusRank(left.runStatus) - comparisonStatusRank(right.runStatus);
+  if (statusDelta !== 0) return statusDelta;
+  const scoreDelta = right.rankScore - left.rankScore;
+  if (scoreDelta !== 0) return scoreDelta;
+  const costDelta = left.costUsd - right.costUsd;
+  if (costDelta !== 0) return costDelta;
+  return left.jobId.localeCompare(right.jobId);
+}
+
+function comparisonStatusRank(status: string) {
+  const normalized = normalizedStatus(status);
+  if (normalized === "SUCCEEDED") return 0;
+  if (["RUNNING", "ACTIVE", "ASSIGNED", "QUEUED", "PENDING"].includes(normalized)) return 1;
+  return 2;
+}
 export function buildChampionComparison(
   summaries: TrainingRunSummary[],
   evaluations: TrainingRunEvaluation[],
@@ -5341,6 +5525,7 @@ export function buildChampionComparison(
   const jobById = new Map(jobs.map((job) => [job.id, job]));
   const seedVarianceBySignature = buildSeedVarianceBySignature(summaries, jobById, evaluationByJob);
   const championJobId = champion?.job_id ?? "";
+  const selectionRanks = championSelectionCandidateRanks(champion);
   return summaries
     .map((summary) => {
       const evaluation = evaluationByJob.get(summary.job_id);
@@ -5357,7 +5542,9 @@ export function buildChampionComparison(
       const seedVariance = signature ? seedVarianceBySignature.get(signature) : undefined;
       const latencyMs = recordNumber(modelProfile, "estimated_latency_ms");
       const primaryMetric = runPrimaryMetric(summary, evaluation ?? null, job ?? null);
-      const rankScore = experimentRankScore({
+      const runStatus = effectiveTrainingRunStatus(summary, job ?? null);
+      const backendRank = selectionRanks.get(summary.job_id) ?? null;
+      const rankScore = backendRank?.score ?? experimentRankScore({
         primaryMetric: primaryMetric.value,
         secondaryMetric: primaryMetric.secondaryValue,
         costUsd: summary.estimated_cost_usd,
@@ -5372,6 +5559,9 @@ export function buildChampionComparison(
         jobId: summary.job_id,
         model: summary.model,
         rankScore,
+        backendRank: backendRank?.rank ?? null,
+        rankSource: backendRank ? "backend_selection" : "frontend_comparison",
+        runStatus,
         primaryMetricLabel: primaryMetric.label,
         primaryMetricValue: primaryMetric.value,
         secondaryMetricLabel: primaryMetric.secondaryLabel,
@@ -5386,13 +5576,9 @@ export function buildChampionComparison(
         seedVariance: seedVariance?.variance ?? null,
         seedRunCount: seedVariance?.runCount ?? 0,
         isChampion: summary.job_id === championJobId,
-      };
+      } satisfies ChampionComparisonRow;
     })
-    .sort((left, right) => {
-      if (left.isChampion !== right.isChampion) return left.isChampion ? -1 : 1;
-      return right.rankScore - left.rankScore;
-    })
-    .slice(0, 8);
+    .sort(compareChampionComparisonRows);
 }
 
 export function buildSeedVarianceBySignature(

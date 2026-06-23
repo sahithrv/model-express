@@ -2868,6 +2868,10 @@ export function App() {
             <Plus size={17} />
             <span>New Project</span>
           </button>
+          <button className="nav-item refresh-nav-item" type="button" onClick={refreshAll} disabled={loading} aria-label="Refresh mission data">
+            <RefreshCcw size={17} />
+            <span>{loading ? "Refreshing" : "Refresh"}</span>
+          </button>
         </nav>
 
         <section className="nav-section compact-nav-section">

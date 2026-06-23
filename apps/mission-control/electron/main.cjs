@@ -46,7 +46,7 @@ let localRuntimeBootstrap = null;
 let championDemoRuntime = null;
 const CHAMPION_DEMO_RUNTIME_IDLE_TTL_MS = 3 * 60 * 1000;
 const CHAMPION_DEMO_RUNTIME_TIMEOUT_MS = 45_000;
-const MISSION_CONTROL_MIN_WIDTH = 1360;
+const MISSION_CONTROL_MIN_WIDTH = 1460;
 const MISSION_CONTROL_MIN_HEIGHT = 760;
 
 function createWindow() {

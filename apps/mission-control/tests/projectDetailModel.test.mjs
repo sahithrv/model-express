@@ -118,6 +118,78 @@ test("results summary keeps backend champion first even when display score is lo
   assert.equal(summary.topCandidates[0].status, "Best model so far");
 });
 
+test("mission rows and results leaderboard share backend selection candidate order", async () => {
+  const { buildChampionComparison, buildMissionRunRows, buildResultsSummary } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    champion: championFixture({
+      job_id: "job-backend-a",
+      metrics: {
+        model: "convnext_tiny",
+        primary_metric_label: "Macro-F1",
+        primary_metric_value: 0.82,
+        selection_candidates: [
+          { job_id: "job-backend-a", deployment_readiness_score: 0.82 },
+          { job_id: "job-backend-b", deployment_readiness_score: 0.76 },
+        ],
+      },
+    }),
+    jobs: [
+      jobFixture({ id: "job-backend-a", config: { plan_id: "plan-1", model: "convnext_tiny" }, status: "SUCCEEDED", completed_at: "2026-06-15T12:20:00.000Z" }),
+      jobFixture({ id: "job-backend-b", config: { plan_id: "plan-1", model: "resnet50" }, status: "SUCCEEDED", completed_at: "2026-06-15T12:15:00.000Z" }),
+      jobFixture({ id: "job-running", config: { plan_id: "plan-1", model: "mobilenet_v3" }, status: "RUNNING", started_at: "2026-06-15T12:25:00.000Z", completed_at: "" }),
+    ],
+    runSummaries: [
+      runSummaryFixture({ job_id: "job-backend-a", model: "convnext_tiny", best_macro_f1: 0.82, best_accuracy: 0.86, estimated_cost_usd: 0.02, updated_at: "2026-06-15T12:20:00.000Z" }),
+      runSummaryFixture({ job_id: "job-backend-b", model: "resnet50", best_macro_f1: 0.91, best_accuracy: 0.93, estimated_cost_usd: 0.05, updated_at: "2026-06-15T12:15:00.000Z" }),
+    ],
+    runEvaluations: [
+      runEvaluationFixture({ job_id: "job-backend-a", holistic_scores: { overall_score: 0.82 } }),
+      runEvaluationFixture({ job_id: "job-backend-b", holistic_scores: { overall_score: 0.91 } }),
+    ],
+  });
+
+  const comparison = buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.jobs, detail.champion);
+  const rows = buildMissionRunRows(detail);
+  const summary = buildResultsSummary(detail, comparison, exportDemoFixture());
+
+  assert.deepEqual(comparison.map((row) => row.jobId), ["job-backend-a", "job-backend-b"]);
+  assert.equal(rows[0].id, "job-backend-a");
+  assert.equal(rows[0].candidateRank, 1);
+  assert.equal(summary.championModel, "convnext_tiny");
+  assert.equal(summary.topCandidates[0].jobId, "job-backend-a");
+  assert.equal(rows.at(-1).id, "job-running");
+});
+
+test("classification ranking and hero facts do not use detection mAP ordering", async () => {
+  const { buildChampionComparison, buildMissionRunRows, buildResultsSummary, heroMetricFacts } = await loadMissionModel();
+  const detail = completedChampionDetail({
+    champion: null,
+    championExports: [],
+    jobs: [
+      jobFixture({ id: "job-macro-leader", config: { plan_id: "plan-1", model: "convnext_tiny", task_type: "classification" }, status: "SUCCEEDED" }),
+      jobFixture({ id: "job-map-distractor", config: { plan_id: "plan-1", model: "resnet50", task_type: "classification" }, status: "SUCCEEDED" }),
+    ],
+    runSummaries: [
+      runSummaryFixture({ job_id: "job-macro-leader", model: "convnext_tiny", best_macro_f1: 0.84, best_accuracy: 0.88, best_map50_95: 0.12, estimated_cost_usd: 0.02 }),
+      runSummaryFixture({ job_id: "job-map-distractor", model: "resnet50", best_macro_f1: 0.72, best_accuracy: 0.9, best_map50_95: 0.99, estimated_cost_usd: 0.02 }),
+    ],
+    runEvaluations: [
+      runEvaluationFixture({ job_id: "job-macro-leader", objective_profile: { task_type: "classification", balanced_accuracy: 0.84, accuracy: 0.88 }, holistic_scores: {} }),
+      runEvaluationFixture({ job_id: "job-map-distractor", objective_profile: { task_type: "classification", balanced_accuracy: 0.72, accuracy: 0.9, heldout_test_map50_95: 0.99 }, holistic_scores: {} }),
+    ],
+  });
+
+  const comparison = buildChampionComparison(detail.runSummaries, detail.runEvaluations, detail.jobs, detail.champion);
+  const rows = buildMissionRunRows(detail);
+  const summary = buildResultsSummary(detail, comparison, exportDemoFixture());
+  const facts = heroMetricFacts(rows[0], summary);
+
+  assert.equal(comparison[0].jobId, "job-macro-leader");
+  assert.equal(rows[0].id, "job-macro-leader");
+  assert.equal(summary.topCandidates[0].jobId, "job-macro-leader");
+  assert.equal(summary.topCandidates[0].metricLabel, "Balanced accuracy score");
+  assert.deepEqual(facts.map((fact) => fact.label), ["Balanced accuracy score", "Accuracy", "Cost", "Runtime"]);
+});
 test("demo images put known-correct held-out examples before hard failures", async () => {
   const { demoImageCategory, demoImageCategoryDetail, demoImageTrainingPredictionText, demoImagesFromUnknown } = await loadMissionModel();
   const ordered = demoImagesFromUnknown([
@@ -815,6 +887,9 @@ function comparisonRowFixture(overrides = {}) {
     jobId: "job-1",
     model: "resnet18",
     rankScore: 0.8,
+    backendRank: null,
+    rankSource: "frontend_comparison",
+    runStatus: "SUCCEEDED",
     primaryMetricLabel: "Macro-F1",
     primaryMetricValue: 0.91,
     secondaryMetricLabel: "Accuracy",

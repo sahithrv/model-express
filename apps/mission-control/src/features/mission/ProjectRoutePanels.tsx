@@ -130,6 +130,7 @@ import {
   ActivityCardModel,
   ResultsCandidate,
   ResultsSummary,
+  MissionRunRow,
   ModelImprovementData,
   ExportSummary,
   TelemetryWindowKey,
@@ -201,6 +202,8 @@ import {
   buildMissionStages,
   buildActivityFeed,
   buildResultsSummary,
+  buildMissionRunRows,
+  heroMetricFacts,
   buildExportSummary,
   userFacingActivityText,
   userFacingActionLabel,
@@ -621,25 +624,6 @@ export function MissionRoute({
   );
 }
 
-type MissionRunRow = {
-  id: string;
-  trial: number;
-  model: string;
-  dataset: string;
-  primaryMetricLabel: string;
-  primaryMetricValue: number | null;
-  primaryMetricDisplay: string;
-  map50Display: string;
-  macroF1Display: string;
-  precisionDisplay: string;
-  recallDisplay: string;
-  status: string;
-  statusClass: string;
-  age: string;
-  timestamp: string;
-  isChampion: boolean;
-  isBaseline: boolean;
-};
 
 function ChampionOrbitHero({
   brief,
@@ -656,15 +640,17 @@ function ChampionOrbitHero({
   rows: MissionRunRow[];
   exportSummary: ExportSummary;
 }) {
-  const championRow = rows.find((row) => row.isChampion) ?? rows.find((row) => row.primaryMetricValue !== null) ?? rows[0] ?? null;
+  const leaderJobId = results.topCandidates[0]?.jobId ?? "";
+  const rankedHeroRow = leaderJobId ? rows.find((row) => row.id === leaderJobId) : undefined;
+  const scoredHeroRow = rows.find((row) => row.primaryMetricValue !== null);
+  const heroRow: MissionRunRow | null = rankedHeroRow || scoredHeroRow || (rows.length > 0 ? rows[0] : null);
   const championName = results.championModel && results.championModel !== "No champion yet"
     ? results.championModel
-    : championRow?.model || "Awaiting champion";
-  const datasetName = championRow?.dataset || detail.datasets[0]?.name || selectedProject?.name || "Dataset pending";
-  const updatedAt = detail.champion?.updated_at || championRow?.timestamp || brief.updatedAt;
-  const improving = results.improvementLabel.startsWith("+") || rows.some((row) => row.isChampion);
-  const facts = heroMetricFacts(championRow, results);
-
+    : heroRow?.model || "Awaiting champion";
+  const datasetName = heroRow?.dataset || detail.datasets[0]?.name || selectedProject?.name || "Dataset pending";
+  const updatedAt = heroRow?.timestamp || detail.champion?.updated_at || brief.updatedAt;
+  const improving = results.improvementLabel.startsWith("+") || Boolean(heroRow?.isChampion);
+  const facts = heroMetricFacts(heroRow, results);
   return (
     <section className="champion-orbit-hero">
       <img className="hero-planet-asset" src={missionPlanetAssetUrl} alt="" aria-hidden="true" />
@@ -675,8 +661,8 @@ function ChampionOrbitHero({
           <span className={`mission-green-pill subdued ${improving ? "improving" : "monitoring"}`}>{improving ? "Improving" : exportSummary.statusLabel}</span>
         </div>
         <h3>
-          {championName}
-          <Rocket size={20} aria-hidden="true" />
+          <span className="hero-model-name">{championName}</span>
+          <Rocket className="hero-model-icon" size={20} aria-hidden="true" />
         </h3>
         <div className="hero-primary-metric">
           <small>{results.primaryMetricLabel || brief.bestMetricLabel}</small>
@@ -727,10 +713,10 @@ function PerformanceTrendPanel({ rows, metricLabel, results }: { rows: MissionRu
     .sort((left, right) => timestampSortScore(left.timestamp) - timestampSortScore(right.timestamp));
   const values = chartRows.map((row) => row.primaryMetricValue ?? 0);
   const first = values[0] ?? null;
-  const best = values.length > 0 ? Math.max(...values) : null;
-  const delta = first !== null && best !== null ? best - first : null;
-  const insight = delta !== null && delta > 0
-    ? `Best score improved ${formatMetricNumber(delta)} over baseline`
+  const leaderRow = rows.find((row) => row.primaryMetricValue !== null) ?? null;
+  const leaderDelta = first !== null && leaderRow && leaderRow.primaryMetricValue !== null ? leaderRow.primaryMetricValue - first : null;
+  const insight = leaderRow
+    ? `${leaderRow.model} leads the ranked candidates at ${leaderRow.primaryMetricDisplay}.`
     : chartRows.length > 1
       ? "Comparable trials are available for review"
       : "Waiting for comparable runs";
@@ -744,11 +730,11 @@ function PerformanceTrendPanel({ rows, metricLabel, results }: { rows: MissionRu
         </div>
         <span className="metric-selector-chip">{metricLabel || results.primaryMetricLabel}</span>
       </div>
-      {chartRows.length > 0 ? <MissionTrendChart rows={chartRows} /> : <div className="mission-empty-surface">Scored runs will draw the performance trajectory here.</div>}
+      {chartRows.length > 0 ? <MissionTrendChart rows={chartRows} leaderRow={leaderRow} /> : <div className="mission-empty-surface">Scored runs will draw the performance trajectory here.</div>}
       <div className="trend-insight-card">
         <span><TrendingUp size={22} /></span>
         <div>
-          <strong>{delta !== null && delta > 0 ? "Consistent improvement" : "Evidence building"}</strong>
+          <strong>{leaderDelta !== null && leaderDelta > 0 ? "Leader ahead" : "Evidence building"}</strong>
           <small>{insight}</small>
         </div>
       </div>
@@ -756,7 +742,7 @@ function PerformanceTrendPanel({ rows, metricLabel, results }: { rows: MissionRu
   );
 }
 
-function MissionTrendChart({ rows }: { rows: MissionRunRow[] }) {
+function MissionTrendChart({ rows, leaderRow }: { rows: MissionRunRow[]; leaderRow: MissionRunRow | null }) {
   const width = 620;
   const height = 270;
   const paddingX = 44;
@@ -778,6 +764,8 @@ function MissionTrendChart({ rows }: { rows: MissionRunRow[] }) {
   const allRunsPath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
   const bestPath = bestPoints.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
   const latest = bestPoints[bestPoints.length - 1];
+  const leaderPoint = leaderRow ? points.find((point) => point.row.id === leaderRow.id) ?? null : null;
+  const calloutPoint = leaderPoint ? { ...leaderPoint, value: leaderPoint.row.primaryMetricValue ?? 0 } : latest;
 
   return (
     <div className="mission-chart-wrap">
@@ -803,11 +791,14 @@ function MissionTrendChart({ rows }: { rows: MissionRunRow[] }) {
             <text className="trend-x-label" x={point.x} y={height - 8} textAnchor="middle">{point.row.trial}</text>
           </g>
         ))}
-        {latest && (
-          <g className="trend-callout" transform={`translate(${Math.max(12, latest.x - 38)} ${Math.max(12, latest.y - 62)})`}>
+        {leaderPoint && (
+          <circle className="trend-point leader" cx={leaderPoint.x} cy={leaderPoint.y} r="6" />
+        )}
+        {calloutPoint && (
+          <g className="trend-callout" transform={`translate(${Math.max(12, calloutPoint.x - 38)} ${Math.max(12, calloutPoint.y - 62)})`}>
             <rect width="78" height="48" rx="8" />
-            <text x="10" y="18">{formatChartValue(latest.value)}</text>
-            <text x="10" y="35">Trial {latest.row.trial}</text>
+            <text x="10" y="18">{formatChartValue(calloutPoint.row.primaryMetricValue ?? calloutPoint.value)}</text>
+            <text x="10" y="35">Trial {calloutPoint.row.trial}</text>
           </g>
         )}
       </svg>
@@ -833,18 +824,18 @@ function ExperimentRunsPanel({ rows, metricLabel, onOpenResults }: { rows: Missi
     <section className="experiment-runs-panel">
       <div className="mission-panel-head">
         <div>
-          <small>Experiment runs</small>
+          <small>Ranked candidates</small>
           <strong>{rows.length > 0 ? `${rows.length} trials` : "No trials yet"}</strong>
         </div>
         <button className="mission-link-button" type="button" onClick={onOpenResults}>
-          View All Runs
+          View Models
           <StepForward size={14} />
         </button>
       </div>
       {rows.length > 0 ? (
-        <div className="experiment-runs-table" role="table" aria-label="Experiment runs">
+        <div className="experiment-runs-table" role="table" aria-label="Ranked model candidates">
           <div className="experiment-run-row head" role="row">
-            <span>Trial</span>
+            <span>Rank</span>
             <span>Model</span>
             <span>Dataset</span>
             <span>{metricLabel || "Metric"}</span>
@@ -853,7 +844,7 @@ function ExperimentRunsPanel({ rows, metricLabel, onOpenResults }: { rows: Missi
           </div>
           {visibleRows.map((row) => (
             <div className={`experiment-run-row ${row.isChampion ? "champion" : ""}`} role="row" key={row.id}>
-              <span>{row.trial}{row.isChampion && <Star size={15} />}{row.isBaseline && <small className="baseline-tag">Baseline</small>}</span>
+              <span>{row.candidateRank ? `#${row.candidateRank}` : `T${row.trial}`}{row.isChampion && <Star size={15} />}{row.isBaseline && <small className="baseline-tag">Baseline</small>}</span>
               <span><strong>{row.model}</strong></span>
               <span>{row.dataset}</span>
               <span className="metric-value">{row.primaryMetricDisplay}</span>
@@ -866,7 +857,7 @@ function ExperimentRunsPanel({ rows, metricLabel, onOpenResults }: { rows: Missi
         <div className="mission-empty-surface">Training runs will appear as soon as jobs report metrics.</div>
       )}
       <div className="experiment-runs-footer">
-        <span>Auto-sorting by {metricLabel || "primary metric"}</span>
+        <span>Ranked by Models leaderboard; active runs follow scored candidates.</span>
         <div className="experiment-runs-pager" aria-label="Experiment run pages">
           <span>
             Showing {visibleStart}-{visibleEnd} of {rows.length} trials
@@ -976,74 +967,6 @@ function AgentRail({
   );
 }
 
-function buildMissionRunRows(detail: ProjectDetail): MissionRunRow[] {
-  const jobById = new Map(detail.jobs.map((job) => [job.id, job]));
-  const evaluationByJob = new Map(detail.runEvaluations.map((evaluation) => [evaluation.job_id, evaluation]));
-  const summaryByJob = new Map(detail.runSummaries.map((summary) => [summary.job_id, summary]));
-  const datasetById = new Map(detail.datasets.map((dataset) => [dataset.id, dataset]));
-  const candidateIds = new Set<string>();
-  for (const summary of detail.runSummaries) candidateIds.add(summary.job_id);
-  for (const job of detail.jobs) {
-    if (isTrainingLikeJob(job) || evaluationByJob.has(job.id)) candidateIds.add(job.id);
-  }
-  const chronological = Array.from(candidateIds)
-    .map((jobId) => {
-      const summary = summaryByJob.get(jobId) ?? null;
-      const job = jobById.get(jobId) ?? null;
-      const evaluation = evaluationByJob.get(jobId) ?? null;
-      const timestamp = summary?.updated_at || job?.completed_at || evaluation?.updated_at || job?.started_at || job?.created_at || summary?.created_at || "";
-      return { jobId, summary, job, evaluation, timestamp };
-    })
-    .sort((left, right) => timestampSortScore(left.timestamp) - timestampSortScore(right.timestamp));
-  const trialByJob = new Map(chronological.map((item, index) => [item.jobId, index + 1]));
-
-  return chronological
-    .map((item) => {
-      const metric = runPrimaryMetric(item.summary, item.evaluation, item.job);
-      const datasetId = item.summary?.dataset_id || item.evaluation?.dataset_id || recordString(item.job?.config ?? {}, "dataset_id") || detail.champion?.dataset_id || "";
-      const dataset = datasetById.get(datasetId);
-      const map50 = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "map50"), item.summary?.best_map50, item.summary?.best_accuracy]);
-      const precision = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "precision"), item.summary?.best_precision]);
-      const recall = firstPositiveMetric([yoloMetricFromEvaluation(item.evaluation, "recall"), item.summary?.best_recall]);
-      const macroF1 = firstPositiveMetric([item.summary?.best_macro_f1, recordNumber(item.evaluation?.objective_profile ?? {}, "macro_f1")]);
-      const status = effectiveTrainingRunStatus(item.summary, item.job);
-      return {
-        id: item.jobId,
-        trial: trialByJob.get(item.jobId) ?? 0,
-        model: item.summary?.model || recordString(item.job?.config ?? {}, "model") || item.job?.template || "Training job",
-        dataset: dataset?.name || datasetId || "Dataset pending",
-        primaryMetricLabel: metric.label,
-        primaryMetricValue: metric.value > 0 ? metric.value : null,
-        primaryMetricDisplay: metric.value > 0 ? formatMetricNumber(metric.value) : "-",
-        map50Display: map50 > 0 ? formatMetricNumber(map50) : "-",
-        macroF1Display: macroF1 > 0 ? formatMetricNumber(macroF1) : "-",
-        precisionDisplay: precision > 0 ? formatMetricNumber(precision) : "-",
-        recallDisplay: recall > 0 ? formatMetricNumber(recall) : "-",
-        status,
-        statusClass: classToken(status),
-        age: item.timestamp ? formatRelativeTime(item.timestamp) : "-",
-        timestamp: item.timestamp,
-        isChampion: detail.champion?.job_id === item.jobId,
-        isBaseline: (trialByJob.get(item.jobId) ?? 0) === 1,
-      } satisfies MissionRunRow;
-    })
-    .sort((left, right) => {
-      if (left.isChampion !== right.isChampion) return left.isChampion ? -1 : 1;
-      const leftRunning = ["RUNNING", "ACTIVE", "ASSIGNED", "QUEUED"].includes(left.status);
-      const rightRunning = ["RUNNING", "ACTIVE", "ASSIGNED", "QUEUED"].includes(right.status);
-      if (leftRunning !== rightRunning) return leftRunning ? -1 : 1;
-      return (right.primaryMetricValue ?? -1) - (left.primaryMetricValue ?? -1) || right.trial - left.trial;
-    });
-}
-
-function heroMetricFacts(row: MissionRunRow | null, results: ResultsSummary) {
-  return [
-    { label: "mAP50", value: row?.map50Display && row.map50Display !== "-" ? row.map50Display : results.primaryMetricLabel.includes("mAP") ? results.primaryMetricValue : "-" },
-    { label: "Macro F1", value: row?.macroF1Display || "-" },
-    { label: "Precision", value: row?.precisionDisplay || "-" },
-    { label: "Recall", value: row?.recallDisplay || "-" },
-  ];
-}
 
 function missionLaunchSteps(stages: MissionStage[], progress: MissionBrief["trialProgress"]) {
   const stageById = new Map(stages.map((stage) => [stage.id, stage]));
@@ -1067,16 +990,6 @@ function missionLogIcon(item: ActivityCardModel) {
   return <Database size={15} />;
 }
 
-function isTrainingLikeJob(job: Job) {
-  const values = [job.template, recordString(job.config, "model"), recordString(job.config, "task"), recordString(job.config, "task_type")]
-    .join(" ")
-    .toLowerCase();
-  return values.includes("train") || values.includes("yolo") || values.includes("cnn") || values.includes("transfer") || values.includes("mobilenet") || values.includes("resnet");
-}
-
-function classToken(value: string) {
-  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
-}
 export function MissionEmptyState({
   brief,
   stages,
