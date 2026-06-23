@@ -1,71 +1,77 @@
-﻿# Model Express
+# Model Express
 
-Model Express is a local-first training workbench for computer vision experiments. It helps you turn an image dataset into a repeatable experiment run: upload a dataset, profile it, generate candidate training plans, run experiments on local hardware or Modal GPUs, compare results, select a champion model, export it, and test predictions from the desktop UI.
+Model Express is a cloud-first training workbench for computer vision experiments. The intended way to use it is from the desktop Mission Control app while training jobs run on Modal GPUs.
 
-The project is currently distributed as source code instead of a packaged executable. The setup is intentionally explicit: you run the support services, the orchestrator, and the Mission Control desktop app from the repo.
+You bring an image dataset and a goal. Model Express uploads the dataset, profiles it, builds experiment plans, launches cloud training jobs on Modal, compares the results, selects a champion model, exports it, and lets you test predictions from the UI.
+
+This project is distributed as source code instead of a packaged executable. That is intentional for now: setup is explicit, the moving pieces are visible, and users can inspect or modify the system before running cloud jobs.
+
+Add screenshots here before public release.
+
+This is an early source release, not a bug-free commercial product. If you encounter a reproducible bug, open an issue in the repository's GitHub Issues tab with your operating system, setup path, what you expected, what happened, and the smallest reproduction/log snippet you can share. For feature requests or workflow ideas, start a GitHub Discussion if Discussions are enabled; otherwise open an issue with `Feature request:` in the title and describe the use case, why it matters, and the outcome you want. For usage questions, use GitHub Discussions if enabled. Do not include API keys, Modal tokens, `.env` contents, tunnel URLs, or private dataset files.
 
 ## What This Project Does
 
-Model Express gives you an end-to-end loop for vision model development:
+Model Express gives you an end-to-end cloud training loop for vision model development:
 
 - Creates a project around a dataset and goal.
 - Uploads an image folder into local object storage.
 - Profiles the dataset for class balance, image counts, image dimensions, metadata, annotations, and possible preprocessing issues.
 - Creates experiment plans from the dataset profile and project goal.
-- Runs training jobs through Python workers.
-- Supports local workers for single-machine runs and Modal workers for cloud GPU runs.
-- Tracks training metrics, evaluations, and artifacts.
+- Runs training jobs on Modal GPU workers.
+- Tracks training metrics, evaluations, decisions, and artifacts.
 - Reviews completed experiments and selects a champion model.
 - Exports the champion for downstream use.
 - Provides a Mission Control UI for monitoring jobs, workers, plans, decisions, metrics, exports, and demo predictions.
 
-The default first-run mode is conservative and local-first. Agentic/OpenAI and Modal cloud features are optional.
+Local-only execution exists for smoke tests and development, but it is not the main product path. CPU or laptop training is usually slow and can hide the value of the system. For normal usage, use the cloud profile and Modal.
 
 ## How It Works
 
-Model Express is split into four main pieces:
+Model Express has a local control plane and a cloud execution plane.
 
 | Component | Location | Purpose |
 | --- | --- | --- |
-| Mission Control | `apps/mission-control` | Electron desktop UI. Starts workers, uploads datasets, shows projects, plans, jobs, results, exports, and demos. |
+| Mission Control | `apps/mission-control` | Electron desktop UI. Uploads datasets, starts workers, manages preflight, shows projects, plans, jobs, results, exports, and demos. |
 | Orchestrator | `services/orchestrator` | Go API server. Owns projects, datasets, jobs, workers, plans, automation settings, run state, champion selection, and DB persistence. |
-| Worker | `services/worker` | Python training/runtime worker. Profiles datasets, trains models, reports metrics, evaluates runs, exports champions, and runs demo inference. |
+| Worker / Dispatcher | `services/worker` | Python runtime. In cloud mode it starts a Modal dispatcher, submits Modal jobs, and reports results back to the orchestrator. |
+| Modal GPU workers | Modal cloud | Remote containers that run the actual training, profiling, evaluation, and export work. |
 | Local services | `infra/compose.yaml` | Postgres, MLflow, and MinIO. Postgres stores app state, MLflow tracks runs/artifacts, and MinIO stores uploaded datasets and generated artifacts. |
 
-Basic flow:
+Cloud-first flow:
 
 ```text
 User creates project in Mission Control
         |
         v
-Mission Control uploads dataset folder to MinIO
+Mission Control uploads the dataset folder to local MinIO
         |
         v
 Orchestrator records project, dataset, jobs, plans, and state in Postgres
         |
         v
-Python worker polls orchestrator for jobs
-        |
-        v
-Worker profiles data, trains models, reports metrics/evaluations, exports artifacts
-        |
-        v
-Mission Control displays progress, decisions, champion model, exports, and demo predictions
-```
-
-Optional cloud flow:
-
-```text
 Mission Control starts a Modal dispatcher worker
         |
         v
-Mission Control creates temporary HTTPS tunnels for orchestrator and local MinIO
+Mission Control creates temporary HTTPS tunnels for orchestrator and MinIO
         |
         v
 Modal GPU containers train remotely and call back to the local orchestrator
+        |
+        v
+Mission Control displays progress, metrics, decisions, champion model, exports, and demo predictions
 ```
 
-For Modal, the local tunnel target is HTTP, for example `http://127.0.0.1:8080`, but the URL passed to Modal must be public HTTPS, for example `https://...trycloudflare.com`.
+The local orchestrator and MinIO services listen on local HTTP URLs such as `http://127.0.0.1:8080` and `http://127.0.0.1:9000`. Modal cannot reach those directly. In cloud mode, Mission Control creates public HTTPS tunnel URLs and passes those HTTPS URLs to Modal.
+
+For Modal, this distinction matters:
+
+```text
+Local tunnel target:  http://127.0.0.1:8080
+Modal callback URL:  https://...trycloudflare.com
+```
+
+The first URL is allowed as the local target. The second URL is the one Modal workers must receive.
 
 ## Repository Layout
 
@@ -73,21 +79,21 @@ For Modal, the local tunnel target is HTTP, for example `http://127.0.0.1:8080`,
 model-express/
 +-- apps/mission-control/        Electron + React desktop UI
 +-- services/orchestrator/       Go API server and Postgres-backed orchestration state
-+-- services/worker/             Python worker package for profiling, training, export, and demo inference
++-- services/worker/             Python worker package for Modal dispatch, profiling, training, export, and demo inference
 +-- infra/                       Docker Compose definitions for Postgres, MLflow, and MinIO
 +-- scripts/                     Development and smoke-test helpers
 +-- schemas/                     Shared schema notes
 +-- datasets/                    Local ignored dataset workspace placeholder
 +-- artifacts/                   Local ignored logs/artifact workspace
 +-- exports/                     Local ignored export workspace
-+-- .env.v1.local.example        Recommended local-first environment profile
-+-- .env.v1.cloud.example        Cloud/Modal-oriented environment profile
++-- .env.v1.cloud.example        Recommended cloud-first environment profile
++-- .env.v1.local.example        Local-only fallback profile for smoke tests and development
 +-- .env.example                 Older/common environment example
 ```
 
 ## Prerequisites
 
-Install these before starting from a fresh clone:
+Install these before starting from a fresh clone.
 
 | Dependency | Why it is needed | Check command |
 | --- | --- | --- |
@@ -96,15 +102,12 @@ Install these before starting from a fresh clone:
 | Docker Compose | Included with modern Docker Desktop. | `docker compose version` |
 | Go | Runs the orchestrator. Use the version from `services/orchestrator/go.mod` or newer. | `go version` |
 | Node.js + npm | Runs Mission Control in development mode. Node 22+ is recommended. | `node --version` and `npm --version` |
-| Python 3.11+ | Runs the worker package. | `python --version` or `py -3.11 --version` |
+| Python 3.11+ | Runs the worker/Modal dispatcher package. | `python --version` or `py -3.11 --version` |
+| Modal account | Runs cloud GPU jobs. | Modal dashboard account access |
+| `cloudflared` | Lets Mission Control create HTTPS tunnels for Modal callbacks. | `cloudflared --version` |
+| OpenAI API key | Enables the agentic planning/review path used by the cloud profile. | Key available from your OpenAI account |
 
-Optional cloud dependencies:
-
-| Dependency | Needed when |
-| --- | --- |
-| OpenAI API key | You want LLM/agent planning, visual analysis, memory embeddings, or agent review. |
-| Modal account and auth | You want cloud GPU workers. |
-| `cloudflared` on PATH | You want Mission Control to create automatic HTTPS tunnels for Modal workers against local services. |
+Modal's own getting started docs currently recommend installing the Modal Python package and running `modal setup` or `python -m modal setup` to authenticate: https://modal.com/docs/guide
 
 ## Dataset Format
 
@@ -122,17 +125,21 @@ my-dataset/
     +-- image-001.jpg
 ```
 
-Use normal image files such as `.jpg`, `.jpeg`, `.png`, or `.webp`. Avoid starting with a huge dataset on the first run. A small smoke dataset with 2-5 classes and a few dozen images per class is enough to verify the system.
+Use normal image files such as `.jpg`, `.jpeg`, `.png`, or `.webp`.
+
+For the first Modal run, keep the dataset small enough that you can tell whether the system is working quickly. A smoke dataset with 2-5 classes and a few dozen images per class is enough to verify upload, profiling, planning, Modal dispatch, metrics, champion selection, and export.
 
 Object detection / YOLO-style datasets are supported by the worker path, but classification is the recommended first setup test because it has fewer moving pieces.
 
-## Fresh Clone Setup
+## Fresh Clone Setup: Cloud / Modal Path
 
-The steps below assume you are running from the repo root unless a command says otherwise.
+The steps below are the recommended setup path. They configure Model Express to use Modal by default.
+
+Run commands from the repo root unless a step says otherwise.
 
 ### 1. Clone the repository
 
-Replace the URL with your repo URL if you publish this under a different owner/name.
+Replace the URL with the final public repo URL before publishing.
 
 Windows PowerShell:
 
@@ -148,46 +155,102 @@ git clone https://github.com/YOUR_USERNAME/model-express.git
 cd model-express
 ```
 
-### 2. Create your local environment file
+### 2. Create the cloud environment file
 
-Start with the safe local profile. It disables autonomous execution and cloud features by default.
+Copy the cloud-first profile:
 
 Windows PowerShell:
 
 ```powershell
-Copy-Item .env.v1.local.example .env.local
+Copy-Item .env.v1.cloud.example .env.v1.cloud
 ```
 
 macOS/Linux:
 
 ```bash
-cp .env.v1.local.example .env.local
+cp .env.v1.cloud.example .env.v1.cloud
 ```
 
-You can open `.env.local` and review it, but you should not need to edit it for a local-first run.
+Open `.env.v1.cloud` in an editor.
 
-The important defaults are:
+At minimum, do two things:
+
+1. Set a real OpenAI key:
+
+   ```env
+   OPENAI_API_KEY=replace-with-openai-api-key
+   ```
+
+2. Choose one Modal authentication method.
+
+Option A, env tokens:
 
 ```env
-MODEL_EXPRESS_ORCHESTRATOR_ADDR=127.0.0.1:8080
-MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER=local
-MODEL_EXPRESS_EXECUTION_PROFILE=safe-local
-MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS=false
-MODEL_EXPRESS_AUTO_EXECUTE_PLANS=false
-MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS=false
-MODEL_EXPRESS_MAX_AUTO_WORKERS=1
-MODEL_EXPRESS_LOCAL_MAX_CONCURRENT_JOBS=1
-MODEL_EXPRESS_LLM_ENABLED=false
-MODEL_EXPRESS_AUTOML_ENABLED=false
+MODAL_TOKEN_ID=your-real-modal-token-id
+MODAL_TOKEN_SECRET=your-real-modal-token-secret
 ```
 
-Notes:
+Option B, Modal CLI config:
 
-- `.env.local` is gitignored.
-- The orchestrator and Mission Control load `.env` and `.env.local` automatically from the repo root.
-- If `MODEL_EXPRESS_ENV_FILE` is set, the app loads only that file instead.
+```env
+MODAL_TOKEN_ID=
+MODAL_TOKEN_SECRET=
+```
 
-### 3. Start local support services
+Then authenticate after the worker virtual environment is installed in step 7. Modal will create a user config such as `C:\Users\you\.modal.toml` on Windows or `~/.modal.toml` on macOS/Linux.
+
+Do not leave placeholder values in `.env.v1.cloud`. Placeholder strings are still non-empty strings, and Modal/OpenAI clients may try to use them as real credentials.
+
+### 3. Review the cloud defaults
+
+The cloud profile should keep these values:
+
+```env
+MODEL_EXPRESS_V1_PROFILE=cloud
+MODEL_EXPRESS_EXECUTION_PROFILE=fast-remote
+MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER=modal
+MODEL_EXPRESS_DEFAULT_GPU_TYPE=T4
+MODEL_EXPRESS_MODAL_DEFAULT_GPU_TYPE=T4
+GPU_TYPE=modal
+MODEL_EXPRESS_MODAL_TUNNEL_S3=true
+MODEL_EXPRESS_AGENT_MODE=autonomous
+MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS=true
+MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS=true
+MODEL_EXPRESS_AUTO_EXECUTE_PLANS=true
+MODEL_EXPRESS_BUDGET_CAP_USD=5
+```
+
+For a first public run, keep the budget cap low. Increase it only after the full path works on a small dataset.
+
+### 4. Install `cloudflared`
+
+Mission Control uses `cloudflared` to create temporary HTTPS URLs that Modal can call back into.
+
+After installing it, verify:
+
+Windows PowerShell:
+
+```powershell
+cloudflared --version
+```
+
+macOS/Linux:
+
+```bash
+cloudflared --version
+```
+
+If `cloudflared` is installed but not on PATH, set this in `.env.v1.cloud`:
+
+```env
+MODEL_EXPRESS_CLOUDFLARED_PATH=C:\path\to\cloudflared.exe
+```
+
+Use the real path on your machine.
+
+### 5. Start local support services
+
+Even in cloud mode, the local app still needs Postgres, MLflow, and MinIO.
 
 Start Docker Desktop first. Wait until Docker says it is running.
 
@@ -213,9 +276,11 @@ docker compose -f infra/compose.yaml ps
 
 If a container is still starting, wait a few seconds and run the command again.
 
-### 4. Install the Python worker dependencies
+### 6. Install the Python worker / Modal dispatcher dependencies
 
-Mission Control starts workers with `python -m worker.main` from `services/worker`. It first looks for `services/worker/.venv`, so create that virtual environment explicitly.
+Mission Control starts a Python worker process even for cloud mode. In cloud mode that process acts as the Modal dispatcher.
+
+Create the worker virtual environment explicitly.
 
 Windows PowerShell:
 
@@ -226,6 +291,7 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -e .
 python -c "import worker; print('worker import ok')"
+python -c "import modal; print('modal import ok')"
 cd ..\..
 ```
 
@@ -238,12 +304,13 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
 python -c "import worker; print('worker import ok')"
+python -c "import modal; print('modal import ok')"
 cd ../..
 ```
 
 If `python -m pip install -e .` takes a while, that is expected. The worker installs ML and training dependencies including PyTorch, torchvision, Ultralytics, MLflow, Modal, ONNX, and scikit-learn.
 
-If Python cannot find the worker later, set `MODEL_EXPRESS_PYTHON` in `.env.local` to the full path of the venv Python executable.
+If Mission Control later cannot find Python, set `MODEL_EXPRESS_PYTHON` in `.env.v1.cloud` to the full path of the venv Python executable.
 
 Example for Windows:
 
@@ -251,7 +318,27 @@ Example for Windows:
 MODEL_EXPRESS_PYTHON=C:\Users\you\path\to\model-express\services\worker\.venv\Scripts\python.exe
 ```
 
-### 5. Install Mission Control dependencies
+### 7. Verify Modal auth from the worker venv
+
+From the activated worker venv, run:
+
+```powershell
+python -m modal --version
+```
+
+If you use Modal CLI config instead of env tokens, run:
+
+```powershell
+python -m modal setup
+```
+
+That command should create or update a Modal user config such as `C:\Users\you\.modal.toml` on Windows or `~/.modal.toml` on macOS/Linux.
+
+If you use env tokens instead, make sure `.env.v1.cloud` contains real token values and not placeholders, then skip `python -m modal setup`.
+
+### 8. Install Mission Control dependencies
+
+Windows PowerShell:
 
 ```powershell
 cd apps\mission-control
@@ -267,11 +354,14 @@ npm install
 cd ../..
 ```
 
-### 6. Start the orchestrator
+### 9. Start the orchestrator with the cloud profile
 
 Open a new terminal from the repo root.
 
+Windows PowerShell:
+
 ```powershell
+$env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
 cd services\orchestrator
 go run ./cmd/orchestrator
 ```
@@ -279,16 +369,18 @@ go run ./cmd/orchestrator
 macOS/Linux:
 
 ```bash
+export MODEL_EXPRESS_ENV_FILE=.env.v1.cloud
 cd services/orchestrator
 go run ./cmd/orchestrator
 ```
 
 Expected behavior:
 
-- The orchestrator loads `.env.local` from the repo root.
+- The orchestrator loads `.env.v1.cloud` from the repo root.
 - It connects to Postgres.
 - It applies embedded migrations automatically.
 - It listens on `127.0.0.1:8080` by default.
+- It reports the cloud profile during cloud preflight.
 
 You should see a log line similar to:
 
@@ -310,13 +402,14 @@ macOS/Linux:
 curl http://127.0.0.1:8080/healthz
 ```
 
-### 7. Start Mission Control
+### 10. Start Mission Control with the same cloud profile
 
 Open another terminal from the repo root.
 
 Windows PowerShell:
 
 ```powershell
+$env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
 cd apps\mission-control
 npm run dev
 ```
@@ -324,13 +417,32 @@ npm run dev
 macOS/Linux:
 
 ```bash
+export MODEL_EXPRESS_ENV_FILE=.env.v1.cloud
 cd apps/mission-control
 npm run dev
 ```
 
 This starts Vite and opens the Electron desktop app. Leave this terminal open while using the app.
 
-### 8. Optional: run the API smoke script
+The environment variable matters. If you forget `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud`, the app may run with local defaults instead of the Modal cloud profile.
+
+### 11. Run cloud preflight before the first real dataset
+
+Mission Control runs cloud checks before cloud-sensitive operations. If you see a preflight panel, fix failed checks before launching jobs.
+
+The cloud profile expects:
+
+- `MODEL_EXPRESS_V1_PROFILE=cloud`
+- `MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER=modal`
+- Modal authentication from env tokens or `~/.modal.toml`
+- OpenAI key configured for the agentic workflow
+- `cloudflared` available for automatic tunnels
+- Public HTTPS tunnel URLs created for Modal callbacks
+- S3/MinIO access available to Modal through the automatic MinIO API tunnel
+
+Do not manually set `MODAL_ORCHESTRATOR_URL=http://localhost:8080`. Modal requires a public HTTPS URL. Let Mission Control create the tunnel unless you are intentionally using your own public HTTPS endpoint.
+
+### 12. Optional: run the API smoke script
 
 With Docker services and the orchestrator running, you can run the lightweight smoke script from the repo root:
 
@@ -338,13 +450,13 @@ With Docker services and the orchestrator running, you can run the lightweight s
 .\scripts\orchestrator_smoke.ps1
 ```
 
-This checks health, creates a project, creates a queued job, registers a worker, reports a fake metric, and reads the resulting state. It does not train a real model.
+This checks health, creates a project, creates a queued job, registers a worker, reports a fake metric, and reads the resulting state. It does not train a real model and does not prove Modal training works. It only verifies the local API path.
 
 ## How To Use The System
 
-### 1. Start the app stack
+### 1. Start the cloud stack
 
-Every time you want to use Model Express locally:
+Every time you want to use Model Express in the intended mode:
 
 1. Start Docker Desktop.
 2. Start support services:
@@ -356,6 +468,7 @@ Every time you want to use Model Express locally:
 3. Start the orchestrator in one terminal:
 
    ```powershell
+   $env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
    cd services\orchestrator
    go run ./cmd/orchestrator
    ```
@@ -363,17 +476,24 @@ Every time you want to use Model Express locally:
 4. Start Mission Control in another terminal:
 
    ```powershell
+   $env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
    cd apps\mission-control
    npm run dev
    ```
 
-If the app cannot connect, check that `http://127.0.0.1:8080/healthz` responds.
+5. Confirm the orchestrator health endpoint responds:
+
+   ```powershell
+   Invoke-RestMethod http://127.0.0.1:8080/healthz
+   ```
+
+If the app behaves like local mode, close both terminals and restart them with `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud` set.
 
 ### 2. Create a project and upload a dataset
 
 In Mission Control:
 
-1. Click the new project / new mission control.
+1. Click `New Project`.
 2. Enter a mission name.
    Example: `Surface defect classifier`.
 3. Enter a goal.
@@ -382,7 +502,7 @@ In Mission Control:
 5. Select your dataset folder.
 6. Review the dataset preflight result.
    - If it says ready, continue.
-   - If it warns about file count, size, or invalid files, decide whether to fix the dataset or continue.
+   - If it warns about file count, size, or invalid files, fix the dataset before spending Modal budget.
 7. Click `Create Project`.
 
 What happens behind the scenes:
@@ -391,12 +511,14 @@ What happens behind the scenes:
 2. Mission Control zips the selected dataset folder.
 3. Mission Control uploads the ZIP to local MinIO.
 4. Mission Control records the dataset in the orchestrator.
-5. Mission Control starts a profiling worker.
-6. The worker profiles the dataset and reports the result back to the orchestrator.
+5. Mission Control starts cloud preflight as needed.
+6. Mission Control starts the Modal dispatcher worker.
+7. The dispatcher submits profiling/training work to Modal.
+8. Modal workers report results back through the public HTTPS orchestrator tunnel.
 
 Wait until the dataset status becomes `PROFILED`. The Datasets view will then show class balance, counts, metadata status, and dataset intelligence.
 
-### 3. Review the dataset
+### 3. Review the dataset before spending more cloud budget
 
 Open the Datasets tab and inspect:
 
@@ -407,7 +529,7 @@ Open the Datasets tab and inspect:
 - Visual analysis coverage if enabled.
 - Warnings about corrupted images, imbalance, annotations, or preprocessing needs.
 
-Do not start with large cloud runs until the dataset profile looks sane.
+Do not start larger Modal runs until the dataset profile looks sane. Bad labels or broken folder structure will waste GPU time.
 
 ### 4. Review or execute an experiment plan
 
@@ -423,28 +545,34 @@ A plan contains:
 - Preprocessing and augmentation settings.
 - Backend validation warnings.
 
-For local-first usage:
+In the cloud profile, Modal should be the default training provider.
 
-1. Keep automation settings conservative.
-2. Review the plan first.
-3. Click `Execute Plan` when you are ready.
-4. Mission Control queues training jobs and starts local worker processes.
-5. Watch jobs move from queued to assigned/running/completed.
+To run the plan:
 
-If workers are not running, click `Resume Work`. Mission Control will try to restart worker processes for open project work.
+1. Confirm the plan is using Modal or a Modal GPU type.
+2. Confirm the budget cap is acceptable.
+3. Click `Execute Plan`.
+4. Mission Control runs cloud preflight if needed.
+5. Mission Control creates HTTPS tunnels for the orchestrator and MinIO API.
+6. Mission Control starts the Modal dispatcher.
+7. The dispatcher submits remote training jobs to Modal.
+8. Watch jobs move from queued to assigned/running/completed.
 
-### 5. Monitor training
+If workers are not running, click `Resume Work`. Mission Control will try to restart the Modal dispatcher for open project work.
+
+### 5. Monitor Modal training
 
 During execution, watch these areas:
 
 - Activity stream: high-level run progress.
 - Jobs: queued, running, succeeded, failed jobs.
-- Workers: active local or Modal workers.
+- Workers: local dispatcher and remote Modal activity.
 - Metrics: epoch metrics and final metrics.
 - Evaluations: run-level evaluation summaries.
-- Agent decisions: review decisions and follow-up reasoning when agent features are enabled.
+- Agent decisions: review decisions and follow-up reasoning.
+- Budget/cost indicators: make sure the run stays within your intended cap.
 
-For local runs, training speed depends on your machine. CPU-only runs can be slow. Start with small datasets and low worker counts.
+Training speed and cost depend on dataset size, model choice, GPU type, and number of follow-up rounds. Start with T4 and a small dataset before using larger GPUs.
 
 ### 6. Review completed runs and select a champion
 
@@ -459,135 +587,106 @@ After jobs complete, Model Express compares successful runs and records champion
 
 If no champion appears, check:
 
-- Did at least one training job succeed?
+- Did at least one Modal training job succeed?
 - Did the worker report a training run summary and evaluation?
 - Are jobs still running or queued?
+- Did cloud preflight fail?
 - Did the plan get cancelled or fail?
 
-### 7. Schedule follow-up experiments
+### 7. Let the agent schedule follow-up experiments
 
-If you want another round:
+In the cloud profile, follow-up automation is enabled by default:
+
+```env
+MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS=true
+MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS=true
+MODEL_EXPRESS_AUTO_EXECUTE_PLANS=true
+MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS=5
+```
+
+You can still review what happened in the UI.
+
+Manual flow:
 
 1. Click `Review Experiments` to have the reviewer inspect completed runs.
 2. If the reviewer recommends more work, click `Schedule Follow-up`.
 3. Mission Control queues a follow-up plan.
-4. Execute the follow-up plan.
+4. Execute the follow-up plan, or let cloud automation execute it when enabled.
 
-In the safe local profile, auto-followups and auto-execution are off by default. You stay in control.
+For first-time users, keep `MODEL_EXPRESS_BUDGET_CAP_USD` low and raise it only after the workflow is proven.
 
 ### 8. Export and test the champion
 
 When a champion is available:
 
-1. Open the Test / Export view.
+1. Open the `Test / Export` view.
 2. Request an ONNX export.
-3. Mission Control queues the export job and starts a worker if needed.
-4. Wait for export status to become ready.
-5. Use the demo prediction controls to run sample images or a custom image.
-6. Save/export the portable bundle when available.
+3. Mission Control queues the export job.
+4. The Modal dispatcher starts export work when needed.
+5. Wait for export status to become ready.
+6. Use the demo prediction controls to run sample images or a custom image.
+7. Save/export the portable bundle when available.
 
 The demo path can use browser ONNX runtime for compatible exports, or the local Python worker runtime for export formats that need Python-side inference.
 
-## Optional Cloud / Modal Setup
+## Local-Only Mode
 
-Use the local setup first. Add Modal only after a local project can upload, profile, and run at least a small job.
+Local-only mode is available, but it is not the recommended user path.
 
-Cloud mode needs more moving pieces:
+Use local-only mode only when:
 
-- Modal credentials.
-- OpenAI key if using agent/LLM features.
-- Public HTTPS callback URL for the orchestrator.
-- Public HTTPS S3 endpoint or a temporary tunnel for local MinIO.
-- `cloudflared` installed if you want Mission Control automatic tunnels.
+- You are developing the app.
+- You need a quick smoke test without a Modal account.
+- You are debugging local worker behavior.
+- You intentionally want to avoid cloud cost.
 
-### Modal prerequisites
-
-1. Create a Modal account.
-2. Authenticate Modal locally using Modal's setup flow, or set:
-
-   ```env
-   MODAL_TOKEN_ID=replace-with-modal-token-id
-   MODAL_TOKEN_SECRET=replace-with-modal-token-secret
-   ```
-
-3. Install `cloudflared` and ensure this works:
-
-   ```powershell
-   cloudflared --version
-   ```
-
-4. Add OpenAI if using LLM features:
-
-   ```env
-   OPENAI_API_KEY=replace-with-openai-api-key
-   ```
-
-### Use the cloud example profile
-
-Copy the cloud profile only when you are ready to test Modal:
+To run local-only mode, copy the local profile:
 
 Windows PowerShell:
 
 ```powershell
-Copy-Item .env.v1.cloud.example .env.v1.cloud
+Copy-Item .env.v1.local.example .env.local
 ```
 
 macOS/Linux:
 
 ```bash
-cp .env.v1.cloud.example .env.v1.cloud
+cp .env.v1.local.example .env.local
 ```
 
-Then edit `.env.v1.cloud` and fill in at least:
+Then start Docker services, the orchestrator, and Mission Control without setting `MODEL_EXPRESS_ENV_FILE`.
+
+Local mode defaults to:
 
 ```env
-MODAL_TOKEN_ID=replace-with-modal-token-id
-MODAL_TOKEN_SECRET=replace-with-modal-token-secret
-OPENAI_API_KEY=replace-with-openai-api-key
+MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER=local
+MODEL_EXPRESS_EXECUTION_PROFILE=safe-local
+MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS=false
+MODEL_EXPRESS_AUTO_EXECUTE_PLANS=false
+MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS=false
 ```
 
-Start the orchestrator and Mission Control with that env file selected:
+Expect local training to be slow on CPU-only machines. It is not the path this README optimizes for.
 
-Windows PowerShell:
+## Cloud Configuration Guide
 
-```powershell
-$env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
-```
+Start with `.env.v1.cloud.example`. These are the settings most users should understand first:
 
-macOS/Linux:
-
-```bash
-export MODEL_EXPRESS_ENV_FILE=.env.v1.cloud
-```
-
-Then start the orchestrator and Mission Control from terminals that have that variable set.
-
-### Automatic tunnels
-
-When Modal workers are selected and no explicit public URLs are configured, Mission Control can create temporary Cloudflare tunnels:
-
-- Local orchestrator target: `http://127.0.0.1:8080`
-- Local MinIO target: `http://127.0.0.1:9000`
-- Modal receives public HTTPS URLs generated by `cloudflared`
-
-Do not expose Postgres, MLflow, or the MinIO console to Modal. The app is designed to tunnel only the orchestrator API and MinIO API when needed.
-
-## Configuration Guide
-
-Start with `.env.v1.local.example`. These are the settings most users should understand first:
-
-| Variable | First-run value | Meaning |
+| Variable | Recommended value | Meaning |
 | --- | --- | --- |
-| `MODEL_EXPRESS_ORCHESTRATOR_ADDR` | `127.0.0.1:8080` | Address for the Go API server. |
-| `MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER` | `local` | Use local Python workers by default. |
-| `MODEL_EXPRESS_EXECUTION_PROFILE` | `safe-local` | Conservative single-machine behavior. |
-| `GPU_TYPE` | `local` | Worker type label for local workers. |
-| `MODEL_EXPRESS_MAX_AUTO_WORKERS` | `1` | Avoids launching too many workers on a laptop. |
-| `MODEL_EXPRESS_LOCAL_MAX_CONCURRENT_JOBS` | `1` | One local training job at a time. |
-| `MLFLOW_TRACKING_URI` | `http://127.0.0.1:5000` | Local MLflow server. |
-| `S3_ENDPOINT_URL` | `http://127.0.0.1:9000` | Local MinIO API. |
-| `S3_BUCKET` | `model-express` | Bucket used for datasets/artifacts. |
-| `MODEL_EXPRESS_LLM_ENABLED` | `false` | Keeps OpenAI/agent features off for first run. |
+| `MODEL_EXPRESS_V1_PROFILE` | `cloud` | Enables the cloud profile expected by preflight. |
+| `MODEL_EXPRESS_ORCHESTRATOR_ADDR` | `127.0.0.1:8080` | Local address for the Go API server. |
+| `MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE` | `true` | Allows authenticated public tunnel callbacks. |
+| `MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER` | `modal` | Uses Modal workers by default. |
+| `MODEL_EXPRESS_EXECUTION_PROFILE` | `fast-remote` | Cloud-oriented execution profile. |
+| `MODEL_EXPRESS_DEFAULT_GPU_TYPE` | `T4` | Conservative first GPU choice. |
+| `MODEL_EXPRESS_MODAL_DEFAULT_GPU_TYPE` | `T4` | Modal default GPU choice. |
+| `MODEL_EXPRESS_MODAL_TUNNEL_S3` | `true` | Allows Mission Control to tunnel local MinIO API to Modal. |
+| `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` | real values or blank | Use real env tokens, or leave blank when using Modal CLI config. |
+| `OPENAI_API_KEY` | real value | Enables agentic planning/review and visual analysis. |
+| `MODEL_EXPRESS_BUDGET_CAP_USD` | `5` for first run | Keeps the first cloud run bounded. |
+| `MODEL_EXPRESS_MAX_AUTO_WORKERS` | `1` for first run | Avoids launching too much cloud work at once. |
+| `MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS` | `5` by default | Controls autonomous follow-up depth. |
 
 Do not start by copying every variable from a development `.env.local`. Most knobs are advanced tuning flags and are not needed for a new user.
 
@@ -609,6 +708,30 @@ Check orchestrator health:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8080/healthz
+```
+
+Start orchestrator in cloud mode:
+
+```powershell
+$env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
+cd services\orchestrator
+go run ./cmd/orchestrator
+```
+
+Start Mission Control in cloud mode:
+
+```powershell
+$env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
+cd apps\mission-control
+npm run dev
+```
+
+Check Modal from the worker venv:
+
+```powershell
+cd services\worker
+.\.venv\Scripts\Activate.ps1
+python -m modal --version
 ```
 
 Run orchestrator tests:
@@ -640,6 +763,81 @@ Run API smoke test:
 
 ## Troubleshooting
 
+### The app is using local mode instead of Modal
+
+Most likely `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud` was not set in the terminal that started the orchestrator or Mission Control.
+
+Fix:
+
+1. Stop the orchestrator.
+2. Stop Mission Control.
+3. Restart both terminals with:
+
+   ```powershell
+   $env:MODEL_EXPRESS_ENV_FILE='.env.v1.cloud'
+   ```
+
+4. Start the orchestrator and Mission Control again.
+
+### Modal authentication fails
+
+Model Express checks Modal auth in this order:
+
+1. `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`
+2. `MODAL_PROFILE`
+3. `MODAL_CONFIG_PATH`
+4. `~/.modal.toml`
+
+Fix options:
+
+- Put real token values in `.env.v1.cloud`.
+- Or run `python -m modal setup` and blank out `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` in `.env.v1.cloud`.
+- Do not leave `replace-with-modal-token-id` or `replace-with-modal-token-secret` as values.
+
+### Modal preflight fails because `cloudflared` is missing
+
+Install `cloudflared` and make sure this works:
+
+```powershell
+cloudflared --version
+```
+
+If it is installed but not on PATH, set:
+
+```env
+MODEL_EXPRESS_CLOUDFLARED_PATH=C:\path\to\cloudflared.exe
+```
+
+### Modal job says localhost or HTTP is not allowed
+
+Modal cannot call `http://localhost:8080` on your computer. That address is only valid as the local tunnel target.
+
+For Modal workers, the callback URL must be public HTTPS. Use Mission Control automatic tunnels with `cloudflared`, or set:
+
+```env
+MODAL_ORCHESTRATOR_URL=https://your-public-orchestrator-url.example.com
+MODAL_S3_ENDPOINT_URL=https://your-public-s3-url.example.com
+```
+
+Do not set either of those to `http://localhost:...`.
+
+### Modal cannot reach MinIO or artifacts fail to upload
+
+The cloud profile expects Mission Control to tunnel local MinIO's API port to Modal:
+
+```env
+MODEL_EXPRESS_MODAL_TUNNEL_S3=true
+S3_ENDPOINT_URL=http://127.0.0.1:9000
+```
+
+Check:
+
+- Docker services are running.
+- MinIO is reachable locally at `http://127.0.0.1:9000`.
+- `cloudflared` is installed.
+- `MODEL_EXPRESS_MODAL_TUNNEL_S3=true` is present in `.env.v1.cloud`.
+- You did not manually set `MODAL_S3_ENDPOINT_URL` to a local HTTP URL.
+
 ### Orchestrator fails to start with a Postgres connection error
 
 Postgres is not running or Docker Desktop is not ready.
@@ -663,7 +861,7 @@ Invoke-RestMethod http://127.0.0.1:8080/healthz
 
 If that fails, restart the orchestrator. If it succeeds, make sure Mission Control is using `http://127.0.0.1:8080` as its base URL.
 
-### Worker does not start
+### Worker or Modal dispatcher does not start
 
 The most common cause is missing Python worker dependencies.
 
@@ -673,6 +871,7 @@ Check:
 cd services\worker
 .\.venv\Scripts\Activate.ps1
 python -c "import worker; print('worker import ok')"
+python -c "import modal; print('modal import ok')"
 ```
 
 If that fails, reinstall:
@@ -692,36 +891,33 @@ docker compose -f infra/compose.yaml ps
 
 Also check dataset size and file count. Start with a small dataset first.
 
-### Modal job says localhost or HTTP is not allowed
+### Modal costs are higher than expected
 
-Modal cannot call `http://localhost:8080` on your computer. That address is only valid as the local tunnel target.
-
-For Modal workers, the callback URL must be public HTTPS. Use Mission Control automatic tunnels with `cloudflared`, or set:
+Lower the first-run budget and parallelism:
 
 ```env
-MODAL_ORCHESTRATOR_URL=https://your-public-orchestrator-url.example.com
-MODAL_S3_ENDPOINT_URL=https://your-public-s3-url.example.com
+MODEL_EXPRESS_BUDGET_CAP_USD=2
+MODEL_EXPRESS_MAX_AUTO_WORKERS=1
+MODEL_EXPRESS_MODAL_DISPATCHER_SLOTS=1
+MODEL_EXPRESS_MODAL_BATCH_MAX_TRIALS=1
+MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS=1
 ```
 
-### Modal preflight fails because `cloudflared` is missing
-
-Install `cloudflared` and make sure `cloudflared --version` works. If it is installed but not on PATH, set:
-
-```env
-MODEL_EXPRESS_CLOUDFLARED_PATH=C:\path\to\cloudflared.exe
-```
-
-### Local training is slow
-
-That is expected on CPU or low-end GPUs. Use a smaller dataset, fewer epochs, one worker, and a lightweight model for the first run. Modal GPU workers are the intended path for faster cloud execution.
+Use T4 for initial tests before trying larger GPUs.
 
 ## Development Notes
 
-- Generated datasets, artifacts, exports, local DB backups, logs, `.env.local`, virtual environments, and node modules are gitignored.
-- The root README should stay user-facing. Planning docs, agent context dumps, and private release notes should not be part of the public release surface.
+- Generated datasets, artifacts, exports, local DB backups, logs, `.env.local`, `.env.v1.cloud`, virtual environments, and node modules are gitignored.
+- The root README should stay user-facing and cloud-first.
+- Planning docs, agent context dumps, and private release notes should not be part of the public release surface.
 - Before publishing, replace `YOUR_USERNAME/model-express.git` with the final public repository URL.
-- Add screenshots later near the top of the README after the project summary.
+- Add screenshots near the top of the README after the project summary.
 
 ## License
 
 Add the project license before public release.
+
+
+
+
+
