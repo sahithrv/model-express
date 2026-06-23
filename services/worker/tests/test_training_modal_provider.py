@@ -175,6 +175,58 @@ class _FakeClient:
         return {"ok": True}
 
 
+def test_modal_orchestrator_url_uses_remote_session_before_local_client(monkeypatch):
+    monkeypatch.delenv("MODAL_ORCHESTRATOR_URL", raising=False)
+    monkeypatch.delenv("MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL", raising=False)
+    client = _FakeClient()
+    client.base_url = "http://localhost:8080"
+
+    assert (
+        modal_provider._modal_orchestrator_url(
+            client,
+            {
+                "config": {
+                    "remote_training_session": {
+                        "public_callback_url": "https://orchestrator.example.test/",
+                    }
+                }
+            },
+        )
+        == "https://orchestrator.example.test"
+    )
+
+
+def test_modal_orchestrator_url_requires_public_url_instead_of_local_default(monkeypatch):
+    monkeypatch.delenv("MODAL_ORCHESTRATOR_URL", raising=False)
+    monkeypatch.delenv("MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL", raising=False)
+    client = _FakeClient()
+    client.base_url = "http://localhost:8080"
+
+    with pytest.raises(ValueError, match="MODAL_ORCHESTRATOR_URL is required"):
+        modal_provider._modal_orchestrator_url(client, {"config": {}})
+
+
+def test_modal_storage_payload_uses_remote_session_public_storage_before_local_env(monkeypatch):
+    monkeypatch.delenv("MODAL_S3_ENDPOINT_URL", raising=False)
+    monkeypatch.delenv("MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL", raising=False)
+    monkeypatch.setenv("S3_ENDPOINT_URL", "http://localhost:9000")
+
+    payload = modal_provider._modal_storage_payload(
+        {
+            "id": "job_1",
+            "config": {
+                "remote_training_session": {
+                    "public_storage_url": "https://storage.example.test/",
+                    "storage_prefix": "model-express/artifacts/job_1",
+                }
+            },
+        },
+        {"storage_uri": "s3://bucket/dataset.zip"},
+    )
+
+    assert payload["s3_endpoint_url"] == "https://storage.example.test"
+
+
 def test_modal_training_invocation_error_reports_retryable_failure(monkeypatch):
     def remote(_payload: dict):
         raise RuntimeError("container exited unexpectedly")

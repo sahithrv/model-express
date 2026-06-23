@@ -95,7 +95,7 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
 
     dataset = client.get_dataset(str(config["dataset_id"]))
 
-    orchestrator_url = _modal_orchestrator_url(client)
+    orchestrator_url = _modal_orchestrator_url(client, job_payload)
 
     payload = {
         "job": job_payload,
@@ -221,7 +221,7 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
 
     try:
         dataset = client.get_dataset(str(batch["dataset_id"]))
-        orchestrator_url = _modal_orchestrator_url(client)
+        orchestrator_url = _modal_orchestrator_url(client, jobs[0] if jobs else None)
         tagged_jobs = _jobs_with_modal_batch_metadata(jobs, batch, "remote_batch_submitted")
         enriched_jobs = []
         resources_by_job = {}
@@ -490,10 +490,29 @@ def run_modal_dataset_materialization(client: OrchestratorClient, job: dict) -> 
     return result
 
 
-def _modal_orchestrator_url(client: OrchestratorClient) -> str:
-    orchestrator_url = os.getenv("MODAL_ORCHESTRATOR_URL", client.base_url)
-    _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
-    return orchestrator_url
+def _modal_orchestrator_url(client: OrchestratorClient, job: dict | None = None) -> str:
+    orchestrator_url = _first_non_empty(
+        *_modal_job_public_url_candidates(
+            job,
+            session_keys=("public_callback_url", "orchestrator_public_url"),
+            config_keys=("public_callback_url", "orchestrator_public_url", "modal_orchestrator_url"),
+        ),
+        os.getenv("MODAL_ORCHESTRATOR_URL"),
+        os.getenv("MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL"),
+    )
+    if orchestrator_url:
+        _require_remote_reachable_url("MODAL_ORCHESTRATOR_URL", orchestrator_url)
+        return orchestrator_url.rstrip("/")
+
+    try:
+        _require_remote_reachable_url("ORCHESTRATOR_URL", client.base_url)
+    except ValueError as exc:
+        raise ValueError(
+            "MODAL_ORCHESTRATOR_URL is required for Modal workers when ORCHESTRATOR_URL is "
+            "local or not public HTTPS. Start through Mission Control automatic tunnels or set "
+            "MODAL_ORCHESTRATOR_URL to the public HTTPS orchestrator URL."
+        ) from exc
+    return client.base_url.rstrip("/")
 
 
 def _modal_storage_payload(job: dict, dataset: dict) -> dict:
@@ -501,7 +520,7 @@ def _modal_storage_payload(job: dict, dataset: dict) -> dict:
 
 
 def _modal_storage_payload_for_jobs(jobs: list[dict], dataset: dict) -> dict:
-    s3_endpoint_url = os.getenv("MODAL_S3_ENDPOINT_URL", os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"))
+    s3_endpoint_url = _modal_s3_endpoint_url(jobs)
     _require_remote_reachable_url("MODAL_S3_ENDPOINT_URL", s3_endpoint_url)
     credentials = _modal_storage_credentials()
     scope = _modal_storage_scope(jobs, dataset)
@@ -510,6 +529,48 @@ def _modal_storage_payload_for_jobs(jobs: list[dict], dataset: dict) -> dict:
         **credentials,
         "storage_scope": scope,
     }
+
+
+def _modal_s3_endpoint_url(jobs: list[dict]) -> str:
+    s3_endpoint_url = _first_non_empty(
+        *(
+            candidate
+            for job in jobs
+            for candidate in _modal_job_public_url_candidates(
+                job,
+                session_keys=("public_storage_url", "storage_public_url"),
+                config_keys=("public_storage_url", "storage_public_url", "modal_s3_endpoint_url"),
+            )
+        ),
+        os.getenv("MODAL_S3_ENDPOINT_URL"),
+        os.getenv("MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL"),
+        os.getenv("S3_ENDPOINT_URL"),
+    )
+    if not s3_endpoint_url:
+        raise ValueError(
+            "MODAL_S3_ENDPOINT_URL is required for Modal workers. Start through Mission Control "
+            "automatic tunnels, set MODAL_S3_ENDPOINT_URL, or use a public HTTPS S3 endpoint."
+        )
+    return s3_endpoint_url.rstrip("/")
+
+
+def _modal_job_public_url_candidates(
+    job: dict | None,
+    *,
+    session_keys: tuple[str, ...],
+    config_keys: tuple[str, ...],
+) -> list[object]:
+    config = job.get("config") if isinstance(job, dict) and isinstance(job.get("config"), dict) else {}
+    session = config.get("remote_training_session") if isinstance(config.get("remote_training_session"), dict) else {}
+    return [*(session.get(key) for key in session_keys), *(config.get(key) for key in config_keys)]
+
+
+def _first_non_empty(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _modal_storage_credentials() -> dict:
