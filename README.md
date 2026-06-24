@@ -1,12 +1,10 @@
 # Model Express
 
-Model Express is a cloud-first training workbench for computer vision experiments. The intended way to use it is from the desktop Mission Control app while training jobs run on Modal GPUs.
+Model Express is a cloud training workbench for computer vision experiments. The intended way to use it is from the desktop Mission Control app while training jobs run on Modal GPUs.
 
 You bring an image dataset and a goal. Model Express uploads the dataset, profiles it, builds experiment plans, launches cloud training jobs on Modal, compares the results, selects a champion model, exports it, and lets you test predictions from the UI.
 
 This project is distributed as source code instead of a packaged executable. That is intentional for now: setup is explicit, the moving pieces are visible, and users can inspect or modify the system before running cloud jobs.
-
-Add screenshots here before public release.
 
 This is an early source release, not a bug-free commercial product. If you encounter a reproducible bug, open an issue in the repository's GitHub Issues tab with your operating system, setup path, what you expected, what happened, and the smallest reproduction/log snippet you can share. For feature requests or workflow ideas, start a GitHub Discussion if Discussions are enabled; otherwise open an issue with `Feature request:` in the title and describe the use case, why it matters, and the outcome you want. For usage questions, use GitHub Discussions if enabled. Do not include API keys, Modal tokens, `.env` contents, tunnel URLs, or private dataset files.
 
@@ -24,7 +22,7 @@ Model Express gives you an end-to-end cloud training loop for vision model devel
 - Exports the champion for downstream use.
 - Provides a Mission Control UI for monitoring jobs, workers, plans, decisions, metrics, exports, and demo predictions.
 
-Local-only execution exists for smoke tests and development, but it is not the main product path. CPU or laptop training is usually slow and can hide the value of the system. For normal usage, use the cloud profile and Modal.
+This README documents the supported user path: Modal cloud training. Your machine still runs the local control plane, Postgres, and temporary tunnels, but training, profiling, evaluation, and export work are dispatched to Modal.
 
 ## How It Works
 
@@ -36,9 +34,9 @@ Model Express has a local control plane and a cloud execution plane.
 | Orchestrator | `services/orchestrator` | Go API server. Owns projects, datasets, jobs, workers, plans, automation settings, run state, champion selection, and DB persistence. |
 | Worker / Dispatcher | `services/worker` | Python runtime. In cloud mode it starts a Modal dispatcher, submits Modal jobs, and reports results back to the orchestrator. |
 | Modal GPU workers | Modal cloud | Remote containers that run the actual training, profiling, evaluation, and export work. |
-| Local services | `infra/compose.yaml` | Postgres, MLflow, and MinIO. Postgres stores app state, MLflow tracks runs/artifacts, and MinIO stores uploaded datasets and generated artifacts. |
+| Local support services | `infra/compose.yaml` | Postgres stores app state. Mission Control manages local MinIO for dataset and artifact object storage, then tunnels only the MinIO API to Modal when needed. |
 
-Cloud-first flow:
+Modal cloud flow:
 
 ```text
 User creates project in Mission Control
@@ -86,9 +84,7 @@ model-express/
 +-- datasets/                    Local ignored dataset workspace placeholder
 +-- artifacts/                   Local ignored logs/artifact workspace
 +-- exports/                     Local ignored export workspace
-+-- .env.v1.cloud.example        Recommended cloud-first environment profile
-+-- .env.v1.local.example        Local-only fallback profile for smoke tests and development
-+-- .env.example                 Older/common environment example
++-- .env.v1.cloud.example        Recommended Modal cloud environment profile
 ```
 
 ## Prerequisites
@@ -98,7 +94,7 @@ Install these before starting from a fresh clone.
 | Dependency | Why it is needed | Check command |
 | --- | --- | --- |
 | Git | Clone the repository. | `git --version` |
-| Docker Desktop | Runs Postgres, MLflow, and MinIO through Docker Compose. | `docker version` |
+| Docker Desktop | Runs Postgres before startup; Mission Control manages MinIO when datasets or Modal jobs need it. | `docker version` |
 | Docker Compose | Included with modern Docker Desktop. | `docker compose version` |
 | Go | Runs the orchestrator. Use the version from `services/orchestrator/go.mod` or newer. | `go version` |
 | Node.js + npm | Runs Mission Control in development mode. Node 22+ is recommended. | `node --version` and `npm --version` |
@@ -318,25 +314,25 @@ Run commands from the repo root unless a step says otherwise.
 
 ### 1. Clone the repository
 
-Replace the URL with the final public repo URL before publishing.
+Use the repository URL from the GitHub `Code` menu.
 
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/YOUR_USERNAME/model-express.git
+git clone <repository-url>
 cd model-express
 ```
 
 macOS/Linux:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/model-express.git
+git clone <repository-url>
 cd model-express
 ```
 
 ### 2. Create the cloud environment file
 
-Copy the cloud-first profile:
+Copy the Modal cloud profile:
 
 Windows PowerShell:
 
@@ -352,15 +348,23 @@ cp .env.v1.cloud.example .env.v1.cloud
 
 Open `.env.v1.cloud` in an editor.
 
-At minimum, do two things:
+At minimum, set one OpenAI key and choose one Modal authentication method.
 
-1. Set a real OpenAI key:
+Set your OpenAI key once:
 
-   ```env
-   OPENAI_API_KEY=replace-with-openai-api-key
-   ```
+```env
+OPENAI_API_KEY=replace-with-openai-api-key
+```
 
-2. Choose one Modal authentication method.
+Leave the product-specific OpenAI key overrides blank unless you intentionally want separate keys:
+
+```env
+MODEL_EXPRESS_LLM_API_KEY=
+MODEL_EXPRESS_VISUAL_LLM_API_KEY=
+MODEL_EXPRESS_MEMORY_EMBEDDING_API_KEY=
+```
+
+Choose one Modal authentication method.
 
 Option A, env tokens:
 
@@ -377,6 +381,10 @@ MODAL_TOKEN_SECRET=
 ```
 
 Then authenticate after the worker virtual environment is installed in step 7. Modal will create a user config such as `C:\Users\you\.modal.toml` on Windows or `~/.modal.toml` on macOS/Linux.
+
+Do not add `MODEL_EXPRESS_API_TOKEN` to `.env.v1.cloud`. Mission Control and the orchestrator generate and persist the local Model Express API token automatically.
+
+Do not fill in blank generated-runtime values such as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `MODEL_EXPRESS_MODAL_AWS_ACCESS_KEY_ID`, or `MODEL_EXPRESS_MODAL_AWS_SECRET_ACCESS_KEY`. Mission Control generates local MinIO credentials and passes the right values to Modal through the managed tunnel.
 
 Do not leave placeholder values in `.env.v1.cloud`. Placeholder strings are still non-empty strings, and Modal/OpenAI clients may try to use them as real credentials.
 
@@ -427,33 +435,31 @@ MODEL_EXPRESS_CLOUDFLARED_PATH=C:\path\to\cloudflared.exe
 
 Use the real path on your machine.
 
-### 5. Start local support services
-
-Even in cloud mode, the local app still needs Postgres, MLflow, and MinIO.
+### 5. Start the required database service
 
 Start Docker Desktop first. Wait until Docker says it is running.
 
-Then run:
+Before starting the orchestrator, start Postgres:
+
+Windows PowerShell:
 
 ```powershell
-docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d
+docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d postgres
 ```
 
-This starts:
+macOS/Linux:
 
-| Service | URL/port | Purpose |
-| --- | --- | --- |
-| Postgres + pgvector | `127.0.0.1:5432` | Orchestrator database. |
-| MLflow | `http://127.0.0.1:5000` | Training run tracking. |
-| MinIO API | `http://127.0.0.1:9000` | Dataset and artifact object storage. |
+```bash
+docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d postgres
+```
 
-Check the services:
+Check the database service:
 
 ```powershell
-docker compose -f infra/compose.yaml ps
+docker compose -f infra/compose.yaml ps postgres
 ```
 
-If a container is still starting, wait a few seconds and run the command again.
+Mission Control starts and reconciles MinIO when uploads or Modal jobs need object storage. Do not manually create S3 credentials for the cloud profile.
 
 ### 6. Install the Python worker / Modal dispatcher dependencies
 
@@ -478,7 +484,7 @@ macOS/Linux:
 
 ```bash
 cd services/worker
-python3.11 -m venv .venv
+python3.11 -m venv .venv  # or python3 if python3 --version reports 3.11+
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
@@ -603,7 +609,7 @@ npm run dev
 
 This starts Vite and opens the Electron desktop app. Leave this terminal open while using the app.
 
-The environment variable matters. If you forget `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud`, the app may run with local defaults instead of the Modal cloud profile.
+The environment variable matters. If you forget `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud`, the app may not use the Modal cloud profile.
 
 ### 11. Run cloud preflight before the first real dataset
 
@@ -621,16 +627,6 @@ The cloud profile expects:
 
 Do not manually set `MODAL_ORCHESTRATOR_URL=http://localhost:8080`. Modal requires a public HTTPS URL. Let Mission Control create the tunnel unless you are intentionally using your own public HTTPS endpoint.
 
-### 12. Optional: run the API smoke script
-
-With Docker services and the orchestrator running, you can run the lightweight smoke script from the repo root:
-
-```powershell
-.\scripts\orchestrator_smoke.ps1
-```
-
-This checks health, creates a project, creates a queued job, registers a worker, reports a fake metric, and reads the resulting state. It does not train a real model and does not prove Modal training works. It only verifies the local API path.
-
 ## How To Use The System
 
 ### 1. Start the cloud stack
@@ -638,10 +634,10 @@ This checks health, creates a project, creates a queued job, registers a worker,
 Every time you want to use Model Express in the intended mode:
 
 1. Start Docker Desktop.
-2. Start support services:
+2. Start the required database service:
 
    ```powershell
-   docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d
+   docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d postgres
    ```
 
 3. Start the orchestrator in one terminal:
@@ -666,7 +662,7 @@ Every time you want to use Model Express in the intended mode:
    Invoke-RestMethod http://127.0.0.1:8080/healthz
    ```
 
-If the app behaves like local mode, close both terminals and restart them with `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud` set.
+If the app does not show Modal as the default training provider, close both terminals and restart them with `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud` set.
 
 ### 2. Create a project and upload a dataset
 
@@ -745,7 +741,7 @@ During execution, watch these areas:
 
 - Activity stream: high-level run progress.
 - Jobs: queued, running, succeeded, failed jobs.
-- Workers: local dispatcher and remote Modal activity.
+- Workers: Modal dispatcher and remote Modal activity.
 - Metrics: epoch metrics and final metrics.
 - Evaluations: run-level evaluation summaries.
 - Agent decisions: review decisions and follow-up reasoning.
@@ -806,46 +802,7 @@ When a champion is available:
 6. Use the demo prediction controls to run sample images or a custom image.
 7. Save/export the portable bundle when available.
 
-The demo path can use browser ONNX runtime for compatible exports, or the local Python worker runtime for export formats that need Python-side inference.
-
-## Local-Only Mode
-
-Local-only mode is available, but it is not the recommended user path.
-
-Use local-only mode only when:
-
-- You are developing the app.
-- You need a quick smoke test without a Modal account.
-- You are debugging local worker behavior.
-- You intentionally want to avoid cloud cost.
-
-To run local-only mode, copy the local profile:
-
-Windows PowerShell:
-
-```powershell
-Copy-Item .env.v1.local.example .env.local
-```
-
-macOS/Linux:
-
-```bash
-cp .env.v1.local.example .env.local
-```
-
-Then start Docker services, the orchestrator, and Mission Control without setting `MODEL_EXPRESS_ENV_FILE`.
-
-Local mode defaults to:
-
-```env
-MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER=local
-MODEL_EXPRESS_EXECUTION_PROFILE=safe-local
-MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS=false
-MODEL_EXPRESS_AUTO_EXECUTE_PLANS=false
-MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS=false
-```
-
-Expect local training to be slow on CPU-only machines. It is not the path this README optimizes for.
+The demo path can use browser ONNX runtime for compatible exports, or the Python worker runtime for export formats that need Python-side inference.
 
 ## Cloud Configuration Guide
 
@@ -867,14 +824,14 @@ Start with `.env.v1.cloud.example`. These are the settings most users should und
 | `MODEL_EXPRESS_MAX_AUTO_WORKERS` | `1` for first run | Avoids launching too much cloud work at once. |
 | `MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS` | `5` by default | Controls autonomous follow-up depth. |
 
-Do not start by copying every variable from a development `.env.local`. Most knobs are advanced tuning flags and are not needed for a new user.
+Do not start by copying variables from development env files. Most knobs are advanced tuning flags and are not needed for a new user.
 
 ## Useful Commands
 
-Start services:
+Start the required database service:
 
 ```powershell
-docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d
+docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d postgres
 ```
 
 Stop services:
@@ -934,15 +891,10 @@ cd services\worker
 python -m pytest tests/test_training_modal_provider.py -q
 ```
 
-Run API smoke test:
-
-```powershell
-.\scripts\orchestrator_smoke.ps1
-```
 
 ## Troubleshooting
 
-### The app is using local mode instead of Modal
+### The app is not using the Modal cloud profile
 
 Most likely `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud` was not set in the terminal that started the orchestrator or Mission Control.
 
@@ -1024,8 +976,8 @@ Postgres is not running or Docker Desktop is not ready.
 Fix:
 
 ```powershell
-docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d
-docker compose -f infra/compose.yaml ps
+docker compose -f infra/compose.yaml -f infra/compose.local-safe.yaml up -d postgres
+docker compose -f infra/compose.yaml ps postgres
 ```
 
 Then restart the orchestrator.
@@ -1062,13 +1014,13 @@ python -m pip install -e .
 
 ### Dataset upload fails
 
-Check that MinIO is running:
+Mission Control starts and reconciles MinIO when uploads need object storage. Check:
 
 ```powershell
-docker compose -f infra/compose.yaml ps
+docker compose -f infra/compose.yaml ps minio
 ```
 
-Also check dataset size and file count. Start with a small dataset first.
+If MinIO is not running, restart Mission Control with `MODEL_EXPRESS_ENV_FILE=.env.v1.cloud` set and try the upload again. Also check dataset size and file count. Start with a small dataset first.
 
 ### Modal costs are higher than expected
 
@@ -1086,11 +1038,10 @@ Use T4 for initial tests before trying larger GPUs.
 
 ## Development Notes
 
-- Generated datasets, artifacts, exports, local DB backups, logs, `.env.local`, `.env.v1.cloud`, virtual environments, and node modules are gitignored.
-- The root README should stay user-facing and cloud-first.
+- Generated datasets, artifacts, exports, local DB backups, logs, `.env.v1.cloud`, virtual environments, and node modules are gitignored.
+- The root README should stay user-facing and Modal-cloud focused.
 - Planning docs, agent context dumps, and private release notes should not be part of the public release surface.
-- Before publishing, replace `YOUR_USERNAME/model-express.git` with the final public repository URL.
-- Add screenshots near the top of the README after the project summary.
+- Before publishing, confirm the GitHub repository URL in the `Code` menu is the URL users should clone.
 
 ## License
 
