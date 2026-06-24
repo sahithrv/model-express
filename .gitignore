@@ -50,4 +50,7 @@ mlartifacts/**
 !artifacts/.gitkeep
 !exports/.gitkeep
 
+# docs
+docs/agents_context/
+docs/plans/
 .tmp/
