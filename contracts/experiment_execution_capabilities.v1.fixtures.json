@@ -1,0 +1,166 @@
+[
+  {
+    "name": "modal_classifier_preserves_false_zero_and_aliases",
+    "task": "image_classification",
+    "runner": "modal_torchvision",
+    "input": {
+      "template": " Train_Experiment ",
+      "model": " ResNet18 ",
+      "mechanism": " Regularization ",
+      "evidence_used": [" profile ", "", "baseline"],
+      "epochs": 12,
+      "batch_size": 4,
+      "learning_rate": 0.001,
+      "optimizer": " SGD ",
+      "optimizer_momentum": 0,
+      "scheduler": " STEP ",
+      "scheduler_gamma": 0.2,
+      "augmentation_policy": "rand_augment",
+      "augmentation_policy_config": {
+        "policy_type": "trivial_augment_wide",
+        "probability": 0
+      },
+      "class_balancing": "class_weighted_loss",
+      "preprocessing": {
+        "resize_strategy": " Preserve_Aspect_Pad ",
+        "normalization": "IMAGENET"
+      },
+      "pretrained": false,
+      "freeze_backbone": false
+    },
+    "expected": {
+      "augmentation_policy": "randaugment",
+      "augmentation_policy_config": {
+        "policy_type": "trivialaugment",
+        "probability": 0
+      },
+      "batch_size": 4,
+      "class_balancing": "weighted_loss",
+      "dropout": 0,
+      "early_stopping_patience": 0,
+      "epochs": 12,
+      "evidence_used": ["profile", "baseline"],
+      "fine_tune_strategy": "head_only",
+      "freeze_backbone": false,
+      "gradient_clip_norm": 0,
+      "image_size": 224,
+      "label_smoothing": 0,
+      "learning_rate": 0.001,
+      "mechanism": "regularization",
+      "model": "resnet18",
+      "optimizer": "sgd",
+      "optimizer_momentum": 0,
+      "preprocessing": {
+        "bbox_mode": "ignore",
+        "crop_strategy": "none",
+        "normalization": "imagenet",
+        "resize_strategy": "preserve_aspect_pad",
+        "use_dataset_normalization": false
+      },
+      "pretrained": false,
+      "sampling_strategy": "none",
+      "scheduler": "step",
+      "scheduler_gamma": 0.2,
+      "scheduler_step_size": 4,
+      "template": "train_experiment",
+      "weight_decay": 0
+    }
+  },
+  {
+    "name": "local_classifier_applies_legacy_defaults",
+    "task": "image_classification",
+    "runner": "local_simulator",
+    "input": {
+      "template": "train_experiment",
+      "model": " EfficientNet_B0 ",
+      "epochs": 6,
+      "batch_size": 8,
+      "learning_rate": 0.0005,
+      "augmentation_policy": "trivialaugmentwide",
+      "preprocessing": {
+        "crop_strategy": " Center_Crop "
+      }
+    },
+    "expected": {
+      "augmentation_policy": "trivialaugment",
+      "batch_size": 8,
+      "class_balancing": "none",
+      "dropout": 0,
+      "early_stopping_patience": 0,
+      "epochs": 6,
+      "fine_tune_strategy": "head_only",
+      "gradient_clip_norm": 0,
+      "image_size": 224,
+      "label_smoothing": 0,
+      "learning_rate": 0.0005,
+      "model": "efficientnet_b0",
+      "optimizer": "adamw",
+      "optimizer_momentum": 0.9,
+      "preprocessing": {
+        "bbox_mode": "ignore",
+        "crop_strategy": "center_crop",
+        "normalization": "imagenet",
+        "resize_strategy": "squash",
+        "use_dataset_normalization": false
+      },
+      "pretrained": true,
+      "sampling_strategy": "none",
+      "scheduler": "none",
+      "scheduler_gamma": 0.5,
+      "scheduler_step_size": 2,
+      "template": "train_experiment",
+      "weight_decay": 0
+    }
+  },
+  {
+    "name": "modal_detection_normalizes_known_but_unsupported_fields",
+    "task": "object_detection",
+    "runner": "modal_ultralytics",
+    "input": {
+      "template": "train_yolo_detection",
+      "model": " YOLO11S.PT ",
+      "epochs": 20,
+      "batch_size": 6,
+      "learning_rate": 0.002,
+      "image_size": 768,
+      "preprocessing": {"resize_strategy": "letterbox"},
+      "pretrained": false,
+      "optimizer": "AdamW"
+    },
+    "expected": {
+      "batch_size": 6,
+      "epochs": 20,
+      "image_size": 768,
+      "learning_rate": 0.002,
+      "model": "yolo11s.pt",
+      "optimizer": "adamw",
+      "preprocessing": {"resize_strategy": "yolo_letterbox"},
+      "pretrained": false,
+      "template": "train_yolo_detection"
+    }
+  },
+  {
+    "name": "local_detection_drops_unknown_top_level_fields",
+    "task": "object_detection",
+    "runner": "local_simulator",
+    "input": {
+      "template": "train_yolo_detection",
+      "model": " YOLO11N.PT ",
+      "epochs": 4,
+      "batch_size": 2,
+      "learning_rate": 0.005,
+      "image_size": 320,
+      "reason": "  smoke case  ",
+      "unknown": "drop me"
+    },
+    "expected": {
+      "batch_size": 2,
+      "epochs": 4,
+      "image_size": 320,
+      "learning_rate": 0.005,
+      "model": "yolo11n.pt",
+      "reason": "smoke case",
+      "template": "train_yolo_detection"
+    }
+  }
+]
