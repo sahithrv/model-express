@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"time"
+
+	"model-express/services/orchestrator/internal/execution"
 )
 
 const (
@@ -28,6 +30,7 @@ type ExperimentJob struct {
 	WorkerID             string         `json:"worker_id,omitempty"`
 	Template             string         `json:"template"`
 	Status               string         `json:"status"`
+	ExecutionSpecStatus  string         `json:"execution_spec_status,omitempty"`
 	Config               map[string]any `json:"config"`
 	MLflowRunID          string         `json:"mlflow_run_id,omitempty"`
 	Error                string         `json:"error,omitempty"`
@@ -39,6 +42,19 @@ type ExperimentJob struct {
 	CreatedAt            time.Time      `json:"created_at"`
 	StartedAt            *time.Time     `json:"started_at,omitempty"`
 	CompletedAt          *time.Time     `json:"completed_at,omitempty"`
+}
+
+func WithExecutionSpecStatus(job ExperimentJob) ExperimentJob {
+	if job.Template != TemplateTrainExperiment {
+		job.ExecutionSpecStatus = ""
+		return job
+	}
+	job.ExecutionSpecStatus = execution.ExecutionSpecStatusLegacyUnversioned
+	payload, ok := job.Config[execution.ExecutionSpecConfigKey].(map[string]any)
+	if ok && payload["schema_version"] == execution.ExecutionSpecSchemaVersionV1 {
+		job.ExecutionSpecStatus = execution.ExecutionSpecStatusVersioned
+	}
+	return job
 }
 
 type EpochMetric struct {

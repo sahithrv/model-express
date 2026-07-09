@@ -611,6 +611,11 @@ export type CandidateRanking = {
   intervention?: string;
   expected_effect?: string;
   score?: number;
+  base_score?: number;
+  selection_score?: number;
+  selection_order?: number;
+  selected_experiment_index?: number;
+  selection_adjustments?: CandidateSelectionAdjustment[];
   total_score?: number;
   score_components?: Record<string, unknown>;
   selected?: boolean;
@@ -629,6 +634,28 @@ export type CandidateRanking = {
   [key: string]: unknown;
 };
 
+export type CandidateSelectionAdjustment = {
+  code?: string;
+  value?: number;
+  detail?: string;
+};
+
+export type CandidateSelectionTraceEntry = {
+  candidate_index?: number;
+  base_score?: number;
+  adjusted_score?: number;
+  selected?: boolean;
+  selection_adjustments?: CandidateSelectionAdjustment[];
+};
+
+export type CandidateSelectionRound = {
+  selection_order?: number;
+  selected_candidate_index?: number;
+  candidates?: CandidateSelectionTraceEntry[];
+  total_candidate_count?: number;
+  truncated?: boolean;
+};
+
 export type AgentDecision = {
   id: string;
   project_id: string;
@@ -639,6 +666,7 @@ export type AgentDecision = {
     retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
     retrieved_run_memory?: RetrievedMemoryCard[];
     candidate_rankings?: CandidateRanking[];
+    candidate_selection_trace?: CandidateSelectionRound[];
     planner_context_snapshot?: {
       retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
       [key: string]: unknown;

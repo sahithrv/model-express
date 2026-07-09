@@ -605,9 +605,10 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 		MaxAttempts: defaultJobMaxAttempts,
 		CreatedAt:   time.Now().UTC(),
 	}
+	job = jobs.WithExecutionSpecStatus(job)
 
 	s.jobs[job.ID] = job
-	return job, nil
+	return jobs.WithExecutionSpecStatus(job), nil
 }
 
 func (s *MemoryStore) GetJob(id string) (jobs.ExperimentJob, error) {
@@ -619,7 +620,7 @@ func (s *MemoryStore) GetJob(id string) (jobs.ExperimentJob, error) {
 		return jobs.ExperimentJob{}, ErrNotFound
 	}
 
-	return job, nil
+	return jobs.WithExecutionSpecStatus(job), nil
 }
 
 func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error) {
@@ -633,7 +634,7 @@ func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, e
 	out := []jobs.ExperimentJob{}
 	for _, job := range s.jobs {
 		if job.ProjectID == projectID {
-			out = append(out, job)
+			out = append(out, jobs.WithExecutionSpecStatus(job))
 		}
 	}
 
@@ -667,6 +668,7 @@ func (s *MemoryStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.
 		next[key] = value
 	}
 	job.Config = next
+	job = jobs.WithExecutionSpecStatus(job)
 	s.jobs[jobID] = job
 	return job, nil
 }
@@ -2201,17 +2203,19 @@ func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, t
 	}
 
 	plan := plans.ExperimentPlan{
-		ID:                 s.newID("plan"),
-		ProjectID:          projectID,
-		DatasetID:          datasetID,
-		Status:             plans.StatusProposed,
-		SourceDecisionID:   sourceDecisionID,
-		TargetMetric:       targetMetric,
-		RecommendedWorkers: recommendedWorkers,
-		EstimatedMinutes:   estimatedMinutes,
-		Experiments:        append([]plans.PlannedExperiment(nil), experiments...),
-		Warnings:           append([]string(nil), warnings...),
-		CreatedAt:          time.Now().UTC(),
+		ID:                  s.newID("plan"),
+		ProjectID:           projectID,
+		DatasetID:           datasetID,
+		Status:              plans.StatusProposed,
+		ExecutionSpecStatus: execution.ExecutionSpecStatusVersioned,
+		CapabilityVersion:   execution.CapabilitiesV1().CapabilityVersion,
+		SourceDecisionID:    sourceDecisionID,
+		TargetMetric:        targetMetric,
+		RecommendedWorkers:  recommendedWorkers,
+		EstimatedMinutes:    estimatedMinutes,
+		Experiments:         append([]plans.PlannedExperiment(nil), experiments...),
+		Warnings:            append([]string(nil), warnings...),
+		CreatedAt:           time.Now().UTC(),
 	}
 
 	s.plans[plan.ID] = plan
@@ -2227,7 +2231,7 @@ func (s *MemoryStore) GetExperimentPlan(id string) (plans.ExperimentPlan, error)
 		return plans.ExperimentPlan{}, ErrNotFound
 	}
 
-	return plan, nil
+	return planWithExecutionSpecStatus(plan), nil
 }
 
 func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error) {
@@ -2241,7 +2245,7 @@ func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.Expe
 	out := []plans.ExperimentPlan{}
 	for _, plan := range s.plans {
 		if plan.ProjectID == projectID {
-			out = append(out, plan)
+			out = append(out, planWithExecutionSpecStatus(plan))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -2249,6 +2253,13 @@ func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.Expe
 	})
 
 	return out, nil
+}
+
+func planWithExecutionSpecStatus(plan plans.ExperimentPlan) plans.ExperimentPlan {
+	if plan.ExecutionSpecStatus == "" {
+		plan.ExecutionSpecStatus = execution.ExecutionSpecStatusLegacyUnversioned
+	}
+	return plan
 }
 
 func (s *MemoryStore) CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error) {
@@ -2300,6 +2311,7 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
 	job.LeaseLastHeartbeatAt = nil
+	job = jobs.WithExecutionSpecStatus(job)
 	s.jobs[jobID] = job
 
 	for workerID, worker := range s.workers {
@@ -2341,6 +2353,7 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	job.Error = message
 	job.CompletedAt = &now
 	job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
+	job = jobs.WithExecutionSpecStatus(job)
 	s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, status, now)
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil

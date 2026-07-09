@@ -1053,6 +1053,7 @@ func selectChampionForPlannerWaitDecision(
 	recommendation.ProposedExperiments = nil
 	recommendation.CandidateHypotheses = nil
 	recommendation.CandidateRankings = nil
+	recommendation.CandidateSelectionTrace = nil
 	recommendation.ProposalMechanisms = nil
 	if strings.TrimSpace(recommendation.Summary) == "" || strings.EqualFold(strings.TrimSpace(recommendation.Summary), "wait") {
 		recommendation.Summary = fmt.Sprintf("Select champion %s; planner pause converted to champion selection.", championJobID)
@@ -1147,6 +1148,7 @@ func experimentPlannerDecisionPayload(
 		"deployment_tradeoff":             recommendation.DeploymentTradeoff,
 		"candidate_hypotheses":            recommendation.CandidateHypotheses,
 		"candidate_rankings":              recommendation.CandidateRankings,
+		"candidate_selection_trace":       recommendation.CandidateSelectionTrace,
 		"proposal_mechanisms":             recommendation.ProposalMechanisms,
 		"risks":                           recommendation.Risks,
 		"expected_tradeoffs":              recommendation.ExpectedTradeoffs,

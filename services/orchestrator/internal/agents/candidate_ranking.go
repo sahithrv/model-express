@@ -23,8 +23,9 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 		return recommendation, fmt.Errorf("experiment planner ADD_EXPERIMENTS requires candidate_hypotheses for backend ranking")
 	}
 
-	rankings, selected, mechanisms := RankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, effectiveMaxPlannerExperiments(input))
+	rankings, selected, mechanisms, selectionTrace := rankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, effectiveMaxPlannerExperiments(input))
 	recommendation.CandidateRankings = rankings
+	recommendation.CandidateSelectionTrace = selectionTrace
 	recommendation.ProposedExperiments = selected
 	recommendation.ProposalMechanisms = mechanisms
 	if len(selected) == 0 {
@@ -96,6 +97,11 @@ func effectiveMaxPlannerExperiments(input ExperimentPlannerInput) int {
 }
 
 func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []CandidateHypothesis, maxExperiments int) ([]CandidateRanking, []plans.PlannedExperiment, []PlannerProposalMechanism) {
+	rankings, selected, mechanisms, _ := rankPlannerCandidateHypotheses(input, candidates, maxExperiments)
+	return rankings, selected, mechanisms
+}
+
+func rankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []CandidateHypothesis, maxExperiments int) ([]CandidateRanking, []plans.PlannedExperiment, []PlannerProposalMechanism, []CandidateSelectionRound) {
 	if maxExperiments < 1 {
 		maxExperiments = 5
 	}
@@ -111,49 +117,132 @@ func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []C
 	rankings := make([]CandidateRanking, 0, len(candidates))
 	for index, candidate := range candidates {
 		ranking := scorePlannerCandidate(input, candidate, index, existing, seenProposed)
+		ranking.BaseScore = ranking.Score
 		rankings = append(rankings, ranking)
 		if !ranking.Rejected {
 			seenProposed[ranking.ExperimentSignature] = true
 		}
 	}
 
-	ordered := append([]CandidateRanking(nil), rankings...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].Rejected != ordered[j].Rejected {
-			return !ordered[i].Rejected
-		}
-		if ordered[i].Score == ordered[j].Score {
-			return ordered[i].CandidateIndex < ordered[j].CandidateIndex
-		}
-		return ordered[i].Score > ordered[j].Score
-	})
-
-	selectedIndexes := map[int]bool{}
+	selectedIndexes, selectionTrace := selectPlannerCandidateIndexes(rankings, candidates, maxExperiments)
+	rankingByCandidateIndex := make(map[int]int, len(rankings))
+	for index := range rankings {
+		rankingByCandidateIndex[rankings[index].CandidateIndex] = index
+	}
 	selected := []plans.PlannedExperiment{}
 	selectedMechanisms := []PlannerProposalMechanism{}
-	selectedFamilyCounts := map[string]int{}
-	for _, ranking := range ordered {
-		if ranking.Rejected || len(selected) >= maxExperiments {
+	for selectionOrder, candidateIndex := range selectedIndexes {
+		rankingIndex, ok := rankingByCandidateIndex[candidateIndex]
+		if !ok {
 			continue
 		}
-		experiment := candidates[ranking.CandidateIndex].ExperimentConfig
-		family := inferExperimentFamily(experiment.Model)
-		if len(selected) >= 2 && selectedFamilyCounts[family] >= 2 {
-			ranking.Score = roundCandidateScore(ranking.Score - 0.12)
+		traceEntry, ok := selectedCandidateTraceEntry(selectionTrace[selectionOrder])
+		if !ok {
+			continue
 		}
-		selectedIndexes[ranking.CandidateIndex] = true
-		selectedMechanisms = append(selectedMechanisms, plannerProposalMechanismFromCandidate(candidates[ranking.CandidateIndex], len(selected)))
-		selected = append(selected, experiment)
-		selectedFamilyCounts[family]++
+		selectionScore := traceEntry.AdjustedScore
+		order := selectionOrder
+		experimentIndex := len(selected)
+		rankings[rankingIndex].Selected = true
+		rankings[rankingIndex].SelectionScore = &selectionScore
+		rankings[rankingIndex].SelectionOrder = &order
+		rankings[rankingIndex].SelectedExperimentIndex = &experimentIndex
+		rankings[rankingIndex].SelectionAdjustments = append([]CandidateSelectionAdjustment(nil), traceEntry.SelectionAdjustments...)
+		rankings[rankingIndex].Reasons = append(rankings[rankingIndex].Reasons, "selected by deterministic backend ranking")
+		selectedMechanisms = append(selectedMechanisms, plannerProposalMechanismFromCandidate(candidates[candidateIndex], experimentIndex))
+		selected = append(selected, candidates[candidateIndex].ExperimentConfig)
+	}
+	return rankings, selected, selectedMechanisms, selectionTrace
+}
+
+const (
+	plannerFamilyDiversityPenalty   = -0.12
+	plannerSelectionTraceEntryLimit = 5
+)
+
+func selectPlannerCandidateIndexes(rankings []CandidateRanking, candidates []CandidateHypothesis, maxExperiments int) ([]int, []CandidateSelectionRound) {
+	if maxExperiments <= 0 {
+		return nil, nil
 	}
 
-	for index := range rankings {
-		if selectedIndexes[rankings[index].CandidateIndex] {
-			rankings[index].Selected = true
-			rankings[index].Reasons = append(rankings[index].Reasons, "selected by deterministic backend ranking")
+	eligible := make([]CandidateRanking, 0, len(rankings))
+	for _, ranking := range rankings {
+		if ranking.Rejected || ranking.CandidateIndex < 0 || ranking.CandidateIndex >= len(candidates) {
+			continue
+		}
+		eligible = append(eligible, ranking)
+	}
+
+	selectedIndexes := make([]int, 0, minInt(maxExperiments, len(eligible)))
+	selectionTrace := make([]CandidateSelectionRound, 0, minInt(maxExperiments, len(eligible)))
+	selected := make(map[int]bool, len(eligible))
+	selectedFamilyCounts := map[string]int{}
+	for len(selectedIndexes) < maxExperiments && len(selectedIndexes) < len(eligible) {
+		roundCandidates := make([]CandidateSelectionTraceEntry, 0, len(eligible)-len(selectedIndexes))
+		for _, ranking := range eligible {
+			if selected[ranking.CandidateIndex] {
+				continue
+			}
+			family := inferExperimentFamily(candidates[ranking.CandidateIndex].ExperimentConfig.Model)
+			adjustments := plannerCandidateSelectionAdjustments(len(selectedIndexes), selectedFamilyCounts[family])
+			adjustedScore := ranking.Score
+			for _, adjustment := range adjustments {
+				adjustedScore += adjustment.Value
+			}
+			roundCandidates = append(roundCandidates, CandidateSelectionTraceEntry{
+				CandidateIndex:       ranking.CandidateIndex,
+				BaseScore:            ranking.Score,
+				AdjustedScore:        roundCandidateScore(adjustedScore),
+				SelectionAdjustments: adjustments,
+			})
+		}
+		if len(roundCandidates) == 0 {
+			break
+		}
+
+		sort.Slice(roundCandidates, func(i, j int) bool {
+			if roundCandidates[i].AdjustedScore == roundCandidates[j].AdjustedScore {
+				return roundCandidates[i].CandidateIndex < roundCandidates[j].CandidateIndex
+			}
+			return roundCandidates[i].AdjustedScore > roundCandidates[j].AdjustedScore
+		})
+		chosen := roundCandidates[0]
+		roundCandidates[0].Selected = true
+		traceCandidates := append([]CandidateSelectionTraceEntry(nil), roundCandidates[:minInt(len(roundCandidates), plannerSelectionTraceEntryLimit)]...)
+		selectionOrder := len(selectedIndexes)
+		selectionTrace = append(selectionTrace, CandidateSelectionRound{
+			SelectionOrder:         selectionOrder,
+			SelectedCandidateIndex: chosen.CandidateIndex,
+			Candidates:             traceCandidates,
+			TotalCandidateCount:    len(roundCandidates),
+			Truncated:              len(roundCandidates) > len(traceCandidates),
+		})
+		selectedIndexes = append(selectedIndexes, chosen.CandidateIndex)
+		selected[chosen.CandidateIndex] = true
+		family := inferExperimentFamily(candidates[chosen.CandidateIndex].ExperimentConfig.Model)
+		selectedFamilyCounts[family]++
+	}
+	return selectedIndexes, selectionTrace
+}
+
+func plannerCandidateSelectionAdjustments(selectedCount int, selectedFamilyCount int) []CandidateSelectionAdjustment {
+	if selectedCount < 2 || selectedFamilyCount < 2 {
+		return nil
+	}
+	return []CandidateSelectionAdjustment{{
+		Code:   "family_diversity",
+		Value:  plannerFamilyDiversityPenalty,
+		Detail: "two candidates from this model family were already selected",
+	}}
+}
+
+func selectedCandidateTraceEntry(round CandidateSelectionRound) (CandidateSelectionTraceEntry, bool) {
+	for _, candidate := range round.Candidates {
+		if candidate.Selected && candidate.CandidateIndex == round.SelectedCandidateIndex {
+			return candidate, true
 		}
 	}
-	return rankings, selected, selectedMechanisms
+	return CandidateSelectionTraceEntry{}, false
 }
 
 func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypothesis, index int, existing map[string]bool, seenProposed map[string]bool) CandidateRanking {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/plans"
 )
 
@@ -31,7 +32,10 @@ func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string,
 		warnings = []string{}
 	}
 
-	experimentsJSON, err := json.Marshal(experiments)
+	experimentsJSON, err := plans.MarshalVersionedExperiments(
+		experiments,
+		execution.CapabilitiesV1().CapabilityVersion,
+	)
 	if err != nil {
 		return plans.ExperimentPlan{}, fmt.Errorf("marshal planned experiments: %w", err)
 	}

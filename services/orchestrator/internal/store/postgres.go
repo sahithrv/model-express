@@ -801,7 +801,7 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 		job.MaxAttempts = defaultJobMaxAttempts
 	}
 
-	return job, nil
+	return jobs.WithExecutionSpecStatus(job), nil
 }
 
 func scanMetric(row rowScanner) (jobs.EpochMetric, error) {
@@ -1616,12 +1616,24 @@ func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
 
 	plan.Experiments = []plans.PlannedExperiment{}
 	if len(experimentsJSON) > 0 {
-		if err := json.Unmarshal(experimentsJSON, &plan.Experiments); err != nil {
+		var legacyUnversioned bool
+		var err error
+		plan.Experiments, plan.CapabilityVersion, legacyUnversioned, err =
+			plans.UnmarshalStoredExperiments(experimentsJSON)
+		if err != nil {
 			return plans.ExperimentPlan{}, fmt.Errorf("unmarshal planned experiments: %w", err)
+		}
+		if legacyUnversioned {
+			plan.ExecutionSpecStatus = execution.ExecutionSpecStatusLegacyUnversioned
+		} else {
+			plan.ExecutionSpecStatus = execution.ExecutionSpecStatusVersioned
 		}
 	}
 	if plan.Experiments == nil {
 		plan.Experiments = []plans.PlannedExperiment{}
+	}
+	if plan.ExecutionSpecStatus == "" {
+		plan.ExecutionSpecStatus = execution.ExecutionSpecStatusLegacyUnversioned
 	}
 
 	plan.Warnings = []string{}

@@ -25,6 +25,96 @@ after(async () => {
   await viteServer?.close();
 });
 
+test("candidate ranking audit parses old and new decision payloads without inventing unselected scores", async () => {
+  const { candidateScoreRows, candidateSelectionTraceRows } = await loadMissionModel();
+  const oldDecision = {
+    id: "decision-old",
+    decision_type: "ADD_EXPERIMENTS",
+    rationale: "legacy ranking",
+    created_at: timestamp,
+    payload: {
+      candidate_rankings: [
+        { candidate_index: 0, hypothesis: "Legacy candidate", score: 0.74, selected: true, reasons: ["legacy reason"] },
+      ],
+    },
+  };
+  const oldRows = candidateScoreRows(oldDecision);
+  assert.equal(oldRows.length, 1);
+  assert.equal(oldRows[0].baseScore, 0.74);
+  assert.equal(oldRows[0].selectionScore, null);
+  assert.equal(oldRows[0].selectionOrder, null);
+  assert.deepEqual(oldRows[0].selectionAdjustments, []);
+  assert.deepEqual(candidateSelectionTraceRows(oldDecision), []);
+
+  const newDecision = {
+    id: "decision-new",
+    decision_type: "ADD_EXPERIMENTS",
+    rationale: "audited ranking",
+    created_at: timestamp,
+    payload: {
+      candidate_rankings: [
+        {
+          candidate_index: 0,
+          hypothesis: "Selected candidate",
+          score: 0.74,
+          base_score: 0.74,
+          selection_score: 0.62,
+          selection_order: 2,
+          selected_experiment_index: 1,
+          selection_adjustments: [
+            {
+              code: "family_diversity",
+              value: -0.12,
+              detail: "two candidates from this model family were already selected",
+            },
+          ],
+          selected: true,
+        },
+        {
+          candidate_index: 1,
+          hypothesis: "Unselected candidate",
+          score: 0.70,
+          base_score: 0.70,
+          selected: false,
+        },
+      ],
+      candidate_selection_trace: [
+        {
+          selection_order: 2,
+          selected_candidate_index: 0,
+          total_candidate_count: 8,
+          truncated: true,
+          candidates: [
+            {
+              candidate_index: 0,
+              base_score: 0.74,
+              adjusted_score: 0.62,
+              selected: true,
+              selection_adjustments: [{ code: "family_diversity", value: -0.12 }],
+            },
+            { candidate_index: 1, base_score: 0.70, adjusted_score: 0.70, selected: false },
+          ],
+        },
+      ],
+    },
+  };
+  const newRows = candidateScoreRows(newDecision);
+  assert.equal(newRows[0].baseScore, 0.74);
+  assert.equal(newRows[0].selectionScore, 0.62);
+  assert.equal(newRows[0].selectionOrder, 2);
+  assert.equal(newRows[0].selectedExperimentIndex, 1);
+  assert.equal(newRows[0].selectionAdjustments[0].label, "Family Diversity");
+  assert.equal(newRows[1].selectionScore, null);
+  assert.equal(newRows[1].selectionOrder, null);
+
+  const traceRows = candidateSelectionTraceRows(newDecision);
+  assert.equal(traceRows.length, 1);
+  assert.equal(traceRows[0].selectedLabel, "Selected candidate");
+  assert.equal(traceRows[0].totalCandidateCount, 8);
+  assert.equal(traceRows[0].truncated, true);
+  assert.equal(traceRows[0].candidates[1].adjustedScore, 0.70);
+});
+
 test("stale failed worker state does not block export-ready champion demo availability", async () => {
   const { buildMissionDigest, buildMissionStages } = await loadMissionModel();
   const project = projectFixture();

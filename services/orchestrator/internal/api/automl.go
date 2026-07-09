@@ -312,7 +312,8 @@ func prepareAutoMLExperimentWithHistory(experiment plans.PlannedExperiment, inde
 }
 
 func clearAutoMLValueFromExperiment(experiment *plans.PlannedExperiment, name string) {
-	switch automl.NormalizeParameterName(name) {
+	normalized := automl.NormalizeParameterName(name)
+	switch normalized {
 	case "optimizer_momentum":
 		experiment.OptimizerMomentum = 0
 	case "scheduler_step_size":
@@ -320,10 +321,12 @@ func clearAutoMLValueFromExperiment(experiment *plans.PlannedExperiment, name st
 	case "scheduler_gamma":
 		experiment.SchedulerGamma = 0
 	}
+	experiment.ClearFieldPresence(normalized)
 }
 
 func applyAutoMLValueToExperiment(experiment *plans.PlannedExperiment, name string, value any) error {
-	switch automl.NormalizeParameterName(name) {
+	normalized := automl.NormalizeParameterName(name)
+	switch normalized {
 	case "learning_rate":
 		number, ok := automl.NumberValue(value)
 		if !ok {
@@ -465,6 +468,7 @@ func applyAutoMLValueToExperiment(experiment *plans.PlannedExperiment, name stri
 	default:
 		return fmt.Errorf("automl cannot apply unsupported parameter %q", name)
 	}
+	experiment.MarkFieldPresent(normalized)
 	return nil
 }
 
@@ -512,7 +516,14 @@ func autoMLStrategySnapshot(experiment plans.PlannedExperiment) map[string]any {
 	if experiment.AugmentationPolicyConfig != nil {
 		snapshot["augmentation_policy_config_policy_type"] = experiment.AugmentationPolicyConfig.PolicyType
 	}
-	return compactNonEmptyMap(snapshot)
+	compacted := compactNonEmptyMap(snapshot)
+	if experiment.IsFieldPresent("pretrained") {
+		compacted["pretrained"] = experiment.Pretrained
+	}
+	if experiment.IsFieldPresent("freeze_backbone") {
+		compacted["freeze_backbone"] = experiment.FreezeBackbone
+	}
+	return compacted
 }
 
 func autoMLFinalValues(experiment plans.PlannedExperiment, sampled map[string]automl.HyperparameterProvenance) (map[string]any, map[string]automl.HyperparameterProvenance) {
@@ -540,17 +551,17 @@ func autoMLParameterValue(experiment plans.PlannedExperiment, name string) (any,
 	case "weight_decay":
 		return experiment.WeightDecay, true
 	case "dropout":
-		return experiment.Dropout, experiment.Dropout > 0
+		return experiment.Dropout, experiment.Dropout > 0 || experiment.IsFieldPresent("dropout")
 	case "optimizer_momentum":
-		return experiment.OptimizerMomentum, experiment.OptimizerMomentum > 0
+		return experiment.OptimizerMomentum, experiment.OptimizerMomentum > 0 || experiment.IsFieldPresent("optimizer_momentum")
 	case "scheduler_step_size":
-		return experiment.SchedulerStepSize, experiment.SchedulerStepSize > 0
+		return experiment.SchedulerStepSize, experiment.SchedulerStepSize > 0 || experiment.IsFieldPresent("scheduler_step_size")
 	case "scheduler_gamma":
-		return experiment.SchedulerGamma, experiment.SchedulerGamma > 0
+		return experiment.SchedulerGamma, experiment.SchedulerGamma > 0 || experiment.IsFieldPresent("scheduler_gamma")
 	case "label_smoothing":
-		return experiment.LabelSmoothing, experiment.LabelSmoothing > 0
+		return experiment.LabelSmoothing, experiment.LabelSmoothing > 0 || experiment.IsFieldPresent("label_smoothing")
 	case "gradient_clip_norm":
-		return experiment.GradientClipNorm, experiment.GradientClipNorm > 0
+		return experiment.GradientClipNorm, experiment.GradientClipNorm > 0 || experiment.IsFieldPresent("gradient_clip_norm")
 	case "batch_size":
 		return experiment.BatchSize, experiment.BatchSize > 0
 	case "epochs":
@@ -571,27 +582,37 @@ func autoMLParameterValue(experiment plans.PlannedExperiment, name string) (any,
 		if experiment.AugmentationPolicyConfig == nil {
 			return nil, false
 		}
-		return experiment.AugmentationPolicyConfig.Magnitude, true
+		return experiment.AugmentationPolicyConfig.Magnitude,
+			experiment.AugmentationPolicyConfig.Magnitude != 0 ||
+				experiment.IsFieldPresent("augmentation_policy_config.magnitude")
 	case "augmentation_policy_config.num_ops":
 		if experiment.AugmentationPolicyConfig == nil {
 			return nil, false
 		}
-		return experiment.AugmentationPolicyConfig.NumOps, true
+		return experiment.AugmentationPolicyConfig.NumOps,
+			experiment.AugmentationPolicyConfig.NumOps != 0 ||
+				experiment.IsFieldPresent("augmentation_policy_config.num_ops")
 	case "augmentation_policy_config.num_magnitude_bins":
 		if experiment.AugmentationPolicyConfig == nil {
 			return nil, false
 		}
-		return experiment.AugmentationPolicyConfig.NumMagnitudeBins, true
+		return experiment.AugmentationPolicyConfig.NumMagnitudeBins,
+			experiment.AugmentationPolicyConfig.NumMagnitudeBins != 0 ||
+				experiment.IsFieldPresent("augmentation_policy_config.num_magnitude_bins")
 	case "augmentation_policy_config.probability":
 		if experiment.AugmentationPolicyConfig == nil {
 			return nil, false
 		}
-		return experiment.AugmentationPolicyConfig.Probability, true
+		return experiment.AugmentationPolicyConfig.Probability,
+			experiment.AugmentationPolicyConfig.Probability != 0 ||
+				experiment.IsFieldPresent("augmentation_policy_config.probability")
 	case "augmentation_policy_config.alpha":
 		if experiment.AugmentationPolicyConfig == nil {
 			return nil, false
 		}
-		return experiment.AugmentationPolicyConfig.Alpha, true
+		return experiment.AugmentationPolicyConfig.Alpha,
+			experiment.AugmentationPolicyConfig.Alpha != 0 ||
+				experiment.IsFieldPresent("augmentation_policy_config.alpha")
 	case "class_balancing_config.effective_number_beta":
 		if experiment.ClassBalancingConfig == nil {
 			return nil, false

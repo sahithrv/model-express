@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import { createServer } from "vite";
 
@@ -22,6 +24,102 @@ async function loadMissionPanels() {
 
 after(async () => {
   await viteServer?.close();
+});
+
+test("agent drill-down renders legacy rankings and discloses new selection audit details", async () => {
+  const { AgentDecisionChat } = await loadMissionPanels();
+  const baseTurn = {
+    decision: {
+      id: "decision-ranking",
+      decision_type: "ADD_EXPERIMENTS",
+      rationale: "Rank candidates.",
+      payload: {},
+      created_at: "2026-07-09T12:00:00.000Z",
+    },
+    question: "What was selected?",
+    opening: "The backend ranked the candidate set.",
+    highlights: [],
+    sections: [],
+    retrievedMemory: [],
+    rejections: [],
+    mechanismCoverage: [],
+  };
+  const legacyCandidate = {
+    label: "Legacy candidate",
+    status: "SELECTED",
+    mechanism: "class_imbalance",
+    intervention: "weighted loss",
+    expectedEffect: "Improve recall",
+    validationStatus: "",
+    totalScore: 0.74,
+    baseScore: 0.74,
+    selectionScore: null,
+    selectionOrder: null,
+    selectedExperimentIndex: null,
+    selectionAdjustments: [],
+    reasons: ["legacy reason"],
+    memoryReasons: [],
+    memoryHits: [],
+    components: [],
+  };
+  const legacyHTML = renderToStaticMarkup(
+    createElement(AgentDecisionChat, {
+      turns: [{ ...baseTurn, candidateScores: [legacyCandidate], candidateSelectionTrace: [] }],
+    }),
+  );
+  assert.match(legacyHTML, /Legacy candidate/);
+  assert.match(legacyHTML, /Base Score/);
+  assert.doesNotMatch(legacyHTML, /Expert selection trace/);
+
+  const adjustment = {
+    code: "family_diversity",
+    label: "Family Diversity",
+    value: -0.12,
+    detail: "two candidates from this model family were already selected",
+  };
+  const auditedHTML = renderToStaticMarkup(
+    createElement(AgentDecisionChat, {
+      turns: [
+        {
+          ...baseTurn,
+          candidateScores: [
+            {
+              ...legacyCandidate,
+              label: "Audited candidate",
+              selectionScore: 0.62,
+              selectionOrder: 2,
+              selectedExperimentIndex: 1,
+              selectionAdjustments: [adjustment],
+            },
+          ],
+          candidateSelectionTrace: [
+            {
+              selectionOrder: 2,
+              selectedCandidateIndex: 0,
+              selectedLabel: "Audited candidate",
+              totalCandidateCount: 8,
+              truncated: true,
+              candidates: [
+                {
+                  candidateIndex: 0,
+                  label: "Audited candidate",
+                  baseScore: 0.74,
+                  adjustedScore: 0.62,
+                  selected: true,
+                  selectionAdjustments: [adjustment],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  assert.match(auditedHTML, /Selection Score/);
+  assert.match(auditedHTML, /Selection Order/);
+  assert.match(auditedHTML, /Family Diversity/);
+  assert.match(auditedHTML, /Expert selection trace/);
+  assert.match(auditedHTML, /Round 3: Audited candidate/);
 });
 
 test("hero metric facts use classification accuracy instead of detection mAP", async () => {

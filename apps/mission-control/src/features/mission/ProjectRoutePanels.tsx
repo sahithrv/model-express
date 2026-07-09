@@ -2717,6 +2717,9 @@ export function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                               {[
                                 candidate.mechanism ? `mechanism ${candidate.mechanism}` : "",
                                 candidate.intervention,
+                                ...candidate.selectionAdjustments.map(
+                                  (adjustment) => adjustment.detail || `${adjustment.label} affected selection`,
+                                ),
                                 ...candidate.reasons.slice(0, 2),
                               ]
                                 .filter(Boolean)
@@ -2730,7 +2733,20 @@ export function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                             candidate.mechanism ? { label: "Mechanism", value: candidate.mechanism } : null,
                             candidate.expectedEffect ? { label: "Expected Effect", value: candidate.expectedEffect } : null,
                             candidate.validationStatus ? { label: "Validation", value: candidate.validationStatus } : null,
-                            candidate.totalScore !== null ? { label: "Total", value: candidate.totalScore.toFixed(3) } : null,
+                            candidate.baseScore !== null ? { label: "Base Score", value: candidate.baseScore.toFixed(3) } : null,
+                            candidate.selectionScore !== null
+                              ? { label: "Selection Score", value: candidate.selectionScore.toFixed(3) }
+                              : null,
+                            candidate.selectionOrder !== null
+                              ? { label: "Selection Order", value: `#${candidate.selectionOrder + 1}` }
+                              : null,
+                            ...candidate.selectionAdjustments.map((adjustment) => ({
+                              label: adjustment.label,
+                              value:
+                                adjustment.value === null
+                                  ? adjustment.detail || "applied"
+                                  : `${adjustment.value >= 0 ? "+" : ""}${adjustment.value.toFixed(3)}`,
+                            })),
                           ]
                             .filter((item): item is { label: string; value: string } => item !== null)
                             .map((item) => (
@@ -2766,6 +2782,46 @@ export function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                       </div>
                     ))}
                   </div>
+                  {turn.candidateSelectionTrace.length > 0 && (
+                    <details className="candidate-selection-trace">
+                      <summary>Expert selection trace</summary>
+                      <div className="candidate-score-list">
+                        {turn.candidateSelectionTrace.map((round) => (
+                          <div className="candidate-score-row" key={`${turn.decision.id}-selection-round-${round.selectionOrder}`}>
+                            <div className="candidate-score-head">
+                              <span>
+                                <strong>{`Round ${round.selectionOrder + 1}: ${round.selectedLabel}`}</strong>
+                                <small>
+                                  {`${round.totalCandidateCount} eligible candidate${round.totalCandidateCount === 1 ? "" : "s"}`}
+                                  {round.truncated ? `; showing the selected candidate and top ${round.candidates.length - 1} competitors` : ""}
+                                </small>
+                              </span>
+                              <Badge value="SELECTED" />
+                            </div>
+                            <div className="score-component-list">
+                              {round.candidates.map((candidate) => (
+                                <span key={`${turn.decision.id}-${round.selectionOrder}-${candidate.candidateIndex}`}>
+                                  <small>{candidate.selected ? `${candidate.label} (selected)` : candidate.label}</small>
+                                  <strong>
+                                    {candidate.adjustedScore !== null ? candidate.adjustedScore.toFixed(3) : "-"}
+                                    {candidate.selectionAdjustments.length > 0
+                                      ? ` (${candidate.selectionAdjustments
+                                          .map((adjustment) =>
+                                            adjustment.value === null
+                                              ? adjustment.label
+                                              : `${adjustment.label} ${adjustment.value >= 0 ? "+" : ""}${adjustment.value.toFixed(3)}`,
+                                          )
+                                          .join(", ")})`
+                                      : ""}
+                                  </strong>
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
             </div>

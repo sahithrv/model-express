@@ -281,6 +281,11 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			config["report_only"] = true
 		}
 		addOptionalExperimentConfig(config, experiment)
+		if jobTemplate == jobs.TemplateTrainExperiment {
+			if err := addExecutionSpecV1(config, experiment, provider); err != nil {
+				return executeExperimentPlanResponse{}, err
+			}
+		}
 		if metadataImport, err := s.store.GetActiveDatasetMetadataImport(plan.DatasetID); err == nil {
 			config["metadata_import_id"] = metadataImport.ID
 			config["metadata_summary"] = metadataImport.AgentSafeSummary
@@ -348,87 +353,150 @@ func experimentExecutionTemplate(experiment plans.PlannedExperiment) string {
 }
 
 func addOptionalExperimentConfig(config map[string]any, experiment plans.PlannedExperiment) {
-	if experiment.Mechanism != "" {
+	if experiment.Mechanism != "" || experiment.IsFieldPresent("mechanism") {
 		config["mechanism"] = experiment.Mechanism
 	}
-	if experiment.Intervention != "" {
+	if experiment.Intervention != "" || experiment.IsFieldPresent("intervention") {
 		config["intervention"] = experiment.Intervention
 	}
-	if len(experiment.EvidenceUsed) > 0 {
+	if len(experiment.EvidenceUsed) > 0 || experiment.IsFieldPresent("evidence_used") {
 		config["evidence_used"] = experiment.EvidenceUsed
 	}
-	if experiment.ExpectedEffect != "" {
+	if experiment.ExpectedEffect != "" || experiment.IsFieldPresent("expected_effect") {
 		config["expected_effect"] = experiment.ExpectedEffect
 	}
 	if experiment.ImageSize > 0 {
 		config["image_size"] = experiment.ImageSize
 	}
-	if experiment.ResolutionStrategy != "" {
+	if experiment.ResolutionStrategy != "" || experiment.IsFieldPresent("resolution_strategy") {
 		config["resolution_strategy"] = experiment.ResolutionStrategy
 	}
 	if experiment.Preprocessing != nil {
 		config["preprocessing"] = experiment.Preprocessing
 	}
-	if experiment.Optimizer != "" {
+	if experiment.Optimizer != "" || experiment.IsFieldPresent("optimizer") {
 		config["optimizer"] = experiment.Optimizer
 	}
-	if experiment.Scheduler != "" {
+	if experiment.Scheduler != "" || experiment.IsFieldPresent("scheduler") {
 		config["scheduler"] = experiment.Scheduler
 	}
-	if experiment.WeightDecay > 0 {
+	if experiment.WeightDecay > 0 || experiment.IsFieldPresent("weight_decay") {
 		config["weight_decay"] = experiment.WeightDecay
 	}
-	if experiment.Dropout > 0 {
+	if experiment.Dropout > 0 || experiment.IsFieldPresent("dropout") {
 		config["dropout"] = experiment.Dropout
 	}
-	if experiment.OptimizerMomentum > 0 {
+	if experiment.OptimizerMomentum > 0 || experiment.IsFieldPresent("optimizer_momentum") {
 		config["optimizer_momentum"] = experiment.OptimizerMomentum
 	}
-	if experiment.SchedulerStepSize > 0 {
+	if experiment.SchedulerStepSize > 0 || experiment.IsFieldPresent("scheduler_step_size") {
 		config["scheduler_step_size"] = experiment.SchedulerStepSize
 	}
-	if experiment.SchedulerGamma > 0 {
+	if experiment.SchedulerGamma > 0 || experiment.IsFieldPresent("scheduler_gamma") {
 		config["scheduler_gamma"] = experiment.SchedulerGamma
 	}
-	if experiment.LabelSmoothing > 0 {
+	if experiment.LabelSmoothing > 0 || experiment.IsFieldPresent("label_smoothing") {
 		config["label_smoothing"] = experiment.LabelSmoothing
 	}
-	if experiment.GradientClipNorm > 0 {
+	if experiment.GradientClipNorm > 0 || experiment.IsFieldPresent("gradient_clip_norm") {
 		config["gradient_clip_norm"] = experiment.GradientClipNorm
 	}
-	if len(experiment.Augmentation) > 0 {
+	if len(experiment.Augmentation) > 0 || experiment.IsFieldPresent("augmentation") {
 		config["augmentation"] = experiment.Augmentation
 	}
-	if experiment.AugmentationPolicy != "" {
+	if experiment.AugmentationPolicy != "" || experiment.IsFieldPresent("augmentation_policy") {
 		config["augmentation_policy"] = experiment.AugmentationPolicy
 	}
 	if experiment.AugmentationPolicyConfig != nil {
 		config["augmentation_policy_config"] = experiment.AugmentationPolicyConfig
 	}
-	if experiment.ClassBalancing != "" {
+	if experiment.ClassBalancing != "" || experiment.IsFieldPresent("class_balancing") {
 		config["class_balancing"] = experiment.ClassBalancing
 	}
-	if len(experiment.ClassBalancingConfig) > 0 {
+	if len(experiment.ClassBalancingConfig) > 0 || experiment.IsFieldPresent("class_balancing_config") {
 		config["class_balancing_config"] = experiment.ClassBalancingConfig
 	}
-	if experiment.SamplingStrategy != "" {
+	if experiment.SamplingStrategy != "" || experiment.IsFieldPresent("sampling_strategy") {
 		config["sampling_strategy"] = experiment.SamplingStrategy
 	}
-	if experiment.EarlyStoppingPatience > 0 {
+	if experiment.EarlyStoppingPatience > 0 || experiment.IsFieldPresent("early_stopping_patience") {
 		config["early_stopping_patience"] = experiment.EarlyStoppingPatience
 	}
-	if experiment.Strategy != "" {
+	if experiment.Strategy != "" || experiment.IsFieldPresent("strategy") {
 		config["strategy"] = experiment.Strategy
 	}
-	if experiment.Pretrained {
+	if experiment.Pretrained || experiment.IsFieldPresent("pretrained") {
 		config["pretrained"] = experiment.Pretrained
 	}
-	if experiment.FreezeBackbone {
+	if experiment.FreezeBackbone || experiment.IsFieldPresent("freeze_backbone") {
 		config["freeze_backbone"] = experiment.FreezeBackbone
 	}
-	if experiment.FineTuneStrategy != "" {
+	if experiment.FineTuneStrategy != "" || experiment.IsFieldPresent("fine_tune_strategy") {
 		config["fine_tune_strategy"] = experiment.FineTuneStrategy
 	}
+}
+
+func addExecutionSpecV1(
+	config map[string]any,
+	experiment plans.PlannedExperiment,
+	provider string,
+) error {
+	modelSpec, ok := supportedModelSpecByName(experiment.Model)
+	if !ok {
+		return fmt.Errorf("%w: unsupported execution-spec model %q", store.ErrInvalidRequest, experiment.Model)
+	}
+	runner, err := executionRunnerFor(provider, modelSpec.TaskType)
+	if err != nil {
+		return err
+	}
+	requestedConfig, err := experiment.RequestedConfig()
+	if err != nil {
+		return err
+	}
+	resolutionInput := make(map[string]any, len(requestedConfig)+1)
+	for key, value := range requestedConfig {
+		resolutionInput[key] = value
+	}
+	if imageSize, ok := resolutionInput["image_size"].(float64); !ok || imageSize <= 0 {
+		if modelSpec.DefaultImageSize > 0 {
+			resolutionInput["image_size"] = modelSpec.DefaultImageSize
+		}
+	}
+	spec, err := execution.BuildExecutionSpecV1(
+		modelSpec.TaskType,
+		runner,
+		requestedConfig,
+		resolutionInput,
+	)
+	if err != nil {
+		return fmt.Errorf("resolve execution spec: %w", err)
+	}
+	payload, err := spec.Payload()
+	if err != nil {
+		return err
+	}
+	config[execution.ExecutionSpecConfigKey] = payload
+	return nil
+}
+
+func executionRunnerFor(provider, task string) (string, error) {
+	switch normalizeTrainingProvider(provider) {
+	case "local", "persistent_gpu", "persistent_disk":
+		return "local_simulator", nil
+	case "modal":
+		if task == "object_detection" {
+			return "modal_ultralytics", nil
+		}
+		if task == "image_classification" {
+			return "modal_torchvision", nil
+		}
+	}
+	return "", fmt.Errorf(
+		"%w: no execution capability runner for provider %q and task %q",
+		store.ErrInvalidRequest,
+		provider,
+		task,
+	)
 }
 
 func addDatasetMaterializationConfig(config map[string]any, policy execution.WorkerRequirementPolicy) {

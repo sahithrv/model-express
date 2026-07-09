@@ -678,6 +678,7 @@ type ExperimentPlanningRecommendation struct {
 	DeploymentTradeoff            string                     `json:"deployment_tradeoff"`
 	CandidateHypotheses           []CandidateHypothesis      `json:"candidate_hypotheses"`
 	CandidateRankings             []CandidateRanking         `json:"candidate_rankings"`
+	CandidateSelectionTrace       []CandidateSelectionRound  `json:"candidate_selection_trace,omitempty"`
 	ProposedExperiments           []plans.PlannedExperiment  `json:"proposed_experiments"`
 	ProposalMechanisms            []PlannerProposalMechanism `json:"proposal_mechanisms"`
 	ChampionJobID                 string                     `json:"champion_job_id"`
@@ -732,21 +733,48 @@ type CandidateHypothesis struct {
 }
 
 type CandidateRanking struct {
-	CandidateIndex      int                           `json:"candidate_index"`
-	Hypothesis          string                        `json:"hypothesis"`
-	PlanningMode        string                        `json:"planning_mode"`
-	Mechanism           string                        `json:"mechanism,omitempty"`
-	Intervention        string                        `json:"intervention,omitempty"`
-	ExpectedEffect      string                        `json:"expected_effect,omitempty"`
-	Score               float64                       `json:"score"`
-	ScoreComponents     map[string]float64            `json:"score_components"`
-	RetrievedMemoryHits []CandidateRetrievedMemoryHit `json:"retrieved_memory_hits,omitempty"`
-	PromotionDecision   string                        `json:"promotion_decision,omitempty"`
-	StopReason          string                        `json:"stop_reason,omitempty"`
-	Selected            bool                          `json:"selected"`
-	Rejected            bool                          `json:"rejected"`
-	Reasons             []string                      `json:"reasons"`
-	ExperimentSignature string                        `json:"experiment_signature"`
+	CandidateIndex          int                            `json:"candidate_index"`
+	Hypothesis              string                         `json:"hypothesis"`
+	PlanningMode            string                         `json:"planning_mode"`
+	Mechanism               string                         `json:"mechanism,omitempty"`
+	Intervention            string                         `json:"intervention,omitempty"`
+	ExpectedEffect          string                         `json:"expected_effect,omitempty"`
+	Score                   float64                        `json:"score"`
+	BaseScore               float64                        `json:"base_score"`
+	SelectionScore          *float64                       `json:"selection_score,omitempty"`
+	SelectionOrder          *int                           `json:"selection_order,omitempty"`
+	SelectedExperimentIndex *int                           `json:"selected_experiment_index,omitempty"`
+	SelectionAdjustments    []CandidateSelectionAdjustment `json:"selection_adjustments,omitempty"`
+	ScoreComponents         map[string]float64             `json:"score_components"`
+	RetrievedMemoryHits     []CandidateRetrievedMemoryHit  `json:"retrieved_memory_hits,omitempty"`
+	PromotionDecision       string                         `json:"promotion_decision,omitempty"`
+	StopReason              string                         `json:"stop_reason,omitempty"`
+	Selected                bool                           `json:"selected"`
+	Rejected                bool                           `json:"rejected"`
+	Reasons                 []string                       `json:"reasons"`
+	ExperimentSignature     string                         `json:"experiment_signature"`
+}
+
+type CandidateSelectionAdjustment struct {
+	Code   string  `json:"code"`
+	Value  float64 `json:"value"`
+	Detail string  `json:"detail"`
+}
+
+type CandidateSelectionRound struct {
+	SelectionOrder         int                            `json:"selection_order"`
+	SelectedCandidateIndex int                            `json:"selected_candidate_index"`
+	Candidates             []CandidateSelectionTraceEntry `json:"candidates"`
+	TotalCandidateCount    int                            `json:"total_candidate_count"`
+	Truncated              bool                           `json:"truncated"`
+}
+
+type CandidateSelectionTraceEntry struct {
+	CandidateIndex       int                            `json:"candidate_index"`
+	BaseScore            float64                        `json:"base_score"`
+	AdjustedScore        float64                        `json:"adjusted_score"`
+	Selected             bool                           `json:"selected"`
+	SelectionAdjustments []CandidateSelectionAdjustment `json:"selection_adjustments,omitempty"`
 }
 
 type CandidateRetrievedMemoryHit struct {

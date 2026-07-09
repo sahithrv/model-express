@@ -769,10 +769,40 @@ export type CandidateScoreRow = {
   expectedEffect: string;
   validationStatus: string;
   totalScore: number | null;
+  baseScore: number | null;
+  selectionScore: number | null;
+  selectionOrder: number | null;
+  selectedExperimentIndex: number | null;
+  selectionAdjustments: CandidateSelectionAdjustmentRow[];
   reasons: string[];
   memoryReasons: string[];
   memoryHits: RetrievedMemoryDisplay[];
   components: Array<{ label: string; value: number | string }>;
+};
+
+export type CandidateSelectionAdjustmentRow = {
+  code: string;
+  label: string;
+  value: number | null;
+  detail: string;
+};
+
+export type CandidateSelectionTraceEntryRow = {
+  candidateIndex: number;
+  label: string;
+  baseScore: number | null;
+  adjustedScore: number | null;
+  selected: boolean;
+  selectionAdjustments: CandidateSelectionAdjustmentRow[];
+};
+
+export type CandidateSelectionTraceRoundRow = {
+  selectionOrder: number;
+  selectedCandidateIndex: number;
+  selectedLabel: string;
+  totalCandidateCount: number;
+  truncated: boolean;
+  candidates: CandidateSelectionTraceEntryRow[];
 };
 
 export type RetrievedMemoryDisplay = {
@@ -825,6 +855,7 @@ export type DecisionChatTurn = {
   rejections: Array<{ kind: string; text: string }>;
   mechanismCoverage: MechanismCoverageRow[];
   candidateScores: CandidateScoreRow[];
+  candidateSelectionTrace: CandidateSelectionTraceRoundRow[];
 };
 
 export type MechanismCoverageRow = {
@@ -5213,6 +5244,7 @@ export function buildDecisionChatTurns(decisions: AgentDecision[]): DecisionChat
       rejections: decisionRejections(decision),
       mechanismCoverage: mechanismCoverageRows(decision.payload),
       candidateScores: candidateScoreRows(decision),
+      candidateSelectionTrace: candidateSelectionTraceRows(decision),
     }));
 }
 
@@ -5709,6 +5741,8 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
       const components = recordObject(record.score_components);
       const memoryHits = candidateRetrievedMemoryRows(record, components);
       const memoryReasons = candidateMemoryReasons(record, components, memoryHits);
+      const baseScore = recordFirstNumber(record, ["base_score", "score", "total_score"]);
+      const selectionAdjustments = candidateSelectionAdjustmentRows(record.selection_adjustments);
       return {
         label:
           recordString(record, "hypothesis") ||
@@ -5721,6 +5755,11 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
         expectedEffect: recordFirstString(record, ["expected_effect", "expected_metric_effect"]),
         validationStatus: recordFirstString(record, ["backend_validation_status", "validation_status"]),
         totalScore: numberPayload(record.score) ?? numberPayload(record.total_score),
+        baseScore,
+        selectionScore: numberPayload(record.selection_score),
+        selectionOrder: numberPayload(record.selection_order),
+        selectedExperimentIndex: numberPayload(record.selected_experiment_index),
+        selectionAdjustments,
         reasons: stringArrayPayload(record.reasons),
         memoryReasons,
         memoryHits,
@@ -5730,6 +5769,10 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
     .filter(
       (row) =>
         row.totalScore !== null ||
+        row.baseScore !== null ||
+        row.selectionScore !== null ||
+        row.selectionOrder !== null ||
+        row.selectionAdjustments.length > 0 ||
         row.components.length > 0 ||
         row.reasons.length > 0 ||
         row.memoryReasons.length > 0 ||
@@ -5737,6 +5780,64 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
         Boolean(row.mechanism || row.intervention || row.expectedEffect || row.validationStatus),
     )
     .slice(0, 6);
+}
+
+export function candidateSelectionAdjustmentRows(value: unknown): CandidateSelectionAdjustmentRow[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      const record = recordObject(item);
+      const code = recordString(record, "code");
+      return {
+        code,
+        label: humanizeAuditKey(code || "selection_adjustment").replace(/\b\w/g, (character) => character.toUpperCase()),
+        value: numberPayload(record.value),
+        detail: recordString(record, "detail"),
+      };
+    })
+    .filter((adjustment) => Boolean(adjustment.code || adjustment.detail || adjustment.value !== null));
+}
+
+export function candidateSelectionTraceRows(decision: AgentDecision): CandidateSelectionTraceRoundRow[] {
+  const rankings = Array.isArray(decision.payload?.candidate_rankings) ? decision.payload.candidate_rankings : [];
+  const labelsByCandidateIndex = new Map<number, string>();
+  rankings.forEach((item, fallbackIndex) => {
+    const record = recordObject(item);
+    const candidateIndex = recordFirstNumber(record, ["candidate_index"]) ?? fallbackIndex;
+    const label =
+      recordString(record, "hypothesis") ||
+      recordString(record, "experiment_signature") ||
+      recordString(record, "model") ||
+      `Candidate ${candidateIndex + 1}`;
+    labelsByCandidateIndex.set(candidateIndex, label);
+  });
+
+  const trace = Array.isArray(decision.payload?.candidate_selection_trace) ? decision.payload.candidate_selection_trace : [];
+  return trace.slice(0, 5).map((item, fallbackOrder) => {
+    const record = recordObject(item);
+    const selectionOrder = recordFirstNumber(record, ["selection_order"]) ?? fallbackOrder;
+    const selectedCandidateIndex = recordFirstNumber(record, ["selected_candidate_index"]) ?? -1;
+    const candidates = (Array.isArray(record.candidates) ? record.candidates : []).slice(0, 5).map((candidate) => {
+      const candidateRecord = recordObject(candidate);
+      const candidateIndex = recordFirstNumber(candidateRecord, ["candidate_index"]) ?? -1;
+      return {
+        candidateIndex,
+        label: labelsByCandidateIndex.get(candidateIndex) || `Candidate ${candidateIndex + 1}`,
+        baseScore: numberPayload(candidateRecord.base_score),
+        adjustedScore: numberPayload(candidateRecord.adjusted_score),
+        selected: candidateRecord.selected === true,
+        selectionAdjustments: candidateSelectionAdjustmentRows(candidateRecord.selection_adjustments),
+      };
+    });
+    return {
+      selectionOrder,
+      selectedCandidateIndex,
+      selectedLabel: labelsByCandidateIndex.get(selectedCandidateIndex) || `Candidate ${selectedCandidateIndex + 1}`,
+      totalCandidateCount: recordFirstNumber(record, ["total_candidate_count"]) ?? candidates.length,
+      truncated: record.truncated === true,
+      candidates,
+    };
+  });
 }
 
 export function decisionRetrievedMemoryRows(decision: AgentDecision): RetrievedMemoryDisplay[] {
