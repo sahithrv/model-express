@@ -13,6 +13,7 @@ import (
 	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
@@ -106,6 +107,8 @@ type ExperimentPlannerInput struct {
 	PriorMemory                  []memory.AgentMemoryRecord
 	ExistingExperimentSignatures []string
 	ValidationFeedback           []PlannerValidationFeedback
+	ExecutionCapabilityCard      execution.PlannerCapabilityCard
+	ExecutionEnforcementFeedback []execution.EnforcementFeedback
 	AgentMode                    string
 	MaxExperiments               int
 	MaxFollowUpRounds            int
@@ -136,6 +139,8 @@ type PlannerContextSnapshot struct {
 	VisualEvidence         map[string]any                    `json:"visual_evidence"`
 	ModelCatalog           []PlannerModelCatalogCard         `json:"model_catalog"`
 	ValidationFeedback     []PlannerValidationFeedback       `json:"planner_validation_feedback,omitempty"`
+	ExecutionCapabilities  execution.PlannerCapabilityCard   `json:"execution_capability_card"`
+	EnforcementFeedback    []execution.EnforcementFeedback   `json:"execution_enforcement_feedback,omitempty"`
 	StopOrContinuePressure PlannerStopContinueCard           `json:"stop_or_continue_pressure"`
 	PromptBudget           PlannerPromptBudget               `json:"prompt_budget"`
 }
@@ -1222,6 +1227,8 @@ Rules:
 - Use planner_context_snapshot.label_quality_card only to recommend label_noise_audit or hard_example_audit as report-only work with template label_quality_audit; never mutate labels or turn audit mechanisms into training jobs.
 - Use planner_context_snapshot.objective_context and dataset_card to decide resolution_strategy, preprocessing, augmentation_policy, augmentation_policy_config, sampling_strategy, class balancing/loss, model family, metrics, and deployment tradeoffs.
 - Use planner_context_snapshot.visual_evidence, when present, only as backend-curated advisory evidence for visible traits such as object scale, background dominance, blur, lighting variation, fine-grained classes, or bbox/crop plausibility. Cite latest accepted visual-analysis IDs, coverage, caps, limitations, warnings, or audit details if they limit confidence. Backend validation remains the gate for every proposed field.
+- Treat planner_context_snapshot.execution_capability_card as the authoritative task/runner contract. Do not propose unsupported fields; satisfy a conditional field's prerequisite or pivot to an executed field.
+- Treat planner_context_snapshot.execution_enforcement_feedback as durable constraints from prior backend checks. Do not repeat a blocked field or strategy unless you explicitly follow its suggested alternative.
 - If a visual preprocessing_hypotheses item motivates an experiment, cite its hypothesis id such as vh_001 in that experiment's evidence_used and include the concrete backend-supported config that validates the idea, such as preprocessing, augmentation_policy_config, image_size, or resolution_strategy. A hypothesis with support_status needs_backend_validation is not executable by itself.
 - Do not ask to choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.
 - Use model families in stages: cheap baseline or preprocessing search first, then challenger models, then champion refinement, then final validation.
@@ -1262,6 +1269,8 @@ func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.J
 		"Use planner_context_snapshot; prefer dataset_card, objective_context, failure_diagnosis, champion_card, project_trajectory_card, training_dynamics_card, per_class_error_card, deployment_card, mechanism_coverage_card, label_quality_card, search_coverage, strategy_lessons, retrieved_memory, model_catalog, optimizer_feedback_summary, validation_feedback, and visual_evidence, when present.",
 		"Treat visual_evidence, when present, only as backend-curated advisory evidence; cite latest accepted visual-analysis IDs, raw images, raw Visual Agent output, and local paths are never included.",
 		"Backend validation remains the gate; retrieved memory cannot bypass backend validation.",
+		"Treat execution_capability_card as the authoritative task/runner field contract. Never propose unsupported fields; satisfy conditional prerequisites or choose an executed alternative.",
+		"Treat execution_enforcement_feedback as durable backend constraints: do not repeat blocked fields or strategies unless the proposal explicitly follows the supplied suggested alternative.",
 		"Mechanism values should come from this taxonomy: baseline_control, architecture_challenge, capacity_finetune, optimizer_scheduler, regularization, augmentation_basic, augmentation_auto, augmentation_mixed_sample, class_imbalance, minority_targeting, resolution_crop, bbox_crop_ablation, label_noise_audit, hard_example_audit, deployment_latency, distillation.",
 		"Model family is a parameter inside a mechanism, not a mechanism by itself.",
 		"Use preprocessing.resize_strategy values, augmentation_policy values, class_balancing values, sampling_strategy values, and focal_loss only when backend validation allows them.",
@@ -1765,6 +1774,8 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		VisualEvidence:         visualExemplarPromptContext(input.VisualExemplarContext),
 		ModelCatalog:           compactPlannerModelCatalog(input.ModelCatalog),
 		ValidationFeedback:     input.ValidationFeedback,
+		ExecutionCapabilities:  input.ExecutionCapabilityCard,
+		EnforcementFeedback:    input.ExecutionEnforcementFeedback,
 		StopOrContinuePressure: plannerStopContinueCard(input),
 		PromptBudget:           promptBudget,
 	}
@@ -1803,6 +1814,8 @@ func plannerPromptBudgetWithEstimates(snapshot PlannerContextSnapshot, base Plan
 	budget.SectionEstimates["planner_context_snapshot_total"] = plannerPromptSectionEstimateFromValue(snapshot)
 	budget.SectionEstimates["project_card"] = plannerPromptSectionEstimateFromValue(snapshot.Project)
 	budget.SectionEstimates["dataset_card"] = plannerPromptSectionEstimateFromValue(snapshot.DatasetCard)
+	budget.SectionEstimates["execution_capability_card"] = plannerPromptSectionEstimateFromValue(snapshot.ExecutionCapabilities)
+	budget.SectionEstimates["execution_enforcement_feedback"] = plannerPromptSectionEstimateFromValue(snapshot.EnforcementFeedback)
 	budget.SectionEstimates["source_plan_card"] = plannerPromptSectionEstimateFromValue(snapshot.SourcePlanCard)
 	budget.SectionEstimates["objective_context"] = plannerPromptSectionEstimateFromValue(snapshot.ObjectiveContext)
 	budget.SectionEstimates["champion_card"] = plannerPromptSectionEstimateFromValue(snapshot.ChampionCard)

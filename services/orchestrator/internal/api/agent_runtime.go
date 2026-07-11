@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/execution"
@@ -583,6 +585,10 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	if err != nil {
 		return agents.ExperimentPlannerInput{}, false, err
 	}
+	executionEvents, err := s.store.ListProjectExecutionEvents(projectID, 100)
+	if err != nil {
+		executionEvents = []execution.ExecutionEvent{}
+	}
 	summaries, err := s.store.ListProjectTrainingRunSummaries(projectID)
 	if err != nil {
 		return agents.ExperimentPlannerInput{}, false, err
@@ -623,6 +629,10 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		return agents.ExperimentPlannerInput{}, false, err
 	}
 	metadataSummary, err := s.activeAgentSafeDatasetMetadataSummary(dataset)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	executionCapabilityCard, executionFeedback, err := s.plannerExecutionCapabilityContext(dataset, metadataSummary, projectJobs, executionEvents)
 	if err != nil {
 		return agents.ExperimentPlannerInput{}, false, err
 	}
@@ -691,6 +701,8 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		PriorEvaluations:             evaluations,
 		PriorMemory:                  priorMemory,
 		ExistingExperimentSignatures: experimentSignaturesForPlans(projectPlans),
+		ExecutionCapabilityCard:      executionCapabilityCard,
+		ExecutionEnforcementFeedback: executionFeedback,
 		AgentMode:                    automationSettings.AgentMode,
 		MaxExperiments:               maxLLMPlannerExperiments,
 		MaxFollowUpRounds:            s.maxAutoFollowUpRounds(),
@@ -699,6 +711,67 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	input.ProjectTrajectory = agents.ComputeProjectTrajectoryDiagnosis(input)
 	input.RetrievedMemory = s.retrievePlannerMemory(context.Background(), input)
 	return input, true, nil
+}
+
+func (s *Server) plannerExecutionCapabilityContext(
+	dataset datasets.Dataset,
+	metadataSummary map[string]any,
+	projectJobs []jobs.ExperimentJob,
+	events []execution.ExecutionEvent,
+) (execution.PlannerCapabilityCard, []execution.EnforcementFeedback, error) {
+	task := "image_classification"
+	if datasetHasYOLODetectionEvidence(dataset, metadataSummary) {
+		task = "object_detection"
+	}
+	provider := s.defaultExecuteExperimentPlanRequest().Provider
+	runner, err := executionRunnerFor(provider, task)
+	if err != nil {
+		return execution.PlannerCapabilityCard{}, nil, err
+	}
+	modelFamilies := []string{}
+	for _, model := range supportedModelCatalogForDataset(dataset, metadataSummary) {
+		if model.TaskType == task {
+			modelFamilies = append(modelFamilies, model.Family)
+		}
+	}
+	card, err := execution.BuildPlannerCapabilityCard(task, runner, executionValidationMode(), modelFamilies)
+	if err != nil {
+		return execution.PlannerCapabilityCard{}, nil, err
+	}
+	reports := executionValidationReports(projectJobs, events)
+	return card, execution.SummarizeEnforcementFeedback(reports, task, runner, 12), nil
+}
+
+func executionValidationReports(projectJobs []jobs.ExperimentJob, events []execution.ExecutionEvent) []execution.ExecutionValidationReport {
+	out := []execution.ExecutionValidationReport{}
+	seen := map[string]bool{}
+	appendReport := func(value any) {
+		blob, err := json.Marshal(value)
+		if err != nil {
+			return
+		}
+		var report execution.ExecutionValidationReport
+		if err := json.Unmarshal(blob, &report); err != nil || report.SchemaVersion != execution.ExecutionValidationSchemaVersionV1 {
+			return
+		}
+		key := report.AcceptedSpecHash + "|" + report.ModelFamily + "|" + executionValidationSummary(report)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, report)
+	}
+	for _, job := range projectJobs {
+		if value, ok := job.Config[execution.ExecutionValidationConfigKey]; ok {
+			appendReport(value)
+		}
+	}
+	for _, event := range events {
+		if event.EventType == execution.EventExecutionValidationReported {
+			appendReport(event.Payload["report"])
+		}
+	}
+	return out
 }
 
 func (s *Server) recordExperimentPlannerInvocation(
@@ -792,8 +865,22 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			recommendation.ProposedExperiments = experiments
 			recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, automlWarnings...)
 		}
+		executionReports, capabilityErr := validatePlannerExecutionCapabilities(recommendation.ProposedExperiments, attemptInput)
+		if capabilityErr != nil {
+			lastErr = capabilityErr
+			s.recordPlannerValidationRejection(invocation, capabilityErr, attempt, attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation))
+			if attempt >= plannerBackendValidationRetryLimit || !shouldRetryExperimentPlannerValidation(recommendation) {
+				result.Recommendation = recommendation
+				return result, capabilityErr
+			}
+			attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, capabilityErr, attempt+1))
+			continue
+		}
 		payload, err := experimentPlannerDecisionPayload(recommendation, invocation, agentMode, attemptInput)
 		if err == nil {
+			if len(executionReports) > 0 {
+				payload["execution_validation_reports"] = executionReports
+			}
 			if attempt > 0 {
 				payload["validation_retry_count"] = attempt
 				payload["validation_feedback_applied"] = attemptInput.ValidationFeedback
@@ -914,6 +1001,12 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 				}
 				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 			}
+			executionReports, err := validatePlannerExecutionCapabilities(experiments, input)
+			result.Details["execution_validation_mode"] = input.ExecutionCapabilityCard.Mode
+			result.Details["execution_validation_reports"] = executionReports
+			if err != nil {
+				return invalidPlannerDryRunResult(result, err)
+			}
 			result.Details["validated_experiment_count"] = len(experiments)
 			if len(relaxedValidationWarnings) > 0 {
 				result.Details["planner_validation_mode"] = "relaxed"
@@ -921,6 +1014,49 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 			}
 		}
 		return result
+	}
+}
+
+func validatePlannerExecutionCapabilities(
+	experiments []plans.PlannedExperiment,
+	input agents.ExperimentPlannerInput,
+) ([]execution.ExecutionValidationReport, error) {
+	if len(experiments) == 0 || input.ExecutionCapabilityCard.Runner == "" {
+		return nil, nil
+	}
+	provider := providerForExecutionRunner(input.ExecutionCapabilityCard.Runner)
+	reports := make([]execution.ExecutionValidationReport, 0, len(experiments))
+	blocked := []string{}
+	for index, experiment := range experiments {
+		if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+			continue
+		}
+		spec, err := buildExecutionSpecV1(experiment, provider)
+		if err != nil {
+			return reports, err
+		}
+		modelSpec, _ := supportedModelSpecByName(experiment.Model)
+		report, err := execution.ValidateExecutionSpecV1(spec, modelSpec.Family, input.ExecutionCapabilityCard.Mode)
+		if err != nil {
+			return reports, err
+		}
+		reports = append(reports, report)
+		if report.Mode == execution.ValidationModeEnforce && report.WouldBlock {
+			blocked = append(blocked, fmt.Sprintf("experiment %d: %s", index, executionValidationSummary(report)))
+		}
+	}
+	if len(blocked) > 0 {
+		return reports, fmt.Errorf("%w: execution fidelity enforcement rejected planner proposal: %s", store.ErrInvalidRequest, strings.Join(blocked, "; "))
+	}
+	return reports, nil
+}
+
+func providerForExecutionRunner(runner string) string {
+	switch runner {
+	case "modal_torchvision", "modal_ultralytics":
+		return "modal"
+	default:
+		return "local"
 	}
 }
 
@@ -955,10 +1091,16 @@ func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommend
 		RejectedExperiments: rejectedExperiments,
 		Instructions: []string{
 			"Return corrected JSON only.",
-			"Do not repeat rejected experiment mechanisms.",
+			"Do not repeat the rejected experiment configuration unchanged.",
 			"Change a meaningful mechanism such as model family, preprocessing, augmentation policy, sampling/class balancing, scheduler, optimizer, regularization, or resolution strategy.",
 			"Only propose experiments that backend validation can schedule.",
 		},
+	}
+	if validationErr != nil && strings.Contains(strings.ToLower(validationErr.Error()), "execution fidelity enforcement") {
+		feedback.Instructions = append(feedback.Instructions,
+			"Follow each execution-fidelity suggested alternative: remove the blocked field, activate its documented prerequisite, or pivot to an executed field from execution_capability_card.",
+			"You may preserve the higher-level mechanism when it remains meaningful after removing the blocked no-op; otherwise propose a different supported mechanism.",
+		)
 	}
 	if validationErr != nil && strings.Contains(strings.ToLower(validationErr.Error()), "champion_challenge") {
 		feedback.Instructions = append(

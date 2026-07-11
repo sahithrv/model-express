@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"model-express/services/orchestrator/internal/agents"
+	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
@@ -35,10 +37,11 @@ type executeExperimentPlanRequest struct {
 }
 
 type executeExperimentPlanResponse struct {
-	Plan              plans.ExperimentPlan         `json:"plan"`
-	Jobs              []jobs.ExperimentJob         `json:"jobs"`
-	CostPolicy        map[string]any               `json:"cost_policy,omitempty"`
-	WorkerRequirement *execution.WorkerRequirement `json:"worker_requirement,omitempty"`
+	Plan              plans.ExperimentPlan                  `json:"plan"`
+	Jobs              []jobs.ExperimentJob                  `json:"jobs"`
+	ValidationReports []execution.ExecutionValidationReport `json:"execution_validation_reports,omitempty"`
+	CostPolicy        map[string]any                        `json:"cost_policy,omitempty"`
+	WorkerRequirement *execution.WorkerRequirement          `json:"worker_requirement,omitempty"`
 }
 
 type cancelExecutionRequest struct {
@@ -217,8 +220,42 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		}
 		jobsByExperiment[index] = job
 	}
+	if executionValidationMode() == execution.ValidationModeEnforce {
+		for index, experiment := range plan.Experiments {
+			if _, ok := jobsByExperiment[index]; ok || experimentExecutionTemplate(experiment) != jobs.TemplateTrainExperiment {
+				continue
+			}
+			if err := validateExperimentDatasetCompatibility(experiment, dataset, index); err != nil {
+				return executeExperimentPlanResponse{}, err
+			}
+			if costPolicy.Enabled {
+				allowed, _ := costPolicy.AllowTrainingJob(trainingTierForExperiment(experiment))
+				if !allowed {
+					continue
+				}
+			}
+			spec, err := buildExecutionSpecV1(experiment, provider)
+			if err != nil {
+				return executeExperimentPlanResponse{}, err
+			}
+			modelSpec, _ := supportedModelSpecByName(experiment.Model)
+			report, err := execution.ValidateExecutionSpecV1(spec, modelSpec.Family, execution.ValidationModeEnforce)
+			if err != nil {
+				return executeExperimentPlanResponse{}, fmt.Errorf("validate execution spec: %w", err)
+			}
+			report.SetShadowDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs))
+			if report.WouldBlock {
+				s.recordExecutionValidationReport(plan, index, report)
+				return executeExperimentPlanResponse{}, fmt.Errorf(
+					"%w: experiment %d would be blocked by execution fidelity enforcement: %s",
+					store.ErrInvalidRequest, index, executionValidationSummary(report),
+				)
+			}
+		}
+	}
 
 	out := make([]jobs.ExperimentJob, 0, len(plan.Experiments))
+	validationReports := make([]execution.ExecutionValidationReport, 0, len(plan.Experiments))
 	for index, experiment := range plan.Experiments {
 		if err := validateExperimentDatasetCompatibility(experiment, dataset, index); err != nil {
 			return executeExperimentPlanResponse{}, err
@@ -282,8 +319,24 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		}
 		addOptionalExperimentConfig(config, experiment)
 		if jobTemplate == jobs.TemplateTrainExperiment {
-			if err := addExecutionSpecV1(config, experiment, provider); err != nil {
+			spec, err := addExecutionSpecV1(config, experiment, provider)
+			if err != nil {
 				return executeExperimentPlanResponse{}, err
+			}
+			modelSpec, _ := supportedModelSpecByName(experiment.Model)
+			report, err := execution.ValidateExecutionSpecV1(spec, modelSpec.Family, executionValidationMode())
+			if err != nil {
+				return executeExperimentPlanResponse{}, fmt.Errorf("validate execution spec: %w", err)
+			}
+			report.SetShadowDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs, out))
+			config[execution.ExecutionValidationConfigKey] = report
+			validationReports = append(validationReports, report)
+			s.recordExecutionValidationReport(plan, index, report)
+			if report.Mode == execution.ValidationModeEnforce && report.WouldBlock {
+				return executeExperimentPlanResponse{}, fmt.Errorf(
+					"%w: experiment %d would be blocked by execution fidelity enforcement: %s",
+					store.ErrInvalidRequest, index, executionValidationSummary(report),
+				)
 			}
 		}
 		if metadataImport, err := s.store.GetActiveDatasetMetadataImport(plan.DatasetID); err == nil {
@@ -322,6 +375,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	return executeExperimentPlanResponse{
 		Plan:              plan,
 		Jobs:              out,
+		ValidationReports: validationReports,
 		CostPolicy:        costPolicy.Payload(),
 		WorkerRequirement: workerRequirement,
 	}, nil
@@ -440,18 +494,34 @@ func addExecutionSpecV1(
 	config map[string]any,
 	experiment plans.PlannedExperiment,
 	provider string,
-) error {
+) (execution.ExecutionSpecV1, error) {
+	spec, err := buildExecutionSpecV1(experiment, provider)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	payload, err := spec.Payload()
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	config[execution.ExecutionSpecConfigKey] = payload
+	return spec, nil
+}
+
+func buildExecutionSpecV1(
+	experiment plans.PlannedExperiment,
+	provider string,
+) (execution.ExecutionSpecV1, error) {
 	modelSpec, ok := supportedModelSpecByName(experiment.Model)
 	if !ok {
-		return fmt.Errorf("%w: unsupported execution-spec model %q", store.ErrInvalidRequest, experiment.Model)
+		return execution.ExecutionSpecV1{}, fmt.Errorf("%w: unsupported execution-spec model %q", store.ErrInvalidRequest, experiment.Model)
 	}
 	runner, err := executionRunnerFor(provider, modelSpec.TaskType)
 	if err != nil {
-		return err
+		return execution.ExecutionSpecV1{}, err
 	}
 	requestedConfig, err := experiment.RequestedConfig()
 	if err != nil {
-		return err
+		return execution.ExecutionSpecV1{}, err
 	}
 	resolutionInput := make(map[string]any, len(requestedConfig)+1)
 	for key, value := range requestedConfig {
@@ -469,14 +539,84 @@ func addExecutionSpecV1(
 		resolutionInput,
 	)
 	if err != nil {
-		return fmt.Errorf("resolve execution spec: %w", err)
+		return execution.ExecutionSpecV1{}, fmt.Errorf("resolve execution spec: %w", err)
 	}
-	payload, err := spec.Payload()
+	return spec, nil
+}
+
+func matchingAcceptedSpecJobIDs(hash string, groups ...[]jobs.ExperimentJob) []string {
+	if strings.TrimSpace(hash) == "" {
+		return nil
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, group := range groups {
+		for _, job := range group {
+			if job.ID == "" || seen[job.ID] || acceptedSpecHashFromJob(job) != hash {
+				continue
+			}
+			seen[job.ID] = true
+			out = append(out, job.ID)
+		}
+	}
+	return out
+}
+
+func acceptedSpecHashFromJob(job jobs.ExperimentJob) string {
+	value, ok := job.Config[execution.ExecutionSpecConfigKey]
+	if !ok || value == nil {
+		return ""
+	}
+	if payload, ok := value.(map[string]any); ok {
+		return configString(payload, "accepted_spec_hash")
+	}
+	blob, err := json.Marshal(value)
 	if err != nil {
-		return err
+		return ""
 	}
-	config[execution.ExecutionSpecConfigKey] = payload
-	return nil
+	var spec execution.ExecutionSpecV1
+	if err := json.Unmarshal(blob, &spec); err != nil {
+		return ""
+	}
+	return spec.AcceptedSpecHash
+}
+
+func executionValidationSummary(report execution.ExecutionValidationReport) string {
+	parts := []string{}
+	for _, finding := range report.Findings {
+		if !finding.WouldBlock {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s): %s", finding.Field, finding.ReasonCode, finding.SuggestedAlternative))
+	}
+	if len(parts) == 0 {
+		return "no blocking findings"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (s *Server) recordExecutionValidationReport(plan plans.ExperimentPlan, experimentIndex int, report execution.ExecutionValidationReport) {
+	for _, finding := range report.Findings {
+		diagnostics.Event("info", "execution_validation_finding", map[string]any{
+			"project_id": plan.ProjectID, "plan_id": plan.ID, "experiment_index": experimentIndex,
+			"mode": report.Mode, "task": report.Task, "runner": report.Runner, "model_family": report.ModelFamily,
+			"field": finding.Field, "classification": finding.Classification, "reason_code": finding.ReasonCode,
+			"would_block": finding.WouldBlock,
+		})
+	}
+	if len(report.Findings) == 0 && !report.ShadowDuplicate.WouldSkip {
+		return
+	}
+	message := fmt.Sprintf("Execution fidelity validation reported %d finding(s) for experiment %d.", len(report.Findings), experimentIndex)
+	if report.Mode == execution.ValidationModeEnforce && report.WouldBlock {
+		message = fmt.Sprintf("Execution fidelity enforcement would block experiment %d.", experimentIndex)
+	}
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventExecutionValidationReported, message, map[string]any{
+		"experiment_index": experimentIndex,
+		"report":           report,
+	}); err != nil {
+		log.Printf("record execution validation event failed for plan %s experiment %d: %v", plan.ID, experimentIndex, err)
+	}
 }
 
 func executionRunnerFor(provider, task string) (string, error) {

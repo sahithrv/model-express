@@ -44,6 +44,7 @@ const (
 	EventDatasetVisualAnalysisResult    = "DATASET_VISUAL_ANALYSIS_RESULT"
 	EventExperimentationReopened        = "EXPERIMENTATION_REOPENED"
 	EventExecutionFailed                = "EXECUTION_FAILED"
+	EventExecutionValidationReported    = "EXECUTION_VALIDATION_REPORTED"
 	EventMemoryRetrievalLogged          = "MEMORY_RETRIEVAL_LOGGED"
 	EventAgentStarted                   = "AGENT_STARTED"
 	EventAgentRecommendationRecorded    = "AGENT_RECOMMENDATION_RECORDED"

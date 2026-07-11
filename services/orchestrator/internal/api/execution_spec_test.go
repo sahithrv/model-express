@@ -2,10 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 
+	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/store"
 )
 
 func TestExecutePlanPreservesExplicitFalseAndZeroInLegacyAndCanonicalPayloads(t *testing.T) {
@@ -93,6 +97,121 @@ func TestExecutePlanPreservesExplicitFalseAndZeroInLegacyAndCanonicalPayloads(t 
 	acceptedPolicy := accepted["augmentation_policy_config"].(map[string]any)
 	assertConfigValue(t, acceptedPolicy, "probability", float64(0))
 	assertConfigValue(t, acceptedPolicy, "alpha", float64(0))
+}
+
+func TestExecutionValidationShadowReportsWithoutBlocking(t *testing.T) {
+	experiment := testExperiment("resnet18", 8)
+	experiment.ResolutionStrategy = "low_latency"
+	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{experiment})
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("shadow execution was blocked: %v", err)
+	}
+	if len(result.Jobs) != 1 || len(result.ValidationReports) != 1 {
+		t.Fatalf("unexpected shadow result: jobs=%d reports=%d", len(result.Jobs), len(result.ValidationReports))
+	}
+	report := result.ValidationReports[0]
+	if report.Mode != execution.ValidationModeShadow || !report.WouldBlock {
+		t.Fatalf("unexpected shadow report: %#v", report)
+	}
+	if _, ok := result.Jobs[0].Config[execution.ExecutionValidationConfigKey]; !ok {
+		t.Fatalf("job config did not retain typed validation report: %#v", result.Jobs[0].Config)
+	}
+}
+
+func TestExecutionValidationEnforceBlocksBeforeJobCreation(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "enforce")
+	experiment := testExperiment("resnet18", 8)
+	experiment.ResolutionStrategy = "low_latency"
+	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{experiment})
+
+	_, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if !errors.Is(err, store.ErrInvalidRequest) {
+		t.Fatalf("expected enforcement error, got %v", err)
+	}
+	projectJobs, listErr := server.store.ListProjectJobs(plan.ProjectID)
+	if listErr != nil {
+		t.Fatalf("list project jobs: %v", listErr)
+	}
+	for _, job := range projectJobs {
+		if configString(job.Config, "plan_id") == plan.ID {
+			t.Fatalf("enforcement created a blocked plan job: %#v", job)
+		}
+	}
+	events, listErr := server.store.ListProjectExecutionEvents(plan.ProjectID, 20)
+	if listErr != nil {
+		t.Fatalf("list validation events: %v", listErr)
+	}
+	found := false
+	for _, event := range events {
+		if event.EventType == execution.EventExecutionValidationReported && event.PlanID == plan.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("enforcement did not persist the typed blocked report")
+	}
+}
+
+func TestExecutionValidationEnforcePreflightsWholePlanBeforeCreatingJobs(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "enforce")
+	valid := testExperiment("resnet18", 8)
+	blocked := testExperiment("efficientnet_b0", 8)
+	blocked.ResolutionStrategy = "low_latency"
+	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{valid, blocked})
+
+	_, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if !errors.Is(err, store.ErrInvalidRequest) {
+		t.Fatalf("expected whole-plan enforcement error, got %v", err)
+	}
+	projectJobs, listErr := server.store.ListProjectJobs(plan.ProjectID)
+	if listErr != nil {
+		t.Fatalf("list project jobs: %v", listErr)
+	}
+	for _, job := range projectJobs {
+		if configString(job.Config, "plan_id") == plan.ID {
+			t.Fatalf("whole-plan preflight created an earlier valid job before rejecting a later experiment: %#v", job)
+		}
+	}
+}
+
+func TestAcceptedHashDuplicateDecisionRemainsShadowOnly(t *testing.T) {
+	baseline := testExperiment("resnet18", 8)
+	equivalent := testExperiment("resnet18", 8)
+	equivalent.ResolutionStrategy = "low_latency"
+	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{baseline, equivalent})
+
+	result, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if err != nil {
+		t.Fatalf("execute equivalent experiments: %v", err)
+	}
+	if len(result.Jobs) != 2 || len(result.ValidationReports) != 2 {
+		t.Fatalf("shadow duplicate changed legacy scheduling: jobs=%d reports=%d", len(result.Jobs), len(result.ValidationReports))
+	}
+	if !result.ValidationReports[1].ShadowDuplicate.WouldSkip || len(result.ValidationReports[1].ShadowDuplicate.MatchingJobIDs) != 1 {
+		t.Fatalf("accepted-hash duplicate was not shadow-reported: %#v", result.ValidationReports[1].ShadowDuplicate)
+	}
+}
+
+func TestPlannerEnforcementErrorCarriesActionableAlternative(t *testing.T) {
+	card, err := execution.BuildPlannerCapabilityCard(
+		"image_classification", "modal_torchvision", execution.ValidationModeEnforce, []string{"resnet"},
+	)
+	if err != nil {
+		t.Fatalf("build capability card: %v", err)
+	}
+	experiment := testExperiment("resnet18", 8)
+	experiment.ResolutionStrategy = "low_latency"
+	reports, err := validatePlannerExecutionCapabilities([]plans.PlannedExperiment{experiment}, agents.ExperimentPlannerInput{
+		ExecutionCapabilityCard: card,
+	})
+	if err == nil || len(reports) != 1 {
+		t.Fatalf("expected actionable planner enforcement result: reports=%#v err=%v", reports, err)
+	}
+	if !strings.Contains(err.Error(), "omit resolution_strategy") {
+		t.Fatalf("planner retry feedback omitted the alternative: %v", err)
+	}
 }
 
 func TestExecutionSpecUsesModelSpecificImageDefault(t *testing.T) {
