@@ -1462,6 +1462,9 @@ func scanOptimizerStudy(row rowScanner) (automl.OptimizerStudy, error) {
 		&study.Seed,
 		&searchSpaceJSON,
 		&strategyJSON,
+		&study.CapabilityVersion,
+		&study.Task,
+		&study.Runner,
 		&study.CreatedAt,
 	); err != nil {
 		return automl.OptimizerStudy{}, normalizeSQLError(err)
@@ -1507,6 +1510,9 @@ func scanOptimizerSuggestion(row rowScanner) (automl.OptimizerSuggestion, error)
 		&provenanceJSON,
 		&suggestion.ValidationStatus,
 		&validationErrorsJSON,
+		&suggestion.CapabilityVersion,
+		&suggestion.Task,
+		&suggestion.Runner,
 		&suggestion.CreatedAt,
 	); err != nil {
 		return automl.OptimizerSuggestion{}, normalizeSQLError(err)
@@ -1554,6 +1560,9 @@ func scanOptimizerTrial(row rowScanner) (automl.OptimizerTrial, error) {
 		&trial.Score,
 		&metricsJSON,
 		&trial.Error,
+		&trial.CapabilityVersion,
+		&trial.Task,
+		&trial.Runner,
 		&trial.CreatedAt,
 		&trial.UpdatedAt,
 	); err != nil {
@@ -1686,15 +1695,15 @@ func strategyScorecardSelectColumns() string {
 }
 
 func automlStudySelectColumns() string {
-	return "id, project_id, plan_id, dataset_id, source_decision_id, experiment_index, model, intent, sampler, seed, search_space, strategy_snapshot, created_at"
+	return "id, project_id, plan_id, dataset_id, source_decision_id, experiment_index, model, intent, sampler, seed, search_space, strategy_snapshot, capability_version, task, runner, created_at"
 }
 
 func automlSuggestionSelectColumns() string {
-	return "id, study_id, project_id, plan_id, dataset_id, job_id, experiment_index, model, sampler, seed, values, final_values, provenance, validation_status, validation_errors, created_at"
+	return "id, study_id, project_id, plan_id, dataset_id, job_id, experiment_index, model, sampler, seed, values, final_values, provenance, validation_status, validation_errors, capability_version, task, runner, created_at"
 }
 
 func automlTrialSelectColumns() string {
-	return "id, study_id, suggestion_id, project_id, plan_id, dataset_id, job_id, status, target_metric, score, metrics, error, created_at, updated_at"
+	return "id, study_id, suggestion_id, project_id, plan_id, dataset_id, job_id, status, target_metric, score, metrics, error, capability_version, task, runner, created_at, updated_at"
 }
 
 func newPostgresTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.TrainingRunSummary {

@@ -969,7 +969,19 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 				if experiments[index].AutoML == nil || !experiments[index].AutoML.Enabled {
 					continue
 				}
-				prepared, err := prepareAutoMLExperiment(experiments[index], index, automl.SamplerSeededRandom)
+				scope := automl.ExecutionScope{
+					CapabilityVersion: input.ExecutionCapabilityCard.CapabilityVersion,
+					Task:              input.ExecutionCapabilityCard.Task,
+					Runner:            input.ExecutionCapabilityCard.Runner,
+				}
+				if scope.Runner == "" {
+					var scopeErr error
+					scope, scopeErr = autoMLExecutionScopeForExperiment(experiments[index], "modal")
+					if scopeErr != nil {
+						return invalidPlannerDryRunResult(result, scopeErr)
+					}
+				}
+				prepared, err := prepareAutoMLExperimentWithHistoryForExecution(experiments[index], index, automl.SamplerSeededRandom, nil, scope)
 				if err != nil {
 					return invalidPlannerDryRunResult(result, err)
 				}

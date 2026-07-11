@@ -1023,8 +1023,12 @@ func validateExperimentAutoML(experiment plans.PlannedExperiment, index int) err
 		return fmt.Errorf("%w: proposed experiment %d cannot use AutoML for report-only label-quality audit jobs", store.ErrInvalidRequest, index)
 	}
 	strategy := automlStrategyContext(experiment)
+	scope, err := autoMLValidationScopeForExperiment(experiment)
+	if err != nil {
+		return fmt.Errorf("%w: proposed experiment %d has invalid AutoML execution scope: %s", store.ErrInvalidRequest, index, err.Error())
+	}
 	if experiment.AutoML.SearchSpace != nil && len(experiment.AutoML.SearchSpace.Parameters) > 0 {
-		if err := automl.ValidateSearchSpace(*experiment.AutoML.SearchSpace, strategy); err != nil {
+		if err := automl.ValidateSearchSpaceForExecution(*experiment.AutoML.SearchSpace, strategy, scope); err != nil {
 			return fmt.Errorf("%w: proposed experiment %d has invalid AutoML search space: %s", store.ErrInvalidRequest, index, err.Error())
 		}
 		return nil
@@ -1032,7 +1036,7 @@ func validateExperimentAutoML(experiment plans.PlannedExperiment, index int) err
 	if len(experiment.AutoML.Intent.AllowedParameters) == 0 {
 		return fmt.Errorf("%w: proposed experiment %d AutoML requires a search_space or intent.allowed_parameters", store.ErrInvalidRequest, index)
 	}
-	if _, err := automl.DefaultSearchSpace(experiment.AutoML.Intent.AllowedParameters, strategy); err != nil {
+	if _, err := automl.DefaultSearchSpaceForExecution(experiment.AutoML.Intent.AllowedParameters, strategy, scope); err != nil {
 		return fmt.Errorf("%w: proposed experiment %d has invalid AutoML intent: %s", store.ErrInvalidRequest, index, err.Error())
 	}
 	return nil

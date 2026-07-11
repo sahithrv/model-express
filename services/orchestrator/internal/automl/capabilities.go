@@ -72,7 +72,10 @@ func (r HyperparameterCapabilityRegistry) Capability(name string) (Hyperparamete
 }
 
 func DefaultSearchSpace(parameterNames []string, strategy StrategyContext) (HyperparameterSearchSpace, error) {
-	registry := DefaultCapabilityRegistry()
+	return defaultSearchSpaceWithRegistry(parameterNames, strategy, DefaultCapabilityRegistry())
+}
+
+func defaultSearchSpaceWithRegistry(parameterNames []string, strategy StrategyContext, registry HyperparameterCapabilityRegistry) (HyperparameterSearchSpace, error) {
 	parameters := []HyperparameterParameterSpec{}
 	for _, name := range parameterNames {
 		capability, ok := registry.Capability(name)
@@ -97,11 +100,14 @@ func DefaultSearchSpace(parameterNames []string, strategy StrategyContext) (Hype
 		parameters = append(parameters, spec)
 	}
 	space := HyperparameterSearchSpace{Parameters: parameters}
-	return space, ValidateSearchSpace(space, strategy)
+	return space, validateSearchSpaceWithRegistry(space, strategy, registry)
 }
 
 func ValidateSearchSpace(space HyperparameterSearchSpace, strategy StrategyContext) error {
-	registry := DefaultCapabilityRegistry()
+	return validateSearchSpaceWithRegistry(space, strategy, DefaultCapabilityRegistry())
+}
+
+func validateSearchSpaceWithRegistry(space HyperparameterSearchSpace, strategy StrategyContext, registry HyperparameterCapabilityRegistry) error {
 	if len(space.Parameters) == 0 {
 		return fmt.Errorf("automl search space must include at least one hyperparameter")
 	}
@@ -149,6 +155,10 @@ func ValidateSearchSpace(space HyperparameterSearchSpace, strategy StrategyConte
 }
 
 func ValidateSuggestion(suggestion HyperparameterSuggestion, space HyperparameterSearchSpace, strategy StrategyContext) error {
+	return validateSuggestionWithRegistry(suggestion, space, strategy, DefaultCapabilityRegistry())
+}
+
+func validateSuggestionWithRegistry(suggestion HyperparameterSuggestion, space HyperparameterSearchSpace, strategy StrategyContext, registry HyperparameterCapabilityRegistry) error {
 	if suggestion.Values == nil {
 		return fmt.Errorf("automl suggestion values are required")
 	}
@@ -162,7 +172,7 @@ func ValidateSuggestion(suggestion HyperparameterSuggestion, space Hyperparamete
 		if !ok {
 			return fmt.Errorf("automl suggestion includes parameter %q outside validated search space", rawName)
 		}
-		capability, ok := DefaultCapabilityRegistry().Capability(name)
+		capability, ok := registry.Capability(name)
 		if !ok {
 			return fmt.Errorf("automl suggestion includes unsupported parameter %q", rawName)
 		}
@@ -205,7 +215,7 @@ func ValidateSuggestion(suggestion HyperparameterSuggestion, space Hyperparamete
 		}
 	}
 	for _, spec := range space.Parameters {
-		capability, _ := DefaultCapabilityRegistry().Capability(spec.Name)
+		capability, _ := registry.Capability(spec.Name)
 		if !conditionActive(parameterCondition(spec, capability), strategy, suggestion.Values) {
 			continue
 		}

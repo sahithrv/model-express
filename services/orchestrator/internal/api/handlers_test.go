@@ -4247,6 +4247,7 @@ func TestPrepareAutoMLExperimentsAutoEnablesBackendDefaultWhenEnabled(t *testing
 	settings := server.currentAutomationSettings()
 	settings.AutoMLEnabled = true
 	settings.AutoMLSampler = automl.SamplerSeededRandom
+	settings.DefaultTrainingProvider = "modal"
 	if _, err := server.store.SaveAutomationSettings(settings); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}

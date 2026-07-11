@@ -15,6 +15,7 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
@@ -22,10 +23,33 @@ import (
 )
 
 func (s *Server) getAutoMLCapabilities(c *gin.Context) {
+	task := strings.TrimSpace(c.Query("task"))
+	runner := strings.TrimSpace(c.Query("runner"))
+	capabilities := automl.DefaultCapabilityRegistry().Capabilities()
+	var scope any
+	if task != "" || runner != "" {
+		if task == "" || runner == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "task and runner must be provided together"})
+			return
+		}
+		executionScope, err := automl.CurrentExecutionScope(task, runner)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		registry, err := automl.CapabilityRegistryForExecution(executionScope)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		capabilities = registry.Capabilities()
+		scope = executionScope
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"enabled":                   s.currentAutomationSettings().AutoMLEnabled,
 		"default_sampler":           s.currentAutomationSettings().AutoMLSampler,
-		"capabilities":              automl.DefaultCapabilityRegistry().Capabilities(),
+		"capabilities":              capabilities,
+		"execution_scope":           scope,
 		"strategy_fields_forbidden": []string{"model", "template", "preprocessing", "resolution_strategy", "image_size", "augmentation_policy", "augmentation_policy_config.policy_type", "class_balancing", "sampling_strategy", "pretrained", "freeze_backbone", "fine_tune_strategy"},
 		"scheduling_authority":      false,
 	})
@@ -49,8 +73,16 @@ func (s *Server) prepareAutoMLExperimentsForProject(projectID string, experiment
 		}
 	}
 	for index := range out {
+		scope, scopeErr := autoMLExecutionScopeForExperiment(out[index], automationSettings.DefaultTrainingProvider)
+		if scopeErr != nil && !strings.EqualFold(strings.TrimSpace(out[index].Template), jobs.TemplateLabelQualityAudit) {
+			return nil, warnings, fmt.Errorf("%w: proposed experiment %d AutoML execution scope is invalid: %s", store.ErrInvalidRequest, index, scopeErr.Error())
+		}
 		if out[index].AutoML == nil && automationSettings.AutoMLEnabled && !strings.EqualFold(strings.TrimSpace(out[index].Template), jobs.TemplateLabelQualityAudit) {
-			out[index].AutoML = defaultBackendAutoMLForExperiment(out[index], automationSettings.AutoMLSampler)
+			defaultAutoML, err := defaultBackendAutoMLForExperiment(out[index], automationSettings.AutoMLSampler, scope)
+			if err != nil {
+				return nil, warnings, fmt.Errorf("%w: proposed experiment %d default AutoML search space is invalid: %s", store.ErrInvalidRequest, index, err.Error())
+			}
+			out[index].AutoML = defaultAutoML
 			warnings = append(warnings, fmt.Sprintf("AutoML auto-enabled for experiment %d; backend sampled concrete hyperparameters inside the LLM-selected strategy.", index))
 		}
 		if out[index].AutoML == nil || !out[index].AutoML.Enabled {
@@ -62,7 +94,7 @@ func (s *Server) prepareAutoMLExperimentsForProject(projectID string, experiment
 			warnings = append(warnings, fmt.Sprintf("AutoML disabled for experiment %d; using LLM-provided concrete hyperparameters.", index))
 			continue
 		}
-		prepared, err := prepareAutoMLExperimentWithHistory(out[index], index, automationSettings.AutoMLSampler, history)
+		prepared, err := prepareAutoMLExperimentWithHistoryForExecution(out[index], index, automationSettings.AutoMLSampler, autoMLHistoryForExecutionScope(history, scope), scope)
 		if err != nil {
 			return nil, warnings, err
 		}
@@ -72,8 +104,21 @@ func (s *Server) prepareAutoMLExperimentsForProject(projectID string, experiment
 	return out, warnings, nil
 }
 
-func defaultBackendAutoMLForExperiment(experiment plans.PlannedExperiment, defaultSampler string) *automl.ExperimentAutoML {
-	searchSpace := defaultBackendAutoMLSearchSpace(experiment)
+func autoMLHistoryForExecutionScope(history []automl.OptimizerTrial, scope automl.ExecutionScope) []automl.OptimizerTrial {
+	out := make([]automl.OptimizerTrial, 0, len(history))
+	for _, trial := range history {
+		if trial.CapabilityVersion == scope.CapabilityVersion && trial.Task == scope.Task && trial.Runner == scope.Runner {
+			out = append(out, trial)
+		}
+	}
+	return out
+}
+
+func defaultBackendAutoMLForExperiment(experiment plans.PlannedExperiment, defaultSampler string, scope automl.ExecutionScope) (*automl.ExperimentAutoML, error) {
+	searchSpace, err := defaultBackendAutoMLSearchSpace(experiment, scope)
+	if err != nil {
+		return nil, err
+	}
 	return &automl.ExperimentAutoML{
 		Enabled:     true,
 		Sampler:     normalizeAutoMLSampler(defaultSampler),
@@ -89,10 +134,13 @@ func defaultBackendAutoMLForExperiment(experiment plans.PlannedExperiment, defau
 			AllowedParameters:   autoMLSearchSpaceParameterNames(searchSpace),
 			StrategyDescription: strings.TrimSpace(experiment.Reason),
 		},
-	}
+		CapabilityVersion: scope.CapabilityVersion,
+		Task:              scope.Task,
+		Runner:            scope.Runner,
+	}, nil
 }
 
-func defaultBackendAutoMLSearchSpace(experiment plans.PlannedExperiment) automl.HyperparameterSearchSpace {
+func defaultBackendAutoMLSearchSpace(experiment plans.PlannedExperiment, scope automl.ExecutionScope) (automl.HyperparameterSearchSpace, error) {
 	params := []automl.HyperparameterParameterSpec{}
 
 	lrMin := 1e-6
@@ -164,7 +212,11 @@ func defaultBackendAutoMLSearchSpace(experiment plans.PlannedExperiment) automl.
 		params = append(params, autoMLFloatSpec("class_balancing_config.focal_loss_gamma", 0.5, 5, automl.SearchScaleLinear, "focal loss gamma"))
 	}
 
-	return automl.HyperparameterSearchSpace{Parameters: params}
+	return automl.FilterSearchSpaceForExecution(
+		automl.HyperparameterSearchSpace{Parameters: params},
+		automlStrategyContext(experiment),
+		scope,
+	)
 }
 
 func autoMLSearchSpaceParameterNames(space automl.HyperparameterSearchSpace) []string {
@@ -234,24 +286,35 @@ func prepareAutoMLExperiment(experiment plans.PlannedExperiment, index int, defa
 }
 
 func prepareAutoMLExperimentWithHistory(experiment plans.PlannedExperiment, index int, defaultSampler string, history []automl.OptimizerTrial) (plans.PlannedExperiment, error) {
+	scope, err := autoMLExecutionScopeForExperiment(experiment, "modal")
+	if err != nil {
+		return experiment, err
+	}
+	return prepareAutoMLExperimentWithHistoryForExecution(experiment, index, defaultSampler, history, scope)
+}
+
+func prepareAutoMLExperimentWithHistoryForExecution(experiment plans.PlannedExperiment, index int, defaultSampler string, history []automl.OptimizerTrial, scope automl.ExecutionScope) (plans.PlannedExperiment, error) {
 	if experiment.AutoML == nil || !experiment.AutoML.Enabled {
 		return experiment, nil
 	}
 	strategy := automlStrategyContext(experiment)
 	searchSpace := experiment.AutoML.SearchSpace
 	if searchSpace == nil || len(searchSpace.Parameters) == 0 {
-		defaultSpace, err := automl.DefaultSearchSpace(experiment.AutoML.Intent.AllowedParameters, strategy)
+		defaultSpace, err := automl.DefaultSearchSpaceForExecution(experiment.AutoML.Intent.AllowedParameters, strategy, scope)
 		if err != nil {
 			return experiment, fmt.Errorf("%w: proposed experiment %d AutoML intent is invalid: %s", store.ErrInvalidRequest, index, err.Error())
 		}
 		searchSpace = &defaultSpace
 		experiment.AutoML.SearchSpace = searchSpace
 	}
-	if err := automl.ValidateSearchSpace(*searchSpace, strategy); err != nil {
+	if err := automl.ValidateSearchSpaceForExecution(*searchSpace, strategy, scope); err != nil {
 		experiment.AutoML.ValidationStatus = "invalid"
 		experiment.AutoML.ValidationErrors = []string{err.Error()}
 		return experiment, fmt.Errorf("%w: proposed experiment %d AutoML search space is invalid: %s", store.ErrInvalidRequest, index, err.Error())
 	}
+	searchSpace.CapabilityVersion = scope.CapabilityVersion
+	searchSpace.Task = scope.Task
+	searchSpace.Runner = scope.Runner
 	samplerName := strings.TrimSpace(experiment.AutoML.Sampler)
 	if samplerName == "" {
 		samplerName = defaultSampler
@@ -292,12 +355,15 @@ func prepareAutoMLExperimentWithHistory(experiment plans.PlannedExperiment, inde
 			return experiment, fmt.Errorf("%w: proposed experiment %d %s", store.ErrInvalidRequest, index, err.Error())
 		}
 	}
-	if err := automl.ValidateSuggestion(suggestion, *searchSpace, automlStrategyContext(experiment)); err != nil {
+	suggestion.CapabilityVersion = scope.CapabilityVersion
+	suggestion.Task = scope.Task
+	suggestion.Runner = scope.Runner
+	if err := automl.ValidateSuggestionForExecution(suggestion, *searchSpace, automlStrategyContext(experiment), scope); err != nil {
 		experiment.AutoML.ValidationStatus = "invalid"
 		experiment.AutoML.ValidationErrors = []string{err.Error()}
 		return experiment, fmt.Errorf("%w: proposed experiment %d AutoML suggestion is invalid: %s", store.ErrInvalidRequest, index, err.Error())
 	}
-	finalValues, provenance := autoMLFinalValues(experiment, suggestion.Provenance)
+	finalValues, provenance := autoMLFinalValues(experiment, suggestion.Provenance, scope)
 	suggestion.FinalValues = finalValues
 	suggestion.ValidationStatus = "valid"
 	experiment.AutoML.Sampler = samplerName
@@ -308,7 +374,76 @@ func prepareAutoMLExperimentWithHistory(experiment plans.PlannedExperiment, inde
 	experiment.AutoML.StrategySnapshot = autoMLStrategySnapshot(experiment)
 	experiment.AutoML.ValidationStatus = "valid"
 	experiment.AutoML.ValidationErrors = []string{}
+	experiment.AutoML.CapabilityVersion = scope.CapabilityVersion
+	experiment.AutoML.Task = scope.Task
+	experiment.AutoML.Runner = scope.Runner
+	provider := providerForExecutionRunner(scope.Runner)
+	executionSpec, err := buildExecutionSpecV1(experiment, provider)
+	if err != nil {
+		return experiment, fmt.Errorf("%w: proposed experiment %d AutoML execution spec is invalid: %s", store.ErrInvalidRequest, index, err.Error())
+	}
+	modelSpec, _ := supportedModelSpecByName(experiment.Model)
+	executionReport, err := execution.ValidateExecutionSpecV1(executionSpec, modelSpec.Family, execution.ValidationModeEnforce)
+	if err != nil {
+		return experiment, fmt.Errorf("%w: proposed experiment %d AutoML execution validation failed: %s", store.ErrInvalidRequest, index, err.Error())
+	}
+	if executionReport.WouldBlock {
+		experiment.AutoML.ValidationStatus = "invalid"
+		experiment.AutoML.ValidationErrors = []string{executionValidationSummary(executionReport)}
+		return experiment, fmt.Errorf("%w: proposed experiment %d AutoML trial is not executable: %s", store.ErrInvalidRequest, index, executionValidationSummary(executionReport))
+	}
 	return experiment, nil
+}
+
+func autoMLExecutionScopeForExperiment(experiment plans.PlannedExperiment, provider string) (automl.ExecutionScope, error) {
+	modelSpec, ok := supportedModelSpecByName(experiment.Model)
+	if !ok {
+		return automl.ExecutionScope{}, fmt.Errorf("unsupported model %q", experiment.Model)
+	}
+	runner, err := executionRunnerFor(provider, modelSpec.TaskType)
+	if err != nil {
+		return automl.ExecutionScope{}, err
+	}
+	return automl.CurrentExecutionScope(modelSpec.TaskType, runner)
+}
+
+func autoMLValidationScopeForExperiment(experiment plans.PlannedExperiment) (automl.ExecutionScope, error) {
+	if experiment.AutoML != nil {
+		scope := automl.ExecutionScope{
+			CapabilityVersion: experiment.AutoML.CapabilityVersion,
+			Task:              experiment.AutoML.Task,
+			Runner:            experiment.AutoML.Runner,
+		}
+		if experiment.AutoML.SearchSpace != nil {
+			if scope.CapabilityVersion == "" {
+				scope.CapabilityVersion = experiment.AutoML.SearchSpace.CapabilityVersion
+			}
+			if scope.Task == "" {
+				scope.Task = experiment.AutoML.SearchSpace.Task
+			}
+			if scope.Runner == "" {
+				scope.Runner = experiment.AutoML.SearchSpace.Runner
+			}
+		}
+		if scope.Task != "" || scope.Runner != "" || scope.CapabilityVersion != "" {
+			if scope.Task == "" || scope.Runner == "" {
+				return automl.ExecutionScope{}, fmt.Errorf("AutoML capability scope requires both task and runner")
+			}
+			current, err := automl.CurrentExecutionScope(scope.Task, scope.Runner)
+			if err != nil {
+				return automl.ExecutionScope{}, err
+			}
+			if scope.CapabilityVersion == "" {
+				scope.CapabilityVersion = current.CapabilityVersion
+			}
+			modelSpec, ok := supportedModelSpecByName(experiment.Model)
+			if !ok || modelSpec.TaskType != scope.Task {
+				return automl.ExecutionScope{}, fmt.Errorf("AutoML task %q does not match model %q", scope.Task, experiment.Model)
+			}
+			return scope, nil
+		}
+	}
+	return autoMLExecutionScopeForExperiment(experiment, "modal")
 }
 
 func clearAutoMLValueFromExperiment(experiment *plans.PlannedExperiment, name string) {
@@ -526,10 +661,14 @@ func autoMLStrategySnapshot(experiment plans.PlannedExperiment) map[string]any {
 	return compacted
 }
 
-func autoMLFinalValues(experiment plans.PlannedExperiment, sampled map[string]automl.HyperparameterProvenance) (map[string]any, map[string]automl.HyperparameterProvenance) {
+func autoMLFinalValues(experiment plans.PlannedExperiment, sampled map[string]automl.HyperparameterProvenance, scope automl.ExecutionScope) (map[string]any, map[string]automl.HyperparameterProvenance) {
 	values := map[string]any{}
 	provenance := map[string]automl.HyperparameterProvenance{}
-	for _, capability := range automl.DefaultCapabilityRegistry().Capabilities() {
+	registry, err := automl.CapabilityRegistryForExecution(scope)
+	if err != nil {
+		return values, provenance
+	}
+	for _, capability := range registry.Capabilities() {
 		value, ok := autoMLParameterValue(experiment, capability.Name)
 		if !ok {
 			continue
@@ -682,36 +821,42 @@ func (s *Server) persistAutoMLForPlan(plan plans.ExperimentPlan) error {
 			continue
 		}
 		study, err := s.store.CreateOptimizerStudy(automl.OptimizerStudy{
-			ProjectID:        plan.ProjectID,
-			PlanID:           plan.ID,
-			DatasetID:        plan.DatasetID,
-			SourceDecisionID: plan.SourceDecisionID,
-			ExperimentIndex:  index,
-			Model:            experiment.Model,
-			Intent:           experiment.AutoML.Intent,
-			Sampler:          experiment.AutoML.Sampler,
-			Seed:             experiment.AutoML.Seed,
-			SearchSpace:      *experiment.AutoML.SearchSpace,
-			StrategySnapshot: experiment.AutoML.StrategySnapshot,
+			ProjectID:         plan.ProjectID,
+			PlanID:            plan.ID,
+			DatasetID:         plan.DatasetID,
+			SourceDecisionID:  plan.SourceDecisionID,
+			ExperimentIndex:   index,
+			Model:             experiment.Model,
+			Intent:            experiment.AutoML.Intent,
+			Sampler:           experiment.AutoML.Sampler,
+			Seed:              experiment.AutoML.Seed,
+			SearchSpace:       *experiment.AutoML.SearchSpace,
+			StrategySnapshot:  experiment.AutoML.StrategySnapshot,
+			CapabilityVersion: experiment.AutoML.CapabilityVersion,
+			Task:              experiment.AutoML.Task,
+			Runner:            experiment.AutoML.Runner,
 		})
 		if err != nil {
 			return err
 		}
 		suggestion := experiment.AutoML.Suggestion
 		_, err = s.store.CreateOptimizerSuggestion(automl.OptimizerSuggestion{
-			StudyID:          study.ID,
-			ProjectID:        plan.ProjectID,
-			PlanID:           plan.ID,
-			DatasetID:        plan.DatasetID,
-			ExperimentIndex:  index,
-			Model:            experiment.Model,
-			Sampler:          suggestion.Sampler,
-			Seed:             suggestion.Seed,
-			Values:           suggestion.Values,
-			FinalValues:      suggestion.FinalValues,
-			Provenance:       suggestion.Provenance,
-			ValidationStatus: suggestion.ValidationStatus,
-			ValidationErrors: suggestion.ValidationErrors,
+			StudyID:           study.ID,
+			ProjectID:         plan.ProjectID,
+			PlanID:            plan.ID,
+			DatasetID:         plan.DatasetID,
+			ExperimentIndex:   index,
+			Model:             experiment.Model,
+			Sampler:           suggestion.Sampler,
+			Seed:              suggestion.Seed,
+			Values:            suggestion.Values,
+			FinalValues:       suggestion.FinalValues,
+			Provenance:        suggestion.Provenance,
+			ValidationStatus:  suggestion.ValidationStatus,
+			ValidationErrors:  suggestion.ValidationErrors,
+			CapabilityVersion: experiment.AutoML.CapabilityVersion,
+			Task:              experiment.AutoML.Task,
+			Runner:            experiment.AutoML.Runner,
 		})
 		if err != nil {
 			return err
@@ -750,6 +895,9 @@ func automlJobSummary(experiment plans.PlannedExperiment, suggestion automl.Opti
 		"provenance":          suggestion.Provenance,
 		"validation_status":   suggestion.ValidationStatus,
 		"validation_errors":   suggestion.ValidationErrors,
+		"capability_version":  suggestion.CapabilityVersion,
+		"task":                suggestion.Task,
+		"runner":              suggestion.Runner,
 		"strategy_snapshot":   autoMLStrategySnapshot(experiment),
 		"llm_remains_planner": true,
 	}
@@ -799,6 +947,9 @@ func (s *Server) observeAutoMLTrialForJob(job jobs.ExperimentJob) error {
 		"hyperparameters":      automlHyperparametersFromJob(job),
 		"automl_summary":       job.Config["automl_summary"],
 		"train_validation_gap": summary.FinalValLoss - summary.FinalTrainLoss,
+		"capability_version":   jobConfigNestedString(job.Config, "automl_summary", "capability_version"),
+		"task":                 jobConfigNestedString(job.Config, "automl_summary", "task"),
+		"runner":               jobConfigNestedString(job.Config, "automl_summary", "runner"),
 	}
 	if evaluation.JobID != "" {
 		metrics["deployment_readiness_score"] = score
@@ -813,19 +964,49 @@ func (s *Server) observeAutoMLTrialForJob(job jobs.ExperimentJob) error {
 		}
 	}
 	_, err = s.store.UpsertOptimizerTrial(automl.OptimizerTrial{
-		StudyID:      jobConfigString(job.Config, "automl_study_id"),
-		SuggestionID: suggestionID,
-		ProjectID:    job.ProjectID,
-		PlanID:       jobConfigString(job.Config, "plan_id"),
-		DatasetID:    jobConfigString(job.Config, "dataset_id"),
-		JobID:        job.ID,
-		Status:       status,
-		TargetMetric: targetMetric,
-		Score:        score,
-		Metrics:      metrics,
-		Error:        job.Error,
+		StudyID:           jobConfigString(job.Config, "automl_study_id"),
+		SuggestionID:      suggestionID,
+		ProjectID:         job.ProjectID,
+		PlanID:            jobConfigString(job.Config, "plan_id"),
+		DatasetID:         jobConfigString(job.Config, "dataset_id"),
+		JobID:             job.ID,
+		Status:            status,
+		TargetMetric:      targetMetric,
+		Score:             score,
+		Metrics:           metrics,
+		Error:             job.Error,
+		CapabilityVersion: jobConfigNestedString(job.Config, "automl_summary", "capability_version"),
+		Task:              jobConfigNestedString(job.Config, "automl_summary", "task"),
+		Runner:            jobConfigNestedString(job.Config, "automl_summary", "runner"),
 	})
 	return err
+}
+
+func jobConfigNestedString(config map[string]any, objectKey, field string) string {
+	value, ok := config[objectKey]
+	if !ok || value == nil {
+		return ""
+	}
+	if payload, ok := value.(map[string]any); ok {
+		fieldValue, exists := payload[field]
+		if !exists || fieldValue == nil {
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprint(fieldValue))
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(blob, &payload); err != nil {
+		return ""
+	}
+	fieldValue, exists := payload[field]
+	if !exists || fieldValue == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(fieldValue))
 }
 
 func automlHyperparametersFromJob(job jobs.ExperimentJob) map[string]any {

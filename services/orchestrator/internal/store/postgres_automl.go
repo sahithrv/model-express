@@ -28,8 +28,8 @@ func (s *PostgresStore) CreateOptimizerStudy(study automl.OptimizerStudy) (autom
 		return automl.OptimizerStudy{}, fmt.Errorf("marshal automl strategy snapshot: %w", err)
 	}
 	query := `
-		INSERT INTO automl_studies (project_id, plan_id, dataset_id, source_decision_id, experiment_index, model, intent, sampler, seed, search_space, strategy_snapshot)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		INSERT INTO automl_studies (project_id, plan_id, dataset_id, source_decision_id, experiment_index, model, intent, sampler, seed, search_space, strategy_snapshot, capability_version, task, runner)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING ` + automlStudySelectColumns() + `
 	`
 	return scanOptimizerStudy(s.db.QueryRowContext(
@@ -46,6 +46,9 @@ func (s *PostgresStore) CreateOptimizerStudy(study automl.OptimizerStudy) (autom
 		study.Seed,
 		searchSpaceJSON,
 		strategyJSON,
+		study.CapabilityVersion,
+		study.Task,
+		study.Runner,
 	))
 }
 
@@ -99,8 +102,8 @@ func (s *PostgresStore) CreateOptimizerSuggestion(suggestion automl.OptimizerSug
 		return automl.OptimizerSuggestion{}, fmt.Errorf("marshal automl validation errors: %w", err)
 	}
 	query := `
-		INSERT INTO automl_suggestions (study_id, project_id, plan_id, dataset_id, job_id, experiment_index, model, sampler, seed, values, final_values, provenance, validation_status, validation_errors)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		INSERT INTO automl_suggestions (study_id, project_id, plan_id, dataset_id, job_id, experiment_index, model, sampler, seed, values, final_values, provenance, validation_status, validation_errors, capability_version, task, runner)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING ` + automlSuggestionSelectColumns() + `
 	`
 	return scanOptimizerSuggestion(s.db.QueryRowContext(
@@ -120,6 +123,9 @@ func (s *PostgresStore) CreateOptimizerSuggestion(suggestion automl.OptimizerSug
 		provenanceJSON,
 		suggestion.ValidationStatus,
 		validationErrorsJSON,
+		suggestion.CapabilityVersion,
+		suggestion.Task,
+		suggestion.Runner,
 	))
 }
 
@@ -169,8 +175,8 @@ func (s *PostgresStore) UpsertOptimizerTrial(trial automl.OptimizerTrial) (autom
 		return automl.OptimizerTrial{}, fmt.Errorf("marshal automl trial metrics: %w", err)
 	}
 	query := `
-		INSERT INTO automl_trials (study_id, suggestion_id, project_id, plan_id, dataset_id, job_id, status, target_metric, score, metrics, error)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		INSERT INTO automl_trials (study_id, suggestion_id, project_id, plan_id, dataset_id, job_id, status, target_metric, score, metrics, error, capability_version, task, runner)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (job_id) WHERE job_id <> '' DO UPDATE SET
 			study_id = EXCLUDED.study_id,
 			suggestion_id = EXCLUDED.suggestion_id,
@@ -182,6 +188,9 @@ func (s *PostgresStore) UpsertOptimizerTrial(trial automl.OptimizerTrial) (autom
 			score = EXCLUDED.score,
 			metrics = EXCLUDED.metrics,
 			error = EXCLUDED.error,
+			capability_version = EXCLUDED.capability_version,
+			task = EXCLUDED.task,
+			runner = EXCLUDED.runner,
 			updated_at = now()
 		RETURNING ` + automlTrialSelectColumns() + `
 	`
@@ -199,6 +208,9 @@ func (s *PostgresStore) UpsertOptimizerTrial(trial automl.OptimizerTrial) (autom
 		trial.Score,
 		metricsJSON,
 		trial.Error,
+		trial.CapabilityVersion,
+		trial.Task,
+		trial.Runner,
 	))
 }
 
