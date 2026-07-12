@@ -44,6 +44,23 @@ def test_complete_job_uses_longer_report_timeout(monkeypatch):
     ]
 
 
+def test_execution_observation_uses_attempt_identity_and_callback_token(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    client = OrchestratorClient("http://orchestrator.test")
+    job = {"id": "job_1", "config": {"active_attempt_id": "job_1:attempt-1", "callback_token": "callback-secret"}}
+    client.report_execution_observation("job_1", {"stage": "FINALIZED", "idempotency_key": "final-1", "realized_config": {"epochs": 3}}, job=job)
+
+    assert calls[0]["url"] == "http://orchestrator.test/jobs/job_1/execution-observations"
+    assert calls[0]["headers"] == {"Authorization": "Bearer callback-secret"}
+    assert calls[0]["json"]["training_attempt_id"] == "job_1:attempt-1"
+
+
 def test_report_timeout_default_allows_slow_callbacks(monkeypatch):
     monkeypatch.delenv("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", raising=False)
 

@@ -191,6 +191,7 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
             runtime_seconds=round(time.time() - started_at, 3),
         ),
     )
+    _finalize_simulated_execution(client, job)
     client.complete_job(job_id, mlflow_run_id=f"local-training-{job_id}")
 
 
@@ -301,7 +302,31 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
             runtime_seconds=runtime_seconds,
         ),
     )
+    _finalize_simulated_execution(client, job)
     client.complete_job(job_id, mlflow_run_id=f"local-yolo-training-{job_id}")
+
+
+def _finalize_simulated_execution(client: OrchestratorClient, job: dict) -> None:
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    execution_spec = config.get("execution_spec_v1")
+    if not isinstance(execution_spec, dict):
+        return
+    accepted_config = execution_spec.get("accepted_config")
+    if not isinstance(accepted_config, dict):
+        return
+    client.report_execution_observation(
+        str(job.get("id") or ""),
+        {
+            "schema_version": "execution_realization_v1",
+            "stage": "FINALIZED",
+            "idempotency_key": "local-simulator-final-v1",
+            "realized_config": accepted_config,
+            "framework_arguments": {"runtime": "deterministic_local_simulator"},
+            "evidence": {"simulation": True},
+            "simulated": True,
+        },
+        job=job,
+    )
 
 
 def _is_detection_training_config(config: dict) -> bool:

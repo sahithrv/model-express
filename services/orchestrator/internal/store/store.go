@@ -103,6 +103,11 @@ type Store interface {
 	CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error)
 	RetryJob(jobID string, message string, options RetryJobOptions) (jobs.ExperimentJob, bool, error)
 	FailJob(jobID string, message string) (jobs.ExperimentJob, error)
+	GetJobExecutionRecord(jobID string) (execution.ExecutionRecord, error)
+	ListProjectExecutionRecords(projectID string, options PageOptions) ([]execution.ExecutionRecord, error)
+	CreateAttemptExecutionRecord(jobID string, attemptID string, attemptNumber int) (execution.AttemptExecutionRecord, error)
+	AppendRealizationObservation(jobID string, create execution.RealizationObservationCreate) (execution.RealizationObservation, bool, error)
+	MarkAttemptNotRealized(jobID string, attemptID string) (execution.AttemptExecutionRecord, error)
 
 	UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error)
 	GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error)

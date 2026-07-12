@@ -7,7 +7,9 @@
 - `metadata_only`: the field belongs to planner or control-plane provenance, not training semantics.
 - `unsupported`: the runner does not execute the requested semantic.
 
-Fidelity PR 2 uses the embedded Go representation to resolve a canonical `execution_spec_v1` when an experiment job is queued. The spec records the requested config, accepted semantic config, capability version, task, runner, requested-config hash, and accepted-spec hash. Legacy flat job keys remain in place for current workers. Python runners do not consume the canonical spec yet, and the spec does not claim realized worker behavior.
+Fidelity PR 2 uses the embedded Go representation to resolve a canonical `execution_spec_v1` when an experiment job is queued. The spec records the requested config, accepted semantic config, capability version, task, runner, requested-config hash, and accepted-spec hash. Legacy flat job keys remain in place for current workers.
+
+Fidelity PR 5 snapshots that accepted spec independently from mutable job configuration and creates one execution record per assigned attempt. Workers may append authenticated `INITIALIZED` and `FINALIZED` observations through `POST /jobs/:id/execution-observations`; the server bounds and redacts evidence, derives the realized hash and fidelity verdict, and rejects callbacks from stale attempts. Records are available through `GET /jobs/:id/execution-record` and the bounded project-level execution-record list. Current real-training runners do not post observations until Fidelity PRs 6 and 7; the deterministic local runner explicitly finalizes as `SIMULATED`.
 
 New plan payloads are stored in a `planned_experiments.v1` envelope. Legacy array payloads remain readable and are reported as `legacy_unversioned` without rewriting stored records.
 

@@ -622,7 +622,6 @@ func (s *Server) failJob(c *gin.Context) {
 	); !ok {
 		return
 	}
-
 	if req.Retryable {
 		currentJob, err := s.store.GetJob(c.Param("id"))
 		if err != nil {

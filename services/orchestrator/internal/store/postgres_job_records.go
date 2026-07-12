@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/workers"
@@ -173,6 +175,9 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 	if err != nil {
 		return nil, err
 	}
+	if _, err := createAttemptExecutionRecordTx(ctx, tx, assignedJob.ID, jobAttemptID(assignedJob.ID, assignedJob.Attempt), assignedJob.Attempt); err != nil && !errors.Is(normalizeSQLError(err), ErrNotFound) {
+		return nil, err
+	}
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE workers
@@ -263,13 +268,31 @@ func (s *PostgresStore) CreateJob(projectID string, template string, config map[
 		return jobs.ExperimentJob{}, fmt.Errorf("marshal job config: %w", err)
 	}
 
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	defer tx.Rollback()
 	const query = `
 		INSERT INTO experiment_jobs (project_id, template, status, config, max_attempts)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
 	`
 
-	return scanJob(s.db.QueryRowContext(context.Background(), query, projectID, template, jobs.StatusQueued, configJSON, defaultJobMaxAttempts))
+	job, err := scanJob(tx.QueryRowContext(ctx, query, projectID, template, jobs.StatusQueued, configJSON, defaultJobMaxAttempts))
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	if spec, ok := executionSpecFromConfig(job.ID, projectID, config, job.CreatedAt); ok {
+		if err := insertJobExecutionSpecTx(ctx, tx, spec); err != nil {
+			return jobs.ExperimentJob{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	return job, nil
 }
 
 func (s *PostgresStore) GetJob(id string) (jobs.ExperimentJob, error) {
@@ -336,6 +359,9 @@ func (s *PostgresStore) ListProjectJobsPage(projectID string, options PageOption
 }
 
 func (s *PostgresStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error) {
+	if _, changesAcceptedSpec := patch[execution.ExecutionSpecConfigKey]; changesAcceptedSpec {
+		return jobs.ExperimentJob{}, fmt.Errorf("%w: %s is immutable after scheduling", ErrInvalidRequest, execution.ExecutionSpecConfigKey)
+	}
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -424,6 +450,9 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 			job.MaxAttempts = defaultJobMaxAttempts
 		}
 		previousConfig := copyAnyMap(job.Config)
+		if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET lifecycle_status=$1, updated_at=now() WHERE job_id=$2 AND attempt_id=$3 AND lifecycle_status=$4`, execution.ExecutionLifecycleNotRealized, job.ID, jobAttemptID(job.ID, job.Attempt), execution.ExecutionLifecyclePending); err != nil {
+			return nil, err
+		}
 		var updated jobs.ExperimentJob
 		if job.Attempt >= job.MaxAttempts {
 			nextConfig := jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)

@@ -3,6 +3,87 @@ package execution
 import "time"
 
 const (
+	ExecutionLifecyclePending     = "PENDING"
+	ExecutionLifecycleInitialized = "INITIALIZED"
+	ExecutionLifecycleFinalized   = "FINALIZED"
+	ExecutionLifecycleNotRealized = "NOT_REALIZED"
+
+	ExecutionVerdictMatched            = "MATCHED"
+	ExecutionVerdictApprovedAdjustment = "APPROVED_ADJUSTMENT"
+	ExecutionVerdictMismatch           = "MISMATCH"
+	ExecutionVerdictSimulated          = "SIMULATED"
+
+	ExecutionObservationInitialized = "INITIALIZED"
+	ExecutionObservationFinalized   = "FINALIZED"
+	ExecutionObservationSchemaV1    = "execution_realization_v1"
+)
+
+// JobExecutionSpec is the immutable, job-scoped snapshot accepted before a job
+// can be assigned. AcceptedSpec is intentionally independent from mutable job
+// configuration and attempt/resource metadata.
+type JobExecutionSpec struct {
+	JobID               string         `json:"job_id"`
+	ProjectID           string         `json:"project_id"`
+	SchemaVersion       string         `json:"schema_version"`
+	CapabilityVersion   string         `json:"capability_version"`
+	Task                string         `json:"task"`
+	Runner              string         `json:"runner"`
+	RequestedConfigHash string         `json:"requested_config_hash"`
+	AcceptedSpecHash    string         `json:"accepted_spec_hash"`
+	AcceptedSpec        map[string]any `json:"accepted_spec"`
+	CreatedAt           time.Time      `json:"created_at"`
+}
+
+type AttemptExecutionRecord struct {
+	ID                    string                   `json:"id"`
+	JobID                 string                   `json:"job_id"`
+	ProjectID             string                   `json:"project_id"`
+	AttemptID             string                   `json:"attempt_id"`
+	AttemptNumber         int                      `json:"attempt_number"`
+	LifecycleStatus       string                   `json:"lifecycle_status"`
+	FidelityVerdict       *string                  `json:"fidelity_verdict"`
+	RealizedEffectiveHash string                   `json:"realized_effective_hash,omitempty"`
+	LatestRealizedConfig  map[string]any           `json:"latest_realized_config,omitempty"`
+	CreatedAt             time.Time                `json:"created_at"`
+	UpdatedAt             time.Time                `json:"updated_at"`
+	Observations          []RealizationObservation `json:"observations,omitempty"`
+}
+
+type RealizationObservation struct {
+	ID                    string         `json:"id"`
+	AttemptRecordID       string         `json:"attempt_record_id"`
+	AttemptID             string         `json:"attempt_id"`
+	SchemaVersion         string         `json:"schema_version"`
+	Stage                 string         `json:"stage"`
+	IdempotencyKey        string         `json:"idempotency_key"`
+	RealizedConfig        map[string]any `json:"realized_config"`
+	FrameworkArguments    map[string]any `json:"framework_arguments,omitempty"`
+	Evidence              map[string]any `json:"evidence,omitempty"`
+	AdjustmentPolicy      string         `json:"adjustment_policy,omitempty"`
+	Simulated             bool           `json:"simulated,omitempty"`
+	RealizedEffectiveHash string         `json:"realized_effective_hash"`
+	FidelityVerdict       string         `json:"fidelity_verdict"`
+	CreatedAt             time.Time      `json:"created_at"`
+}
+
+type RealizationObservationCreate struct {
+	AttemptID          string
+	SchemaVersion      string
+	Stage              string
+	IdempotencyKey     string
+	RealizedConfig     map[string]any
+	FrameworkArguments map[string]any
+	Evidence           map[string]any
+	AdjustmentPolicy   string
+	Simulated          bool
+}
+
+type ExecutionRecord struct {
+	AcceptedSpec JobExecutionSpec         `json:"accepted_spec"`
+	Attempts     []AttemptExecutionRecord `json:"attempts"`
+}
+
+const (
 	WorkerRequirementPending   = "PENDING"
 	WorkerRequirementStarting  = "STARTING"
 	WorkerRequirementActive    = "ACTIVE"

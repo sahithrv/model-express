@@ -217,6 +217,21 @@ class OrchestratorClient:
         response.raise_for_status()
         return response.json()
 
+    def report_execution_observation(self, job_id: str, observation: dict, *, job: dict | None = None) -> dict:
+        response = requests.post(
+            f"{self.base_url}/jobs/{job_id}/execution-observations",
+            json=self._with_callback_identity(job_id, observation, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
+        )
+        if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
+            return {
+                "status": "unavailable",
+                "reason": "execution_observation_endpoint_unavailable",
+                "status_code": response.status_code,
+            }
+        response.raise_for_status()
+        return response.json()
+
     def report_modal_call(self, job_id: str, payload: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/modal-call",

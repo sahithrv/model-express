@@ -8,6 +8,7 @@ class _FakeClient:
         self.metrics: list[dict] = []
         self.summaries: list[dict] = []
         self.evaluations: list[dict] = []
+        self.execution_observations: list[dict] = []
         self.completed: list[dict] = []
 
     def report_metric(self, job_id: str, epoch: int, metrics: dict[str, float]) -> dict:
@@ -20,6 +21,10 @@ class _FakeClient:
 
     def report_training_run_evaluation(self, job_id: str, evaluation: dict) -> dict:
         self.evaluations.append({"job_id": job_id, "evaluation": evaluation})
+        return {"ok": True}
+
+    def report_execution_observation(self, job_id: str, observation: dict, *, job: dict | None = None) -> dict:
+        self.execution_observations.append({"job_id": job_id, "observation": observation, "job": job})
         return {"ok": True}
 
     def complete_job(self, job_id: str, mlflow_run_id: str = "") -> dict:
@@ -42,6 +47,10 @@ def test_local_training_reports_yolo_detection_metrics(monkeypatch):
                 "batch_size": 4,
                 "image_size": 640,
                 "class_names": ["face", "spoof"],
+                "execution_spec_v1": {
+                    "schema_version": "execution_spec_v1",
+                    "accepted_config": {"model": "yolo11n.pt", "epochs": 2},
+                },
             },
         },
     )
@@ -59,4 +68,34 @@ def test_local_training_reports_yolo_detection_metrics(monkeypatch):
     assert evaluation["model_profile"]["export_status"] == "SIMULATED_UNEXPORTABLE"
     assert evaluation["preprocessing_summary"]["simulation"] is True
     assert evaluation["holistic_scores"]["detection_metrics"]["mAP50_95"] > 0
+    assert client.execution_observations == [
+        {
+            "job_id": "job_yolo",
+            "observation": {
+                "schema_version": "execution_realization_v1",
+                "stage": "FINALIZED",
+                "idempotency_key": "local-simulator-final-v1",
+                "realized_config": {"model": "yolo11n.pt", "epochs": 2},
+                "framework_arguments": {"runtime": "deterministic_local_simulator"},
+                "evidence": {"simulation": True},
+                "simulated": True,
+            },
+            "job": {
+                "id": "job_yolo",
+                "config": {
+                    "model": "yolo11n.pt",
+                    "task_type": "object_detection",
+                    "model_kind": "ultralytics_yolo_detector",
+                    "epochs": 2,
+                    "batch_size": 4,
+                    "image_size": 640,
+                    "class_names": ["face", "spoof"],
+                    "execution_spec_v1": {
+                        "schema_version": "execution_spec_v1",
+                        "accepted_config": {"model": "yolo11n.pt", "epochs": 2},
+                    },
+                },
+            },
+        }
+    ]
     assert client.completed[-1]["mlflow_run_id"].startswith("local-yolo-training-")

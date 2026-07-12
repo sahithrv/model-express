@@ -133,6 +133,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/projects/:id/worker-requirements", server.listProjectWorkerRequirements)
 	router.POST("/projects/:id/cancel-active-executions", server.cancelProjectActiveExecutions)
 	router.GET("/projects/:id/execution-events", server.listProjectExecutionEvents)
+	router.GET("/projects/:id/execution-records", server.listProjectExecutionRecords)
 	router.POST("/projects/:id/dispatcher-events", server.reportProjectDispatcherEvent)
 	router.GET("/projects/:id/events/stream", server.streamProjectExecutionEvents)
 	router.GET("/projects/:id/activity-stream", server.streamProjectActivityEvents)
@@ -158,6 +159,8 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/datasets/:id/visual-analysis-result", server.reportDatasetVisualAnalysisResult)
 
 	router.GET("/jobs/:id", server.getJob)
+	router.GET("/jobs/:id/execution-record", server.getJobExecutionRecord)
+	router.POST("/jobs/:id/execution-observations", server.reportRealizationObservation)
 	router.POST("/jobs/:id/metrics", server.reportMetric)
 	router.GET("/jobs/:id/metrics", server.listJobMetrics)
 	router.POST("/jobs/:id/training-run-summary", server.upsertTrainingRunSummary)

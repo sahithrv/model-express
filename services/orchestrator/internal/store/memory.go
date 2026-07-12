@@ -33,66 +33,72 @@ const (
 type MemoryStore struct {
 	mu sync.Mutex
 
-	nextID               uint64
-	projects             map[string]projects.Project
-	datasets             map[string]datasets.Dataset
-	workers              map[string]workers.Worker
-	jobs                 map[string]jobs.ExperimentJob
-	metrics              map[string][]jobs.EpochMetric
-	remoteSessions       map[string]runs.RemoteTrainingSession
-	plans                map[string]plans.ExperimentPlan
-	summaries            map[string]runs.TrainingRunSummary
-	evaluations          map[string]runs.TrainingRunEvaluation
-	champions            map[string]runs.ProjectChampion
-	championExports      map[string]runs.ChampionExport
-	demoPredictions      map[string]runs.ChampionDemoPrediction
-	championFeedback     map[string]runs.ChampionFeedback
-	metadataImports      map[string]datasets.DatasetMetadataImport
-	visualAnalyses       map[string]datasets.DatasetVisualAnalysis
-	decisions            map[string]decisions.AgentDecision
-	workerRequirements   map[string]execution.WorkerRequirement
-	executionEvents      map[string]execution.ExecutionEvent
-	agentMemoryRecords   map[string]memory.AgentMemoryRecord
-	agentInvocations     map[string]memory.AgentInvocation
-	memoryEmbeddings     map[string]memory.MemoryEmbeddingRecord
-	memoryUsageEvents    map[string]memory.MemoryEmbeddingUsageEvent
-	queryCache           map[string]memory.MemoryRetrievalQueryCacheRecord
-	strategyScorecards   map[string]strategies.StrategyScorecard
-	optimizerStudies     map[string]automl.OptimizerStudy
-	optimizerSuggestions map[string]automl.OptimizerSuggestion
-	optimizerTrials      map[string]automl.OptimizerTrial
-	automationSettings   *settings.AutomationSettings
+	nextID                  uint64
+	projects                map[string]projects.Project
+	datasets                map[string]datasets.Dataset
+	workers                 map[string]workers.Worker
+	jobs                    map[string]jobs.ExperimentJob
+	metrics                 map[string][]jobs.EpochMetric
+	remoteSessions          map[string]runs.RemoteTrainingSession
+	plans                   map[string]plans.ExperimentPlan
+	summaries               map[string]runs.TrainingRunSummary
+	evaluations             map[string]runs.TrainingRunEvaluation
+	champions               map[string]runs.ProjectChampion
+	championExports         map[string]runs.ChampionExport
+	demoPredictions         map[string]runs.ChampionDemoPrediction
+	championFeedback        map[string]runs.ChampionFeedback
+	metadataImports         map[string]datasets.DatasetMetadataImport
+	visualAnalyses          map[string]datasets.DatasetVisualAnalysis
+	decisions               map[string]decisions.AgentDecision
+	workerRequirements      map[string]execution.WorkerRequirement
+	executionEvents         map[string]execution.ExecutionEvent
+	jobExecutionSpecs       map[string]execution.JobExecutionSpec
+	attemptExecutions       map[string]execution.AttemptExecutionRecord
+	realizationObservations map[string][]execution.RealizationObservation
+	agentMemoryRecords      map[string]memory.AgentMemoryRecord
+	agentInvocations        map[string]memory.AgentInvocation
+	memoryEmbeddings        map[string]memory.MemoryEmbeddingRecord
+	memoryUsageEvents       map[string]memory.MemoryEmbeddingUsageEvent
+	queryCache              map[string]memory.MemoryRetrievalQueryCacheRecord
+	strategyScorecards      map[string]strategies.StrategyScorecard
+	optimizerStudies        map[string]automl.OptimizerStudy
+	optimizerSuggestions    map[string]automl.OptimizerSuggestion
+	optimizerTrials         map[string]automl.OptimizerTrial
+	automationSettings      *settings.AutomationSettings
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		projects:             make(map[string]projects.Project),
-		datasets:             make(map[string]datasets.Dataset),
-		workers:              make(map[string]workers.Worker),
-		jobs:                 make(map[string]jobs.ExperimentJob),
-		metrics:              make(map[string][]jobs.EpochMetric),
-		remoteSessions:       make(map[string]runs.RemoteTrainingSession),
-		plans:                make(map[string]plans.ExperimentPlan),
-		summaries:            make(map[string]runs.TrainingRunSummary),
-		evaluations:          make(map[string]runs.TrainingRunEvaluation),
-		champions:            make(map[string]runs.ProjectChampion),
-		championExports:      make(map[string]runs.ChampionExport),
-		demoPredictions:      make(map[string]runs.ChampionDemoPrediction),
-		championFeedback:     make(map[string]runs.ChampionFeedback),
-		metadataImports:      make(map[string]datasets.DatasetMetadataImport),
-		visualAnalyses:       make(map[string]datasets.DatasetVisualAnalysis),
-		decisions:            make(map[string]decisions.AgentDecision),
-		workerRequirements:   make(map[string]execution.WorkerRequirement),
-		executionEvents:      make(map[string]execution.ExecutionEvent),
-		agentMemoryRecords:   make(map[string]memory.AgentMemoryRecord),
-		agentInvocations:     make(map[string]memory.AgentInvocation),
-		memoryEmbeddings:     make(map[string]memory.MemoryEmbeddingRecord),
-		memoryUsageEvents:    make(map[string]memory.MemoryEmbeddingUsageEvent),
-		queryCache:           make(map[string]memory.MemoryRetrievalQueryCacheRecord),
-		strategyScorecards:   make(map[string]strategies.StrategyScorecard),
-		optimizerStudies:     make(map[string]automl.OptimizerStudy),
-		optimizerSuggestions: make(map[string]automl.OptimizerSuggestion),
-		optimizerTrials:      make(map[string]automl.OptimizerTrial),
+		projects:                make(map[string]projects.Project),
+		datasets:                make(map[string]datasets.Dataset),
+		workers:                 make(map[string]workers.Worker),
+		jobs:                    make(map[string]jobs.ExperimentJob),
+		metrics:                 make(map[string][]jobs.EpochMetric),
+		remoteSessions:          make(map[string]runs.RemoteTrainingSession),
+		plans:                   make(map[string]plans.ExperimentPlan),
+		summaries:               make(map[string]runs.TrainingRunSummary),
+		evaluations:             make(map[string]runs.TrainingRunEvaluation),
+		champions:               make(map[string]runs.ProjectChampion),
+		championExports:         make(map[string]runs.ChampionExport),
+		demoPredictions:         make(map[string]runs.ChampionDemoPrediction),
+		championFeedback:        make(map[string]runs.ChampionFeedback),
+		metadataImports:         make(map[string]datasets.DatasetMetadataImport),
+		visualAnalyses:          make(map[string]datasets.DatasetVisualAnalysis),
+		decisions:               make(map[string]decisions.AgentDecision),
+		workerRequirements:      make(map[string]execution.WorkerRequirement),
+		executionEvents:         make(map[string]execution.ExecutionEvent),
+		jobExecutionSpecs:       make(map[string]execution.JobExecutionSpec),
+		attemptExecutions:       make(map[string]execution.AttemptExecutionRecord),
+		realizationObservations: make(map[string][]execution.RealizationObservation),
+		agentMemoryRecords:      make(map[string]memory.AgentMemoryRecord),
+		agentInvocations:        make(map[string]memory.AgentInvocation),
+		memoryEmbeddings:        make(map[string]memory.MemoryEmbeddingRecord),
+		memoryUsageEvents:       make(map[string]memory.MemoryEmbeddingUsageEvent),
+		queryCache:              make(map[string]memory.MemoryRetrievalQueryCacheRecord),
+		strategyScorecards:      make(map[string]strategies.StrategyScorecard),
+		optimizerStudies:        make(map[string]automl.OptimizerStudy),
+		optimizerSuggestions:    make(map[string]automl.OptimizerSuggestion),
+		optimizerTrials:         make(map[string]automl.OptimizerTrial),
 	}
 }
 
@@ -570,6 +576,11 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
 		job.LeaseExpiresAt = &leaseExpiresAt
 		s.jobs[id] = job
+		if _, ok := s.jobExecutionSpecs[job.ID]; ok {
+			if _, err := s.createAttemptExecutionRecordLocked(job.ID, jobAttemptID(job.ID, job.Attempt), job.Attempt); err != nil {
+				return nil, err
+			}
+		}
 
 		worker.Status = workers.StatusRunning
 		worker.CurrentJobID = job.ID
@@ -605,9 +616,13 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 		MaxAttempts: defaultJobMaxAttempts,
 		CreatedAt:   time.Now().UTC(),
 	}
+	job.Config = jobConfigWithImmutableExecutionSpec(config, job.Config)
 	job = jobs.WithExecutionSpecStatus(job)
 
 	s.jobs[job.ID] = job
+	if spec, ok := executionSpecFromConfig(job.ID, projectID, job.Config, job.CreatedAt); ok {
+		s.jobExecutionSpecs[job.ID] = spec
+	}
 	return jobs.WithExecutionSpecStatus(job), nil
 }
 
@@ -660,6 +675,9 @@ func (s *MemoryStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.
 	if !ok {
 		return jobs.ExperimentJob{}, ErrNotFound
 	}
+	if _, changesAcceptedSpec := patch[execution.ExecutionSpecConfigKey]; changesAcceptedSpec {
+		return jobs.ExperimentJob{}, fmt.Errorf("%w: %s is immutable after scheduling", ErrInvalidRequest, execution.ExecutionSpecConfigKey)
+	}
 	next := copyAnyMap(job.Config)
 	if next == nil {
 		next = map[string]any{}
@@ -693,6 +711,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 			job.MaxAttempts = defaultJobMaxAttempts
 		}
 		previousConfig := copyAnyMap(job.Config)
+		_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 		if job.Attempt >= job.MaxAttempts {
 			job.Status = jobs.StatusFailed
 			job.Error = "job lease expired after maximum attempts"
@@ -2285,10 +2304,12 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 	now := time.Now().UTC()
 	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
 	previousConfig := copyAnyMap(job.Config)
+	_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 	nextConfig := copyAnyMap(job.Config)
 	if options.Config != nil {
 		nextConfig = copyAnyMap(options.Config)
 	}
+	nextConfig = jobConfigWithImmutableExecutionSpec(job.Config, nextConfig)
 	if requeued {
 		job.Status = jobs.StatusQueued
 		job.Error = message
@@ -2348,6 +2369,7 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 
 	now := time.Now().UTC()
 	previousConfig := copyAnyMap(job.Config)
+	_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 	job.Status = status
 	job.MLflowRunID = mlflowRunID
 	job.Error = message
@@ -2454,6 +2476,21 @@ func jobConfigWithTerminalAttempt(config map[string]any, jobID string, attempt i
 	next["active_attempt_id"] = fmt.Sprintf("%s:terminal-after-attempt-%d", jobID, attempt)
 	next["active_attempt_number"] = attempt
 	return next
+}
+
+func jobConfigWithImmutableExecutionSpec(current, next map[string]any) map[string]any {
+	out := copyAnyMap(next)
+	if out == nil {
+		out = map[string]any{}
+	}
+	if accepted, ok := current[execution.ExecutionSpecConfigKey]; ok {
+		if payload, isMap := accepted.(map[string]any); isMap {
+			out[execution.ExecutionSpecConfigKey] = cloneJSONMap(payload)
+		} else {
+			out[execution.ExecutionSpecConfigKey] = accepted
+		}
+	}
+	return out
 }
 
 func jobAttemptID(jobID string, attempt int) string {

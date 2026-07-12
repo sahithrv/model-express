@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/workers"
@@ -40,10 +41,14 @@ func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobO
 
 	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
 	previousConfig := copyAnyMap(job.Config)
+	if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET lifecycle_status=$1, updated_at=now() WHERE job_id=$2 AND attempt_id=$3 AND lifecycle_status=$4`, execution.ExecutionLifecycleNotRealized, job.ID, jobAttemptID(job.ID, job.Attempt), execution.ExecutionLifecyclePending); err != nil {
+		return jobs.ExperimentJob{}, false, err
+	}
 	nextConfig := copyAnyMap(job.Config)
 	if options.Config != nil {
 		nextConfig = copyAnyMap(options.Config)
 	}
+	nextConfig = jobConfigWithImmutableExecutionSpec(job.Config, nextConfig)
 	if requeued {
 		nextConfig = jobConfigWithPendingAttempt(nextConfig, job.ID, job.Attempt+1)
 		configJSON, marshalErr := json.Marshal(nextConfig)
@@ -140,6 +145,9 @@ func (s *PostgresStore) finishJob(jobID string, status string, mlflowRunID strin
 	}
 	nextConfig := jobConfigWithTerminalAttempt(current.Config, current.ID, current.Attempt)
 	previousConfig := copyAnyMap(current.Config)
+	if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET lifecycle_status=$1, updated_at=now() WHERE job_id=$2 AND attempt_id=$3 AND lifecycle_status=$4`, execution.ExecutionLifecycleNotRealized, current.ID, jobAttemptID(current.ID, current.Attempt), execution.ExecutionLifecyclePending); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
 	configJSON, err := json.Marshal(nextConfig)
 	if err != nil {
 		return jobs.ExperimentJob{}, fmt.Errorf("marshal terminal job config: %w", err)
