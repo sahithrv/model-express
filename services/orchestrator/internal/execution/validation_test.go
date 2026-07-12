@@ -32,6 +32,40 @@ func TestExecutionValidationReportsUnsupportedDetectionFieldWithAlternative(t *t
 	}
 }
 
+func TestExecutionValidationTypesEveryUnsupportedDetectionSemantic(t *testing.T) {
+	requested := map[string]any{
+		"template": "yolo11_detection", "model": "yolo11n.pt", "epochs": 8,
+		"batch_size": 8, "learning_rate": 0.001, "image_size": 640,
+		"augmentation":    map[string]any{"horizontal_flip": true},
+		"class_balancing": "focal_loss", "sampling_strategy": "weighted_random_sampler",
+		"optimizer": "adamw", "scheduler": "cosine", "weight_decay": 0.1,
+		"freeze_backbone": true, "pretrained": false,
+	}
+	spec, err := execution.BuildExecutionSpecV1("object_detection", "modal_ultralytics", requested, requested)
+	if err != nil {
+		t.Fatalf("build spec: %v", err)
+	}
+	report, err := execution.ValidateExecutionSpecV1(spec, "yolo11", execution.ValidationModeShadow)
+	if err != nil {
+		t.Fatalf("validate spec: %v", err)
+	}
+	for _, field := range []string{
+		"augmentation.horizontal_flip",
+		"class_balancing",
+		"sampling_strategy",
+		"optimizer",
+		"scheduler",
+		"weight_decay",
+		"freeze_backbone",
+		"pretrained",
+	} {
+		finding, ok := validationFinding(report, field)
+		if !ok || !finding.WouldBlock || finding.Classification != "unsupported" {
+			t.Fatalf("field %s missing typed blocking finding: %#v", field, report.Findings)
+		}
+	}
+}
+
 func TestExecutionValidationReportsInactiveConditionalField(t *testing.T) {
 	requested := map[string]any{
 		"template": "resnet_transfer", "model": "resnet18", "epochs": 8,

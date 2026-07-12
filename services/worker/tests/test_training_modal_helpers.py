@@ -311,6 +311,120 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(payload["framework_arguments"]["optimizer"]["name"], "SGD")
         self.assertFalse(payload["simulated"])
 
+    def test_yolo_initialization_callback_captures_saved_trainer_arguments(self) -> None:
+        accepted = {
+            "model": "yolo11n.pt",
+            "epochs": 8,
+            "batch_size": 8,
+            "learning_rate": 0.001,
+            "image_size": 640,
+            "pretrained": True,
+            "preprocessing": {"resize_strategy": "yolo_letterbox"},
+        }
+        execution = self.modal_app.YoloExecution(
+            accepted_config=accepted,
+            realized_config=accepted.copy(),
+            adjustment_policy="",
+            fidelity_mode="shadow",
+        )
+        submitted = self.modal_app.ultralytics_train_kwargs(
+            execution,
+            data="data.yaml",
+            project="runs",
+            name="train",
+            workers=2,
+        )
+        callbacks = {}
+        observations = []
+
+        class FakeDetector:
+            def add_callback(self, name, callback):
+                callbacks[name] = callback
+
+        trainer_args = {**submitted, "model": "yolo11n.pt"}
+        state = {}
+        with patch.object(
+            self.modal_app,
+            "_post_job_json",
+            lambda *args, **kwargs: observations.append({"args": args, "kwargs": kwargs}),
+        ):
+            installed = self.modal_app._install_yolo_fidelity_callback(
+                FakeDetector(),
+                orchestrator_url="https://orchestrator.test",
+                job={"id": "job_1", "config": {"active_attempt_id": "attempt-1"}},
+                execution=execution,
+                submitted_train_kwargs=submitted,
+                ultralytics_version="8.4.66",
+                state=state,
+            )
+            callbacks["on_pretrain_routine_end"](
+                SimpleNamespace(args=SimpleNamespace(**trainer_args))
+            )
+
+        self.assertTrue(installed)
+        self.assertTrue(state["initialized"])
+        self.assertEqual(state["execution"].realized_config, accepted)
+        payload = observations[0]["args"][3]
+        self.assertEqual(payload["stage"], "INITIALIZED")
+        self.assertEqual(payload["realized_config"], accepted)
+        self.assertEqual(payload["framework_arguments"]["realized_trainer"]["mosaic"], 1.0)
+        self.assertEqual(payload["framework_arguments"]["framework_mismatches"], [])
+
+    def test_yolo_enforcement_callback_rejects_changed_native_semantics(self) -> None:
+        accepted = {
+            "model": "yolo11n.pt",
+            "epochs": 8,
+            "batch_size": 8,
+            "learning_rate": 0.001,
+            "image_size": 640,
+            "pretrained": True,
+            "preprocessing": {"resize_strategy": "yolo_letterbox"},
+        }
+        execution = self.modal_app.YoloExecution(
+            accepted_config=accepted,
+            realized_config=accepted.copy(),
+            adjustment_policy="",
+            fidelity_mode="enforce",
+        )
+        submitted = self.modal_app.ultralytics_train_kwargs(
+            execution,
+            data="data.yaml",
+            project="runs",
+            name="train",
+            workers=2,
+        )
+        callbacks = {}
+
+        class FakeDetector:
+            def add_callback(self, name, callback):
+                callbacks[name] = callback
+
+        with patch.object(self.modal_app, "_post_job_json"):
+            self.modal_app._install_yolo_fidelity_callback(
+                FakeDetector(),
+                orchestrator_url="https://orchestrator.test",
+                job={"id": "job_1", "config": {}},
+                execution=execution,
+                submitted_train_kwargs=submitted,
+                ultralytics_version="8.4.66",
+                state={},
+            )
+            with self.assertRaisesRegex(
+                self.modal_app.YoloExecutionError,
+                "before the training loop",
+            ):
+                callbacks["on_pretrain_routine_end"](
+                    SimpleNamespace(
+                        args=SimpleNamespace(
+                            **{
+                                **submitted,
+                                "model": "yolo11n.pt",
+                                "mosaic": 0.5,
+                            }
+                        )
+                    )
+                )
+
     def test_modal_dataset_timeouts_are_configurable(self) -> None:
         with patch.dict(
             "os.environ",

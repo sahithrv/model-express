@@ -27,6 +27,19 @@ from worker.training.classification_execution import (
     realization_matches_policy,
     resolve_classification_execution,
 )
+from worker.training.yolo_execution import (
+    OBSERVATION_SCHEMA as YOLO_OBSERVATION_SCHEMA,
+    PINNED_ULTRALYTICS_VERSION,
+    YoloExecution,
+    YoloExecutionError,
+    capture_yolo_trainer_arguments,
+    realize_yolo_trainer_arguments,
+    resolve_yolo_execution,
+    ultralytics_train_kwargs,
+    yolo_framework_semantic_arguments,
+    yolo_framework_semantic_hash,
+    yolo_realization_matches_policy,
+)
 from worker.training.preprocessing_registry import (
     bbox_compare_requested,
     bbox_crop_required,
@@ -805,7 +818,15 @@ def train_yolo_detector(payload: dict) -> dict:
 def _train_yolo_detector_impl(payload: dict) -> dict:
     import time
 
-    from ultralytics import YOLO
+    import ultralytics
+
+    YOLO = ultralytics.YOLO
+    ultralytics_version = str(getattr(ultralytics, "__version__", ""))
+    if ultralytics_version != PINNED_ULTRALYTICS_VERSION:
+        raise YoloExecutionError(
+            "YOLO runner requires Ultralytics "
+            f"{PINNED_ULTRALYTICS_VERSION}, found {ultralytics_version or 'unknown'}."
+        )
 
     started_at = time.time()
     stage_events: list[dict] = []
@@ -819,12 +840,22 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
 
     job_id = job["id"]
     dataset_id = dataset["id"]
-    model_name = str(config.get("model") or config.get("pretrained_weights") or "yolo11n.pt")
     modal_resources = modal_resources_from_payload(payload, config, detection_job=True)
-    epochs = _positive_int(config.get("epochs"), default=8)
-    batch_size = _positive_int(modal_resources.get("effective_batch_size"), default=8)
-    image_size = _bounded_int(config.get("image_size"), default=640, minimum=160, maximum=1280)
-    learning_rate = _positive_float(config.get("learning_rate"), default=0.001)
+    accepted_execution = resolve_yolo_execution(config)
+    accepted_batch_size = int(accepted_execution.value("batch_size"))
+    resource_batch_size = _positive_int(
+        modal_resources.get("effective_batch_size"),
+        default=accepted_batch_size,
+    )
+    yolo_execution = resolve_yolo_execution(
+        config,
+        effective_batch_size=resource_batch_size,
+    )
+    model_name = str(yolo_execution.value("model"))
+    epochs = int(yolo_execution.value("epochs"))
+    batch_size = int(yolo_execution.value("batch_size"))
+    image_size = int(yolo_execution.value("image_size"))
+    learning_rate = float(yolo_execution.value("learning_rate"))
     confidence_threshold = _bounded_float(config.get("confidence_threshold"), default=0.25, minimum=0.01, maximum=0.99)
     iou_threshold = _bounded_float(config.get("iou_threshold"), default=0.7, minimum=0.1, maximum=0.99)
     gpu_type = str(modal_resources.get("effective_gpu_type") or config.get("gpu_type") or "T4")
@@ -889,20 +920,69 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         callback_identity=callback_identity(job, modal_resources),
         callback_auth_token=callback_token(job),
     )
-    detector.train(
+    train_kwargs = ultralytics_train_kwargs(
+        yolo_execution,
         data=str(data_config_path),
-        epochs=epochs,
-        batch=batch_size,
-        imgsz=image_size,
-        lr0=learning_rate,
         project=str(run_root),
         name="train",
-        exist_ok=True,
-        pretrained=True,
-        plots=False,
-        val=True,
         workers=_yolo_dataloader_workers(),
     )
+    yolo_fidelity_state: dict = {}
+    fidelity_callback_installed = _install_yolo_fidelity_callback(
+        detector,
+        orchestrator_url=orchestrator_url,
+        job=job,
+        execution=yolo_execution,
+        submitted_train_kwargs=train_kwargs,
+        ultralytics_version=ultralytics_version,
+        state=yolo_fidelity_state,
+        modal_resources=modal_resources,
+    )
+    if yolo_execution.fidelity_mode == "enforce":
+        if not yolo_realization_matches_policy(yolo_execution):
+            raise YoloExecutionError(
+                "Runner fidelity enforcement rejected a YOLO realization mismatch before training."
+            )
+        if yolo_execution.versioned and not fidelity_callback_installed:
+            raise YoloExecutionError(
+                "Runner fidelity enforcement could not register the Ultralytics initialization "
+                "callback before training."
+            )
+    detector.train(**train_kwargs)
+    yolo_execution = _finalize_yolo_execution_state(
+        detector,
+        yolo_execution,
+        yolo_fidelity_state,
+    )
+    if yolo_execution.versioned and not yolo_fidelity_state.get("initialized"):
+        _post_yolo_execution_observation(
+            orchestrator_url,
+            job,
+            stage="INITIALIZED",
+            idempotency_key="yolo-initialized-v1",
+            execution=yolo_execution,
+            framework_arguments=_yolo_framework_arguments(
+                yolo_execution,
+                submitted_train_kwargs=train_kwargs,
+                ultralytics_version=ultralytics_version,
+                trainer=getattr(detector, "trainer", None),
+            ),
+            evidence={
+                "trainer_class": getattr(
+                    getattr(detector, "trainer", None),
+                    "__class__",
+                    type(None),
+                ).__name__,
+                "callback_timing": "post_train_shadow_fallback",
+            },
+            modal_resources=modal_resources,
+        )
+    if yolo_execution.fidelity_mode == "enforce" and not yolo_realization_matches_policy(
+        yolo_execution
+    ):
+        raise YoloExecutionError(
+            "Runner fidelity enforcement rejected the realized Ultralytics trainer arguments."
+        )
     _modal_training_phase(job_id, "yolo_train_done", started_at)
     final_yolo_epoch_rows_posted = _post_yolo_epoch_metrics(
         orchestrator_url,
@@ -1116,6 +1196,25 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
             ),
         },
         job=job,
+        modal_resources=modal_resources,
+    )
+    _post_yolo_execution_observation(
+        orchestrator_url,
+        job,
+        stage="FINALIZED",
+        idempotency_key="yolo-finalized-v1",
+        execution=yolo_execution,
+        framework_arguments=_yolo_framework_arguments(
+            yolo_execution,
+            submitted_train_kwargs=train_kwargs,
+            ultralytics_version=ultralytics_version,
+            trainer=getattr(detector, "trainer", None),
+        ),
+        evidence={
+            "class_count": len(class_names),
+            "epochs_completed": epochs,
+            "checkpoint_available": best_model_path is not None,
+        },
         modal_resources=modal_resources,
     )
     _post_job_json(
@@ -1632,6 +1731,88 @@ def _install_yolo_epoch_metrics_callback(
             add_callback(event_name, post_epoch_metrics)
         except Exception as exc:
             print(f"[model-express] failed to register YOLO {event_name} metric callback: {exc}")
+
+
+def _install_yolo_fidelity_callback(
+    detector,
+    *,
+    orchestrator_url: str,
+    job: dict,
+    execution: YoloExecution,
+    submitted_train_kwargs: dict,
+    ultralytics_version: str,
+    state: dict,
+    modal_resources: dict | None = None,
+) -> bool:
+    add_callback = getattr(detector, "add_callback", None)
+    if not callable(add_callback):
+        return False
+
+    def observe_initialized(trainer) -> None:
+        if state.get("initialized"):
+            return
+        captured = capture_yolo_trainer_arguments(trainer)
+        realized = realize_yolo_trainer_arguments(execution, captured)
+        framework_arguments = _yolo_framework_arguments(
+            realized,
+            submitted_train_kwargs=submitted_train_kwargs,
+            ultralytics_version=ultralytics_version,
+            trainer=trainer,
+        )
+        state.update(
+            {
+                "initialized": True,
+                "execution": realized,
+                "framework_arguments": framework_arguments,
+            }
+        )
+        _post_yolo_execution_observation(
+            orchestrator_url,
+            job,
+            stage="INITIALIZED",
+            idempotency_key="yolo-initialized-v1",
+            execution=realized,
+            framework_arguments=framework_arguments,
+            evidence={"trainer_class": trainer.__class__.__name__},
+            modal_resources=modal_resources,
+        )
+        if realized.fidelity_mode == "enforce" and not yolo_realization_matches_policy(
+            realized
+        ):
+            raise YoloExecutionError(
+                "Runner fidelity enforcement rejected realized Ultralytics arguments "
+                "before the training loop."
+            )
+
+    try:
+        add_callback("on_pretrain_routine_end", observe_initialized)
+    except Exception as exc:
+        print(f"[model-express] failed to register YOLO fidelity callback: {exc}")
+        return False
+    return True
+
+
+def _finalize_yolo_execution_state(
+    detector,
+    execution: YoloExecution,
+    state: dict,
+) -> YoloExecution:
+    current = state.get("execution")
+    if isinstance(current, YoloExecution):
+        execution = current
+    trainer = getattr(detector, "trainer", None)
+    if trainer is not None:
+        captured = capture_yolo_trainer_arguments(trainer)
+        execution = realize_yolo_trainer_arguments(execution, captured)
+        state["execution"] = execution
+    if execution.versioned and execution.fidelity_mode == "enforce" and not state.get(
+        "initialized"
+    ):
+        raise YoloExecutionError(
+            "Runner fidelity enforcement did not receive the Ultralytics initialization "
+            "callback before training."
+        )
+    return execution
 
 
 def _post_yolo_epoch_metrics(
@@ -4651,7 +4832,7 @@ def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> b
 
 
 def _modal_training_failure_retryable(exc: Exception) -> bool:
-    if isinstance(exc, ClassificationExecutionError):
+    if isinstance(exc, (ClassificationExecutionError, YoloExecutionError)):
         return False
     message = str(exc or "").lower()
     if "409 client error" in message and "/complete" in message:
@@ -4711,6 +4892,118 @@ def _post_classification_execution_observation(
         },
         modal_resources=modal_resources,
     )
+
+
+def _post_yolo_execution_observation(
+    orchestrator_url: str,
+    job: dict,
+    *,
+    stage: str,
+    idempotency_key: str,
+    execution: YoloExecution,
+    framework_arguments: dict,
+    evidence: dict,
+    modal_resources: dict | None = None,
+) -> None:
+    if not execution.versioned:
+        return
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "execution-observations",
+        {
+            "schema_version": YOLO_OBSERVATION_SCHEMA,
+            "stage": stage,
+            "idempotency_key": idempotency_key,
+            "realized_config": execution.realized_config,
+            "framework_arguments": framework_arguments,
+            "evidence": evidence,
+            "adjustment_policy": execution.adjustment_policy,
+            "simulated": False,
+        },
+        modal_resources=modal_resources,
+    )
+
+
+def _yolo_framework_arguments(
+    execution: YoloExecution,
+    *,
+    submitted_train_kwargs: dict,
+    ultralytics_version: str,
+    trainer=None,
+) -> dict:
+    import platform
+
+    semantic = yolo_framework_semantic_arguments(execution)
+    submitted_semantic = {
+        key: copy.deepcopy(value)
+        for key, value in submitted_train_kwargs.items()
+        if key not in {"data", "project", "name", "exist_ok", "workers"}
+    }
+    return {
+        "runtime": {
+            "python": platform.python_version(),
+            "ultralytics": ultralytics_version,
+        },
+        "framework_semantic_hash": yolo_framework_semantic_hash(execution),
+        "constructor": semantic["constructor"],
+        "submitted_train": submitted_semantic,
+        "realized_trainer": copy.deepcopy(execution.trainer_arguments or {}),
+        "trainer_runtime": _yolo_trainer_runtime_arguments(trainer),
+        "framework_mismatches": list(execution.framework_mismatches),
+        "preprocessing": semantic["preprocessing"],
+        "native_augmentation": {
+            key: semantic["train"][key]
+            for key in (
+                "hsv_h",
+                "hsv_s",
+                "hsv_v",
+                "degrees",
+                "translate",
+                "scale",
+                "shear",
+                "perspective",
+                "flipud",
+                "fliplr",
+                "bgr",
+                "mosaic",
+                "mixup",
+                "cutmix",
+                "copy_paste",
+                "copy_paste_mode",
+            )
+        },
+    }
+
+
+def _yolo_trainer_runtime_arguments(trainer) -> dict:
+    if trainer is None:
+        return {}
+    optimizer = getattr(trainer, "optimizer", None)
+    optimizer_group = (
+        optimizer.param_groups[0]
+        if optimizer is not None and getattr(optimizer, "param_groups", None)
+        else {}
+    )
+    scheduler = getattr(trainer, "scheduler", None)
+    model = getattr(trainer, "model", None)
+    stride = getattr(model, "stride", None)
+    if hasattr(stride, "tolist"):
+        stride = stride.tolist()
+    elif isinstance(stride, tuple):
+        stride = list(stride)
+    elif stride is not None and not isinstance(stride, (bool, int, float, str, list)):
+        stride = str(stride)
+    return {
+        "trainer": trainer.__class__.__name__,
+        "model": model.__class__.__name__ if model is not None else "",
+        "model_stride": stride,
+        "optimizer": optimizer.__class__.__name__ if optimizer is not None else "",
+        "optimizer_learning_rate": optimizer_group.get("lr"),
+        "optimizer_weight_decay": optimizer_group.get("weight_decay"),
+        "optimizer_momentum": optimizer_group.get("momentum"),
+        "scheduler": scheduler.__class__.__name__ if scheduler is not None else "",
+    }
 
 
 def _classification_framework_arguments(

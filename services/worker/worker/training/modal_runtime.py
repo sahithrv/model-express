@@ -126,7 +126,7 @@ if modal is not None:
             "pyyaml",
             "torch",
             "torchvision",
-            "ultralytics",
+            "ultralytics==8.4.66",
         )
         .env({"TORCH_HOME": str(TORCH_CACHE_ROOT)})
         .add_local_python_source("worker")

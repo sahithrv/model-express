@@ -13,6 +13,8 @@ Fidelity PR 5 snapshots that accepted spec independently from mutable job config
 
 Fidelity PR 6 makes the Modal torchvision classifier consume the accepted semantic config through the packaged capability resolver. It reports initialized and finalized realization observations with exact optimizer, scheduler, loss, sampler, transform, normalization, transfer-learning, and framework-version evidence. Pretrained-weight and dataset-normalization failures no longer fall back to different semantics. Shadow mode records mismatches while runner enforcement stops before the training loop; legacy unversioned jobs remain runnable only in shadow mode.
 
+Fidelity PR 7 makes the Modal Ultralytics detector consume the accepted detection spec through a pure kwargs translator. The Modal image pins Ultralytics 8.4.66, and the translator explicitly supplies the pinned native optimization, augmentation, determinism, and letterboxing semantics in addition to the five executable detection fields. The runner captures allowlisted trainer arguments at `on_pretrain_routine_end`, posts `INITIALIZED` and `FINALIZED` observations, and treats any framework-normalized divergence as a mismatch. Unsupported classifier augmentation, balancing, sampling, optimizer, scheduler, regularization, and fine-tuning requests remain typed validation findings rather than silently entering `YOLO.train`. Enforcement rejects mismatches before the epoch loop; shadow mode records them for rollout analysis.
+
 New plan payloads are stored in a `planned_experiments.v1` envelope. Legacy array payloads remain readable and are reported as `legacy_unversioned` without rewriting stored records.
 
 After editing the canonical JSON, regenerate the embedded Go data and packaged Python data:
