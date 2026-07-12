@@ -27,6 +27,22 @@ func TestDeriveRealizationVerdicts(t *testing.T) {
 	}
 }
 
+func TestRealizedEffectiveHashIsDeterministic(t *testing.T) {
+	spec := JobExecutionSpec{CapabilityVersion: "2026-07-09", Task: "image_classification", Runner: "modal_torchvision", AcceptedSpec: map[string]any{"model": "resnet18", "batch_size": float64(16), "pretrained": false}}
+	observation := RealizationObservationCreate{RealizedConfig: map[string]any{"pretrained": false, "batch_size": float64(16), "model": "resnet18"}}
+	_, firstHash, firstVerdict, err := DeriveRealization(spec, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondHash, secondVerdict, err := DeriveRealization(spec, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash != secondHash || firstVerdict != ExecutionVerdictMatched || secondVerdict != ExecutionVerdictMatched {
+		t.Fatalf("nondeterministic realization: first=%s/%s second=%s/%s", firstHash, firstVerdict, secondHash, secondVerdict)
+	}
+}
+
 func TestObservationRejectsUnacceptedAndRedactsSensitiveFields(t *testing.T) {
 	spec := JobExecutionSpec{AcceptedSpec: map[string]any{"epochs": float64(3)}}
 	if _, _, _, err := DeriveRealization(spec, RealizationObservationCreate{RealizedConfig: map[string]any{"epochs": float64(3), "token": "secret"}}); err == nil {

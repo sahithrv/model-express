@@ -9,6 +9,7 @@ from worker.training.preprocessing_registry import (
     bbox_crop_required,
     build_image_transform,
     normalize_preprocessing_config,
+    normalization_values,
     validate_augmentation_strategy,
 )
 
@@ -121,6 +122,42 @@ class PreprocessingRegistryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Unsupported resize_strategy 'mystery'"):
             build_image_transform(64, {}, {"resize_strategy": "mystery"}, training=False)
+
+    def test_dataset_normalization_never_falls_back_to_imagenet(self) -> None:
+        with self.assertRaisesRegex(ValueError, "mean/std metadata is unavailable"):
+            normalization_values("dataset", {})
+
+        self.assertEqual(
+            normalization_values(
+                "dataset",
+                {"normalization_metadata": {"mean": [0.1, 0.2, 0.3], "std": [0.4, 0.5, 0.6]}},
+            ),
+            ((0.1, 0.2, 0.3), (0.4, 0.5, 0.6)),
+        )
+
+    def test_train_and_eval_transforms_share_preprocessing_but_not_train_augmentation(self) -> None:
+        try:
+            import torchvision  # noqa: F401
+        except Exception as exc:  # pragma: no cover - depends on optional training deps
+            raise unittest.SkipTest(f"torchvision is unavailable: {exc}") from exc
+
+        preprocessing = {
+            "resize_strategy": "center_crop",
+            "crop_strategy": "none",
+            "normalization": "imagenet",
+        }
+        augmentation = {"horizontal_flip": True, "color_jitter": True}
+        train = build_image_transform(224, augmentation, preprocessing, training=True)
+        evaluate = build_image_transform(224, augmentation, preprocessing, training=False)
+        train_names = [step.__class__.__name__ for step in train.transforms]
+        eval_names = [step.__class__.__name__ for step in evaluate.transforms]
+
+        self.assertEqual(train_names[:2], eval_names[:2])
+        self.assertEqual(train_names[-2:], eval_names[-2:])
+        self.assertIn("RandomHorizontalFlip", train_names)
+        self.assertIn("ColorJitter", train_names)
+        self.assertNotIn("RandomHorizontalFlip", eval_names)
+        self.assertNotIn("ColorJitter", eval_names)
 
 
 if __name__ == "__main__":

@@ -10,14 +10,13 @@ from worker.training.execution_capabilities import (
     capability_document_v1,
     capability_profile,
     normalize_execution_config,
+    resolve_accepted_config,
 )
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 CONTRACT_PATH = REPOSITORY_ROOT / "contracts" / "experiment_execution_capabilities.v1.json"
-FIXTURES_PATH = (
-    REPOSITORY_ROOT / "contracts" / "experiment_execution_capabilities.v1.fixtures.json"
-)
+FIXTURES_PATH = REPOSITORY_ROOT / "contracts" / "experiment_execution_capabilities.v1.fixtures.json"
 
 
 def test_generated_python_capabilities_match_canonical_contract():
@@ -31,11 +30,24 @@ def test_python_normalizes_shared_capability_fixtures():
     fixtures = json.loads(FIXTURES_PATH.read_text(encoding="utf-8"))
     assert fixtures
     for fixture in fixtures:
-        assert normalize_execution_config(
-            fixture["task"],
-            fixture["runner"],
-            fixture["input"],
-        ) == fixture["expected"], fixture["name"]
+        assert (
+            normalize_execution_config(
+                fixture["task"],
+                fixture["runner"],
+                fixture["input"],
+            )
+            == fixture["expected"]
+        ), fixture["name"]
+
+
+def test_python_accepted_resolver_drops_inactive_conditional_fields():
+    accepted = resolve_accepted_config(
+        "image_classification",
+        "modal_torchvision",
+        {"model": "resnet18", "optimizer": "adamw", "optimizer_momentum": 0},
+    )
+    assert accepted["optimizer"] == "adamw"
+    assert "optimizer_momentum" not in accepted
 
 
 def test_every_profile_classifies_every_catalog_field():

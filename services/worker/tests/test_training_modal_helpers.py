@@ -279,6 +279,38 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(calls[0]["json"]["training_attempt_id"], "job_1:attempt-2")
         self.assertEqual(calls[0]["headers"], {"Authorization": "Bearer callback-secret"})
 
+    def test_classification_realization_callback_contains_exact_semantics(self) -> None:
+        calls = []
+        execution = self.modal_app.ClassificationExecution(
+            accepted_config={"model": "resnet18", "batch_size": 16},
+            realized_config={"model": "resnet18", "batch_size": 8},
+            adjustment_policy="batch_size_recovery",
+            fidelity_mode="shadow",
+        )
+        job = {"id": "job_1", "config": {"active_attempt_id": "job_1:attempt-1"}}
+
+        with patch.object(
+            self.modal_app,
+            "_post_job_json",
+            lambda *args, **kwargs: calls.append({"args": args, "kwargs": kwargs}),
+        ):
+            self.modal_app._post_classification_execution_observation(
+                "https://orchestrator.test",
+                job,
+                stage="INITIALIZED",
+                idempotency_key="classification-initialized-v1",
+                execution=execution,
+                framework_arguments={"optimizer": {"name": "SGD"}},
+                evidence={"class_count": 2},
+            )
+
+        payload = calls[0]["args"][3]
+        self.assertEqual(calls[0]["args"][2], "execution-observations")
+        self.assertEqual(payload["realized_config"], {"model": "resnet18", "batch_size": 8})
+        self.assertEqual(payload["adjustment_policy"], "batch_size_recovery")
+        self.assertEqual(payload["framework_arguments"]["optimizer"]["name"], "SGD")
+        self.assertFalse(payload["simulated"])
+
     def test_modal_dataset_timeouts_are_configurable(self) -> None:
         with patch.dict(
             "os.environ",
@@ -1461,6 +1493,7 @@ class ModalTrainingHelperTests(unittest.TestCase):
             None,
             "focal_loss",
             torch.device("cpu"),
+            label_smoothing=0.1,
             class_balancing_config={"focal_loss_gamma": 3.0},
         )
         head = self.modal_app._classification_head(nn, 4, 2, dropout=0.25)
@@ -1470,8 +1503,21 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(scheduler.gamma, 0.35)
         self.assertEqual(criterion.label_smoothing, 0.12)
         self.assertEqual(focal.gamma, 3.0)
+        self.assertEqual(focal.label_smoothing, 0.1)
         self.assertIsInstance(head[0], nn.Dropout)
         self.assertEqual(head[0].p, 0.25)
+
+    def test_pretrained_model_loading_never_falls_back_to_random_weights(self) -> None:
+        calls = []
+
+        def failing_factory(*, weights):
+            calls.append(weights)
+            raise RuntimeError("pretrained weights unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "pretrained weights unavailable"):
+            self.modal_app._torchvision_model(failing_factory, "DEFAULT_WEIGHTS")
+
+        self.assertEqual(calls, ["DEFAULT_WEIGHTS"])
 
     def test_early_stopping_waits_until_after_half_epochs_for_non_egregious_runs(self) -> None:
         should_stop = self.modal_app._should_stop_training_early

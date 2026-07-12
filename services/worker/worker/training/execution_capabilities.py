@@ -27,11 +27,7 @@ def normalize_execution_config(task: str, runner: str, config: dict) -> dict:
     profile = _profile_from_document(CAPABILITY_DOCUMENT, task, runner)
     catalog = CAPABILITY_DOCUMENT["field_catalog"]
     root_fields = {path.split(".", 1)[0] for path in catalog}
-    normalized = {
-        key: deepcopy(value)
-        for key, value in config.items()
-        if key in root_fields
-    }
+    normalized = {key: deepcopy(value) for key, value in config.items() if key in root_fields}
 
     for path, value in profile.get("defaults", {}).items():
         if not _has_path(normalized, path):
@@ -48,6 +44,36 @@ def normalize_execution_config(task: str, runner: str, config: dict) -> dict:
         constraint = profile.get("constraints", {}).get(path, {})
         _set_path(normalized, path, _normalize_value(path, value, definition, constraint))
     return normalized
+
+
+def resolve_accepted_config(task: str, runner: str, config: dict) -> dict:
+    """Resolve the executable semantic subset exactly like the Go orchestrator."""
+    profile = capability_profile(task, runner)
+    normalized = normalize_execution_config(task, runner, config)
+    for path, default in profile.get("defaults", {}).items():
+        present, value = _value_at_path(normalized, path)
+        if present and isinstance(default, str) and isinstance(value, str) and not value.strip():
+            _set_path(normalized, path, default)
+    accepted: dict[str, Any] = {}
+    catalog = CAPABILITY_DOCUMENT["field_catalog"]
+    for path, capability in profile["fields"].items():
+        if capability["classification"] not in {"executed", "conditional"}:
+            continue
+        if catalog[path]["type"] == "object" and any(
+            candidate.startswith(f"{path}.") for candidate in catalog
+        ):
+            continue
+        present, value = _value_at_path(normalized, path)
+        if not present or not _conditional_capability_active(
+            path,
+            capability,
+            normalized,
+        ):
+            continue
+        _set_path(accepted, path, deepcopy(value))
+    for path, value in profile.get("fixed_semantics", {}).items():
+        _set_path(accepted, path, deepcopy(value))
+    return accepted
 
 
 def validate_capability_document(document: dict[str, Any]) -> None:
@@ -198,3 +224,45 @@ def _set_path(config: dict, path: str, value: object) -> None:
             current[part] = nested
         current = nested
     current[parts[-1]] = value
+
+
+def _conditional_capability_active(path: str, capability: dict, config: dict) -> bool:
+    if capability.get("classification") != "conditional":
+        return True
+    reason_code = capability.get("reason_code")
+    if reason_code == "conditional_optimizer_sgd":
+        return _string_at_path(config, "optimizer") == "sgd"
+    if reason_code == "conditional_scheduler_step":
+        return _string_at_path(config, "scheduler") == "step"
+    if reason_code == "conditional_class_balancing":
+        strategy = _string_at_path(config, "class_balancing")
+        if path in {"class_balancing", "sampling_strategy"}:
+            return True
+        if path == "class_balancing_config.effective_number_beta":
+            return strategy == "effective_number_loss"
+        if path == "class_balancing_config.focal_loss_gamma":
+            return strategy == "focal_loss"
+        return True
+    if reason_code == "conditional_augmentation_policy":
+        policy = _string_at_path(config, "augmentation_policy_config.policy_type")
+        if not policy:
+            policy = _string_at_path(config, "augmentation_policy")
+        if path == "augmentation_policy":
+            return True
+        if path == "augmentation_policy_config.alpha":
+            return policy in {"mixup", "cutmix"}
+        if path in {
+            "augmentation_policy_config.magnitude",
+            "augmentation_policy_config.num_ops",
+        }:
+            return policy == "randaugment"
+        if path == "augmentation_policy_config.num_magnitude_bins":
+            return policy == "trivialaugment"
+        if path == "augmentation_policy_config.probability":
+            return bool(policy and policy not in {"none", "custom"})
+    return True
+
+
+def _string_at_path(config: dict, path: str) -> str:
+    present, value = _value_at_path(config, path)
+    return str(value) if present and isinstance(value, str) else ""

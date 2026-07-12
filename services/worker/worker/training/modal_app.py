@@ -19,6 +19,14 @@ from worker.training.augmentation import (
     normalize_augmentation_config,
     structured_policy_type,
 )
+from worker.training.classification_execution import (
+    ClassificationExecution,
+    ClassificationExecutionError,
+    OBSERVATION_SCHEMA,
+    load_torchvision_model,
+    realization_matches_policy,
+    resolve_classification_execution,
+)
 from worker.training.preprocessing_registry import (
     bbox_compare_requested,
     bbox_crop_required,
@@ -273,33 +281,42 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     job_id = job["id"]
     dataset_id = dataset["id"]
     modal_resources = modal_resources_from_payload(payload, config, detection_job=False)
-    epochs = _positive_int(config.get("epochs"), default=5)
-    batch_size = _positive_int(modal_resources.get("effective_batch_size"), default=16)
-    learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
-    image_size = _bounded_int(config.get("image_size"), default=224, minimum=96, maximum=384)
-    optimizer_name = str(config.get("optimizer", "adamw")).lower()
-    scheduler_name = str(config.get("scheduler", "none")).lower()
-    weight_decay = _non_negative_float(config.get("weight_decay"), default=0.0)
-    dropout = _bounded_float(config.get("dropout"), default=0.0, minimum=0.0, maximum=0.7)
-    optimizer_momentum = _bounded_float(config.get("optimizer_momentum"), default=0.9, minimum=0.0, maximum=0.99)
-    scheduler_step_size = _bounded_int(config.get("scheduler_step_size"), default=max(1, epochs // 3), minimum=1, maximum=max(1, epochs))
-    scheduler_gamma = _bounded_float(config.get("scheduler_gamma"), default=0.5, minimum=0.05, maximum=0.95)
-    label_smoothing = _bounded_float(config.get("label_smoothing"), default=0.0, minimum=0.0, maximum=0.3)
-    gradient_clip_norm = _bounded_float(config.get("gradient_clip_norm"), default=0.0, minimum=0.0, maximum=10.0)
-    augmentation = normalize_augmentation_config(
-        config.get("augmentation"),
-        config.get("augmentation_policy", ""),
-        config.get("augmentation_policy_config"),
+    accepted_execution = resolve_classification_execution(config)
+    accepted_batch_size = int(accepted_execution.value("batch_size"))
+    resource_batch_size = _positive_int(
+        modal_resources.get("effective_batch_size"),
+        default=accepted_batch_size,
     )
-    class_balancing = str(config.get("class_balancing", "")).lower()
-    sampling_strategy = str(config.get("sampling_strategy", "")).lower()
-    preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
-    class_balancing_config = config.get("class_balancing_config") if isinstance(config.get("class_balancing_config"), dict) else {}
-    early_stopping_patience = _positive_int(config.get("early_stopping_patience"), default=0)
-    model_name = str(config.get("model", "mobilenet_v3_small"))
-    pretrained = _bool(config.get("pretrained"), default=True)
-    freeze_backbone = _bool(config.get("freeze_backbone"), default=True)
-    fine_tune_strategy = str(config.get("fine_tune_strategy", "head_only")).lower()
+    classification_execution = resolve_classification_execution(
+        config,
+        effective_batch_size=resource_batch_size,
+    )
+    realized_config = classification_execution.realized_config
+    epochs = int(classification_execution.value("epochs"))
+    batch_size = int(classification_execution.value("batch_size"))
+    learning_rate = float(classification_execution.value("learning_rate"))
+    image_size = int(classification_execution.value("image_size"))
+    optimizer_name = str(classification_execution.value("optimizer"))
+    scheduler_name = str(classification_execution.value("scheduler"))
+    weight_decay = float(classification_execution.value("weight_decay"))
+    dropout = float(classification_execution.value("dropout"))
+    optimizer_momentum = float(realized_config.get("optimizer_momentum", 0.0))
+    scheduler_step_size = int(realized_config.get("scheduler_step_size", max(1, epochs // 3)))
+    scheduler_gamma = float(realized_config.get("scheduler_gamma", 0.5))
+    label_smoothing = float(classification_execution.value("label_smoothing"))
+    gradient_clip_norm = float(classification_execution.value("gradient_clip_norm"))
+    augmentation = classification_execution.augmentation
+    class_balancing = str(classification_execution.value("class_balancing"))
+    sampling_strategy = str(classification_execution.value("sampling_strategy"))
+    preprocessing = classification_execution.preprocessing
+    class_balancing_config = realized_config.get("class_balancing_config")
+    if not isinstance(class_balancing_config, dict):
+        class_balancing_config = {}
+    early_stopping_patience = int(classification_execution.value("early_stopping_patience"))
+    model_name = str(classification_execution.value("model"))
+    pretrained = bool(classification_execution.value("pretrained"))
+    freeze_backbone = bool(classification_execution.value("freeze_backbone"))
+    fine_tune_strategy = str(classification_execution.value("fine_tune_strategy"))
     gpu_type = str(modal_resources.get("effective_gpu_type") or config.get("gpu_type") or "T4")
     modal_function_call_id, modal_input_id = _modal_identifiers()
     modal_resources = {
@@ -357,6 +374,10 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     if isinstance(subset_manifest, dict):
         dataset_materialization["subset_manifest"] = subset_manifest
     effective_batch_size = _positive_int(getattr(train_loader, "batch_size", None), default=batch_size)
+    classification_execution = resolve_classification_execution(
+        config,
+        effective_batch_size=effective_batch_size,
+    )
     modal_resource_telemetry = resource_telemetry(
         modal_resources,
         effective_batch_size=effective_batch_size,
@@ -389,6 +410,35 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     optimizer = _build_optimizer(optimizer_name, trainable_parameters, learning_rate, weight_decay, optimizer_momentum)
     scheduler = _build_scheduler(scheduler_name, optimizer, epochs, scheduler_step_size, scheduler_gamma)
     _modal_training_phase(job_id, "optimizer_ready", started_at, trainable_parameters=len(trainable_parameters))
+
+    classification_framework_arguments = _classification_framework_arguments(
+        classification_execution,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        model=model,
+        augmentation=augmentation,
+        effective_preprocessing=effective_preprocessing,
+    )
+    _post_classification_execution_observation(
+        orchestrator_url,
+        job,
+        stage="INITIALIZED",
+        idempotency_key="classification-initialized-v1",
+        execution=classification_execution,
+        framework_arguments=classification_framework_arguments,
+        evidence={
+            "class_count": len(class_names),
+            "trainable_parameter_count": sum(parameter.numel() for parameter in trainable_parameters),
+        },
+        modal_resources=modal_resources,
+    )
+    if classification_execution.fidelity_mode == "enforce" and not realization_matches_policy(classification_execution):
+        raise ValueError(
+            "Runner fidelity enforcement rejected a classification realization mismatch before training."
+        )
 
     best_macro_f1 = 0.0
     best_accuracy = 0.0
@@ -542,7 +592,11 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         image_size=image_size,
         preprocessing=effective_preprocessing,
         model_profile=model_profile,
-        training_config={**config, "preprocessing": effective_preprocessing},
+        training_config={
+            **config,
+            **classification_execution.realized_config,
+            "preprocessing": effective_preprocessing,
+        },
         dataset=dataset,
         job_id=job_id,
         export_self_test_samples=test_eval_details.get("export_self_test_samples")
@@ -641,10 +695,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "modal_resources": modal_resource_telemetry,
             },
             "preprocessing_summary": {
-                "augmentation_policy": str(config.get("augmentation_policy", "")),
-                "augmentation_policy_config": config.get("augmentation_policy_config")
-                if isinstance(config.get("augmentation_policy_config"), dict)
-                else {},
+                "augmentation_policy": str(
+                    classification_execution.realized_config.get("augmentation_policy", "none")
+                ),
+                "augmentation_policy_config": classification_execution.realized_config.get(
+                    "augmentation_policy_config", {}
+                ),
                 "class_balancing": class_balancing,
                 "sampling_strategy": sampling_strategy,
                 "preprocessing": preprocessing,
@@ -685,6 +741,21 @@ def _train_image_classifier_impl(payload: dict) -> dict:
             ),
         },
         job=job,
+        modal_resources=modal_resources,
+    )
+
+    _post_classification_execution_observation(
+        orchestrator_url,
+        job,
+        stage="FINALIZED",
+        idempotency_key="classification-finalized-v1",
+        execution=classification_execution,
+        framework_arguments=classification_framework_arguments,
+        evidence={
+            "completed_epochs": completed_epochs,
+            "export_status": export_bundle.get("status", ""),
+            "class_count": len(class_names),
+        },
         modal_resources=modal_resources,
     )
 
@@ -3234,7 +3305,17 @@ def _dataset_normalization_metadata(dataset_dir: Path, preprocessing: dict) -> d
     from worker.datasets.profiler import compute_image_normalization_metadata
 
     metadata = compute_image_normalization_metadata(dataset_dir)
-    return metadata if metadata.get("status") == "computed" else None
+    if metadata.get("status") != "computed":
+        raise ValueError(
+            "Dataset normalization was accepted, but dataset statistics could not be computed."
+        )
+    mean = _three_float_tuple(metadata.get("mean"))
+    std = _three_positive_float_tuple(metadata.get("std"))
+    if mean is None or std is None:
+        raise ValueError(
+            "Dataset normalization was accepted, but computed dataset statistics are invalid."
+        )
+    return metadata
 
 
 def _normalization_values(normalization: str, preprocessing: dict) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
@@ -3273,23 +3354,40 @@ def _build_criterion(class_weights, class_balancing: str, device, label_smoothin
     )
     if class_balancing == "focal_loss":
         class FocalLoss(nn.Module):
-            def __init__(self, weight=None, gamma: float = 2.0):
+            def __init__(self, weight=None, gamma: float = 2.0, label_smoothing: float = 0.0):
                 super().__init__()
                 self.weight = weight
                 self.gamma = gamma
+                self.label_smoothing = label_smoothing
 
             def forward(self, logits, targets):
                 if targets.dtype.is_floating_point:
+                    if self.label_smoothing > 0:
+                        class_count = max(1, int(targets.shape[1]))
+                        targets = (
+                            targets * (1.0 - self.label_smoothing)
+                            + self.label_smoothing / class_count
+                        )
                     log_probabilities = F.log_softmax(logits, dim=1)
                     weights = self.weight.view(1, -1) if self.weight is not None else 1.0
                     cross_entropy = -(targets * log_probabilities * weights).sum(dim=1)
                 else:
-                    cross_entropy = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+                    cross_entropy = F.cross_entropy(
+                        logits,
+                        targets,
+                        weight=self.weight,
+                        reduction="none",
+                        label_smoothing=self.label_smoothing,
+                    )
                 probability = torch.exp(-cross_entropy)
                 loss = ((1 - probability) ** self.gamma) * cross_entropy
                 return loss.mean()
 
-        return FocalLoss(weight=weight_tensor, gamma=focal_gamma)
+        return FocalLoss(
+            weight=weight_tensor,
+            gamma=focal_gamma,
+            label_smoothing=label_smoothing,
+        )
     return nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
 
 
@@ -3354,72 +3452,77 @@ def _build_model(
     normalized = model_name.lower()
     dropout = _bounded_float(dropout, default=0.0, minimum=0.0, maximum=0.7)
 
-    if "efficientnet_b2" in normalized:
+    if normalized == "efficientnet_b2":
         model = _torchvision_model(models.efficientnet_b2, models.EfficientNet_B2_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet_b1" in normalized:
+    if normalized == "efficientnet_b1":
         model = _torchvision_model(models.efficientnet_b1, models.EfficientNet_B1_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet" in normalized:
+    if normalized == "efficientnet_b0":
         model = _torchvision_model(models.efficientnet_b0, models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "resnet34" in normalized:
+    if normalized == "resnet34":
         model = _torchvision_model(models.resnet34, models.ResNet34_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "resnet" in normalized:
+    if normalized == "resnet18":
         model = _torchvision_model(models.resnet18, models.ResNet18_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "regnet_y_400mf" in normalized:
+    if normalized == "regnet_y_400mf":
         model = _torchvision_model(models.regnet_y_400mf, models.RegNet_Y_400MF_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "convnext_tiny" in normalized:
+    if normalized == "convnext_tiny":
         model = _torchvision_model(models.convnext_tiny, models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "swin_t" in normalized:
+    if normalized == "swin_t":
         model = _torchvision_model(models.swin_t, models.Swin_T_Weights.DEFAULT if pretrained else None)
         in_features = model.head.in_features
         _apply_transfer_strategy(model, "head", freeze_backbone, fine_tune_strategy)
         model.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "vit_b_16" in normalized:
+    if normalized == "vit_b_16":
         model = _torchvision_model(models.vit_b_16, models.ViT_B_16_Weights.DEFAULT if pretrained else None)
         in_features = model.heads.head.in_features
         _apply_transfer_strategy(model, "heads", freeze_backbone, fine_tune_strategy)
         model.heads.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "mobilenet_v3_large" in normalized:
+    if normalized == "mobilenet_v3_large":
         model = _torchvision_model(models.mobilenet_v3_large, models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
 
-    model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
-    in_features = model.classifier[-1].in_features
-    _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-    _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
-    return model
+    if normalized == "mobilenet_v3_small":
+        model = _torchvision_model(
+            models.mobilenet_v3_small,
+            models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None,
+        )
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    raise ValueError(f"Unsupported torchvision classification model {model_name!r}.")
 
 
 def _classification_head(nn, in_features: int, class_count: int, dropout: float = 0.0):
@@ -3439,10 +3542,10 @@ def _replace_classifier_head(nn, classifier, in_features: int, class_count: int,
 
 
 def _torchvision_model(factory, weights):
-    try:
-        return factory(weights=weights)
-    except Exception:
-        return factory(weights=None)
+    # Pretrained-to-random fallback changes training semantics and must never be
+    # hidden. Let download, cache, compatibility, and integrity errors fail the
+    # attempt so a random initialization requires a new accepted spec.
+    return load_torchvision_model(factory, weights)
 
 
 def _apply_transfer_strategy(model, head_name: str, freeze_backbone: bool, fine_tune_strategy: str) -> None:
@@ -3468,7 +3571,9 @@ def _build_optimizer(optimizer_name: str, parameters, learning_rate: float, weig
         return torch.optim.SGD(parameters, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
     if optimizer_name == "adam":
         return torch.optim.Adam(parameters, lr=learning_rate, weight_decay=weight_decay)
-    return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
+    raise ValueError(f"Unsupported classification optimizer {optimizer_name!r}.")
 
 
 def _build_scheduler(scheduler_name: str, optimizer, epochs: int, step_size: int | None = None, gamma: float = 0.5):
@@ -3482,7 +3587,9 @@ def _build_scheduler(scheduler_name: str, optimizer, epochs: int, step_size: int
             step_size=max(1, int(step_size or max(1, epochs // 3))),
             gamma=_bounded_float(gamma, default=0.5, minimum=0.05, maximum=0.95),
         )
-    return None
+    if scheduler_name == "none":
+        return None
+    raise ValueError(f"Unsupported classification scheduler {scheduler_name!r}.")
 
 
 def _batch_size(labels) -> int:
@@ -4544,10 +4651,14 @@ def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> b
 
 
 def _modal_training_failure_retryable(exc: Exception) -> bool:
+    if isinstance(exc, ClassificationExecutionError):
+        return False
     message = str(exc or "").lower()
     if "409 client error" in message and "/complete" in message:
         return False
     if "training completion requires a succeeded summary and exportable evaluation artifact" in message:
+        return False
+    if "runner fidelity enforcement" in message or "dataset normalization was accepted" in message:
         return False
     return True
 
@@ -4569,6 +4680,188 @@ def _post_job_json(
         },
         callback_token(job),
     )
+
+
+def _post_classification_execution_observation(
+    orchestrator_url: str,
+    job: dict,
+    *,
+    stage: str,
+    idempotency_key: str,
+    execution: ClassificationExecution,
+    framework_arguments: dict,
+    evidence: dict,
+    modal_resources: dict | None = None,
+) -> None:
+    if not execution.versioned:
+        return
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "execution-observations",
+        {
+            "schema_version": OBSERVATION_SCHEMA,
+            "stage": stage,
+            "idempotency_key": idempotency_key,
+            "realized_config": execution.realized_config,
+            "framework_arguments": framework_arguments,
+            "evidence": evidence,
+            "adjustment_policy": execution.adjustment_policy,
+            "simulated": False,
+        },
+        modal_resources=modal_resources,
+    )
+
+
+def _classification_framework_arguments(
+    execution: ClassificationExecution,
+    *,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    model,
+    augmentation: dict,
+    effective_preprocessing: dict,
+) -> dict:
+    import platform
+    import torch
+    import torchvision
+
+    normalization = str(effective_preprocessing.get("normalization") or "")
+    normalization_parameters = _normalization_values(normalization, effective_preprocessing)
+    mean, std = normalization_parameters if normalization_parameters is not None else (None, None)
+    optimizer_group = optimizer.param_groups[0] if getattr(optimizer, "param_groups", None) else {}
+    sampler = getattr(train_loader, "sampler", None)
+    criterion_weights = getattr(criterion, "weight", None)
+    return {
+        "runtime": {
+            "python": platform.python_version(),
+            "torch": str(torch.__version__),
+            "torchvision": str(torchvision.__version__),
+            "cuda": str(torch.version.cuda or ""),
+        },
+        "model": {
+            "name": execution.realized_config["model"],
+            "implementation": model.__class__.__name__,
+            "pretrained": execution.realized_config["pretrained"],
+            "freeze_backbone": execution.realized_config["freeze_backbone"],
+            "fine_tune_strategy": execution.realized_config["fine_tune_strategy"],
+            "dropout": execution.realized_config["dropout"],
+        },
+        "optimizer": {
+            "name": optimizer.__class__.__name__,
+            "learning_rate": float(optimizer_group.get("lr", 0.0)),
+            "weight_decay": float(optimizer_group.get("weight_decay", 0.0)),
+            "momentum": float(optimizer_group.get("momentum", 0.0)),
+        },
+        "scheduler": {
+            "name": scheduler.__class__.__name__ if scheduler is not None else "none",
+            "step_size": getattr(scheduler, "step_size", None),
+            "gamma": getattr(scheduler, "gamma", None),
+            "t_max": getattr(scheduler, "T_max", None),
+        },
+        "loss": {
+            "name": criterion.__class__.__name__,
+            "label_smoothing": float(getattr(criterion, "label_smoothing", 0.0)),
+            "focal_gamma": getattr(criterion, "gamma", None),
+            "class_weights_applied": criterion_weights is not None,
+            "class_weights": _numeric_tensor_fingerprint(criterion_weights),
+        },
+        "dataloader": {
+            "batch_size": int(getattr(train_loader, "batch_size", 0) or 0),
+            "sampler": sampler.__class__.__name__ if sampler is not None else "none",
+            "sampler_arguments": _sampler_arguments(sampler),
+            "train_transform": _loader_transform_manifest(train_loader),
+            "eval_transform": _loader_transform_manifest(val_loader),
+        },
+        "preprocessing": {
+            "config": effective_preprocessing,
+            "normalization_mean": list(mean) if mean is not None else None,
+            "normalization_std": list(std) if std is not None else None,
+        },
+        "augmentation": augmentation,
+        "class_balancing": execution.realized_config.get("class_balancing", "none"),
+        "class_balancing_config": execution.realized_config.get("class_balancing_config", {}),
+        "sampling_strategy": execution.realized_config.get("sampling_strategy", "none"),
+        "gradient_clip_norm": execution.realized_config["gradient_clip_norm"],
+        "early_stopping_patience": execution.realized_config["early_stopping_patience"],
+    }
+
+
+def _loader_transform_manifest(loader) -> list[dict]:
+    dataset = getattr(loader, "dataset", None)
+    while dataset is not None:
+        transform = getattr(dataset, "transform", None)
+        if transform is not None:
+            return _transform_manifest(transform)
+        nested = getattr(dataset, "dataset", None)
+        dataset = nested if nested is not None else getattr(dataset, "base_dataset", None)
+    return []
+
+
+def _transform_manifest(transform) -> list[dict]:
+    steps = getattr(transform, "transforms", None)
+    if not isinstance(steps, list):
+        return [{"name": transform.__class__.__name__}]
+    manifest = []
+    for step in steps:
+        item = {"name": step.__class__.__name__}
+        for attribute in (
+            "size",
+            "scale",
+            "ratio",
+            "p",
+            "degrees",
+            "brightness",
+            "contrast",
+            "saturation",
+            "hue",
+            "interpolation",
+            "fill",
+            "mean",
+            "std",
+            "num_ops",
+            "magnitude",
+            "num_magnitude_bins",
+        ):
+            value = getattr(step, attribute, None)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                if value is not None:
+                    item[attribute] = value
+            elif isinstance(value, (list, tuple)):
+                item[attribute] = list(value)
+        manifest.append(item)
+    return manifest
+
+
+def _sampler_arguments(sampler) -> dict:
+    if sampler is None:
+        return {}
+    arguments = {}
+    for attribute in ("num_samples", "replacement"):
+        value = getattr(sampler, attribute, None)
+        if isinstance(value, (int, float, bool, str)):
+            arguments[attribute] = value
+    weights = getattr(sampler, "weights", None)
+    if weights is not None:
+        arguments["weights"] = _numeric_tensor_fingerprint(weights)
+    return arguments
+
+
+def _numeric_tensor_fingerprint(value) -> dict | None:
+    if value is None:
+        return None
+    try:
+        numbers = [float(item) for item in value.detach().cpu().reshape(-1).tolist()]
+    except (AttributeError, TypeError, ValueError):
+        return None
+    canonical = json.dumps(numbers, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {
+        "count": len(numbers),
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+    }
 
 
 def _post_training_run_summary(
@@ -4814,13 +5107,3 @@ def _target_metric_is_egregiously_low(*, best_accuracy: float, best_macro_f1: fl
     if normalized == "accuracy":
         return best_accuracy < threshold
     return best_macro_f1 < threshold
-
-
-
-
-
-
-
-
-
-
