@@ -43,6 +43,29 @@ func TestPostgresLifecycleAtomicIntegration(t *testing.T) {
 		t.Fatalf("assignment=%#v err=%v", assigned, err)
 	}
 	assertPostgresProgressStage(t, store, job.ID, 1, jobs.ProgressStageWorkerStarting)
+	attemptID := configString(assigned.Config, "active_attempt_id")
+	reported, err := store.ReportJobProgress(job.ID, attemptID, jobs.JobProgressUpsert{
+		TaxonomyVersion: jobs.ProgressTaxonomyVersion,
+		Stage:           jobs.ProgressStageRemoteScheduled, Status: jobs.ProgressStatusRunning, Revision: 3,
+	})
+	if err != nil || !reported.Updated || !reported.EventCreated {
+		t.Fatalf("postgres progress boundary=%#v err=%v", reported, err)
+	}
+	heartbeat, err := store.ReportJobProgress(job.ID, attemptID, jobs.JobProgressUpsert{
+		TaxonomyVersion: jobs.ProgressTaxonomyVersion,
+		Stage:           jobs.ProgressStageRemoteScheduled, Status: jobs.ProgressStatusRunning,
+		Revision: 4, Message: "Remote scheduling is active.",
+	})
+	if err != nil || !heartbeat.Updated || heartbeat.EventCreated {
+		t.Fatalf("postgres progress heartbeat=%#v err=%v", heartbeat, err)
+	}
+	duplicate, err := store.ReportJobProgress(job.ID, attemptID, jobs.JobProgressUpsert{
+		TaxonomyVersion: jobs.ProgressTaxonomyVersion,
+		Stage:           jobs.ProgressStageTraining, Status: jobs.ProgressStatusRunning, Revision: 4,
+	})
+	if err != nil || duplicate.Updated || duplicate.Progress.Stage != jobs.ProgressStageRemoteScheduled {
+		t.Fatalf("postgres duplicate progress=%#v err=%v", duplicate, err)
+	}
 	if _, err := store.ReportMetric(job.ID, 3, map[string]float64{"loss": .5}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +94,7 @@ func TestPostgresLifecycleAtomicIntegration(t *testing.T) {
 	want := map[string]bool{
 		execution.EventJobQueued: false, execution.EventJobAssigned: false,
 		execution.EventJobRunning: false, execution.EventJobCompleted: false,
+		execution.EventJobProgressBoundary: false,
 	}
 	for _, event := range events {
 		if _, ok := want[event.EventType]; ok {
@@ -81,6 +105,39 @@ func TestPostgresLifecycleAtomicIntegration(t *testing.T) {
 		if !found {
 			t.Errorf("missing lifecycle event %s: %#v", eventType, events)
 		}
+	}
+
+	// Force the boundary event insert to fail after a second job is assigned.
+	// PostgreSQL must roll back its snapshot update in the same transaction.
+	rollbackProgressJob, err := store.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollbackAssigned, err := store.PollJob(worker.ID, JobPollFilter{})
+	if err != nil || rollbackAssigned.ID != rollbackProgressJob.ID {
+		t.Fatalf("assign rollback job=%#v err=%v", rollbackAssigned, err)
+	}
+	beforeRollbackProgress := assertPostgresProgressStage(t, store, rollbackAssigned.ID, rollbackAssigned.Attempt, jobs.ProgressStageWorkerStarting)
+	const progressConstraint = "test_reject_atomic_progress_event"
+	if _, err := store.db.Exec(`ALTER TABLE execution_events DROP CONSTRAINT IF EXISTS ` + progressConstraint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`ALTER TABLE execution_events ADD CONSTRAINT ` + progressConstraint + ` CHECK (event_type <> '` + execution.EventJobProgressBoundary + `')`); err != nil {
+		t.Fatal(err)
+	}
+	_, reportErr := store.ReportJobProgress(rollbackAssigned.ID, configString(rollbackAssigned.Config, "active_attempt_id"), jobs.JobProgressUpsert{
+		TaxonomyVersion: jobs.ProgressTaxonomyVersion,
+		Stage:           jobs.ProgressStageFinalizing, Status: jobs.ProgressStatusRunning, Revision: 3,
+	})
+	if _, err := store.db.Exec(`ALTER TABLE execution_events DROP CONSTRAINT IF EXISTS ` + progressConstraint); err != nil {
+		t.Fatal(err)
+	}
+	if reportErr == nil {
+		t.Fatal("expected forced progress boundary failure")
+	}
+	afterRollbackProgress := assertPostgresProgressStage(t, store, rollbackAssigned.ID, rollbackAssigned.Attempt, jobs.ProgressStageWorkerStarting)
+	if afterRollbackProgress.Revision != beforeRollbackProgress.Revision || !afterRollbackProgress.UpdatedAt.Equal(beforeRollbackProgress.UpdatedAt) {
+		t.Fatalf("progress/event rollback diverged: before=%#v after=%#v", beforeRollbackProgress, afterRollbackProgress)
 	}
 
 	rollbackProject, err := store.CreateProject("postgres rollback", "")

@@ -190,6 +190,7 @@ func TestIsDurableTransitionEventTypeExcludesLegacyTypes(t *testing.T) {
 		EventAgentValidationAccepted,
 		EventAgentValidationFailed,
 		EventAgentDecisionRecorded,
+		EventJobProgressBoundary,
 	} {
 		if !IsDurableTransitionEventType(eventType) {
 			t.Fatalf("new event type %q was not recognized", eventType)
@@ -199,6 +200,39 @@ func TestIsDurableTransitionEventTypeExcludesLegacyTypes(t *testing.T) {
 		if IsDurableTransitionEventType(legacy) {
 			t.Fatalf("legacy event type %q was marked durable", legacy)
 		}
+	}
+}
+
+func TestJobProgressBoundaryEventIsSafeAndRevisionIdempotent(t *testing.T) {
+	current, total := int64(2), int64(5)
+	input := JobProgressBoundaryEventInput{
+		ProjectID: "project_1", PlanID: "plan_1", JobID: "job_1",
+		AttemptID: "job_1:attempt-1", Attempt: 1, TaxonomyVersion: 1,
+		Stage: "training", DetailCode: "epoch.complete", Status: "running",
+		Current: &current, Total: &total, Unit: "epoch", Revision: 9,
+	}
+	first, err := NewJobProgressBoundaryEvent(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewJobProgressBoundaryEvent(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.IdempotencyKey != second.IdempotencyKey || first.EventType != EventJobProgressBoundary {
+		t.Fatalf("boundary event is not stable: %#v %#v", first, second)
+	}
+	allowed := map[string]bool{}
+	for _, key := range SafeExecutionEventMetadataKeys() {
+		allowed[key] = true
+	}
+	for key := range first.Payload {
+		if !allowed[key] {
+			t.Fatalf("progress event key %q is not stream allowlisted: %#v", key, first.Payload)
+		}
+	}
+	if first.Payload["current"] != int64(2) || first.Payload["total"] != int64(5) || first.Payload["revision"] != int64(9) {
+		t.Fatalf("progress boundary payload=%#v", first.Payload)
 	}
 }
 

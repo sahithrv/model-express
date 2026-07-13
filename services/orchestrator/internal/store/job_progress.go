@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 )
 
@@ -37,6 +40,65 @@ func (s *MemoryStore) UpsertJobProgress(jobID string, update jobs.JobProgressUps
 		return jobs.JobProgress{}, ErrNotFound
 	}
 	return s.upsertJobProgressLocked(job, update, time.Now().UTC())
+}
+
+// ReportJobProgress is the attempt-aware worker composition point. A newer
+// heartbeat always replaces the snapshot, while only stage/range boundaries
+// append to the durable event stream. Both changes occur under the same lock.
+func (s *MemoryStore) ReportJobProgress(jobID string, attemptID string, update jobs.JobProgressUpsert) (jobs.JobProgressReportResult, error) {
+	normalized, err := jobs.NormalizeWorkerJobProgressUpsert(update)
+	if err != nil {
+		return jobs.JobProgressReportResult{}, fmt.Errorf("%w: invalid worker progress: %v", ErrInvalidRequest, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return jobs.JobProgressReportResult{}, ErrNotFound
+	}
+	attempt, err := activeWorkerProgressAttempt(job, attemptID)
+	if err != nil {
+		return jobs.JobProgressReportResult{}, err
+	}
+	normalized.Attempt = attempt
+
+	existing, hasExisting := s.jobProgress[jobProgressKey(job.ID, attempt)]
+	if hasExisting && jobs.IsTerminalJobProgressStage(existing.Stage) {
+		return jobs.JobProgressReportResult{Progress: cloneJobProgress(existing)}, nil
+	}
+	if hasExisting && normalized.Revision <= existing.Revision {
+		return jobs.JobProgressReportResult{Progress: cloneJobProgress(existing)}, nil
+	}
+
+	boundary := !hasExisting || jobProgressBoundaryChanged(existing, normalized)
+	var create execution.ExecutionEventCreate
+	if boundary {
+		create, err = execution.NewJobProgressBoundaryEvent(jobProgressBoundaryInput(job, attemptID, normalized))
+		if err != nil {
+			return jobs.JobProgressReportResult{}, fmt.Errorf("%w: invalid progress boundary: %v", ErrInvalidRequest, err)
+		}
+	}
+
+	now := time.Now().UTC()
+	progress, err := s.upsertJobProgressLocked(job, normalized, now)
+	if err != nil {
+		return jobs.JobProgressReportResult{}, err
+	}
+	result := jobs.JobProgressReportResult{Progress: progress, Updated: true}
+	if boundary {
+		_, result.EventCreated, err = s.appendExecutionTransitionLocked(create, now)
+		if err != nil {
+			if hasExisting {
+				s.jobProgress[jobProgressKey(job.ID, attempt)] = existing
+			} else {
+				delete(s.jobProgress, jobProgressKey(job.ID, attempt))
+			}
+			return jobs.JobProgressReportResult{}, err
+		}
+	}
+	return result, nil
 }
 
 // upsertJobProgressLocked is the memory lifecycle composition point. Callers
@@ -116,6 +178,123 @@ func (s *PostgresStore) UpsertJobProgress(jobID string, update jobs.JobProgressU
 		return jobs.JobProgress{}, err
 	}
 	return progress, nil
+}
+
+// ReportJobProgress locks the job attempt, compares the worker revision, and
+// commits the snapshot plus optional boundary event in one transaction.
+func (s *PostgresStore) ReportJobProgress(jobID string, attemptID string, update jobs.JobProgressUpsert) (jobs.JobProgressReportResult, error) {
+	normalized, err := jobs.NormalizeWorkerJobProgressUpsert(update)
+	if err != nil {
+		return jobs.JobProgressReportResult{}, fmt.Errorf("%w: invalid worker progress: %v", ErrInvalidRequest, err)
+	}
+
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return jobs.JobProgressReportResult{}, err
+	}
+	defer tx.Rollback()
+
+	job, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id")+" FOR UPDATE", jobID))
+	if err != nil {
+		return jobs.JobProgressReportResult{}, err
+	}
+	attempt, err := activeWorkerProgressAttempt(job, attemptID)
+	if err != nil {
+		return jobs.JobProgressReportResult{}, err
+	}
+	normalized.Attempt = attempt
+
+	existing, existingErr := scanJobProgress(tx.QueryRowContext(ctx, `
+		SELECT `+jobProgressSelectColumns()+`
+		FROM job_progress
+		WHERE job_id = $1 AND attempt = $2
+		FOR UPDATE
+	`, job.ID, attempt))
+	if existingErr != nil && !errors.Is(existingErr, ErrNotFound) {
+		return jobs.JobProgressReportResult{}, existingErr
+	}
+	if existingErr == nil && jobs.IsTerminalJobProgressStage(existing.Stage) {
+		return jobs.JobProgressReportResult{Progress: existing}, nil
+	}
+	if existingErr == nil && normalized.Revision <= existing.Revision {
+		return jobs.JobProgressReportResult{Progress: existing}, nil
+	}
+
+	boundary := existingErr != nil || jobProgressBoundaryChanged(existing, normalized)
+	var create execution.ExecutionEventCreate
+	if boundary {
+		create, err = execution.NewJobProgressBoundaryEvent(jobProgressBoundaryInput(job, attemptID, normalized))
+		if err != nil {
+			return jobs.JobProgressReportResult{}, fmt.Errorf("%w: invalid progress boundary: %v", ErrInvalidRequest, err)
+		}
+	}
+
+	now := time.Now().UTC()
+	progress, err := upsertJobProgressTx(ctx, tx, job, normalized, now)
+	if err != nil {
+		return jobs.JobProgressReportResult{}, err
+	}
+	result := jobs.JobProgressReportResult{Progress: progress, Updated: true}
+	if boundary {
+		_, result.EventCreated, err = appendExecutionTransitionTx(ctx, tx, create)
+		if err != nil {
+			return jobs.JobProgressReportResult{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return jobs.JobProgressReportResult{}, err
+	}
+	return result, nil
+}
+
+func activeWorkerProgressAttempt(job jobs.ExperimentJob, attemptID string) (int, error) {
+	attemptID = strings.TrimSpace(attemptID)
+	activeAttemptID := strings.TrimSpace(configString(job.Config, "active_attempt_id"))
+	if attemptID == "" {
+		return 0, fmt.Errorf("%w: training attempt id is required", ErrInvalidRequest)
+	}
+	if (job.Status != jobs.StatusAssigned && job.Status != jobs.StatusRunning) || activeAttemptID == "" || activeAttemptID != attemptID {
+		return 0, ErrStaleAttempt
+	}
+	attempt := activeJobProgressAttempt(job)
+	if attempt < 1 {
+		return 0, ErrStaleAttempt
+	}
+	return attempt, nil
+}
+
+func jobProgressBoundaryChanged(existing jobs.JobProgress, update jobs.JobProgressUpsert) bool {
+	return existing.Stage != update.Stage ||
+		existing.Status != update.Status ||
+		!progressInt64Equal(existing.Current, update.Current) ||
+		!progressInt64Equal(existing.Total, update.Total) ||
+		existing.Unit != update.Unit
+}
+
+func progressInt64Equal(left *int64, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func jobProgressBoundaryInput(job jobs.ExperimentJob, attemptID string, update jobs.JobProgressUpsert) execution.JobProgressBoundaryEventInput {
+	return execution.JobProgressBoundaryEventInput{
+		ProjectID:       job.ProjectID,
+		PlanID:          configString(job.Config, "plan_id"),
+		JobID:           job.ID,
+		AttemptID:       strings.TrimSpace(attemptID),
+		Attempt:         update.Attempt,
+		TaxonomyVersion: update.TaxonomyVersion,
+		Stage:           update.Stage,
+		DetailCode:      update.DetailCode,
+		Status:          update.Status,
+		Current:         update.Current,
+		Total:           update.Total,
+		Unit:            update.Unit,
+		Revision:        update.Revision,
+	}
 }
 
 // upsertJobProgressTx is the PostgreSQL lifecycle composition point. Its

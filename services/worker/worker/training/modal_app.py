@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
+from worker.progress import ProgressReporter
 from worker.training.augmentation import (
     MIXED_SAMPLE_POLICY_TYPES,
     normalize_augmentation_config,
@@ -279,7 +280,6 @@ def train_image_classifier(payload: dict) -> dict:
 
 def _train_image_classifier_impl(payload: dict) -> dict:
     import time
-    import torch
 
     started_at = time.time()
     stage_events: list[dict] = []
@@ -288,6 +288,17 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     config = job["config"]
     dataset = payload["dataset"]
     orchestrator_url = payload["orchestrator_url"].rstrip("/")
+    progress_reporter = _modal_remote_progress_reporter(payload, orchestrator_url, job)
+    pre_materialized_dataset = isinstance(payload.get("_modal_pre_materialized_dataset"), dict)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "environment_starting",
+            detail_code="modal_container_starting",
+            message="Modal training environment is starting.",
+        )
+
+    import torch
 
     _configure_storage_env(payload)
 
@@ -342,6 +353,13 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     _modal_training_phase(job_id, "torch_cache_reload_start", started_at)
     _reload_modal_torch_cache_volume()
     _modal_training_phase(job_id, "torch_cache_reload_done", started_at)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "dataset_materializing",
+            detail_code="classification_dataset_materializing",
+            message="Classification dataset is being materialized.",
+        )
     dataset_dir, dataset_materialization = _modal_training_dataset_for_job(
         payload,
         dataset=dataset,
@@ -349,6 +367,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         job_id=job_id,
         dataset_id=dataset_id,
         started_at=started_at,
+    )
+    _report_modal_progress(
+        progress_reporter,
+        "data_loading",
+        detail_code="classification_data_loading",
+        message="Classification data loaders are being prepared.",
     )
     _modal_training_phase(job_id, "metadata_fetch_start", started_at)
     metadata_bundle = _fetch_training_metadata_bundle(orchestrator_url, dataset_id, config)
@@ -408,6 +432,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         loader_workers=dataloader_metadata.get("workers"),
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _report_modal_progress(
+        progress_reporter,
+        "model_initializing",
+        detail_code="classification_model_initializing",
+        message="Classification model and optimizer are being initialized.",
+    )
     _modal_training_phase(job_id, "model_build_start", started_at, model=model_name, pretrained=pretrained, device=str(device))
     model = _build_model(model_name, len(class_names), pretrained, freeze_backbone, fine_tune_strategy, dropout).to(device)
     _modal_training_phase(job_id, "model_build_done", started_at, model=model_name, device=str(device))
@@ -452,6 +482,8 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         raise ValueError(
             "Runner fidelity enforcement rejected a classification realization mismatch before training."
         )
+
+    _report_classification_training_progress(progress_reporter, current=0, total=epochs)
 
     best_macro_f1 = 0.0
     best_accuracy = 0.0
@@ -557,6 +589,11 @@ def _train_image_classifier_impl(payload: dict) -> dict:
             job=job,
             modal_resources=modal_resources,
         )
+        _report_classification_training_progress(
+            progress_reporter,
+            current=epoch,
+            total=epochs,
+        )
         if _should_stop_training_early(
             epoch=epoch,
             epochs=epochs,
@@ -570,6 +607,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
 
     runtime_seconds = time.time() - started_at
     estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
+    _report_modal_progress(
+        progress_reporter,
+        "evaluating",
+        detail_code="classification_final_evaluation",
+        message="Classification final evaluation is running.",
+    )
     _modal_training_phase(job_id, "final_eval_start", started_at)
     test_loss, test_accuracy, test_macro_f1, test_eval_details = _evaluate(
         model,
@@ -596,6 +639,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         class_names,
         dataset=dataset,
         job_id=job_id,
+    )
+    _report_modal_progress(
+        progress_reporter,
+        "exporting",
+        detail_code="classification_exporting",
+        message="Classification model artifacts are being exported.",
     )
     _modal_training_phase(job_id, "export_start", started_at)
     export_bundle = _export_trained_champion_bundle(
@@ -643,143 +692,124 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         "export_validation_errors": export_bundle.get("validation_errors", []),
         "modal_resources": modal_resource_telemetry,
     }
-    _post_training_run_summary(
-        orchestrator_url,
-        job_id,
-        {
-            "model": model_name,
-            "provider": "modal",
-            "gpu_type": gpu_type,
-            "status": "SUCCEEDED",
-            "runtime_seconds": round(runtime_seconds, 3),
-            "estimated_cost_usd": round(estimated_cost_usd, 6),
-            "best_macro_f1": round(best_macro_f1, 6),
-            "best_accuracy": round(best_accuracy, 6),
-            "final_train_loss": round(train_loss, 6),
-            "final_val_loss": round(val_loss, 6),
-            "epochs_completed": completed_epochs,
-            "modal_function_call_id": modal_function_call_id,
-            "modal_input_id": modal_input_id,
-            "dataset_materialization": dataset_materialization,
-            "stage_telemetry": _modal_stage_telemetry_payload(
-                job,
+    final_summary_payload = {
+        "model": model_name,
+        "provider": "modal",
+        "gpu_type": gpu_type,
+        "status": "SUCCEEDED",
+        "runtime_seconds": round(runtime_seconds, 3),
+        "estimated_cost_usd": round(estimated_cost_usd, 6),
+        "best_macro_f1": round(best_macro_f1, 6),
+        "best_accuracy": round(best_accuracy, 6),
+        "final_train_loss": round(train_loss, 6),
+        "final_val_loss": round(val_loss, 6),
+        "epochs_completed": completed_epochs,
+        "modal_function_call_id": modal_function_call_id,
+        "modal_input_id": modal_input_id,
+        "dataset_materialization": dataset_materialization,
+        "stage_telemetry": _modal_stage_telemetry_payload(
+            job,
+            runtime_seconds,
+            stage_events,
+            dataset_materialization,
+            gpu_type,
+            modal_resources=modal_resource_telemetry,
+        ),
+        "execution_references": _training_export_references(export_bundle),
+    }
+    final_evaluation_payload = {
+        "objective_profile": {
+            "target_metric": str(config.get("target_metric", "macro_f1")),
+            "metric_preferences": ["macro_f1", "accuracy", "per_class_f1", "latency"],
+            "split_strategy": "train_validation_with_heldout_test_when_possible",
+            "heldout_test_accuracy": round(test_accuracy, 6),
+            "heldout_test_macro_f1": round(test_macro_f1, 6),
+            "heldout_test_loss": round(test_loss, 6),
+            "heldout_demo_images": demo_images,
+            "modal_resources": modal_resource_telemetry,
+        },
+        "per_class_metrics": final_eval_details.get("per_class_metrics", {}),
+        "confusion_matrix": final_eval_details.get("confusion_matrix", []),
+        "model_profile": {
+            **model_profile,
+            "pretrained": pretrained,
+            "freeze_backbone": freeze_backbone,
+            "fine_tune_strategy": fine_tune_strategy,
+            "dropout": dropout,
+            "modal_resources": modal_resource_telemetry,
+        },
+        "holistic_scores": {
+            **_holistic_scores(
+                best_macro_f1,
+                best_accuracy,
+                estimated_cost_usd,
                 runtime_seconds,
-                stage_events,
-                dataset_materialization,
-                gpu_type,
-                modal_resources=modal_resource_telemetry,
+                model_profile,
             ),
-            "execution_references": _training_export_references(export_bundle),
+            "modal_resources": modal_resource_telemetry,
         },
-        job=job,
-        modal_resources=modal_resources,
-    )
-    _post_training_run_evaluation(
-        orchestrator_url,
-        job_id,
-        {
-            "objective_profile": {
-                "target_metric": str(config.get("target_metric", "macro_f1")),
-                "metric_preferences": ["macro_f1", "accuracy", "per_class_f1", "latency"],
-                "split_strategy": "train_validation_with_heldout_test_when_possible",
-                "heldout_test_accuracy": round(test_accuracy, 6),
-                "heldout_test_macro_f1": round(test_macro_f1, 6),
-                "heldout_test_loss": round(test_loss, 6),
-                "heldout_demo_images": demo_images,
-                "modal_resources": modal_resource_telemetry,
-            },
-            "per_class_metrics": final_eval_details.get("per_class_metrics", {}),
-            "confusion_matrix": final_eval_details.get("confusion_matrix", []),
-            "model_profile": {
-                **model_profile,
-                "pretrained": pretrained,
-                "freeze_backbone": freeze_backbone,
-                "fine_tune_strategy": fine_tune_strategy,
+        "preprocessing_summary": {
+            "augmentation_policy": str(
+                classification_execution.realized_config.get("augmentation_policy", "none")
+            ),
+            "augmentation_policy_config": classification_execution.realized_config.get(
+                "augmentation_policy_config", {}
+            ),
+            "class_balancing": class_balancing,
+            "sampling_strategy": sampling_strategy,
+            "preprocessing": preprocessing,
+            "effective_preprocessing": effective_preprocessing,
+            "worker_execution_metadata": _public_execution_metadata(execution_metadata),
+            "dataset_materialization": dataset_materialization,
+            "bbox_crop_ablation": bbox_ablation,
+            "training_hyperparameters": {
+                "optimizer": optimizer_name,
+                "scheduler": scheduler_name,
+                "learning_rate": learning_rate,
+                "weight_decay": weight_decay,
                 "dropout": dropout,
-                "modal_resources": modal_resource_telemetry,
+                "optimizer_momentum": optimizer_momentum if optimizer_name == "sgd" else 0,
+                "scheduler_step_size": scheduler_step_size if scheduler_name == "step" else 0,
+                "scheduler_gamma": scheduler_gamma if scheduler_name == "step" else 0,
+                "label_smoothing": label_smoothing,
+                "gradient_clip_norm": gradient_clip_norm,
+                "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
+                "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
+                "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
+                "focal_loss_gamma": _bounded_float(
+                    class_balancing_config.get("focal_loss_gamma"),
+                    default=2.0,
+                    minimum=0.5,
+                    maximum=5.0,
+                )
+                if class_balancing == "focal_loss"
+                else 0,
             },
-            "holistic_scores": {
-                **_holistic_scores(
-                    best_macro_f1,
-                    best_accuracy,
-                    estimated_cost_usd,
-                    runtime_seconds,
-                    model_profile,
-                ),
-                "modal_resources": modal_resource_telemetry,
-            },
-            "preprocessing_summary": {
-                "augmentation_policy": str(
-                    classification_execution.realized_config.get("augmentation_policy", "none")
-                ),
-                "augmentation_policy_config": classification_execution.realized_config.get(
-                    "augmentation_policy_config", {}
-                ),
-                "class_balancing": class_balancing,
-                "sampling_strategy": sampling_strategy,
-                "preprocessing": preprocessing,
-                "effective_preprocessing": effective_preprocessing,
-                "worker_execution_metadata": _public_execution_metadata(execution_metadata),
-                "dataset_materialization": dataset_materialization,
-                "bbox_crop_ablation": bbox_ablation,
-                "training_hyperparameters": {
-                    "optimizer": optimizer_name,
-                    "scheduler": scheduler_name,
-                    "learning_rate": learning_rate,
-                    "weight_decay": weight_decay,
-                    "dropout": dropout,
-                    "optimizer_momentum": optimizer_momentum if optimizer_name == "sgd" else 0,
-                    "scheduler_step_size": scheduler_step_size if scheduler_name == "step" else 0,
-                    "scheduler_gamma": scheduler_gamma if scheduler_name == "step" else 0,
-                    "label_smoothing": label_smoothing,
-                    "gradient_clip_norm": gradient_clip_norm,
-                    "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
-                    "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
-                    "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
-                    "focal_loss_gamma": _bounded_float(
-                        class_balancing_config.get("focal_loss_gamma"),
-                        default=2.0,
-                        minimum=0.5,
-                        maximum=5.0,
-                    )
-                    if class_balancing == "focal_loss"
-                    else 0,
-                },
-            },
-            "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
-            "export_bundle": export_bundle,
-            "execution_references": _training_export_references(export_bundle),
-            "recommendation_summary": (
-                f"{model_name} finished with macro-F1 {best_macro_f1:.3f}, "
-                f"accuracy {best_accuracy:.3f}, and estimated latency "
-                f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
-            ),
         },
+        "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
+        "export_bundle": export_bundle,
+        "execution_references": _training_export_references(export_bundle),
+        "recommendation_summary": (
+            f"{model_name} finished with macro-F1 {best_macro_f1:.3f}, "
+            f"accuracy {best_accuracy:.3f}, and estimated latency "
+            f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
+        ),
+    }
+    _publish_classification_final_callbacks(
+        progress_reporter=progress_reporter,
+        orchestrator_url=orchestrator_url,
         job=job,
-        modal_resources=modal_resources,
-    )
-
-    _post_classification_execution_observation(
-        orchestrator_url,
-        job,
-        stage="FINALIZED",
-        idempotency_key="classification-finalized-v1",
+        summary_payload=final_summary_payload,
+        evaluation_payload=final_evaluation_payload,
         execution=classification_execution,
         framework_arguments=classification_framework_arguments,
-        evidence={
+        fidelity_evidence={
             "completed_epochs": completed_epochs,
             "export_status": export_bundle.get("status", ""),
             "class_count": len(class_names),
         },
         modal_resources=modal_resources,
-    )
-
-    _post_job_json(
-        orchestrator_url,
-        job,
-        "complete",
-        {"mlflow_run_id": f"modal-{job_id}"},
-        modal_resources=modal_resources,
+        mlflow_run_id=f"modal-{job_id}",
     )
 
     return {
@@ -1350,6 +1380,43 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
     _configure_storage_env(payload)
 
     dataset = normalized["dataset"]
+    progress_revisions = dict(
+        payload.get("progress_revisions")
+        if isinstance(payload.get("progress_revisions"), dict)
+        else {}
+    )
+    progress_enabled_by_job = dict(
+        payload.get("progress_reporting_enabled_by_job")
+        if isinstance(payload.get("progress_reporting_enabled_by_job"), dict)
+        else {}
+    )
+    if batch["task_type"] == "image_classification":
+        for job in jobs:
+            job_id = str(job.get("id") or "")
+            progress_payload = {
+                "progress_revision": progress_revisions.get(job_id, 2),
+                "progress_reporting_enabled": progress_enabled_by_job.get(job_id, False),
+            }
+            progress_reporter = _modal_remote_progress_reporter(
+                progress_payload,
+                str(payload["orchestrator_url"]).rstrip("/"),
+                job,
+            )
+            _report_modal_progress(
+                progress_reporter,
+                "environment_starting",
+                detail_code="modal_batch_container_starting",
+                message="Modal batch training environment is starting.",
+            )
+            _report_modal_progress(
+                progress_reporter,
+                "dataset_materializing",
+                detail_code="classification_batch_dataset_materializing",
+                message="Classification batch dataset is being materialized.",
+            )
+            if progress_reporter is not None:
+                progress_revisions[job_id] = progress_reporter.revision
+                progress_enabled_by_job[job_id] = progress_reporter.enabled
     representative_config = jobs[0].get("config") if isinstance(jobs[0].get("config"), dict) else {}
     batch_cache_root = _modal_preview_batch_cache_root(batch["batch_id"])
     materialized = ensure_dataset_materialized(
@@ -1393,11 +1460,17 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
         runner_status = "yolo_batch_completed"
     job_results: list[dict] = []
     for index, job in enumerate(jobs):
+        job_id = str(job.get("id") or "")
         job_payload = {
             **payload,
             "job": job,
             "dataset": dataset,
             "_modal_pre_materialized_dataset": pre_materialized,
+            "progress_revision": progress_revisions.get(job_id, payload.get("progress_revision", 2)),
+            "progress_reporting_enabled": progress_enabled_by_job.get(
+                job_id,
+                payload.get("progress_reporting_enabled", False),
+            ),
         }
         try:
             if batch["task_type"] == "object_detection":
@@ -1408,7 +1481,7 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
             reported = _report_modal_training_retryable_failure(job_payload, exc)
             job_results.append(
                 {
-                    "job_id": str(job.get("id") or ""),
+                    "job_id": job_id,
                     "status": "retryable_failure_reported" if reported else "failed",
                     "error": _modal_training_error_message(exc),
                     "batch_index": index,
@@ -1418,7 +1491,7 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
             continue
         job_results.append(
             {
-                "job_id": str(job.get("id") or ""),
+                "job_id": job_id,
                 "status": "succeeded",
                 "batch_index": index,
                 "batch_size": len(jobs),
@@ -2000,6 +2073,116 @@ def profile_image_dataset(payload: dict) -> dict:
 
 def _modal_stage_telemetry_enabled() -> bool:
     return _bool(os.getenv("MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY"), default=False)
+
+
+def _modal_remote_progress_reporter(
+    payload: dict,
+    orchestrator_url: str,
+    job: dict,
+) -> ProgressReporter | None:
+    try:
+        initial_revision = max(2, int(payload.get("progress_revision", 2)))
+    except (TypeError, ValueError):
+        initial_revision = 2
+    try:
+        return ProgressReporter.from_orchestrator_url(
+            orchestrator_url,
+            job,
+            initial_revision=initial_revision,
+            enabled=_bool(payload.get("progress_reporting_enabled"), default=False),
+        )
+    except Exception:
+        return None
+
+
+def _report_modal_progress(
+    progress_reporter: ProgressReporter | None,
+    stage: str,
+    **fields: object,
+) -> bool:
+    if progress_reporter is None:
+        return False
+    try:
+        return bool(progress_reporter.report(stage, **fields))
+    except Exception:
+        return False
+
+
+def _report_classification_training_progress(
+    progress_reporter: ProgressReporter | None,
+    *,
+    current: int,
+    total: int,
+) -> bool:
+    if current <= 0:
+        detail_code = "classification_training"
+        message = f"Classification training is starting for {total} epochs."
+    else:
+        detail_code = "classification_epoch_complete"
+        message = f"Classification training epoch {current} of {total} finished."
+    return _report_modal_progress(
+        progress_reporter,
+        "training",
+        current=current,
+        total=total,
+        unit="epoch",
+        detail_code=detail_code,
+        message=message,
+    )
+
+
+def _publish_classification_final_callbacks(
+    *,
+    progress_reporter: ProgressReporter | None,
+    orchestrator_url: str,
+    job: dict,
+    summary_payload: dict,
+    evaluation_payload: dict,
+    execution: ClassificationExecution,
+    framework_arguments: dict,
+    fidelity_evidence: dict,
+    modal_resources: dict,
+    mlflow_run_id: str,
+) -> None:
+    """Publish backend-owned completion only after every final callback succeeds."""
+    _report_modal_progress(
+        progress_reporter,
+        "finalizing",
+        detail_code="classification_finalizing",
+        message="Classification results are being finalized by the backend.",
+    )
+    job_id = str(job.get("id") or "")
+    _post_training_run_summary(
+        orchestrator_url,
+        job_id,
+        summary_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_training_run_evaluation(
+        orchestrator_url,
+        job_id,
+        evaluation_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_classification_execution_observation(
+        orchestrator_url,
+        job,
+        stage="FINALIZED",
+        idempotency_key="classification-finalized-v1",
+        execution=execution,
+        framework_arguments=framework_arguments,
+        evidence=fidelity_evidence,
+        modal_resources=modal_resources,
+    )
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "complete",
+        {"mlflow_run_id": mlflow_run_id},
+        modal_resources=modal_resources,
+    )
 
 
 def _modal_training_phase(job_id: str, phase: str, started_at: float, **fields: object) -> None:

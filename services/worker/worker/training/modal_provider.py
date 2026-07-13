@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from worker.diagnostics import log_event
 from worker.orchestrator_client import OrchestratorClient
+from worker.progress import ProgressReporter
 from worker.training.modal_resources import (
     callback_identity,
     failure_callback_payload,
@@ -35,6 +36,11 @@ class ModalJobAlreadyTerminal(RuntimeError):
 
 _MODAL_APP_SESSION_LOCK = threading.RLock()
 _MODAL_APP_SESSION_DEPTH = 0
+# Backend assignment owns revisions 1-2. A classification run is capped at
+# 100 epochs, so 1000 safely supersedes any partially-started batch execution
+# before a single-job fallback resumes the same attempt.
+DEFAULT_PROVIDER_PROGRESS_REVISION_BASE = 2
+BATCH_FALLBACK_PROGRESS_REVISION_BASE = 1000
 
 
 @contextmanager
@@ -81,6 +87,13 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     detection_job = _is_detection_training_config(config)
     modal_resources = resolve_modal_resources(config, detection_job=detection_job)
     job_payload = job_with_modal_resources(job, modal_resources)
+    progress_reporter = None if detection_job else _modal_progress_reporter(client, job_payload)
+    _report_modal_progress(
+        progress_reporter,
+        "worker_starting",
+        detail_code="modal_provider_submitting",
+        message="Modal provider is preparing the training submission.",
+    )
     try:
         if detection_job:
             from worker.training.modal_app import app, train_yolo_detector as training_function
@@ -118,7 +131,14 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     try:
         with _modal_invocation_context(app):
             configured_function = _function_with_modal_options(training_function, modal_resources)
-            result = _invoke_modal_function(configured_function, payload, client, job_payload, modal_resources)
+            result = _invoke_modal_function(
+                configured_function,
+                payload,
+                client,
+                job_payload,
+                modal_resources,
+                progress_reporter=progress_reporter,
+            )
     except ModalJobAlreadyTerminal as exc:
         log_event(
             "info",
@@ -234,6 +254,21 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
             resources_by_job[str(tagged_job.get("id") or "")] = tagged_resources
             enriched_jobs.append(job_with_modal_resources(tagged_job, tagged_resources))
         batch_resources = _modal_batch_invocation_resources(enriched_jobs, resources_by_job)
+        progress_reporters = [
+            None
+            if _is_detection_training_config(
+                enriched_job.get("config") if isinstance(enriched_job.get("config"), dict) else {}
+            )
+            else _modal_progress_reporter(client, enriched_job)
+            for enriched_job in enriched_jobs
+        ]
+        for progress_reporter in progress_reporters:
+            _report_modal_progress(
+                progress_reporter,
+                "worker_starting",
+                detail_code="modal_batch_submitting",
+                message="Modal provider is preparing the batch training submission.",
+            )
         payload = {
             "batch": batch,
             "jobs": enriched_jobs,
@@ -252,6 +287,18 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
             payload["job_callback_metadata"] = job_callback_metadata
         with _modal_invocation_context(app):
             configured_function = _function_with_modal_options(train_modal_preview_batch, batch_resources)
+            progress_revisions: dict[str, int] = {}
+            progress_enabled_by_job: dict[str, bool] = {}
+            for enriched_job, progress_reporter in zip(enriched_jobs, progress_reporters, strict=True):
+                _report_modal_remote_scheduled(progress_reporter, detail_code="modal_batch_scheduled")
+                job_id = str(enriched_job.get("id") or "")
+                progress_revisions[job_id] = _modal_progress_revision(
+                    progress_reporter,
+                    enriched_job,
+                )
+                progress_enabled_by_job[job_id] = _modal_progress_enabled(progress_reporter)
+            payload["progress_revisions"] = progress_revisions
+            payload["progress_reporting_enabled_by_job"] = progress_enabled_by_job
             result = _remote_function(configured_function)(payload)
     except Exception as exc:
         message = _modal_training_batch_error_message(exc)
@@ -289,6 +336,12 @@ def _jobs_with_modal_batch_metadata(jobs: list[dict], batch: dict, remote_status
         tagged_jobs.append(
             {
                 **job,
+                **(
+                    {"_progress_revision_base": BATCH_FALLBACK_PROGRESS_REVISION_BASE}
+                    if remote_status
+                    not in {"stubbed_single_job_fallback", "remote_batch_submitted"}
+                    else {}
+                ),
                 "config": {
                     **config,
                     "modal_batch": {
@@ -678,8 +731,22 @@ def _remote_function(function):
     return remote
 
 
-def _invoke_modal_function(function, payload: dict, client: OrchestratorClient, job: dict, modal_resources: dict):
+def _invoke_modal_function(
+    function,
+    payload: dict,
+    client: OrchestratorClient,
+    job: dict,
+    modal_resources: dict,
+    *,
+    progress_reporter: ProgressReporter | None = None,
+):
     spawn = getattr(function, "spawn", None)
+    _report_modal_remote_scheduled(progress_reporter)
+    payload["progress_revision"] = _modal_progress_revision(
+        progress_reporter,
+        job,
+    )
+    payload["progress_reporting_enabled"] = _modal_progress_enabled(progress_reporter)
     if not modal_spawn_invocation_enabled() or not callable(spawn):
         return _remote_function(function)(payload)
     call = spawn(payload)
@@ -687,6 +754,76 @@ def _invoke_modal_function(function, payload: dict, client: OrchestratorClient, 
     if call_object_id:
         _report_modal_call(client, job, modal_resources, call_object_id, "active")
     return _wait_for_modal_function_call(call, client, job, modal_resources, call_object_id)
+
+
+def _modal_progress_reporter(
+    client: OrchestratorClient,
+    job: dict,
+) -> ProgressReporter | None:
+    try:
+        return ProgressReporter(
+            client,
+            job,
+            initial_revision=_modal_provider_progress_revision_base(job),
+        )
+    except Exception:
+        return None
+
+
+def _modal_provider_progress_revision_base(job: dict) -> int:
+    try:
+        value = int(job.get("_progress_revision_base", DEFAULT_PROVIDER_PROGRESS_REVISION_BASE))
+    except (TypeError, ValueError):
+        return DEFAULT_PROVIDER_PROGRESS_REVISION_BASE
+    return max(DEFAULT_PROVIDER_PROGRESS_REVISION_BASE, value)
+
+
+def _modal_progress_revision(
+    progress_reporter: ProgressReporter | None,
+    job: dict,
+) -> int:
+    fallback = _modal_provider_progress_revision_base(job)
+    if progress_reporter is None:
+        return fallback
+    try:
+        return max(fallback, int(progress_reporter.revision))
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+
+
+def _modal_progress_enabled(progress_reporter: ProgressReporter | None) -> bool:
+    if progress_reporter is None:
+        return False
+    try:
+        return bool(progress_reporter.enabled)
+    except Exception:
+        return False
+
+
+def _report_modal_remote_scheduled(
+    progress_reporter: ProgressReporter | None,
+    *,
+    detail_code: str = "modal_remote_scheduled",
+) -> None:
+    _report_modal_progress(
+        progress_reporter,
+        "remote_scheduled",
+        detail_code=detail_code,
+        message="Modal remote training submission is being scheduled.",
+    )
+
+
+def _report_modal_progress(
+    progress_reporter: ProgressReporter | None,
+    stage: str,
+    **fields: object,
+) -> bool:
+    if progress_reporter is None:
+        return False
+    try:
+        return bool(progress_reporter.report(stage, **fields))
+    except Exception:
+        return False
 
 
 def _wait_for_modal_function_call(call, client: OrchestratorClient, job: dict, modal_resources: dict, call_object_id: str):

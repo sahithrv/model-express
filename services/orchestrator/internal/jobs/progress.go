@@ -45,8 +45,32 @@ const (
 )
 
 var (
-	progressCodePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
-	progressUnsafeTextPattern = regexp.MustCompile(`(?i)(?:\b(?:s3|gs|https?|file)://|[a-z]:\\|(?:^|[[:space:]])/(?:[^[:space:]]+)|\b(?:bearer|authorization)[[:space:]]+|\b(?:sk|pk)-[a-z0-9_-]{8,})`)
+	progressCodePattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
+	progressUnsafeTextPattern  = regexp.MustCompile(`(?i)(?:\b(?:s3|gs|https?|file)://|[a-z]:\\|(?:^|[[:space:]])/(?:[^[:space:]]+)|\b(?:bearer|authorization)[[:space:]]+|\b(?:sk|pk)-[a-z0-9_-]{8,})`)
+	workerProgressMetadataKeys = map[string]struct{}{
+		"cache_status":   {},
+		"early_stopped":  {},
+		"execution_mode": {},
+		"framework":      {},
+		"provider":       {},
+		"resource_class": {},
+		"task_type":      {},
+	}
+	workerProgressUnits = map[string]struct{}{
+		"batch":   {},
+		"batches": {},
+		"byte":    {},
+		"bytes":   {},
+		"epoch":   {},
+		"epochs":  {},
+		"item":    {},
+		"items":   {},
+		"sample":  {},
+		"samples": {},
+		"step":    {},
+		"steps":   {},
+		"percent": {},
+	}
 )
 
 // JobProgress is the replaceable current snapshot for one job attempt. Older
@@ -84,6 +108,12 @@ type JobProgressUpsert struct {
 	Message         string         `json:"message,omitempty"`
 	Revision        int64          `json:"revision"`
 	Metadata        map[string]any `json:"metadata,omitempty"`
+}
+
+type JobProgressReportResult struct {
+	Progress     JobProgress
+	Updated      bool
+	EventCreated bool
 }
 
 // NormalizeJobProgressUpsert canonicalizes taxonomy tokens, validates stage
@@ -146,6 +176,87 @@ func NormalizeJobProgressUpsert(update JobProgressUpsert) (JobProgressUpsert, er
 	update.Current = copyProgressInt64(update.Current)
 	update.Total = copyProgressInt64(update.Total)
 	return update, nil
+}
+
+// NormalizeWorkerJobProgressUpsert applies the narrower callback contract on
+// top of the server lifecycle snapshot contract. Workers can publish only
+// observations from worker_starting through finalizing; terminal stages remain
+// exclusively backend-owned. Metadata is a closed allowlist so a callback can
+// never turn the progress record into an arbitrary payload store.
+func NormalizeWorkerJobProgressUpsert(update JobProgressUpsert) (JobProgressUpsert, error) {
+	normalized, err := NormalizeJobProgressUpsert(update)
+	if err != nil {
+		return JobProgressUpsert{}, err
+	}
+	if !IsWorkerJobProgressStage(normalized.Stage) {
+		return JobProgressUpsert{}, fmt.Errorf("workers cannot report progress stage %q", normalized.Stage)
+	}
+	if normalized.Status != ProgressStatusRunning {
+		return JobProgressUpsert{}, fmt.Errorf("worker progress status must be %q", ProgressStatusRunning)
+	}
+	if normalized.Revision < 1 {
+		return JobProgressUpsert{}, fmt.Errorf("worker progress revision must be positive")
+	}
+	if (normalized.Current == nil) != (normalized.Total == nil) {
+		return JobProgressUpsert{}, fmt.Errorf("current and total must be reported together")
+	}
+	if normalized.Current != nil && normalized.Unit == "" {
+		return JobProgressUpsert{}, fmt.Errorf("unit is required when current and total are reported")
+	}
+	if normalized.Current == nil && normalized.Unit != "" {
+		return JobProgressUpsert{}, fmt.Errorf("unit requires current or total")
+	}
+	if normalized.Unit != "" {
+		if _, ok := workerProgressUnits[normalized.Unit]; !ok {
+			return JobProgressUpsert{}, fmt.Errorf("worker progress unit %q is not supported", normalized.Unit)
+		}
+	}
+	for key, value := range normalized.Metadata {
+		if _, ok := workerProgressMetadataKeys[key]; !ok {
+			return JobProgressUpsert{}, fmt.Errorf("metadata key %q is not allowed for worker progress", key)
+		}
+		if key == "early_stopped" {
+			if _, ok := value.(bool); !ok {
+				return JobProgressUpsert{}, fmt.Errorf("metadata %q must be a boolean", key)
+			}
+			continue
+		}
+		token, ok := value.(string)
+		if !ok || token == "" || len(token) > JobProgressMaxDetailCodeBytes || !progressCodePattern.MatchString(token) {
+			return JobProgressUpsert{}, fmt.Errorf("metadata %q must be a bounded lowercase safe token", key)
+		}
+	}
+	return normalized, nil
+}
+
+func IsWorkerJobProgressStage(stage string) bool {
+	switch stage {
+	case ProgressStageWorkerStarting,
+		ProgressStageRemoteScheduled,
+		ProgressStageEnvironmentStarting,
+		ProgressStageDatasetMaterializing,
+		ProgressStageDataLoading,
+		ProgressStageModelInitializing,
+		ProgressStageTraining,
+		ProgressStageEvaluating,
+		ProgressStageExporting,
+		ProgressStageFinalizing:
+		return true
+	default:
+		return false
+	}
+}
+
+func WorkerJobProgressMetadataKeys() []string {
+	return []string{
+		"cache_status",
+		"early_stopped",
+		"execution_mode",
+		"framework",
+		"provider",
+		"resource_class",
+		"task_type",
+	}
 }
 
 func IsJobProgressStage(stage string) bool {

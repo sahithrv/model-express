@@ -5,6 +5,7 @@ import types
 import os
 
 import pytest
+import requests
 
 from worker.training import modal_provider
 from worker.training.modal_provider import (
@@ -143,6 +144,7 @@ class _FakeClient:
     def __init__(self):
         self.failures = []
         self.modal_calls = []
+        self.progress = []
         self.job_reads = []
         self.jobs_by_id = {}
 
@@ -156,6 +158,24 @@ class _FakeClient:
     def report_modal_call(self, job_id: str, payload: dict) -> dict:
         self.modal_calls.append({"job_id": job_id, "payload": payload})
         return {"job_id": job_id}
+
+    def report_progress(
+        self,
+        job_id: str,
+        payload: dict,
+        *,
+        job: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        self.progress.append(
+            {
+                "job_id": job_id,
+                "payload": payload,
+                "job": job,
+                "timeout": timeout,
+            }
+        )
+        return {"status": "accepted"}
 
     def fail_job(
         self,
@@ -363,6 +383,139 @@ def test_modal_training_uses_with_options_for_per_job_gpu_and_memory(monkeypatch
     assert client.failures == []
     assert sys.modules["worker.training.modal_app"].train_image_classifier.options_calls[0]["gpu"] == "A10"
     assert os.environ["MODAL_GPU_TYPE"] == "T4"
+
+
+def test_modal_classification_reports_submission_and_hands_remote_revision_forward(monkeypatch):
+    remote_payloads = []
+
+    def remote(payload: dict):
+        remote_payloads.append(payload)
+        return {}
+
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = _FakeModalFunction(remote)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+
+    client = _FakeClient()
+    run_modal_training(
+        client,
+        {
+            "id": "job_progress",
+            "project_id": "project_1",
+            "attempt": 1,
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "active_attempt_id": "job_progress:attempt-1",
+                "callback_token": "callback-secret",
+            },
+        },
+    )
+
+    assert [entry["payload"]["stage"] for entry in client.progress] == [
+        "worker_starting",
+        "remote_scheduled",
+    ]
+    assert [entry["payload"]["revision"] for entry in client.progress] == [3, 4]
+    assert all(entry["job"]["config"]["callback_token"] == "callback-secret" for entry in client.progress)
+    assert remote_payloads[0]["progress_revision"] == 4
+    assert remote_payloads[0]["progress_reporting_enabled"] is True
+
+
+def test_modal_progress_reporting_outage_does_not_fail_submission(monkeypatch):
+    remote_calls = []
+
+    def remote(payload: dict):
+        remote_calls.append(payload["job"]["id"])
+        return {}
+
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = _FakeModalFunction(remote)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("MODEL_EXPRESS_PROGRESS_REPORT_MAX_ATTEMPTS", "1")
+
+    client = _FakeClient()
+
+    def unavailable(*_args, **_kwargs):
+        raise requests.ConnectionError("progress callback unavailable")
+
+    client.report_progress = unavailable
+    run_modal_training(
+        client,
+        {
+            "id": "job_progress_outage",
+            "project_id": "project_1",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "active_attempt_id": "job_progress_outage:attempt-1",
+            },
+        },
+    )
+
+    assert remote_calls == ["job_progress_outage"]
+    assert client.failures == []
+
+
+def test_modal_disabled_progress_flag_is_forwarded_to_remote(monkeypatch):
+    remote_payloads = []
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_image_classifier = _FakeModalFunction(remote_payloads.append)
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("MODEL_EXPRESS_PROGRESS_REPORTING_ENABLED", "false")
+
+    client = _FakeClient()
+    run_modal_training(
+        client,
+        {
+            "id": "job_progress_disabled",
+            "project_id": "project_1",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "active_attempt_id": "job_progress_disabled:attempt-1",
+            },
+        },
+    )
+
+    assert client.progress == []
+    assert remote_payloads[0]["progress_reporting_enabled"] is False
+
+
+def test_modal_detection_does_not_publish_classification_progress(monkeypatch):
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_yolo_detector = _FakeModalFunction(lambda _payload: {})
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+
+    client = _FakeClient()
+    run_modal_training(
+        client,
+        {
+            "id": "job_yolo_progress",
+            "project_id": "project_1",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "task_type": "object_detection",
+                "model": "yolo11n.pt",
+                "active_attempt_id": "job_yolo_progress:attempt-1",
+            },
+        },
+    )
+
+    assert client.progress == []
 
 
 def test_modal_storage_rejects_default_root_credentials(monkeypatch):
@@ -750,7 +903,19 @@ def test_modal_training_batch_flag_on_remote_unsupported_falls_back(monkeypatch)
     assert remote_payloads[0]["job_callback_metadata"]["job_1"]["callback_token"] == "callback-secret-1"
     assert remote_payloads[0]["job_callback_metadata"]["job_1"]["remote_training_session"]["id"] == "session_1"
     assert remote_payloads[0]["job_callback_metadata"]["job_2"]["callback_token"] == "callback-secret-2"
+    assert remote_payloads[0]["progress_revisions"] == {"job_1": 4, "job_2": 4}
+    assert remote_payloads[0]["progress_reporting_enabled_by_job"] == {
+        "job_1": True,
+        "job_2": True,
+    }
+    assert [(entry["job_id"], entry["payload"]["revision"]) for entry in client.progress] == [
+        ("job_1", 3),
+        ("job_2", 3),
+        ("job_1", 4),
+        ("job_2", 4),
+    ]
     assert [job["id"] for job in submitted] == ["job_1", "job_2"]
+    assert all(job["_progress_revision_base"] == 1000 for job in submitted)
     assert submitted[0]["config"]["modal_batch"]["batch_remote_status"] == (
         "remote_batch_shell_unsupported_single_job_fallback"
     )
@@ -956,6 +1121,7 @@ def test_modal_training_batch_flag_on_remote_completed_with_failed_child_falls_b
     assert submitted[0]["config"]["modal_batch"]["batch_remote_status"] == (
         "classification_batch_completed_single_job_fallback"
     )
+    assert all(job["_progress_revision_base"] == 1000 for job in submitted)
 
 
 def test_modal_app_session_enables_modal_output(monkeypatch):

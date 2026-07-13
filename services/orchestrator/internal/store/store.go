@@ -24,6 +24,7 @@ var (
 	ErrNotFound       = errors.New("not found")
 	ErrNoJob          = errors.New("no job available")
 	ErrInvalidRequest = errors.New("invalid request")
+	ErrStaleAttempt   = errors.New("stale job attempt")
 )
 
 type JobPollFilter struct {
@@ -99,6 +100,7 @@ type Store interface {
 	ListProjectJobsPage(projectID string, options PageOptions) ([]jobs.ExperimentJob, error)
 	GetJobProgress(jobID string, attempt int) (jobs.JobProgress, error)
 	UpsertJobProgress(jobID string, update jobs.JobProgressUpsert) (jobs.JobProgress, error)
+	ReportJobProgress(jobID string, attemptID string, update jobs.JobProgressUpsert) (jobs.JobProgressReportResult, error)
 	UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error)
 	RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error)
 	ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error)

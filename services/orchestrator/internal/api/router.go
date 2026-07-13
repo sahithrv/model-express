@@ -166,6 +166,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/jobs/:id", server.getJob)
 	router.GET("/jobs/:id/execution-record", server.getJobExecutionRecord)
 	router.POST("/jobs/:id/execution-observations", server.reportRealizationObservation)
+	router.POST("/jobs/:id/progress", server.reportJobProgress)
 	router.POST("/jobs/:id/metrics", server.reportMetric)
 	router.GET("/jobs/:id/metrics", server.listJobMetrics)
 	router.POST("/jobs/:id/training-run-summary", server.upsertTrainingRunSummary)
@@ -306,6 +307,7 @@ func callbackEndpointUsesAttemptToken(method string, path string) bool {
 	}
 	switch parts[2] {
 	case "metrics",
+		"progress",
 		"training-run-summary",
 		"training-run-evaluation",
 		"modal-call",

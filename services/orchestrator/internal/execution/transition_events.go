@@ -44,6 +44,7 @@ const (
 	EventAgentValidationAccepted  = "AGENT_VALIDATION_ACCEPTED"
 	EventAgentValidationFailed    = "AGENT_VALIDATION_FAILED"
 	EventAgentDecisionRecorded    = "AGENT_DECISION_RECORDED"
+	EventJobProgressBoundary      = "JOB_PROGRESS_BOUNDARY"
 )
 
 // ExecutionEventCreate is the validated input consumed by durable event
@@ -78,6 +79,26 @@ type ExecutionTransitionEventInput struct {
 	ReasonCode   string
 }
 
+// JobProgressBoundaryEventInput is the bounded durable event emitted for a
+// worker-observed stage change or current/total/unit boundary. It deliberately
+// excludes the worker message and metadata: those belong only in the bounded
+// replaceable snapshot.
+type JobProgressBoundaryEventInput struct {
+	ProjectID       string
+	PlanID          string
+	JobID           string
+	AttemptID       string
+	Attempt         int
+	TaxonomyVersion int
+	Stage           string
+	DetailCode      string
+	Status          string
+	Current         *int64
+	Total           *int64
+	Unit            string
+	Revision        int64
+}
+
 type executionTransitionDescriptor struct {
 	eventType string
 	category  string
@@ -106,9 +127,12 @@ var executionTransitionDescriptors = map[ExecutionTransition]executionTransition
 	TransitionAgentDecisionRecorded:   {eventType: EventAgentDecisionRecorded, category: "agent", phase: "decision", status: "succeeded", severity: "success", message: "Agent decision recorded.", decision: true},
 }
 
-// IsDurableTransitionEventType reports whether eventType belongs to the closed
-// PR4 producer contract. Legacy event types intentionally return false.
+// IsDurableTransitionEventType reports whether eventType belongs to the typed
+// durable producer contract. Legacy event types intentionally return false.
 func IsDurableTransitionEventType(eventType string) bool {
+	if eventType == EventJobProgressBoundary {
+		return true
+	}
 	for _, descriptor := range executionTransitionDescriptors {
 		if descriptor.eventType == eventType {
 			return true
@@ -118,12 +142,112 @@ func IsDurableTransitionEventType(eventType string) bool {
 }
 
 func DurableTransitionEventTypes() []string {
-	types := make([]string, 0, len(executionTransitionDescriptors))
+	types := make([]string, 0, len(executionTransitionDescriptors)+1)
 	for _, descriptor := range executionTransitionDescriptors {
 		types = append(types, descriptor.eventType)
 	}
+	types = append(types, EventJobProgressBoundary)
 	sort.Strings(types)
 	return types
+}
+
+// NewJobProgressBoundaryEvent derives a safe, idempotent durable event without
+// accepting arbitrary caller payload or message content.
+func NewJobProgressBoundaryEvent(input JobProgressBoundaryEventInput) (ExecutionEventCreate, error) {
+	projectID, err := executionTransitionToken("project_id", input.ProjectID, true)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	planID, err := executionTransitionToken("plan_id", input.PlanID, false)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	jobID, err := executionTransitionToken("job_id", input.JobID, true)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	attemptID, err := executionTransitionToken("attempt_id", input.AttemptID, true)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	stage, err := executionTransitionToken("stage", input.Stage, true)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	detailCode, err := executionTransitionToken("detail_code", input.DetailCode, false)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	status, err := executionTransitionToken("status", input.Status, true)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	unit, err := executionTransitionToken("unit", input.Unit, false)
+	if err != nil {
+		return ExecutionEventCreate{}, err
+	}
+	if input.Attempt < 1 {
+		return ExecutionEventCreate{}, fmt.Errorf("attempt must be positive")
+	}
+	if input.TaxonomyVersion != 1 {
+		return ExecutionEventCreate{}, fmt.Errorf("unsupported taxonomy_version %d", input.TaxonomyVersion)
+	}
+	if input.Revision < 1 {
+		return ExecutionEventCreate{}, fmt.Errorf("revision must be positive")
+	}
+	if status != "running" {
+		return ExecutionEventCreate{}, fmt.Errorf("worker progress status must be running")
+	}
+	if (input.Current == nil) != (input.Total == nil) {
+		return ExecutionEventCreate{}, fmt.Errorf("current and total must be reported together")
+	}
+	if input.Current != nil {
+		if *input.Current < 0 || *input.Total < 0 || *input.Current > *input.Total {
+			return ExecutionEventCreate{}, fmt.Errorf("progress range is invalid")
+		}
+		if unit == "" {
+			return ExecutionEventCreate{}, fmt.Errorf("unit is required with progress range")
+		}
+	} else if unit != "" {
+		return ExecutionEventCreate{}, fmt.Errorf("unit requires progress range")
+	}
+
+	payload := map[string]any{
+		"category":         "job",
+		"phase":            "progress",
+		"status":           status,
+		"severity":         "info",
+		"job_id":           jobID,
+		"attempt_id":       attemptID,
+		"attempt":          input.Attempt,
+		"taxonomy_version": input.TaxonomyVersion,
+		"stage":            stage,
+		"revision":         input.Revision,
+	}
+	if detailCode != "" {
+		payload["detail_code"] = detailCode
+	}
+	if input.Current != nil {
+		payload["current"] = *input.Current
+	}
+	if input.Total != nil {
+		payload["total"] = *input.Total
+	}
+	if unit != "" {
+		payload["unit"] = unit
+	}
+
+	return ExecutionEventCreate{
+		ProjectID: projectID,
+		PlanID:    planID,
+		EventType: EventJobProgressBoundary,
+		Message:   "Job progress advanced to " + strings.ReplaceAll(stage, "_", " ") + ".",
+		Payload:   payload,
+		IdempotencyKey: executionTransitionIdempotencyKey([]string{
+			"job.progress_boundary", projectID, jobID, attemptID,
+			strconv.Itoa(input.Attempt), strconv.FormatInt(input.Revision, 10),
+		}),
+	}, nil
 }
 
 // NewExecutionTransitionEvent builds the only payload shape used by durable

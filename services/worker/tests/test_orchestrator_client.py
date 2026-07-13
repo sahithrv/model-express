@@ -61,6 +61,57 @@ def test_execution_observation_uses_attempt_identity_and_callback_token(monkeypa
     assert calls[0]["json"]["training_attempt_id"] == "job_1:attempt-1"
 
 
+def test_progress_uses_attempt_identity_callback_token_and_short_timeout(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    client = OrchestratorClient("http://orchestrator.test")
+    job = {
+        "id": "job_1",
+        "config": {
+            "active_attempt_id": "job_1:attempt-1",
+            "callback_token": "callback-secret",
+        },
+    }
+
+    client.report_progress(
+        "job_1",
+        {
+            "taxonomy_version": 1,
+            "stage": "training",
+            "status": "running",
+            "revision": 3,
+            "current": 1,
+            "total": 4,
+            "unit": "epochs",
+        },
+        job=job,
+        timeout=5,
+    )
+
+    assert calls == [
+        {
+            "url": "http://orchestrator.test/jobs/job_1/progress",
+            "json": {
+                "taxonomy_version": 1,
+                "stage": "training",
+                "status": "running",
+                "revision": 3,
+                "current": 1,
+                "total": 4,
+                "unit": "epochs",
+                "training_attempt_id": "job_1:attempt-1",
+            },
+            "headers": {"Authorization": "Bearer callback-secret"},
+            "timeout": 5,
+        }
+    ]
+
+
 def test_report_timeout_default_allows_slow_callbacks(monkeypatch):
     monkeypatch.delenv("MODEL_EXPRESS_WORKER_REPORT_TIMEOUT_SECONDS", raising=False)
 

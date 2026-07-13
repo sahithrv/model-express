@@ -175,6 +175,10 @@ PROJECT_ID=optional-project-id
 GPU_TYPE=local
 MODEL_EXPRESS_WORKER_POLL_INTERVAL_SECONDS=5
 MODEL_EXPRESS_WORKER_IDLE_LOG_SECONDS=60
+MODEL_EXPRESS_PROGRESS_REPORTING_ENABLED=true
+MODEL_EXPRESS_PROGRESS_HEARTBEAT_SECONDS=15
+MODEL_EXPRESS_PROGRESS_REPORT_TIMEOUT_SECONDS=5
+MODEL_EXPRESS_PROGRESS_REPORT_MAX_ATTEMPTS=3
 ```
 
 ### What it unlocks
@@ -189,6 +193,10 @@ MODEL_EXPRESS_WORKER_IDLE_LOG_SECONDS=60
 ### Trust boundary
 
 The worker does not decide what work exists. It polls the backend, receives one assigned job, executes that job, and reports back. Job failures are reported with retry-aware metadata when possible.
+
+Attempt-scoped progress reporting is enabled by default. It is best-effort: unsupported endpoints, authentication rejection, timeouts, and reporting outages never change the training result. Workers stop using an unsupported progress endpoint after the first 404/405/501 response, which keeps new-worker/old-backend deployments safe. Unchanged observations are heartbeat-throttled, while stage transitions and changed progress boundaries are sent immediately. Callback attempts are bounded to five and each timeout to 30 seconds even if larger environment values are configured.
+
+Set `MODEL_EXPRESS_PROGRESS_REPORTING_ENABLED=false` to roll back progress callbacks while retaining legacy stage and metric telemetry. This switch requires no data repair and does not disable authoritative job completion/failure callbacks. Local progress diagnostics retain only a bounded list of reason codes, stages, revisions, attempt counts, and HTTP status codes; they never retain callback tokens, attempt identities, storage paths, prompts, or request payload contents.
 
 ## Modal Provider
 
