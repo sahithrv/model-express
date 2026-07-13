@@ -120,6 +120,7 @@ func (s *Server) getTrainingRunSummary(c *gin.Context) {
 		return
 	}
 	summary.ExecutionReferences = s.executionReferencesForJob(summary.JobID, summary.ExecutionReferences)
+	s.recordUnverifiedExecutionRead(summary.ProjectID, summary.ExecutionReferences)
 
 	c.JSON(http.StatusOK, summary)
 }
@@ -262,6 +263,7 @@ func (s *Server) getTrainingRunEvaluation(c *gin.Context) {
 		return
 	}
 	evaluation.ExecutionReferences = s.executionReferencesForJob(evaluation.JobID, evaluation.ExecutionReferences)
+	s.recordUnverifiedExecutionRead(evaluation.ProjectID, evaluation.ExecutionReferences)
 
 	c.JSON(http.StatusOK, evaluation)
 }
@@ -280,6 +282,7 @@ func (s *Server) listProjectTrainingRunSummaries(c *gin.Context) {
 	summaries = s.reconcileTrainingSummaryTerminalStatus(projectID, summaries)
 	for index := range summaries {
 		summaries[index].ExecutionReferences = s.executionReferencesForJob(summaries[index].JobID, summaries[index].ExecutionReferences)
+		s.recordUnverifiedExecutionRead(summaries[index].ProjectID, summaries[index].ExecutionReferences)
 	}
 	if queryBool(c, "compact") {
 		c.JSON(http.StatusOK, pagedListPayload("summaries", compactTrainingRunSummaries(summaries), limit, offset, hasMore))
@@ -327,6 +330,7 @@ func (s *Server) listProjectTrainingRunEvaluations(c *gin.Context) {
 	evaluations, hasMore := pageHasMore(items, limit)
 	for index := range evaluations {
 		evaluations[index].ExecutionReferences = s.executionReferencesForJob(evaluations[index].JobID, evaluations[index].ExecutionReferences)
+		s.recordUnverifiedExecutionRead(evaluations[index].ProjectID, evaluations[index].ExecutionReferences)
 	}
 	if queryBool(c, "compact") {
 		c.JSON(http.StatusOK, pagedListPayload("evaluations", compactTrainingRunEvaluations(evaluations), limit, offset, hasMore))
@@ -613,7 +617,7 @@ func (s *Server) validateTrainingCompletionReadiness(job jobs.ExperimentJob) err
 	if artifactURI == "" || championExportFormatFromArtifactURI(artifactURI) == "" {
 		return fmt.Errorf("%w: training completion requires a succeeded summary and exportable evaluation artifact", store.ErrInvalidRequest)
 	}
-	return nil
+	return s.validateTrainingCompletionFidelity(job)
 }
 
 func (s *Server) failJob(c *gin.Context) {
@@ -2028,13 +2032,15 @@ func (s *Server) getJob(c *gin.Context) {
 }
 
 func (s *Server) compactJobPayload(job jobs.ExperimentJob) map[string]any {
+	references := s.executionReferencesForJob(job.ID, nil)
+	s.recordUnverifiedExecutionRead(job.ProjectID, references)
 	return map[string]any{
 		"id":                   job.ID,
 		"project_id":           job.ProjectID,
 		"template":             job.Template,
 		"status":               job.Status,
 		"attempt":              job.Attempt,
-		"execution_references": s.executionReferencesForJob(job.ID, nil),
+		"execution_references": references,
 	}
 }
 

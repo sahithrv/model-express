@@ -100,6 +100,7 @@ func TestExecutePlanPreservesExplicitFalseAndZeroInLegacyAndCanonicalPayloads(t 
 }
 
 func TestExecutionValidationShadowReportsWithoutBlocking(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	experiment := testExperiment("resnet18", 8)
 	experiment.ResolutionStrategy = "low_latency"
 	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{experiment})
@@ -117,6 +118,24 @@ func TestExecutionValidationShadowReportsWithoutBlocking(t *testing.T) {
 	}
 	if _, ok := result.Jobs[0].Config[execution.ExecutionValidationConfigKey]; !ok {
 		t.Fatalf("job config did not retain typed validation report: %#v", result.Jobs[0].Config)
+	}
+}
+
+func TestExecutionValidationDefaultsToEnforceBeforeJobCreation(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "")
+	experiment := testExperiment("resnet18", 8)
+	experiment.ResolutionStrategy = "low_latency"
+	server, _, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{experiment})
+
+	_, err := server.executeStoredExperimentPlan(plan.ID, executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"})
+	if !errors.Is(err, store.ErrInvalidRequest) {
+		t.Fatalf("default enforcement did not reject unsupported proposal: %v", err)
+	}
+	projectJobs, _ := server.store.ListProjectJobs(plan.ProjectID)
+	for _, job := range projectJobs {
+		if configString(job.Config, "plan_id") == plan.ID {
+			t.Fatalf("default enforcement scheduled GPU work for blocked proposal: %#v", job)
+		}
 	}
 }
 
@@ -177,6 +196,7 @@ func TestExecutionValidationEnforcePreflightsWholePlanBeforeCreatingJobs(t *test
 }
 
 func TestAcceptedHashDuplicateIsSkippedBeforeScheduling(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	baseline := testExperiment("resnet18", 8)
 	equivalent := testExperiment("resnet18", 8)
 	equivalent.ResolutionStrategy = "low_latency"
@@ -195,6 +215,7 @@ func TestAcceptedHashDuplicateIsSkippedBeforeScheduling(t *testing.T) {
 }
 
 func TestInfrastructureChangesPreserveAcceptedSemanticIdentity(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	baseline := testExperiment("resnet18", 8)
 	server, projectID, firstPlan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{baseline})
 	first, err := server.executeStoredExperimentPlan(

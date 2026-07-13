@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"model-express/services/orchestrator/internal/execution"
+	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
@@ -17,6 +18,7 @@ func (s *Server) executionReferencesForJob(jobID string, existing *runs.Executio
 		references = *existing
 	}
 	record, err := s.store.GetJobExecutionRecord(jobID)
+	recordMissing := errors.Is(err, store.ErrNotFound)
 	if err == nil {
 		evidence := execution.DeriveEvidenceEligibility(&record, execution.LegacyEvidencePolicyAllow)
 		references.SchemaVersion = runExecutionReferencesSchemaV1
@@ -31,6 +33,10 @@ func (s *Server) executionReferencesForJob(jobID string, existing *runs.Executio
 	}
 
 	if job, jobErr := s.store.GetJob(jobID); jobErr == nil {
+		if recordMissing && job.Template == jobs.TemplateTrainExperiment {
+			references.SchemaVersion = runExecutionReferencesSchemaV1
+			references.FidelityVerdict = execution.ExecutionVerdictUnverified
+		}
 		if exports, exportErr := s.store.ListProjectChampionExports(job.ProjectID); exportErr == nil {
 			for _, export := range exports {
 				if export.JobID != jobID || export.Status != runs.ChampionExportStatusReady {

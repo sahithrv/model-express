@@ -26,6 +26,8 @@ type Server struct {
 	trainingTerminalHooksQueued map[string]bool
 	automationSettings          settings.AutomationSettings
 	settingsMu                  sync.RWMutex
+	fidelityMetricsMu           sync.Mutex
+	unverifiedReadsByProject    map[string]int64
 }
 
 const defaultOrchestratorAddr = "127.0.0.1:8080"
@@ -189,6 +191,7 @@ func newServer(store store.Store) *Server {
 		store:                       store,
 		callbackSecret:              callbackSecretFromEnv(),
 		trainingTerminalHooksQueued: make(map[string]bool),
+		unverifiedReadsByProject:    make(map[string]int64),
 		automationSettings:          automationSettingsFromEnv(),
 	}
 

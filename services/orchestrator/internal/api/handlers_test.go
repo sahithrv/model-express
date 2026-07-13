@@ -2933,6 +2933,7 @@ func TestAutomaticReviewMaxFollowUpRoundsNoSuccessfulRunRecordsTerminalEvent(t *
 }
 
 func TestAutomaticReviewAutoExecutionCreatesWorkerRequirement(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "true")
@@ -4448,6 +4449,7 @@ func TestPrepareAutoMLExperimentSamplesDeferredHyperparameters(t *testing.T) {
 }
 
 func TestExecuteExperimentPlanIncludesStructuredAugmentationPolicyConfig(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		func() plans.PlannedExperiment {
 			experiment := testExperiment("efficientnet_b0", 8)
@@ -5104,6 +5106,7 @@ func TestProposedExperimentPlannerDecisionDoesNotAutoSchedule(t *testing.T) {
 }
 
 func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
 
 	responses := []string{

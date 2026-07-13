@@ -88,10 +88,10 @@ type EnforcementFeedback struct {
 }
 
 func NormalizeValidationMode(mode string) string {
-	if strings.EqualFold(strings.TrimSpace(mode), ValidationModeEnforce) {
-		return ValidationModeEnforce
+	if strings.EqualFold(strings.TrimSpace(mode), ValidationModeShadow) {
+		return ValidationModeShadow
 	}
-	return ValidationModeShadow
+	return ValidationModeEnforce
 }
 
 // ValidateExecutionSpecV1 reports settings that the selected task/runner cannot

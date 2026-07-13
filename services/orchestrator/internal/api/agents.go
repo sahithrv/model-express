@@ -603,6 +603,11 @@ func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	fidelityMetrics, err := s.executionOperationalMetrics(projectID, limit)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"project_id":                    projectID,
@@ -610,6 +615,7 @@ func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
 		"limit":                         limit,
 		"agent_invocations":             agentInvocationResponseRows(invocations),
 		"memory_embedding_usage_events": usageEvents,
+		"execution_fidelity":            fidelityMetrics,
 	})
 }
 

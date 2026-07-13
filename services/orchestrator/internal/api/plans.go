@@ -221,6 +221,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		jobsByExperiment[index] = job
 	}
 	if executionValidationMode() == execution.ValidationModeEnforce {
+		preflightCostPolicy := costPolicy
 		for index, experiment := range plan.Experiments {
 			if _, ok := jobsByExperiment[index]; ok || experimentExecutionTemplate(experiment) != jobs.TemplateTrainExperiment {
 				continue
@@ -228,8 +229,8 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			if err := validateExperimentDatasetCompatibility(experiment, dataset, index); err != nil {
 				return executeExperimentPlanResponse{}, err
 			}
-			if costPolicy.Enabled {
-				allowed, _ := costPolicy.AllowTrainingJob(trainingTierForExperiment(experiment))
+			if preflightCostPolicy.Enabled {
+				allowed, _ := preflightCostPolicy.AllowTrainingJob(trainingTierForExperiment(experiment))
 				if !allowed {
 					continue
 				}

@@ -6,6 +6,18 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 )
 
+func TestExecutionValidationModeDefaultsToEnforceWithExplicitShadowRollback(t *testing.T) {
+	if got := execution.NormalizeValidationMode(""); got != execution.ValidationModeEnforce {
+		t.Fatalf("default validation mode = %s, want enforce", got)
+	}
+	if got := execution.NormalizeValidationMode("shadow"); got != execution.ValidationModeShadow {
+		t.Fatalf("shadow rollback mode = %s, want shadow", got)
+	}
+	if got := execution.NormalizeValidationMode("invalid"); got != execution.ValidationModeEnforce {
+		t.Fatalf("invalid validation mode should fail closed to enforce, got %s", got)
+	}
+}
+
 func TestExecutionValidationReportsUnsupportedDetectionFieldWithAlternative(t *testing.T) {
 	requested := map[string]any{
 		"template": "yolo11_detection", "model": "yolo11n.pt", "epochs": 8,
