@@ -823,6 +823,7 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 	var summary runs.TrainingRunSummary
 	var datasetMaterializationJSON []byte
 	var stageTelemetryJSON []byte
+	var executionReferencesJSON []byte
 	if err := row.Scan(
 		&summary.JobID,
 		&summary.ProjectID,
@@ -843,6 +844,7 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 		&summary.ModalInputID,
 		&datasetMaterializationJSON,
 		&stageTelemetryJSON,
+		&executionReferencesJSON,
 		&summary.CreatedAt,
 		&summary.UpdatedAt,
 	); err != nil {
@@ -860,6 +862,13 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 			return runs.TrainingRunSummary{}, fmt.Errorf("unmarshal stage telemetry: %w", err)
 		}
 	}
+	if len(executionReferencesJSON) > 0 && string(executionReferencesJSON) != "{}" {
+		var references runs.ExecutionArtifactReferences
+		if err := json.Unmarshal(executionReferencesJSON, &references); err != nil {
+			return runs.TrainingRunSummary{}, fmt.Errorf("unmarshal execution references: %w", err)
+		}
+		summary.ExecutionReferences = &references
+	}
 
 	return summary, nil
 }
@@ -871,6 +880,7 @@ func scanTrainingRunEvaluation(row rowScanner) (runs.TrainingRunEvaluation, erro
 	var confusionMatrixJSON []byte
 	var modelProfileJSON []byte
 	var holisticScoresJSON []byte
+	var executionReferencesJSON []byte
 	if err := row.Scan(
 		&evaluation.JobID,
 		&evaluation.ProjectID,
@@ -882,6 +892,7 @@ func scanTrainingRunEvaluation(row rowScanner) (runs.TrainingRunEvaluation, erro
 		&modelProfileJSON,
 		&holisticScoresJSON,
 		&evaluation.RecommendationSummary,
+		&executionReferencesJSON,
 		&evaluation.CreatedAt,
 		&evaluation.UpdatedAt,
 	); err != nil {
@@ -917,6 +928,13 @@ func scanTrainingRunEvaluation(row rowScanner) (runs.TrainingRunEvaluation, erro
 		if err := json.Unmarshal(holisticScoresJSON, &evaluation.HolisticScores); err != nil {
 			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal holistic scores: %w", err)
 		}
+	}
+	if len(executionReferencesJSON) > 0 && string(executionReferencesJSON) != "{}" {
+		var references runs.ExecutionArtifactReferences
+		if err := json.Unmarshal(executionReferencesJSON, &references); err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal execution references: %w", err)
+		}
+		evaluation.ExecutionReferences = &references
 	}
 	return evaluation, nil
 }
@@ -1387,6 +1405,8 @@ func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error)
 	var objectiveProfileJSON []byte
 	var proposedChangesJSON []byte
 	var tagsJSON []byte
+	var fidelityVerdictsJSON []byte
+	var adjustmentReasonCodesJSON []byte
 	if err := row.Scan(
 		&scorecard.ID,
 		&scorecard.ProjectID,
@@ -1413,11 +1433,30 @@ func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error)
 		&scorecard.Outcome,
 		&scorecard.Lesson,
 		&tagsJSON,
+		&fidelityVerdictsJSON,
+		&scorecard.EvidenceEligible,
+		&scorecard.RequestedMechanism,
+		&scorecard.RealizedMechanismIdentity,
+		&scorecard.AcceptedSpecHash,
+		&scorecard.RealizedEffectiveHash,
+		&adjustmentReasonCodesJSON,
 		&scorecard.CreatedAt,
 	); err != nil {
 		return strategies.StrategyScorecard{}, normalizeSQLError(err)
 	}
 	scorecard.DiagnosisTriggers = []string{}
+	scorecard.FidelityVerdicts = []string{}
+	scorecard.AdjustmentReasonCodes = []string{}
+	if len(fidelityVerdictsJSON) > 0 {
+		if err := json.Unmarshal(fidelityVerdictsJSON, &scorecard.FidelityVerdicts); err != nil {
+			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard fidelity_verdicts: %w", err)
+		}
+	}
+	if len(adjustmentReasonCodesJSON) > 0 {
+		if err := json.Unmarshal(adjustmentReasonCodesJSON, &scorecard.AdjustmentReasonCodes); err != nil {
+			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard adjustment_reason_codes: %w", err)
+		}
+	}
 	if len(diagnosisTriggersJSON) > 0 {
 		if err := json.Unmarshal(diagnosisTriggersJSON, &scorecard.DiagnosisTriggers); err != nil {
 			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard diagnosis_triggers: %w", err)
@@ -1691,7 +1730,7 @@ func memoryEmbeddingSelectColumns() string {
 }
 
 func strategyScorecardSelectColumns() string {
-	return "id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id, strategy_type, planning_mode, mechanism, intervention, diagnosis_triggers, evidence_used, expected_effect, dataset_traits, objective_profile, proposed_changes, expected_delta, actual_delta, confidence_before, confidence_after, cost_usd, runtime_seconds, outcome, lesson, tags, created_at"
+	return "id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id, strategy_type, planning_mode, mechanism, intervention, diagnosis_triggers, evidence_used, expected_effect, dataset_traits, objective_profile, proposed_changes, expected_delta, actual_delta, confidence_before, confidence_after, cost_usd, runtime_seconds, outcome, lesson, tags, fidelity_verdicts, evidence_eligible, requested_mechanism, realized_mechanism_identity, accepted_spec_hash, realized_effective_hash, adjustment_reason_codes, created_at"
 }
 
 func automlStudySelectColumns() string {
@@ -1773,6 +1812,10 @@ func applyPostgresTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, upd
 	}
 	if update.StageTelemetry != nil {
 		summary.StageTelemetry = copyAnyMap(update.StageTelemetry)
+	}
+	if update.ExecutionReferences != nil {
+		references := *update.ExecutionReferences
+		summary.ExecutionReferences = &references
 	}
 
 	summary.UpdatedAt = now

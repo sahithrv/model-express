@@ -32,8 +32,8 @@ type ExecutionValidationFinding struct {
 	AcceptedValue        any    `json:"accepted_value,omitempty"`
 }
 
-type ShadowDuplicateDecision struct {
-	WouldSkip      bool     `json:"would_skip"`
+type AcceptedDuplicateDecision struct {
+	Skip           bool     `json:"skip"`
 	MatchingJobIDs []string `json:"matching_job_ids,omitempty"`
 	DecisionBasis  string   `json:"decision_basis"`
 }
@@ -48,7 +48,7 @@ type ExecutionValidationReport struct {
 	AcceptedSpecHash  string                       `json:"accepted_spec_hash"`
 	WouldBlock        bool                         `json:"would_block"`
 	Findings          []ExecutionValidationFinding `json:"findings"`
-	ShadowDuplicate   ShadowDuplicateDecision      `json:"shadow_duplicate"`
+	AcceptedDuplicate AcceptedDuplicateDecision    `json:"accepted_duplicate"`
 }
 
 type PlannerConditionalCapability struct {
@@ -95,8 +95,8 @@ func NormalizeValidationMode(mode string) string {
 }
 
 // ValidateExecutionSpecV1 reports settings that the selected task/runner cannot
-// faithfully execute. It intentionally does not make the accepted-hash duplicate
-// decision authoritative; that cutover belongs to Fidelity PR 8.
+// faithfully execute. The scheduler attaches and applies the accepted-spec-hash
+// duplicate decision after validation.
 func ValidateExecutionSpecV1(spec ExecutionSpecV1, modelFamily, mode string) (ExecutionValidationReport, error) {
 	document, err := parseCapabilitiesV1()
 	if err != nil {
@@ -115,8 +115,8 @@ func ValidateExecutionSpecV1(spec ExecutionSpecV1, modelFamily, mode string) (Ex
 		ModelFamily:       strings.ToLower(strings.TrimSpace(modelFamily)),
 		AcceptedSpecHash:  spec.AcceptedSpecHash,
 		Findings:          []ExecutionValidationFinding{},
-		ShadowDuplicate: ShadowDuplicateDecision{
-			DecisionBasis: "accepted_spec_hash_shadow_v1",
+		AcceptedDuplicate: AcceptedDuplicateDecision{
+			DecisionBasis: "accepted_spec_hash_v1",
 		},
 	}
 
@@ -239,13 +239,13 @@ func capabilityValuesEqual(left, right any) bool {
 	return reflect.DeepEqual(left, right)
 }
 
-func (report *ExecutionValidationReport) SetShadowDuplicate(matchingJobIDs []string) {
+func (report *ExecutionValidationReport) SetAcceptedDuplicate(matchingJobIDs []string) {
 	if report == nil {
 		return
 	}
-	report.ShadowDuplicate.MatchingJobIDs = append([]string(nil), matchingJobIDs...)
-	sort.Strings(report.ShadowDuplicate.MatchingJobIDs)
-	report.ShadowDuplicate.WouldSkip = len(report.ShadowDuplicate.MatchingJobIDs) > 0
+	report.AcceptedDuplicate.MatchingJobIDs = append([]string(nil), matchingJobIDs...)
+	sort.Strings(report.AcceptedDuplicate.MatchingJobIDs)
+	report.AcceptedDuplicate.Skip = len(report.AcceptedDuplicate.MatchingJobIDs) > 0
 }
 
 func BuildPlannerCapabilityCard(task, runner, mode string, modelFamilies []string) (PlannerCapabilityCard, error) {

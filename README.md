@@ -823,6 +823,7 @@ Start with `.env.v1.cloud.example`. These are the settings most users should und
 | `MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER` | `modal` | Uses Modal workers by default. |
 | `MODEL_EXPRESS_EXECUTION_PROFILE` | `fast-remote` | Cloud-oriented execution profile. |
 | `MODEL_EXPRESS_EXECUTION_VALIDATION_MODE` | `shadow` | Reports task/runner settings that enforcement would block; use `enforce` only after reviewing shadow findings. |
+| `MODEL_EXPRESS_LEGACY_EXECUTION_EVIDENCE_POLICY` | `allow` | Controls historical jobs without versioned execution records: `allow` keeps them eligible but marks them `UNVERIFIED`; `visible_only` keeps them readable while excluding them from planner learning and automatic champion selection. Versioned `MISMATCH` and `SIMULATED` runs are always ineligible. |
 | `MODEL_EXPRESS_DEFAULT_GPU_TYPE` | `T4` | Conservative first GPU choice. |
 | `MODEL_EXPRESS_MODAL_DEFAULT_GPU_TYPE` | `T4` | Modal default GPU choice. |
 | `MODEL_EXPRESS_MODAL_TUNNEL_S3` | `true` | Allows Mission Control to tunnel local MinIO API to Modal. |

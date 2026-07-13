@@ -49,7 +49,9 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
     export_dir = _export_dir(config, job_id, requested_format)
     dataset_profile = _dataset_profile(client, config)
     class_names = _class_names(config, dataset_profile)
-    image_size = _positive_int(config.get("image_size"), 224)
+    execution_contract = config.get("execution_contract") if isinstance(config.get("execution_contract"), dict) else {}
+    contract_errors = _execution_contract_errors(execution_contract)
+    image_size = _positive_int(execution_contract.get("image_size"), 224) if execution_contract else _positive_int(config.get("image_size"), 224)
     export_metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
     deployment_profile = export_metadata.get("deployment_profile") if isinstance(export_metadata.get("deployment_profile"), dict) else {}
     model_profile = config.get("model_profile") if isinstance(config.get("model_profile"), dict) else {}
@@ -61,16 +63,23 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
         or _first_string(model_profile, "model", "model_name", "architecture")
         or "unknown_model"
     )
-    preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
-    if not preprocessing and isinstance(deployment_profile.get("preprocessing"), dict):
-        preprocessing = deployment_profile["preprocessing"]
-    training_config = config.get("training_config") if isinstance(config.get("training_config"), dict) else {}
-    if not training_config and isinstance(deployment_profile.get("training_config"), dict):
-        training_config = deployment_profile["training_config"]
-    if not training_config:
-        training_config = config
+    if execution_contract:
+        preprocessing = dict(execution_contract.get("preprocessing") or {})
+        training_config = {
+            "model": model_name,
+            "task": execution_contract.get("task", ""),
+        }
+    else:
+        preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
+        if not preprocessing and isinstance(deployment_profile.get("preprocessing"), dict):
+            preprocessing = deployment_profile["preprocessing"]
+        training_config = config.get("training_config") if isinstance(config.get("training_config"), dict) else {}
+        if not training_config and isinstance(deployment_profile.get("training_config"), dict):
+            training_config = deployment_profile["training_config"]
+        if not training_config:
+            training_config = config
 
-    validation_errors: list[str] = []
+    validation_errors: list[str] = list(contract_errors)
     if requested_format not in SUPPORTED_EXPORT_FORMATS:
         validation_errors.append(
             f"unsupported export format {requested_format!r}; expected one of {sorted(SUPPORTED_EXPORT_FORMATS)}"
@@ -102,6 +111,7 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
             sample_input_shape=config.get("sample_input_shape"),
             provenance=provenance,
             validation_errors=validation_errors,
+            execution_contract=execution_contract,
         )
     elif source_errors:
         manifest = _error_manifest(export_dir, requested_format, validation_errors, provenance=provenance)
@@ -133,11 +143,11 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
                 if checkpoint_metadata:
                     if not class_names:
                         class_names = _metadata_class_names(checkpoint_metadata)
-                    if not config.get("image_size"):
+                    if not execution_contract and not config.get("image_size"):
                         image_size = _metadata_image_size(checkpoint_metadata, image_size)
                     if not model_profile and isinstance(checkpoint_metadata.get("model_profile"), dict):
                         model_profile = checkpoint_metadata["model_profile"]
-                    if not isinstance(config.get("training_config"), dict) and isinstance(
+                    if not execution_contract and not isinstance(config.get("training_config"), dict) and isinstance(
                         checkpoint_metadata.get("training_config"), dict
                     ):
                         training_config = checkpoint_metadata["training_config"]
@@ -155,6 +165,7 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
                     sample_input_shape=config.get("sample_input_shape"),
                     provenance=provenance,
                     validation_errors=validation_errors,
+                    execution_contract=execution_contract,
                 )
     else:
         validation_errors.append(
@@ -299,12 +310,51 @@ def _export_dir(config: dict, job_id: str, requested_format: str) -> Path:
 
 
 def _export_provenance(config: dict, job_id: str, artifact_format: str) -> dict:
-    return {
+    provenance = {
         "export_job_id": job_id,
         "source_job_id": _first_string(config, "champion_job_id", "source_job_id", "training_job_id"),
         "source_export_id": _first_string(config, "source_export_id", "export_id", "champion_export_id"),
         "artifact_format": artifact_format,
     }
+    contract = config.get("execution_contract") if isinstance(config.get("execution_contract"), dict) else {}
+    for key in (
+        "execution_record_ref",
+        "attempt_id",
+        "task",
+        "capability_version",
+        "accepted_spec_hash",
+        "realized_effective_hash",
+        "fidelity_verdict",
+        "preprocessing_contract_hash",
+    ):
+        if contract.get(key) not in (None, ""):
+            provenance[key] = contract[key]
+    return provenance
+
+
+def _execution_contract_errors(contract: dict) -> list[str]:
+    if not contract:
+        return []
+    errors: list[str] = []
+    if contract.get("schema_version") != "export_execution_contract_v1":
+        errors.append("EXPORT_EXECUTION_CONTRACT_INVALID: unsupported schema_version")
+    for key in (
+        "execution_record_ref",
+        "attempt_id",
+        "task",
+        "capability_version",
+        "accepted_spec_hash",
+        "realized_effective_hash",
+        "fidelity_verdict",
+        "preprocessing_contract_hash",
+    ):
+        if not str(contract.get(key) or "").strip():
+            errors.append(f"EXPORT_EXECUTION_CONTRACT_INVALID: missing {key}")
+    if not isinstance(contract.get("preprocessing"), dict) or not contract.get("preprocessing"):
+        errors.append("EXPORT_EXECUTION_CONTRACT_INVALID: missing preprocessing")
+    if _positive_int(contract.get("image_size"), 0) <= 0:
+        errors.append("EXPORT_EXECUTION_CONTRACT_INVALID: missing image_size")
+    return errors
 
 
 def _exemplar_dir(dataset_id: str, job_id: str) -> Path:
@@ -733,7 +783,17 @@ def _inline_manifest_provenance(provenance: dict, artifact_format: str) -> dict:
         "artifact_format": artifact_format,
         "validation_errors": [],
     }
-    for key in ("source_job_id", "source_export_id", "export_job_id"):
+    for key in (
+        "source_job_id",
+        "source_export_id",
+        "export_job_id",
+        "execution_record_ref",
+        "attempt_id",
+        "capability_version",
+        "accepted_spec_hash",
+        "realized_effective_hash",
+        "preprocessing_contract_hash",
+    ):
         value = provenance.get(key)
         if value:
             record[key] = str(value)
@@ -1137,6 +1197,8 @@ def _export_status_for_manifest(
     if _manifest_export_self_test_failed(manifest):
         return "FAILED", errors
     if primary_artifact:
+        if errors:
+            return "FAILED", list(dict.fromkeys(errors))
         return "READY", errors
     if artifact_errors:
         errors.extend(artifact_errors)
@@ -1195,7 +1257,17 @@ def _error_manifest(
         "validation_errors": [str(error) for error in validation_errors if error],
     }
     if provenance:
-        for key in ("source_job_id", "source_export_id", "export_job_id"):
+        for key in (
+            "source_job_id",
+            "source_export_id",
+            "export_job_id",
+            "execution_record_ref",
+            "attempt_id",
+            "capability_version",
+            "accepted_spec_hash",
+            "realized_effective_hash",
+            "preprocessing_contract_hash",
+        ):
             value = provenance.get(key)
             if value:
                 provenance_record[key] = str(value)

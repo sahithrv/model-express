@@ -16,7 +16,7 @@ func TestDeriveRealizationVerdicts(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, _, got, err := DeriveRealization(spec, test.create)
+			_, _, got, _, err := DeriveRealization(spec, test.create)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -30,11 +30,11 @@ func TestDeriveRealizationVerdicts(t *testing.T) {
 func TestRealizedEffectiveHashIsDeterministic(t *testing.T) {
 	spec := JobExecutionSpec{CapabilityVersion: "2026-07-09", Task: "image_classification", Runner: "modal_torchvision", AcceptedSpec: map[string]any{"model": "resnet18", "batch_size": float64(16), "pretrained": false}}
 	observation := RealizationObservationCreate{RealizedConfig: map[string]any{"pretrained": false, "batch_size": float64(16), "model": "resnet18"}}
-	_, firstHash, firstVerdict, err := DeriveRealization(spec, observation)
+	_, firstHash, firstVerdict, _, err := DeriveRealization(spec, observation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secondHash, secondVerdict, err := DeriveRealization(spec, observation)
+	_, secondHash, secondVerdict, _, err := DeriveRealization(spec, observation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestRealizedEffectiveHashIsDeterministic(t *testing.T) {
 
 func TestObservationRejectsUnacceptedAndRedactsSensitiveFields(t *testing.T) {
 	spec := JobExecutionSpec{AcceptedSpec: map[string]any{"epochs": float64(3)}}
-	if _, _, _, err := DeriveRealization(spec, RealizationObservationCreate{RealizedConfig: map[string]any{"epochs": float64(3), "token": "secret"}}); err == nil {
+	if _, _, _, _, err := DeriveRealization(spec, RealizationObservationCreate{RealizedConfig: map[string]any{"epochs": float64(3), "token": "secret"}}); err == nil {
 		t.Fatal("expected unaccepted semantic field to be rejected")
 	}
 	redacted := RedactSensitiveMap(map[string]any{"api_token": "secret", "nested": map[string]any{"password": "p", "safe": "value"}})

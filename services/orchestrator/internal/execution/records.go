@@ -13,10 +13,10 @@ const MaxObservationJSONBytes = 64 * 1024
 // DeriveRealization compares only the accepted semantic object with the worker's
 // allowlisted realization. Framework/evidence payloads are audit context and do
 // not participate in semantic identity.
-func DeriveRealization(spec JobExecutionSpec, observation RealizationObservationCreate) (map[string]any, string, string, error) {
+func DeriveRealization(spec JobExecutionSpec, observation RealizationObservationCreate) (map[string]any, string, string, []string, error) {
 	realized, err := boundedSemanticConfig(spec.AcceptedSpec, observation.RealizedConfig)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
 	hash, err := CanonicalJSONHash(map[string]any{
 		"schema_version":     ExecutionObservationSchemaV1,
@@ -26,18 +26,20 @@ func DeriveRealization(spec JobExecutionSpec, observation RealizationObservation
 		"realized_config":    realized,
 	})
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
 	if observation.Simulated {
-		return realized, hash, ExecutionVerdictSimulated, nil
+		return realized, hash, ExecutionVerdictSimulated, []string{}, nil
 	}
 	if reflect.DeepEqual(spec.AcceptedSpec, realized) {
-		return realized, hash, ExecutionVerdictMatched, nil
+		return realized, hash, ExecutionVerdictMatched, []string{}, nil
 	}
 	if approvedBatchAdjustment(spec.AcceptedSpec, realized, observation.AdjustmentPolicy) {
-		return realized, hash, ExecutionVerdictApprovedAdjustment, nil
+		return realized, hash, ExecutionVerdictApprovedAdjustment, []string{
+			ExecutionAdjustmentReasonBatchSizeReduced,
+		}, nil
 	}
-	return realized, hash, ExecutionVerdictMismatch, nil
+	return realized, hash, ExecutionVerdictMismatch, []string{}, nil
 }
 
 func ValidateObservation(create RealizationObservationCreate) error {

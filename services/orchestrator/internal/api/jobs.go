@@ -91,6 +91,7 @@ func (s *Server) upsertTrainingRunSummary(c *gin.Context) {
 	); !ok {
 		return
 	}
+	req.ExecutionReferences = s.executionReferencesForJob(c.Param("id"), req.ExecutionReferences)
 
 	summary, err := s.store.UpsertTrainingRunSummary(c.Param("id"), req)
 	if err != nil {
@@ -107,6 +108,7 @@ func (s *Server) upsertTrainingRunSummary(c *gin.Context) {
 			}
 		}
 	}
+	summary.ExecutionReferences = s.executionReferencesForJob(summary.JobID, summary.ExecutionReferences)
 
 	c.JSON(http.StatusOK, summary)
 }
@@ -117,6 +119,7 @@ func (s *Server) getTrainingRunSummary(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	summary.ExecutionReferences = s.executionReferencesForJob(summary.JobID, summary.ExecutionReferences)
 
 	c.JSON(http.StatusOK, summary)
 }
@@ -247,6 +250,7 @@ func (s *Server) upsertTrainingRunEvaluation(c *gin.Context) {
 	if err := s.maybeQueueDeficiencyDatasetVisualAnalysis(evaluation); err != nil {
 		log.Printf("visual dataset deficiency reanalysis check failed for job %s: %v", evaluation.JobID, err)
 	}
+	evaluation.ExecutionReferences = s.executionReferencesForJob(evaluation.JobID, evaluation.ExecutionReferences)
 
 	c.JSON(http.StatusOK, evaluation)
 }
@@ -257,6 +261,7 @@ func (s *Server) getTrainingRunEvaluation(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	evaluation.ExecutionReferences = s.executionReferencesForJob(evaluation.JobID, evaluation.ExecutionReferences)
 
 	c.JSON(http.StatusOK, evaluation)
 }
@@ -273,6 +278,13 @@ func (s *Server) listProjectTrainingRunSummaries(c *gin.Context) {
 
 	summaries, hasMore := pageHasMore(items, limit)
 	summaries = s.reconcileTrainingSummaryTerminalStatus(projectID, summaries)
+	for index := range summaries {
+		summaries[index].ExecutionReferences = s.executionReferencesForJob(summaries[index].JobID, summaries[index].ExecutionReferences)
+	}
+	if queryBool(c, "compact") {
+		c.JSON(http.StatusOK, pagedListPayload("summaries", compactTrainingRunSummaries(summaries), limit, offset, hasMore))
+		return
+	}
 	c.JSON(http.StatusOK, pagedListPayload("summaries", summaries, limit, offset, hasMore))
 }
 
@@ -313,13 +325,18 @@ func (s *Server) listProjectTrainingRunEvaluations(c *gin.Context) {
 	}
 
 	evaluations, hasMore := pageHasMore(items, limit)
+	for index := range evaluations {
+		evaluations[index].ExecutionReferences = s.executionReferencesForJob(evaluations[index].JobID, evaluations[index].ExecutionReferences)
+	}
 	if queryBool(c, "compact") {
-		evaluations = compactTrainingRunEvaluations(evaluations)
+		c.JSON(http.StatusOK, pagedListPayload("evaluations", compactTrainingRunEvaluations(evaluations), limit, offset, hasMore))
+		return
 	}
 	c.JSON(http.StatusOK, pagedListPayload("evaluations", evaluations, limit, offset, hasMore))
 }
 
 func (s *Server) enrichTrainingRunEvaluationUpdate(jobID string, update runs.TrainingRunEvaluationUpdate) runs.TrainingRunEvaluationUpdate {
+	update.ExecutionReferences = s.executionReferencesForJob(jobID, update.ExecutionReferences)
 	summary, err := s.store.GetTrainingRunSummary(jobID)
 	if err != nil {
 		return update
@@ -471,22 +488,14 @@ func metricFloat(metrics map[string]float64, keys ...string) (float64, bool) {
 	return 0, false
 }
 
-func compactTrainingRunEvaluations(evaluations []runs.TrainingRunEvaluation) []runs.TrainingRunEvaluation {
-	out := append([]runs.TrainingRunEvaluation(nil), evaluations...)
-	for index := range out {
-		if out[index].HolisticScores != nil {
-			out[index].HolisticScores = copyPayloadMap(out[index].HolisticScores)
-		}
-		if len(out[index].PerClassMetrics) > 20 {
-			out[index].PerClassMetrics = map[string]any{"_truncated": true, "class_count": len(out[index].PerClassMetrics)}
-		}
-		if len(out[index].ConfusionMatrix) > 20 {
-			out[index].ConfusionMatrix = nil
-			if out[index].HolisticScores == nil {
-				out[index].HolisticScores = map[string]any{}
-			}
-			out[index].HolisticScores["confusion_matrix_truncated"] = true
-		}
+func compactTrainingRunEvaluations(evaluations []runs.TrainingRunEvaluation) []map[string]any {
+	out := make([]map[string]any, 0, len(evaluations))
+	for _, evaluation := range evaluations {
+		out = append(out, map[string]any{
+			"job_id":               evaluation.JobID,
+			"project_id":           evaluation.ProjectID,
+			"execution_references": evaluation.ExecutionReferences,
+		})
 	}
 	return out
 }
@@ -1809,6 +1818,15 @@ func (s *Server) selectBestAvailableChampionForUserCancelledPlan(plan plans.Expe
 	if err != nil {
 		return cancelBestAvailableModel{}, err
 	}
+	projectJobs, err := s.store.ListProjectJobs(plan.ProjectID)
+	if err != nil {
+		return cancelBestAvailableModel{}, err
+	}
+	executionEvidenceByJob, err := s.executionEvidenceForJobs(projectJobs)
+	if err != nil {
+		return cancelBestAvailableModel{}, err
+	}
+	summaries = automaticChampionEligibleSummaries(summaries, executionEvidenceByJob)
 	planSummaries := []runs.TrainingRunSummary{}
 	for _, summary := range summaries {
 		if summary.PlanID == plan.ID {
@@ -1984,6 +2002,14 @@ func (s *Server) listProjectJobs(c *gin.Context) {
 	}
 
 	jobs, hasMore := pageHasMore(items, limit)
+	if queryBool(c, "compact") {
+		compact := make([]map[string]any, 0, len(jobs))
+		for _, job := range jobs {
+			compact = append(compact, s.compactJobPayload(job))
+		}
+		c.JSON(http.StatusOK, pagedListPayload("jobs", compact, limit, offset, hasMore))
+		return
+	}
 	c.JSON(http.StatusOK, pagedListPayload("jobs", jobs, limit, offset, hasMore))
 }
 
@@ -1993,8 +2019,23 @@ func (s *Server) getJob(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	if queryBool(c, "compact") {
+		c.JSON(http.StatusOK, s.compactJobPayload(job))
+		return
+	}
 
 	c.JSON(http.StatusOK, job)
+}
+
+func (s *Server) compactJobPayload(job jobs.ExperimentJob) map[string]any {
+	return map[string]any{
+		"id":                   job.ID,
+		"project_id":           job.ProjectID,
+		"template":             job.Template,
+		"status":               job.Status,
+		"attempt":              job.Attempt,
+		"execution_references": s.executionReferencesForJob(job.ID, nil),
+	}
 }
 
 func (s *Server) reportMetric(c *gin.Context) {

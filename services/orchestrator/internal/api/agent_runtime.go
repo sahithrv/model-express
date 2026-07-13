@@ -77,6 +77,14 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	if err != nil {
 		return err
 	}
+	projectJobs, err := s.store.ListProjectJobs(job.ProjectID)
+	if err != nil {
+		return err
+	}
+	executionEvidenceByJob, err := s.executionEvidenceForJobs(projectJobs)
+	if err != nil {
+		return err
+	}
 	evaluations, err := s.store.ListProjectTrainingRunEvaluations(job.ProjectID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -87,7 +95,7 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
-	outcome, err := experimentPlanningOutcomeForPlan(sourceDecision, plan, projectPlans, summaries, evaluations, projectObjectiveContext(goalText))
+	outcome, err := experimentPlanningOutcomeForPlan(sourceDecision, plan, projectPlans, summaries, evaluations, projectObjectiveContext(goalText), executionEvidenceByJob)
 	if err != nil {
 		return err
 	}
@@ -116,7 +124,9 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	if err != nil {
 		return err
 	}
-	s.indexMemoryCard(context.Background(), memory.NewAgentMemoryCard(record))
+	if outcome.EvidenceEligibleRunCount > 0 {
+		s.indexMemoryCard(context.Background(), memory.NewAgentMemoryCard(record))
+	}
 
 	if _, err := s.store.CreateExecutionEvent(job.ProjectID, plan.ID, execution.EventAgentOutcomeRecorded, fmt.Sprintf("Experiment Planner outcome recorded for follow-up plan %s.", plan.ID), map[string]any{
 		"invocation_id":      updatedInvocation.ID,
@@ -126,16 +136,30 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	}); err != nil {
 		log.Printf("record experiment planner outcome event failed: %v", err)
 	}
+	primaryEvidence := primaryOutcomeExecutionEvidence(outcome)
+	scorecardOutcome := outcome.OutcomeStatus
+	if scorecardOutcome == agents.ExperimentPlanningOutcomeExecutionIneligible {
+		scorecardOutcome = strategies.OutcomeInvalidated
+	}
 	if updatedScorecard, err := s.store.UpdateStrategyScorecardOutcomeByFollowUpPlan(plan.ID, strategies.StrategyScorecardOutcomeUpdate{
-		ActualDelta:     outcome.ActualDeltaVsChampion,
-		ConfidenceAfter: plannerOutcomeConfidence(outcome),
-		CostUSD:         outcome.TotalCostUSD,
-		RuntimeSeconds:  outcome.TotalRuntimeSeconds,
-		Outcome:         outcome.OutcomeStatus,
-		Lesson:          outcome.Lesson,
-		Tags:            tags,
+		ActualDelta:               outcome.ActualDeltaVsChampion,
+		ConfidenceAfter:           plannerOutcomeConfidence(outcome),
+		CostUSD:                   outcome.TotalCostUSD,
+		RuntimeSeconds:            outcome.TotalRuntimeSeconds,
+		Outcome:                   scorecardOutcome,
+		Lesson:                    outcome.Lesson,
+		Tags:                      tags,
+		FidelityVerdicts:          outcomeExecutionFidelityVerdicts(outcome),
+		EvidenceEligible:          outcome.EvidenceEligibleRunCount > 0,
+		RequestedMechanism:        primaryEvidence.RequestedMechanism,
+		RealizedMechanismIdentity: primaryEvidence.RealizedMechanismIdentity,
+		AcceptedSpecHash:          primaryEvidence.AcceptedSpecHash,
+		RealizedEffectiveHash:     primaryEvidence.RealizedEffectiveHash,
+		AdjustmentReasonCodes:     primaryEvidence.AdjustmentReasonCodes,
 	}); err == nil {
-		s.indexMemoryCard(context.Background(), memory.NewStrategyScorecardMemoryCard(updatedScorecard))
+		if updatedScorecard.EvidenceEligible {
+			s.indexMemoryCard(context.Background(), memory.NewStrategyScorecardMemoryCard(updatedScorecard))
+		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		log.Printf("update strategy scorecard failed for follow-up plan %s: %v", plan.ID, err)
 	}
@@ -597,24 +621,32 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return agents.ExperimentPlannerInput{}, false, err
 	}
+	executionEvidenceByJob, err := s.executionEvidenceForJobs(projectJobs)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	learningSummaries := learningEligibleSummaries(summaries, executionEvidenceByJob)
+	learningEvaluations := evaluationsForEligibleSummaries(evaluations, learningSummaries)
 
 	planJobs := jobsForPlan(projectJobs, plan.ID)
-	planSummaries := summariesForPlanID(summaries, plan.ID)
-	planEvaluations := evaluationsForPlanID(evaluations, plan.ID)
-	if !planTrainingRunsComplete(plan, planSummaries) {
+	allPlanSummaries := summariesForPlanID(summaries, plan.ID)
+	if !planTrainingRunsComplete(plan, allPlanSummaries) {
 		return agents.ExperimentPlannerInput{}, false, nil
 	}
+	planSummaries := summariesForPlanID(learningSummaries, plan.ID)
+	planEvaluations := evaluationsForPlanID(learningEvaluations, plan.ID)
 	automationSettings := s.currentAutomationSettings()
 	minimumMeaningfulImprovement := plannerMinimumMeaningfulImprovementFromEnv(automationSettings.AgentMode)
 	objectiveContext := projectObjectiveContext(project.Goal)
 	currentChampion, baselineChampion, sourcePlanDeltas, noImprovementRounds, stopSignals := experimentPlannerPerformanceContext(
 		plan.TargetMetric,
 		projectPlans,
-		summaries,
-		evaluations,
+		learningSummaries,
+		learningEvaluations,
 		objectiveContext,
 		plan.ID,
 	)
+	attachPlannerExecutionEvidence(currentChampion, baselineChampion, sourcePlanDeltas, executionEvidenceByJob)
 
 	planMetrics := map[string][]jobs.EpochMetric{}
 	for _, planJob := range planJobs {
@@ -697,12 +729,13 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		OptimizerFeedback:            s.optimizerFeedbackSummariesForProject(projectID, plan.TargetMetric),
 		PriorPlans:                   projectPlans,
 		PriorJobs:                    projectJobs,
-		PriorSummaries:               summaries,
-		PriorEvaluations:             evaluations,
+		PriorSummaries:               learningSummaries,
+		PriorEvaluations:             learningEvaluations,
 		PriorMemory:                  priorMemory,
 		ExistingExperimentSignatures: experimentSignaturesForPlans(projectPlans),
 		ExecutionCapabilityCard:      executionCapabilityCard,
 		ExecutionEnforcementFeedback: executionFeedback,
+		ExecutionEvidence:            executionEvidenceList(executionEvidenceByJob),
 		AgentMode:                    automationSettings.AgentMode,
 		MaxExperiments:               maxLLMPlannerExperiments,
 		MaxFollowUpRounds:            s.maxAutoFollowUpRounds(),
@@ -1329,6 +1362,7 @@ func experimentPlannerDecisionPayload(
 		"failed_strategy_memory":          input.FailedStrategyMemory,
 		"rejected_strategy_memory":        input.RejectedStrategyMemory,
 		"strategy_scorecards":             input.StrategyScorecards,
+		"execution_evidence":              input.ExecutionEvidence,
 		"optimizer_feedback_summary":      input.OptimizerFeedback,
 		"no_improvement_rounds":           input.NoImprovementRounds,
 		"minimum_meaningful_improvement":  input.MinimumMeaningfulImprovement,

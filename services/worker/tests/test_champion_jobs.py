@@ -50,6 +50,60 @@ class RaisingExportResultClient(FakeClient):
 
 
 class ChampionJobTests(unittest.TestCase):
+    def test_versioned_export_uses_realized_preprocessing_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_root = root / "exports"
+            source = export_root / "controlled" / "source.onnx"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"real onnx bytes")
+            contract = {
+                "schema_version": "export_execution_contract_v1",
+                "execution_record_ref": "/jobs/train_1/execution-record",
+                "attempt_id": "attempt-1",
+                "task": "image_classification",
+                "capability_version": "cap-v1",
+                "accepted_spec_hash": "accepted-hash",
+                "realized_effective_hash": "realized-hash",
+                "fidelity_verdict": "MATCHED",
+                "preprocessing_contract_hash": "preprocessing-hash",
+                "image_size": 64,
+                "preprocessing": {
+                    "resize_strategy": "preserve_aspect_pad",
+                    "crop_strategy": "none",
+                    "normalization": "imagenet",
+                    "bbox_mode": "ignore",
+                },
+            }
+            client = FakeClient()
+            job = {
+                "id": "job_export",
+                "template": "export_champion",
+                "config": {
+                    "format": "onnx",
+                    "champion_job_id": "train_1",
+                    "export_id": "export_1",
+                    "artifact_path": str(source),
+                    "model": "mobilenet_v3_small",
+                    "class_names": ["cat", "dog"],
+                    "image_size": 32,
+                    "preprocessing": {"resize_strategy": "squash", "normalization": "none"},
+                    "execution_contract": contract,
+                },
+            }
+
+            with patch.dict("os.environ", {"WORKER_EXPORT_ROOT": str(export_root)}):
+                run_export_champion_job(client, job)
+
+            _, result = client.export_results[0]
+            self.assertEqual(result["status"], "READY")
+            metadata = result["metadata"]["manifest"]["metadata"]
+            self.assertEqual(metadata["execution_contract"], contract)
+            self.assertEqual(metadata["input_shape"], [1, 3, 64, 64])
+            self.assertEqual(metadata["preprocessing_contract"]["config"]["resize_strategy"], "preserve_aspect_pad")
+            self.assertEqual(metadata["preprocessing_contract"]["config"]["normalization"], "imagenet")
+            self.assertEqual(metadata["provenance"]["realized_effective_hash"], "realized-hash")
+
     def test_export_reports_ready_only_when_existing_artifact_is_copied(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

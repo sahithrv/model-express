@@ -42,6 +42,7 @@ func copyExecutionSpec(spec execution.JobExecutionSpec) execution.JobExecutionSp
 
 func copyAttemptRecord(record execution.AttemptExecutionRecord) execution.AttemptExecutionRecord {
 	record.LatestRealizedConfig = cloneJSONMap(record.LatestRealizedConfig)
+	record.AdjustmentReasonCodes = append([]string(nil), record.AdjustmentReasonCodes...)
 	if record.FidelityVerdict != nil {
 		value := *record.FidelityVerdict
 		record.FidelityVerdict = &value
@@ -51,6 +52,10 @@ func copyAttemptRecord(record execution.AttemptExecutionRecord) execution.Attemp
 		record.Observations[index].RealizedConfig = cloneJSONMap(record.Observations[index].RealizedConfig)
 		record.Observations[index].FrameworkArguments = cloneJSONMap(record.Observations[index].FrameworkArguments)
 		record.Observations[index].Evidence = cloneJSONMap(record.Observations[index].Evidence)
+		record.Observations[index].AdjustmentReasonCodes = append(
+			[]string(nil),
+			record.Observations[index].AdjustmentReasonCodes...,
+		)
 	}
 	return record
 }
@@ -156,7 +161,7 @@ func (s *MemoryStore) AppendRealizationObservation(jobID string, create executio
 	if record.LifecycleStatus == execution.ExecutionLifecycleFinalized {
 		return execution.RealizationObservation{}, false, fmt.Errorf("%w: attempt realization is already finalized", ErrInvalidRequest)
 	}
-	realized, hash, verdict, err := execution.DeriveRealization(spec, create)
+	realized, hash, verdict, adjustmentReasonCodes, err := execution.DeriveRealization(spec, create)
 	if err != nil {
 		return execution.RealizationObservation{}, false, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
@@ -166,12 +171,13 @@ func (s *MemoryStore) AppendRealizationObservation(jobID string, create executio
 	if stage == execution.ExecutionObservationFinalized {
 		lifecycle = execution.ExecutionLifecycleFinalized
 	}
-	observation := execution.RealizationObservation{ID: s.newID("realization"), AttemptRecordID: record.ID, AttemptID: create.AttemptID, SchemaVersion: execution.ExecutionObservationSchemaV1, Stage: stage, IdempotencyKey: create.IdempotencyKey, RealizedConfig: cloneJSONMap(realized), FrameworkArguments: cloneJSONMap(create.FrameworkArguments), Evidence: cloneJSONMap(create.Evidence), AdjustmentPolicy: create.AdjustmentPolicy, Simulated: create.Simulated, RealizedEffectiveHash: hash, FidelityVerdict: verdict, CreatedAt: now}
+	observation := execution.RealizationObservation{ID: s.newID("realization"), AttemptRecordID: record.ID, AttemptID: create.AttemptID, SchemaVersion: execution.ExecutionObservationSchemaV1, Stage: stage, IdempotencyKey: create.IdempotencyKey, RealizedConfig: cloneJSONMap(realized), FrameworkArguments: cloneJSONMap(create.FrameworkArguments), Evidence: cloneJSONMap(create.Evidence), AdjustmentPolicy: create.AdjustmentPolicy, AdjustmentReasonCodes: append([]string(nil), adjustmentReasonCodes...), Simulated: create.Simulated, RealizedEffectiveHash: hash, FidelityVerdict: verdict, CreatedAt: now}
 	s.realizationObservations[record.ID] = append(s.realizationObservations[record.ID], observation)
 	verdictCopy := verdict
 	record.LifecycleStatus = lifecycle
 	record.FidelityVerdict = &verdictCopy
 	record.RealizedEffectiveHash = hash
+	record.AdjustmentReasonCodes = append([]string(nil), adjustmentReasonCodes...)
 	record.LatestRealizedConfig = cloneJSONMap(realized)
 	record.UpdatedAt = now
 	s.attemptExecutions[record.ID] = record

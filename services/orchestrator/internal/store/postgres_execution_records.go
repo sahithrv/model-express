@@ -25,7 +25,7 @@ func createAttemptExecutionRecordTx(ctx context.Context, tx *sql.Tx, jobID, atte
 		INSERT INTO attempt_execution_records (job_id, project_id, attempt_id, attempt_number)
 		SELECT $1, project_id, $2, $3 FROM job_execution_specs WHERE job_id = $1
 		ON CONFLICT (job_id, attempt_id) DO UPDATE SET attempt_id = EXCLUDED.attempt_id
-		RETURNING id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, latest_realized_config, created_at, updated_at
+		RETURNING id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at
 	`, jobID, attemptID, attemptNumber)
 	return scanAttemptExecutionRecord(row)
 }
@@ -85,7 +85,7 @@ func (s *PostgresStore) ListProjectExecutionRecords(projectID string, options Pa
 }
 
 func (s *PostgresStore) listAttemptExecutionRecords(where string, arg any) ([]execution.AttemptExecutionRecord, error) {
-	rows, err := s.db.QueryContext(context.Background(), `SELECT id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, latest_realized_config, created_at, updated_at FROM attempt_execution_records `+where+` ORDER BY attempt_number ASC`, arg)
+	rows, err := s.db.QueryContext(context.Background(), `SELECT id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at FROM attempt_execution_records `+where+` ORDER BY attempt_number ASC`, arg)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func (s *PostgresStore) AppendRealizationObservation(jobID string, create execut
 	if err != nil {
 		return execution.RealizationObservation{}, false, err
 	}
-	record, err := scanAttemptExecutionRecord(tx.QueryRowContext(ctx, `SELECT id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, latest_realized_config, created_at, updated_at FROM attempt_execution_records WHERE job_id=$1 AND attempt_id=$2 FOR UPDATE`, jobID, create.AttemptID))
+	record, err := scanAttemptExecutionRecord(tx.QueryRowContext(ctx, `SELECT id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at FROM attempt_execution_records WHERE job_id=$1 AND attempt_id=$2 FOR UPDATE`, jobID, create.AttemptID))
 	if err != nil {
 		return execution.RealizationObservation{}, false, err
 	}
@@ -156,15 +156,16 @@ func (s *PostgresStore) AppendRealizationObservation(jobID string, create execut
 	if record.LifecycleStatus == execution.ExecutionLifecycleFinalized {
 		return execution.RealizationObservation{}, false, fmt.Errorf("%w: attempt realization is already finalized", ErrInvalidRequest)
 	}
-	realized, hash, verdict, err := execution.DeriveRealization(spec, create)
+	realized, hash, verdict, adjustmentReasonCodes, err := execution.DeriveRealization(spec, create)
 	if err != nil {
 		return execution.RealizationObservation{}, false, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	realizedJSON, _ := jsonMap(realized)
 	frameworkJSON, _ := jsonMap(create.FrameworkArguments)
 	evidenceJSON, _ := jsonMap(create.Evidence)
+	adjustmentReasonsJSON, _ := json.Marshal(adjustmentReasonCodes)
 	stage := strings.ToUpper(strings.TrimSpace(create.Stage))
-	observation, err := scanRealizationObservation(tx.QueryRowContext(ctx, `INSERT INTO execution_realization_observations (attempt_record_id, attempt_id, schema_version, stage, idempotency_key, realized_config, framework_arguments, evidence, adjustment_policy, simulated, realized_effective_hash, fidelity_verdict) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, attempt_record_id, attempt_id, schema_version, stage, idempotency_key, realized_config, framework_arguments, evidence, adjustment_policy, simulated, realized_effective_hash, fidelity_verdict, created_at`, record.ID, create.AttemptID, execution.ExecutionObservationSchemaV1, stage, create.IdempotencyKey, realizedJSON, frameworkJSON, evidenceJSON, create.AdjustmentPolicy, create.Simulated, hash, verdict))
+	observation, err := scanRealizationObservation(tx.QueryRowContext(ctx, `INSERT INTO execution_realization_observations (attempt_record_id, attempt_id, schema_version, stage, idempotency_key, realized_config, framework_arguments, evidence, adjustment_policy, adjustment_reason_codes, simulated, realized_effective_hash, fidelity_verdict) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id, attempt_record_id, attempt_id, schema_version, stage, idempotency_key, realized_config, framework_arguments, evidence, adjustment_policy, adjustment_reason_codes, simulated, realized_effective_hash, fidelity_verdict, created_at`, record.ID, create.AttemptID, execution.ExecutionObservationSchemaV1, stage, create.IdempotencyKey, realizedJSON, frameworkJSON, evidenceJSON, create.AdjustmentPolicy, adjustmentReasonsJSON, create.Simulated, hash, verdict))
 	if err != nil {
 		return execution.RealizationObservation{}, false, err
 	}
@@ -172,7 +173,7 @@ func (s *PostgresStore) AppendRealizationObservation(jobID string, create execut
 	if stage == execution.ExecutionObservationFinalized {
 		lifecycle = execution.ExecutionLifecycleFinalized
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET lifecycle_status=$1, fidelity_verdict=$2, realized_effective_hash=$3, latest_realized_config=$4, updated_at=now() WHERE id=$5`, lifecycle, verdict, hash, realizedJSON, record.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET lifecycle_status=$1, fidelity_verdict=$2, realized_effective_hash=$3, adjustment_reason_codes=$4, latest_realized_config=$5, updated_at=now() WHERE id=$6`, lifecycle, verdict, hash, adjustmentReasonsJSON, realizedJSON, record.ID); err != nil {
 		return execution.RealizationObservation{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -182,11 +183,11 @@ func (s *PostgresStore) AppendRealizationObservation(jobID string, create execut
 }
 
 func (s *PostgresStore) MarkAttemptNotRealized(jobID, attemptID string) (execution.AttemptExecutionRecord, error) {
-	return scanAttemptExecutionRecord(s.db.QueryRowContext(context.Background(), `UPDATE attempt_execution_records SET lifecycle_status=CASE WHEN lifecycle_status=$1 THEN $2 ELSE lifecycle_status END, updated_at=CASE WHEN lifecycle_status=$1 THEN now() ELSE updated_at END WHERE job_id=$3 AND attempt_id=$4 RETURNING id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, latest_realized_config, created_at, updated_at`, execution.ExecutionLifecyclePending, execution.ExecutionLifecycleNotRealized, jobID, attemptID))
+	return scanAttemptExecutionRecord(s.db.QueryRowContext(context.Background(), `UPDATE attempt_execution_records SET lifecycle_status=CASE WHEN lifecycle_status=$1 THEN $2 ELSE lifecycle_status END, updated_at=CASE WHEN lifecycle_status=$1 THEN now() ELSE updated_at END WHERE job_id=$3 AND attempt_id=$4 RETURNING id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at`, execution.ExecutionLifecyclePending, execution.ExecutionLifecycleNotRealized, jobID, attemptID))
 }
 
 func observationSelectSQL() string {
-	return `SELECT id, attempt_record_id, attempt_id, schema_version, stage, idempotency_key, realized_config, framework_arguments, evidence, adjustment_policy, simulated, realized_effective_hash, fidelity_verdict, created_at FROM execution_realization_observations`
+	return `SELECT id, attempt_record_id, attempt_id, schema_version, stage, idempotency_key, realized_config, framework_arguments, evidence, adjustment_policy, adjustment_reason_codes, simulated, realized_effective_hash, fidelity_verdict, created_at FROM execution_realization_observations`
 }
 
 func scanJobExecutionSpec(scanner rowScanner) (execution.JobExecutionSpec, error) {
@@ -203,12 +204,19 @@ func scanJobExecutionSpec(scanner rowScanner) (execution.JobExecutionSpec, error
 func scanAttemptExecutionRecord(scanner rowScanner) (execution.AttemptExecutionRecord, error) {
 	var out execution.AttemptExecutionRecord
 	var verdict sql.NullString
-	var raw []byte
-	if err := scanner.Scan(&out.ID, &out.JobID, &out.ProjectID, &out.AttemptID, &out.AttemptNumber, &out.LifecycleStatus, &verdict, &out.RealizedEffectiveHash, &raw, &out.CreatedAt, &out.UpdatedAt); err != nil {
+	var realizedHash sql.NullString
+	var reasons, raw []byte
+	if err := scanner.Scan(&out.ID, &out.JobID, &out.ProjectID, &out.AttemptID, &out.AttemptNumber, &out.LifecycleStatus, &verdict, &realizedHash, &reasons, &raw, &out.CreatedAt, &out.UpdatedAt); err != nil {
 		return out, normalizeSQLError(err)
 	}
 	if verdict.Valid {
 		out.FidelityVerdict = &verdict.String
+	}
+	if realizedHash.Valid {
+		out.RealizedEffectiveHash = realizedHash.String
+	}
+	if err := json.Unmarshal(reasons, &out.AdjustmentReasonCodes); err != nil {
+		return out, err
 	}
 	if err := json.Unmarshal(raw, &out.LatestRealizedConfig); err != nil {
 		return out, err
@@ -217,8 +225,8 @@ func scanAttemptExecutionRecord(scanner rowScanner) (execution.AttemptExecutionR
 }
 func scanRealizationObservation(scanner rowScanner) (execution.RealizationObservation, error) {
 	var out execution.RealizationObservation
-	var realized, framework, evidence []byte
-	if err := scanner.Scan(&out.ID, &out.AttemptRecordID, &out.AttemptID, &out.SchemaVersion, &out.Stage, &out.IdempotencyKey, &realized, &framework, &evidence, &out.AdjustmentPolicy, &out.Simulated, &out.RealizedEffectiveHash, &out.FidelityVerdict, &out.CreatedAt); err != nil {
+	var realized, framework, evidence, reasons []byte
+	if err := scanner.Scan(&out.ID, &out.AttemptRecordID, &out.AttemptID, &out.SchemaVersion, &out.Stage, &out.IdempotencyKey, &realized, &framework, &evidence, &out.AdjustmentPolicy, &reasons, &out.Simulated, &out.RealizedEffectiveHash, &out.FidelityVerdict, &out.CreatedAt); err != nil {
 		return out, normalizeSQLError(err)
 	}
 	if err := json.Unmarshal(realized, &out.RealizedConfig); err != nil {
@@ -228,6 +236,9 @@ func scanRealizationObservation(scanner rowScanner) (execution.RealizationObserv
 		return out, err
 	}
 	if err := json.Unmarshal(evidence, &out.Evidence); err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal(reasons, &out.AdjustmentReasonCodes); err != nil {
 		return out, err
 	}
 	return out, nil

@@ -3554,6 +3554,7 @@ func TestCostPolicySkippedFullTrainSelectsChampionAfterAllowedJobsFinish(t *test
 	}); err != nil {
 		t.Fatalf("upsert preview evaluation: %v", err)
 	}
+	finalizeMatchedExecutionForTest(t, memoryStore, previewJob.ID)
 
 	selected, err := server.selectBestAvailableChampionIfCostStoppedAfterTrainingJob(previewJob)
 	if err != nil {

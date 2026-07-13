@@ -109,6 +109,7 @@ type ExperimentPlannerInput struct {
 	ValidationFeedback           []PlannerValidationFeedback
 	ExecutionCapabilityCard      execution.PlannerCapabilityCard
 	ExecutionEnforcementFeedback []execution.EnforcementFeedback
+	ExecutionEvidence            []ExperimentExecutionEvidence
 	AgentMode                    string
 	MaxExperiments               int
 	MaxFollowUpRounds            int
@@ -141,6 +142,7 @@ type PlannerContextSnapshot struct {
 	ValidationFeedback     []PlannerValidationFeedback       `json:"planner_validation_feedback,omitempty"`
 	ExecutionCapabilities  execution.PlannerCapabilityCard   `json:"execution_capability_card"`
 	EnforcementFeedback    []execution.EnforcementFeedback   `json:"execution_enforcement_feedback,omitempty"`
+	ExecutionEvidence      []ExperimentExecutionEvidence     `json:"execution_evidence"`
 	StopOrContinuePressure PlannerStopContinueCard           `json:"stop_or_continue_pressure"`
 	PromptBudget           PlannerPromptBudget               `json:"prompt_budget"`
 }
@@ -254,6 +256,26 @@ type PlannerExperimentLog struct {
 	TrainingDiagnostics map[string]any `json:"training_diagnostics,omitempty"`
 	ModelProfile        map[string]any `json:"model_profile,omitempty"`
 	Outcome             string         `json:"outcome"`
+}
+
+type ExperimentExecutionEvidence struct {
+	JobID                     string   `json:"job_id"`
+	PlanID                    string   `json:"plan_id,omitempty"`
+	Model                     string   `json:"model,omitempty"`
+	JobStatus                 string   `json:"job_status,omitempty"`
+	SchemaVersion             string   `json:"schema_version,omitempty"`
+	CapabilityVersion         string   `json:"capability_version,omitempty"`
+	LifecycleStatus           string   `json:"lifecycle_status,omitempty"`
+	FidelityVerdict           string   `json:"fidelity_verdict"`
+	RequestedConfigHash       string   `json:"requested_config_hash,omitempty"`
+	AcceptedSpecHash          string   `json:"accepted_spec_hash,omitempty"`
+	RealizedEffectiveHash     string   `json:"realized_effective_hash,omitempty"`
+	RequestedMechanism        string   `json:"requested_mechanism,omitempty"`
+	RealizedMechanismIdentity string   `json:"realized_mechanism_identity,omitempty"`
+	AdjustmentReasonCodes     []string `json:"adjustment_reason_codes,omitempty"`
+	LearningEligible          bool     `json:"learning_eligible"`
+	AutomaticChampionEligible bool     `json:"automatic_champion_eligible"`
+	EligibilityReason         string   `json:"eligibility_reason"`
 }
 
 type PlannerFailureDiagnosis struct {
@@ -559,33 +581,39 @@ type PlannerStrategyMemory struct {
 	TotalRuntimeSeconds     float64  `json:"total_runtime_seconds"`
 	ProposedModels          []string `json:"proposed_models"`
 	Tags                    []string `json:"tags"`
+	FidelityVerdict         string   `json:"fidelity_verdict,omitempty"`
+	LearningEligible        bool     `json:"learning_eligible"`
 }
 
 type PlannerStrategyScorecard struct {
-	ID                string         `json:"id"`
-	DatasetID         string         `json:"dataset_id"`
-	SourceDecisionID  string         `json:"source_decision_id"`
-	SourcePlanID      string         `json:"source_plan_id"`
-	FollowUpPlanID    string         `json:"followup_plan_id"`
-	StrategyType      string         `json:"strategy_type"`
-	PlanningMode      string         `json:"planning_mode"`
-	Mechanism         string         `json:"mechanism,omitempty"`
-	Intervention      string         `json:"intervention,omitempty"`
-	DiagnosisTriggers []string       `json:"diagnosis_triggers,omitempty"`
-	EvidenceUsed      []string       `json:"evidence_used,omitempty"`
-	ExpectedEffect    string         `json:"expected_effect,omitempty"`
-	DatasetTraits     map[string]any `json:"dataset_traits"`
-	ObjectiveProfile  map[string]any `json:"objective_profile"`
-	ProposedChanges   map[string]any `json:"proposed_changes"`
-	ExpectedDelta     float64        `json:"expected_delta"`
-	ActualDelta       float64        `json:"actual_delta"`
-	ConfidenceBefore  float64        `json:"confidence_before"`
-	ConfidenceAfter   float64        `json:"confidence_after"`
-	CostUSD           float64        `json:"cost_usd"`
-	RuntimeSeconds    float64        `json:"runtime_seconds"`
-	Outcome           string         `json:"outcome"`
-	Lesson            string         `json:"lesson"`
-	Tags              []string       `json:"tags"`
+	ID                        string         `json:"id"`
+	DatasetID                 string         `json:"dataset_id"`
+	SourceDecisionID          string         `json:"source_decision_id"`
+	SourcePlanID              string         `json:"source_plan_id"`
+	FollowUpPlanID            string         `json:"followup_plan_id"`
+	StrategyType              string         `json:"strategy_type"`
+	PlanningMode              string         `json:"planning_mode"`
+	Mechanism                 string         `json:"mechanism,omitempty"`
+	Intervention              string         `json:"intervention,omitempty"`
+	DiagnosisTriggers         []string       `json:"diagnosis_triggers,omitempty"`
+	EvidenceUsed              []string       `json:"evidence_used,omitempty"`
+	ExpectedEffect            string         `json:"expected_effect,omitempty"`
+	DatasetTraits             map[string]any `json:"dataset_traits"`
+	ObjectiveProfile          map[string]any `json:"objective_profile"`
+	ProposedChanges           map[string]any `json:"proposed_changes"`
+	ExpectedDelta             float64        `json:"expected_delta"`
+	ActualDelta               float64        `json:"actual_delta"`
+	ConfidenceBefore          float64        `json:"confidence_before"`
+	ConfidenceAfter           float64        `json:"confidence_after"`
+	CostUSD                   float64        `json:"cost_usd"`
+	RuntimeSeconds            float64        `json:"runtime_seconds"`
+	Outcome                   string         `json:"outcome"`
+	Lesson                    string         `json:"lesson"`
+	Tags                      []string       `json:"tags"`
+	FidelityVerdicts          []string       `json:"fidelity_verdicts,omitempty"`
+	EvidenceEligible          bool           `json:"evidence_eligible"`
+	RequestedMechanism        string         `json:"requested_mechanism,omitempty"`
+	RealizedMechanismIdentity string         `json:"realized_mechanism_identity,omitempty"`
 }
 
 type PlannerValidationFeedback struct {
@@ -598,69 +626,74 @@ type PlannerValidationFeedback struct {
 }
 
 type ExperimentChampion struct {
-	JobID            string  `json:"job_id"`
-	PlanID           string  `json:"plan_id"`
-	Model            string  `json:"model"`
-	TargetMetric     string  `json:"target_metric"`
-	Score            float64 `json:"score"`
-	ScoreBasis       string  `json:"score_basis,omitempty"`
-	BestMacroF1      float64 `json:"best_macro_f1"`
-	BestAccuracy     float64 `json:"best_accuracy"`
-	FinalTrainLoss   float64 `json:"final_train_loss,omitempty"`
-	FinalValLoss     float64 `json:"final_val_loss,omitempty"`
-	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
-	RuntimeSeconds   float64 `json:"runtime_seconds"`
-	EpochsCompleted  int     `json:"epochs_completed"`
+	JobID             string                       `json:"job_id"`
+	PlanID            string                       `json:"plan_id"`
+	Model             string                       `json:"model"`
+	TargetMetric      string                       `json:"target_metric"`
+	Score             float64                      `json:"score"`
+	ScoreBasis        string                       `json:"score_basis,omitempty"`
+	BestMacroF1       float64                      `json:"best_macro_f1"`
+	BestAccuracy      float64                      `json:"best_accuracy"`
+	FinalTrainLoss    float64                      `json:"final_train_loss,omitempty"`
+	FinalValLoss      float64                      `json:"final_val_loss,omitempty"`
+	EstimatedCostUSD  float64                      `json:"estimated_cost_usd"`
+	RuntimeSeconds    float64                      `json:"runtime_seconds"`
+	EpochsCompleted   int                          `json:"epochs_completed"`
+	ExecutionEvidence *ExperimentExecutionEvidence `json:"execution_evidence,omitempty"`
 }
 
 type ExperimentRunDelta struct {
-	JobID                    string  `json:"job_id"`
-	PlanID                   string  `json:"plan_id"`
-	Model                    string  `json:"model"`
-	Status                   string  `json:"status"`
-	TargetMetric             string  `json:"target_metric"`
-	Score                    float64 `json:"score"`
-	ScoreBasis               string  `json:"score_basis,omitempty"`
-	BestMacroF1              float64 `json:"best_macro_f1"`
-	BestAccuracy             float64 `json:"best_accuracy"`
-	FinalTrainLoss           float64 `json:"final_train_loss,omitempty"`
-	FinalValLoss             float64 `json:"final_val_loss,omitempty"`
-	EstimatedCostUSD         float64 `json:"estimated_cost_usd"`
-	RuntimeSeconds           float64 `json:"runtime_seconds"`
-	EpochsCompleted          int     `json:"epochs_completed"`
-	ChampionJobID            string  `json:"champion_job_id"`
-	DeltaScoreVsChampion     float64 `json:"delta_score_vs_champion"`
-	DeltaCostVsChampion      float64 `json:"delta_cost_vs_champion"`
-	DeltaRuntimeVsChampion   float64 `json:"delta_runtime_vs_champion"`
-	MeaningfullyImprovedOver bool    `json:"meaningfully_improved_over_champion"`
+	JobID                    string                       `json:"job_id"`
+	PlanID                   string                       `json:"plan_id"`
+	Model                    string                       `json:"model"`
+	Status                   string                       `json:"status"`
+	TargetMetric             string                       `json:"target_metric"`
+	Score                    float64                      `json:"score"`
+	ScoreBasis               string                       `json:"score_basis,omitempty"`
+	BestMacroF1              float64                      `json:"best_macro_f1"`
+	BestAccuracy             float64                      `json:"best_accuracy"`
+	FinalTrainLoss           float64                      `json:"final_train_loss,omitempty"`
+	FinalValLoss             float64                      `json:"final_val_loss,omitempty"`
+	EstimatedCostUSD         float64                      `json:"estimated_cost_usd"`
+	RuntimeSeconds           float64                      `json:"runtime_seconds"`
+	EpochsCompleted          int                          `json:"epochs_completed"`
+	ChampionJobID            string                       `json:"champion_job_id"`
+	DeltaScoreVsChampion     float64                      `json:"delta_score_vs_champion"`
+	DeltaCostVsChampion      float64                      `json:"delta_cost_vs_champion"`
+	DeltaRuntimeVsChampion   float64                      `json:"delta_runtime_vs_champion"`
+	MeaningfullyImprovedOver bool                         `json:"meaningfully_improved_over_champion"`
+	ExecutionEvidence        *ExperimentExecutionEvidence `json:"execution_evidence,omitempty"`
 }
 
 const (
-	ExperimentPlanningOutcomeImprovedChampion = "improved_champion"
-	ExperimentPlanningOutcomeMinorImprovement = "minor_improvement"
-	ExperimentPlanningOutcomeNoImprovement    = "no_improvement"
-	ExperimentPlanningOutcomeFailed           = "failed"
+	ExperimentPlanningOutcomeImprovedChampion    = "improved_champion"
+	ExperimentPlanningOutcomeMinorImprovement    = "minor_improvement"
+	ExperimentPlanningOutcomeNoImprovement       = "no_improvement"
+	ExperimentPlanningOutcomeFailed              = "failed"
+	ExperimentPlanningOutcomeExecutionIneligible = "execution_ineligible"
 )
 
 type ExperimentPlanningOutcome struct {
-	OutcomeType             string                    `json:"outcome_type"`
-	OutcomeStatus           string                    `json:"outcome_status"`
-	SourceDecisionID        string                    `json:"source_decision_id"`
-	SourcePlanID            string                    `json:"source_plan_id"`
-	FollowUpPlanID          string                    `json:"follow_up_plan_id"`
-	BaselineChampion        *ExperimentChampion       `json:"baseline_champion,omitempty"`
-	ActualBestRun           *ExperimentChampion       `json:"actual_best_run,omitempty"`
-	ExpectedDeltaVsChampion float64                   `json:"expected_delta_vs_champion"`
-	ActualDeltaVsChampion   float64                   `json:"actual_delta_vs_champion"`
-	MetExpectedDelta        bool                      `json:"met_expected_delta"`
-	TotalCostUSD            float64                   `json:"total_cost_usd"`
-	TotalRuntimeSeconds     float64                   `json:"total_runtime_seconds"`
-	TerminalRunCount        int                       `json:"terminal_run_count"`
-	SuccessfulRunCount      int                       `json:"successful_run_count"`
-	FailedRunCount          int                       `json:"failed_run_count"`
-	ProposedExperiments     []plans.PlannedExperiment `json:"proposed_experiments"`
-	Lesson                  string                    `json:"lesson"`
-	CompletedAt             time.Time                 `json:"completed_at"`
+	OutcomeType              string                        `json:"outcome_type"`
+	OutcomeStatus            string                        `json:"outcome_status"`
+	SourceDecisionID         string                        `json:"source_decision_id"`
+	SourcePlanID             string                        `json:"source_plan_id"`
+	FollowUpPlanID           string                        `json:"follow_up_plan_id"`
+	BaselineChampion         *ExperimentChampion           `json:"baseline_champion,omitempty"`
+	ActualBestRun            *ExperimentChampion           `json:"actual_best_run,omitempty"`
+	ExpectedDeltaVsChampion  float64                       `json:"expected_delta_vs_champion"`
+	ActualDeltaVsChampion    float64                       `json:"actual_delta_vs_champion"`
+	MetExpectedDelta         bool                          `json:"met_expected_delta"`
+	TotalCostUSD             float64                       `json:"total_cost_usd"`
+	TotalRuntimeSeconds      float64                       `json:"total_runtime_seconds"`
+	TerminalRunCount         int                           `json:"terminal_run_count"`
+	SuccessfulRunCount       int                           `json:"successful_run_count"`
+	FailedRunCount           int                           `json:"failed_run_count"`
+	ProposedExperiments      []plans.PlannedExperiment     `json:"proposed_experiments"`
+	Lesson                   string                        `json:"lesson"`
+	CompletedAt              time.Time                     `json:"completed_at"`
+	ExecutionEvidence        []ExperimentExecutionEvidence `json:"execution_evidence"`
+	EvidenceEligibleRunCount int                           `json:"evidence_eligible_run_count"`
 }
 
 type ExperimentPlanningRecommendation struct {
@@ -1776,6 +1809,7 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 		ValidationFeedback:     input.ValidationFeedback,
 		ExecutionCapabilities:  input.ExecutionCapabilityCard,
 		EnforcementFeedback:    input.ExecutionEnforcementFeedback,
+		ExecutionEvidence:      input.ExecutionEvidence,
 		StopOrContinuePressure: plannerStopContinueCard(input),
 		PromptBudget:           promptBudget,
 	}
@@ -1816,6 +1850,7 @@ func plannerPromptBudgetWithEstimates(snapshot PlannerContextSnapshot, base Plan
 	budget.SectionEstimates["dataset_card"] = plannerPromptSectionEstimateFromValue(snapshot.DatasetCard)
 	budget.SectionEstimates["execution_capability_card"] = plannerPromptSectionEstimateFromValue(snapshot.ExecutionCapabilities)
 	budget.SectionEstimates["execution_enforcement_feedback"] = plannerPromptSectionEstimateFromValue(snapshot.EnforcementFeedback)
+	budget.SectionEstimates["execution_evidence"] = plannerPromptSectionEstimateFromValue(snapshot.ExecutionEvidence)
 	budget.SectionEstimates["source_plan_card"] = plannerPromptSectionEstimateFromValue(snapshot.SourcePlanCard)
 	budget.SectionEstimates["objective_context"] = plannerPromptSectionEstimateFromValue(snapshot.ObjectiveContext)
 	budget.SectionEstimates["champion_card"] = plannerPromptSectionEstimateFromValue(snapshot.ChampionCard)
@@ -1882,6 +1917,9 @@ func plannerContextSnapshotV2(snapshot PlannerContextSnapshot) PlannerContextSna
 	snapshot.PerClassErrorCard = plannerCompactPerClassErrorCardV2(snapshot.PerClassErrorCard)
 	snapshot.DeploymentCard = plannerCompactDeploymentCardV2(snapshot.DeploymentCard)
 	snapshot.MechanismCoverageCard = plannerCompactMechanismCoverageCardV2(snapshot.MechanismCoverageCard)
+	if len(snapshot.ExecutionEvidence) > 12 {
+		snapshot.ExecutionEvidence = append([]ExperimentExecutionEvidence(nil), snapshot.ExecutionEvidence[len(snapshot.ExecutionEvidence)-12:]...)
+	}
 	snapshot.BackendGatedMethods = plannerCompactBackendGatedMethodsV2(snapshot.BackendGatedMethods)
 	snapshot.LabelQualityCard = plannerCompactLabelQualityCardV2(snapshot.LabelQualityCard)
 	snapshot.SearchCoverage = plannerCompactSearchCoverageV2(snapshot.SearchCoverage)

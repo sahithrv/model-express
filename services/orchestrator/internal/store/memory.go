@@ -894,6 +894,10 @@ func (s *MemoryStore) UpsertTrainingRunEvaluation(jobID string, update runs.Trai
 	evaluation.ModelProfile = emptyMapIfNil(update.ModelProfile)
 	evaluation.HolisticScores = emptyMapIfNil(update.HolisticScores)
 	evaluation.RecommendationSummary = update.RecommendationSummary
+	if update.ExecutionReferences != nil {
+		references := *update.ExecutionReferences
+		evaluation.ExecutionReferences = &references
+	}
 	evaluation.UpdatedAt = now
 	s.evaluations[jobID] = evaluation
 	return evaluation, nil
@@ -1970,6 +1974,13 @@ func (s *MemoryStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPlanI
 		scorecard.Outcome = update.Outcome
 		scorecard.Lesson = update.Lesson
 		scorecard.Tags = append([]string(nil), update.Tags...)
+		scorecard.FidelityVerdicts = append([]string(nil), update.FidelityVerdicts...)
+		scorecard.EvidenceEligible = update.EvidenceEligible
+		scorecard.RequestedMechanism = update.RequestedMechanism
+		scorecard.RealizedMechanismIdentity = update.RealizedMechanismIdentity
+		scorecard.AcceptedSpecHash = update.AcceptedSpecHash
+		scorecard.RealizedEffectiveHash = update.RealizedEffectiveHash
+		scorecard.AdjustmentReasonCodes = append([]string(nil), update.AdjustmentReasonCodes...)
 		s.strategyScorecards[id] = scorecard
 		return scorecard, nil
 	}
@@ -2710,6 +2721,10 @@ func applyTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, update runs
 	}
 	if update.StageTelemetry != nil {
 		summary.StageTelemetry = copyAnyMap(update.StageTelemetry)
+	}
+	if update.ExecutionReferences != nil {
+		references := *update.ExecutionReferences
+		summary.ExecutionReferences = &references
 	}
 
 	summary.UpdatedAt = now

@@ -82,6 +82,14 @@ func (s *PostgresStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPla
 	if err != nil {
 		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard tags: %w", err)
 	}
+	fidelityVerdictsJSON, err := json.Marshal(update.FidelityVerdicts)
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard fidelity verdicts: %w", err)
+	}
+	adjustmentReasonsJSON, err := json.Marshal(update.AdjustmentReasonCodes)
+	if err != nil {
+		return strategies.StrategyScorecard{}, fmt.Errorf("marshal strategy scorecard adjustment reasons: %w", err)
+	}
 	query := `
 		UPDATE strategy_scorecards
 		SET actual_delta = $1,
@@ -90,8 +98,15 @@ func (s *PostgresStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPla
 			runtime_seconds = $4,
 			outcome = $5,
 			lesson = $6,
-			tags = $7
-		WHERE followup_plan_id = $8
+			tags = $7,
+			fidelity_verdicts = $8,
+			evidence_eligible = $9,
+			requested_mechanism = $10,
+			realized_mechanism_identity = $11,
+			accepted_spec_hash = $12,
+			realized_effective_hash = $13,
+			adjustment_reason_codes = $14
+		WHERE followup_plan_id = $15
 		RETURNING ` + strategyScorecardSelectColumns() + `
 	`
 	return scanStrategyScorecard(s.db.QueryRowContext(
@@ -104,6 +119,13 @@ func (s *PostgresStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPla
 		update.Outcome,
 		update.Lesson,
 		tagsJSON,
+		fidelityVerdictsJSON,
+		update.EvidenceEligible,
+		update.RequestedMechanism,
+		update.RealizedMechanismIdentity,
+		update.AcceptedSpecHash,
+		update.RealizedEffectiveHash,
+		adjustmentReasonsJSON,
 		followUpPlanID,
 	))
 }

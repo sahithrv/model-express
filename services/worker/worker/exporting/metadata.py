@@ -21,6 +21,7 @@ def build_champion_export_metadata(
     runtime: str | None = None,
     model_kind: str | None = None,
     task_type: str | None = None,
+    execution_contract: dict | None = None,
 ) -> dict:
     """Build additive export metadata; the backend remains responsible for export records."""
     profile = model_profile if isinstance(model_profile, dict) else {}
@@ -58,7 +59,7 @@ def build_champion_export_metadata(
         class_labels=labels,
         confidence_threshold_defaults=confidence_threshold_defaults,
     )
-    return {
+    metadata = {
         "schema_version": "champion_export_metadata_v1",
         "model": str(model_name),
         "model_kind": resolved_model_kind,
@@ -90,6 +91,9 @@ def build_champion_export_metadata(
             "Production runtimes must apply the postprocessing_contract and confidence_threshold_defaults before displaying results.",
         ],
     }
+    if isinstance(execution_contract, dict) and execution_contract:
+        metadata["execution_contract"] = dict(execution_contract)
+    return metadata
 
 
 def build_demo_prediction_payload(

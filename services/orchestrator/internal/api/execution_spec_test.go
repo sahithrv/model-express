@@ -176,7 +176,7 @@ func TestExecutionValidationEnforcePreflightsWholePlanBeforeCreatingJobs(t *test
 	}
 }
 
-func TestAcceptedHashDuplicateDecisionRemainsShadowOnly(t *testing.T) {
+func TestAcceptedHashDuplicateIsSkippedBeforeScheduling(t *testing.T) {
 	baseline := testExperiment("resnet18", 8)
 	equivalent := testExperiment("resnet18", 8)
 	equivalent.ResolutionStrategy = "low_latency"
@@ -186,11 +186,52 @@ func TestAcceptedHashDuplicateDecisionRemainsShadowOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute equivalent experiments: %v", err)
 	}
-	if len(result.Jobs) != 2 || len(result.ValidationReports) != 2 {
-		t.Fatalf("shadow duplicate changed legacy scheduling: jobs=%d reports=%d", len(result.Jobs), len(result.ValidationReports))
+	if len(result.Jobs) != 1 || len(result.ValidationReports) != 2 {
+		t.Fatalf("accepted duplicate was not skipped: jobs=%d reports=%d", len(result.Jobs), len(result.ValidationReports))
 	}
-	if !result.ValidationReports[1].ShadowDuplicate.WouldSkip || len(result.ValidationReports[1].ShadowDuplicate.MatchingJobIDs) != 1 {
-		t.Fatalf("accepted-hash duplicate was not shadow-reported: %#v", result.ValidationReports[1].ShadowDuplicate)
+	if !result.ValidationReports[1].AcceptedDuplicate.Skip || len(result.ValidationReports[1].AcceptedDuplicate.MatchingJobIDs) != 1 {
+		t.Fatalf("accepted-hash duplicate was not reported: %#v", result.ValidationReports[1].AcceptedDuplicate)
+	}
+}
+
+func TestInfrastructureChangesPreserveAcceptedSemanticIdentity(t *testing.T) {
+	baseline := testExperiment("resnet18", 8)
+	server, projectID, firstPlan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{baseline})
+	first, err := server.executeStoredExperimentPlan(
+		firstPlan.ID,
+		executeExperimentPlanRequest{Provider: "modal", GPUType: "T4"},
+	)
+	if err != nil || len(first.Jobs) != 1 {
+		t.Fatalf("execute first plan: jobs=%d err=%v", len(first.Jobs), err)
+	}
+	equivalent := baseline
+	equivalent.ResolutionStrategy = "low_latency"
+	secondPlan, err := server.store.CreateExperimentPlan(
+		projectID,
+		firstPlan.DatasetID,
+		"macro_f1",
+		1,
+		5,
+		[]plans.PlannedExperiment{equivalent},
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := server.executeStoredExperimentPlan(
+		secondPlan.ID,
+		executeExperimentPlanRequest{Provider: "modal", GPUType: "A100"},
+	)
+	if err != nil {
+		t.Fatalf("execute equivalent plan: %v", err)
+	}
+	if len(second.Jobs) != 0 || len(second.ValidationReports) != 1 {
+		t.Fatalf("infrastructure-only duplicate was scheduled: %#v", second)
+	}
+	decision := second.ValidationReports[0].AcceptedDuplicate
+	if !decision.Skip || len(decision.MatchingJobIDs) != 1 || decision.MatchingJobIDs[0] != first.Jobs[0].ID {
+		t.Fatalf("unexpected accepted duplicate decision: %#v", decision)
 	}
 }
 

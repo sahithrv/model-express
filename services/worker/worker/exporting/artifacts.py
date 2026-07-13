@@ -119,6 +119,7 @@ def produce_champion_export_artifacts(
     validation_errors: Iterable[str] | None = None,
     export_self_test_samples: Iterable[dict] | None = None,
     export_self_test_tolerance: dict | None = None,
+    execution_contract: dict | None = None,
 ) -> dict:
     """Create worker-owned export artifacts without touching backend records."""
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -131,6 +132,7 @@ def produce_champion_export_artifacts(
         preprocessing=preprocessing,
         model_profile=model_profile,
         training_config=training_config,
+        execution_contract=execution_contract,
     )
     metadata["input_shape"] = input_shape
     metadata["preprocessing_latency_profile"] = benchmark_preprocessing_latency(metadata)
@@ -226,6 +228,7 @@ def produce_existing_champion_export_manifest(
     sample_input_shape: Iterable[int] | None = None,
     provenance: dict | None = None,
     validation_errors: Iterable[str] | None = None,
+    execution_contract: dict | None = None,
 ) -> dict:
     """Copy an existing worker-visible artifact into a controlled export directory."""
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -238,6 +241,7 @@ def produce_existing_champion_export_manifest(
         preprocessing=preprocessing,
         model_profile=model_profile,
         training_config=training_config,
+        execution_contract=execution_contract,
     )
     metadata["preprocessing_latency_profile"] = benchmark_preprocessing_latency(metadata)
     try:
@@ -775,7 +779,19 @@ def _base_provenance(provenance: dict | None, *, artifact_format: str, source: s
         "source": source,
         "artifact_format": artifact_format,
     }
-    for key in ("source_job_id", "source_export_id", "export_job_id"):
+    for key in (
+        "source_job_id",
+        "source_export_id",
+        "export_job_id",
+        "execution_record_ref",
+        "attempt_id",
+        "task",
+        "capability_version",
+        "accepted_spec_hash",
+        "realized_effective_hash",
+        "fidelity_verdict",
+        "preprocessing_contract_hash",
+    ):
         value = source_data.get(key)
         if value:
             record[key] = str(value)

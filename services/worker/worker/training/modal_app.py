@@ -669,6 +669,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 gpu_type,
                 modal_resources=modal_resource_telemetry,
             ),
+            "execution_references": _training_export_references(export_bundle),
         },
         job=job,
         modal_resources=modal_resources,
@@ -747,6 +748,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
             },
             "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
             "export_bundle": export_bundle,
+            "execution_references": _training_export_references(export_bundle),
             "recommendation_summary": (
                 f"{model_name} finished with macro-F1 {best_macro_f1:.3f}, "
                 f"accuracy {best_accuracy:.3f}, and estimated latency "
@@ -1128,6 +1130,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 gpu_type,
                 modal_resources=modal_resource_telemetry,
             ),
+            "execution_references": _training_export_references(export_bundle),
         },
         job=job,
         modal_resources=modal_resources,
@@ -1189,6 +1192,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 },
             },
             "export_bundle": export_bundle,
+            "execution_references": _training_export_references(export_bundle),
             "recommendation_summary": (
                 f"{model_name} detector finished with mAP50-95 {map50_95:.3f}, "
                 f"mAP50 {map50:.3f}, recall {recall:.3f}, and estimated latency "
@@ -5155,6 +5159,19 @@ def _numeric_tensor_fingerprint(value) -> dict | None:
         "count": len(numbers),
         "sha256": hashlib.sha256(canonical).hexdigest(),
     }
+
+
+def _training_export_references(export_bundle: dict) -> dict:
+    manifest_uri = str(export_bundle.get("manifest_uri") or "").strip()
+    artifact_uri = str(export_bundle.get("artifact_uri") or "").strip()
+    references = {
+        "schema_version": "run_execution_references_v1",
+        "training_artifact_uri": artifact_uri,
+        "training_export_manifest_uri": manifest_uri,
+    }
+    if manifest_uri:
+        references["preprocessing_contract_ref"] = manifest_uri + "#/metadata/preprocessing_contract"
+    return references
 
 
 def _post_training_run_summary(

@@ -145,6 +145,9 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 		championJobID = selectionReview.SelectedJobID
 		summary = selectionReview.SelectedSummary
 	}
+	if selectionReview.SelectedJobID == "" {
+		return fmt.Errorf("%w: no execution-fidelity-eligible successful run is available for automatic champion selection", store.ErrInvalidRequest)
+	}
 	job, err := s.store.GetJob(championJobID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -264,6 +267,20 @@ func (s *Server) persistProjectChampionFromDecision(projectID string, decision d
 			metrics["model"] = model
 		}
 	}
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return err
+	}
+	executionEvidenceByJob, err := s.executionEvidenceForJobs(projectJobs)
+	if err != nil {
+		return err
+	}
+	championExecutionEvidence := executionEvidenceByJob[championJobID]
+	if !championExecutionEvidence.AutomaticChampionEligible {
+		return fmt.Errorf("%w: job %s is not automatic champion eligible: %s", store.ErrInvalidRequest, championJobID, championExecutionEvidence.EligibilityReason)
+	}
+	metrics["execution_evidence"] = championExecutionEvidence
+	deploymentProfile["execution_evidence"] = championExecutionEvidence
 
 	champion, err := s.store.UpsertProjectChampion(runs.ProjectChampionUpsert{
 		ProjectID:         projectID,
@@ -320,6 +337,15 @@ func (s *Server) bestAvailableChampionJobForStoppedProject(projectID string, dec
 	if err != nil {
 		return "", false, err
 	}
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return "", false, err
+	}
+	executionEvidenceByJob, err := s.executionEvidenceForJobs(projectJobs)
+	if err != nil {
+		return "", false, err
+	}
+	summaries = automaticChampionEligibleSummaries(summaries, executionEvidenceByJob)
 	evaluations, err := s.store.ListProjectTrainingRunEvaluations(projectID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return "", false, err
@@ -378,6 +404,15 @@ func (s *Server) selectBestAvailableChampionForTerminalPlanStop(plan plans.Exper
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return false, err
 	}
+	projectJobs, err := s.store.ListProjectJobs(plan.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	executionEvidenceByJob, err := s.executionEvidenceForJobs(projectJobs)
+	if err != nil {
+		return false, err
+	}
+	summaries = automaticChampionEligibleSummaries(summaries, executionEvidenceByJob)
 	evaluations, err := s.store.ListProjectTrainingRunEvaluations(plan.ProjectID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return false, err
@@ -491,6 +526,14 @@ func (s *Server) reviewChampionSelection(projectID, requestedJobID, targetMetric
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return review, err
 	}
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return review, err
+	}
+	executionEvidenceByJob, err := s.executionEvidenceForJobs(projectJobs)
+	if err != nil {
+		return review, err
+	}
 	evaluationsByJob := map[string]runs.TrainingRunEvaluation{}
 	for _, evaluation := range evaluations {
 		evaluationsByJob[evaluation.JobID] = evaluation
@@ -515,15 +558,18 @@ func (s *Server) reviewChampionSelection(projectID, requestedJobID, targetMetric
 		evaluation := evaluationsByJob[summary.JobID]
 		score, breakdown := holisticRunScoreBreakdown(targetMetric, summary, evaluation, objectiveContext)
 		candidate := championSelectionCandidatePayload(summary, breakdown)
+		executionEvidence := executionEvidenceByJob[summary.JobID]
+		candidate["execution_evidence"] = executionEvidence
+		candidate["selection_eligible"] = executionEvidence.AutomaticChampionEligible
 		candidates = append(candidates, candidate)
 		if summary.JobID == requestedJobID {
 			requested = summary
 			requestedFound = true
-			requestedSucceeded = true
+			requestedSucceeded = executionEvidence.AutomaticChampionEligible
 			review.RequestedScore = score
 			review.RequestedBreakdown = breakdown
 		}
-		if !hasBest || score > bestScore || (score == bestScore && summary.EstimatedCostUSD < best.EstimatedCostUSD) {
+		if executionEvidence.AutomaticChampionEligible && (!hasBest || score > bestScore || (score == bestScore && summary.EstimatedCostUSD < best.EstimatedCostUSD)) {
 			best = summary
 			bestScore = score
 			review.SelectedBreakdown = breakdown
@@ -649,6 +695,10 @@ func (s *Server) ensureChampionExport(
 	requestArtifactURI string,
 	requestMetadata map[string]any,
 ) (runs.ChampionExport, error) {
+	executionContract, err := s.championExportExecutionContract(champion.JobID)
+	if err != nil {
+		return runs.ChampionExport{}, fmt.Errorf("%w: champion export requires finalized preprocessing evidence: %v", store.ErrInvalidRequest, err)
+	}
 	requestArtifactURI = strings.TrimSpace(requestArtifactURI)
 	sourceArtifactURI := requestArtifactURI
 	if sourceArtifactURI == "" {
@@ -656,6 +706,11 @@ func (s *Server) ensureChampionExport(
 	}
 	artifactURI := ""
 	profileReady := championDeploymentProfileHasReadyExport(champion.DeploymentProfile, format, sourceArtifactURI)
+	if executionContract != nil {
+		// Versioned exports must pass through a fresh worker manifest so the
+		// artifact is cryptographically tied to the finalized execution receipt.
+		profileReady = false
+	}
 	if requestArtifactURI != "" || (artifactMatchesChampionExportFormat(sourceArtifactURI, format) && trustedChampionExportArtifactURI(sourceArtifactURI) && profileReady) {
 		artifactURI = sourceArtifactURI
 	}
@@ -673,6 +728,10 @@ func (s *Server) ensureChampionExport(
 	}
 
 	metadata := championExportMetadata(champion, format, requestMetadata)
+	if executionContract != nil {
+		metadata = compactChampionExportMetadata(champion, format, requestMetadata)
+		metadata["execution_contract"] = executionContract
+	}
 	if sourceArtifactURI != "" && sourceArtifactURI != artifactURI {
 		metadata["source_artifact_uri"] = sourceArtifactURI
 	}
@@ -700,6 +759,13 @@ func (s *Server) ensureChampionExport(
 			"artifact_uri":        artifactURI,
 			"source_artifact_uri": sourceArtifactURI,
 			"metadata":            metadata,
+		}
+		if executionContract != nil {
+			exportJobConfig["execution_contract"] = executionContract
+			exportJobConfig["model"] = firstNonEmptyString(
+				payloadString(champion.Metrics, "model"),
+				jobConfigString(championJob.Config, "model"),
+			)
 		}
 		if _, err := s.ensureOpenJob(champion.ProjectID, jobs.TemplateExportChampion, exportJobConfig, func(existing jobs.ExperimentJob) bool {
 			return jobConfigString(existing.Config, "export_id") == export.ID
@@ -1342,6 +1408,12 @@ func validateChampionExportReadyResult(job jobs.ExperimentJob, export runs.Champ
 	}
 	if !championExportManifestHasProvenance(manifest, job.ID, export.ID) {
 		return fmt.Errorf("%w: worker export manifest provenance does not match the export job", store.ErrInvalidRequest)
+	}
+	if len(nonEmptyStringValues(req.ValidationErrors)) > 0 || !championExportValidationErrorsEmpty(req.Metadata, manifest) {
+		return fmt.Errorf("%w: READY worker export must not contain validation errors", store.ErrInvalidRequest)
+	}
+	if err := validateChampionExportExecutionContract(payloadMap(job.Config, "execution_contract"), manifest); err != nil {
+		return fmt.Errorf("%w: %v", store.ErrInvalidRequest, err)
 	}
 	if championExportManifestSelfTestFailed(manifest) {
 		return fmt.Errorf("%w: worker export manifest ONNX self-test failed", store.ErrInvalidRequest)

@@ -58,17 +58,27 @@ func TestMemoryStoreStrategyScorecardHydratesMechanismFields(t *testing.T) {
 	}
 
 	updated, err := store.UpdateStrategyScorecardOutcomeByFollowUpPlan("plan_followup", strategies.StrategyScorecardOutcomeUpdate{
-		ActualDelta:     0.04,
-		ConfidenceAfter: 0.7,
-		Outcome:         strategies.OutcomeMinorImprovement,
-		Lesson:          "Resolution and crop changes helped.",
-		Tags:            []string{"resolution_crop", "minor_improvement"},
+		ActualDelta:               0.04,
+		ConfidenceAfter:           0.7,
+		Outcome:                   strategies.OutcomeMinorImprovement,
+		Lesson:                    "Resolution and crop changes helped.",
+		Tags:                      []string{"resolution_crop", "minor_improvement"},
+		FidelityVerdicts:          []string{"APPROVED_ADJUSTMENT"},
+		EvidenceEligible:          true,
+		RequestedMechanism:        "resolution_crop",
+		RealizedMechanismIdentity: "sha256:realized",
+		AcceptedSpecHash:          "sha256:accepted",
+		RealizedEffectiveHash:     "sha256:realized",
+		AdjustmentReasonCodes:     []string{"batch_size_reduced_by_resource_recovery"},
 	})
 	if err != nil {
 		t.Fatalf("UpdateStrategyScorecardOutcomeByFollowUpPlan() error = %v", err)
 	}
 	if updated.Mechanism != scorecard.Mechanism || updated.Intervention != scorecard.Intervention || updated.ExpectedEffect != scorecard.ExpectedEffect {
 		t.Fatalf("update should preserve mechanism fields, got %#v", updated)
+	}
+	if !updated.EvidenceEligible || !reflect.DeepEqual(updated.FidelityVerdicts, []string{"APPROVED_ADJUSTMENT"}) || updated.RequestedMechanism != "resolution_crop" || updated.RealizedMechanismIdentity != "sha256:realized" {
+		t.Fatalf("fidelity outcome fields were not persisted: %#v", updated)
 	}
 }
 

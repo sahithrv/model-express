@@ -243,7 +243,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			if err != nil {
 				return executeExperimentPlanResponse{}, fmt.Errorf("validate execution spec: %w", err)
 			}
-			report.SetShadowDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs))
+			report.SetAcceptedDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs))
 			if report.WouldBlock {
 				s.recordExecutionValidationReport(plan, index, report)
 				return executeExperimentPlanResponse{}, fmt.Errorf(
@@ -328,7 +328,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			if err != nil {
 				return executeExperimentPlanResponse{}, fmt.Errorf("validate execution spec: %w", err)
 			}
-			report.SetShadowDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs, out))
+			report.SetAcceptedDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs, out))
 			config[execution.ExecutionValidationConfigKey] = report
 			validationReports = append(validationReports, report)
 			s.recordExecutionValidationReport(plan, index, report)
@@ -337,6 +337,9 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 					"%w: experiment %d would be blocked by execution fidelity enforcement: %s",
 					store.ErrInvalidRequest, index, executionValidationSummary(report),
 				)
+			}
+			if report.AcceptedDuplicate.Skip {
+				continue
 			}
 		}
 		if metadataImport, err := s.store.GetActiveDatasetMetadataImport(plan.DatasetID); err == nil {
@@ -604,10 +607,16 @@ func (s *Server) recordExecutionValidationReport(plan plans.ExperimentPlan, expe
 			"would_block": finding.WouldBlock,
 		})
 	}
-	if len(report.Findings) == 0 && !report.ShadowDuplicate.WouldSkip {
+	if len(report.Findings) == 0 && !report.AcceptedDuplicate.Skip {
 		return
 	}
 	message := fmt.Sprintf("Execution fidelity validation reported %d finding(s) for experiment %d.", len(report.Findings), experimentIndex)
+	if report.AcceptedDuplicate.Skip {
+		message = fmt.Sprintf(
+			"Experiment %d was skipped because its accepted execution semantics duplicate an existing job.",
+			experimentIndex,
+		)
+	}
 	if report.Mode == execution.ValidationModeEnforce && report.WouldBlock {
 		message = fmt.Sprintf("Execution fidelity enforcement would block experiment %d.", experimentIndex)
 	}

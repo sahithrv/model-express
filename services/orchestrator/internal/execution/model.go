@@ -12,6 +12,9 @@ const (
 	ExecutionVerdictApprovedAdjustment = "APPROVED_ADJUSTMENT"
 	ExecutionVerdictMismatch           = "MISMATCH"
 	ExecutionVerdictSimulated          = "SIMULATED"
+	ExecutionVerdictUnverified         = "UNVERIFIED"
+
+	ExecutionAdjustmentReasonBatchSizeReduced = "batch_size_reduced_by_resource_recovery"
 
 	ExecutionObservationInitialized = "INITIALIZED"
 	ExecutionObservationFinalized   = "FINALIZED"
@@ -43,6 +46,7 @@ type AttemptExecutionRecord struct {
 	LifecycleStatus       string                   `json:"lifecycle_status"`
 	FidelityVerdict       *string                  `json:"fidelity_verdict"`
 	RealizedEffectiveHash string                   `json:"realized_effective_hash,omitempty"`
+	AdjustmentReasonCodes []string                 `json:"adjustment_reason_codes,omitempty"`
 	LatestRealizedConfig  map[string]any           `json:"latest_realized_config,omitempty"`
 	CreatedAt             time.Time                `json:"created_at"`
 	UpdatedAt             time.Time                `json:"updated_at"`
@@ -60,6 +64,7 @@ type RealizationObservation struct {
 	FrameworkArguments    map[string]any `json:"framework_arguments,omitempty"`
 	Evidence              map[string]any `json:"evidence,omitempty"`
 	AdjustmentPolicy      string         `json:"adjustment_policy,omitempty"`
+	AdjustmentReasonCodes []string       `json:"adjustment_reason_codes,omitempty"`
 	Simulated             bool           `json:"simulated,omitempty"`
 	RealizedEffectiveHash string         `json:"realized_effective_hash"`
 	FidelityVerdict       string         `json:"fidelity_verdict"`
