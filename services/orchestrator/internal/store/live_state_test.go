@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -31,6 +33,9 @@ func TestMemoryProjectLiveStateTracksCurrentAttemptsAndAggregates(t *testing.T) 
 	if len(queued.ActiveProgress) != 1 || queued.ActiveProgress[0].Progress.Stage != jobs.ProgressStageQueued {
 		t.Fatalf("queued progress = %#v", queued.ActiveProgress)
 	}
+	if !queued.ActiveProgress[0].ElapsedStartedAt.Equal(job.CreatedAt) {
+		t.Fatalf("queued elapsed start = %s, want creation %s", queued.ActiveProgress[0].ElapsedStartedAt, job.CreatedAt)
+	}
 
 	assigned, err := s.PollJob(worker.ID, JobPollFilter{})
 	if err != nil {
@@ -42,6 +47,9 @@ func TestMemoryProjectLiveStateTracksCurrentAttemptsAndAggregates(t *testing.T) 
 	}
 	if active.ActiveProgress[0].Progress.Attempt != assigned.Attempt || active.ActiveProgress[0].Progress.Stage != jobs.ProgressStageWorkerStarting {
 		t.Fatalf("active attempt progress = %#v", active.ActiveProgress[0])
+	}
+	if assigned.StartedAt == nil || !active.ActiveProgress[0].ElapsedStartedAt.Equal(*assigned.StartedAt) {
+		t.Fatalf("assigned elapsed start = %s, want started_at %v", active.ActiveProgress[0].ElapsedStartedAt, assigned.StartedAt)
 	}
 
 	retried, requeued, err := s.RetryJob(job.ID, "retry", RetryJobOptions{})
@@ -134,6 +142,61 @@ func TestPostgresProjectLiveStateReadPlanIsRepeatableAndFixed(t *testing.T) {
 	if !strings.Contains(text, "LIMIT 8") || !strings.Contains(text, "executionEventV2SelectColumns()") {
 		t.Fatal("PostgreSQL live state must cap progress and reuse the safe event projection")
 	}
+	if !strings.Contains(text, "COALESCE(job.started_at, job.created_at)") {
+		t.Fatal("PostgreSQL live state must derive elapsed start from started_at with a created_at fallback")
+	}
+}
+
+func TestScanProjectLiveStateProgressKeepsElapsedWorkerAndLeaseTimesAligned(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	elapsedStartedAt := now.Add(-10 * time.Minute)
+	workerHeartbeat := now.Add(-20 * time.Second)
+	leaseHeartbeat := now.Add(-10 * time.Second)
+	row := fixedLiveStateProgressRow{values: []any{
+		3,
+		"project_1", "job_1", 2,
+		jobs.ProgressTaxonomyVersion, jobs.ProgressStageTraining, "epoch.complete",
+		jobs.ProgressStatusRunning, sql.NullInt64{Int64: 2, Valid: true}, sql.NullInt64{Int64: 5, Valid: true}, "epoch",
+		"Training is running.", int64(9), now, now, []byte(`{"provider":"local"}`),
+		jobs.StatusRunning, elapsedStartedAt,
+		sql.NullTime{Time: workerHeartbeat, Valid: true}, sql.NullTime{Time: leaseHeartbeat, Valid: true},
+	}}
+
+	item, total, err := scanProjectLiveStateProgress(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || !item.ElapsedStartedAt.Equal(elapsedStartedAt) {
+		t.Fatalf("total/elapsed = %d/%s, want 3/%s", total, item.ElapsedStartedAt, elapsedStartedAt)
+	}
+	if item.WorkerHeartbeatAt == nil || !item.WorkerHeartbeatAt.Equal(workerHeartbeat) {
+		t.Fatalf("worker heartbeat misaligned: %v", item.WorkerHeartbeatAt)
+	}
+	if item.LeaseHeartbeatAt == nil || !item.LeaseHeartbeatAt.Equal(leaseHeartbeat) {
+		t.Fatalf("lease heartbeat misaligned: %v", item.LeaseHeartbeatAt)
+	}
+}
+
+type fixedLiveStateProgressRow struct {
+	values []any
+}
+
+func (r fixedLiveStateProgressRow) Scan(dest ...any) error {
+	if len(dest) != len(r.values) {
+		return fmt.Errorf("scan destination count = %d, want %d", len(dest), len(r.values))
+	}
+	for index, value := range r.values {
+		target := reflect.ValueOf(dest[index])
+		if target.Kind() != reflect.Pointer || target.IsNil() {
+			return fmt.Errorf("scan destination %d is not a pointer", index)
+		}
+		source := reflect.ValueOf(value)
+		if !source.Type().AssignableTo(target.Elem().Type()) {
+			return fmt.Errorf("scan value %d type %s is not assignable to %s", index, source.Type(), target.Elem().Type())
+		}
+		target.Elem().Set(source)
+	}
+	return nil
 }
 
 func TestPostgresProjectLiveStateParityIntegration(t *testing.T) {
@@ -160,6 +223,9 @@ func TestPostgresProjectLiveStateParityIntegration(t *testing.T) {
 	gotProgress := got.ActiveProgress[0].Progress
 	if gotProgress.Attempt != wantProgress.Attempt || gotProgress.TaxonomyVersion != wantProgress.TaxonomyVersion || gotProgress.Stage != wantProgress.Stage || gotProgress.DetailCode != wantProgress.DetailCode || gotProgress.Revision != wantProgress.Revision || !reflect.DeepEqual(gotProgress.Metadata, wantProgress.Metadata) {
 		t.Fatalf("memory/postgres progress differs:\nmemory=%#v\npostgres=%#v", wantProgress, gotProgress)
+	}
+	if got.ActiveProgress[0].ElapsedStartedAt.IsZero() || want.ActiveProgress[0].ElapsedStartedAt.IsZero() {
+		t.Fatalf("memory/postgres elapsed starts missing: memory=%s postgres=%s", want.ActiveProgress[0].ElapsedStartedAt, got.ActiveProgress[0].ElapsedStartedAt)
 	}
 	if got.LatestEvent == nil || want.LatestEvent == nil || got.LatestEvent.EventType != want.LatestEvent.EventType {
 		t.Fatalf("memory/postgres latest event differs: memory=%#v postgres=%#v", want.LatestEvent, got.LatestEvent)

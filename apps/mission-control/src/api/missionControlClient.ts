@@ -3,13 +3,18 @@ import liveRequestPlan from "./liveRequestPlan.json";
 export type MissionControlRequestReason =
   | "activity_event"
   | "active_poll"
+  | "fallback_poll"
   | "idle_poll"
   | "initial_load"
   | "manual_refresh"
   | "project_change"
+  | "rollback_poll"
   | "stream_initial"
   | "stream_reconnect"
   | "targeted"
+  | "targeted_invalidation"
+  | "v2_cursor_recovery"
+  | "v2_snapshot"
   | "unspecified";
 
 export type RequestOptions = {
@@ -18,6 +23,7 @@ export type RequestOptions = {
   bypassCache?: boolean;
   cacheTtlMs?: number;
   diagnosticReason?: MissionControlRequestReason;
+  signal?: AbortSignal;
 };
 
 export type CachedGetRequest = {
@@ -36,6 +42,35 @@ export type OrchestratorHttpErrorResponse = {
   url?: string;
   payload?: unknown;
 };
+
+export class OrchestratorHttpError extends Error {
+  readonly status: number;
+  readonly reasonCode: string;
+
+  constructor(response: OrchestratorHttpErrorResponse) {
+    const statusText = response.statusText ? ` ${response.statusText}` : "";
+    const message = response.message || "request failed";
+    const requestPath = response.path ? ` (${response.path})` : "";
+    super(`${response.status}${statusText} ${message}${requestPath}`);
+    this.name = "OrchestratorHttpError";
+    this.status = response.status;
+    this.reasonCode = httpErrorReasonCode(response.payload);
+  }
+}
+
+export function isUnsupportedIncrementalStatus(status: number): boolean {
+  return status === 404 || status === 405 || status === 501;
+}
+
+export function isCursorRecoveryStatus(status: number): boolean {
+  return status === 400 || status === 409 || status === 410;
+}
+
+export function httpErrorReasonCode(payload: unknown): string {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
+  const value = (payload as { reason_code?: unknown }).reason_code;
+  return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : "";
+}
 
 const expensiveGetCacheTtlMs = 15_000;
 

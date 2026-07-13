@@ -12821,3 +12821,258 @@ body,
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Compact, server-authoritative v2 project progress. */
+.live-progress-panel {
+  display: grid;
+  grid-template-columns: minmax(250px, 1.4fr) auto auto;
+  align-items: center;
+  gap: 12px 18px;
+  min-width: 0;
+  border: 1px solid rgba(34, 229, 139, 0.2);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 12px 14px;
+  color: #dbe8e3;
+  background:
+    linear-gradient(90deg, rgba(34, 229, 139, 0.06), transparent 34%),
+    rgba(6, 14, 18, 0.96);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.live-progress-summary {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.live-progress-state-mark {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(34, 229, 139, 0.34);
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px rgba(34, 229, 139, 0.08), 0 0 18px rgba(34, 229, 139, 0.28);
+}
+
+.live-progress-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.live-progress-copy > small,
+.live-progress-facts dt {
+  color: #7f908d;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.live-progress-copy > strong {
+  color: #f5fffa;
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.live-progress-copy > span {
+  overflow: hidden;
+  color: #aab9b4;
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-progress-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.live-progress-state-badge,
+.live-progress-connection-badge,
+.live-progress-mode-badge,
+.live-progress-taxonomy-badge,
+.live-progress-epoch > span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 25px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: #b9c8c3;
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.live-progress-state-badge.state-active,
+.live-progress-connection-badge.connected {
+  border-color: rgba(34, 229, 139, 0.22);
+  color: #76edb5;
+  background: rgba(34, 229, 139, 0.09);
+}
+
+.live-progress-state-badge.state-queued,
+.live-progress-state-badge.state-retrying,
+.live-progress-connection-badge.pending {
+  border-color: rgba(217, 170, 67, 0.25);
+  color: #e8c670;
+  background: rgba(217, 170, 67, 0.09);
+}
+
+.live-progress-state-badge.state-stale,
+.live-progress-connection-badge.fallback {
+  border-color: rgba(255, 196, 84, 0.34);
+  color: #ffd166;
+  background: rgba(255, 196, 84, 0.12);
+}
+
+.live-progress-state-badge.state-blocked,
+.live-progress-panel.terminal-failed .live-progress-state-badge,
+.live-progress-panel.terminal-cancelled .live-progress-state-badge {
+  border-color: rgba(255, 104, 117, 0.3);
+  color: #ff9ca5;
+  background: rgba(255, 104, 117, 0.1);
+}
+
+.live-progress-state-badge.mixed {
+  border-color: rgba(125, 183, 255, 0.3);
+  color: #9ac8ff;
+  background: rgba(125, 183, 255, 0.1);
+}
+
+.live-progress-mode-badge,
+.live-progress-taxonomy-badge {
+  color: #8d9c98;
+}
+
+.live-progress-epoch {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.live-progress-epoch > span {
+  min-height: 30px;
+  border-color: rgba(125, 183, 255, 0.25);
+  padding-inline: 11px;
+  color: #b7d7ff;
+  background: rgba(125, 183, 255, 0.08);
+  font-size: 12px;
+}
+
+.live-progress-facts {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 7px;
+  margin: 0;
+}
+
+.live-progress-facts > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.055);
+  padding-top: 7px;
+}
+
+.live-progress-facts dd {
+  overflow: hidden;
+  margin: 0;
+  color: #dce8e4;
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-progress-panel.state-stale {
+  border-color: rgba(255, 196, 84, 0.42);
+  border-left-color: #ffd166;
+  background:
+    repeating-linear-gradient(-45deg, rgba(255, 196, 84, 0.035), rgba(255, 196, 84, 0.035) 6px, transparent 6px, transparent 12px),
+    rgba(18, 15, 7, 0.96);
+}
+
+.live-progress-panel.state-stale .live-progress-state-mark {
+  border-radius: 2px;
+  border-color: rgba(255, 196, 84, 0.42);
+  background: #ffd166;
+  box-shadow: 0 0 0 4px rgba(255, 196, 84, 0.08);
+  transform: rotate(45deg);
+}
+
+.live-progress-panel.state-stale .stale-reason dd {
+  color: #ffe09a;
+  font-weight: 750;
+}
+
+.live-progress-panel.state-blocked,
+.live-progress-panel.terminal-failed,
+.live-progress-panel.terminal-cancelled {
+  border-color: rgba(255, 104, 117, 0.38);
+  border-left-color: #ff6875;
+  background:
+    linear-gradient(90deg, rgba(255, 104, 117, 0.075), transparent 36%),
+    rgba(18, 8, 11, 0.96);
+}
+
+.live-progress-panel.state-blocked .live-progress-state-mark,
+.live-progress-panel.terminal-failed .live-progress-state-mark,
+.live-progress-panel.terminal-cancelled .live-progress-state-mark {
+  border-color: rgba(255, 104, 117, 0.42);
+  background: #ff6875;
+  box-shadow: 0 0 0 4px rgba(255, 104, 117, 0.08);
+}
+
+.live-progress-panel.state-blocked .blocked-reason dd {
+  color: #ffb1b8;
+  font-weight: 750;
+}
+
+.live-progress-panel.state-retrying {
+  border-left-color: #e1b44e;
+}
+
+.live-progress-panel.mixed {
+  box-shadow: inset 0 -2px 0 rgba(125, 183, 255, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+@media (max-width: 1050px) {
+  .live-progress-panel {
+    grid-template-columns: minmax(240px, 1fr) auto;
+  }
+
+  .live-progress-epoch {
+    grid-column: 2;
+  }
+}
+
+@media (max-width: 720px) {
+  .live-progress-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .live-progress-badges,
+  .live-progress-epoch {
+    grid-column: 1;
+    justify-content: flex-start;
+  }
+
+  .live-progress-copy > span,
+  .live-progress-facts dd {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+  }
+}

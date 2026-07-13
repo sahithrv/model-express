@@ -302,7 +302,7 @@ func listProjectExecutionEventsAfterQuery() string {
 }
 
 func executionEventV2SelectColumns() string {
-	return "id, project_id, plan_id, event_type, left(message, 512), " + executionEventV2PayloadProjectionSQL() + ", created_at, sequence"
+	return "id, project_id, plan_id, event_type, left(message, 512), " + executionEventV2PayloadProjectionSQL() + ", created_at, sequence, idempotency_key"
 }
 
 func executionEventV2PayloadProjectionSQL() string {
@@ -360,6 +360,7 @@ func scanExecutionEventV2(row rowScanner) (execution.ExecutionEvent, error) {
 		&payloadJSON,
 		&event.CreatedAt,
 		&event.Sequence,
+		&event.IdempotencyKey,
 	); err != nil {
 		return execution.ExecutionEvent{}, normalizeSQLError(err)
 	}

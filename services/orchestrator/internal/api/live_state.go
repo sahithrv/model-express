@@ -47,21 +47,22 @@ type projectLiveStateEnvelope struct {
 }
 
 type projectLiveStateProgress struct {
-	JobID           string         `json:"job_id"`
-	Attempt         int            `json:"attempt"`
-	TaxonomyVersion int            `json:"taxonomy_version"`
-	Stage           string         `json:"stage"`
-	DetailCode      string         `json:"detail_code,omitempty"`
-	Status          string         `json:"status"`
-	Current         *int64         `json:"current,omitempty"`
-	Total           *int64         `json:"total,omitempty"`
-	Unit            string         `json:"unit,omitempty"`
-	Message         string         `json:"message,omitempty"`
-	Revision        int64          `json:"revision"`
-	HeartbeatAt     time.Time      `json:"heartbeat_at"`
-	UpdatedAt       time.Time      `json:"updated_at"`
-	Stale           bool           `json:"stale"`
-	Metadata        map[string]any `json:"metadata"`
+	JobID            string         `json:"job_id"`
+	Attempt          int            `json:"attempt"`
+	TaxonomyVersion  int            `json:"taxonomy_version"`
+	Stage            string         `json:"stage"`
+	DetailCode       string         `json:"detail_code,omitempty"`
+	Status           string         `json:"status"`
+	Current          *int64         `json:"current,omitempty"`
+	Total            *int64         `json:"total,omitempty"`
+	Unit             string         `json:"unit,omitempty"`
+	Message          string         `json:"message,omitempty"`
+	Revision         int64          `json:"revision"`
+	HeartbeatAt      time.Time      `json:"heartbeat_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+	ElapsedStartedAt time.Time      `json:"elapsed_started_at"`
+	Stale            bool           `json:"stale"`
+	Metadata         map[string]any `json:"metadata"`
 }
 
 func (s *Server) getProjectLiveState(c *gin.Context) {
@@ -113,21 +114,22 @@ func projectLiveStateProjection(snapshot store.ProjectLiveStateSnapshot) project
 			snapshot.ObservedAt.Sub(heartbeat) > projectLiveStateStaleAfter
 		progress := active.Progress
 		response.ActiveProgress = append(response.ActiveProgress, projectLiveStateProgress{
-			JobID:           activitySafeIdentifier(progress.JobID),
-			Attempt:         progress.Attempt,
-			TaxonomyVersion: progress.TaxonomyVersion,
-			Stage:           liveStateStage(progress.Stage),
-			DetailCode:      liveStateToken(progress.DetailCode),
-			Status:          liveStateToken(progress.Status),
-			Current:         cloneAPIInt64Pointer(progress.Current),
-			Total:           cloneAPIInt64Pointer(progress.Total),
-			Unit:            liveStateToken(progress.Unit),
-			Message:         activitySafeText(progress.Message, 220),
-			Revision:        progress.Revision,
-			HeartbeatAt:     progress.HeartbeatAt.UTC(),
-			UpdatedAt:       progress.UpdatedAt.UTC(),
-			Stale:           stale,
-			Metadata:        projectLiveStateProgressMetadata(progress.Metadata),
+			JobID:            activitySafeIdentifier(progress.JobID),
+			Attempt:          progress.Attempt,
+			TaxonomyVersion:  progress.TaxonomyVersion,
+			Stage:            liveStateStage(progress.Stage),
+			DetailCode:       liveStateToken(progress.DetailCode),
+			Status:           liveStateToken(progress.Status),
+			Current:          cloneAPIInt64Pointer(progress.Current),
+			Total:            cloneAPIInt64Pointer(progress.Total),
+			Unit:             liveStateToken(progress.Unit),
+			Message:          activitySafeText(progress.Message, 220),
+			Revision:         progress.Revision,
+			HeartbeatAt:      progress.HeartbeatAt.UTC(),
+			UpdatedAt:        progress.UpdatedAt.UTC(),
+			ElapsedStartedAt: active.ElapsedStartedAt.UTC(),
+			Stale:            stale,
+			Metadata:         projectLiveStateProgressMetadata(progress.Metadata),
 		})
 		response.Stale = response.Stale || stale
 		if response.LastHeartbeatAt == nil || heartbeat.After(*response.LastHeartbeatAt) {

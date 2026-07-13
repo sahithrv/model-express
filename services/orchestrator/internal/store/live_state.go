@@ -44,9 +44,11 @@ type LiveStateRequirementCounts struct {
 // Job configuration is used by the store to select that attempt but is never
 // included in the API projection.
 type LiveStateActiveProgress struct {
-	Progress          jobs.JobProgress
-	JobStatus         string
-	JobCreatedAt      time.Time
+	Progress  jobs.JobProgress
+	JobStatus string
+	// ElapsedStartedAt is backend-owned job.started_at, or job.created_at while
+	// the job has not started yet.
+	ElapsedStartedAt  time.Time
 	WorkerHeartbeatAt *time.Time
 	LeaseHeartbeatAt  *time.Time
 }
@@ -125,10 +127,14 @@ func (s *MemoryStore) GetProjectLiveState(ctx context.Context, projectID string)
 		candidates = candidates[:ProjectLiveStateProgressLimit]
 	}
 	for _, candidate := range candidates {
+		elapsedStartedAt := candidate.job.CreatedAt.UTC()
+		if candidate.job.StartedAt != nil {
+			elapsedStartedAt = candidate.job.StartedAt.UTC()
+		}
 		snapshot.ActiveProgress = append(snapshot.ActiveProgress, LiveStateActiveProgress{
 			Progress:          candidate.progress,
 			JobStatus:         candidate.job.Status,
-			JobCreatedAt:      candidate.job.CreatedAt,
+			ElapsedStartedAt:  elapsedStartedAt,
 			WorkerHeartbeatAt: cloneTimePointer(candidate.workerHeartbeat),
 			LeaseHeartbeatAt:  cloneTimePointer(candidate.job.LeaseLastHeartbeatAt),
 		})
@@ -156,7 +162,6 @@ func (s *MemoryStore) GetProjectLiveState(ctx context.Context, projectID string)
 		projected := event
 		projected.Message = boundedExecutionEventProjectionText(event.Message, 512)
 		projected.Payload = executionEventStreamPayloadProjection(event.Payload)
-		projected.IdempotencyKey = ""
 		snapshot.LatestEvent = &projected
 	}
 	return snapshot, nil

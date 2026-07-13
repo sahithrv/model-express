@@ -4,26 +4,46 @@ const LIVE_REQUEST_PLAN = require("../src/api/liveRequestPlan.json");
 const REQUEST_REASON_CODES = new Set([
   "activity_event",
   "active_poll",
+  "fallback_poll",
   "idle_poll",
   "initial_load",
   "manual_refresh",
   "project_change",
+  "rollback_poll",
   "stream_initial",
   "stream_reconnect",
   "targeted",
+  "targeted_invalidation",
+  "v2_cursor_recovery",
+  "v2_snapshot",
   "unspecified",
 ]);
 
 const BROAD_GET_REASON_CODES = new Set([
   "activity_event",
   "active_poll",
+  "fallback_poll",
   "idle_poll",
   "initial_load",
   "manual_refresh",
   "project_change",
+  "rollback_poll",
 ]);
 
-const BASELINE_FAST_REFRESH_REQUESTS = Object.values(LIVE_REQUEST_PLAN).map((entry) => ({
+const LEGACY_BASELINE_REQUEST_KEYS = [
+  "health",
+  "projectIndex",
+  "workerRequirements",
+  "datasets",
+  "jobs",
+  "plans",
+  "trainingRunSummaries",
+  "champion",
+  "workers",
+  "executionEvents",
+  "jobMetrics",
+];
+const BASELINE_FAST_REFRESH_REQUESTS = LEGACY_BASELINE_REQUEST_KEYS.map((key) => LIVE_REQUEST_PLAN[key]).map((entry) => ({
   path: entry.template
     .replace("{project_id}", "project-baseline")
     .replace("{job_id}", "job-baseline"),
@@ -43,6 +63,8 @@ function classifyEndpointCategory(requestPath) {
   if (pathname === "/settings/automation") return "settings";
   if (/^\/jobs\/[^/]+\/metrics$/.test(pathname)) return "job_metrics";
   if (/^\/projects\/[^/]+\/activity-stream$/.test(pathname)) return "activity_stream";
+  if (/^\/projects\/[^/]+\/live-state$/.test(pathname)) return "project_live_state";
+  if (/^\/projects\/[^/]+\/events\/stream\/v2$/.test(pathname)) return "execution_event_stream_v2";
   if (
     /^\/projects\/[^/]+\/(?:datasets|jobs|plans|training-run-summaries|workers|worker-requirements|execution-events)$/.test(pathname) ||
     /^\/projects\/[^/]+\/champion$/.test(pathname)
@@ -188,7 +210,7 @@ function sortedCounts(counts) {
 
 function normalizedMethodCode(method) {
   const value = String(method ?? "GET").trim().toUpperCase();
-  return ["GET", "POST", "PATCH", "DELETE"].includes(value) ? value : "OTHER";
+  return ["GET", "HEAD", "POST", "PATCH", "DELETE"].includes(value) ? value : "OTHER";
 }
 
 function finiteNonNegative(value) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,8 @@ func TestProjectLiveStateOperationalStates(t *testing.T) {
 	now := time.Now().UTC()
 	progress := func(stage string, heartbeat time.Time) store.LiveStateActiveProgress {
 		return store.LiveStateActiveProgress{
-			JobStatus: jobs.StatusRunning,
+			JobStatus:        jobs.StatusRunning,
+			ElapsedStartedAt: heartbeat.Add(-5 * time.Minute),
 			Progress: jobs.JobProgress{
 				JobID: "job_1", Attempt: 1, TaxonomyVersion: jobs.ProgressTaxonomyVersion,
 				Stage: stage, Status: jobs.ProgressStatusRunning, Revision: 3,
@@ -61,6 +63,9 @@ func TestProjectLiveStateOperationalStates(t *testing.T) {
 				if active.TaxonomyVersion != jobs.ProgressTaxonomyVersion || !jobs.IsJobProgressStage(active.Stage) {
 					t.Fatalf("invalid progress taxonomy: %#v", active)
 				}
+				if active.ElapsedStartedAt.IsZero() || !active.ElapsedStartedAt.Before(active.UpdatedAt) {
+					t.Fatalf("active progress lost elapsed start: %#v", active)
+				}
 			}
 		})
 	}
@@ -102,7 +107,7 @@ func TestProjectLiveStateEndpointIsBoundedRedactedAndCacheable(t *testing.T) {
 			}
 		}
 	}
-	if _, err := memoryStore.CreateExecutionEvent(
+	latestEvent, err := memoryStore.CreateExecutionEvent(
 		project.ID,
 		"",
 		execution.EventDispatcherStatus,
@@ -114,7 +119,8 @@ func TestProjectLiveStateEndpointIsBoundedRedactedAndCacheable(t *testing.T) {
 			"storage_uri": "s3://secret-bucket/dataset.zip",
 			"raw_config":  map[string]any{"secret": "value"},
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,12 +138,12 @@ func TestProjectLiveStateEndpointIsBoundedRedactedAndCacheable(t *testing.T) {
 		t.Fatalf("live state body = %d bytes, want <= %d", response.Body.Len(), projectLiveStateMaxSafeBytes)
 	}
 	body := response.Body.String()
-	for _, forbidden := range []string{"private prompt", "secret-bucket", "/tmp/private", "storage_uri", "raw_config"} {
+	for _, forbidden := range []string{"private prompt", "secret-bucket", "/tmp/private", "storage_uri", "raw_config", latestEvent.IdempotencyKey} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("live state leaked %q: %s", forbidden, body)
 		}
 	}
-	for _, required := range []string{`"provider":"local"`, `"execution_mode":"local_simulator"`, `"active_progress_truncated":true`, `"snapshot_cursor"`} {
+	for _, required := range []string{`"provider":"local"`, `"execution_mode":"local_simulator"`, `"active_progress_truncated":true`, `"snapshot_cursor"`, `"elapsed_started_at"`, `"idempotency_key":"ik_`} {
 		if !strings.Contains(body, required) {
 			t.Fatalf("live state missing %s: %s", required, body)
 		}
@@ -164,6 +170,14 @@ func TestProjectLiveStateEndpointIsBoundedRedactedAndCacheable(t *testing.T) {
 	}
 	if len(decoded.ActiveProgress) != store.ProjectLiveStateProgressLimit || decoded.ActiveProgressTotal != 180 {
 		t.Fatalf("bounded active progress = %d/%d", len(decoded.ActiveProgress), decoded.ActiveProgressTotal)
+	}
+	if decoded.LatestImportantEvent == nil || !regexp.MustCompile(`^ik_[0-9a-f]{64}$`).MatchString(decoded.LatestImportantEvent.IdempotencyKey) {
+		t.Fatalf("latest event omitted opaque idempotency identity: %#v", decoded.LatestImportantEvent)
+	}
+	for _, active := range decoded.ActiveProgress {
+		if active.ElapsedStartedAt.IsZero() {
+			t.Fatalf("active progress omitted elapsed start: %#v", active)
+		}
 	}
 }
 

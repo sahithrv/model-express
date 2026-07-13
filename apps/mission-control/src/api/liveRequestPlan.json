@@ -1,5 +1,7 @@
 {
   "health": { "template": "/healthz", "cache_ttl_ms": 0 },
+  "liveState": { "template": "/projects/{project_id}/live-state", "cache_ttl_ms": 0 },
+  "executionEventStreamV2": { "template": "/projects/{project_id}/events/stream/v2", "cache_ttl_ms": 0 },
   "projectIndex": { "template": "/projects", "cache_ttl_ms": 0 },
   "workerRequirements": { "template": "/projects/{project_id}/worker-requirements", "cache_ttl_ms": 0 },
   "datasets": { "template": "/projects/{project_id}/datasets", "cache_ttl_ms": 0 },

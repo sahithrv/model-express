@@ -179,7 +179,7 @@ func listProjectLiveStateProgress(ctx context.Context, tx *sql.Tx, projectID str
 			progress.status, progress.current, progress.total, progress.unit,
 			progress.safe_message, progress.revision, progress.heartbeat_at,
 			progress.updated_at, progress.metadata,
-			job.status, job.created_at, worker.last_heartbeat,
+			job.status, COALESCE(job.started_at, job.created_at), worker.last_heartbeat,
 			job.lease_last_heartbeat_at
 		FROM experiment_jobs AS job
 		JOIN job_progress AS progress
@@ -250,7 +250,7 @@ func scanProjectLiveStateProgress(row rowScanner) (LiveStateActiveProgress, int,
 		&item.Progress.UpdatedAt,
 		&metadataJSON,
 		&item.JobStatus,
-		&item.JobCreatedAt,
+		&item.ElapsedStartedAt,
 		&workerHeartbeat,
 		&leaseHeartbeat,
 	); err != nil {

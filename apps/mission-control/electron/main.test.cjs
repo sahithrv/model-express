@@ -45,6 +45,16 @@ test("orchestrator requests are limited to app paths, approved methods, and loop
   assert.equal(request.bodyText, '{"name":"demo"}');
   assert.equal(request.reasonCode, "active_poll");
 
+  const probe = __test.validateOrchestratorRequest({
+    baseUrl: "http://127.0.0.1:8080",
+    method: "HEAD",
+    path: "/projects/project-1/events/stream/v2?cursor=7",
+    requestId: "live_probe_7",
+    diagnosticReason: "stream_reconnect",
+  });
+  assert.equal(probe.method, "HEAD");
+  assert.equal(probe.requestId, "live_probe_7");
+
   assert.throws(
     () => __test.validateOrchestratorRequest({ baseUrl: "http://127.0.0.1:8080", method: "PUT", path: "/projects" }),
     /Unsupported orchestrator request method/,
@@ -56,6 +66,65 @@ test("orchestrator requests are limited to app paths, approved methods, and loop
   assert.throws(
     () => __test.validateOrchestratorRequest({ baseUrl: "http://example.com:8080", path: "/projects" }),
     /Non-loopback orchestrator URLs/,
+  );
+  assert.throws(
+    () => __test.validateOrchestratorRequest({ baseUrl: "http://127.0.0.1:8080", path: "/projects", requestId: "../unsafe" }),
+    /bounded opaque identifier/,
+  );
+});
+
+test("incremental live feature flags are bounded booleans with a safe automatic default", () => {
+  assert.deepEqual(__test.missionControlLiveFeatureFlags({}), {
+    incremental_v2_enabled: true,
+    incremental_v2_shadow: false,
+    incremental_v2_rollback: false,
+  });
+  assert.deepEqual(__test.missionControlLiveFeatureFlags({
+    MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ENABLED: "off",
+    MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_SHADOW: "yes",
+    MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ROLLBACK: "1",
+  }), {
+    incremental_v2_enabled: false,
+    incremental_v2_shadow: true,
+    incremental_v2_rollback: true,
+  });
+});
+
+test("event-stream relay accepts only a bounded v2 cursor path", () => {
+  const options = __test.validateOrchestratorEventStreamOptions({
+    streamId: "stream_1",
+    baseUrl: "http://127.0.0.1:8080",
+    path: "/projects/project-1/events/stream/v2?cursor=42",
+    diagnosticReason: "stream_initial",
+  });
+  assert.equal(options.streamId, "stream_1");
+  assert.equal(options.url, "http://127.0.0.1:8080/projects/project-1/events/stream/v2?cursor=42");
+  assert.throws(
+    () => __test.validateOrchestratorEventStreamOptions({
+      streamId: "stream_2",
+      baseUrl: "http://127.0.0.1:8080",
+      path: "/projects/project-1/activity-stream?cursor=42",
+    }),
+    /bounded v2 execution-event stream/,
+  );
+  assert.throws(
+    () => __test.validateOrchestratorEventStreamOptions({
+      streamId: "stream_3",
+      baseUrl: "http://127.0.0.1:8080",
+      path: "/projects/project-1/events/stream/v2?cursor=-1",
+    }),
+    /bounded nonnegative integer/,
+  );
+});
+
+test("event-stream HTTP error bodies are read with a strict byte bound", async () => {
+  const response = new Response(`{"reason_code":"cursor_too_old","padding":"${"x".repeat(10_000)}"}`);
+  const text = await __test.readBoundedResponseText(response, 128);
+  assert.ok(Buffer.byteLength(text, "utf8") <= 128);
+  assert.match(text, /cursor_too_old/);
+  await assert.rejects(
+    () => __test.readBoundedResponseText(new Response("{}"), 100_000),
+    /byte limit must be bounded/,
   );
 });
 
@@ -112,6 +181,29 @@ test("renderer activity stream diagnostics accept only request outcome scalars",
   );
   assert.throws(
     () => __test.validateActivityStreamAttempt({ reason_code: "raw", outcome_code: "connected" }),
+    /supported reason and outcome codes/,
+  );
+});
+
+test("incremental diagnostics discard identities and payload contents", () => {
+  const fields = __test.validateIncrementalLiveDiagnostic({
+    reason_code: "shadow_compare",
+    outcome_code: "mismatched",
+    count: 3,
+    duration_ms: 12,
+    project_id: "private-project",
+    message: "s3://private-bucket/prompt.txt",
+    payload: { prompt: "secret" },
+  });
+  assert.deepEqual(fields, {
+    reason_code: "shadow_compare",
+    outcome_code: "mismatched",
+    count: 3,
+    duration_ms: 12,
+  });
+  assert.equal(JSON.stringify(fields).includes("private-project"), false);
+  assert.throws(
+    () => __test.validateIncrementalLiveDiagnostic({ reason_code: "raw_payload", outcome_code: "applied" }),
     /supported reason and outcome codes/,
   );
 });

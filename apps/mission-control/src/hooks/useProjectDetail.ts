@@ -59,6 +59,8 @@ export type ProjectDetailLoadStatusMap = Record<ProjectDetailLoadStatusKey, Proj
 export type ChampionExportsStatus = ProjectDetailLoadStatus;
 
 export type ProjectDetail = {
+  /** Explicit owner identity, including for projects whose child collections are all empty. */
+  project_id: string;
   decisions: AgentDecision[];
   datasets: Dataset[];
   telemetry: MissionControlTelemetryResponse | null;
@@ -116,9 +118,13 @@ export function emptyProjectDetailLoadStatus(): ProjectDetailLoadStatusMap {
   };
 }
 
-export function emptyProjectDetail(message = "Select a dataset to load visual analysis evidence."): ProjectDetail {
+export function emptyProjectDetail(
+  projectId = "",
+  message = "Select a dataset to load visual analysis evidence.",
+): ProjectDetail {
   const loadStatus = emptyProjectDetailLoadStatus();
   return {
+    project_id: projectId,
     decisions: [],
     datasets: [],
     telemetry: null,

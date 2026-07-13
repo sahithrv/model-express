@@ -548,6 +548,11 @@ func TestExecutionEventV2RouteFlagAndCursorRecovery(t *testing.T) {
 	if disabled.Code != http.StatusNotFound {
 		t.Fatalf("disabled v2 route status = %d, want 404", disabled.Code)
 	}
+	disabledHead := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(disabledHead, httptest.NewRequest(http.MethodHead, "/projects/"+project.ID+"/events/stream/v2?cursor=0", nil))
+	if disabledHead.Code != http.StatusNotFound {
+		t.Fatalf("disabled v2 HEAD route status = %d, want 404", disabledHead.Code)
+	}
 
 	t.Setenv("MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED", "true")
 	invalid := httptest.NewRecorder()
@@ -570,6 +575,48 @@ func TestExecutionEventV2RouteFlagAndCursorRecovery(t *testing.T) {
 	NewRouter(floorStore).ServeHTTP(tooOld, httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/events/stream/v2?cursor=1", nil))
 	if tooOld.Code != http.StatusGone || !strings.Contains(tooOld.Body.String(), "cursor_too_old") || !strings.Contains(tooOld.Body.String(), "resync") {
 		t.Fatalf("too-old cursor response = %d %s", tooOld.Code, tooOld.Body.String())
+	}
+}
+
+func TestExecutionEventV2HeadProbeSharesCursorValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED", "true")
+	memoryStore := store.NewMemoryStore()
+	project, _ := memoryStore.CreateProject("v2 head", "")
+	for index := 0; index < 5; index++ {
+		_, _ = memoryStore.CreateExecutionEvent(project.ID, "", "EVENT", "event", nil)
+	}
+
+	probeStore := &cursorStateStore{Store: memoryStore, state: execution.ExecutionEventCursorState{LastSequence: 5}}
+	router := NewRouter(probeStore)
+	probe := func(projectID string, cursor string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodHead, "/projects/"+projectID+"/events/stream/v2?cursor="+cursor, nil))
+		return response
+	}
+
+	valid := probe(project.ID, "5")
+	if valid.Code != http.StatusNoContent || valid.Body.Len() != 0 || probeStore.afterCalls != 0 {
+		t.Fatalf("valid HEAD probe = %d body=%q stream_reads=%d", valid.Code, valid.Body.String(), probeStore.afterCalls)
+	}
+	if got := probe(project.ID, "bad").Code; got != http.StatusBadRequest {
+		t.Fatalf("invalid HEAD cursor status = %d, want 400", got)
+	}
+	if got := probe(project.ID, "6").Code; got != http.StatusConflict {
+		t.Fatalf("ahead HEAD cursor status = %d, want 409", got)
+	}
+	if got := probe("missing_project", "0").Code; got != http.StatusNotFound {
+		t.Fatalf("missing-project HEAD status = %d, want 404", got)
+	}
+
+	floorStore := &cursorStateStore{Store: memoryStore, state: execution.ExecutionEventCursorState{
+		LastSequence:          5,
+		RetainedSequenceFloor: 3,
+	}}
+	tooOld := httptest.NewRecorder()
+	NewRouter(floorStore).ServeHTTP(tooOld, httptest.NewRequest(http.MethodHead, "/projects/"+project.ID+"/events/stream/v2?cursor=1", nil))
+	if tooOld.Code != http.StatusGone {
+		t.Fatalf("too-old HEAD cursor status = %d, want 410", tooOld.Code)
 	}
 }
 
@@ -611,10 +658,11 @@ func TestExecutionEventV2BurstReconnectHasNoGapOrDuplicate(t *testing.T) {
 func TestExecutionEventV2ProjectionSanitizesHistoricalRows(t *testing.T) {
 	base64Blob := strings.Repeat("A", 120)
 	projected := executionEventV2Projection(execution.ExecutionEvent{
-		ID:        "execution_event_1",
-		ProjectID: "project_1",
-		EventType: execution.EventJobsQueued,
-		Message:   "read s3://private-bucket/data.zip at C:\\Users\\Private\\data " + base64Blob,
+		ID:             "execution_event_1",
+		IdempotencyKey: "internal:raw-idempotency-key",
+		ProjectID:      "project_1",
+		EventType:      execution.EventJobsQueued,
+		Message:        "read s3://private-bucket/data.zip at C:\\Users\\Private\\data " + base64Blob,
 		Payload: map[string]any{
 			"job_id":      "job_1",
 			"storage_uri": "s3://private-bucket/data.zip",
@@ -633,13 +681,21 @@ func TestExecutionEventV2ProjectionSanitizesHistoricalRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(blob)
-	for _, forbidden := range []string{"s3://private-bucket", "C:\\Users\\Private", base64Blob[:80], "storage_uri", "local_path", "raw_payload", "do-not-emit", "raw_output", "nested-confidential-text", `"payload"`} {
+	for _, forbidden := range []string{"s3://private-bucket", "C:\\Users\\Private", base64Blob[:80], "storage_uri", "local_path", "raw_payload", "do-not-emit", "raw_output", "nested-confidential-text", `"payload"`, "internal:raw-idempotency-key"} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("v2 projection leaked %q: %s", forbidden, body)
 		}
 	}
-	if !strings.Contains(body, `"job_id":"job_1"`) || !strings.Contains(body, `"sequence":9`) {
+	if !strings.Contains(body, `"job_id":"job_1"`) || !strings.Contains(body, `"sequence":9`) || !strings.Contains(body, `"idempotency_key":"ik_`) {
 		t.Fatalf("v2 projection lost safe identity: %s", body)
+	}
+	if !regexp.MustCompile(`^ik_[0-9a-f]{64}$`).MatchString(projected.IdempotencyKey) {
+		t.Fatalf("v2 idempotency key is not a bounded opaque digest: %q", projected.IdempotencyKey)
+	}
+	replayed := executionEventV2Projection(execution.ExecutionEvent{IdempotencyKey: "internal:raw-idempotency-key"})
+	different := executionEventV2Projection(execution.ExecutionEvent{IdempotencyKey: "internal:other-key"})
+	if replayed.IdempotencyKey != projected.IdempotencyKey || different.IdempotencyKey == projected.IdempotencyKey {
+		t.Fatalf("opaque idempotency digest is not stable and discriminating: %q %q %q", projected.IdempotencyKey, replayed.IdempotencyKey, different.IdempotencyKey)
 	}
 }
 

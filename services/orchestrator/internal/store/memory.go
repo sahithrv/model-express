@@ -1624,7 +1624,6 @@ func (s *MemoryStore) ListProjectExecutionEventsAfter(ctx context.Context, proje
 		if event.ProjectID == projectID && event.Sequence > cursor {
 			event.Message = boundedExecutionEventProjectionText(event.Message, 512)
 			event.Payload = executionEventStreamPayloadProjection(event.Payload)
-			event.IdempotencyKey = ""
 			out = append(out, event)
 		}
 	}

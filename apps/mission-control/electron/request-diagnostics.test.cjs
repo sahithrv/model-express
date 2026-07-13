@@ -13,7 +13,30 @@ test("request diagnostics classify endpoint shapes without retaining resource id
   assert.equal(classifyEndpointCategory("/projects/private-project/jobs?limit=100"), "project_live");
   assert.equal(classifyEndpointCategory("/projects/private-project/agent-invocations?limit=8"), "project_history");
   assert.equal(classifyEndpointCategory("/jobs/private-job/metrics?limit=200"), "job_metrics");
+  assert.equal(classifyEndpointCategory("/projects/private-project/live-state"), "project_live_state");
+  assert.equal(classifyEndpointCategory("/projects/private-project/events/stream/v2?cursor=7"), "execution_event_stream_v2");
   assert.equal(classifyEndpointCategory("/datasets/private-dataset/metadata/summary"), "dataset_detail");
+});
+
+test("v2 reasons stay bounded and targeted traffic is never classified as broad", () => {
+  let nowMs = 1_000;
+  const diagnostics = createRollingRequestDiagnostics({ now: () => nowMs });
+  const snapshot = diagnostics.record({
+    method: "GET",
+    path: "/projects/private/live-state",
+    reasonCode: "v2_snapshot",
+    statusCode: 200,
+  });
+  nowMs += 1;
+  const targeted = diagnostics.record({
+    method: "GET",
+    path: "/jobs/private/metrics",
+    reasonCode: "targeted_invalidation",
+    statusCode: 200,
+  });
+  assert.equal(snapshot.reason_code, "v2_snapshot");
+  assert.equal(targeted.rolling_broad_get_count, 0);
+  assert.deepEqual(targeted.reason_code_counts, { targeted_invalidation: 1, v2_snapshot: 1 });
 });
 
 test("rolling request diagnostics use a fake clock and bounded second buckets", () => {

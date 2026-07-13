@@ -129,15 +129,16 @@ func (s *Server) streamProjectExecutionEvents(c *gin.Context) {
 }
 
 type executionEventV2Envelope struct {
-	SchemaVersion string         `json:"schema_version"`
-	Sequence      int64          `json:"sequence"`
-	EventID       string         `json:"event_id"`
-	ProjectID     string         `json:"project_id"`
-	PlanID        string         `json:"plan_id,omitempty"`
-	EventType     string         `json:"event_type"`
-	Message       string         `json:"message"`
-	CreatedAt     time.Time      `json:"created_at"`
-	Metadata      map[string]any `json:"metadata,omitempty"`
+	SchemaVersion  string         `json:"schema_version"`
+	Sequence       int64          `json:"sequence"`
+	EventID        string         `json:"event_id"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty"`
+	ProjectID      string         `json:"project_id"`
+	PlanID         string         `json:"plan_id,omitempty"`
+	EventType      string         `json:"event_type"`
+	Message        string         `json:"message"`
+	CreatedAt      time.Time      `json:"created_at"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
 }
 
 func activityStreamV2Enabled() bool {
@@ -145,33 +146,8 @@ func activityStreamV2Enabled() bool {
 }
 
 func (s *Server) streamProjectExecutionEventsV2(c *gin.Context) {
-	projectID := c.Param("id")
-	cursor, err := executionEventCursorFromRequest(c)
-	if err != nil {
-		writeExecutionEventCursorError(c, http.StatusBadRequest, "invalid_cursor", 0, 0)
-		return
-	}
-	if _, err := s.store.GetProjectContext(c.Request.Context(), projectID); err != nil {
-		if c.Request.Context().Err() != nil {
-			return
-		}
-		writeStoreError(c, err)
-		return
-	}
-	state, err := s.store.GetExecutionEventCursorState(c.Request.Context())
-	if err != nil {
-		if c.Request.Context().Err() != nil {
-			return
-		}
-		writeStoreError(c, err)
-		return
-	}
-	if cursor > state.LastSequence {
-		writeExecutionEventCursorError(c, http.StatusConflict, "cursor_ahead", state.RetainedSequenceFloor, state.LastSequence)
-		return
-	}
-	if cursor > 0 && cursor < state.RetainedSequenceFloor {
-		writeExecutionEventCursorError(c, http.StatusGone, "cursor_too_old", state.RetainedSequenceFloor, state.LastSequence)
+	projectID, cursor, ok := s.validateProjectExecutionEventV2Cursor(c)
+	if !ok {
 		return
 	}
 
@@ -221,6 +197,47 @@ func (s *Server) streamProjectExecutionEventsV2(c *gin.Context) {
 			writeExecutionEventV2Keepalive(c)
 		}
 	}
+}
+
+func (s *Server) probeProjectExecutionEventsV2(c *gin.Context) {
+	if _, _, ok := s.validateProjectExecutionEventV2Cursor(c); !ok {
+		return
+	}
+	c.Header("Cache-Control", "no-cache")
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) validateProjectExecutionEventV2Cursor(c *gin.Context) (string, int64, bool) {
+	projectID := c.Param("id")
+	cursor, err := executionEventCursorFromRequest(c)
+	if err != nil {
+		writeExecutionEventCursorError(c, http.StatusBadRequest, "invalid_cursor", 0, 0)
+		return "", 0, false
+	}
+	if _, err := s.store.GetProjectContext(c.Request.Context(), projectID); err != nil {
+		if c.Request.Context().Err() != nil {
+			return "", 0, false
+		}
+		writeStoreError(c, err)
+		return "", 0, false
+	}
+	state, err := s.store.GetExecutionEventCursorState(c.Request.Context())
+	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return "", 0, false
+		}
+		writeStoreError(c, err)
+		return "", 0, false
+	}
+	if cursor > state.LastSequence {
+		writeExecutionEventCursorError(c, http.StatusConflict, "cursor_ahead", state.RetainedSequenceFloor, state.LastSequence)
+		return "", 0, false
+	}
+	if cursor > 0 && cursor < state.RetainedSequenceFloor {
+		writeExecutionEventCursorError(c, http.StatusGone, "cursor_too_old", state.RetainedSequenceFloor, state.LastSequence)
+		return "", 0, false
+	}
+	return projectID, cursor, true
 }
 
 func writeExecutionEventV2Keepalive(c *gin.Context) {
@@ -297,16 +314,28 @@ func (s *Server) writeProjectExecutionEventV2Pages(
 
 func executionEventV2Projection(event execution.ExecutionEvent) executionEventV2Envelope {
 	return executionEventV2Envelope{
-		SchemaVersion: "execution_event.v2",
-		Sequence:      event.Sequence,
-		EventID:       activitySafeIdentifier(event.ID),
-		ProjectID:     activitySafeIdentifier(event.ProjectID),
-		PlanID:        activitySafeIdentifier(event.PlanID),
-		EventType:     activitySafeIdentifier(event.EventType),
-		Message:       activitySafeText(event.Message, 220),
-		CreatedAt:     event.CreatedAt,
-		Metadata:      activityMetadataFromPayload(event.Payload),
+		SchemaVersion:  "execution_event.v2",
+		Sequence:       event.Sequence,
+		EventID:        activitySafeIdentifier(event.ID),
+		IdempotencyKey: executionEventV2OpaqueIdempotencyKey(event.IdempotencyKey),
+		ProjectID:      activitySafeIdentifier(event.ProjectID),
+		PlanID:         activitySafeIdentifier(event.PlanID),
+		EventType:      activitySafeIdentifier(event.EventType),
+		Message:        activitySafeText(event.Message, 220),
+		CreatedAt:      event.CreatedAt,
+		Metadata:       activityMetadataFromPayload(event.Payload),
 	}
+}
+
+func executionEventV2OpaqueIdempotencyKey(value string) string {
+	if value == "" {
+		return ""
+	}
+	// The stored key is internal transition identity and can contain database
+	// identifiers. Expose only a fixed-width digest so clients can deduplicate
+	// reconnects without receiving the raw value.
+	digest := sha256.Sum256([]byte(value))
+	return "ik_" + hex.EncodeToString(digest[:])
 }
 
 var (

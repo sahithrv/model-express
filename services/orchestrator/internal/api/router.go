@@ -140,6 +140,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/projects/:id/dispatcher-events", server.reportProjectDispatcherEvent)
 	router.GET("/projects/:id/events/stream", server.streamProjectExecutionEvents)
 	if activityStreamV2Enabled() {
+		router.HEAD("/projects/:id/events/stream/v2", server.probeProjectExecutionEventsV2)
 		router.GET("/projects/:id/events/stream/v2", server.streamProjectExecutionEventsV2)
 	}
 	router.GET("/projects/:id/activity-stream", server.streamProjectActivityEvents)

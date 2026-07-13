@@ -26,6 +26,9 @@ func TestMemoryExecutionEventCursorIsGlobalAndPagesAscending(t *testing.T) {
 	if len(page) != 2 || page[0].Sequence != second.Sequence || page[1].Sequence != third.Sequence {
 		t.Fatalf("cursor page has a gap or unstable order: %#v", page)
 	}
+	if page[0].IdempotencyKey != second.IdempotencyKey || page[1].IdempotencyKey != third.IdempotencyKey {
+		t.Fatalf("cursor projection lost internal idempotency identity: %#v", page)
+	}
 	after, err := s.ListProjectExecutionEventsAfter(context.Background(), projectA.ID, third.Sequence, 2)
 	if err != nil || len(after) != 0 {
 		t.Fatalf("reconnect duplicated delivered events: rows=%#v err=%v", after, err)
@@ -60,12 +63,13 @@ func TestExecutionEventAfterQueryIsIndexedAscendingAndBounded(t *testing.T) {
 		"jsonb_each(execution_events.payload)",
 		"left(message, 512)",
 		"LIMIT 8",
+		"idempotency_key",
 	} {
 		if !strings.Contains(query, required) {
 			t.Fatalf("cursor query omitted %q: %s", required, query)
 		}
 	}
-	for _, forbidden := range []string{"idempotency_key", "raw_output", "storage_uri"} {
+	for _, forbidden := range []string{"raw_output", "storage_uri"} {
 		if strings.Contains(query, forbidden) {
 			t.Fatalf("cursor query selected disallowed field %q: %s", forbidden, query)
 		}
