@@ -17,13 +17,17 @@ func (s *PostgresStore) CreateProject(name string, goal string) (projects.Projec
 }
 
 func (s *PostgresStore) GetProject(id string) (projects.Project, error) {
+	return s.GetProjectContext(context.Background(), id)
+}
+
+func (s *PostgresStore) GetProjectContext(ctx context.Context, id string) (projects.Project, error) {
 	const query = `
 		SELECT id, name, goal, status, created_at, updated_at
 		FROM projects
 		WHERE id = $1
 	`
 
-	return scanProject(s.db.QueryRowContext(context.Background(), query, id))
+	return scanProject(s.db.QueryRowContext(ctx, query, id))
 }
 
 func (s *PostgresStore) ListProjects() ([]projects.Project, error) {

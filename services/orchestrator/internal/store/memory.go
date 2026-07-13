@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -33,38 +34,39 @@ const (
 type MemoryStore struct {
 	mu sync.Mutex
 
-	nextID                  uint64
-	projects                map[string]projects.Project
-	datasets                map[string]datasets.Dataset
-	workers                 map[string]workers.Worker
-	jobs                    map[string]jobs.ExperimentJob
-	metrics                 map[string][]jobs.EpochMetric
-	remoteSessions          map[string]runs.RemoteTrainingSession
-	plans                   map[string]plans.ExperimentPlan
-	summaries               map[string]runs.TrainingRunSummary
-	evaluations             map[string]runs.TrainingRunEvaluation
-	champions               map[string]runs.ProjectChampion
-	championExports         map[string]runs.ChampionExport
-	demoPredictions         map[string]runs.ChampionDemoPrediction
-	championFeedback        map[string]runs.ChampionFeedback
-	metadataImports         map[string]datasets.DatasetMetadataImport
-	visualAnalyses          map[string]datasets.DatasetVisualAnalysis
-	decisions               map[string]decisions.AgentDecision
-	workerRequirements      map[string]execution.WorkerRequirement
-	executionEvents         map[string]execution.ExecutionEvent
-	jobExecutionSpecs       map[string]execution.JobExecutionSpec
-	attemptExecutions       map[string]execution.AttemptExecutionRecord
-	realizationObservations map[string][]execution.RealizationObservation
-	agentMemoryRecords      map[string]memory.AgentMemoryRecord
-	agentInvocations        map[string]memory.AgentInvocation
-	memoryEmbeddings        map[string]memory.MemoryEmbeddingRecord
-	memoryUsageEvents       map[string]memory.MemoryEmbeddingUsageEvent
-	queryCache              map[string]memory.MemoryRetrievalQueryCacheRecord
-	strategyScorecards      map[string]strategies.StrategyScorecard
-	optimizerStudies        map[string]automl.OptimizerStudy
-	optimizerSuggestions    map[string]automl.OptimizerSuggestion
-	optimizerTrials         map[string]automl.OptimizerTrial
-	automationSettings      *settings.AutomationSettings
+	nextID                     uint64
+	nextExecutionEventSequence int64
+	projects                   map[string]projects.Project
+	datasets                   map[string]datasets.Dataset
+	workers                    map[string]workers.Worker
+	jobs                       map[string]jobs.ExperimentJob
+	metrics                    map[string][]jobs.EpochMetric
+	remoteSessions             map[string]runs.RemoteTrainingSession
+	plans                      map[string]plans.ExperimentPlan
+	summaries                  map[string]runs.TrainingRunSummary
+	evaluations                map[string]runs.TrainingRunEvaluation
+	champions                  map[string]runs.ProjectChampion
+	championExports            map[string]runs.ChampionExport
+	demoPredictions            map[string]runs.ChampionDemoPrediction
+	championFeedback           map[string]runs.ChampionFeedback
+	metadataImports            map[string]datasets.DatasetMetadataImport
+	visualAnalyses             map[string]datasets.DatasetVisualAnalysis
+	decisions                  map[string]decisions.AgentDecision
+	workerRequirements         map[string]execution.WorkerRequirement
+	executionEvents            map[string]execution.ExecutionEvent
+	jobExecutionSpecs          map[string]execution.JobExecutionSpec
+	attemptExecutions          map[string]execution.AttemptExecutionRecord
+	realizationObservations    map[string][]execution.RealizationObservation
+	agentMemoryRecords         map[string]memory.AgentMemoryRecord
+	agentInvocations           map[string]memory.AgentInvocation
+	memoryEmbeddings           map[string]memory.MemoryEmbeddingRecord
+	memoryUsageEvents          map[string]memory.MemoryEmbeddingUsageEvent
+	queryCache                 map[string]memory.MemoryRetrievalQueryCacheRecord
+	strategyScorecards         map[string]strategies.StrategyScorecard
+	optimizerStudies           map[string]automl.OptimizerStudy
+	optimizerSuggestions       map[string]automl.OptimizerSuggestion
+	optimizerTrials            map[string]automl.OptimizerTrial
+	automationSettings         *settings.AutomationSettings
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -121,8 +123,18 @@ func (s *MemoryStore) CreateProject(name string, goal string) (projects.Project,
 }
 
 func (s *MemoryStore) GetProject(id string) (projects.Project, error) {
+	return s.GetProjectContext(context.Background(), id)
+}
+
+func (s *MemoryStore) GetProjectContext(ctx context.Context, id string) (projects.Project, error) {
+	if err := ctx.Err(); err != nil {
+		return projects.Project{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return projects.Project{}, err
+	}
 
 	project, ok := s.projects[id]
 	if !ok {
@@ -1255,7 +1267,32 @@ func (s *MemoryStore) ListProjectAgentDecisions(projectID string) ([]decisions.A
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
+	return out, nil
+}
 
+func (s *MemoryStore) ListProjectAgentDecisionActivity(projectID string, limit int) ([]decisions.AgentDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	limit = boundedActivityReadLimit(limit)
+	out := []decisions.AgentDecision{}
+	for _, decision := range s.decisions {
+		if decision.ProjectID == projectID {
+			out = append(out, decision)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 
@@ -1399,6 +1436,9 @@ func (s *MemoryStore) CreateExecutionEvent(projectID string, planID string, even
 		Payload:   payload,
 		CreatedAt: time.Now().UTC(),
 	}
+	s.nextExecutionEventSequence++
+	event.Sequence = s.nextExecutionEventSequence
+	event.IdempotencyKey = "event:" + event.ID
 	s.executionEvents[event.ID] = event
 	return event, nil
 }
@@ -1427,6 +1467,131 @@ func (s *MemoryStore) ListProjectExecutionEvents(projectID string, limit int) ([
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) ListProjectExecutionEventsAfter(ctx context.Context, projectID string, cursor int64, limit int) ([]execution.ExecutionEvent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if cursor < 0 {
+		return nil, fmt.Errorf("%w: execution event cursor must be nonnegative", ErrInvalidRequest)
+	}
+	limit = boundedExecutionEventPageLimit(limit)
+	out := []execution.ExecutionEvent{}
+	for _, event := range s.executionEvents {
+		if event.ProjectID == projectID && event.Sequence > cursor {
+			event.Message = boundedExecutionEventProjectionText(event.Message, 512)
+			event.Payload = executionEventStreamPayloadProjection(event.Payload)
+			event.IdempotencyKey = ""
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Sequence < out[j].Sequence
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func executionEventStreamPayloadProjection(payload map[string]any) map[string]any {
+	allowed := map[string]bool{}
+	for _, key := range execution.SafeExecutionEventMetadataKeys() {
+		allowed[key] = true
+	}
+	out := map[string]any{}
+	for key, value := range payload {
+		if !allowed[key] {
+			continue
+		}
+		if projected, ok := executionEventStreamMetadataValue(value); ok {
+			out[key] = projected
+		}
+	}
+	return out
+}
+
+func executionEventStreamMetadataValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		return boundedExecutionEventProjectionText(typed, 512), true
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return typed, true
+	case []string:
+		out := make([]string, 0, min(8, len(typed)))
+		for _, item := range typed {
+			if len(out) >= 8 {
+				break
+			}
+			out = append(out, boundedExecutionEventProjectionText(item, 80))
+		}
+		return out, true
+	case []any:
+		out := make([]any, 0, min(8, len(typed)))
+		for _, item := range typed {
+			if len(out) >= 8 {
+				break
+			}
+			if projected, ok := executionEventStreamArrayValue(item); ok {
+				out = append(out, projected)
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func executionEventStreamArrayValue(value any) (any, bool) {
+	if text, ok := value.(string); ok {
+		return boundedExecutionEventProjectionText(text, 80), true
+	}
+	switch value.(type) {
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return value, true
+	default:
+		return nil, false
+	}
+}
+
+func boundedExecutionEventProjectionText(value string, maxRunes int) string {
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes])
+}
+
+func (s *MemoryStore) GetExecutionEventCursorState(ctx context.Context) (execution.ExecutionEventCursorState, error) {
+	if err := ctx.Err(); err != nil {
+		return execution.ExecutionEventCursorState{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return execution.ExecutionEventCursorState{}, err
+	}
+	return execution.ExecutionEventCursorState{LastSequence: s.nextExecutionEventSequence}, nil
+}
+
+func boundedExecutionEventPageLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
 }
 
 func (s *MemoryStore) CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error) {
@@ -1553,6 +1718,96 @@ func (s *MemoryStore) ListProjectAgentInvocations(projectID string, filter memor
 		out = out[:filter.Limit]
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) ListProjectAgentInvocationActivity(projectID string, limit int) ([]memory.AgentInvocationActivity, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	limit = boundedActivityReadLimit(limit)
+
+	out := make([]memory.AgentInvocationActivity, 0, min(limit, len(s.agentInvocations)))
+	for _, invocation := range s.agentInvocations {
+		if invocation.ProjectID == projectID {
+			out = append(out, agentInvocationActivityProjection(invocation))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func boundedActivityReadLimit(limit int) int {
+	if limit <= 0 {
+		return 25
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+func agentInvocationActivityProjection(invocation memory.AgentInvocation) memory.AgentInvocationActivity {
+	outcome := map[string]any{}
+	for _, key := range []string{
+		"backend_validation_status",
+		"backend_validation_error",
+		"will_retry",
+		"retry_attempt",
+		"completion_state",
+	} {
+		if value, ok := agentInvocationActivityScalar(key, invocation.DownstreamOutcome[key]); ok {
+			outcome[key] = value
+		}
+	}
+	return memory.AgentInvocationActivity{
+		ID:                invocation.ID,
+		ProjectID:         invocation.ProjectID,
+		PlanID:            invocation.PlanID,
+		JobID:             invocation.JobID,
+		AgentName:         boundedExecutionEventProjectionText(invocation.AgentName, 128),
+		ValidationStatus:  boundedExecutionEventProjectionText(invocation.ValidationStatus, 64),
+		ValidationError:   boundedExecutionEventProjectionText(invocation.ValidationError, 512),
+		DownstreamOutcome: outcome,
+		CreatedAt:         invocation.CreatedAt,
+	}
+}
+
+func agentInvocationActivityScalar(key string, value any) (any, bool) {
+	switch key {
+	case "backend_validation_status":
+		text, ok := value.(string)
+		return boundedExecutionEventProjectionText(text, 64), ok
+	case "backend_validation_error":
+		text, ok := value.(string)
+		return boundedExecutionEventProjectionText(text, 512), ok
+	case "completion_state":
+		text, ok := value.(string)
+		return boundedExecutionEventProjectionText(text, 128), ok
+	case "will_retry":
+		switch typed := value.(type) {
+		case bool:
+			return value, true
+		case string:
+			return boundedExecutionEventProjectionText(typed, 16), true
+		}
+	case "retry_attempt":
+		switch value.(type) {
+		case int, int64, float64:
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func (s *MemoryStore) UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord) (memory.MemoryEmbeddingRecord, error) {

@@ -37,11 +37,13 @@ test("orchestrator requests are limited to app paths, approved methods, and loop
     method: "post",
     path: "/projects?limit=1",
     body: { name: "demo" },
+    diagnosticReason: "active_poll",
   });
 
   assert.equal(request.method, "POST");
   assert.equal(request.url, "http://127.0.0.1:8080/projects?limit=1");
   assert.equal(request.bodyText, '{"name":"demo"}');
+  assert.equal(request.reasonCode, "active_poll");
 
   assert.throws(
     () => __test.validateOrchestratorRequest({ baseUrl: "http://127.0.0.1:8080", method: "PUT", path: "/projects" }),
@@ -54,6 +56,63 @@ test("orchestrator requests are limited to app paths, approved methods, and loop
   assert.throws(
     () => __test.validateOrchestratorRequest({ baseUrl: "http://example.com:8080", path: "/projects" }),
     /Non-loopback orchestrator URLs/,
+  );
+});
+
+test("renderer activity visibility diagnostics accept only bounded scalar summaries", () => {
+  const summary = __test.validateActivityVisibilitySummary({
+    reason_code: "live",
+    sample_count: 2,
+    latency_sample_count: 2,
+    invalid_sample_count: 0,
+    dropped_count: 0,
+    latency_total_ms: 30,
+    latency_min_ms: 10,
+    latency_max_ms: 20,
+    latency_average_ms: 15,
+    commit_delay_total_ms: 4,
+    commit_delay_average_ms: 2,
+    message: "must not be retained",
+    payload: { prompt: "must not be retained" },
+  });
+
+  assert.deepEqual(summary, {
+    reason_code: "live",
+    sample_count: 2,
+    latency_sample_count: 2,
+    invalid_sample_count: 0,
+    dropped_count: 0,
+    latency_total_ms: 30,
+    latency_min_ms: 10,
+    latency_max_ms: 20,
+    latency_average_ms: 15,
+    commit_delay_total_ms: 4,
+    commit_delay_average_ms: 2,
+  });
+  assert.throws(
+    () => __test.validateActivityVisibilitySummary({ reason_code: "raw_event", sample_count: 1 }),
+    /supported reason code/,
+  );
+});
+
+test("renderer activity stream diagnostics accept only request outcome scalars", () => {
+  assert.deepEqual(
+    __test.validateActivityStreamAttempt({
+      reason_code: "stream_reconnect",
+      outcome_code: "connected",
+      duration_ms: 42.4,
+      project_id: "must-not-be-retained",
+      payload: { prompt: "must-not-be-retained" },
+    }),
+    {
+      reason_code: "stream_reconnect",
+      outcome_code: "connected",
+      duration_ms: 42,
+    },
+  );
+  assert.throws(
+    () => __test.validateActivityStreamAttempt({ reason_code: "raw", outcome_code: "connected" }),
+    /supported reason and outcome codes/,
   );
 });
 

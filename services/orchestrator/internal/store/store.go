@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"time"
@@ -68,6 +69,7 @@ func (filter JobPollFilter) Matches(job jobs.ExperimentJob) bool {
 type Store interface {
 	CreateProject(name string, goal string) (projects.Project, error)
 	GetProject(id string) (projects.Project, error)
+	GetProjectContext(ctx context.Context, id string) (projects.Project, error)
 	ListProjects() ([]projects.Project, error)
 
 	CreateDataset(projectID string, name string, storageURI string, checksumSHA256 string, sizeBytes int64) (datasets.Dataset, error)
@@ -133,6 +135,7 @@ type Store interface {
 
 	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)
 	ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error)
+	ListProjectAgentDecisionActivity(projectID string, limit int) ([]decisions.AgentDecision, error)
 
 	GetAutomationSettings() (settings.AutomationSettings, error)
 	SaveAutomationSettings(automationSettings settings.AutomationSettings) (settings.AutomationSettings, error)
@@ -142,6 +145,8 @@ type Store interface {
 	UpdateWorkerRequirement(id string, update execution.WorkerRequirementUpdate) (execution.WorkerRequirement, error)
 	CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error)
 	ListProjectExecutionEvents(projectID string, limit int) ([]execution.ExecutionEvent, error)
+	ListProjectExecutionEventsAfter(ctx context.Context, projectID string, cursor int64, limit int) ([]execution.ExecutionEvent, error)
+	GetExecutionEventCursorState(ctx context.Context) (execution.ExecutionEventCursorState, error)
 
 	CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error)
 	ListProjectAgentMemoryRecords(projectID string, filter memory.AgentMemoryFilter) ([]memory.AgentMemoryRecord, error)
@@ -149,6 +154,7 @@ type Store interface {
 	GetAgentInvocation(invocationID string) (memory.AgentInvocation, error)
 	UpdateAgentInvocationDownstreamOutcome(invocationID string, outcome map[string]any) (memory.AgentInvocation, error)
 	ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error)
+	ListProjectAgentInvocationActivity(projectID string, limit int) ([]memory.AgentInvocationActivity, error)
 	UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord) (memory.MemoryEmbeddingRecord, error)
 	SearchMemoryEmbeddings(query memory.MemoryRetrievalQuery) ([]memory.MemoryRetrievalResult, error)
 	CountMemoryEmbeddings(projectID string, datasetID string, embeddingModel string) (int, error)

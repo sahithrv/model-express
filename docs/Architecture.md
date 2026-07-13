@@ -360,6 +360,16 @@ The orchestrator exposes a broad but conventional API. At a high level:
 
 The API is intentionally not just a training API. It is a control-plane API for an auditable agentic workflow.
 
+### Cursor-safe execution-event stream
+
+The optional raw execution-event v2 stream is exposed at `GET /projects/:id/events/stream/v2` only when `MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED=true`. The flag defaults to false, so rollback disables the route without removing or repairing cursor data. The existing execution-event and synthesized activity endpoints remain unchanged.
+
+V2 uses the durable decimal event sequence as the SSE `id`. An initial connection may pass `cursor`; a reconnect uses `Last-Event-ID`, which takes precedence. Missing cursors bootstrap from zero. Invalid, negative, or overflowing cursors return `400 invalid_cursor`; cursors ahead of the committed high-water mark return `409 cursor_ahead`; and positive cursors below `retained_sequence_floor` return `410 cursor_too_old`. Ahead and too-old responses require a state resync instead of silently resetting the cursor. While the compact live-state endpoint is not yet available, clients should fall back to the v1 synthesized activity path for that resync.
+
+Catch-up reads are ascending and bounded per page, idle connections receive keepalive comments, and request cancellation stops further reads. Stream data is a bounded allowlist/redaction envelope: stored payload JSON is never serialized directly, and messages and metadata are sanitized at read time.
+
+This v2 endpoint is a raw stream of rows already present in `execution_events`. It is not yet authoritative for synthesized job or agent transitions. Mission Control must continue using the v1 fallback until Activity PR 4 adds durable producer coverage and its coverage test passes.
+
 ## Reliability State
 
 Implemented current-scale hardening includes:

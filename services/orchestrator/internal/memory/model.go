@@ -71,3 +71,17 @@ type AgentInvocationFilter struct {
 	AgentName string
 	Limit     int
 }
+
+// AgentInvocationActivity is the bounded read model used by the live activity
+// feed. It deliberately excludes prompts, context, and model output fields.
+type AgentInvocationActivity struct {
+	ID                string         `json:"id"`
+	ProjectID         string         `json:"project_id"`
+	PlanID            string         `json:"plan_id,omitempty"`
+	JobID             string         `json:"job_id,omitempty"`
+	AgentName         string         `json:"agent_name"`
+	ValidationStatus  string         `json:"validation_status"`
+	ValidationError   string         `json:"validation_error,omitempty"`
+	DownstreamOutcome map[string]any `json:"downstream_outcome"`
+	CreatedAt         time.Time      `json:"created_at"`
+}

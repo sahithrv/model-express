@@ -40,6 +40,14 @@ func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, dec
 }
 
 func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {
+	return s.listProjectAgentDecisions(projectID)
+}
+
+func (s *PostgresStore) ListProjectAgentDecisionActivity(projectID string, limit int) ([]decisions.AgentDecision, error) {
+	return s.listProjectAgentDecisionsActivity(projectID, boundedActivityReadLimit(limit))
+}
+
+func (s *PostgresStore) listProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return nil, err
 	}
@@ -67,6 +75,38 @@ func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions
 	}
 
 	return out, rows.Err()
+}
+
+func (s *PostgresStore) listProjectAgentDecisionsActivity(projectID string, limit int) ([]decisions.AgentDecision, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.QueryContext(context.Background(), agentDecisionActivitySelectQuery(), projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []decisions.AgentDecision{}
+	for rows.Next() {
+		decision, err := scanAgentDecision(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, decision)
+	}
+	return out, rows.Err()
+}
+
+func agentDecisionActivitySelectQuery() string {
+	return `
+		SELECT id, project_id, plan_id, decision_type, rationale, payload, created_at
+		FROM agent_decisions
+		WHERE project_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2
+	`
 }
 
 func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error) {
@@ -228,4 +268,89 @@ func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter mem
 		out = append(out, invocation)
 	}
 	return out, rows.Err()
+}
+
+func (s *PostgresStore) ListProjectAgentInvocationActivity(projectID string, limit int) ([]memory.AgentInvocationActivity, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	limit = boundedActivityReadLimit(limit)
+
+	rows, err := s.db.QueryContext(context.Background(), agentInvocationActivitySelectQuery(), projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []memory.AgentInvocationActivity{}
+	for rows.Next() {
+		invocation, err := scanAgentInvocationActivity(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, invocation)
+	}
+	return out, rows.Err()
+}
+
+func agentInvocationActivitySelectQuery() string {
+	return `
+		SELECT
+			id,
+			project_id,
+			plan_id,
+			job_id,
+			left(agent_name, 128),
+			left(validation_status, 64),
+			left(validation_error, 512),
+			jsonb_strip_nulls(jsonb_build_object(
+				'backend_validation_status', CASE
+					WHEN jsonb_typeof(downstream_outcome->'backend_validation_status') = 'string'
+					THEN to_jsonb(left(downstream_outcome->>'backend_validation_status', 64)) END,
+				'backend_validation_error', CASE
+					WHEN jsonb_typeof(downstream_outcome->'backend_validation_error') = 'string'
+					THEN to_jsonb(left(downstream_outcome->>'backend_validation_error', 512)) END,
+				'will_retry', CASE
+					WHEN jsonb_typeof(downstream_outcome->'will_retry') = 'boolean'
+						THEN downstream_outcome->'will_retry'
+					WHEN jsonb_typeof(downstream_outcome->'will_retry') = 'string'
+						THEN to_jsonb(left(downstream_outcome->>'will_retry', 16)) END,
+				'retry_attempt', CASE
+					WHEN jsonb_typeof(downstream_outcome->'retry_attempt') = 'number'
+					THEN downstream_outcome->'retry_attempt' END,
+				'completion_state', CASE
+					WHEN jsonb_typeof(downstream_outcome->'completion_state') = 'string'
+					THEN to_jsonb(left(downstream_outcome->>'completion_state', 128)) END
+			)) AS activity_outcome,
+			created_at
+		FROM agent_invocations
+		WHERE project_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2
+	`
+}
+
+func scanAgentInvocationActivity(row rowScanner) (memory.AgentInvocationActivity, error) {
+	var invocation memory.AgentInvocationActivity
+	var outcomeJSON []byte
+	if err := row.Scan(
+		&invocation.ID,
+		&invocation.ProjectID,
+		&invocation.PlanID,
+		&invocation.JobID,
+		&invocation.AgentName,
+		&invocation.ValidationStatus,
+		&invocation.ValidationError,
+		&outcomeJSON,
+		&invocation.CreatedAt,
+	); err != nil {
+		return memory.AgentInvocationActivity{}, normalizeSQLError(err)
+	}
+	invocation.DownstreamOutcome = map[string]any{}
+	if len(outcomeJSON) > 0 {
+		if err := json.Unmarshal(outcomeJSON, &invocation.DownstreamOutcome); err != nil {
+			return memory.AgentInvocationActivity{}, fmt.Errorf("unmarshal agent invocation activity outcome: %w", err)
+		}
+	}
+	return invocation, nil
 }

@@ -5,11 +5,20 @@ interface OrchestratorRequest {
   method?: string;
   path: string;
   body?: unknown;
+  diagnosticReason?: import("./api/missionControlClient").MissionControlRequestReason;
 }
 
 interface Window {
   missionControl: {
     request<T>(request: OrchestratorRequest): Promise<T>;
+    recordActivityVisibility(summary: import("./api/activityDiagnostics").ActivityVisibilitySummary): Promise<{
+      recorded: boolean;
+    }>;
+    recordActivityStreamAttempt(summary: {
+      reason_code: "stream_initial" | "stream_reconnect";
+      outcome_code: "connected" | "failed";
+      duration_ms: number;
+    }): Promise<{ recorded: boolean }>;
     selectDatasetFolder(): Promise<{
       token: string;
       path: string;

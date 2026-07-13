@@ -1,0 +1,13 @@
+{
+  "health": { "template": "/healthz", "cache_ttl_ms": 0 },
+  "projectIndex": { "template": "/projects", "cache_ttl_ms": 0 },
+  "workerRequirements": { "template": "/projects/{project_id}/worker-requirements", "cache_ttl_ms": 0 },
+  "datasets": { "template": "/projects/{project_id}/datasets", "cache_ttl_ms": 0 },
+  "jobs": { "template": "/projects/{project_id}/jobs?limit=100", "cache_ttl_ms": 0 },
+  "plans": { "template": "/projects/{project_id}/plans", "cache_ttl_ms": 0 },
+  "trainingRunSummaries": { "template": "/projects/{project_id}/training-run-summaries?limit=100", "cache_ttl_ms": 0 },
+  "champion": { "template": "/projects/{project_id}/champion", "cache_ttl_ms": 0 },
+  "workers": { "template": "/projects/{project_id}/workers", "cache_ttl_ms": 0 },
+  "executionEvents": { "template": "/projects/{project_id}/execution-events?limit=8", "cache_ttl_ms": 15000 },
+  "jobMetrics": { "template": "/jobs/{job_id}/metrics?limit=200", "cache_ttl_ms": 0 }
+}

@@ -294,8 +294,12 @@ func (s *PostgresStore) insertDatasetVisualAnalysis(analysis datasets.DatasetVis
 }
 
 func (s *PostgresStore) requireProject(projectID string) error {
+	return s.requireProjectContext(context.Background(), projectID)
+}
+
+func (s *PostgresStore) requireProjectContext(ctx context.Context, projectID string) error {
 	var exists bool
-	if err := s.db.QueryRowContext(context.Background(), `
+	if err := s.db.QueryRowContext(ctx, `
 		SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)
 	`, projectID).Scan(&exists); err != nil {
 		return err
@@ -1183,6 +1187,8 @@ func scanExecutionEvent(row rowScanner) (execution.ExecutionEvent, error) {
 		&event.Message,
 		&payloadJSON,
 		&event.CreatedAt,
+		&event.Sequence,
+		&event.IdempotencyKey,
 	); err != nil {
 		return execution.ExecutionEvent{}, normalizeSQLError(err)
 	}

@@ -1,8 +1,23 @@
+import liveRequestPlan from "./liveRequestPlan.json";
+
+export type MissionControlRequestReason =
+  | "activity_event"
+  | "active_poll"
+  | "idle_poll"
+  | "initial_load"
+  | "manual_refresh"
+  | "project_change"
+  | "stream_initial"
+  | "stream_reconnect"
+  | "targeted"
+  | "unspecified";
+
 export type RequestOptions = {
   method?: string;
   body?: unknown;
   bypassCache?: boolean;
   cacheTtlMs?: number;
+  diagnosticReason?: MissionControlRequestReason;
 };
 
 export type CachedGetRequest = {
@@ -24,10 +39,21 @@ export type OrchestratorHttpErrorResponse = {
 
 const expensiveGetCacheTtlMs = 15_000;
 
+export type LiveRequestPlanKey = keyof typeof liveRequestPlan;
+
+export function liveRequestPath(
+  key: LiveRequestPlanKey,
+  identifiers: { projectId?: string; jobId?: string } = {},
+): string {
+  return liveRequestPlan[key].template
+    .replace("{project_id}", encodeURIComponent(identifiers.projectId ?? ""))
+    .replace("{job_id}", encodeURIComponent(identifiers.jobId ?? ""));
+}
+
 export function cachedGetRequestTtlMs(path: string): number {
   const normalizedPath = path.split("?")[0] ?? path;
   if (/^\/projects\/[^/]+\/execution-events$/.test(normalizedPath)) {
-    return expensiveGetCacheTtlMs;
+    return liveRequestPlan.executionEvents.cache_ttl_ms;
   }
   if (/^\/projects\/[^/]+\/(agent-invocations|agent-decisions|agent-memory|strategy-scorecards|training-run-evaluations)$/.test(normalizedPath)) {
     return expensiveGetCacheTtlMs;

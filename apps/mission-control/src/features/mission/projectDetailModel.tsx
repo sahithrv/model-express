@@ -681,6 +681,7 @@ export type AgentInvocationsResponse = {
 export type ProjectDetailRefreshOptions = {
   includeSlowData?: boolean;
   forceSlowData?: boolean;
+  diagnosticReason?: import("../../api/missionControlClient").MissionControlRequestReason;
 };
 
 export type DatasetMetadataSummaryResponse =

@@ -15,6 +15,10 @@ const { Transform } = require("stream");
 const { pipeline } = require("stream/promises");
 const { fileURLToPath, pathToFileURL } = require("url");
 const { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
+const {
+  createRollingRequestDiagnostics,
+  normalizeRequestReason,
+} = require("./request-diagnostics.cjs");
 const { buildDatasetUploadPreflight, collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
 
 let mainWindow;
@@ -48,6 +52,19 @@ const CHAMPION_DEMO_RUNTIME_IDLE_TTL_MS = 3 * 60 * 1000;
 const CHAMPION_DEMO_RUNTIME_TIMEOUT_MS = 45_000;
 const MISSION_CONTROL_MIN_WIDTH = 1460;
 const MISSION_CONTROL_MIN_HEIGHT = 760;
+const ACTIVITY_VISIBILITY_REASON_CODES = new Set([
+  "clock_skew",
+  "initial_catch_up",
+  "invalid_timestamp",
+  "live",
+  "reconnect_catch_up",
+]);
+const ACTIVITY_STREAM_REASON_CODES = new Set(["stream_initial", "stream_reconnect"]);
+const ACTIVITY_STREAM_OUTCOME_CODES = new Set(["connected", "failed"]);
+const missionControlRequestDiagnostics = createRollingRequestDiagnostics();
+let missionControlRequestMetricsFlushTimer = null;
+let missionControlRequestMetricsFlushEnv = null;
+let missionControlRequestMetricsPendingCount = 0;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -95,6 +112,7 @@ function validateOrchestratorRequest(request = {}, env = process.env) {
     path: requestPath,
     url,
     bodyText,
+    reasonCode: normalizeRequestReason(request.diagnosticReason),
   };
 }
 
@@ -1068,6 +1086,7 @@ if (electronRuntimeAvailable) {
   });
 
   app.on("before-quit", () => {
+	flushMissionControlRequestMetrics();
     for (const worker of projectWorkers.values()) {
       if (worker.exitCode === null && !worker.killed) {
         worker.kill();
@@ -1081,16 +1100,57 @@ if (electronRuntimeAvailable) {
   ipcMain.handle("orchestrator:request", async (_event, request) => {
     const env = missionControlEnv();
     const validated = validateOrchestratorRequest(request, env);
-    const response = await fetch(validated.url, {
-      method: validated.method,
-      headers: {
-        "Content-Type": "application/json",
-        ...apiTokenHeaders(env),
-      },
-      body: validated.bodyText,
-    });
+    const startedAt = Date.now();
+    let response;
+    try {
+      response = await fetch(validated.url, {
+        method: validated.method,
+        headers: {
+          "Content-Type": "application/json",
+          ...apiTokenHeaders(env),
+        },
+        body: validated.bodyText,
+      });
+    } catch (error) {
+      recordMissionControlRequestMetrics({
+        env,
+        method: validated.method,
+        path: validated.path,
+        reasonCode: validated.reasonCode,
+        statusCode: 0,
+        durationMs: Date.now() - startedAt,
+        responseBytes: 0,
+        failed: true,
+      });
+      throw error;
+    }
 
-    const text = await response.text();
+    let text;
+    try {
+      text = await response.text();
+    } catch (error) {
+      recordMissionControlRequestMetrics({
+        env,
+        method: validated.method,
+        path: validated.path,
+        reasonCode: validated.reasonCode,
+        statusCode: response.status,
+        durationMs: Date.now() - startedAt,
+        responseBytes: 0,
+        failed: true,
+      });
+      throw error;
+    }
+    recordMissionControlRequestMetrics({
+      env,
+      method: validated.method,
+      path: validated.path,
+      reasonCode: validated.reasonCode,
+      statusCode: response.status,
+      durationMs: Date.now() - startedAt,
+      responseBytes: Buffer.byteLength(text, "utf8"),
+      failed: !response.ok,
+    });
     let payload = null;
     if (text) {
       try {
@@ -1117,6 +1177,29 @@ if (electronRuntimeAvailable) {
     }
 
     return payload;
+  });
+
+  ipcMain.handle("diagnostics:activityVisibility", async (_event, summary) => {
+    const fields = validateActivityVisibilitySummary(summary);
+    const env = missionControlEnv();
+    setImmediate(() => appendDiagnosticLog(resolveLogDir(repoRoot(env), env), "info", "activity_visibility_latency", fields));
+    return { recorded: true };
+  });
+
+  ipcMain.handle("diagnostics:activityStreamAttempt", async (_event, summary) => {
+    const fields = validateActivityStreamAttempt(summary);
+    const env = missionControlEnv();
+    recordMissionControlRequestMetrics({
+      env,
+      method: "GET",
+      path: "/projects/resource/activity-stream",
+      reasonCode: fields.reason_code,
+      statusCode: fields.outcome_code === "connected" ? 200 : 0,
+      durationMs: fields.duration_ms,
+      responseBytes: 0,
+      failed: fields.outcome_code === "failed",
+    });
+    return { recorded: true };
   });
 
   ipcMain.handle("dataset:selectAndUpload", async (_event, options) => {
@@ -2537,6 +2620,98 @@ function resolveLogDir(repoRoot, env = process.env) {
   return env.MODEL_EXPRESS_LOG_DIR ?? path.join(repoRoot, "artifacts", "logs");
 }
 
+function recordMissionControlRequestMetrics(sample) {
+  const metrics = missionControlRequestDiagnostics.record(sample);
+  missionControlRequestMetricsFlushEnv = sample.env;
+  missionControlRequestMetricsPendingCount += 1;
+  if (missionControlRequestMetricsFlushTimer === null) {
+    missionControlRequestMetricsFlushTimer = setTimeout(flushMissionControlRequestMetrics, 5_000);
+    missionControlRequestMetricsFlushTimer.unref?.();
+  }
+  return metrics;
+}
+
+function flushMissionControlRequestMetrics() {
+	if (missionControlRequestMetricsFlushTimer !== null) {
+	  clearTimeout(missionControlRequestMetricsFlushTimer);
+	}
+  missionControlRequestMetricsFlushTimer = null;
+  const env = missionControlRequestMetricsFlushEnv;
+  const flushRequestCount = missionControlRequestMetricsPendingCount;
+  missionControlRequestMetricsFlushEnv = null;
+  missionControlRequestMetricsPendingCount = 0;
+  if (!env || flushRequestCount < 1) return;
+  const metrics = missionControlRequestDiagnostics.snapshot();
+  appendDiagnosticLog(
+    resolveLogDir(repoRoot(env), env),
+    metrics.rolling_error_count > 0 ? "warn" : "info",
+    "mission_control_request_metrics",
+    {
+      ...metrics,
+      flush_request_count: flushRequestCount,
+      rolling_average_duration_ms: metrics.rolling_request_count > 0
+        ? Math.round(metrics.rolling_duration_ms / metrics.rolling_request_count)
+        : 0,
+      rolling_average_response_bytes: metrics.rolling_request_count > 0
+        ? Math.round(metrics.rolling_response_bytes / metrics.rolling_request_count)
+        : 0,
+    },
+  );
+}
+
+function validateActivityStreamAttempt(summary = {}) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+    throw new Error("Activity stream diagnostics must be an object.");
+  }
+  const reasonCode = String(summary.reason_code ?? "").trim().toLowerCase();
+  const outcomeCode = String(summary.outcome_code ?? "").trim().toLowerCase();
+  if (!ACTIVITY_STREAM_REASON_CODES.has(reasonCode) || !ACTIVITY_STREAM_OUTCOME_CODES.has(outcomeCode)) {
+    throw new Error("Activity stream diagnostics require supported reason and outcome codes.");
+  }
+  return {
+    reason_code: reasonCode,
+    outcome_code: outcomeCode,
+    duration_ms: boundedDiagnosticInteger(summary.duration_ms, 0, 24 * 60 * 60 * 1000),
+  };
+}
+
+function validateActivityVisibilitySummary(summary = {}) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+    throw new Error("Activity visibility diagnostics must be an object.");
+  }
+  const reasonCode = String(summary.reason_code ?? "").trim().toLowerCase();
+  if (!ACTIVITY_VISIBILITY_REASON_CODES.has(reasonCode)) {
+    throw new Error("Activity visibility diagnostics require a supported reason code.");
+  }
+  const sampleCount = boundedDiagnosticInteger(summary.sample_count, 0, 32);
+  const latencySampleCount = boundedDiagnosticInteger(summary.latency_sample_count, 0, sampleCount);
+  const invalidSampleCount = boundedDiagnosticInteger(summary.invalid_sample_count, 0, sampleCount);
+  if (sampleCount < 1 || latencySampleCount + invalidSampleCount !== sampleCount) {
+    throw new Error("Activity visibility diagnostic counts are invalid.");
+  }
+  return {
+    reason_code: reasonCode,
+    sample_count: sampleCount,
+    latency_sample_count: latencySampleCount,
+    invalid_sample_count: invalidSampleCount,
+    dropped_count: boundedDiagnosticInteger(summary.dropped_count, 0, 100_000),
+    latency_total_ms: boundedDiagnosticInteger(summary.latency_total_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    latency_min_ms: boundedDiagnosticInteger(summary.latency_min_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    latency_max_ms: boundedDiagnosticInteger(summary.latency_max_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    latency_average_ms: boundedDiagnosticInteger(summary.latency_average_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    commit_delay_total_ms: boundedDiagnosticInteger(summary.commit_delay_total_ms, 0, 60 * 60 * 1000),
+    commit_delay_average_ms: boundedDiagnosticInteger(summary.commit_delay_average_ms, 0, 60 * 60 * 1000),
+  };
+}
+
+function boundedDiagnosticInteger(value, minimum, maximum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return minimum;
+  }
+  return Math.min(maximum, Math.max(minimum, Math.round(parsed)));
+}
+
 function appendDiagnosticLog(logDir, level, event, fields = {}) {
   try {
     fs.mkdirSync(logDir, { recursive: true });
@@ -3536,6 +3711,8 @@ module.exports = {
     validateLocalPortableBundlePath,
     validateOrchestratorBaseUrl,
     validateOrchestratorRequest,
+    validateActivityVisibilitySummary,
+    validateActivityStreamAttempt,
     validateRemoteModalUrl,
     validateS3ExportArtifactUri,
     validateUploadEndpoint,

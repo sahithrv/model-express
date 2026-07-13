@@ -48,10 +48,17 @@ import {
 import {
   cachedGetRequestTtlMs,
   isOrchestratorHttpErrorResponse,
+	liveRequestPath,
   type CachedGetRequest,
+  type MissionControlRequestReason,
   type OrchestratorHttpErrorResponse,
   type RequestOptions,
 } from "./api/missionControlClient";
+import {
+  appendActivityVisibilitySample,
+  summarizeActivityVisibility,
+  type ActivityVisibilitySample,
+} from "./api/activityDiagnostics";
 import {
   emptyProjectDetail,
   type ChampionExportsStatus,
@@ -536,10 +543,7 @@ const activeLiveRefreshIntervalMs = 10_000;
 const idleLiveRefreshIntervalMs = 30_000;
 const eventRefreshMinIntervalMs = 3_000;
 const eventRefreshDebounceMs = 750;
-const projectJobsFetchLimit = 100;
-const trainingSummariesFetchLimit = 100;
 const trainingEvaluationsFetchLimit = 50;
-const selectedJobMetricsFetchLimit = 200;
 const selectedProjectStorageKey = "selectedProjectId";
 
 function missionControlErrorMessage(error: unknown): string {
@@ -920,6 +924,8 @@ export function App() {
   const liveRefreshInFlight = useRef(false);
   const cachedGetRequests = useRef<Map<string, CachedGetRequest>>(new Map());
   const executionAuditRequestId = useRef(0);
+  const pendingActivityVisibilitySamples = useRef<ActivityVisibilitySample[]>([]);
+  const droppedActivityVisibilitySamples = useRef(0);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -1117,6 +1123,7 @@ export function App() {
           path,
           method: options.method,
           body: options.body,
+          diagnosticReason: options.diagnosticReason,
         });
         if (isOrchestratorHttpErrorResponse(response)) {
           const statusText = response.statusText ? ` ${response.statusText}` : "";
@@ -1176,8 +1183,8 @@ export function App() {
     [baseUrl],
   );
 
-  const refreshProjects = useCallback(async () => {
-    const response = await request<{ projects: Project[] }>("/projects");
+  const refreshProjects = useCallback(async (options: Pick<RequestOptions, "diagnosticReason"> = {}) => {
+    const response = await request<{ projects: Project[] }>(liveRequestPath("projectIndex"), options);
     setProjects(response.projects);
     setSelectedProjectId((current) => {
       const projectIds = new Set(response.projects.map((project) => project.id));
@@ -1192,19 +1199,22 @@ export function App() {
     });
   }, [request]);
 
-  const refreshHealth = useCallback(async () => {
-    const response = await request<Health>("/healthz");
+  const refreshHealth = useCallback(async (options: Pick<RequestOptions, "diagnosticReason"> = {}) => {
+    const response = await request<Health>(liveRequestPath("health"), options);
     setHealth(response);
   }, [request]);
 
-  const refreshAutomationSettings = useCallback(async () => {
-    const response = await request<AutomationSettings>("/settings/automation");
+  const refreshAutomationSettings = useCallback(async (options: Pick<RequestOptions, "diagnosticReason"> = {}) => {
+    const response = await request<AutomationSettings>("/settings/automation", options);
     setAutomationSettings(response);
     setSettingsDraft(response);
   }, [request]);
 
   const fetchLatestDatasetVisualAnalysis = useCallback(
-    async (dataset: Dataset | null, options: Pick<RequestOptions, "bypassCache"> = {}): Promise<VisualAnalysisDetail> => {
+    async (
+      dataset: Dataset | null,
+      options: Pick<RequestOptions, "bypassCache" | "diagnosticReason"> = {},
+    ): Promise<VisualAnalysisDetail> => {
       if (!dataset) {
         return {
           analysis: null,
@@ -1273,7 +1283,10 @@ export function App() {
   );
 
   const fetchLatestDatasetMetadata = useCallback(
-    async (dataset: Dataset | null, options: Pick<RequestOptions, "bypassCache"> = {}): Promise<DatasetMetadataDetail> => {
+    async (
+      dataset: Dataset | null,
+      options: Pick<RequestOptions, "bypassCache" | "diagnosticReason"> = {},
+    ): Promise<DatasetMetadataDetail> => {
       if (!dataset) {
         return {
           summary: null,
@@ -1346,11 +1359,16 @@ export function App() {
         return;
       }
       const includeSlowData = options.includeSlowData ?? true;
-      const slowRequestOptions: Pick<RequestOptions, "bypassCache"> = {
+      const liveRequestOptions: Pick<RequestOptions, "diagnosticReason"> = {
+        diagnosticReason: options.diagnosticReason,
+      };
+      const slowRequestOptions: Pick<RequestOptions, "bypassCache" | "diagnosticReason"> = {
         bypassCache: options.forceSlowData ?? false,
+        diagnosticReason: options.diagnosticReason,
       };
       const workerRequirementsRequest = request<{ requirements: WorkerRequirement[] }>(
-        `/projects/${projectId}/worker-requirements`,
+        liveRequestPath("workerRequirements", { projectId }),
+        liveRequestOptions,
       )
         .then((response): WorkerRequirementsFetchResult => {
           const requirements = Array.isArray(response.requirements) ? response.requirements : [];
@@ -1375,13 +1393,19 @@ export function App() {
         workers,
         executionEvents,
       ] = await Promise.all([
-        request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
-        request<{ jobs: Job[] }>(`/projects/${projectId}/jobs?limit=${projectJobsFetchLimit}`),
-        request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
-        request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries?limit=${trainingSummariesFetchLimit}`),
-        request<{ champion: ProjectChampion | null }>(`/projects/${projectId}/champion`),
-        request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
-        request<{ events: ExecutionEvent[] }>(`/projects/${projectId}/execution-events?limit=8`),
+        request<{ datasets: Dataset[] }>(liveRequestPath("datasets", { projectId }), liveRequestOptions),
+        request<{ jobs: Job[] }>(liveRequestPath("jobs", { projectId }), liveRequestOptions),
+        request<{ plans: ExperimentPlan[] }>(liveRequestPath("plans", { projectId }), liveRequestOptions),
+        request<{ summaries: TrainingRunSummary[] }>(
+          liveRequestPath("trainingRunSummaries", { projectId }),
+          liveRequestOptions,
+        ),
+        request<{ champion: ProjectChampion | null }>(liveRequestPath("champion", { projectId }), liveRequestOptions),
+        request<{ workers: Worker[] }>(liveRequestPath("workers", { projectId }), liveRequestOptions),
+        request<{ events: ExecutionEvent[] }>(
+          liveRequestPath("executionEvents", { projectId }),
+          liveRequestOptions,
+        ),
       ]);
       const workerRequirements = await workerRequirementsRequest;
 
@@ -1670,13 +1694,16 @@ export function App() {
     [fetchLatestDatasetMetadata, fetchLatestDatasetVisualAnalysis, request],
   );
 
-  const refreshSelectedJobMetrics = useCallback(async () => {
+  const refreshSelectedJobMetrics = useCallback(async (options: Pick<RequestOptions, "diagnosticReason"> = {}) => {
     if (!selectedJobId) {
       setMetrics([]);
       return;
     }
 
-    const response = await request<{ metrics: EpochMetric[] }>(`/jobs/${selectedJobId}/metrics?limit=${selectedJobMetricsFetchLimit}`);
+    const response = await request<{ metrics: EpochMetric[] }>(
+      liveRequestPath("jobMetrics", { jobId: selectedJobId }),
+      options,
+    );
     setMetrics(response.metrics);
   }, [request, selectedJobId]);
 
@@ -1710,17 +1737,22 @@ export function App() {
     setExecutionAuditLoading(false);
   }, [selectedJobId]);
 
-  const refreshAll = useCallback(async () => {
+  const refreshAllWithReason = useCallback(async (diagnosticReason: MissionControlRequestReason) => {
+    const requestOptions = { diagnosticReason };
     setLoading(true);
     setNotice(null);
     try {
-      await refreshHealth();
-      await refreshAutomationSettings();
-      await refreshProjects();
+      await refreshHealth(requestOptions);
+      await refreshAutomationSettings(requestOptions);
+      await refreshProjects(requestOptions);
       if (selectedProjectId) {
-        await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
+        await refreshProjectDetail(selectedProjectId, {
+          includeSlowData: true,
+          forceSlowData: true,
+          diagnosticReason,
+        });
       }
-      await refreshSelectedJobMetrics();
+      await refreshSelectedJobMetrics(requestOptions);
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -1735,19 +1767,29 @@ export function App() {
     selectedProjectId,
   ]);
 
+  const refreshAll = useCallback(async () => {
+    await refreshAllWithReason("manual_refresh");
+  }, [refreshAllWithReason]);
+
   const refreshLive = useCallback(async (options: ProjectDetailRefreshOptions = { includeSlowData: false }) => {
     if (liveRefreshInFlight.current) {
       return;
     }
     const includeSlowData = options.includeSlowData ?? false;
+    const diagnosticReason = options.diagnosticReason ?? "unspecified";
+    const requestOptions = { diagnosticReason };
     liveRefreshInFlight.current = true;
     try {
-      await refreshHealth();
-      await refreshProjects();
+      await refreshHealth(requestOptions);
+      await refreshProjects(requestOptions);
       if (selectedProjectId) {
-        await refreshProjectDetail(selectedProjectId, { includeSlowData, forceSlowData: includeSlowData });
+        await refreshProjectDetail(selectedProjectId, {
+          includeSlowData,
+          forceSlowData: includeSlowData,
+          diagnosticReason,
+        });
       }
-      await refreshSelectedJobMetrics();
+      await refreshSelectedJobMetrics(requestOptions);
     } catch (error) {
       setHealth(null);
       setDetail((previous) => {
@@ -1800,7 +1842,7 @@ export function App() {
   }, [baseUrl]);
 
   useEffect(() => {
-    refreshAll();
+    refreshAllWithReason("initial_load");
   }, []);
 
   useEffect(() => {
@@ -1819,11 +1861,17 @@ export function App() {
       setLocalInferenceError("");
       setActivityEvents([]);
       setActivityStreamState("connecting");
+      pendingActivityVisibilitySamples.current = [];
+      droppedActivityVisibilitySamples.current = 0;
       localRuntime.current = null;
       window.missionControl.disposeChampionDemoLocalRuntime({ reason: "project_changed" }).catch(() => undefined);
       resetWorkerSupervisor();
       setJobPage(0);
-      refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch((error) =>
+      refreshProjectDetail(selectedProjectId, {
+        includeSlowData: true,
+        forceSlowData: true,
+        diagnosticReason: "project_change",
+      }).catch((error) =>
         setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
       );
     }
@@ -1929,7 +1977,10 @@ export function App() {
   useEffect(() => {
     const interval = projectHasOpenWork ? activeLiveRefreshIntervalMs : idleLiveRefreshIntervalMs;
     const timer = window.setInterval(() => {
-      refreshLive();
+      refreshLive({
+        includeSlowData: false,
+        diagnosticReason: projectHasOpenWork ? "active_poll" : "idle_poll",
+      });
     }, interval);
 
     return () => window.clearInterval(timer);
@@ -1946,6 +1997,12 @@ export function App() {
     }
 
     let closed = false;
+    let hasOpened = false;
+    let streamOpenedAtMs = Date.now();
+    let catchUpReason: ActivityVisibilitySample["catchUpReason"] = "initial_catch_up";
+    let streamAttemptStartedAtMs = streamOpenedAtMs;
+    let streamAttemptPending = true;
+    let streamAttemptReason: "stream_initial" | "stream_reconnect" = "stream_initial";
     setActivityStreamState("connecting");
     const streamUrl = new URL(`/projects/${selectedProjectId}/activity-stream`, baseUrl);
     streamUrl.searchParams.set("limit", "12");
@@ -1964,7 +2021,7 @@ export function App() {
         lastEventRefreshAt.current = Date.now();
         const shouldIncludeSlowData = eventRefreshQueuedSlow.current;
         eventRefreshQueuedSlow.current = false;
-        refreshLive({ includeSlowData: shouldIncludeSlowData })
+        refreshLive({ includeSlowData: shouldIncludeSlowData, diagnosticReason: "activity_event" })
           .catch(() => undefined)
           .finally(() => {
             eventRefreshInFlight.current = false;
@@ -1975,13 +2032,34 @@ export function App() {
     const handleActivityEvent = (event: MessageEvent) => {
       const activity = activityEventFromMessage(event);
       if (activity) {
+        const queued = appendActivityVisibilitySample(pendingActivityVisibilitySamples.current, {
+          createdAtMs: Date.parse(activity.created_at),
+          receivedAtMs: Date.now(),
+          streamOpenedAtMs,
+          catchUpReason,
+        });
+        pendingActivityVisibilitySamples.current = queued.samples;
+        droppedActivityVisibilitySamples.current += queued.dropped;
         setActivityEvents((current) => mergeActivityEvents(current, activity));
       }
       triggerRefresh(event);
     };
 
     events.onopen = () => {
-      if (!closed) setActivityStreamState("connected");
+      if (!closed) {
+        if (streamAttemptPending) {
+          window.missionControl.recordActivityStreamAttempt({
+            reason_code: streamAttemptReason,
+            outcome_code: "connected",
+            duration_ms: Math.max(0, Date.now() - streamAttemptStartedAtMs),
+          }).catch(() => undefined);
+          streamAttemptPending = false;
+        }
+        catchUpReason = hasOpened ? "reconnect_catch_up" : "initial_catch_up";
+        hasOpened = true;
+        streamOpenedAtMs = Date.now();
+        setActivityStreamState("connected");
+      }
     };
     events.onmessage = (event) => {
       handleActivityEvent(event);
@@ -1991,7 +2069,20 @@ export function App() {
       if (!closed) setActivityStreamState("fallback");
     });
     events.onerror = () => {
-      if (!closed) setActivityStreamState("reconnecting");
+      if (!closed) {
+        if (streamAttemptPending) {
+          window.missionControl.recordActivityStreamAttempt({
+            reason_code: streamAttemptReason,
+            outcome_code: "failed",
+            duration_ms: Math.max(0, Date.now() - streamAttemptStartedAtMs),
+          }).catch(() => undefined);
+        }
+        streamAttemptPending = events.readyState !== EventSource.CLOSED;
+        streamAttemptReason = "stream_reconnect";
+        streamAttemptStartedAtMs = Date.now();
+        catchUpReason = "reconnect_catch_up";
+        setActivityStreamState("reconnecting");
+      }
     };
 
     return () => {
@@ -2003,6 +2094,18 @@ export function App() {
       events.close();
     };
   }, [baseUrl, projectHasOpenWork, refreshLive, selectedProjectId]);
+
+  useEffect(() => {
+    if (pendingActivityVisibilitySamples.current.length === 0) return;
+    const samples = pendingActivityVisibilitySamples.current;
+    const dropped = droppedActivityVisibilitySamples.current;
+    pendingActivityVisibilitySamples.current = [];
+    droppedActivityVisibilitySamples.current = 0;
+    const summaries = summarizeActivityVisibility(samples, Date.now(), dropped);
+    for (const summary of summaries) {
+      window.missionControl.recordActivityVisibility(summary).catch(() => undefined);
+    }
+  }, [activityEvents]);
 
   useEffect(() => {
     if (!workerSupervisorEnabled) return;

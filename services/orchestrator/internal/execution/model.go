@@ -176,11 +176,71 @@ type WorkerRequirementPolicy struct {
 }
 
 type ExecutionEvent struct {
-	ID        string         `json:"id"`
-	ProjectID string         `json:"project_id"`
-	PlanID    string         `json:"plan_id,omitempty"`
-	EventType string         `json:"event_type"`
-	Message   string         `json:"message"`
-	Payload   map[string]any `json:"payload"`
-	CreatedAt time.Time      `json:"created_at"`
+	ID             string         `json:"id"`
+	ProjectID      string         `json:"project_id"`
+	PlanID         string         `json:"plan_id,omitempty"`
+	EventType      string         `json:"event_type"`
+	Message        string         `json:"message"`
+	Payload        map[string]any `json:"payload"`
+	CreatedAt      time.Time      `json:"created_at"`
+	Sequence       int64          `json:"-"`
+	IdempotencyKey string         `json:"-"`
+}
+
+type ExecutionEventCursorState struct {
+	LastSequence          int64
+	RetainedSequenceFloor int64
+}
+
+// SafeExecutionEventMetadataKeys is the storage fetch allowlist for the
+// bounded v2 execution-event projection. The API remaps error source keys to
+// stable public aliases.
+func SafeExecutionEventMetadataKeys() []string {
+	return []string{
+		"agent_name",
+		"decision_id",
+		"source_decision_id",
+		"decision_type",
+		"job_id",
+		"job_ids",
+		"worker_requirement_id",
+		"open_job_count",
+		"active_worker_count",
+		"target_count",
+		"previous_slot_count",
+		"slot_count",
+		"desired_slot_count",
+		"registered_slot_count",
+		"active_slot_count",
+		"idle_seconds",
+		"idle_exit_seconds",
+		"dispatcher",
+		"provider",
+		"gpu_type",
+		"requirement_status",
+		"template",
+		"attempt",
+		"max_attempts",
+		"requeued",
+		"backend_validation_status",
+		"backend_stop_guard",
+		"reason",
+		"model",
+		"selection_source",
+		"materialization_status",
+		"max_concurrent_jobs",
+		"max_cold_dataset_materializations",
+		"retry_attempt",
+		"will_retry",
+		"completed_run_count",
+		"memory_count",
+		"evaluation_count",
+		"purpose",
+		"retrieved_count",
+		"log_only",
+		"cross_project_ok",
+		"backend_validation_error",
+		"error",
+		"last_error",
+	}
 }

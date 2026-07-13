@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("missionControl", {
   request: (request) => ipcRenderer.invoke("orchestrator:request", request),
+  recordActivityVisibility: (summary) => ipcRenderer.invoke("diagnostics:activityVisibility", summary),
+  recordActivityStreamAttempt: (summary) => ipcRenderer.invoke("diagnostics:activityStreamAttempt", summary),
   selectAndUploadDataset: (options) => ipcRenderer.invoke("dataset:selectAndUpload", options),
   selectDatasetFolder: () => ipcRenderer.invoke("dataset:selectFolder"),
   preflightDatasetFolder: (options) => ipcRenderer.invoke("dataset:preflightFolder", options),
