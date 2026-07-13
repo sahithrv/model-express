@@ -198,6 +198,8 @@ Attempt-scoped progress reporting is enabled by default. It is best-effort: unsu
 
 Set `MODEL_EXPRESS_PROGRESS_REPORTING_ENABLED=false` to roll back progress callbacks while retaining legacy stage and metric telemetry. This switch requires no data repair and does not disable authoritative job completion/failure callbacks. Local progress diagnostics retain only a bounded list of reason codes, stages, revisions, attempt counts, and HTTP status codes; they never retain callback tokens, attempt identities, storage paths, prompts, or request payload contents.
 
+Local training and the current `persistent_gpu`/`persistent_disk` path publish the same versioned coarse progress stages as Modal. These paths are deterministic simulators, so their progress metadata explicitly sets `execution_mode=local_simulator`; provider/runtime distinctions stay in bounded detail codes and allowlisted metadata rather than becoming new stages. The persistent provider still performs real persistent-disk dataset materialization before handing the same attempt-scoped reporter to the simulator, preserving monotonic revisions and outage/throttling behavior across that handoff. Workers report only through `finalizing`; the backend remains authoritative for completion, failure, cancellation, retry, and recovery.
+
 ## Modal Provider
 
 Modal is the primary remote GPU execution provider for real training runs.

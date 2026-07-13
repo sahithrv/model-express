@@ -364,11 +364,17 @@ The API is intentionally not just a training API. It is a control-plane API for 
 
 The optional raw execution-event v2 stream is exposed at `GET /projects/:id/events/stream/v2` only when `MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED=true`. The flag defaults to false, so rollback disables the route without removing or repairing cursor data. The existing execution-event and synthesized activity endpoints remain unchanged.
 
-V2 uses the durable decimal event sequence as the SSE `id`. An initial connection may pass `cursor`; a reconnect uses `Last-Event-ID`, which takes precedence. Missing cursors bootstrap from zero. Invalid, negative, or overflowing cursors return `400 invalid_cursor`; cursors ahead of the committed high-water mark return `409 cursor_ahead`; and positive cursors below `retained_sequence_floor` return `410 cursor_too_old`. Ahead and too-old responses require a state resync instead of silently resetting the cursor. While the compact live-state endpoint is not yet available, clients should fall back to the v1 synthesized activity path for that resync.
+V2 uses the durable decimal event sequence as the SSE `id`. An initial connection may pass `cursor`; a reconnect uses `Last-Event-ID`, which takes precedence. Missing cursors bootstrap from zero. Invalid, negative, or overflowing cursors return `400 invalid_cursor`; cursors ahead of the committed high-water mark return `409 cursor_ahead`; and positive cursors below `retained_sequence_floor` return `410 cursor_too_old`. Ahead and too-old responses require a state resync instead of silently resetting the cursor.
 
 Catch-up reads are ascending and bounded per page, idle connections receive keepalive comments, and request cancellation stops further reads. Stream data is a bounded allowlist/redaction envelope: stored payload JSON is never serialized directly, and messages and metadata are sanitized at read time.
 
 This v2 endpoint is the authoritative transition stream for job lifecycle, agent-validation, and agent-decision changes produced after Activity PR 4. Those producers use typed allowlisted payloads and deterministic idempotency keys; job lifecycle rows are committed atomically with the job and current attempt snapshot. Historical pre-PR-4 rows can still lack producer coverage, and Mission Control retains the v1 compatibility fallback during the rollout window.
+
+### Compact live state
+
+`GET /projects/:id/live-state` returns one bounded operational snapshot: aggregate job, worker, and worker-requirement counts; up to eight current attempt progress rows; server-derived heartbeat staleness; the next stable taxonomy stage; one safely projected important event; and the global event cursor that follows the snapshot. It excludes plans, evaluations, histories, prompts, raw configuration, job errors, and storage locations. Progress metadata is reduced to the worker callback allowlist, which preserves bounded provider and simulator identity without exposing arbitrary stored metadata.
+
+Memory reads hold the store mutex across the cursor and all snapshot fields. PostgreSQL reads the cursor first in a read-only repeatable-read transaction and then performs a fixed five additional queries. Therefore a racing transition is either visible in the snapshot or commits with a sequence greater than `snapshot_cursor` and is returned by the v2 stream after that cursor; it cannot fall between the two. The response carries an ETag derived from the full deterministic snapshot rather than from the cursor alone, because snapshot-only heartbeats can change progress and stale status without appending an event.
 
 ## Reliability State
 

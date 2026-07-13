@@ -491,10 +491,11 @@ def test_modal_disabled_progress_flag_is_forwarded_to_remote(monkeypatch):
     assert remote_payloads[0]["progress_reporting_enabled"] is False
 
 
-def test_modal_detection_does_not_publish_classification_progress(monkeypatch):
+def test_modal_detection_reports_submission_and_hands_remote_revision_forward(monkeypatch):
+    remote_payloads = []
     fake_modal_app = types.ModuleType("worker.training.modal_app")
     fake_modal_app.app = _FakeModalApp()
-    fake_modal_app.train_yolo_detector = _FakeModalFunction(lambda _payload: {})
+    fake_modal_app.train_yolo_detector = _FakeModalFunction(remote_payloads.append)
     monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
     monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
     monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
@@ -511,11 +512,57 @@ def test_modal_detection_does_not_publish_classification_progress(monkeypatch):
                 "task_type": "object_detection",
                 "model": "yolo11n.pt",
                 "active_attempt_id": "job_yolo_progress:attempt-1",
+                "callback_token": "callback-secret",
             },
         },
     )
 
-    assert client.progress == []
+    assert [entry["payload"]["stage"] for entry in client.progress] == [
+        "worker_starting",
+        "remote_scheduled",
+    ]
+    assert [entry["payload"]["revision"] for entry in client.progress] == [3, 4]
+    assert all(entry["payload"]["taxonomy_version"] == 1 for entry in client.progress)
+    assert all(entry["payload"]["stage"] != "completed" for entry in client.progress)
+    assert remote_payloads[0]["progress_revision"] == 4
+    assert remote_payloads[0]["progress_reporting_enabled"] is True
+
+
+def test_modal_detection_progress_outage_does_not_fail_submission(monkeypatch):
+    remote_calls = []
+    fake_modal_app = types.ModuleType("worker.training.modal_app")
+    fake_modal_app.app = _FakeModalApp()
+    fake_modal_app.train_yolo_detector = _FakeModalFunction(
+        lambda payload: remote_calls.append(payload["job"]["id"])
+    )
+    monkeypatch.setitem(sys.modules, "worker.training.modal_app", fake_modal_app)
+    monkeypatch.setenv("MODAL_ORCHESTRATOR_URL", "https://orchestrator.test")
+    monkeypatch.setenv("MODAL_S3_ENDPOINT_URL", "https://s3.test")
+    monkeypatch.setenv("MODEL_EXPRESS_PROGRESS_REPORT_MAX_ATTEMPTS", "1")
+
+    client = _FakeClient()
+
+    def unavailable(*_args, **_kwargs):
+        raise requests.ConnectionError("progress callback unavailable")
+
+    client.report_progress = unavailable
+    run_modal_training(
+        client,
+        {
+            "id": "job_yolo_progress_outage",
+            "project_id": "project_1",
+            "config": {
+                "dataset_id": "dataset_1",
+                "provider": "modal",
+                "task_type": "object_detection",
+                "model": "yolo11n.pt",
+                "active_attempt_id": "job_yolo_progress_outage:attempt-1",
+            },
+        },
+    )
+
+    assert remote_calls == ["job_yolo_progress_outage"]
+    assert client.failures == []
 
 
 def test_modal_storage_rejects_default_root_credentials(monkeypatch):

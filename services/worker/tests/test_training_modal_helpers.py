@@ -300,6 +300,110 @@ class ModalTrainingHelperTests(unittest.TestCase):
         )
         self.assertLess(before_epoch_loop.index('"environment_starting"'), before_epoch_loop.index("import torch"))
 
+    def test_yolo_progress_starts_before_epoch_one_and_epochs_are_monotonic(self) -> None:
+        calls = []
+
+        class Reporter:
+            def report(self, stage: str, **fields) -> bool:
+                calls.append({"stage": stage, **fields})
+                return True
+
+        reporter = Reporter()
+        self.modal_app._report_yolo_training_progress(reporter, current=0, total=3)
+        state = {"last_epoch": 0}
+        for epoch in (0, 1, 1, 0, 2, 5):
+            self.modal_app._report_yolo_epoch_callback_progress(
+                reporter,
+                trainer=SimpleNamespace(epoch=epoch),
+                total=3,
+                state=state,
+            )
+
+        self.assertEqual([call["stage"] for call in calls], ["training"] * 4)
+        self.assertEqual([call["current"] for call in calls], [0, 1, 2, 3])
+        self.assertTrue(all(call["total"] == 3 and call["unit"] == "epoch" for call in calls))
+        self.assertEqual(
+            [call["detail_code"] for call in calls],
+            ["yolo_training", "yolo_epoch_complete", "yolo_epoch_complete", "yolo_epoch_complete"],
+        )
+        self.assertTrue(all(len(call["detail_code"].encode("utf-8")) <= 64 for call in calls))
+        self.assertNotIn("completed", [call["stage"] for call in calls])
+
+    def test_yolo_and_classification_share_the_training_taxonomy(self) -> None:
+        calls = {"classification": [], "yolo": []}
+
+        class Reporter:
+            def __init__(self, kind: str):
+                self.kind = kind
+
+            def report(self, stage: str, **fields) -> bool:
+                calls[self.kind].append({"stage": stage, **fields})
+                return True
+
+        self.modal_app._report_classification_training_progress(
+            Reporter("classification"),
+            current=0,
+            total=3,
+        )
+        self.modal_app._report_yolo_training_progress(
+            Reporter("yolo"),
+            current=0,
+            total=3,
+        )
+
+        stable_fields = ("stage", "current", "total", "unit")
+        self.assertEqual(
+            {key: calls["classification"][0][key] for key in stable_fields},
+            {key: calls["yolo"][0][key] for key in stable_fields},
+        )
+        self.assertNotEqual(
+            calls["classification"][0]["detail_code"],
+            calls["yolo"][0]["detail_code"],
+        )
+
+    def test_yolo_cold_start_stages_are_wired_before_training(self) -> None:
+        source = inspect.getsource(self.modal_app._train_yolo_detector_impl)
+        before_training = source[: source.index("detector.train(**train_kwargs)")]
+        stage_positions = [
+            before_training.index(f'"{stage}"')
+            for stage in (
+                "environment_starting",
+                "dataset_materializing",
+                "model_initializing",
+            )
+        ]
+
+        self.assertEqual(stage_positions, sorted(stage_positions))
+        self.assertIn(
+            "_report_yolo_training_progress(progress_reporter, current=0, total=epochs)",
+            before_training,
+        )
+        self.assertLess(before_training.index('"environment_starting"'), before_training.index("import ultralytics"))
+
+    def test_yolo_progress_reporting_failure_is_non_fatal(self) -> None:
+        class UnavailableReporter:
+            def report(self, _stage: str, **_fields) -> bool:
+                raise RuntimeError("progress endpoint unavailable")
+
+        reporter = UnavailableReporter()
+        self.assertFalse(
+            self.modal_app._report_yolo_training_progress(
+                reporter,
+                current=0,
+                total=3,
+            )
+        )
+        state = {"last_epoch": 0}
+        self.assertFalse(
+            self.modal_app._report_yolo_epoch_callback_progress(
+                reporter,
+                trainer=SimpleNamespace(epoch=0),
+                total=3,
+                state=state,
+            )
+        )
+        self.assertEqual(state["last_epoch"], 1)
+
     def test_classification_backend_completion_follows_all_final_processing(self) -> None:
         calls = []
         job = {"id": "job_1", "config": {"active_attempt_id": "job_1:attempt-1"}}
@@ -376,6 +480,86 @@ class ModalTrainingHelperTests(unittest.TestCase):
                     fidelity_evidence={},
                     modal_resources={},
                     mlflow_run_id="modal-job_1",
+                )
+
+        self.assertEqual(calls, ["summary", "evaluation"])
+
+    def test_yolo_backend_completion_follows_all_final_processing(self) -> None:
+        calls = []
+        job = {"id": "job_1", "config": {"active_attempt_id": "job_1:attempt-1"}}
+
+        with patch.object(
+            self.modal_app,
+            "_report_modal_progress",
+            lambda _reporter, stage, **_fields: calls.append(stage) or True,
+        ), patch.object(
+            self.modal_app,
+            "_post_training_run_summary",
+            lambda *_args, **_kwargs: calls.append("summary"),
+        ), patch.object(
+            self.modal_app,
+            "_post_training_run_evaluation",
+            lambda *_args, **_kwargs: calls.append("evaluation"),
+        ), patch.object(
+            self.modal_app,
+            "_post_yolo_execution_observation",
+            lambda *_args, **_kwargs: calls.append("fidelity"),
+        ), patch.object(
+            self.modal_app,
+            "_post_job_json",
+            lambda *_args, **_kwargs: calls.append("complete"),
+        ):
+            self.modal_app._publish_yolo_final_callbacks(
+                progress_reporter=object(),
+                orchestrator_url="https://orchestrator.test",
+                job=job,
+                summary_payload={"status": "SUCCEEDED"},
+                evaluation_payload={"export_bundle": {"status": "ready"}},
+                execution=object(),
+                framework_arguments={},
+                evidence={"checkpoint_available": True},
+                modal_resources={},
+                mlflow_run_id="modal-yolo-job_1",
+            )
+
+        self.assertEqual(calls, ["finalizing", "summary", "evaluation", "fidelity", "complete"])
+
+    def test_yolo_does_not_complete_when_final_processing_fails(self) -> None:
+        calls = []
+
+        def fail_evaluation(*_args, **_kwargs):
+            calls.append("evaluation")
+            raise RuntimeError("evaluation rejected")
+
+        with patch.object(self.modal_app, "_report_modal_progress", lambda *_args, **_kwargs: False), patch.object(
+            self.modal_app,
+            "_post_training_run_summary",
+            lambda *_args, **_kwargs: calls.append("summary"),
+        ), patch.object(
+            self.modal_app,
+            "_post_training_run_evaluation",
+            fail_evaluation,
+        ), patch.object(
+            self.modal_app,
+            "_post_yolo_execution_observation",
+            lambda *_args, **_kwargs: calls.append("fidelity"),
+        ), patch.object(
+            self.modal_app,
+            "_post_job_json",
+            lambda *_args, **_kwargs: calls.append("complete"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "evaluation rejected"):
+                self.modal_app._publish_yolo_final_callbacks(
+                    progress_reporter=None,
+                    orchestrator_url="https://orchestrator.test",
+                    job={"id": "job_1", "config": {}},
+                    summary_payload={},
+                    evaluation_payload={},
+                    execution=object(),
+                    framework_arguments={},
+                    evidence={},
+                    modal_resources={},
+                    mlflow_run_id="modal-yolo-job_1",
                 )
 
         self.assertEqual(calls, ["summary", "evaluation"])
@@ -1351,6 +1535,7 @@ class ModalTrainingHelperTests(unittest.TestCase):
             data_yaml.write_text("train: images/train\nval: images/val\nnc: 2\nnames: [cat, dog]\n", encoding="utf-8")
             materialize_calls = []
             yolo_payloads = []
+            progress_calls = []
 
             def fake_materialize(**kwargs):
                 materialize_calls.append(kwargs)
@@ -1377,12 +1562,30 @@ class ModalTrainingHelperTests(unittest.TestCase):
                     "runtime_seconds": 1.0,
                 }
 
+            def fake_report_progress(_client, job_id, progress, *, job=None, timeout=None):
+                progress_calls.append(
+                    {
+                        "job_id": job_id,
+                        "progress": progress,
+                        "job": job,
+                        "timeout": timeout,
+                    }
+                )
+                return {"status": "accepted"}
+
             payload = self._modal_preview_batch_payload(task_type="object_detection", model="yolo11n.pt")
             payload["jobs"][1]["config"]["model"] = "yolo11s.pt"
+            for job in payload["jobs"]:
+                job["config"]["active_attempt_id"] = f"{job['id']}:attempt-1"
+            payload["progress_revisions"] = {"job_1": 4, "job_2": 4}
+            payload["progress_reporting_enabled_by_job"] = {"job_1": True, "job_2": True}
             with patch.dict("os.environ", {"MODEL_EXPRESS_YOLO_BATCH_PREVIEW": "1"}):
                 with patch("worker.datasets.cache.ensure_dataset_materialized", fake_materialize):
                     with patch.object(self.modal_app, "_prepare_yolo_dataset_tier", fake_prepare):
-                        with patch.object(self.modal_app, "_train_yolo_detector_impl", fake_yolo_train):
+                        with patch.object(self.modal_app, "_train_yolo_detector_impl", fake_yolo_train), patch(
+                            "worker.orchestrator_client.OrchestratorClient.report_progress",
+                            fake_report_progress,
+                        ):
                             result = self.modal_app._train_modal_preview_batch_impl(payload)
 
         self.assertEqual(len(materialize_calls), 1)
@@ -1400,6 +1603,17 @@ class ModalTrainingHelperTests(unittest.TestCase):
         self.assertEqual(result["runner_status"], "yolo_batch_completed")
         self.assertEqual([job["status"] for job in result["job_results"]], ["succeeded", "succeeded"])
         self.assertEqual(result["dataset_materialization"]["subset_manifest"]["manifest_id"], "preview-subset-test")
+        self.assertEqual(
+            [(call["job_id"], call["progress"]["stage"], call["progress"]["revision"]) for call in progress_calls],
+            [
+                ("job_1", "environment_starting", 5),
+                ("job_1", "dataset_materializing", 6),
+                ("job_2", "environment_starting", 5),
+                ("job_2", "dataset_materializing", 6),
+            ],
+        )
+        self.assertEqual([payload["progress_revision"] for payload in yolo_payloads], [6, 6])
+        self.assertTrue(all(payload["progress_reporting_enabled"] for payload in yolo_payloads))
 
     def test_modal_preview_batch_shell_continues_after_yolo_job_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

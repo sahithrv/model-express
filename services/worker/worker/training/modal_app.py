@@ -850,6 +850,23 @@ def train_yolo_detector(payload: dict) -> dict:
 def _train_yolo_detector_impl(payload: dict) -> dict:
     import time
 
+    started_at = time.time()
+    stage_events: list[dict] = []
+    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
+    job = payload["job"]
+    config = job["config"]
+    dataset = payload["dataset"]
+    orchestrator_url = payload["orchestrator_url"].rstrip("/")
+    progress_reporter = _modal_remote_progress_reporter(payload, orchestrator_url, job)
+    pre_materialized_dataset = isinstance(payload.get("_modal_pre_materialized_dataset"), dict)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "environment_starting",
+            detail_code="modal_yolo_container_starting",
+            message="Modal YOLO training environment is starting.",
+        )
+
     import ultralytics
 
     YOLO = ultralytics.YOLO
@@ -859,14 +876,6 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
             "YOLO runner requires Ultralytics "
             f"{PINNED_ULTRALYTICS_VERSION}, found {ultralytics_version or 'unknown'}."
         )
-
-    started_at = time.time()
-    stage_events: list[dict] = []
-    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
-    job = payload["job"]
-    config = job["config"]
-    dataset = payload["dataset"]
-    orchestrator_url = payload["orchestrator_url"].rstrip("/")
 
     _configure_storage_env(payload)
 
@@ -900,6 +909,13 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     modal_resource_telemetry = resource_telemetry(modal_resources, effective_batch_size=batch_size)
 
     _modal_training_phase(job_id, "storage_configured", started_at)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "dataset_materializing",
+            detail_code="yolo_dataset_materializing",
+            message="YOLO dataset is being materialized.",
+        )
     dataset_dir, dataset_materialization = _modal_training_dataset_for_job(
         payload,
         dataset=dataset,
@@ -939,6 +955,12 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     dataset_materialization["yolo_data_config"] = str(data_config_path)
     _modal_training_phase(job_id, "yolo_train_start", started_at, model=model_name, data=str(data_config_path))
     run_root = Path(tempfile.gettempdir()) / "model-express-yolo-runs" / _safe_path_part(job_id)
+    _report_modal_progress(
+        progress_reporter,
+        "model_initializing",
+        detail_code="yolo_model_initializing",
+        message="YOLO model and trainer are being initialized.",
+    )
     detector = YOLO(model_name)
     posted_yolo_epochs: set[int] = set()
     _install_yolo_epoch_metrics_callback(
@@ -951,6 +973,8 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         posted_epochs=posted_yolo_epochs,
         callback_identity=callback_identity(job, modal_resources),
         callback_auth_token=callback_token(job),
+        progress_reporter=progress_reporter,
+        total_epochs=epochs,
     )
     train_kwargs = ultralytics_train_kwargs(
         yolo_execution,
@@ -980,6 +1004,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
                 "Runner fidelity enforcement could not register the Ultralytics initialization "
                 "callback before training."
             )
+    _report_yolo_training_progress(progress_reporter, current=0, total=epochs)
     detector.train(**train_kwargs)
     yolo_execution = _finalize_yolo_execution_state(
         detector,
@@ -1028,6 +1053,12 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     )
     yolo_epoch_rows_posted = len(posted_yolo_epochs) or final_yolo_epoch_rows_posted
 
+    _report_modal_progress(
+        progress_reporter,
+        "evaluating",
+        detail_code="yolo_final_evaluation",
+        message="YOLO final evaluation is running.",
+    )
     best_model_path = _yolo_best_model_path(run_root)
     trained_detector = YOLO(str(best_model_path)) if best_model_path is not None else detector
     class_names = _yolo_class_names(trained_detector, config)
@@ -1080,6 +1111,12 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         iou_threshold=iou_threshold,
         metrics=final_metrics,
     )
+    _report_modal_progress(
+        progress_reporter,
+        "exporting",
+        detail_code="yolo_exporting",
+        message="YOLO model artifacts are being exported.",
+    )
     _modal_training_phase(job_id, "export_start", started_at)
     export_bundle = _export_yolo_detector_bundle(
         model_path=best_model_path,
@@ -1129,114 +1166,103 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
             },
             modal_resources=modal_resources,
         )
-    _post_training_run_summary(
-        orchestrator_url,
-        job_id,
-        {
-            "model": model_name,
-            "provider": "modal",
-            "gpu_type": gpu_type,
-            "status": "SUCCEEDED",
-            "runtime_seconds": round(runtime_seconds, 3),
-            "estimated_cost_usd": round(estimated_cost_usd, 6),
-            "best_macro_f1": round(map50_95, 6),
-            "best_accuracy": round(map50, 6),
-            "best_map50_95": round(map50_95, 6),
-            "best_map50": round(map50, 6),
-            "best_precision": round(precision, 6),
-            "best_recall": round(recall, 6),
-            "target_metric": "mAP50_95",
-            "final_train_loss": val_loss,
-            "final_val_loss": val_loss,
-            "epochs_completed": epochs,
-            "modal_function_call_id": modal_function_call_id,
-            "modal_input_id": modal_input_id,
-            "dataset_materialization": dataset_materialization,
-            "stage_telemetry": _modal_stage_telemetry_payload(
-                job,
-                runtime_seconds,
-                stage_events,
-                dataset_materialization,
-                gpu_type,
-                modal_resources=modal_resource_telemetry,
-            ),
-            "execution_references": _training_export_references(export_bundle),
+    final_summary_payload = {
+        "model": model_name,
+        "provider": "modal",
+        "gpu_type": gpu_type,
+        "status": "SUCCEEDED",
+        "runtime_seconds": round(runtime_seconds, 3),
+        "estimated_cost_usd": round(estimated_cost_usd, 6),
+        "best_macro_f1": round(map50_95, 6),
+        "best_accuracy": round(map50, 6),
+        "best_map50_95": round(map50_95, 6),
+        "best_map50": round(map50, 6),
+        "best_precision": round(precision, 6),
+        "best_recall": round(recall, 6),
+        "target_metric": "mAP50_95",
+        "final_train_loss": val_loss,
+        "final_val_loss": val_loss,
+        "epochs_completed": epochs,
+        "modal_function_call_id": modal_function_call_id,
+        "modal_input_id": modal_input_id,
+        "dataset_materialization": dataset_materialization,
+        "stage_telemetry": _modal_stage_telemetry_payload(
+            job,
+            runtime_seconds,
+            stage_events,
+            dataset_materialization,
+            gpu_type,
+            modal_resources=modal_resource_telemetry,
+        ),
+        "execution_references": _training_export_references(export_bundle),
+    }
+    final_evaluation_payload = {
+        "objective_profile": {
+            "target_metric": str(config.get("target_metric", "mAP50_95")),
+            "task_type": "object_detection",
+            "metric_preferences": ["mAP50_95", "mAP50", "precision", "recall", "latency_p95_ms"],
+            "split_strategy": "official_yolo_train_val_test_when_present",
+            "heldout_split": heldout_split,
+            "heldout_demo_images": heldout_demo_images,
+            "heldout_test_map50_95": round(map50_95, 6),
+            "heldout_test_map50": round(map50, 6),
+            "heldout_test_precision": round(precision, 6),
+            "heldout_test_recall": round(recall, 6),
+            "heldout_test_box_loss": round(box_loss, 6),
+            "heldout_test_cls_loss": round(cls_loss, 6),
+            "heldout_test_dfl_loss": round(dfl_loss, 6),
+            "modal_resources": modal_resource_telemetry,
         },
-        job=job,
-        modal_resources=modal_resources,
-    )
-    _post_training_run_evaluation(
-        orchestrator_url,
-        job_id,
-        {
-            "objective_profile": {
-                "target_metric": str(config.get("target_metric", "mAP50_95")),
-                "task_type": "object_detection",
-                "metric_preferences": ["mAP50_95", "mAP50", "precision", "recall", "latency_p95_ms"],
-                "split_strategy": "official_yolo_train_val_test_when_present",
-                "heldout_split": heldout_split,
-                "heldout_demo_images": heldout_demo_images,
-                "heldout_test_map50_95": round(map50_95, 6),
-                "heldout_test_map50": round(map50, 6),
-                "heldout_test_precision": round(precision, 6),
-                "heldout_test_recall": round(recall, 6),
-                "heldout_test_box_loss": round(box_loss, 6),
-                "heldout_test_cls_loss": round(cls_loss, 6),
-                "heldout_test_dfl_loss": round(dfl_loss, 6),
-                "modal_resources": modal_resource_telemetry,
-            },
-            "per_class_metrics": _yolo_per_class_metrics(class_names, final_metrics),
-            "confusion_matrix": [],
-            "model_profile": {
-                **model_profile,
-                "modal_resources": modal_resource_telemetry,
-            },
-            "holistic_scores": {
-                **_detection_holistic_scores(
-                    map50_95=map50_95,
-                    map50=map50,
-                    precision=precision,
-                    recall=recall,
-                    box_loss=box_loss,
-                    cls_loss=cls_loss,
-                    dfl_loss=dfl_loss,
-                    estimated_cost_usd=estimated_cost_usd,
-                    runtime_seconds=runtime_seconds,
-                    model_profile=model_profile,
-                ),
-                "modal_resources": modal_resource_telemetry,
-            },
-            "preprocessing_summary": {
-                "task_type": "object_detection",
-                "preserved_yolo_config": str(data_config_path),
-                "preserved_official_splits": True,
-                "worker_execution_metadata": {"dataset_materialization": dataset_materialization},
-                "training_hyperparameters": {
-                    "learning_rate": learning_rate,
-                    "batch_size": batch_size,
-                    "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
-                    "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
-                    "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
-                    "epochs": epochs,
-                    "image_size": image_size,
-                },
-            },
-            "export_bundle": export_bundle,
-            "execution_references": _training_export_references(export_bundle),
-            "recommendation_summary": (
-                f"{model_name} detector finished with mAP50-95 {map50_95:.3f}, "
-                f"mAP50 {map50:.3f}, recall {recall:.3f}, and estimated latency "
-                f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
-            ),
+        "per_class_metrics": _yolo_per_class_metrics(class_names, final_metrics),
+        "confusion_matrix": [],
+        "model_profile": {
+            **model_profile,
+            "modal_resources": modal_resource_telemetry,
         },
+        "holistic_scores": {
+            **_detection_holistic_scores(
+                map50_95=map50_95,
+                map50=map50,
+                precision=precision,
+                recall=recall,
+                box_loss=box_loss,
+                cls_loss=cls_loss,
+                dfl_loss=dfl_loss,
+                estimated_cost_usd=estimated_cost_usd,
+                runtime_seconds=runtime_seconds,
+                model_profile=model_profile,
+            ),
+            "modal_resources": modal_resource_telemetry,
+        },
+        "preprocessing_summary": {
+            "task_type": "object_detection",
+            "preserved_yolo_config": str(data_config_path),
+            "preserved_official_splits": True,
+            "worker_execution_metadata": {"dataset_materialization": dataset_materialization},
+            "training_hyperparameters": {
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
+                "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
+                "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
+                "epochs": epochs,
+                "image_size": image_size,
+            },
+        },
+        "export_bundle": export_bundle,
+        "execution_references": _training_export_references(export_bundle),
+        "recommendation_summary": (
+            f"{model_name} detector finished with mAP50-95 {map50_95:.3f}, "
+            f"mAP50 {map50:.3f}, recall {recall:.3f}, and estimated latency "
+            f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
+        ),
+    }
+    _publish_yolo_final_callbacks(
+        progress_reporter=progress_reporter,
+        orchestrator_url=orchestrator_url,
         job=job,
-        modal_resources=modal_resources,
-    )
-    _post_yolo_execution_observation(
-        orchestrator_url,
-        job,
-        stage="FINALIZED",
-        idempotency_key="yolo-finalized-v1",
+        summary_payload=final_summary_payload,
+        evaluation_payload=final_evaluation_payload,
         execution=yolo_execution,
         framework_arguments=_yolo_framework_arguments(
             yolo_execution,
@@ -1250,13 +1276,7 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
             "checkpoint_available": best_model_path is not None,
         },
         modal_resources=modal_resources,
-    )
-    _post_job_json(
-        orchestrator_url,
-        job,
-        "complete",
-        {"mlflow_run_id": f"modal-yolo-{job_id}"},
-        modal_resources=modal_resources,
+        mlflow_run_id=f"modal-yolo-{job_id}",
     )
     return {
         "job_id": job_id,
@@ -1390,33 +1410,41 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
         if isinstance(payload.get("progress_reporting_enabled_by_job"), dict)
         else {}
     )
-    if batch["task_type"] == "image_classification":
-        for job in jobs:
-            job_id = str(job.get("id") or "")
-            progress_payload = {
-                "progress_revision": progress_revisions.get(job_id, 2),
-                "progress_reporting_enabled": progress_enabled_by_job.get(job_id, False),
-            }
-            progress_reporter = _modal_remote_progress_reporter(
-                progress_payload,
-                str(payload["orchestrator_url"]).rstrip("/"),
-                job,
-            )
-            _report_modal_progress(
-                progress_reporter,
-                "environment_starting",
-                detail_code="modal_batch_container_starting",
-                message="Modal batch training environment is starting.",
-            )
-            _report_modal_progress(
-                progress_reporter,
-                "dataset_materializing",
-                detail_code="classification_batch_dataset_materializing",
-                message="Classification batch dataset is being materialized.",
-            )
-            if progress_reporter is not None:
-                progress_revisions[job_id] = progress_reporter.revision
-                progress_enabled_by_job[job_id] = progress_reporter.enabled
+    detection_batch = batch["task_type"] == "object_detection"
+    for job in jobs:
+        job_id = str(job.get("id") or "")
+        progress_payload = {
+            "progress_revision": progress_revisions.get(job_id, 2),
+            "progress_reporting_enabled": progress_enabled_by_job.get(job_id, False),
+        }
+        progress_reporter = _modal_remote_progress_reporter(
+            progress_payload,
+            str(payload["orchestrator_url"]).rstrip("/"),
+            job,
+        )
+        _report_modal_progress(
+            progress_reporter,
+            "environment_starting",
+            detail_code="modal_batch_container_starting",
+            message="Modal batch training environment is starting.",
+        )
+        _report_modal_progress(
+            progress_reporter,
+            "dataset_materializing",
+            detail_code=(
+                "yolo_batch_dataset_materializing"
+                if detection_batch
+                else "classification_batch_dataset_materializing"
+            ),
+            message=(
+                "YOLO batch dataset is being materialized."
+                if detection_batch
+                else "Classification batch dataset is being materialized."
+            ),
+        )
+        if progress_reporter is not None:
+            progress_revisions[job_id] = progress_reporter.revision
+            progress_enabled_by_job[job_id] = progress_reporter.enabled
     representative_config = jobs[0].get("config") if isinstance(jobs[0].get("config"), dict) else {}
     batch_cache_root = _modal_preview_batch_cache_root(batch["batch_id"])
     materialized = ensure_dataset_materialized(
@@ -1787,8 +1815,12 @@ def _install_yolo_epoch_metrics_callback(
     posted_epochs: set[int],
     callback_identity: dict | None = None,
     callback_auth_token: str = "",
+    progress_reporter: ProgressReporter | None = None,
+    total_epochs: int = 0,
 ) -> None:
-    def post_epoch_metrics(_trainer=None) -> None:
+    progress_state = {"last_epoch": 0}
+
+    def post_epoch_metrics(trainer=None) -> None:
         _post_yolo_epoch_metrics(
             orchestrator_url,
             job_id,
@@ -1799,6 +1831,12 @@ def _install_yolo_epoch_metrics_callback(
             callback_identity=callback_identity,
             callback_auth_token=callback_auth_token,
         )
+        _report_yolo_epoch_callback_progress(
+            progress_reporter,
+            trainer=trainer,
+            total=total_epochs,
+            state=progress_state,
+        )
 
     add_callback = getattr(detector, "add_callback", None)
     if not callable(add_callback):
@@ -1808,6 +1846,33 @@ def _install_yolo_epoch_metrics_callback(
             add_callback(event_name, post_epoch_metrics)
         except Exception as exc:
             print(f"[model-express] failed to register YOLO {event_name} metric callback: {exc}")
+
+
+def _report_yolo_epoch_callback_progress(
+    progress_reporter: ProgressReporter | None,
+    *,
+    trainer,
+    total: int,
+    state: dict,
+) -> bool:
+    """Publish each completed Ultralytics epoch at most once and in order."""
+    try:
+        total_epochs = int(total)
+        current = int(getattr(trainer, "epoch")) + 1
+        previous = int(state.get("last_epoch", 0))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+    if total_epochs < 1:
+        return False
+    current = min(total_epochs, max(0, current))
+    if current <= previous:
+        return False
+    state["last_epoch"] = current
+    return _report_yolo_training_progress(
+        progress_reporter,
+        current=current,
+        total=total_epochs,
+    )
 
 
 def _install_yolo_fidelity_callback(
@@ -2131,6 +2196,29 @@ def _report_classification_training_progress(
     )
 
 
+def _report_yolo_training_progress(
+    progress_reporter: ProgressReporter | None,
+    *,
+    current: int,
+    total: int,
+) -> bool:
+    if current <= 0:
+        detail_code = "yolo_training"
+        message = f"YOLO training is starting for {total} epochs."
+    else:
+        detail_code = "yolo_epoch_complete"
+        message = f"YOLO training epoch {current} of {total} finished."
+    return _report_modal_progress(
+        progress_reporter,
+        "training",
+        current=current,
+        total=total,
+        unit="epoch",
+        detail_code=detail_code,
+        message=message,
+    )
+
+
 def _publish_classification_final_callbacks(
     *,
     progress_reporter: ProgressReporter | None,
@@ -2174,6 +2262,60 @@ def _publish_classification_final_callbacks(
         execution=execution,
         framework_arguments=framework_arguments,
         evidence=fidelity_evidence,
+        modal_resources=modal_resources,
+    )
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "complete",
+        {"mlflow_run_id": mlflow_run_id},
+        modal_resources=modal_resources,
+    )
+
+
+def _publish_yolo_final_callbacks(
+    *,
+    progress_reporter: ProgressReporter | None,
+    orchestrator_url: str,
+    job: dict,
+    summary_payload: dict,
+    evaluation_payload: dict,
+    execution: YoloExecution,
+    framework_arguments: dict,
+    evidence: dict,
+    modal_resources: dict,
+    mlflow_run_id: str,
+) -> None:
+    """Keep YOLO finalization observable while backend completion stays authoritative."""
+    _report_modal_progress(
+        progress_reporter,
+        "finalizing",
+        detail_code="yolo_finalizing",
+        message="YOLO results are being finalized by the backend.",
+    )
+    job_id = str(job.get("id") or "")
+    _post_training_run_summary(
+        orchestrator_url,
+        job_id,
+        summary_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_training_run_evaluation(
+        orchestrator_url,
+        job_id,
+        evaluation_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_yolo_execution_observation(
+        orchestrator_url,
+        job,
+        stage="FINALIZED",
+        idempotency_key="yolo-finalized-v1",
+        execution=execution,
+        framework_arguments=framework_arguments,
+        evidence=evidence,
         modal_resources=modal_resources,
     )
     _post_job_json(

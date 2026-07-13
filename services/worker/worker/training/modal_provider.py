@@ -87,7 +87,7 @@ def run_modal_training(client: OrchestratorClient, job: dict) -> None:
     detection_job = _is_detection_training_config(config)
     modal_resources = resolve_modal_resources(config, detection_job=detection_job)
     job_payload = job_with_modal_resources(job, modal_resources)
-    progress_reporter = None if detection_job else _modal_progress_reporter(client, job_payload)
+    progress_reporter = _modal_progress_reporter(client, job_payload)
     _report_modal_progress(
         progress_reporter,
         "worker_starting",
@@ -255,11 +255,7 @@ def _try_run_remote_modal_training_batch(client: OrchestratorClient, jobs: list[
             enriched_jobs.append(job_with_modal_resources(tagged_job, tagged_resources))
         batch_resources = _modal_batch_invocation_resources(enriched_jobs, resources_by_job)
         progress_reporters = [
-            None
-            if _is_detection_training_config(
-                enriched_job.get("config") if isinstance(enriched_job.get("config"), dict) else {}
-            )
-            else _modal_progress_reporter(client, enriched_job)
+            _modal_progress_reporter(client, enriched_job)
             for enriched_job in enriched_jobs
         ]
         for progress_reporter in progress_reporters:

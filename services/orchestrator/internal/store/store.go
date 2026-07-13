@@ -154,6 +154,7 @@ type Store interface {
 	ListProjectExecutionEventActivity(projectID string, limit int) ([]execution.ExecutionEvent, error)
 	ListProjectExecutionEventsAfter(ctx context.Context, projectID string, cursor int64, limit int) ([]execution.ExecutionEvent, error)
 	GetExecutionEventCursorState(ctx context.Context) (execution.ExecutionEventCursorState, error)
+	GetProjectLiveState(ctx context.Context, projectID string) (ProjectLiveStateSnapshot, error)
 
 	CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error)
 	ListProjectAgentMemoryRecords(projectID string, filter memory.AgentMemoryFilter) ([]memory.AgentMemoryRecord, error)

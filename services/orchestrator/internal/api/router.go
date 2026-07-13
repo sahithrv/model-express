@@ -134,6 +134,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/projects/:id/strategy-scorecards", server.listProjectStrategyScorecards)
 	router.GET("/projects/:id/worker-requirements", server.listProjectWorkerRequirements)
 	router.POST("/projects/:id/cancel-active-executions", server.cancelProjectActiveExecutions)
+	router.GET("/projects/:id/live-state", server.getProjectLiveState)
 	router.GET("/projects/:id/execution-events", server.listProjectExecutionEvents)
 	router.GET("/projects/:id/execution-records", server.listProjectExecutionRecords)
 	router.POST("/projects/:id/dispatcher-events", server.reportProjectDispatcherEvent)
