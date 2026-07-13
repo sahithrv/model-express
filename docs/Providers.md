@@ -536,6 +536,22 @@ Provider pricing changes over time, so this repo should avoid hardcoding pricing
 - Enable embeddings only when memory retrieval is part of the demo.
 - Watch Model Express telemetry for token usage, cached input, reasoning tokens, embedding calls, and cost estimates when available.
 
+Planner invocations always retain provider usage. Cost is derived only when all
+six fields of an explicitly reviewed pricing snapshot are configured, and only
+when its provider and model match the actual request:
+
+```bash
+MODEL_EXPRESS_LLM_PRICING_VERSION=provider-model-YYYY-MM-DD
+MODEL_EXPRESS_LLM_PRICING_PROVIDER=openai
+MODEL_EXPRESS_LLM_PRICING_MODEL=gpt-5.4-mini
+MODEL_EXPRESS_LLM_INPUT_USD_PER_MILLION_TOKENS=...
+MODEL_EXPRESS_LLM_CACHED_INPUT_USD_PER_MILLION_TOKENS=...
+MODEL_EXPRESS_LLM_OUTPUT_USD_PER_MILLION_TOKENS=...
+```
+
+Leaving the snapshot unset records usage without fabricating a cost. A partial
+or unversioned snapshot is ignored and never produces a cost record.
+
 The system is designed so provider costs are visible and bounded rather than hidden.
 
 ## Choosing a Provider Profile

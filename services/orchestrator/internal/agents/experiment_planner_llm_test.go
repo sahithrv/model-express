@@ -11,10 +11,50 @@ import (
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 )
+
+func TestExperimentPlannerTraceCapturesActualRequestRuntimeIdentityInputs(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION", plannerStaticPromptVersionCompactV1)
+	t.Setenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION", "v2")
+	t.Setenv("MODEL_EXPRESS_MULTI_FIDELITY_POLICY", "true")
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	response, err := json.Marshal(recommendation)
+	if err != nil {
+		t.Fatalf("marshal recommendation: %v", err)
+	}
+	config := llm.Config{
+		ReasoningEffort:        llm.ReasoningEffortMedium,
+		PlateauReasoningEffort: llm.ReasoningEffortHigh,
+		MaxToolRounds:          4,
+	}
+	agent := NewExperimentPlannerAgentWithRuntime(fakeJSONGenerator{response: string(response)}, "planner-test-model", config, PlannerInformationToolOptions{})
+	input := testExperimentPlannerInput()
+	input.NoImprovementRounds = 1
+
+	trace, err := agent.PlanWithTrace(context.Background(), input)
+	if err != nil {
+		t.Fatalf("PlanWithTrace() error = %v", err)
+	}
+	if trace.Request.Temperature != 0.35 {
+		t.Fatalf("request temperature = %v, want 0.35", trace.Request.Temperature)
+	}
+	if trace.Request.ReasoningEffort != llm.ReasoningEffortHigh {
+		t.Fatalf("request reasoning effort = %q, want plateau effort %q", trace.Request.ReasoningEffort, llm.ReasoningEffortHigh)
+	}
+	if trace.StaticPromptVersion != plannerStaticPromptVersionCompactV1 {
+		t.Fatalf("static prompt version = %q", trace.StaticPromptVersion)
+	}
+	if trace.ContextBuilderVersion != "planner_context_builder_v2" {
+		t.Fatalf("context builder version = %q", trace.ContextBuilderVersion)
+	}
+	if !trace.RankerMultiFidelity {
+		t.Fatal("expected traced ranker setting to match the setting used by the finalizer")
+	}
+}
 
 func TestExperimentPlannerAgentValidatesAddExperiments(t *testing.T) {
 	agent := NewExperimentPlannerAgent(fakeJSONGenerator{

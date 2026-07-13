@@ -1338,6 +1338,9 @@ func scanAgentMemoryRecord(row rowScanner) (memory.AgentMemoryRecord, error) {
 
 func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 	var invocation memory.AgentInvocation
+	var plannerVariantJSON []byte
+	var providerUsageJSON []byte
+	var derivedCostJSON []byte
 	var inputMessagesJSON []byte
 	var inputContextJSON []byte
 	var parsedOutputJSON []byte
@@ -1353,6 +1356,15 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		&invocation.AgentName,
 		&invocation.AgentVersion,
 		&invocation.PromptVersion,
+		&invocation.PlannerVariantID,
+		&plannerVariantJSON,
+		&invocation.ValidationMode,
+		&invocation.AttemptGroupID,
+		&invocation.AttemptIndex,
+		&invocation.RetryReason,
+		&invocation.WallLatencyMS,
+		&providerUsageJSON,
+		&derivedCostJSON,
 		&invocation.Provider,
 		&invocation.Model,
 		&inputMessagesJSON,
@@ -1367,6 +1379,30 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		&invocation.CreatedAt,
 	); err != nil {
 		return memory.AgentInvocation{}, normalizeSQLError(err)
+	}
+	if len(plannerVariantJSON) > 0 {
+		var variant memory.PlannerVariant
+		if err := json.Unmarshal(plannerVariantJSON, &variant); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner variant: %w", err)
+		}
+		if variant.IdentitySchemaVersion != "" {
+			invocation.PlannerVariant = &variant
+		}
+	}
+	invocation.ProviderUsage = map[string]any{}
+	if len(providerUsageJSON) > 0 {
+		if err := json.Unmarshal(providerUsageJSON, &invocation.ProviderUsage); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation provider usage: %w", err)
+		}
+	}
+	if len(derivedCostJSON) > 0 {
+		var cost memory.PlannerInvocationCost
+		if err := json.Unmarshal(derivedCostJSON, &cost); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation derived cost: %w", err)
+		}
+		if cost.PricingVersion != "" {
+			invocation.DerivedCost = &cost
+		}
 	}
 
 	invocation.InputMessages = []map[string]string{}
@@ -1400,6 +1436,10 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		}
 	}
 
+	invocation, err := memory.NormalizeAgentInvocationRuntime(invocation)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("normalize agent invocation runtime: %w", err)
+	}
 	return invocation, nil
 }
 

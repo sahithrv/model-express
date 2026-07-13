@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"reflect"
@@ -705,6 +706,113 @@ func TestMemoryStoreAgentInvocationPersistsLLMUsage(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreAgentInvocationRuntimeIdentityRoundTripAndFilter(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("planner identity project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	variant := memory.PlannerVariant{
+		IdentitySchemaVersion:       memory.PlannerVariantIdentitySchemaV1,
+		AgentVersion:                "v2",
+		PromptVersion:               "experiment_planner_v3",
+		StaticPromptVersion:         "compact_v1",
+		ContextBuilderVersion:       "planner_context_builder_v2",
+		ToolPolicyVersion:           "planner_information_tools_v1",
+		ValidatorVersion:            "experiment_planner_validator_v1",
+		ValidationMode:              "relaxed",
+		ExecutionValidatorVersion:   "execution_validation_v1",
+		ExecutionValidationMode:     "enforce",
+		RankerVersion:               "candidate_ranker_v1",
+		RetrievalPolicyVersion:      "planner_memory_retrieval_v1",
+		RetryPolicyVersion:          "planner_backend_validation_retry_v1",
+		MaxBackendValidationRetries: 1,
+		Provider:                    "openai",
+		APIStyle:                    "responses",
+		Model:                       "test-model",
+		RequestTemperature:          0.35,
+		RequestReasoningEffort:      "medium",
+		ConfiguredReasoningEffort:   "medium",
+		PlateauReasoningEffort:      "high",
+		StoredResponses:             true,
+		MaxToolRounds:               4,
+		MaxProviderRetries:          2,
+		RequestTimeoutMS:            180000,
+	}
+	variantID, err := memory.ComputePlannerVariantID(variant)
+	if err != nil {
+		t.Fatalf("ComputePlannerVariantID() error = %v", err)
+	}
+	cost := &memory.PlannerInvocationCost{
+		PricingVersion:                 "test-pricing-v1",
+		Currency:                       "USD",
+		Provider:                       "openai",
+		Model:                          "test-model",
+		InputTokens:                    10,
+		CachedInputTokens:              2,
+		OutputTokens:                   4,
+		InputUSDPerMillionTokens:       "1",
+		CachedInputUSDPerMillionTokens: "0.1",
+		OutputUSDPerMillionTokens:      "2",
+		UncachedInputCostUSD:           "0.000008",
+		CachedInputCostUSD:             "0.0000002",
+		OutputCostUSD:                  "0.000008",
+		TotalCostUSD:                   "0.0000162",
+	}
+	stored, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:        project.ID,
+		AgentName:        "experiment_planner",
+		PlannerVariantID: variantID,
+		PlannerVariant:   &variant,
+		ValidationMode:   "relaxed",
+		AttemptGroupID:   "planner-attempt-group",
+		AttemptIndex:     1,
+		RetryReason:      "trace_validation_rejected",
+		WallLatencyMS:    12.75,
+		ProviderUsage:    map[string]any{"input_tokens": 10, "output_tokens": 4},
+		DerivedCost:      cost,
+		ValidationStatus: memory.InvocationValidationValid,
+	})
+	if err != nil {
+		t.Fatalf("CreateAgentInvocation() error = %v", err)
+	}
+
+	otherVariant := variant
+	otherVariant.Provider = "local"
+	if _, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:        project.ID,
+		AgentName:        "experiment_planner",
+		PlannerVariant:   &otherVariant,
+		AttemptGroupID:   "other-group",
+		AttemptIndex:     0,
+		ValidationStatus: memory.InvocationValidationValid,
+	}); err != nil {
+		t.Fatalf("CreateAgentInvocation(other) error = %v", err)
+	}
+
+	reloaded, err := store.GetAgentInvocation(stored.ID)
+	if err != nil {
+		t.Fatalf("GetAgentInvocation() error = %v", err)
+	}
+	if reloaded.PlannerVariantID != variantID || reloaded.PlannerVariant == nil || reloaded.PlannerVariant.Provider != "openai" {
+		t.Fatalf("unexpected planner identity round trip %#v", reloaded)
+	}
+	if reloaded.AttemptGroupID != "planner-attempt-group" || reloaded.AttemptIndex != 1 || reloaded.RetryReason == "" || reloaded.WallLatencyMS != 12.75 {
+		t.Fatalf("unexpected invocation facts %#v", reloaded)
+	}
+	if reloaded.DerivedCost == nil || reloaded.DerivedCost.PricingVersion != "test-pricing-v1" || reloaded.DerivedCost.TotalCostUSD != "0.0000162" {
+		t.Fatalf("unexpected derived cost %#v", reloaded.DerivedCost)
+	}
+
+	filtered, err := store.ListProjectAgentInvocations(project.ID, memory.AgentInvocationFilter{PlannerVariantID: variantID})
+	if err != nil {
+		t.Fatalf("ListProjectAgentInvocations() error = %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != stored.ID {
+		t.Fatalf("expected exact planner variant filter to return %s, got %#v", stored.ID, filtered)
+	}
+}
+
 func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 	createdAt := time.Date(2026, time.June, 2, 12, 0, 0, 0, time.UTC)
 	row := fakeAgentInvocationRow{values: []any{
@@ -716,6 +824,15 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 		"experiment_planner",
 		"v1",
 		"prompt_v1",
+		memory.LegacyPlannerVariantID,
+		[]byte(`{}`),
+		"",
+		"",
+		-1,
+		"",
+		float64(0),
+		[]byte(`{"input_tokens":14,"output_tokens":6,"total_tokens":20,"cached_input_tokens":4,"reasoning_tokens":2,"request_model":"test-model","api_style":"responses","tool_rounds":1}`),
+		[]byte(`{}`),
 		"openai",
 		"test-model",
 		[]byte(`[{"role":"user","content":"hello"}]`),
@@ -734,6 +851,12 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scanAgentInvocation() error = %v", err)
 	}
+	if invocation.PlannerVariantID != memory.LegacyPlannerVariantID || invocation.PlannerVariant != nil || invocation.AttemptIndex != -1 {
+		t.Fatalf("expected migrated legacy invocation defaults, got %#v", invocation)
+	}
+	if invocation.ProviderUsage["input_tokens"] != float64(14) || invocation.DerivedCost != nil {
+		t.Fatalf("unexpected provider usage/cost scan: usage=%#v cost=%#v", invocation.ProviderUsage, invocation.DerivedCost)
+	}
 	runtime, ok := invocation.InputContext["invocation_runtime"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected invocation runtime, got %#v", invocation.InputContext)
@@ -750,6 +873,76 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 	}
 	if usage["request_model"] != "test-model" || usage["api_style"] != "responses" || usage["tool_rounds"] != float64(1) {
 		t.Fatalf("unexpected scanned usage metadata: %#v", usage)
+	}
+}
+
+func TestScanAgentInvocationPreservesPlannerRuntimeIdentity(t *testing.T) {
+	variant := memory.PlannerVariant{
+		IdentitySchemaVersion:  memory.PlannerVariantIdentitySchemaV1,
+		AgentVersion:           "v2",
+		PromptVersion:          "experiment_planner_v3",
+		StaticPromptVersion:    "compact_v1",
+		ContextBuilderVersion:  "planner_context_builder_v2",
+		ToolPolicyVersion:      "planner_information_tools_v1",
+		ValidatorVersion:       "experiment_planner_validator_v1",
+		ValidationMode:         "strict",
+		RankerVersion:          "candidate_ranker_v1",
+		RetrievalPolicyVersion: "planner_memory_retrieval_v1",
+		Provider:               "openai",
+		APIStyle:               "responses",
+		Model:                  "test-model",
+		RequestTemperature:     0.35,
+		RequestReasoningEffort: "high",
+	}
+	variantID, err := memory.ComputePlannerVariantID(variant)
+	if err != nil {
+		t.Fatalf("compute variant ID: %v", err)
+	}
+	variantJSON, err := json.Marshal(variant)
+	if err != nil {
+		t.Fatalf("marshal variant: %v", err)
+	}
+	cost := memory.PlannerInvocationCost{
+		PricingVersion:                 "pricing-v1",
+		Currency:                       "USD",
+		Provider:                       "openai",
+		Model:                          "test-model",
+		InputTokens:                    5,
+		CachedInputTokens:              1,
+		OutputTokens:                   2,
+		InputUSDPerMillionTokens:       "1",
+		CachedInputUSDPerMillionTokens: "0.1",
+		OutputUSDPerMillionTokens:      "2",
+		UncachedInputCostUSD:           "0.000004",
+		CachedInputCostUSD:             "0.0000001",
+		OutputCostUSD:                  "0.000004",
+		TotalCostUSD:                   "0.0000081",
+	}
+	costJSON, err := json.Marshal(cost)
+	if err != nil {
+		t.Fatalf("marshal cost: %v", err)
+	}
+	createdAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	row := fakeAgentInvocationRow{values: []any{
+		"agent_invocation_2", "project_1", "dataset_1", "plan_1", "", "experiment_planner", "v2", "experiment_planner_v3",
+		variantID, variantJSON, "strict", "planner_attempt_group", 1, "trace_validation_rejected", float64(8.25),
+		[]byte(`{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}`), costJSON,
+		"openai", "test-model", []byte(`[]`), []byte(`{}`), `{"ok":true}`, []byte(`{"ok":true}`),
+		"valid", "", true, []byte(`{}`), []byte(`{}`), createdAt,
+	}}
+
+	invocation, err := scanAgentInvocation(row)
+	if err != nil {
+		t.Fatalf("scanAgentInvocation() error = %v", err)
+	}
+	if invocation.PlannerVariantID != variantID || invocation.PlannerVariant == nil || invocation.PlannerVariant.StaticPromptVersion != "compact_v1" {
+		t.Fatalf("unexpected planner variant scan %#v", invocation)
+	}
+	if invocation.AttemptGroupID != "planner_attempt_group" || invocation.AttemptIndex != 1 || invocation.RetryReason == "" || invocation.WallLatencyMS != 8.25 {
+		t.Fatalf("unexpected invocation fact scan %#v", invocation)
+	}
+	if invocation.DerivedCost == nil || invocation.DerivedCost.PricingVersion != "pricing-v1" || invocation.DerivedCost.TotalCostUSD != "0.0000081" {
+		t.Fatalf("unexpected derived cost scan %#v", invocation.DerivedCost)
 	}
 }
 

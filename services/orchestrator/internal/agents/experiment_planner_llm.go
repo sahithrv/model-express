@@ -26,6 +26,11 @@ const (
 	ExperimentPlannerAgentName     = "experiment_planner"
 	ExperimentPlannerAgentVersion  = "v2"
 	ExperimentPlannerPromptVersion = "experiment_planner_v3"
+
+	ExperimentPlannerToolPolicyVersion      = "planner_information_tools_v1"
+	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v1"
+	ExperimentPlannerRankerVersion          = "candidate_ranker_v1"
+	ExperimentPlannerRetrievalPolicyVersion = "planner_memory_retrieval_v1"
 )
 
 const (
@@ -98,6 +103,7 @@ type ExperimentPlannerInput struct {
 	FailedStrategyMemory         []PlannerStrategyMemory
 	RejectedStrategyMemory       []RejectedPlannerOption
 	RetrievedMemory              []memory.MemoryRetrievalResult
+	RetrievalVariant             memory.PlannerRetrievalVariant
 	StrategyScorecards           []PlannerStrategyScorecard
 	OptimizerFeedback            []automl.OptimizerFeedbackSummary
 	PriorPlans                   []plans.ExperimentPlan
@@ -110,6 +116,13 @@ type ExperimentPlannerInput struct {
 	ExecutionCapabilityCard      execution.PlannerCapabilityCard
 	ExecutionEnforcementFeedback []execution.EnforcementFeedback
 	ExecutionEvidence            []ExperimentExecutionEvidence
+	// RankerMultiFidelityEnabled snapshots the ranker switch for a traced
+	// invocation. Nil preserves the existing environment-based behavior for
+	// direct deterministic finalizer callers.
+	RankerMultiFidelityEnabled *bool
+	// TerminalPlannerGuardsEnabled snapshots the post-generation decision
+	// policy so the persisted variant matches the policy actually applied.
+	TerminalPlannerGuardsEnabled *bool
 	AgentMode                    string
 	MaxExperiments               int
 	MaxFollowUpRounds            int
@@ -841,6 +854,10 @@ type ExperimentPlanningTrace struct {
 	ValidationError         string
 	AgentVersion            string
 	PromptVersion           string
+	StaticPromptVersion     string
+	ContextBuilderVersion   string
+	ValidatorMode           string
+	RankerMultiFidelity     bool
 	ResponseID              string
 	PreviousResponseID      string
 	ToolRounds              int
@@ -875,12 +892,24 @@ func (a ExperimentPlannerAgent) Plan(ctx context.Context, input ExperimentPlanne
 }
 
 func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input ExperimentPlannerInput) (ExperimentPlanningTrace, error) {
+	staticPromptVersion := plannerStaticPromptVersion()
+	rankerMultiFidelity := multiFidelityPolicyEnabled()
+	validatorMode := "relaxed"
+	if plannerStrictValidationEnabled() {
+		validatorMode = "strict"
+	}
+	input.RankerMultiFidelityEnabled = &rankerMultiFidelity
+	promptContext := experimentPlannerPromptContext(input)
 	trace := ExperimentPlanningTrace{
-		PromptContext:    experimentPlannerPromptContext(input),
-		ParsedOutput:     map[string]any{},
-		ValidationStatus: memory.InvocationValidationFailed,
-		AgentVersion:     ExperimentPlannerAgentVersion,
-		PromptVersion:    ExperimentPlannerPromptVersion,
+		PromptContext:         promptContext,
+		ParsedOutput:          map[string]any{},
+		ValidationStatus:      memory.InvocationValidationFailed,
+		AgentVersion:          ExperimentPlannerAgentVersion,
+		PromptVersion:         ExperimentPlannerPromptVersion,
+		StaticPromptVersion:   staticPromptVersion,
+		ContextBuilderVersion: plannerContextBuilderVersion(promptContext),
+		ValidatorMode:         validatorMode,
+		RankerMultiFidelity:   rankerMultiFidelity,
 	}
 
 	if a.generator == nil {
@@ -896,7 +925,7 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 		return trace, wrapped
 	}
 
-	trace.Request = experimentPlannerJSONRequest(a.model, contextBlob)
+	trace.Request = experimentPlannerJSONRequestForStaticPromptVersion(a.model, contextBlob, staticPromptVersion)
 	trace.Request.ReasoningEffort = a.reasoningEffortForInput(input)
 	raw, err := a.generatePlannerJSON(ctx, &trace, input)
 	if err != nil {
@@ -1009,7 +1038,11 @@ func (a plannerInformationAnswerer) AnswerInformationToolCall(_ context.Context,
 }
 
 func experimentPlannerJSONRequest(model string, contextBlob []byte) llm.JSONRequest {
-	if plannerStaticPromptVersion() == plannerStaticPromptVersionCompactV1 {
+	return experimentPlannerJSONRequestForStaticPromptVersion(model, contextBlob, plannerStaticPromptVersion())
+}
+
+func experimentPlannerJSONRequestForStaticPromptVersion(model string, contextBlob []byte, staticPromptVersion string) llm.JSONRequest {
+	if staticPromptVersion == plannerStaticPromptVersionCompactV1 {
 		return experimentPlannerJSONRequestCompact(model, contextBlob)
 	}
 	return llm.JSONRequest{
@@ -1358,6 +1391,14 @@ func plannerContextSnapshotVersion() string {
 	default:
 		return "v1"
 	}
+}
+
+func plannerContextBuilderVersion(promptContext map[string]any) string {
+	snapshot, ok := promptContext["planner_context_snapshot"].(PlannerContextSnapshot)
+	if !ok || strings.TrimSpace(snapshot.ContextVersion) == "" {
+		return "planner_context_builder_unknown"
+	}
+	return "planner_context_builder_" + strings.TrimSpace(snapshot.ContextVersion)
 }
 
 func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningRecommendation, maxExperiments int) error {
@@ -5213,4 +5254,10 @@ func maxPlannerExperiments(value int) int {
 		return 5
 	}
 	return value
+}
+
+// EffectivePlannerMaxExperiments exposes the normalized planner selection and
+// validation budget for runtime identity without duplicating its defaults.
+func EffectivePlannerMaxExperiments(value int) int {
+	return maxPlannerExperiments(value)
 }

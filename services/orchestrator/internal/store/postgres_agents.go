@@ -10,6 +10,11 @@ import (
 	"model-express/services/orchestrator/internal/memory"
 )
 
+const agentInvocationSelectColumns = `id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version,
+	planner_variant_id, planner_variant, validation_mode, attempt_group_id, attempt_index, retry_reason, wall_latency_ms,
+	provider_usage, derived_cost, provider, model, input_messages, input_context, raw_output, parsed_output,
+	validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at`
+
 func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
 	if payload == nil {
 		payload = map[string]any{}
@@ -132,6 +137,11 @@ func agentDecisionActivitySelectQuery() string {
 }
 
 func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error) {
+	var err error
+	invocation, err = memory.NormalizeAgentInvocationRuntime(invocation)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("normalize agent invocation runtime: %w", err)
+	}
 	if invocation.InputMessages == nil {
 		invocation.InputMessages = []map[string]string{}
 	}
@@ -168,6 +178,24 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 	if err != nil {
 		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation downstream outcome: %w", err)
 	}
+	plannerVariantJSON := []byte(`{}`)
+	if invocation.PlannerVariant != nil {
+		plannerVariantJSON, err = json.Marshal(invocation.PlannerVariant)
+		if err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("marshal planner variant: %w", err)
+		}
+	}
+	providerUsageJSON, err := json.Marshal(invocation.ProviderUsage)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation provider usage: %w", err)
+	}
+	derivedCostJSON := []byte(`{}`)
+	if invocation.DerivedCost != nil {
+		derivedCostJSON, err = json.Marshal(invocation.DerivedCost)
+		if err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation derived cost: %w", err)
+		}
+	}
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -187,6 +215,15 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 			agent_name,
 			agent_version,
 			prompt_version,
+			planner_variant_id,
+			planner_variant,
+			validation_mode,
+			attempt_group_id,
+			attempt_index,
+			retry_reason,
+			wall_latency_ms,
+			provider_usage,
+			derived_cost,
 			provider,
 			model,
 			input_messages,
@@ -199,8 +236,8 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 			human_feedback,
 			downstream_outcome
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-		RETURNING id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		RETURNING ` + agentInvocationSelectColumns + `
 	`
 	stored, err := scanAgentInvocation(tx.QueryRowContext(
 		ctx,
@@ -212,6 +249,15 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 		invocation.AgentName,
 		invocation.AgentVersion,
 		invocation.PromptVersion,
+		invocation.PlannerVariantID,
+		plannerVariantJSON,
+		invocation.ValidationMode,
+		invocation.AttemptGroupID,
+		invocation.AttemptIndex,
+		invocation.RetryReason,
+		invocation.WallLatencyMS,
+		providerUsageJSON,
+		derivedCostJSON,
 		invocation.Provider,
 		invocation.Model,
 		inputMessagesJSON,
@@ -244,7 +290,7 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 
 func (s *PostgresStore) GetAgentInvocation(invocationID string) (memory.AgentInvocation, error) {
 	const query = `
-		SELECT id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+		SELECT ` + agentInvocationSelectColumns + `
 		FROM agent_invocations
 		WHERE id = $1
 	`
@@ -270,7 +316,7 @@ func (s *PostgresStore) UpdateAgentInvocationDownstreamOutcome(invocationID stri
 		UPDATE agent_invocations
 		SET downstream_outcome = $2
 		WHERE id = $1
-		RETURNING id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+		RETURNING ` + agentInvocationSelectColumns + `
 	`
 	updated, err := scanAgentInvocation(tx.QueryRowContext(ctx, query, invocationID, outcomeJSON))
 	if err != nil {
@@ -313,15 +359,16 @@ func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter mem
 	}
 
 	const query = `
-		SELECT id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
+		SELECT ` + agentInvocationSelectColumns + `
 		FROM agent_invocations
 		WHERE project_id = $1
 			AND ($2 = '' OR dataset_id = $2)
 			AND ($3 = '' OR plan_id = $3)
 			AND ($4 = '' OR job_id = $4)
 			AND ($5 = '' OR agent_name = $5)
+			AND ($6 = '' OR planner_variant_id = $6)
 		ORDER BY created_at DESC
-		LIMIT $6
+		LIMIT $7
 	`
 	rows, err := s.db.QueryContext(
 		context.Background(),
@@ -331,6 +378,7 @@ func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter mem
 		filter.PlanID,
 		filter.JobID,
 		filter.AgentName,
+		filter.PlannerVariantID,
 		filter.Limit,
 	)
 	if err != nil {

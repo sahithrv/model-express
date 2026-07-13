@@ -657,6 +657,23 @@ export type AgentInvocationRuntime = {
   [key: string]: unknown;
 };
 
+export type PlannerInvocationCost = {
+  pricing_version: string;
+  currency: string;
+  provider: string;
+  model: string;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  input_usd_per_million_tokens: string;
+  cached_input_usd_per_million_tokens: string;
+  output_usd_per_million_tokens: string;
+  uncached_input_cost_usd: string;
+  cached_input_cost_usd: string;
+  output_cost_usd: string;
+  total_cost_usd: string;
+};
+
 export type RetrievedMemoryPayload = {
   retrieval_enabled?: boolean;
   successful_strategy_cards?: RetrievedMemoryCard[];
@@ -848,6 +865,15 @@ export type AgentInvocation = {
   agent_name: string;
   agent_version?: string;
   prompt_version?: string;
+  planner_variant_id?: string;
+  planner_variant?: Record<string, unknown>;
+  validation_mode?: string;
+  attempt_group_id?: string;
+  attempt_index?: number;
+  retry_reason?: string;
+  wall_latency_ms?: number;
+  provider_usage?: LLMUsage;
+  derived_cost?: PlannerInvocationCost;
   provider?: string;
   model?: string;
   input_messages?: Array<Record<string, string>>;

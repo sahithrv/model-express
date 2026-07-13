@@ -5338,6 +5338,42 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 	if len(invocations) != 2 {
 		t.Fatalf("expected two planner invocations, got %d", len(invocations))
 	}
+	attemptGroupID := invocations[0].AttemptGroupID
+	plannerVariantID := invocations[0].PlannerVariantID
+	if attemptGroupID == "" {
+		t.Fatal("expected retry attempts to have a shared non-empty attempt group")
+	}
+	if plannerVariantID == "" || plannerVariantID == memory.LegacyPlannerVariantID {
+		t.Fatalf("expected exact non-legacy planner variant identity, got %q", plannerVariantID)
+	}
+	byAttempt := map[int]memory.AgentInvocation{}
+	for _, invocation := range invocations {
+		if invocation.AttemptGroupID != attemptGroupID {
+			t.Fatalf("retry attempts have different groups: %#v", invocations)
+		}
+		if invocation.PlannerVariantID != plannerVariantID {
+			t.Fatalf("retry attempts have different planner variants: %#v", invocations)
+		}
+		if invocation.PlannerVariant == nil {
+			t.Fatalf("planner invocation is missing canonical variant components: %#v", invocation)
+		}
+		if invocation.WallLatencyMS <= 0 {
+			t.Fatalf("planner invocation is missing locally measured latency: %#v", invocation)
+		}
+		if _, duplicate := byAttempt[invocation.AttemptIndex]; duplicate {
+			t.Fatalf("duplicate retry attempt index %d", invocation.AttemptIndex)
+		}
+		byAttempt[invocation.AttemptIndex] = invocation
+	}
+	if len(byAttempt) != 2 || byAttempt[0].RetryReason != "" || byAttempt[1].RetryReason == "" {
+		t.Fatalf("unexpected retry attempt facts: %#v", byAttempt)
+	}
+	if payloadString(agentDecisions[0].Payload, "planner_variant_id") != plannerVariantID {
+		t.Fatalf("decision is not attributed to accepted planner variant %q: %#v", plannerVariantID, agentDecisions[0].Payload)
+	}
+	if payloadString(agentDecisions[0].Payload, "invocation_id") != byAttempt[1].ID {
+		t.Fatalf("decision is not linked to accepted retry invocation %s: %#v", byAttempt[1].ID, agentDecisions[0].Payload)
+	}
 	foundRejected := false
 	for _, invocation := range invocations {
 		if invocation.DownstreamOutcome["backend_validation_status"] == "rejected" {

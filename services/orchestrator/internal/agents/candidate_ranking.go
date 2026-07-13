@@ -48,7 +48,7 @@ func mechanismExhausted(input ExperimentPlannerInput, candidate CandidateHypothe
 		return false, ""
 	}
 	group := mechanismGroup(normalized)
-	if multiFidelityPolicyEnabled() && yoloWeakBaselineRescueAllowed(input, candidate, experiment, normalized, group) {
+	if multiFidelityPolicyEnabledForInput(input) && yoloWeakBaselineRescueAllowed(input, candidate, experiment, normalized, group) {
 		return false, ""
 	}
 
@@ -453,7 +453,7 @@ func candidateMechanismScore(input ExperimentPlannerInput, candidate CandidateHy
 }
 
 func applyMultiFidelityPolicy(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment, ranking *CandidateRanking) {
-	if ranking == nil || !multiFidelityPolicyEnabled() {
+	if ranking == nil || !multiFidelityPolicyEnabledForInput(input) {
 		return
 	}
 	if ranking.Rejected {
@@ -497,6 +497,13 @@ func applyMultiFidelityPolicy(input ExperimentPlannerInput, candidate CandidateH
 func multiFidelityPolicyEnabled() bool {
 	value := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_MULTI_FIDELITY_POLICY")))
 	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func multiFidelityPolicyEnabledForInput(input ExperimentPlannerInput) bool {
+	if input.RankerMultiFidelityEnabled != nil {
+		return *input.RankerMultiFidelityEnabled
+	}
+	return multiFidelityPolicyEnabled()
 }
 
 func budgetStopSignalActive(input ExperimentPlannerInput) bool {

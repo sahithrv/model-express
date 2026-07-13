@@ -440,8 +440,7 @@ func (c OpenAICompatibleClient) modelForRequest(req JSONRequest) (string, error)
 }
 
 func (c OpenAICompatibleClient) useResponses() bool {
-	return strings.ToLower(strings.TrimSpace(c.config.Provider)) == ProviderOpenAI &&
-		NormalizeAPIStyle(c.config.APIStyle) == APIStyleResponses
+	return EffectiveAPIStyle(c.config.Provider, c.config.APIStyle) == APIStyleResponses
 }
 
 type chatCompletionRequest struct {

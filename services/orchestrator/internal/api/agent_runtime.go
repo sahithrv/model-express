@@ -2,11 +2,14 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/automl"
@@ -21,6 +24,15 @@ import (
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/strategies"
+)
+
+const (
+	plannerRetryPolicyVersion               = "planner_backend_validation_retry_v1"
+	plannerRetryReasonTraceValidation       = "trace_validation_rejected"
+	plannerRetryReasonAutoMLPreparation     = "automl_preparation_rejected"
+	plannerRetryReasonExecutionCapabilities = "execution_capability_rejected"
+	plannerRetryReasonDecisionPayload       = "decision_payload_rejected"
+	plannerDecisionPolicyVersion            = "planner_decision_postprocessor_v1"
 )
 
 func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.ExperimentJob) error {
@@ -375,7 +387,8 @@ func agentInvocationInputContext(
 		out[key] = value
 	}
 	out["invocation_runtime"] = map[string]any{
-		"api_style":                  config.APIStyle,
+		"api_style":                  llm.EffectiveAPIStyle(config.Provider, config.APIStyle),
+		"configured_api_style":       config.APIStyle,
 		"provider":                   config.Provider,
 		"model":                      config.Model,
 		"reasoning_effort":           config.ReasoningEffort,
@@ -732,6 +745,7 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		FollowUpRound:                followUpRoundCount(projectPlans),
 	}
 	input.ProjectTrajectory = agents.ComputeProjectTrajectoryDiagnosis(input)
+	input.RetrievalVariant = plannerRetrievalVariant()
 	input.RetrievedMemory = s.retrievePlannerMemory(context.Background(), input)
 	return input, true, nil
 }
@@ -802,12 +816,34 @@ func (s *Server) recordExperimentPlannerInvocation(
 	config llm.Config,
 	trace agents.ExperimentPlanningTrace,
 	acceptedForMemory bool,
+	facts plannerInvocationFacts,
 ) (memory.AgentInvocation, error) {
 	validationStatus := trace.ValidationStatus
 	if validationStatus == "" {
 		validationStatus = memory.InvocationValidationFailed
 	}
 	inputContext := agentInvocationInputContext(trace.PromptContext, config, trace.ToolRounds, trace.Usage, trace.ToolCalls, trace.ToolResults, trace.RejectedToolCalls, trace.DryRunValidationResults)
+	variant, variantID, err := experimentPlannerVariant(input, config, trace)
+	if err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	providerUsage, err := plannerProviderUsage(trace.Usage)
+	if err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	derivedCost := plannerDerivedCost(config, trace.Usage)
+	if runtime, ok := inputContext["invocation_runtime"].(map[string]any); ok {
+		runtime["request_temperature"] = trace.Request.Temperature
+		runtime["request_reasoning_effort"] = trace.Request.ReasoningEffort
+		runtime["planner_variant_id"] = variantID
+		runtime["attempt_group_id"] = facts.AttemptGroupID
+		runtime["attempt_index"] = facts.AttemptIndex
+		runtime["retry_reason"] = facts.RetryReason
+		runtime["wall_latency_ms"] = facts.WallLatencyMS
+		if derivedCost != nil {
+			runtime["derived_cost"] = derivedCost
+		}
+	}
 
 	return s.store.CreateAgentInvocation(memory.AgentInvocation{
 		ProjectID:         input.Project.ID,
@@ -816,6 +852,15 @@ func (s *Server) recordExperimentPlannerInvocation(
 		AgentName:         agents.ExperimentPlannerAgentName,
 		AgentVersion:      trace.AgentVersion,
 		PromptVersion:     trace.PromptVersion,
+		PlannerVariantID:  variantID,
+		PlannerVariant:    &variant,
+		ValidationMode:    variant.ValidationMode,
+		AttemptGroupID:    facts.AttemptGroupID,
+		AttemptIndex:      facts.AttemptIndex,
+		RetryReason:       facts.RetryReason,
+		WallLatencyMS:     facts.WallLatencyMS,
+		ProviderUsage:     providerUsage,
+		DerivedCost:       derivedCost,
 		Provider:          config.Provider,
 		Model:             config.Model,
 		InputMessages:     llmMessagesForMemory(trace.Request.Messages),
@@ -828,6 +873,131 @@ func (s *Server) recordExperimentPlannerInvocation(
 		HumanFeedback:     map[string]any{},
 		DownstreamOutcome: map[string]any{},
 	})
+}
+
+type plannerInvocationFacts struct {
+	AttemptGroupID string
+	AttemptIndex   int
+	RetryReason    string
+	WallLatencyMS  float64
+}
+
+func experimentPlannerVariant(input agents.ExperimentPlannerInput, config llm.Config, trace agents.ExperimentPlanningTrace) (memory.PlannerVariant, string, error) {
+	retrieval := input.RetrievalVariant
+	if retrieval.MaxCards == 0 {
+		retrieval = plannerRetrievalVariant()
+	}
+	executionValidatorMode := firstNonEmptyString(input.ExecutionCapabilityCard.Mode, executionValidationMode())
+	variant := memory.PlannerVariant{
+		IdentitySchemaVersion:        memory.PlannerVariantIdentitySchemaV1,
+		AgentVersion:                 trace.AgentVersion,
+		PromptVersion:                trace.PromptVersion,
+		StaticPromptVersion:          trace.StaticPromptVersion,
+		ContextBuilderVersion:        trace.ContextBuilderVersion,
+		ToolPolicyVersion:            agents.ExperimentPlannerToolPolicyVersion,
+		ValidatorVersion:             agents.ExperimentPlannerValidatorVersion,
+		ValidationMode:               firstNonEmptyString(trace.ValidatorMode, plannerValidationMode()),
+		ExecutionValidatorVersion:    execution.ExecutionValidationSchemaVersionV1,
+		ExecutionValidationMode:      executionValidatorMode,
+		RankerVersion:                agents.ExperimentPlannerRankerVersion,
+		RankerMultiFidelityEnabled:   trace.RankerMultiFidelity,
+		RetrievalPolicyVersion:       agents.ExperimentPlannerRetrievalPolicyVersion,
+		Retrieval:                    retrieval,
+		RetryPolicyVersion:           plannerRetryPolicyVersion,
+		MaxBackendValidationRetries:  plannerBackendValidationRetryLimit,
+		DecisionPolicyVersion:        plannerDecisionPolicyVersion,
+		AgentMode:                    llm.NormalizeAgentMode(input.AgentMode),
+		TerminalPlannerGuards:        terminalPlannerGuardsEnabledForInput(input),
+		MinimumMeaningfulImprovement: input.MinimumMeaningfulImprovement,
+		MaxFollowUpRounds:            input.MaxFollowUpRounds,
+		Provider:                     config.Provider,
+		APIStyle:                     config.APIStyle,
+		EffectiveAPIStyle:            llm.EffectiveAPIStyle(config.Provider, config.APIStyle),
+		Model:                        firstNonEmptyString(trace.Request.Model, config.Model),
+		EndpointFingerprint:          llm.EndpointFingerprint(config.BaseURL),
+		RequestTemperature:           trace.Request.Temperature,
+		TemperatureSent:              llm.EffectiveAPIStyle(config.Provider, config.APIStyle) == llm.APIStyleChatCompletions,
+		RequestReasoningEffort:       trace.Request.ReasoningEffort,
+		ReasoningEffortSent:          llm.EffectiveAPIStyle(config.Provider, config.APIStyle) == llm.APIStyleResponses && strings.TrimSpace(trace.Request.ReasoningEffort) != "",
+		ConfiguredReasoningEffort:    config.ReasoningEffort,
+		PlateauReasoningEffort:       config.PlateauReasoningEffort,
+		StoredResponses:              config.StoredResponses,
+		MaxToolRounds:                config.MaxToolRounds,
+		MaxSelectedExperiments:       agents.EffectivePlannerMaxExperiments(input.MaxExperiments),
+		MaxProviderRetries:           config.MaxRetries,
+		RequestTimeoutMS:             config.Timeout.Milliseconds(),
+	}
+	variantID, err := memory.ComputePlannerVariantID(variant)
+	if err != nil {
+		return memory.PlannerVariant{}, "", fmt.Errorf("compute planner variant identity: %w", err)
+	}
+	return variant, variantID, nil
+}
+
+func plannerValidationMode() string {
+	if plannerStrictValidationEnabled() {
+		return "strict"
+	}
+	return "relaxed"
+}
+
+func plannerProviderUsage(usage *llm.Usage) (map[string]any, error) {
+	if usage == nil {
+		return map[string]any{}, nil
+	}
+	out, err := mapFromStruct(usage)
+	if err != nil {
+		return nil, fmt.Errorf("encode planner provider usage: %w", err)
+	}
+	return out, nil
+}
+
+func plannerDerivedCost(config llm.Config, usage *llm.Usage) *memory.PlannerInvocationCost {
+	snapshot, err := llm.PricingSnapshotFromEnv()
+	if err != nil {
+		log.Printf("planner pricing snapshot ignored: %v", err)
+		return nil
+	}
+	runtimeModel := config.Model
+	if usage != nil {
+		runtimeModel = firstNonEmptyString(usage.RequestModel, config.Model)
+	}
+	if snapshot != nil && !snapshot.MatchesRuntime(config.Provider, runtimeModel) {
+		log.Printf("planner pricing snapshot %q ignored for unmatched runtime %s/%s", snapshot.PricingVersion, config.Provider, runtimeModel)
+		return nil
+	}
+	derived, err := llm.DeriveCost(usage, snapshot)
+	if err != nil {
+		log.Printf("planner usage cost derivation failed: %v", err)
+		return nil
+	}
+	if derived == nil || snapshot == nil {
+		return nil
+	}
+	return &memory.PlannerInvocationCost{
+		PricingVersion:                 derived.PricingVersion,
+		Currency:                       "USD",
+		Provider:                       config.Provider,
+		Model:                          runtimeModel,
+		InputTokens:                    usage.InputTokens,
+		CachedInputTokens:              usage.CachedInputTokens,
+		OutputTokens:                   usage.OutputTokens,
+		InputUSDPerMillionTokens:       snapshot.InputUSDPerMillionTokens,
+		CachedInputUSDPerMillionTokens: snapshot.CachedInputUSDPerMillionTokens,
+		OutputUSDPerMillionTokens:      snapshot.OutputUSDPerMillionTokens,
+		UncachedInputCostUSD:           derived.UncachedInputCostUSD,
+		CachedInputCostUSD:             derived.CachedInputCostUSD,
+		OutputCostUSD:                  derived.OutputCostUSD,
+		TotalCostUSD:                   derived.TotalCostUSD,
+	}
+}
+
+func newPlannerAttemptGroupID() string {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err == nil {
+		return "planner_attempt_" + hex.EncodeToString(value)
+	}
+	return fmt.Sprintf("planner_attempt_%d", time.Now().UTC().UnixNano())
 }
 
 type experimentPlannerAttemptResult struct {
@@ -845,15 +1015,32 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 	config llm.Config,
 	agentMode string,
 ) (experimentPlannerAttemptResult, error) {
+	agentMode = llm.NormalizeAgentMode(firstNonEmptyString(agentMode, input.AgentMode))
 	attemptInput := input
+	attemptInput.AgentMode = agentMode
+	terminalGuards := terminalPlannerGuardsEnabledForMode(agentMode)
+	attemptInput.TerminalPlannerGuardsEnabled = &terminalGuards
 	var result experimentPlannerAttemptResult
 	var lastErr error
+	attemptGroupID := newPlannerAttemptGroupID()
+	retryReason := ""
 	for attempt := 0; attempt <= plannerBackendValidationRetryLimit; attempt++ {
+		startedAt := time.Now()
 		trace, err := agent.PlanWithTrace(ctx, attemptInput)
+		wallLatencyMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
 		acceptedForMemory := err == nil
-		invocation, invocationErr := s.recordExperimentPlannerInvocation(attemptInput, config, trace, acceptedForMemory)
+		invocation, invocationErr := s.recordExperimentPlannerInvocation(attemptInput, config, trace, acceptedForMemory, plannerInvocationFacts{
+			AttemptGroupID: attemptGroupID,
+			AttemptIndex:   attempt,
+			RetryReason:    retryReason,
+			WallLatencyMS:  wallLatencyMS,
+		})
 		if invocationErr != nil {
-			log.Printf("experiment planner invocation write failed for plan %s: %v", input.SourcePlan.ID, invocationErr)
+			result = experimentPlannerAttemptResult{
+				Input: attemptInput,
+				Trace: trace,
+			}
+			return result, fmt.Errorf("persist experiment planner invocation for plan %s: %w", input.SourcePlan.ID, invocationErr)
 		}
 		result = experimentPlannerAttemptResult{
 			Input:      attemptInput,
@@ -866,6 +1053,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			s.recordPlannerValidationRejection(invocation, err, attempt, willRetry)
 			if willRetry {
 				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(trace.Recommendation, err, attempt+1))
+				retryReason = plannerRetryReasonTraceValidation
 				continue
 			}
 			result.Recommendation = trace.Recommendation
@@ -883,6 +1071,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 					return result, prepareErr
 				}
 				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, prepareErr, attempt+1))
+				retryReason = plannerRetryReasonAutoMLPreparation
 				continue
 			}
 			recommendation.ProposedExperiments = experiments
@@ -897,6 +1086,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 				return result, capabilityErr
 			}
 			attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, capabilityErr, attempt+1))
+			retryReason = plannerRetryReasonExecutionCapabilities
 			continue
 		}
 		payload, err := experimentPlannerDecisionPayload(recommendation, invocation, agentMode, attemptInput)
@@ -920,6 +1110,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			return result, err
 		}
 		attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, err, attempt+1))
+		retryReason = plannerRetryReasonDecisionPayload
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("%w: experiment planner validation retry failed", store.ErrInvalidRequest)
@@ -1185,7 +1376,7 @@ func applyExperimentPlannerStopCriteria(
 	if !ok {
 		return recommendation
 	}
-	if !terminalPlannerGuardsEnabledForMode(input.AgentMode) {
+	if !terminalPlannerGuardsEnabledForInput(input) {
 		recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend stop advisory only; continuing is allowed because terminal planner guards are disabled: "+stopReason)
 		recommendation.Tags = append(recommendation.Tags, "backend_stop_advisory", guardTag)
 		return recommendation
@@ -1200,6 +1391,13 @@ func applyExperimentPlannerStopCriteria(
 	recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, "Backend guard converted ADD_EXPERIMENTS to SELECT_CHAMPION because additional training had insufficient meaningful upside.")
 	recommendation.Tags = append(recommendation.Tags, "select_champion", guardTag)
 	return recommendation
+}
+
+func terminalPlannerGuardsEnabledForInput(input agents.ExperimentPlannerInput) bool {
+	if input.TerminalPlannerGuardsEnabled != nil {
+		return *input.TerminalPlannerGuardsEnabled
+	}
+	return terminalPlannerGuardsEnabledForMode(input.AgentMode)
 }
 
 func plannerWaitShouldSelectChampion(recommendation agents.ExperimentPlanningRecommendation) bool {
@@ -1315,6 +1513,7 @@ func experimentPlannerDecisionPayload(
 		"decision_source":                 llmExperimentPlannerDecisionSource,
 		"agent_name":                      agents.ExperimentPlannerAgentName,
 		"invocation_id":                   invocation.ID,
+		"planner_variant_id":              invocation.PlannerVariantID,
 		"confidence":                      recommendation.Confidence,
 		"auto_executable":                 agentMode == llm.AgentModeAutonomous,
 		"planning_mode":                   recommendation.PlanningMode,

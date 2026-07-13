@@ -1778,6 +1778,11 @@ func (s *MemoryStore) CreateAgentInvocation(invocation memory.AgentInvocation) (
 	if _, ok := s.projects[invocation.ProjectID]; !ok {
 		return memory.AgentInvocation{}, ErrNotFound
 	}
+	var err error
+	invocation, err = memory.NormalizeAgentInvocationRuntime(invocation)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("normalize agent invocation runtime: %w", err)
+	}
 	if invocation.InputMessages == nil {
 		invocation.InputMessages = []map[string]string{}
 	}
@@ -3325,6 +3330,9 @@ func agentInvocationMatchesFilter(invocation memory.AgentInvocation, filter memo
 		return false
 	}
 	if filter.AgentName != "" && invocation.AgentName != filter.AgentName {
+		return false
+	}
+	if filter.PlannerVariantID != "" && invocation.PlannerVariantID != filter.PlannerVariantID {
 		return false
 	}
 	return true
