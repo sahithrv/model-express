@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 
 	"model-express/services/orchestrator/internal/execution"
@@ -27,6 +28,7 @@ func (s *Server) executionReferencesForJob(jobID string, existing *runs.Executio
 		references.CapabilityVersion = evidence.CapabilityVersion
 		references.AcceptedSpecHash = evidence.AcceptedSpecHash
 		references.RealizedEffectiveHash = evidence.RealizedEffectiveHash
+		references.AdjustmentReasonCodes = append([]string(nil), evidence.AdjustmentReasonCodes...)
 		references.ExecutionRecordRef = "/jobs/" + strings.TrimSpace(jobID) + "/execution-record"
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return existing
@@ -54,7 +56,7 @@ func (s *Server) executionReferencesForJob(jobID string, existing *runs.Executio
 			}
 		}
 	}
-	if references == (runs.ExecutionArtifactReferences{}) {
+	if reflect.DeepEqual(references, runs.ExecutionArtifactReferences{}) {
 		return nil
 	}
 	if references.SchemaVersion == "" {

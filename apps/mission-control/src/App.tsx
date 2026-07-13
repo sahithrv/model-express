@@ -459,6 +459,7 @@ import {
   DetectionOverlay,
   PredictionRow,
   RunEvaluationDetails,
+  RunExecutionAudit,
   MetricCard,
   Badge,
   MetricChart,
@@ -507,6 +508,7 @@ import type {
   DatasetMetadataSummary,
   DatasetVisualAnalysis,
   EpochMetric,
+  ExecutionRecord,
   ExecutionEvent,
   ExperimentPlan,
   Health,
@@ -875,6 +877,10 @@ export function App() {
   const [detail, setDetail] = useState<ProjectDetail>(() => emptyProjectDetail());
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
+  const [executionAuditRecord, setExecutionAuditRecord] = useState<ExecutionRecord | null>(null);
+  const [executionAuditRecordJobId, setExecutionAuditRecordJobId] = useState("");
+  const [executionAuditLoading, setExecutionAuditLoading] = useState(false);
+  const [executionAuditError, setExecutionAuditError] = useState("");
   const [automationSettings, setAutomationSettings] = useState<AutomationSettings>(defaultAutomationSettings);
   const [settingsDraft, setSettingsDraft] = useState<AutomationSettings>(defaultAutomationSettings);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -913,6 +919,7 @@ export function App() {
   const lastEventRefreshAt = useRef(0);
   const liveRefreshInFlight = useRef(false);
   const cachedGetRequests = useRef<Map<string, CachedGetRequest>>(new Map());
+  const executionAuditRequestId = useRef(0);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -1672,6 +1679,36 @@ export function App() {
     const response = await request<{ metrics: EpochMetric[] }>(`/jobs/${selectedJobId}/metrics?limit=${selectedJobMetricsFetchLimit}`);
     setMetrics(response.metrics);
   }, [request, selectedJobId]);
+
+  const loadSelectedExecutionAudit = useCallback(async () => {
+    if (!selectedJobId || executionAuditLoading) return;
+    const references = selectedRunSummary?.execution_references ?? selectedRunEvaluation?.execution_references;
+    const receiptPath = String(references?.execution_record_ref || "").trim();
+    if (!receiptPath) return;
+    setExecutionAuditLoading(true);
+    setExecutionAuditError("");
+    const requestId = ++executionAuditRequestId.current;
+    try {
+      const requestedJobId = selectedJobId;
+      const record = await request<ExecutionRecord>(receiptPath, { bypassCache: true });
+      if (executionAuditRequestId.current !== requestId) return;
+      setExecutionAuditRecord(record);
+      setExecutionAuditRecordJobId(requestedJobId);
+    } catch (error) {
+      if (executionAuditRequestId.current !== requestId) return;
+      setExecutionAuditError(`Execution receipt lookup failed: ${errorMessage(error)}`);
+    } finally {
+      if (executionAuditRequestId.current === requestId) setExecutionAuditLoading(false);
+    }
+  }, [executionAuditLoading, request, selectedJobId, selectedRunEvaluation, selectedRunSummary]);
+
+  useEffect(() => {
+    executionAuditRequestId.current += 1;
+    setExecutionAuditRecord(null);
+    setExecutionAuditRecordJobId("");
+    setExecutionAuditError("");
+    setExecutionAuditLoading(false);
+  }, [selectedJobId]);
 
   const refreshAll = useCallback(async () => {
     setLoading(true);
@@ -4035,7 +4072,7 @@ export function App() {
                         <span key={chip}>{chip}</span>
                       ))}
                       {selectedRunEvaluation && (
-                        <span>{formatLatency(recordNumber(selectedRunEvaluation.model_profile, "estimated_latency_ms"))}</span>
+                        <span>{formatLatency(recordNumber(recordObject(selectedRunEvaluation.model_profile), "estimated_latency_ms"))}</span>
                       )}
                     </div>
                   )}
@@ -4048,6 +4085,17 @@ export function App() {
                   />
                 ) : (
                   <div className="empty chart-empty">No graphable metrics reported</div>
+                )}
+                {(selectedJob.template === "train_experiment" || selectedRunSummary || selectedRunEvaluation) && (
+                  <RunExecutionAudit
+                    summary={selectedRunSummary}
+                    evaluation={selectedRunEvaluation}
+                    job={selectedJob}
+                    record={executionAuditRecordJobId === selectedJobId ? executionAuditRecord : null}
+                    loading={executionAuditLoading}
+                    error={executionAuditError}
+                    onLoadReceipt={loadSelectedExecutionAudit}
+                  />
                 )}
                 {selectedRunEvaluation && <RunEvaluationDetails evaluation={selectedRunEvaluation} />}
               </div>

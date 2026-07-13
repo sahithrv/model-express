@@ -104,17 +104,18 @@ type TrainingRunSummaryUpdate struct {
 // export consumers stable links and hashes without copying realization receipts
 // or framework argument payloads into run summaries.
 type ExecutionArtifactReferences struct {
-	SchemaVersion             string `json:"schema_version"`
-	LifecycleStatus           string `json:"lifecycle_status,omitempty"`
-	FidelityVerdict           string `json:"fidelity_verdict,omitempty"`
-	CapabilityVersion         string `json:"capability_version,omitempty"`
-	AcceptedSpecHash          string `json:"accepted_spec_hash,omitempty"`
-	RealizedEffectiveHash     string `json:"realized_effective_hash,omitempty"`
-	ExecutionRecordRef        string `json:"execution_record_ref,omitempty"`
-	TrainingArtifactURI       string `json:"training_artifact_uri,omitempty"`
-	TrainingExportManifestURI string `json:"training_export_manifest_uri,omitempty"`
-	PreprocessingContractRef  string `json:"preprocessing_contract_ref,omitempty"`
-	ChampionExportManifestURI string `json:"champion_export_manifest_uri,omitempty"`
+	SchemaVersion             string   `json:"schema_version"`
+	LifecycleStatus           string   `json:"lifecycle_status,omitempty"`
+	FidelityVerdict           string   `json:"fidelity_verdict,omitempty"`
+	CapabilityVersion         string   `json:"capability_version,omitempty"`
+	AcceptedSpecHash          string   `json:"accepted_spec_hash,omitempty"`
+	RealizedEffectiveHash     string   `json:"realized_effective_hash,omitempty"`
+	AdjustmentReasonCodes     []string `json:"adjustment_reason_codes,omitempty"`
+	ExecutionRecordRef        string   `json:"execution_record_ref,omitempty"`
+	TrainingArtifactURI       string   `json:"training_artifact_uri,omitempty"`
+	TrainingExportManifestURI string   `json:"training_export_manifest_uri,omitempty"`
+	PreprocessingContractRef  string   `json:"preprocessing_contract_ref,omitempty"`
+	ChampionExportManifestURI string   `json:"champion_export_manifest_uri,omitempty"`
 }
 
 type TrainingRunEvaluation struct {

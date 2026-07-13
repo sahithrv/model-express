@@ -216,6 +216,73 @@ export type Job = {
   completed_at?: string;
 };
 
+export type ExecutionArtifactReferences = {
+  schema_version?: string;
+  lifecycle_status?: string;
+  fidelity_verdict?: string;
+  capability_version?: string;
+  accepted_spec_hash?: string;
+  realized_effective_hash?: string;
+  adjustment_reason_codes?: string[];
+  execution_record_ref?: string;
+  training_artifact_uri?: string;
+  training_export_manifest_uri?: string;
+  preprocessing_contract_ref?: string;
+  champion_export_manifest_uri?: string;
+};
+
+export type RealizationObservation = {
+  id?: string;
+  attempt_record_id?: string;
+  attempt_id?: string;
+  schema_version?: string;
+  stage?: string;
+  idempotency_key?: string;
+  realized_config?: Record<string, unknown>;
+  framework_arguments?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  adjustment_policy?: string;
+  adjustment_reason_codes?: string[];
+  simulated?: boolean;
+  realized_effective_hash?: string;
+  fidelity_verdict?: string;
+  created_at?: string;
+};
+
+export type AttemptExecutionRecord = {
+  id?: string;
+  job_id?: string;
+  project_id?: string;
+  attempt_id?: string;
+  attempt_number?: number;
+  lifecycle_status?: string;
+  fidelity_verdict?: string;
+  realized_effective_hash?: string;
+  adjustment_reason_codes?: string[];
+  latest_realized_config?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+  observations?: RealizationObservation[];
+};
+
+export type JobExecutionSpec = {
+  job_id?: string;
+  project_id?: string;
+  schema_version?: string;
+  capability_version?: string;
+  task?: string;
+  runner?: string;
+  requested_config_hash?: string;
+  accepted_spec_hash?: string;
+  accepted_spec?: Record<string, unknown>;
+  created_at?: string;
+};
+
+export type ExecutionRecord = {
+  accepted_spec: JobExecutionSpec;
+  attempts: AttemptExecutionRecord[];
+};
+
 export type PlannedExperiment = {
   template: string;
   model: string;
@@ -355,6 +422,7 @@ export type TrainingRunSummary = {
   modal_input_id?: string;
   dataset_materialization?: Record<string, unknown>;
   stage_telemetry?: Record<string, unknown>;
+  execution_references?: ExecutionArtifactReferences;
   created_at: string;
   updated_at: string;
 };
@@ -364,14 +432,15 @@ export type TrainingRunEvaluation = {
   project_id: string;
   plan_id?: string;
   dataset_id?: string;
-  objective_profile: Record<string, unknown>;
-  per_class_metrics: Record<string, unknown>;
-  confusion_matrix: number[][];
-  model_profile: Record<string, unknown>;
-  holistic_scores: Record<string, unknown>;
-  recommendation_summary: string;
-  created_at: string;
-  updated_at: string;
+  objective_profile?: Record<string, unknown>;
+  per_class_metrics?: Record<string, unknown>;
+  confusion_matrix?: number[][];
+  model_profile?: Record<string, unknown>;
+  holistic_scores?: Record<string, unknown>;
+  recommendation_summary?: string;
+  execution_references?: ExecutionArtifactReferences;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type ProjectChampion = {

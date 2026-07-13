@@ -948,7 +948,9 @@ function validateLocalArtifactPathForExtensions(artifactUri, env, allowedExtensi
   if (!allowed) {
     throw new Error(`${label} must be under a configured Model Express artifact or export root.`);
   }
-  if (isPathInsideOrEqual(realCandidate, path.join(repoRoot(env), "artifacts", "logs"))) {
+  const configuredLogRoot = path.join(repoRoot(env), "artifacts", "logs");
+  const realLogRoot = safeRealpath(configuredLogRoot) || path.resolve(configuredLogRoot);
+  if (isPathInsideOrEqual(realCandidate, realLogRoot)) {
     throw new Error(`${label} loading refuses log directories.`);
   }
   if (!isAllowedArtifactFile(realCandidate, allowedExtensions)) {

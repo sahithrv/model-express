@@ -26,6 +26,66 @@ after(async () => {
   await viteServer?.close();
 });
 
+test("run execution audit renders compact fidelity without loading large receipts", async () => {
+  const { RunExecutionAudit } = await loadMissionPanels();
+  let receiptLoads = 0;
+  const html = renderToStaticMarkup(
+    createElement(RunExecutionAudit, {
+      summary: {
+        job_id: "job-1",
+        project_id: "project-1",
+        model: "resnet18",
+        status: "SUCCEEDED",
+        execution_references: {
+          fidelity_verdict: "MATCHED",
+          lifecycle_status: "FINALIZED",
+          capability_version: "1.0.0",
+          accepted_spec_hash: "sha256:accepted-long-hash",
+          realized_effective_hash: "sha256:realized-long-hash",
+          execution_record_ref: "/jobs/job-1/execution-record",
+        },
+      },
+      evaluation: null,
+      job: { id: "job-1", project_id: "project-1", template: "train_experiment", status: "SUCCEEDED", config: {} },
+      record: null,
+      loading: false,
+      error: "",
+      onLoadReceipt: () => { receiptLoads += 1; },
+    }),
+  );
+
+  assert.match(html, /MATCHED/);
+  assert.match(html, /Verified: the accepted training semantics were realized/);
+  assert.match(html, /Expert execution audit/);
+  assert.doesNotMatch(html, /framework_arguments/);
+  assert.doesNotMatch(html, /Full bounded receipt/);
+  assert.equal(receiptLoads, 0);
+});
+
+test("run execution audit gives mismatch and simulation explicit unsafe copy", async () => {
+  const { RunExecutionAudit } = await loadMissionPanels();
+  const renderStatus = (fidelityVerdict) => renderToStaticMarkup(
+    createElement(RunExecutionAudit, {
+      summary: {
+        job_id: "job-1",
+        project_id: "project-1",
+        model: "resnet18",
+        status: "SUCCEEDED",
+        execution_references: { fidelity_verdict: fidelityVerdict, lifecycle_status: "FINALIZED" },
+      },
+      evaluation: null,
+      job: { id: "job-1", project_id: "project-1", template: "train_experiment", status: "SUCCEEDED", config: {} },
+      record: null,
+      loading: false,
+      error: "",
+      onLoadReceipt: () => {},
+    }),
+  );
+
+  assert.match(renderStatus("MISMATCH"), /Not trustworthy as faithful evidence/);
+  assert.match(renderStatus("SIMULATED"), /Simulation only: this is not verified real-training evidence/);
+});
+
 test("agent drill-down renders legacy rankings and discloses new selection audit details", async () => {
   const { AgentDecisionChat } = await loadMissionPanels();
   const baseTurn = {

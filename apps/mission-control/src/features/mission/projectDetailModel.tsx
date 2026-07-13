@@ -40,7 +40,9 @@ import type {
   DatasetMetadataSummary,
   DatasetVisualAnalysis,
   EpochMetric,
+  ExecutionArtifactReferences,
   ExecutionEvent,
+  ExecutionRecord,
   ExperimentPlan,
   Health,
   Job,
@@ -1068,6 +1070,185 @@ export function trainingRunLifecycleChips(summary: TrainingRunSummary) {
   const reuseStatus = recordString(materialization, "dataset_prewarm_reuse_status");
   if (reuseStatus && !chips.includes(reuseStatus)) chips.push(humanizeAuditKey(reuseStatus));
   return chips.slice(0, 7);
+}
+
+export type ExecutionFidelityStatus =
+  | "MATCHED"
+  | "APPROVED_ADJUSTMENT"
+  | "MISMATCH"
+  | "UNVERIFIED"
+  | "SIMULATED"
+  | "NOT_REALIZED"
+  | "PENDING_REALIZATION";
+
+export type ExecutionSemanticDiffRow = {
+  path: string;
+  requested: unknown;
+  realized: unknown;
+  change: "same" | "changed" | "requested_only" | "realized_only";
+};
+
+export type ExecutionAuditView = {
+  status: ExecutionFidelityStatus;
+  lifecycleStatus: string;
+  capabilityVersion: string;
+  acceptedSpecHash: string;
+  realizedEffectiveHash: string;
+  adjustmentReasonCodes: string[];
+  adjustmentSummary: string;
+  executionRecordRef: string;
+  trustworthy: boolean;
+  tone: "trusted" | "adjusted" | "untrusted" | "unverified" | "pending";
+  message: string;
+  diff: ExecutionSemanticDiffRow[];
+};
+
+export function executionAuditView(
+  summary: TrainingRunSummary | null,
+  evaluation: TrainingRunEvaluation | null,
+  job: Job | null,
+  record: ExecutionRecord | null = null,
+): ExecutionAuditView {
+  const references = executionArtifactReferences(summary, evaluation);
+  const attempt = latestExecutionAttempt(record);
+  const lifecycleStatus = String(references.lifecycle_status || attempt?.lifecycle_status || "").trim().toUpperCase();
+  const rawVerdict = String(references.fidelity_verdict || attempt?.fidelity_verdict || "").trim().toUpperCase();
+  const status = normalizedExecutionFidelityStatus(rawVerdict, lifecycleStatus);
+  const adjustmentReasonCodes = uniqueStrings([
+    ...(references.adjustment_reason_codes ?? []),
+    ...(attempt?.adjustment_reason_codes ?? []),
+  ]);
+  const requested = requestedExecutionConfig(job);
+  const realized = recordObject(attempt?.latest_realized_config);
+  return {
+    status,
+    lifecycleStatus,
+    capabilityVersion: String(references.capability_version || record?.accepted_spec?.capability_version || ""),
+    acceptedSpecHash: String(references.accepted_spec_hash || record?.accepted_spec?.accepted_spec_hash || ""),
+    realizedEffectiveHash: String(references.realized_effective_hash || attempt?.realized_effective_hash || ""),
+    adjustmentReasonCodes,
+    adjustmentSummary:
+      adjustmentReasonCodes.length > 0
+        ? adjustmentReasonCodes.map((code) => humanizeAuditKey(code)).join(", ")
+        : status === "APPROVED_ADJUSTMENT"
+          ? "Approved runtime adjustment"
+          : "None",
+    executionRecordRef: String(references.execution_record_ref || ""),
+    trustworthy: status === "MATCHED" || status === "APPROVED_ADJUSTMENT",
+    tone: executionFidelityTone(status),
+    message: executionFidelityMessage(status),
+    diff: semanticExecutionDiff(requested, realized),
+  };
+}
+
+export function executionArtifactReferences(
+  summary: TrainingRunSummary | null,
+  evaluation: TrainingRunEvaluation | null,
+): ExecutionArtifactReferences {
+  return {
+    ...(evaluation?.execution_references ?? {}),
+    ...(summary?.execution_references ?? {}),
+  };
+}
+
+export function semanticExecutionDiff(
+  requested: Record<string, unknown>,
+  realized: Record<string, unknown>,
+): ExecutionSemanticDiffRow[] {
+  const requestedLeaves = flattenSemanticObject(requested);
+  const realizedLeaves = flattenSemanticObject(realized);
+  const paths = Array.from(new Set([...Object.keys(requestedLeaves), ...Object.keys(realizedLeaves)]));
+  return paths
+    .map((path): ExecutionSemanticDiffRow => {
+      const requestedPresent = Object.prototype.hasOwnProperty.call(requestedLeaves, path);
+      const realizedPresent = Object.prototype.hasOwnProperty.call(realizedLeaves, path);
+      const requestedValue = requestedLeaves[path];
+      const realizedValue = realizedLeaves[path];
+      const change = !requestedPresent
+        ? "realized_only"
+        : !realizedPresent
+          ? "requested_only"
+          : semanticValueKey(requestedValue) === semanticValueKey(realizedValue)
+            ? "same"
+            : "changed";
+      return { path, requested: requestedValue, realized: realizedValue, change };
+    })
+    .sort((left, right) => {
+      if ((left.change === "same") !== (right.change === "same")) return left.change === "same" ? 1 : -1;
+      return left.path.localeCompare(right.path);
+    });
+}
+
+function requestedExecutionConfig(job: Job | null) {
+  const spec = recordObject(recordObject(job?.config).execution_spec_v1);
+  return recordObject(spec.requested_config);
+}
+
+function latestExecutionAttempt(record: ExecutionRecord | null) {
+  return [...(record?.attempts ?? [])].sort((left, right) => {
+    const numberDelta = Number(right.attempt_number ?? 0) - Number(left.attempt_number ?? 0);
+    if (numberDelta !== 0) return numberDelta;
+    return String(right.updated_at || "").localeCompare(String(left.updated_at || ""));
+  })[0];
+}
+
+function normalizedExecutionFidelityStatus(verdict: string, lifecycleStatus: string): ExecutionFidelityStatus {
+  if (["MATCHED", "APPROVED_ADJUSTMENT", "MISMATCH", "UNVERIFIED", "SIMULATED"].includes(verdict)) {
+    return verdict as ExecutionFidelityStatus;
+  }
+  if (lifecycleStatus === "NOT_REALIZED") return "NOT_REALIZED";
+  if (["PENDING", "INITIALIZED"].includes(lifecycleStatus)) return "PENDING_REALIZATION";
+  return "UNVERIFIED";
+}
+
+function executionFidelityTone(status: ExecutionFidelityStatus): ExecutionAuditView["tone"] {
+  if (status === "MATCHED") return "trusted";
+  if (status === "APPROVED_ADJUSTMENT") return "adjusted";
+  if (status === "MISMATCH" || status === "SIMULATED") return "untrusted";
+  if (status === "UNVERIFIED") return "unverified";
+  return "pending";
+}
+
+function executionFidelityMessage(status: ExecutionFidelityStatus) {
+  switch (status) {
+    case "MATCHED":
+      return "Verified: the accepted training semantics were realized.";
+    case "APPROVED_ADJUSTMENT":
+      return "Verified with an explicitly approved runtime adjustment.";
+    case "MISMATCH":
+      return "Not trustworthy as faithful evidence: realized training contradicted the accepted semantics.";
+    case "SIMULATED":
+      return "Simulation only: this is not verified real-training evidence.";
+    case "NOT_REALIZED":
+      return "This attempt ended before training semantics were realized.";
+    case "PENDING_REALIZATION":
+      return "Training realization evidence is still pending.";
+    default:
+      return "Legacy or unverifiable run: no versioned execution receipt proves what ran.";
+  }
+}
+
+function flattenSemanticObject(value: Record<string, unknown>, prefix = ""): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort()) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    const item = value[key];
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      Object.assign(out, flattenSemanticObject(item as Record<string, unknown>, path));
+    } else {
+      out[path] = item;
+    }
+  }
+  return out;
+}
+
+function semanticValueKey(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(semanticValueKey).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${key}:${semanticValueKey(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
 }
 
 export function lifecycleSecondsChip(label: string, seconds: number) {
