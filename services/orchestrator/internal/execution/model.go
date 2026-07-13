@@ -197,11 +197,17 @@ type ExecutionEventCursorState struct {
 // stable public aliases.
 func SafeExecutionEventMetadataKeys() []string {
 	return []string{
+		"category",
+		"phase",
+		"status",
+		"severity",
 		"agent_name",
+		"invocation_id",
 		"decision_id",
 		"source_decision_id",
 		"decision_type",
 		"job_id",
+		"attempt_id",
 		"job_ids",
 		"worker_requirement_id",
 		"open_job_count",
@@ -225,6 +231,7 @@ func SafeExecutionEventMetadataKeys() []string {
 		"backend_validation_status",
 		"backend_stop_guard",
 		"reason",
+		"reason_code",
 		"model",
 		"selection_source",
 		"materialization_status",

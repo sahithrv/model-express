@@ -93,7 +93,7 @@ func TestRecoverExpiredLeasesOnceFailsExpiredMaxAttemptJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list execution events: %v", err)
 	}
-	if !leaseRecoveryHasExecutionEvent(events, execution.EventExecutionFailed) {
+	if !leaseRecoveryHasExecutionEvent(events, execution.EventJobFailed) {
 		t.Fatalf("expected execution failure event, got %#v", events)
 	}
 }

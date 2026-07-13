@@ -87,3 +87,18 @@ func TestExecutionEventCreateAllocatesCursorAndInsertUnderOneLock(t *testing.T) 
 		}
 	}
 }
+
+func TestV1ActivityExecutionEventQueryFiltersBeforeLimit(t *testing.T) {
+	query := executionEventActivitySelectQuery()
+	for _, required := range []string{
+		"event_type NOT IN",
+		"JOB_RETRY_QUEUED_TRANSITION",
+		"payload->>'reason_code' IN ('attempts_exhausted', 'lease_attempts_exhausted')",
+		"ORDER BY created_at DESC",
+		"LIMIT $2",
+	} {
+		if !strings.Contains(query, required) {
+			t.Fatalf("v1-compatible execution event query omitted %q: %s", required, query)
+		}
+	}
+}

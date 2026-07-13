@@ -2,9 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/workers"
 )
 
@@ -102,26 +102,55 @@ func (s *PostgresStore) HeartbeatWorker(id string) (workers.Worker, error) {
 	defer tx.Rollback()
 
 	worker, err := scanWorker(tx.QueryRowContext(ctx, `
-		UPDATE workers
-		SET last_heartbeat = now()
+		SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		FROM workers
 		WHERE id = $1
-		RETURNING id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
 	`, id))
 	if err != nil {
 		return workers.Worker{}, err
 	}
 
 	if worker.CurrentJobID != "" {
+		job, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id")+" FOR UPDATE", worker.CurrentJobID))
+		if err != nil {
+			return workers.Worker{}, err
+		}
+		worker, err = scanWorker(tx.QueryRowContext(ctx, `
+			UPDATE workers
+			SET last_heartbeat = now()
+			WHERE id = $1 AND current_job_id = $2
+			RETURNING id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		`, id, job.ID))
+		if errors.Is(err, ErrNotFound) {
+			if err := tx.Commit(); err != nil {
+				return workers.Worker{}, err
+			}
+			return s.HeartbeatWorker(id)
+		}
+		if err != nil {
+			return workers.Worker{}, err
+		}
 		now := worker.LastHeartbeat
 		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
-		if _, err := tx.ExecContext(ctx, `
+		if !isTerminalJobStatus(job.Status) {
+			if _, err := tx.ExecContext(ctx, `
 			UPDATE experiment_jobs
 			SET lease_owner_worker_id = $1,
 				lease_last_heartbeat_at = $2,
 				lease_expires_at = $3
 			WHERE id = $4
-				AND status NOT IN ($5, $6)
-		`, worker.ID, now, leaseExpiresAt, worker.CurrentJobID, jobs.StatusSucceeded, jobs.StatusFailed); err != nil {
+		`, worker.ID, now, leaseExpiresAt, job.ID); err != nil {
+				return workers.Worker{}, err
+			}
+		}
+	} else {
+		worker, err = scanWorker(tx.QueryRowContext(ctx, `
+			UPDATE workers
+			SET last_heartbeat = now()
+			WHERE id = $1
+			RETURNING id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		`, id))
+		if err != nil {
 			return workers.Worker{}, err
 		}
 	}

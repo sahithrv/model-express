@@ -1,7 +1,6 @@
 package api
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -9,7 +8,6 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/diagnostics"
-	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/runs"
 )
@@ -105,30 +103,6 @@ func (s *Server) handleRecoveredExpiredLeaseFailure(job jobs.ExperimentJob) {
 		s.updateWorkerRequirementDemandAfterTerminalJob(job)
 	}
 
-	planID := jobConfigString(job.Config, "plan_id")
-	payload := map[string]any{
-		"job_id":          job.ID,
-		"worker_id":       job.WorkerID,
-		"template":        job.Template,
-		"attempt":         job.Attempt,
-		"max_attempts":    job.MaxAttempts,
-		"error":           job.Error,
-		"recovery_reason": "expired_lease",
-	}
-	if _, err := s.store.CreateExecutionEvent(
-		job.ProjectID,
-		planID,
-		execution.EventExecutionFailed,
-		fmt.Sprintf("Job %s failed after its worker lease expired and attempts were exhausted.", job.ID),
-		payload,
-	); err != nil {
-		log.Printf("record expired lease failure event failed for job %s: %v", job.ID, err)
-		diagnostics.Event("warn", "job_lease_recovery_event_failed", map[string]any{
-			"job_id":     job.ID,
-			"project_id": job.ProjectID,
-			"error":      err.Error(),
-		})
-	}
 	if job.Template == jobs.TemplateTrainExperiment {
 		s.enqueueTrainingTerminalHooks(job)
 	}

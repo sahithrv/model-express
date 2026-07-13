@@ -664,7 +664,6 @@ func (s *Server) failJob(c *gin.Context) {
 			"oom_kind":      req.OOMKind,
 			"retry_guard":   retryDecision.Status,
 		})
-		s.recordRetryableJobFailureEvent(job, requeued, req.Error, retryDecision)
 		if job.Template == jobs.TemplateTrainExperiment {
 			status := jobs.StatusQueued
 			if !requeued {
@@ -1135,45 +1134,6 @@ func mergePayloadMap(base map[string]any, overlay map[string]any) map[string]any
 	return out
 }
 
-func (s *Server) recordRetryableJobFailureEvent(job jobs.ExperimentJob, requeued bool, message string, retryDecision retryFailureDecision) {
-	planID := jobConfigString(job.Config, "plan_id")
-	nextAttempt := job.Attempt + 1
-	if nextAttempt > job.MaxAttempts {
-		nextAttempt = job.MaxAttempts
-	}
-	eventType := execution.EventJobRetryQueued
-	eventMessage := fmt.Sprintf("Job %s reported a retryable failure and was requeued for attempt %d of %d.", job.ID, nextAttempt, job.MaxAttempts)
-	if !requeued {
-		eventType = execution.EventExecutionFailed
-		eventMessage = fmt.Sprintf("Job %s reported a retryable failure and exhausted %d attempts.", job.ID, job.MaxAttempts)
-	}
-	if _, err := s.store.CreateExecutionEvent(job.ProjectID, planID, eventType, eventMessage, map[string]any{
-		"job_id":       job.ID,
-		"worker_id":    job.WorkerID,
-		"template":     job.Template,
-		"attempt":      job.Attempt,
-		"max_attempts": job.MaxAttempts,
-		"requeued":     requeued,
-		"error":        message,
-		"retry_guard": map[string]any{
-			"status":                   retryDecision.Status,
-			"reason":                   retryDecision.Reason,
-			"failure_class":            retryDecision.FailureClass,
-			"oom_kind":                 retryDecision.OOMKind,
-			"resource_signature":       retryDecision.ResourceSignature,
-			"previous_gpu_type":        retryDecision.PreviousGPUType,
-			"next_gpu_type":            retryDecision.NextGPUType,
-			"effective_batch_size":     retryDecision.EffectiveBatchSize,
-			"memory_mb":                retryDecision.MemoryMB,
-			"repeated_signature":       retryDecision.RepeatedSignature,
-			"escalation_exhausted":     retryDecision.EscalationExhausted,
-			"same_combo_retry_blocked": retryDecision.Status == "oom_retry_blocked_same_resource",
-		},
-	}); err != nil {
-		log.Printf("record retryable job failure event failed: %v", err)
-	}
-}
-
 func (s *Server) updateWorkerRequirementDemandAfterTerminalJob(job jobs.ExperimentJob) {
 	if job.Template != jobs.TemplateTrainExperiment {
 		return
@@ -1609,12 +1569,11 @@ func (s *Server) cancelPlanActiveExecutionByID(planID string, req cancelExecutio
 		} else {
 			response.ActiveJobsMarkedCancelling++
 		}
-		s.closeRemoteTrainingSession(job, runs.RemoteTrainingSessionStatusClosing)
-		cancelledJob, err := s.store.FailJob(job.ID, cancelMessage)
-		if err != nil {
-			return cancelExecutionResponse{}, err
-		}
-		cancelledJob, err = s.store.UpdateJobConfig(cancelledJob.ID, cancellationJobConfigPatch(reason, modalCall, req.TerminateRemoteWork))
+		cancelledJob, err := s.store.CancelJob(
+			job.ID,
+			cancelMessage,
+			cancellationJobConfigPatch(job, reason, modalCall, req.TerminateRemoteWork),
+		)
 		if err != nil {
 			return cancelExecutionResponse{}, err
 		}
@@ -1772,7 +1731,7 @@ func modalCallCancelResultForJob(job jobs.ExperimentJob, terminateRemoteWork boo
 	}
 }
 
-func cancellationJobConfigPatch(reason string, modalCall cancelModalCallResult, terminateRemoteWork bool) map[string]any {
+func cancellationJobConfigPatch(job jobs.ExperimentJob, reason string, modalCall cancelModalCallResult, terminateRemoteWork bool) map[string]any {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	patch := map[string]any{
 		"cancel_requested":      true,
@@ -1794,6 +1753,13 @@ func cancellationJobConfigPatch(reason string, modalCall cancelModalCallResult, 
 	}
 	if modalCall.TrainingAttemptID != "" {
 		patch["cancelled_training_attempt_id"] = modalCall.TrainingAttemptID
+	}
+	if existing := payloadMap(job.Config, "remote_training_session"); len(existing) > 0 {
+		session := copyPayloadMap(existing)
+		session["status"] = runs.RemoteTrainingSessionStatusFailed
+		session["updated_at"] = now
+		session["closed_at"] = now
+		patch["remote_training_session"] = session
 	}
 	return patch
 }

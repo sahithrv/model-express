@@ -455,7 +455,7 @@ func (s *Server) listProjectActivityEventsWithStats(projectID string, limit int)
 
 	stats := activityQueryStats{}
 	stats.StoreCallCount++
-	executionEvents, err := s.store.ListProjectExecutionEvents(projectID, sourceLimit)
+	executionEvents, err := s.store.ListProjectExecutionEventActivity(projectID, sourceLimit)
 	if err != nil {
 		stats.ErrorReason = "execution_events_read_failed"
 		return nil, stats, err
@@ -485,6 +485,12 @@ func (s *Server) listProjectActivityEventsWithStats(projectID string, limit int)
 
 	out := []agentActivityEvent{}
 	for _, event := range executionEvents {
+		// The activity store query filters producer-only rows before applying its
+		// bound. Keep this defensive check so alternate Store implementations also
+		// preserve v1 synthesis without duplicate job/agent transitions.
+		if execution.IsDurableTransitionEventType(event.EventType) && !durableTransitionVisibleInV1Activity(event) {
+			continue
+		}
 		out = append(out, activityFromExecutionEvent(event))
 	}
 	activeWork := activityHasActiveWork(projectJobs, agentInvocations)
@@ -613,8 +619,11 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 		activity.Severity = "success"
 		activity.Title = "Modal dispatcher idle"
 		activity.Status = "succeeded"
-	case execution.EventJobRetryQueued:
+	case execution.EventJobRetryQueued, execution.EventJobRetryQueuedTransition:
 		requeued := activityMetadataBool(event.Payload, "requeued")
+		if event.EventType == execution.EventJobRetryQueuedTransition {
+			requeued = true
+		}
 		activity.Type = "job.retrying"
 		activity.Severity = "warning"
 		activity.Title = "Retrying job"
@@ -625,7 +634,7 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 			activity.Title = "Job attempts exhausted"
 			activity.Status = "failed"
 		}
-	case execution.EventExecutionFailed:
+	case execution.EventExecutionFailed, execution.EventJobFailed:
 		activity.Type = "system.failed"
 		activity.Severity = "error"
 		activity.Title = "Execution failed"
@@ -665,6 +674,17 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 		activity.Status = "active"
 	}
 	return activity
+}
+
+func durableTransitionVisibleInV1Activity(event execution.ExecutionEvent) bool {
+	if event.EventType == execution.EventJobRetryQueuedTransition {
+		return true
+	}
+	if event.EventType != execution.EventJobFailed {
+		return false
+	}
+	reason := activityMetadataString(event.Payload, "reason_code")
+	return reason == "attempts_exhausted" || reason == "lease_attempts_exhausted"
 }
 
 func activityFromAgentInvocation(invocation memory.AgentInvocationActivity, activeWork bool) (agentActivityEvent, bool) {

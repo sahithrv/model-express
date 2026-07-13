@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 
@@ -10,9 +11,6 @@ import (
 )
 
 func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
-	if err := s.requireProject(projectID); err != nil {
-		return decisions.AgentDecision{}, err
-	}
 	if payload == nil {
 		payload = map[string]any{}
 	}
@@ -22,14 +20,24 @@ func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, dec
 		return decisions.AgentDecision{}, fmt.Errorf("marshal agent decision payload: %w", err)
 	}
 
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return decisions.AgentDecision{}, err
+	}
+	defer tx.Rollback()
+	if err := requireAgentProjectTx(ctx, tx, projectID); err != nil {
+		return decisions.AgentDecision{}, err
+	}
+
 	const query = `
 		INSERT INTO agent_decisions (project_id, plan_id, decision_type, rationale, payload)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, project_id, plan_id, decision_type, rationale, payload, created_at
 	`
 
-	return scanAgentDecision(s.db.QueryRowContext(
-		context.Background(),
+	decision, err := scanAgentDecision(tx.QueryRowContext(
+		ctx,
 		query,
 		projectID,
 		planID,
@@ -37,6 +45,20 @@ func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, dec
 		rationale,
 		payloadJSON,
 	))
+	if err != nil {
+		return decisions.AgentDecision{}, err
+	}
+	create, err := agentDecisionRecordedEvent(decision)
+	if err != nil {
+		return decisions.AgentDecision{}, invalidAgentTransitionError("create agent decision transition", err)
+	}
+	if _, _, err := appendExecutionTransitionTx(ctx, tx, create); err != nil {
+		return decisions.AgentDecision{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return decisions.AgentDecision{}, err
+	}
+	return decision, nil
 }
 
 func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {
@@ -110,9 +132,6 @@ func agentDecisionActivitySelectQuery() string {
 }
 
 func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error) {
-	if err := s.requireProject(invocation.ProjectID); err != nil {
-		return memory.AgentInvocation{}, err
-	}
 	if invocation.InputMessages == nil {
 		invocation.InputMessages = []map[string]string{}
 	}
@@ -149,6 +168,15 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 	if err != nil {
 		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation downstream outcome: %w", err)
 	}
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	defer tx.Rollback()
+	if err := requireAgentProjectTx(ctx, tx, invocation.ProjectID); err != nil {
+		return memory.AgentInvocation{}, err
+	}
 
 	const query = `
 		INSERT INTO agent_invocations (
@@ -174,8 +202,8 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
 	`
-	return scanAgentInvocation(s.db.QueryRowContext(
-		context.Background(),
+	stored, err := scanAgentInvocation(tx.QueryRowContext(
+		ctx,
 		query,
 		invocation.ProjectID,
 		invocation.DatasetID,
@@ -196,6 +224,22 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 		humanFeedbackJSON,
 		downstreamOutcomeJSON,
 	))
+	if err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	create, emit, err := agentInvocationValidationEvent(stored)
+	if err != nil {
+		return memory.AgentInvocation{}, invalidAgentTransitionError("create agent validation transition", err)
+	}
+	if emit {
+		if _, _, err := appendExecutionTransitionTx(ctx, tx, create); err != nil {
+			return memory.AgentInvocation{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	return stored, nil
 }
 
 func (s *PostgresStore) GetAgentInvocation(invocationID string) (memory.AgentInvocation, error) {
@@ -215,6 +259,12 @@ func (s *PostgresStore) UpdateAgentInvocationDownstreamOutcome(invocationID stri
 	if err != nil {
 		return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation downstream outcome: %w", err)
 	}
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	defer tx.Rollback()
 
 	const query = `
 		UPDATE agent_invocations
@@ -222,7 +272,36 @@ func (s *PostgresStore) UpdateAgentInvocationDownstreamOutcome(invocationID stri
 		WHERE id = $1
 		RETURNING id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version, provider, model, input_messages, input_context, raw_output, parsed_output, validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at
 	`
-	return scanAgentInvocation(s.db.QueryRowContext(context.Background(), query, invocationID, outcomeJSON))
+	updated, err := scanAgentInvocation(tx.QueryRowContext(ctx, query, invocationID, outcomeJSON))
+	if err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	create, emit, err := agentInvocationValidationRetryEvent(updated, outcome)
+	if err != nil {
+		return memory.AgentInvocation{}, invalidAgentTransitionError("create agent validation retry transition", err)
+	}
+	if emit {
+		if _, _, err := appendExecutionTransitionTx(ctx, tx, create); err != nil {
+			return memory.AgentInvocation{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return memory.AgentInvocation{}, err
+	}
+	return updated, nil
+}
+
+func requireAgentProjectTx(ctx context.Context, tx *sql.Tx, projectID string) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)
+	`, projectID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *PostgresStore) ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error) {

@@ -368,7 +368,7 @@ V2 uses the durable decimal event sequence as the SSE `id`. An initial connectio
 
 Catch-up reads are ascending and bounded per page, idle connections receive keepalive comments, and request cancellation stops further reads. Stream data is a bounded allowlist/redaction envelope: stored payload JSON is never serialized directly, and messages and metadata are sanitized at read time.
 
-This v2 endpoint is a raw stream of rows already present in `execution_events`. It is not yet authoritative for synthesized job or agent transitions. Mission Control must continue using the v1 fallback until Activity PR 4 adds durable producer coverage and its coverage test passes.
+This v2 endpoint is the authoritative transition stream for job lifecycle, agent-validation, and agent-decision changes produced after Activity PR 4. Those producers use typed allowlisted payloads and deterministic idempotency keys; job lifecycle rows are committed atomically with the job and current attempt snapshot. Historical pre-PR-4 rows can still lack producer coverage, and Mission Control retains the v1 compatibility fallback during the rollout window.
 
 ## Reliability State
 
@@ -377,6 +377,7 @@ Implemented current-scale hardening includes:
 - Postgres-backed job assignment with row locks.
 - Worker lease fields with owner, attempt, expiry, and heartbeat metadata.
 - Expired non-terminal job recovery paths.
+- Attempt-scoped `job_progress` snapshots whose active attempt is owned by queue/assignment/retry/recovery transitions; terminal snapshots cannot regress.
 - Idempotent epoch metrics by job and epoch.
 - Durable worker requirements for Mission Control-supervised worker startup.
 - Durable execution events and SSE refresh hints.

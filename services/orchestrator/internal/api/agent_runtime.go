@@ -550,16 +550,6 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		log.Printf("persist planner champion failed for project %s decision %s: %v", job.ProjectID, decision.ID, err)
 	}
 
-	if _, err := s.store.CreateExecutionEvent(job.ProjectID, input.SourcePlan.ID, execution.EventAgentRecommendationRecorded, fmt.Sprintf("Experiment Planner recorded a plan-level decision for plan %s.", input.SourcePlan.ID), map[string]any{
-		"invocation_id":    invocation.ID,
-		"memory_record_id": record.ID,
-		"decision_id":      decision.ID,
-		"decision_type":    decision.DecisionType,
-		"agent_name":       agents.ExperimentPlannerAgentName,
-	}); err != nil {
-		log.Printf("record experiment planner event failed: %v", err)
-	}
-
 	result := automaticExperimentReviewResult{Decision: &decision}
 	if decision.DecisionType != decisions.TypeAddExperiments ||
 		!s.shouldAutoScheduleFollowUps() ||

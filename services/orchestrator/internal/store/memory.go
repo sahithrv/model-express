@@ -40,6 +40,7 @@ type MemoryStore struct {
 	datasets                   map[string]datasets.Dataset
 	workers                    map[string]workers.Worker
 	jobs                       map[string]jobs.ExperimentJob
+	jobProgress                map[string]jobs.JobProgress
 	metrics                    map[string][]jobs.EpochMetric
 	remoteSessions             map[string]runs.RemoteTrainingSession
 	plans                      map[string]plans.ExperimentPlan
@@ -75,6 +76,7 @@ func NewMemoryStore() *MemoryStore {
 		datasets:                make(map[string]datasets.Dataset),
 		workers:                 make(map[string]workers.Worker),
 		jobs:                    make(map[string]jobs.ExperimentJob),
+		jobProgress:             make(map[string]jobs.JobProgress),
 		metrics:                 make(map[string][]jobs.EpochMetric),
 		remoteSessions:          make(map[string]runs.RemoteTrainingSession),
 		plans:                   make(map[string]plans.ExperimentPlan),
@@ -546,7 +548,9 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		return nil, ErrNotFound
 	}
 	now := time.Now().UTC()
-	s.recoverExpiredJobLeasesLocked(now)
+	if _, err := s.recoverExpiredJobLeasesLocked(now); err != nil {
+		return nil, err
+	}
 	worker = s.workers[workerID]
 
 	if worker.CurrentJobID != "" {
@@ -563,7 +567,7 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		return &job, nil
 	}
 
-	for id, job := range s.jobs {
+	for _, job := range s.jobs {
 		if job.Status != jobs.StatusQueued {
 			continue
 		}
@@ -587,11 +591,23 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		job.LeaseLastHeartbeatAt = &now
 		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
 		job.LeaseExpiresAt = &leaseExpiresAt
-		s.jobs[id] = job
 		if _, ok := s.jobExecutionSpecs[job.ID]; ok {
 			if _, err := s.createAttemptExecutionRecordLocked(job.ID, jobAttemptID(job.ID, job.Attempt), job.Attempt); err != nil {
 				return nil, err
 			}
+		}
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobAssigned,
+			job.Attempt,
+			jobs.ProgressStageWorkerStarting,
+			jobs.ProgressStatusRunning,
+			progressRevisionAssigned,
+			"worker_assigned",
+			"worker_assignment",
+		)
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return nil, err
 		}
 
 		worker.Status = workers.StatusRunning
@@ -629,9 +645,22 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 		CreatedAt:   time.Now().UTC(),
 	}
 	job.Config = jobConfigWithImmutableExecutionSpec(config, job.Config)
+	job.Config = jobConfigWithPendingAttempt(job.Config, job.ID, 1)
 	job = jobs.WithExecutionSpecStatus(job)
 
-	s.jobs[job.ID] = job
+	transition, progress := newJobLifecycleTransition(
+		job,
+		execution.TransitionJobQueued,
+		1,
+		jobs.ProgressStageQueued,
+		jobs.ProgressStatusQueued,
+		progressRevisionQueued,
+		"initial_queue",
+		"job_created",
+	)
+	if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, job.CreatedAt); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
 	if spec, ok := executionSpecFromConfig(job.ID, projectID, job.Config, job.CreatedAt); ok {
 		s.jobExecutionSpecs[job.ID] = spec
 	}
@@ -707,12 +736,12 @@ func (s *MemoryStore) RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJ
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.recoverExpiredJobLeasesLocked(now.UTC()), nil
+	return s.recoverExpiredJobLeasesLocked(now.UTC())
 }
 
-func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.ExperimentJob {
+func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) ([]jobs.ExperimentJob, error) {
 	recovered := []jobs.ExperimentJob{}
-	for id, job := range s.jobs {
+	for _, job := range s.jobs {
 		if job.LeaseExpiresAt == nil || job.LeaseExpiresAt.After(now) {
 			continue
 		}
@@ -741,11 +770,45 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 		job.LeaseOwnerWorkerID = ""
 		job.LeaseExpiresAt = nil
 		job.LeaseLastHeartbeatAt = nil
-		s.jobs[id] = job
+		if job.Status == jobs.StatusFailed {
+			transition, progress := newJobLifecycleTransition(
+				job,
+				execution.TransitionJobFailed,
+				activeJobProgressAttempt(job),
+				jobs.ProgressStageFailed,
+				jobs.ProgressStatusFailed,
+				progressRevisionTerminal,
+				"lease_attempts_exhausted",
+				"lease_attempts_exhausted",
+			)
+			if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+				return nil, err
+			}
+		} else {
+			// job.Config already points at the pending attempt, while job.Attempt
+			// still identifies the abandoned lease owner.
+			attempt := jobConfigPositiveInt(job.Config, "active_attempt_number")
+			if attempt < 1 {
+				attempt = pendingJobProgressAttempt(job)
+			}
+			transition, progress := newJobLifecycleTransition(
+				job,
+				execution.TransitionJobLeaseRecovered,
+				attempt,
+				jobs.ProgressStageQueued,
+				jobs.ProgressStatusQueued,
+				progressRevisionQueued,
+				"lease_recovered",
+				"lease_expired",
+			)
+			if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+				return nil, err
+			}
+		}
 		recovered = append(recovered, job)
 
 		for workerID, worker := range s.workers {
-			if worker.CurrentJobID != id {
+			if worker.CurrentJobID != job.ID {
 				continue
 			}
 			worker.CurrentJobID = ""
@@ -755,7 +818,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 			s.workers[workerID] = worker
 		}
 	}
-	return recovered
+	return recovered, nil
 }
 
 func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error) {
@@ -770,17 +833,55 @@ func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]fl
 		return jobs.EpochMetric{}, ErrNotFound
 	}
 
-	if job.Status == jobs.StatusAssigned {
+	becameRunning := job.Status == jobs.StatusAssigned
+	if becameRunning {
 		job.Status = jobs.StatusRunning
 	}
 	now := time.Now().UTC()
-	if job.WorkerID != "" {
+	if job.WorkerID != "" && (job.Status == jobs.StatusAssigned || job.Status == jobs.StatusRunning) {
 		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
 		job.LeaseOwnerWorkerID = job.WorkerID
 		job.LeaseLastHeartbeatAt = &now
 		job.LeaseExpiresAt = &leaseExpiresAt
 	}
-	s.jobs[jobID] = job
+	if becameRunning {
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobRunning,
+			activeJobProgressAttempt(job),
+			jobs.ProgressStageTraining,
+			jobs.ProgressStatusRunning,
+			progressRevisionForEpoch(epoch),
+			"first_metric",
+			"first_metric",
+		)
+		current := int64(epoch)
+		progress.Current = &current
+		progress.Unit = "epoch"
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return jobs.EpochMetric{}, err
+		}
+	} else {
+		s.jobs[jobID] = job
+		if job.Status == jobs.StatusRunning {
+			_, progress := newJobLifecycleTransition(
+				job,
+				execution.TransitionJobRunning,
+				activeJobProgressAttempt(job),
+				jobs.ProgressStageTraining,
+				jobs.ProgressStatusRunning,
+				progressRevisionForEpoch(epoch),
+				"metric_reported",
+				"metric_reported",
+			)
+			current := int64(epoch)
+			progress.Current = &current
+			progress.Unit = "epoch"
+			if _, err := s.upsertJobProgressLocked(job, progress, now); err != nil {
+				return jobs.EpochMetric{}, err
+			}
+		}
+	}
 
 	metric := jobs.EpochMetric{
 		JobID:     jobID,
@@ -1246,6 +1347,13 @@ func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decis
 		CreatedAt:    time.Now().UTC(),
 	}
 
+	create, err := agentDecisionRecordedEvent(decision)
+	if err != nil {
+		return decisions.AgentDecision{}, invalidAgentTransitionError("create agent decision transition", err)
+	}
+	if _, _, err := s.appendExecutionTransitionLocked(create, decision.CreatedAt); err != nil {
+		return decisions.AgentDecision{}, err
+	}
 	s.decisions[decision.ID] = decision
 	return decision, nil
 }
@@ -1469,6 +1577,31 @@ func (s *MemoryStore) ListProjectExecutionEvents(projectID string, limit int) ([
 	return out, nil
 }
 
+func (s *MemoryStore) ListProjectExecutionEventActivity(projectID string, limit int) ([]execution.ExecutionEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	out := []execution.ExecutionEvent{}
+	for _, event := range s.executionEvents {
+		if event.ProjectID == projectID && executionEventIncludedInV1Activity(event) {
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (s *MemoryStore) ListProjectExecutionEventsAfter(ctx context.Context, projectID string, cursor int64, limit int) ([]execution.ExecutionEvent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1663,6 +1796,15 @@ func (s *MemoryStore) CreateAgentInvocation(invocation memory.AgentInvocation) (
 	}
 	invocation.ID = s.newID("agent_invocation")
 	invocation.CreatedAt = time.Now().UTC()
+	create, emit, err := agentInvocationValidationEvent(invocation)
+	if err != nil {
+		return memory.AgentInvocation{}, invalidAgentTransitionError("create agent validation transition", err)
+	}
+	if emit {
+		if _, _, err := s.appendExecutionTransitionLocked(create, invocation.CreatedAt); err != nil {
+			return memory.AgentInvocation{}, err
+		}
+	}
 	s.agentInvocations[invocation.ID] = invocation
 	return invocation, nil
 }
@@ -1688,6 +1830,15 @@ func (s *MemoryStore) UpdateAgentInvocationDownstreamOutcome(invocationID string
 	}
 	if outcome == nil {
 		outcome = map[string]any{}
+	}
+	create, emit, err := agentInvocationValidationRetryEvent(invocation, outcome)
+	if err != nil {
+		return memory.AgentInvocation{}, invalidAgentTransitionError("create agent validation retry transition", err)
+	}
+	if emit {
+		if _, _, err := s.appendExecutionTransitionLocked(create, time.Now().UTC()); err != nil {
+			return memory.AgentInvocation{}, err
+		}
 	}
 	invocation.DownstreamOutcome = outcome
 	s.agentInvocations[invocationID] = invocation
@@ -2569,6 +2720,7 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 
 	now := time.Now().UTC()
 	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
+	terminalAttempt := activeJobProgressAttempt(job)
 	previousConfig := copyAnyMap(job.Config)
 	_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 	nextConfig := copyAnyMap(job.Config)
@@ -2588,7 +2740,7 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 		job.Status = jobs.StatusFailed
 		job.Error = message
 		job.CompletedAt = &now
-		job.Config = jobConfigWithTerminalAttempt(nextConfig, job.ID, job.Attempt)
+		job.Config = jobConfigWithTerminalAttempt(nextConfig, job.ID, terminalAttempt)
 	}
 	if requeued {
 		s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, runs.RemoteTrainingSessionStatusExpired, now)
@@ -2599,7 +2751,36 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 	job.LeaseExpiresAt = nil
 	job.LeaseLastHeartbeatAt = nil
 	job = jobs.WithExecutionSpecStatus(job)
-	s.jobs[jobID] = job
+	if requeued {
+		attempt := jobConfigPositiveInt(job.Config, "active_attempt_number")
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobRetryQueued,
+			attempt,
+			jobs.ProgressStageQueued,
+			jobs.ProgressStatusQueued,
+			progressRevisionQueued,
+			"retry_queued",
+			"retryable_failure",
+		)
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return jobs.ExperimentJob{}, false, err
+		}
+	} else {
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobFailed,
+			terminalAttempt,
+			jobs.ProgressStageFailed,
+			jobs.ProgressStatusFailed,
+			progressRevisionTerminal,
+			"attempts_exhausted",
+			"attempts_exhausted",
+		)
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return jobs.ExperimentJob{}, false, err
+		}
+	}
 
 	for workerID, worker := range s.workers {
 		if worker.CurrentJobID != jobID {
@@ -2620,7 +2801,19 @@ func (s *MemoryStore) FailJob(jobID string, message string) (jobs.ExperimentJob,
 	return s.finishJob(jobID, jobs.StatusFailed, "", message)
 }
 
+func (s *MemoryStore) CancelJob(jobID string, message string, configPatch map[string]any) (jobs.ExperimentJob, error) {
+	return s.finishJobWithTransition(jobID, jobs.StatusFailed, "", message, execution.TransitionJobCancelled, configPatch)
+}
+
 func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string, message string) (jobs.ExperimentJob, error) {
+	transition := execution.TransitionJobFailed
+	if status == jobs.StatusSucceeded {
+		transition = execution.TransitionJobCompleted
+	}
+	return s.finishJobWithTransition(jobID, status, mlflowRunID, message, transition, nil)
+}
+
+func (s *MemoryStore) finishJobWithTransition(jobID string, status string, mlflowRunID string, message string, transition execution.ExecutionTransition, configPatch map[string]any) (jobs.ExperimentJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2634,19 +2827,54 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	}
 
 	now := time.Now().UTC()
+	terminalAttempt := activeJobProgressAttempt(job)
 	previousConfig := copyAnyMap(job.Config)
 	_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 	job.Status = status
 	job.MLflowRunID = mlflowRunID
 	job.Error = message
 	job.CompletedAt = &now
-	job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
+	if len(configPatch) > 0 {
+		nextConfig := copyAnyMap(job.Config)
+		for key, value := range configPatch {
+			nextConfig[key] = value
+		}
+		job.Config = nextConfig
+	}
+	job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, terminalAttempt)
 	job = jobs.WithExecutionSpecStatus(job)
 	s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, status, now)
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
 	job.LeaseLastHeartbeatAt = nil
-	s.jobs[jobID] = job
+	stage := jobs.ProgressStageFailed
+	progressStatus := jobs.ProgressStatusFailed
+	detailCode := "backend_failure"
+	reasonCode := "backend_failure"
+	if transition == execution.TransitionJobCompleted {
+		stage = jobs.ProgressStageCompleted
+		progressStatus = jobs.ProgressStatusCompleted
+		detailCode = "backend_completion"
+		reasonCode = "backend_completion"
+	} else if transition == execution.TransitionJobCancelled {
+		stage = jobs.ProgressStageCancelled
+		progressStatus = jobs.ProgressStatusCancelled
+		detailCode = "user_cancelled"
+		reasonCode = "user_cancelled"
+	}
+	transitionInput, progress := newJobLifecycleTransition(
+		job,
+		transition,
+		terminalAttempt,
+		stage,
+		progressStatus,
+		progressRevisionTerminal,
+		detailCode,
+		reasonCode,
+	)
+	if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transitionInput, now); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
 
 	if job.WorkerID != "" {
 		if worker, ok := s.workers[job.WorkerID]; ok {

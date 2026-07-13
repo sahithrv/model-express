@@ -219,6 +219,52 @@ func (s *PostgresStore) ListProjectExecutionEvents(projectID string, limit int) 
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) ListProjectExecutionEventActivity(projectID string, limit int) ([]execution.ExecutionEvent, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(context.Background(), executionEventActivitySelectQuery(), projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []execution.ExecutionEvent{}
+	for rows.Next() {
+		event, err := scanExecutionEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
+func executionEventActivitySelectQuery() string {
+	eventTypes := execution.DurableTransitionEventTypes()
+	quoted := make([]string, 0, len(eventTypes))
+	for _, eventType := range eventTypes {
+		quoted = append(quoted, "'"+strings.ReplaceAll(eventType, "'", "''")+"'")
+	}
+	return `
+		SELECT ` + executionEventSelectColumns() + `
+		FROM execution_events
+		WHERE project_id = $1
+			AND (
+				event_type NOT IN (` + strings.Join(quoted, ", ") + `)
+				OR event_type = 'JOB_RETRY_QUEUED_TRANSITION'
+				OR (
+					event_type = 'JOB_FAILED'
+					AND payload->>'reason_code' IN ('attempts_exhausted', 'lease_attempts_exhausted')
+				)
+			)
+		ORDER BY created_at DESC
+		LIMIT $2
+	`
+}
+
 func (s *PostgresStore) ListProjectExecutionEventsAfter(ctx context.Context, projectID string, cursor int64, limit int) ([]execution.ExecutionEvent, error) {
 	if err := s.requireProjectContext(ctx, projectID); err != nil {
 		return nil, err

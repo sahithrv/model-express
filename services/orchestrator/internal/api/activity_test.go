@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
+	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/store"
@@ -99,6 +102,158 @@ func TestActivityUsesOnlyBoundedProjectionReads(t *testing.T) {
 	}
 	if !foundRetry {
 		t.Fatalf("bounded projection lost retry activity: %#v", events)
+	}
+}
+
+func TestV1ActivityIgnoresDualWrittenDurableTransitions(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("dual write compatibility", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := memoryStore.CreateExecutionTransition(execution.ExecutionTransitionEventInput{
+		Transition: execution.TransitionJobAssigned,
+		ProjectID:  project.ID,
+		JobID:      "job_1",
+		AttemptID:  "job_1:attempt-1",
+		Attempt:    1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memoryStore.CreateExecutionEvent(project.ID, "", execution.EventWorkersActive, "Workers active.", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := newServer(memoryStore).listProjectActivityEvents(project.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundLegacy := false
+	for _, event := range events {
+		if event.Type == "system.event" && event.Message == "Job assigned to a worker." {
+			t.Fatalf("durable transition leaked into v1 as a duplicate: %#v", events)
+		}
+		if event.Type == "workers.active" {
+			foundLegacy = true
+		}
+	}
+	if !foundLegacy {
+		t.Fatalf("legacy execution events were filtered with durable transitions: %#v", events)
+	}
+}
+
+func TestV1ActivityPreservesRetryAndLegacyEventsAcrossDurableBursts(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, _ := memoryStore.CreateProject("v1 retry compatibility", "")
+	dataset, _ := memoryStore.CreateDataset(project.ID, "dataset", "memory://dataset", "checksum", 1)
+	worker, _ := memoryStore.RegisterWorker(project.ID, "worker", "gpu")
+	job, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memoryStore.PollJob(worker.ID, store.JobPollFilter{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, requeued, err := memoryStore.RetryJob(job.ID, "retry", store.RetryJobOptions{}); err != nil || !requeued {
+		t.Fatalf("retry requeued=%t err=%v", requeued, err)
+	}
+	if _, requeued, err := memoryStore.RetryJob(job.ID, "attempts exhausted", store.RetryJobOptions{ForceFail: true}); err != nil || requeued {
+		t.Fatalf("retry exhaustion requeued=%t err=%v", requeued, err)
+	}
+	if _, err := memoryStore.CreateExecutionEvent(project.ID, "", execution.EventWorkersActive, "Workers active.", nil); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 80; index++ {
+		if _, _, err := memoryStore.CreateExecutionTransition(execution.ExecutionTransitionEventInput{
+			Transition: execution.TransitionJobAssigned,
+			ProjectID:  project.ID,
+			JobID:      "burst_job_" + strconv.Itoa(index),
+			Attempt:    1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, err := newServer(memoryStore).listProjectActivityEvents(project.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundRetry := false
+	foundLegacy := false
+	foundFailure := false
+	for _, event := range events {
+		foundRetry = foundRetry || event.Type == "job.retrying"
+		foundLegacy = foundLegacy || event.Type == "workers.active"
+		foundFailure = foundFailure || event.Type == "system.failed"
+	}
+	if !foundRetry || !foundLegacy || !foundFailure {
+		t.Fatalf("v1 activity lost retry/legacy events across durable burst: %#v", events)
+	}
+}
+
+func TestV1ActivityProducerCoverage(t *testing.T) {
+	// Execution-event projections already originate in the durable log. Job,
+	// invocation-validation, and decision projections are covered by the typed
+	// PR4 producers. Only the rolling count summary is intentionally derived
+	// current state rather than a transition.
+	coverage := map[string]string{
+		"system.event":                     "existing durable execution-event row",
+		"planner.started":                  "existing durable execution-event row",
+		"planner.decision_recorded":        "typed agent-decision transition",
+		"champion.decision_recorded":       "typed agent-decision transition",
+		"planner.stopped":                  "typed agent-decision transition",
+		"planner.waiting":                  "typed agent-decision transition",
+		"agent.outcome_recorded":           "existing durable execution-event row",
+		"planner.blocked":                  "existing durable execution-event row",
+		"planner.validation_failed":        "typed agent-validation transition",
+		"planner.validation_rejected":      "typed agent-validation transition",
+		"agent.validation_rejected":        "typed agent-validation transition",
+		"agent.failed":                     "existing durable execution-event row",
+		"plan.queued":                      "existing durable execution-event row",
+		"workers.required":                 "existing durable execution-event row",
+		"workers.starting":                 "existing durable execution-event row",
+		"workers.active":                   "existing durable execution-event row",
+		"dispatcher.status":                "existing durable execution-event row",
+		"dispatcher.idle_exit":             "existing durable execution-event row",
+		"job.retrying":                     "typed job retry transition",
+		"job.queued":                       "typed job queue transition",
+		"job.running":                      "typed job assignment/running transition",
+		"job.completed":                    "typed job completion transition",
+		"job.failed":                       "typed job failure transition",
+		"system.failed":                    "existing durable execution-event row",
+		"memory.retrieval_logged":          "existing durable execution-event row",
+		"champion.selected":                "existing durable execution-event row",
+		"champion.feedback_recorded":       "existing durable execution-event row",
+		"dataset.visual_analysis_queued":   "existing durable execution-event row",
+		"dataset.visual_analysis_recorded": "existing durable execution-event row",
+		"project.reopened":                 "typed decision or existing durable execution-event row",
+		"jobs.status_counts":               "documented derived aggregate; not a transition",
+	}
+
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve activity test source path")
+	}
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "activity.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pattern := regexp.MustCompile(`(?:activity\.Type|eventType)\s*(?::=|=)\s*"([^"]+)"|Type:\s*"([^"]+)"`)
+	discovered := map[string]bool{}
+	for _, match := range pattern.FindAllStringSubmatch(string(source), -1) {
+		activityType := match[1]
+		if activityType == "" {
+			activityType = match[2]
+		}
+		discovered[activityType] = true
+	}
+	for activityType := range discovered {
+		if strings.TrimSpace(coverage[activityType]) == "" {
+			t.Errorf("v1 activity type %q has no durable producer or documented exclusion", activityType)
+		}
+	}
+	if coverage["jobs.status_counts"] == "" || !strings.Contains(coverage["jobs.status_counts"], "not a transition") {
+		t.Fatal("derived jobs.status_counts exclusion must remain explicit")
 	}
 }
 
