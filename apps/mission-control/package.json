@@ -7,6 +7,7 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "tsc --noEmit && vite build",
     "baseline:activity": "node electron/request-diagnostics.cjs",
+    "rollout:activity": "node electron/request-diagnostics.cjs --rollout",
     "test": "node --test electron/*.test.cjs tests/*.test.mjs",
     "preview": "vite preview --host 127.0.0.1"
   },

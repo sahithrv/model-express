@@ -58,76 +58,6 @@ func (s *Server) listProjectExecutionEvents(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"events": events})
 }
 
-func (s *Server) streamProjectExecutionEvents(c *gin.Context) {
-	projectID := c.Param("id")
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	if limit < 1 || limit > 200 {
-		limit = 50
-	}
-	interval, _ := strconv.Atoi(c.DefaultQuery("interval_ms", "2000"))
-	if interval < 500 {
-		interval = 500
-	}
-	if interval > 10000 {
-		interval = 10000
-	}
-
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
-	lastID := c.GetHeader("Last-Event-ID")
-	delivered := map[string]bool{}
-	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
-	defer ticker.Stop()
-
-	send := func() bool {
-		events, err := s.store.ListProjectExecutionEvents(projectID, limit)
-		if err != nil {
-			c.SSEvent("error", gin.H{"error": err.Error()})
-			c.Writer.Flush()
-			return false
-		}
-		sort.Slice(events, func(i, j int) bool {
-			return events[i].CreatedAt.Before(events[j].CreatedAt)
-		})
-		seenLastID := lastID == ""
-		for _, event := range events {
-			if delivered[event.ID] {
-				continue
-			}
-			if !seenLastID {
-				if event.ID == lastID {
-					seenLastID = true
-				}
-				continue
-			}
-			c.Writer.WriteString("id: " + event.ID + "\n")
-			c.SSEvent("execution_event", event)
-			delivered[event.ID] = true
-			lastID = event.ID
-		}
-		if !seenLastID {
-			lastID = ""
-		}
-		c.Writer.Flush()
-		return true
-	}
-
-	send()
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			return
-		case <-ticker.C:
-			if !send() {
-				return
-			}
-		}
-	}
-}
-
 type executionEventV2Envelope struct {
 	SchemaVersion  string         `json:"schema_version"`
 	Sequence       int64          `json:"sequence"`
@@ -142,7 +72,7 @@ type executionEventV2Envelope struct {
 }
 
 func activityStreamV2Enabled() bool {
-	return envFlag("MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED", false)
+	return envFlag("MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED", true)
 }
 
 func (s *Server) streamProjectExecutionEventsV2(c *gin.Context) {
@@ -159,20 +89,35 @@ func (s *Server) streamProjectExecutionEventsV2(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Writer.WriteString("retry: 2000\n\n")
 	c.Writer.Flush()
+	connectionReason := executionEventV2ConnectionReason(c)
+	diagnostics.Event("info", "execution_event_stream_v2_connection", map[string]any{
+		"reconnect_count":  map[bool]int{true: 1, false: 0}[connectionReason == "reconnect"],
+		"store_call_count": 2,
+		"query_count":      2,
+		"reason_code":      connectionReason,
+	})
 
 	pollTicker := time.NewTicker(time.Duration(intervalMS) * time.Millisecond)
 	keepaliveTicker := time.NewTicker(executionEventV2Keepalive)
 	defer pollTicker.Stop()
 	defer keepaliveTicker.Stop()
 
-	catchUp := make(chan struct{}, 1)
-	catchUp <- struct{}{}
+	catchUp := make(chan string, 1)
+	catchUp <- "initial"
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			return
-		case <-catchUp:
-			nextCursor, hasMore, err := s.writeProjectExecutionEventV2Pages(c, projectID, cursor, pageLimit, executionEventV2MaxPages)
+		case reasonCode := <-catchUp:
+			startedAt := time.Now()
+			bytesBefore := c.Writer.Size()
+			nextCursor, hasMore, stats, err := s.writeProjectExecutionEventV2PagesWithStats(
+				c,
+				projectID,
+				cursor,
+				pageLimit,
+				executionEventV2MaxPages,
+			)
 			cursor = nextCursor
 			if err != nil {
 				if c.Request.Context().Err() != nil {
@@ -180,23 +125,45 @@ func (s *Server) streamProjectExecutionEventsV2(c *gin.Context) {
 				}
 				c.SSEvent("stream_error", gin.H{"reason_code": "execution_events_read_failed"})
 				c.Writer.Flush()
+				diagnostics.Event("warn", "execution_event_stream_v2_batch", executionEventV2BatchDiagnostic(
+					stats,
+					time.Since(startedAt),
+					activityResponseByteDelta(bytesBefore, c.Writer.Size()),
+					reasonCode,
+					1,
+				))
 				return
 			}
+			diagnostics.Event("info", "execution_event_stream_v2_batch", executionEventV2BatchDiagnostic(
+				stats,
+				time.Since(startedAt),
+				activityResponseByteDelta(bytesBefore, c.Writer.Size()),
+				reasonCode,
+				0,
+			))
 			if hasMore {
 				select {
-				case catchUp <- struct{}{}:
+				case catchUp <- "catch_up":
 				default:
 				}
 			}
 		case <-pollTicker.C:
 			select {
-			case catchUp <- struct{}{}:
+			case catchUp <- "poll":
 			default:
 			}
 		case <-keepaliveTicker.C:
 			writeExecutionEventV2Keepalive(c)
 		}
 	}
+}
+
+func executionEventV2ConnectionReason(c *gin.Context) string {
+	value := strings.ToLower(strings.TrimSpace(c.Query("reason")))
+	if value == "stream_reconnect" || strings.TrimSpace(c.GetHeader("Last-Event-ID")) != "" {
+		return "reconnect"
+	}
+	return "initial"
 }
 
 func (s *Server) probeProjectExecutionEventsV2(c *gin.Context) {
@@ -282,20 +249,51 @@ func (s *Server) writeProjectExecutionEventV2Pages(
 	pageLimit int,
 	maxPages int,
 ) (int64, bool, error) {
+	nextCursor, hasMore, _, err := s.writeProjectExecutionEventV2PagesWithStats(
+		c,
+		projectID,
+		cursor,
+		pageLimit,
+		maxPages,
+	)
+	return nextCursor, hasMore, err
+}
+
+type executionEventV2BatchStats struct {
+	StoreCallCount     int
+	PageCount          int
+	EventsReturned     int
+	EventsDelivered    int
+	LatencySampleCount int
+	LatencyTotalMS     int64
+	LatencyMaxMS       int64
+}
+
+func (s *Server) writeProjectExecutionEventV2PagesWithStats(
+	c *gin.Context,
+	projectID string,
+	cursor int64,
+	pageLimit int,
+	maxPages int,
+) (int64, bool, executionEventV2BatchStats, error) {
+	stats := executionEventV2BatchStats{}
 	if maxPages < 1 {
 		maxPages = 1
 	}
 	for page := 0; page < maxPages; page++ {
 		if err := c.Request.Context().Err(); err != nil {
-			return cursor, false, err
+			return cursor, false, stats, err
 		}
+		stats.StoreCallCount++
 		events, err := s.store.ListProjectExecutionEventsAfter(c.Request.Context(), projectID, cursor, pageLimit)
 		if err != nil {
-			return cursor, false, err
+			return cursor, false, stats, err
 		}
+		stats.PageCount++
+		stats.EventsReturned += len(events)
 		for _, event := range events {
 			if err := c.Request.Context().Err(); err != nil {
-				return cursor, false, err
+				return cursor, false, stats, err
 			}
 			if event.Sequence <= cursor {
 				continue
@@ -303,13 +301,52 @@ func (s *Server) writeProjectExecutionEventV2Pages(
 			c.Writer.WriteString("id: " + strconv.FormatInt(event.Sequence, 10) + "\n")
 			c.SSEvent("execution_event_v2", executionEventV2Projection(event))
 			cursor = event.Sequence
+			stats.EventsDelivered++
+			latencyMS := time.Since(event.CreatedAt).Milliseconds()
+			if latencyMS < 0 {
+				latencyMS = 0
+			}
+			stats.LatencySampleCount++
+			stats.LatencyTotalMS += latencyMS
+			if latencyMS > stats.LatencyMaxMS {
+				stats.LatencyMaxMS = latencyMS
+			}
 		}
 		c.Writer.Flush()
 		if len(events) < pageLimit {
-			return cursor, false, nil
+			return cursor, false, stats, nil
 		}
 	}
-	return cursor, true, nil
+	return cursor, true, stats, nil
+}
+
+func executionEventV2BatchDiagnostic(
+	stats executionEventV2BatchStats,
+	duration time.Duration,
+	responseBytes int,
+	reasonCode string,
+	errorCount int,
+) map[string]any {
+	latencyAverageMS := int64(0)
+	if stats.LatencySampleCount > 0 {
+		latencyAverageMS = stats.LatencyTotalMS / int64(stats.LatencySampleCount)
+	}
+	return map[string]any{
+		"duration_ms":              duration.Milliseconds(),
+		"events_returned":          stats.EventsReturned,
+		"events_delivered":         stats.EventsDelivered,
+		"response_bytes":           responseBytes,
+		"store_call_count":         stats.StoreCallCount,
+		"query_count":              stats.StoreCallCount,
+		"page_count":               stats.PageCount,
+		"event_latency_samples":    stats.LatencySampleCount,
+		"event_latency_total_ms":   stats.LatencyTotalMS,
+		"event_latency_max_ms":     stats.LatencyMaxMS,
+		"event_latency_average_ms": latencyAverageMS,
+		"cursor_advance_count":     stats.EventsDelivered,
+		"error_count":              errorCount,
+		"reason_code":              reasonCode,
+	}
 }
 
 func executionEventV2Projection(event execution.ExecutionEvent) executionEventV2Envelope {
@@ -348,6 +385,8 @@ var (
 )
 
 func (s *Server) streamProjectActivityEvents(c *gin.Context) {
+	c.Header("Deprecation", "true")
+	c.Header("Warning", `299 model-express "Deprecated activity stream; migrate to live-state plus events/stream/v2"`)
 	projectID := c.Param("id")
 	limit := activityLimitFromQuery(c.DefaultQuery("limit", strconv.Itoa(activityDefaultLimit)))
 	interval, _ := strconv.Atoi(c.DefaultQuery("interval_ms", strconv.Itoa(activityDefaultIntervalMS)))

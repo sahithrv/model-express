@@ -37,11 +37,6 @@ interface Window {
     recordActivityVisibility(summary: import("./api/activityDiagnostics").ActivityVisibilitySummary): Promise<{
       recorded: boolean;
     }>;
-    recordActivityStreamAttempt(summary: {
-      reason_code: "stream_initial" | "stream_reconnect";
-      outcome_code: "connected" | "failed";
-      duration_ms: number;
-    }): Promise<{ recorded: boolean }>;
     recordIncrementalLiveDiagnostic(summary: {
       reason_code:
         | "cursor_recovery"

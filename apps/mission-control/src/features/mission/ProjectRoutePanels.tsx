@@ -46,7 +46,7 @@ import { championLocalInferenceSafety, readyONNXExport, type ChampionLocalRuntim
 import { activityFilters } from "../activity/activityFilters";
 import { exportWaitingSteps } from "../exportDemo/exportWaitingSteps";
 import { resultsEmptySteps } from "../results/resultsEmptySteps";
-import type { ActivityStreamState } from "../../hooks/useActivityStream";
+import type { ActivityStreamState } from "../activity/activityStreamState";
 import type { DatasetMetadataDetail, ProjectDetail, ProjectDetailLoadStatus, VisualAnalysisDetail } from "../../hooks/useProjectDetail";
 import {
   formatBytes,
@@ -240,7 +240,6 @@ import {
   missionStateLabel,
   missionHealthLabel,
   missionToneRank,
-  activityEventFromMessage,
   mergeActivityEvents,
   buildFallbackActivityEvents,
   fallbackActivityFromExecutionEvent,

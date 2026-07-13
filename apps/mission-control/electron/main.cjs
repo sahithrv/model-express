@@ -60,8 +60,6 @@ const ACTIVITY_VISIBILITY_REASON_CODES = new Set([
   "live",
   "reconnect_catch_up",
 ]);
-const ACTIVITY_STREAM_REASON_CODES = new Set(["stream_initial", "stream_reconnect"]);
-const ACTIVITY_STREAM_OUTCOME_CODES = new Set(["connected", "failed"]);
 const INCREMENTAL_LIVE_REASON_CODES = new Set([
   "cursor_recovery",
   "fallback",
@@ -174,6 +172,10 @@ function validateOrchestratorEventStreamOptions(options = {}, env = process.env)
   const cursor = parsed.searchParams.get("cursor") ?? "";
   if (!/^\d+$/.test(cursor) || cursor.length > 19) {
     throw new Error("Execution-event stream cursor must be a bounded nonnegative integer.");
+  }
+  const reason = parsed.searchParams.get("reason") ?? "";
+  if (!["stream_initial", "stream_reconnect"].includes(reason)) {
+    throw new Error("Execution-event stream reason must be initial or reconnect.");
   }
   return { ...request, streamId };
 }
@@ -1502,22 +1504,6 @@ if (electronRuntimeAvailable) {
     const fields = validateActivityVisibilitySummary(summary);
     const env = missionControlEnv();
     setImmediate(() => appendDiagnosticLog(resolveLogDir(repoRoot(env), env), "info", "activity_visibility_latency", fields));
-    return { recorded: true };
-  });
-
-  ipcMain.handle("diagnostics:activityStreamAttempt", async (_event, summary) => {
-    const fields = validateActivityStreamAttempt(summary);
-    const env = missionControlEnv();
-    recordMissionControlRequestMetrics({
-      env,
-      method: "GET",
-      path: "/projects/resource/activity-stream",
-      reasonCode: fields.reason_code,
-      statusCode: fields.outcome_code === "connected" ? 200 : 0,
-      durationMs: fields.duration_ms,
-      responseBytes: 0,
-      failed: fields.outcome_code === "failed",
-    });
     return { recorded: true };
   });
 
@@ -2985,22 +2971,6 @@ function flushMissionControlRequestMetrics() {
   );
 }
 
-function validateActivityStreamAttempt(summary = {}) {
-  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
-    throw new Error("Activity stream diagnostics must be an object.");
-  }
-  const reasonCode = String(summary.reason_code ?? "").trim().toLowerCase();
-  const outcomeCode = String(summary.outcome_code ?? "").trim().toLowerCase();
-  if (!ACTIVITY_STREAM_REASON_CODES.has(reasonCode) || !ACTIVITY_STREAM_OUTCOME_CODES.has(outcomeCode)) {
-    throw new Error("Activity stream diagnostics require supported reason and outcome codes.");
-  }
-  return {
-    reason_code: reasonCode,
-    outcome_code: outcomeCode,
-    duration_ms: boundedDiagnosticInteger(summary.duration_ms, 0, 24 * 60 * 60 * 1000),
-  };
-}
-
 function validateIncrementalLiveDiagnostic(summary = {}) {
   if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
     throw new Error("Incremental live diagnostics must be an object.");
@@ -3026,6 +2996,9 @@ function validateActivityVisibilitySummary(summary = {}) {
   if (!ACTIVITY_VISIBILITY_REASON_CODES.has(reasonCode)) {
     throw new Error("Activity visibility diagnostics require a supported reason code.");
   }
+  if (summary.source_code !== "execution_event_v2") {
+    throw new Error("Activity visibility diagnostics require the v2 source code.");
+  }
   const sampleCount = boundedDiagnosticInteger(summary.sample_count, 0, 32);
   const latencySampleCount = boundedDiagnosticInteger(summary.latency_sample_count, 0, sampleCount);
   const invalidSampleCount = boundedDiagnosticInteger(summary.invalid_sample_count, 0, sampleCount);
@@ -3033,6 +3006,7 @@ function validateActivityVisibilitySummary(summary = {}) {
     throw new Error("Activity visibility diagnostic counts are invalid.");
   }
   return {
+    source_code: "execution_event_v2",
     reason_code: reasonCode,
     sample_count: sampleCount,
     latency_sample_count: latencySampleCount,
@@ -4059,7 +4033,6 @@ module.exports = {
     validateOrchestratorRequestId,
     validateOrchestratorEventStreamOptions,
     validateActivityVisibilitySummary,
-    validateActivityStreamAttempt,
     validateIncrementalLiveDiagnostic,
     validateRemoteModalUrl,
     validateS3ExportArtifactUri,

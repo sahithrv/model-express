@@ -12,7 +12,6 @@ contextBridge.exposeInMainWorld("missionControl", {
     return () => ipcRenderer.removeListener("orchestrator:eventStream", listener);
   },
   recordActivityVisibility: (summary) => ipcRenderer.invoke("diagnostics:activityVisibility", summary),
-  recordActivityStreamAttempt: (summary) => ipcRenderer.invoke("diagnostics:activityStreamAttempt", summary),
   recordIncrementalLiveDiagnostic: (summary) => ipcRenderer.invoke("diagnostics:incrementalLive", summary),
   selectAndUploadDataset: (options) => ipcRenderer.invoke("dataset:selectAndUpload", options),
   selectDatasetFolder: () => ipcRenderer.invoke("dataset:selectFolder"),

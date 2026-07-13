@@ -846,40 +846,14 @@ class ModalTrainingHelperTests(unittest.TestCase):
             self.assertIsNone(self.modal_app._modal_training_min_containers())
             self.assertIsNone(self.modal_app._modal_training_buffer_containers())
 
-    def test_modal_stage_telemetry_payload_summarizes_phases(self) -> None:
-        import time
-
-        started_at = time.time() - 10
-        stage_events = []
-        token = self.modal_app._MODAL_STAGE_EVENTS.set(stage_events)
-        try:
-            with patch.dict("os.environ", {"MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY": "1"}, clear=True):
-                self.modal_app._modal_training_phase("job_1", "dataset_local_materialization_start", started_at)
-                self.modal_app._modal_training_phase("job_1", "dataset_local_materialization_done", started_at)
-                self.modal_app._modal_training_phase("job_1", "epoch_train_start", started_at, epoch=1)
-                self.modal_app._modal_training_phase("job_1", "epoch_train_done", started_at, epoch=1)
-                payload = self.modal_app._modal_stage_telemetry_payload(
-                    {"id": "job_1", "created_at": "2026-06-09T00:00:00Z"},
-                    12.0,
-                    stage_events,
-                    {
-                        "dataset_materialization_extract_seconds": 1.2,
-                        "dataset_materialization_wait_seconds": 0.3,
-                        "dataset_materialization_download_seconds": 2.4,
-                    },
-                    "T4",
-                )
-        finally:
-            self.modal_app._MODAL_STAGE_EVENTS.reset(token)
-
+    def test_modal_stage_telemetry_keeps_resource_summary_without_legacy_phase_dual_write(self) -> None:
+        with patch.dict("os.environ", {"MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY": "1"}, clear=True):
+            payload = self.modal_app._modal_stage_telemetry_payload("T4")
         self.assertEqual(payload["schema_version"], "remote_gpu_stage_telemetry_v1")
-        self.assertEqual(payload["current_stage"], "epoch_train_done")
-        self.assertGreaterEqual(payload["dataset_materialization_seconds"], 0)
-        self.assertGreaterEqual(payload["active_training_seconds"], 0)
-        self.assertEqual(payload["dataset_download_seconds"], 2.4)
-        self.assertEqual(payload["dataset_extract_seconds"], 1.2)
         self.assertEqual(payload["warm_container_policy"]["scaledown_window_seconds"], 600)
-        self.assertGreaterEqual(len(payload["events"]), 4)
+        self.assertNotIn("current_stage", payload)
+        self.assertNotIn("events", payload)
+        self.assertNotIn("active_training_seconds", payload)
 
     def test_modal_storage_env_sets_torch_home_default(self) -> None:
         payload = {

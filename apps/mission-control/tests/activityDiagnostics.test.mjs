@@ -46,6 +46,7 @@ test("activity visibility is summarized after a deterministic visible timestamp"
 
   assert.deepEqual(summaries, [
     {
+      source_code: "execution_event_v2",
       reason_code: "live",
       sample_count: 1,
       latency_sample_count: 1,
@@ -59,6 +60,7 @@ test("activity visibility is summarized after a deterministic visible timestamp"
       commit_delay_average_ms: 100,
     },
     {
+      source_code: "execution_event_v2",
       reason_code: "initial_catch_up",
       sample_count: 1,
       latency_sample_count: 1,

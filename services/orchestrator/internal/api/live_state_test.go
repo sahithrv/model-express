@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -72,6 +74,8 @@ func TestProjectLiveStateOperationalStates(t *testing.T) {
 }
 
 func TestProjectLiveStateEndpointIsBoundedRedactedAndCacheable(t *testing.T) {
+	logDir := t.TempDir()
+	t.Setenv("MODEL_EXPRESS_LOG_DIR", logDir)
 	memoryStore := store.NewMemoryStore()
 	project, err := memoryStore.CreateProject("live", "")
 	if err != nil {
@@ -178,6 +182,24 @@ func TestProjectLiveStateEndpointIsBoundedRedactedAndCacheable(t *testing.T) {
 		if active.ElapsedStartedAt.IsZero() {
 			t.Fatalf("active progress omitted elapsed start: %#v", active)
 		}
+	}
+
+	diagnosticBytes, err := os.ReadFile(filepath.Join(logDir, "orchestrator.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(diagnosticBytes)), "\n") {
+		var record map[string]any
+		if json.Unmarshal([]byte(line), &record) == nil && record["event"] == "project_live_state_read" {
+			diagnostic = record
+		}
+	}
+	if diagnostic == nil || diagnostic["store_call_count"] != float64(1) || diagnostic["query_count"] != float64(projectLiveStateQueryBudget) {
+		t.Fatalf("live-state diagnostic = %#v", diagnostic)
+	}
+	if strings.Contains(string(diagnosticBytes), project.ID) || strings.Contains(string(diagnosticBytes), "secret-bucket") {
+		t.Fatalf("live-state diagnostic retained identity or payload: %s", diagnosticBytes)
 	}
 }
 

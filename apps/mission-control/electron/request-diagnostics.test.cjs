@@ -4,6 +4,7 @@ const test = require("node:test");
 const {
   classifyEndpointCategory,
   createRollingRequestDiagnostics,
+  runActivityRolloutReport,
   runBaselineRequestScenario,
 } = require("./request-diagnostics.cjs");
 
@@ -101,7 +102,7 @@ test("deterministic active and idle baselines report broad GETs per minute", () 
   assert.deepEqual(idle.reason_code_counts, { idle_poll: 22 });
 });
 
-test("activity stream attempts are counted without being classified as broad refreshes", () => {
+test("deprecated activity stream requests remain measurable without counting as broad refreshes", () => {
   let nowMs = 1_000;
   const diagnostics = createRollingRequestDiagnostics({ now: () => nowMs });
   const initial = diagnostics.record({
@@ -123,4 +124,21 @@ test("activity stream attempts are counted without being classified as broad ref
   assert.equal(reconnect.rolling_broad_get_count, 0);
   assert.equal(reconnect.rolling_error_count, 1);
   assert.deepEqual(reconnect.reason_code_counts, { stream_initial: 1, stream_reconnect: 1 });
+});
+
+test("rollout gate proves the active v2 request target and zero broad polling", () => {
+  const report = runActivityRolloutReport();
+  assert.equal(report.schema_version, "activity_rollout_report.v1");
+  assert.equal(report.active.baseline_request_count, 63);
+  assert.equal(report.active.rolling_request_count, 11);
+  assert.equal(report.active.rolling_broad_get_count, 0);
+  assert.ok(report.active.request_reduction_percent >= 80);
+  assert.deepEqual(report.active.endpoint_category_counts, {
+    execution_event_stream_v2: 2,
+    job_metrics: 6,
+    project_live_state: 3,
+  });
+  assert.equal(report.idle.rolling_request_count, 3);
+  assert.equal(report.idle.rolling_broad_get_count, 0);
+  assert.equal(report.go_no_go, true);
 });

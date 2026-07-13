@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -494,6 +495,9 @@ func TestActivityTickDiagnosticsContainOnlyBoundedMetrics(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/activity-stream?limit=10", nil).WithContext(ctx)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, req)
+	if response.Header().Get("Deprecation") != "true" || !strings.Contains(response.Header().Get("Warning"), "events/stream/v2") {
+		t.Fatalf("legacy activity deprecation headers = %#v", response.Header())
+	}
 
 	body, err := os.ReadFile(filepath.Join(logDir, "orchestrator.jsonl"))
 	if err != nil {
@@ -540,6 +544,18 @@ func TestExecutionEventV2RouteFlagAndCursorRecovery(t *testing.T) {
 	project, _ := memoryStore.CreateProject("v2", "")
 	for index := 0; index < 5; index++ {
 		_, _ = memoryStore.CreateExecutionEvent(project.ID, "", "EVENT", "event", map[string]any{"index": index})
+	}
+	legacyRaw := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(legacyRaw, httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/events/stream", nil))
+	if legacyRaw.Code != http.StatusNotFound {
+		t.Fatalf("retired raw stream status = %d, want 404", legacyRaw.Code)
+	}
+
+	t.Setenv("MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED", "")
+	defaultProbe := httptest.NewRecorder()
+	NewRouter(memoryStore).ServeHTTP(defaultProbe, httptest.NewRequest(http.MethodHead, "/projects/"+project.ID+"/events/stream/v2?cursor=5", nil))
+	if defaultProbe.Code != http.StatusNoContent {
+		t.Fatalf("default v2 route status = %d, want 204", defaultProbe.Code)
 	}
 
 	t.Setenv("MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED", "false")
@@ -653,6 +669,113 @@ func TestExecutionEventV2BurstReconnectHasNoGapOrDuplicate(t *testing.T) {
 	if strings.Contains(reconnect.Body.String(), "id: 4\n") || strings.Count(reconnect.Body.String(), "id: 5\n") != 1 {
 		t.Fatalf("reconnect duplicated or skipped a cursor: %s", reconnect.Body.String())
 	}
+}
+
+func TestExecutionEventV2ProductionBurstSoakPreservesEveryProjectCursor(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	memoryStore := store.NewMemoryStore()
+	project, _ := memoryStore.CreateProject("soak", "")
+	otherProject, _ := memoryStore.CreateProject("soak other", "")
+	expected := make([]int64, 0, 1200)
+	for index := 0; index < 1200; index++ {
+		created, err := memoryStore.CreateExecutionEvent(
+			project.ID,
+			"",
+			execution.EventJobProgressBoundary,
+			"progress boundary",
+			map[string]any{"attempt": 1, "revision": index + 1},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected = append(expected, created.Sequence)
+		if index%5 == 0 {
+			if _, err := memoryStore.CreateExecutionEvent(otherProject.ID, "", "OTHER_PROJECT_EVENT", "other", nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	server := &Server{store: memoryStore}
+	cursor := int64(0)
+	delivered := make([]int64, 0, len(expected))
+	totalStoreCalls := 0
+	for {
+		response := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(response)
+		context.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		nextCursor, hasMore, stats, err := server.writeProjectExecutionEventV2PagesWithStats(
+			context,
+			project.ID,
+			cursor,
+			17,
+			3,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nextCursor <= cursor {
+			t.Fatalf("soak cursor did not advance: before=%d after=%d", cursor, nextCursor)
+		}
+		if stats.StoreCallCount != stats.PageCount || stats.EventsDelivered != stats.EventsReturned {
+			t.Fatalf("bounded batch stats = %#v", stats)
+		}
+		totalStoreCalls += stats.StoreCallCount
+		delivered = append(delivered, executionEventV2IDs(t, response.Body.String())...)
+		cursor = nextCursor
+		if !hasMore {
+			break
+		}
+	}
+	if !slices.Equal(delivered, expected) {
+		t.Fatalf("soak delivery mismatch: got=%d want=%d first=%v last=%v", len(delivered), len(expected), delivered[:min(3, len(delivered))], delivered[max(0, len(delivered)-3):])
+	}
+	if totalStoreCalls < 10 {
+		t.Fatalf("soak did not exercise bounded pagination: store_calls=%d", totalStoreCalls)
+	}
+
+	checkpoint := expected[499]
+	reconnect := httptest.NewRecorder()
+	reconnectContext, _ := gin.CreateTestContext(reconnect)
+	reconnectContext.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	reconnectCursor := checkpoint
+	reconnected := make([]int64, 0, len(expected)-500)
+	for {
+		nextCursor, hasMore, _, err := server.writeProjectExecutionEventV2PagesWithStats(
+			reconnectContext,
+			project.ID,
+			reconnectCursor,
+			23,
+			2,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reconnectCursor = nextCursor
+		if !hasMore {
+			break
+		}
+	}
+	reconnected = executionEventV2IDs(t, reconnect.Body.String())
+	if !slices.Equal(reconnected, expected[500:]) {
+		t.Fatalf("reconnect delivery mismatch: got=%d want=%d", len(reconnected), len(expected)-500)
+	}
+}
+
+func executionEventV2IDs(t *testing.T, body string) []int64 {
+	t.Helper()
+	ids := []int64{}
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "id: ") {
+			continue
+		}
+		value, err := strconv.ParseInt(strings.TrimPrefix(line, "id: "), 10, 64)
+		if err != nil {
+			t.Fatalf("invalid SSE id line %q: %v", line, err)
+		}
+		ids = append(ids, value)
+	}
+	return ids
 }
 
 func TestExecutionEventV2ProjectionSanitizesHistoricalRows(t *testing.T) {

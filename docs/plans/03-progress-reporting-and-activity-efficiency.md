@@ -1,6 +1,6 @@
 # Progress Reporting And Activity Efficiency Plan
 
-Status: Proposed
+Status: Implemented; deprecated endpoint sunset pending the documented observation window
 Date: 2026-07-09
 Track: Activity
 Depends on: None
@@ -431,6 +431,8 @@ Acceptance criteria:
 - V2 activity requires no multi-source synthesis.
 - Rollback requires flags only, not data repair.
 
+Implementation outcome (2026-07-13): The deterministic rollout gate, bounded v2/snapshot diagnostics, mixed-version matrix, and production-sized burst/reconnect soak are implemented. Go/no-go thresholds and the compatibility observation window are documented in [Activity V2 Rollout And Retirement Policy](../operations/activity-v2-rollout.md).
+
 ### Activity PR 15: Legacy Activity Retirement
 
 Size: S
@@ -450,6 +452,8 @@ Acceptance criteria:
 - Supported-version matrix no longer needs removed paths.
 - Request/query targets remain satisfied after cleanup.
 - Historical execution events and progress records remain readable.
+
+Implementation outcome (2026-07-13): The current UI no longer consumes synthesized activity SSE or performs activity-triggered broad refreshes, and the unused unversioned raw event stream plus detailed Modal phase dual-write are removed. The synthesized endpoint is retained with explicit deprecation headers for the previous UI, while automatic broad polling remains for disconnect and previous-backend support. Rollout flags remain until the documented observation window passes; this is the release-policy branch explicitly allowed by the scope above.
 
 ## Migration Coordination
 

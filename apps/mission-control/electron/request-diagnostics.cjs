@@ -258,11 +258,77 @@ function runBaselineRequestScenario(mode) {
   };
 }
 
+function requestReductionPercent(baselineRequests, currentRequests) {
+  const baseline = finiteNonNegativeInteger(baselineRequests);
+  const current = finiteNonNegativeInteger(currentRequests);
+  if (baseline === 0) return 0;
+  return Math.round((((baseline - current) / baseline) * 100) * 100) / 100;
+}
+
+function runIncrementalRequestScenario(mode) {
+  const active = mode === "active";
+  let nowMs = 1_000;
+  const diagnostics = createRollingRequestDiagnostics({ now: () => nowMs });
+  const record = (method, requestPath, reasonCode) => diagnostics.record({
+    method,
+    path: requestPath,
+    reasonCode,
+    statusCode: method === "HEAD" ? 204 : 200,
+    responseBytes: 0,
+    durationMs: 0,
+  });
+
+  record("GET", "/projects/project-rollout/live-state", "v2_snapshot");
+  record("HEAD", "/projects/project-rollout/events/stream/v2?cursor=0", "stream_initial");
+  record("GET", "/projects/project-rollout/events/stream/v2?cursor=0", "stream_initial");
+
+  if (active) {
+    for (nowMs = 10_000; nowMs <= 60_000; nowMs += 10_000) {
+      record("GET", "/jobs/job-rollout/metrics", "targeted_invalidation");
+      if (nowMs % 30_000 === 0) {
+        record("GET", "/projects/project-rollout/live-state", "v2_snapshot");
+      }
+    }
+  }
+
+  nowMs = 60_000;
+  const current = diagnostics.snapshot();
+  const baseline = runBaselineRequestScenario(active ? "active" : "idle");
+  const reduction = requestReductionPercent(baseline.rolling_request_count, current.rolling_request_count);
+  return {
+    mode: active ? "active" : "idle",
+    duration_ms: 60_000,
+    baseline_request_count: baseline.rolling_request_count,
+    request_reduction_percent: reduction,
+    go_no_go: {
+      request_reduction_at_least_80_percent: reduction >= 80,
+      broad_get_count_is_zero: current.rolling_broad_get_count === 0,
+    },
+    ...current,
+  };
+}
+
+function runActivityRolloutReport() {
+  const active = runIncrementalRequestScenario("active");
+  const idle = runIncrementalRequestScenario("idle");
+  return {
+    schema_version: "activity_rollout_report.v1",
+    active,
+    idle,
+    go_no_go: active.go_no_go.request_reduction_at_least_80_percent &&
+      active.go_no_go.broad_get_count_is_zero &&
+      idle.go_no_go.broad_get_count_is_zero,
+  };
+}
+
 if (require.main === module) {
-  process.stdout.write(`${JSON.stringify({
-    active: runBaselineRequestScenario("active"),
-    idle: runBaselineRequestScenario("idle"),
-  }, null, 2)}\n`);
+  const output = process.argv.includes("--rollout")
+    ? runActivityRolloutReport()
+    : {
+        active: runBaselineRequestScenario("active"),
+        idle: runBaselineRequestScenario("idle"),
+      };
+	process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
 }
 
 module.exports = {
@@ -273,5 +339,8 @@ module.exports = {
   createRollingRequestDiagnostics,
   isBroadGet,
   normalizeRequestReason,
+  requestReductionPercent,
+  runActivityRolloutReport,
   runBaselineRequestScenario,
+  runIncrementalRequestScenario,
 };

@@ -68,7 +68,7 @@ import {
   type ProjectDetailLoadStatus,
   type VisualAnalysisDetail,
 } from "./hooks/useProjectDetail";
-import { eventNeedsSlowProjectRefresh, type ActivityStreamState } from "./hooks/useActivityStream";
+import type { ActivityStreamState } from "./features/activity/activityStreamState";
 import {
   useIncrementalLiveState,
   type IncrementalResourceFetcher,
@@ -219,7 +219,6 @@ import {
   missionStateLabel,
   missionHealthLabel,
   missionToneRank,
-  activityEventFromMessage,
   mergeActivityEvents,
   buildFallbackActivityEvents,
   fallbackActivityFromExecutionEvent,
@@ -557,8 +556,6 @@ const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://127.0.
 const datasetPlanetAssetUrl = new URL("../moon3.png", import.meta.url).href;
 const jobsPerPage = 10;
 const idleLiveRefreshIntervalMs = 30_000;
-const eventRefreshMinIntervalMs = 3_000;
-const eventRefreshDebounceMs = 750;
 const trainingEvaluationsFetchLimit = 50;
 const selectedProjectStorageKey = "selectedProjectId";
 const defaultLiveDataFeatureFlags: LiveDataFeatureFlags = {
@@ -966,10 +963,6 @@ export function App() {
   const localRuntime = useRef<ChampionLocalRuntime | null>(null);
   const demoImagesRef = useRef<ChampionDemoImage[]>([]);
   const demoSlideshowInFlight = useRef(false);
-  const eventRefreshInFlight = useRef(false);
-  const eventRefreshTimer = useRef<number | null>(null);
-  const eventRefreshQueuedSlow = useRef(false);
-  const lastEventRefreshAt = useRef(0);
   const liveRefreshInFlight = useRef(false);
   const liveRefreshCoordinator = useRef(createLiveRefreshCoordinator());
   const cachedGetRequests = useRef<Map<string, CachedGetRequest>>(new Map());
@@ -2616,119 +2609,22 @@ export function App() {
       setActivityStreamState("idle");
       return;
     }
-    if (!livePollingPolicy.run_legacy_polling) {
-      setActivityStreamState("connected");
-      return;
-    }
-    if (typeof EventSource === "undefined") {
-      setActivityStreamState("fallback");
-      return;
-    }
-
-    let closed = false;
-    let hasOpened = false;
-    let streamOpenedAtMs = Date.now();
-    let catchUpReason: ActivityVisibilitySample["catchUpReason"] = "initial_catch_up";
-    let streamAttemptStartedAtMs = streamOpenedAtMs;
-    let streamAttemptPending = true;
-    let streamAttemptReason: "stream_initial" | "stream_reconnect" = "stream_initial";
-    setActivityStreamState("connecting");
-    const streamUrl = new URL(`/projects/${selectedProjectId}/activity-stream`, baseUrl);
-    streamUrl.searchParams.set("limit", "12");
-    streamUrl.searchParams.set("interval_ms", pollingHasOpenWork ? "5000" : "10000");
-    const events = new EventSource(streamUrl.toString());
-    const triggerRefresh = (event: MessageEvent | Event) => {
-      if (closed) return;
-      const includeSlowData = eventNeedsSlowProjectRefresh(event);
-      eventRefreshQueuedSlow.current = eventRefreshQueuedSlow.current || includeSlowData;
-      if (eventRefreshInFlight.current || eventRefreshTimer.current !== null) return;
-      const elapsed = Date.now() - lastEventRefreshAt.current;
-      const delay = Math.max(eventRefreshDebounceMs, eventRefreshMinIntervalMs - elapsed);
-      eventRefreshTimer.current = window.setTimeout(() => {
-        eventRefreshTimer.current = null;
-        eventRefreshInFlight.current = true;
-        lastEventRefreshAt.current = Date.now();
-        const shouldIncludeSlowData = eventRefreshQueuedSlow.current;
-        eventRefreshQueuedSlow.current = false;
-        refreshLive({ includeSlowData: shouldIncludeSlowData, diagnosticReason: "activity_event" })
-          .catch(() => undefined)
-          .finally(() => {
-            eventRefreshInFlight.current = false;
-          });
-      }, delay);
-    };
-
-    const handleActivityEvent = (event: MessageEvent) => {
-      const activity = activityEventFromMessage(event);
-      if (activity) {
-        const queued = appendActivityVisibilitySample(pendingActivityVisibilitySamples.current, {
-          createdAtMs: Date.parse(activity.created_at),
-          receivedAtMs: Date.now(),
-          streamOpenedAtMs,
-          catchUpReason,
-        });
-        pendingActivityVisibilitySamples.current = queued.samples;
-        droppedActivityVisibilitySamples.current += queued.dropped;
-        setActivityEvents((current) => mergeActivityEvents(current, activity));
-      }
-      triggerRefresh(event);
-    };
-
-    events.onopen = () => {
-      if (!closed) {
-        if (streamAttemptPending) {
-          window.missionControl.recordActivityStreamAttempt({
-            reason_code: streamAttemptReason,
-            outcome_code: "connected",
-            duration_ms: Math.max(0, Date.now() - streamAttemptStartedAtMs),
-          }).catch(() => undefined);
-          streamAttemptPending = false;
-        }
-        catchUpReason = hasOpened ? "reconnect_catch_up" : "initial_catch_up";
-        hasOpened = true;
-        streamOpenedAtMs = Date.now();
+    switch (incrementalLive.session.connection) {
+      case "connected":
         setActivityStreamState("connected");
-      }
-    };
-    events.onmessage = (event) => {
-      handleActivityEvent(event);
-    };
-    events.addEventListener("activity_event", handleActivityEvent);
-    events.addEventListener("stream_error", () => {
-      if (!closed) setActivityStreamState("fallback");
-    });
-    events.onerror = () => {
-      if (!closed) {
-        if (streamAttemptPending) {
-          window.missionControl.recordActivityStreamAttempt({
-            reason_code: streamAttemptReason,
-            outcome_code: "failed",
-            duration_ms: Math.max(0, Date.now() - streamAttemptStartedAtMs),
-          }).catch(() => undefined);
-        }
-        streamAttemptPending = events.readyState !== EventSource.CLOSED;
-        streamAttemptReason = "stream_reconnect";
-        streamAttemptStartedAtMs = Date.now();
-        catchUpReason = "reconnect_catch_up";
+        break;
+      case "reconnecting":
+      case "recovering":
         setActivityStreamState("reconnecting");
-      }
-    };
-
-    return () => {
-      closed = true;
-      if (eventRefreshTimer.current !== null) {
-        window.clearTimeout(eventRefreshTimer.current);
-        eventRefreshTimer.current = null;
-      }
-      events.close();
-    };
-  }, [
-    baseUrl,
-    livePollingPolicy.run_legacy_polling,
-    pollingHasOpenWork,
-    refreshLive,
-    selectedProjectId,
-  ]);
+        break;
+      case "connecting":
+        setActivityStreamState("connecting");
+        break;
+      default:
+        setActivityStreamState("fallback");
+        break;
+    }
+  }, [incrementalLive.session.connection, selectedProjectId]);
 
   useEffect(() => {
     if (pendingActivityVisibilitySamples.current.length === 0) return;

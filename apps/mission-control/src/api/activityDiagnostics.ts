@@ -15,6 +15,7 @@ export type ActivityVisibilitySample = {
 };
 
 export type ActivityVisibilitySummary = {
+  source_code: "execution_event_v2";
   reason_code: ActivityVisibilityReasonCode;
   sample_count: number;
   latency_sample_count: number;
@@ -73,6 +74,7 @@ export function summarizeActivityVisibility(
     const latencyTotal = sum(group.latencies);
     const commitDelayTotal = sum(group.commitDelays);
     return {
+      source_code: "execution_event_v2",
       reason_code: reasonCode,
       sample_count: group.latencies.length + group.invalid,
       latency_sample_count: group.latencies.length,

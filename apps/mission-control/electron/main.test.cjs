@@ -94,16 +94,16 @@ test("event-stream relay accepts only a bounded v2 cursor path", () => {
   const options = __test.validateOrchestratorEventStreamOptions({
     streamId: "stream_1",
     baseUrl: "http://127.0.0.1:8080",
-    path: "/projects/project-1/events/stream/v2?cursor=42",
+    path: "/projects/project-1/events/stream/v2?cursor=42&reason=stream_initial",
     diagnosticReason: "stream_initial",
   });
   assert.equal(options.streamId, "stream_1");
-  assert.equal(options.url, "http://127.0.0.1:8080/projects/project-1/events/stream/v2?cursor=42");
+  assert.equal(options.url, "http://127.0.0.1:8080/projects/project-1/events/stream/v2?cursor=42&reason=stream_initial");
   assert.throws(
     () => __test.validateOrchestratorEventStreamOptions({
       streamId: "stream_2",
       baseUrl: "http://127.0.0.1:8080",
-      path: "/projects/project-1/activity-stream?cursor=42",
+      path: "/projects/project-1/activity-stream?cursor=42&reason=stream_initial",
     }),
     /bounded v2 execution-event stream/,
   );
@@ -111,9 +111,17 @@ test("event-stream relay accepts only a bounded v2 cursor path", () => {
     () => __test.validateOrchestratorEventStreamOptions({
       streamId: "stream_3",
       baseUrl: "http://127.0.0.1:8080",
-      path: "/projects/project-1/events/stream/v2?cursor=-1",
+      path: "/projects/project-1/events/stream/v2?cursor=-1&reason=stream_initial",
     }),
     /bounded nonnegative integer/,
+  );
+  assert.throws(
+    () => __test.validateOrchestratorEventStreamOptions({
+      streamId: "stream_4",
+      baseUrl: "http://127.0.0.1:8080",
+      path: "/projects/project-1/events/stream/v2?cursor=42&reason=legacy",
+    }),
+    /reason must be initial or reconnect/,
   );
 });
 
@@ -130,6 +138,7 @@ test("event-stream HTTP error bodies are read with a strict byte bound", async (
 
 test("renderer activity visibility diagnostics accept only bounded scalar summaries", () => {
   const summary = __test.validateActivityVisibilitySummary({
+    source_code: "execution_event_v2",
     reason_code: "live",
     sample_count: 2,
     latency_sample_count: 2,
@@ -146,6 +155,7 @@ test("renderer activity visibility diagnostics accept only bounded scalar summar
   });
 
   assert.deepEqual(summary, {
+    source_code: "execution_event_v2",
     reason_code: "live",
     sample_count: 2,
     latency_sample_count: 2,
@@ -159,29 +169,12 @@ test("renderer activity visibility diagnostics accept only bounded scalar summar
     commit_delay_average_ms: 2,
   });
   assert.throws(
-    () => __test.validateActivityVisibilitySummary({ reason_code: "raw_event", sample_count: 1 }),
+    () => __test.validateActivityVisibilitySummary({ source_code: "execution_event_v2", reason_code: "raw_event", sample_count: 1 }),
     /supported reason code/,
   );
-});
-
-test("renderer activity stream diagnostics accept only request outcome scalars", () => {
-  assert.deepEqual(
-    __test.validateActivityStreamAttempt({
-      reason_code: "stream_reconnect",
-      outcome_code: "connected",
-      duration_ms: 42.4,
-      project_id: "must-not-be-retained",
-      payload: { prompt: "must-not-be-retained" },
-    }),
-    {
-      reason_code: "stream_reconnect",
-      outcome_code: "connected",
-      duration_ms: 42,
-    },
-  );
   assert.throws(
-    () => __test.validateActivityStreamAttempt({ reason_code: "raw", outcome_code: "connected" }),
-    /supported reason and outcome codes/,
+    () => __test.validateActivityVisibilitySummary({ reason_code: "live", sample_count: 1 }),
+    /v2 source code/,
   );
 });
 

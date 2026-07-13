@@ -25,14 +25,18 @@ export type OpenExecutionEventStreamOptions = ExecutionEventStreamCallbacks & {
 
 let streamSequence = 0;
 
-export function executionEventStreamPath(projectId: string, cursor: number): string {
+export function executionEventStreamPath(
+  projectId: string,
+  cursor: number,
+  reason: OpenExecutionEventStreamOptions["diagnosticReason"] = "stream_initial",
+): string {
   if (!projectId.trim()) throw new Error("Project id is required for the execution-event stream.");
   if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error("Execution-event cursor must be a nonnegative safe integer.");
-  return `/projects/${encodeURIComponent(projectId)}/events/stream/v2?cursor=${cursor}&limit=100&interval_ms=1000`;
+  return `/projects/${encodeURIComponent(projectId)}/events/stream/v2?cursor=${cursor}&limit=100&interval_ms=1000&reason=${reason}`;
 }
 
 export function openExecutionEventStream(options: OpenExecutionEventStreamOptions): ExecutionEventStreamHandle {
-  const path = executionEventStreamPath(options.projectId, options.cursor);
+  const path = executionEventStreamPath(options.projectId, options.cursor, options.diagnosticReason);
   if (supportsEventStreamRelay()) {
     return openRelayedExecutionEventStream(options, path);
   }

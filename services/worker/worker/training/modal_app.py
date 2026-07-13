@@ -3,14 +3,12 @@ from __future__ import annotations
 import base64
 import copy
 import csv
-import contextvars
 import hashlib
 import json
 import os
 import random
 import re
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -86,7 +84,6 @@ from worker.training.modal_runtime import (
     ROOT_METADATA_DIR_NAMES,
     TORCH_CACHE_ROOT,
     TORCH_CACHE_VOLUME_NAME,
-    _MODAL_STAGE_EVENTS,
     _bool,
     _modal_cost_sensitive_defaults_enabled,
     _modal_dataset_materialization_timeout_seconds,
@@ -197,35 +194,6 @@ from worker.training.modal_yolo import (
 )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class _DatasetRelativePathResolver:
     def __init__(self, dataset_dir: Path):
         from worker.datasets.metadata_discovery import is_safe_relative_path
@@ -255,7 +223,6 @@ class _DatasetRelativePathResolver:
         return None
 
 
-
 @app.function(
     image=image,
     gpu=DEFAULT_GPU,
@@ -282,8 +249,6 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     import time
 
     started_at = time.time()
-    stage_events: list[dict] = []
-    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
     job = payload["job"]
     config = job["config"]
     dataset = payload["dataset"]
@@ -578,10 +543,6 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "modal_input_id": modal_input_id,
                 "dataset_materialization": dataset_materialization,
                 "stage_telemetry": _modal_stage_telemetry_payload(
-                    job,
-                    runtime_seconds,
-                    stage_events,
-                    dataset_materialization,
                     gpu_type,
                     modal_resources=modal_resource_telemetry,
                 ),
@@ -708,10 +669,6 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         "modal_input_id": modal_input_id,
         "dataset_materialization": dataset_materialization,
         "stage_telemetry": _modal_stage_telemetry_payload(
-            job,
-            runtime_seconds,
-            stage_events,
-            dataset_materialization,
             gpu_type,
             modal_resources=modal_resource_telemetry,
         ),
@@ -851,8 +808,6 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     import time
 
     started_at = time.time()
-    stage_events: list[dict] = []
-    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
     job = payload["job"]
     config = job["config"]
     dataset = payload["dataset"]
@@ -1187,10 +1142,6 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         "modal_input_id": modal_input_id,
         "dataset_materialization": dataset_materialization,
         "stage_telemetry": _modal_stage_telemetry_payload(
-            job,
-            runtime_seconds,
-            stage_events,
-            dataset_materialization,
             gpu_type,
             modal_resources=modal_resource_telemetry,
         ),
@@ -1724,64 +1675,6 @@ def _modal_preview_batch_task_type(config: dict) -> str:
     return "image_classification"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _collect_yolo_validation_metrics(
     detector,
     data_config_path: Path,
@@ -1800,8 +1693,6 @@ def _collect_yolo_validation_metrics(
         workers=_yolo_dataloader_workers(),
     )
     return _yolo_metrics_from_object(metrics, class_names=class_names)
-
-
 
 
 def _install_yolo_epoch_metrics_callback(
@@ -2002,48 +1893,6 @@ def _post_yolo_epoch_metrics(
     return posted
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @app.function(
     image=image,
     timeout=_modal_dataset_materialization_timeout_seconds(),
@@ -2108,36 +1957,6 @@ def profile_image_dataset(payload: dict) -> dict:
             "metadata_import": build_metadata_import_payload(dataset_dir),
             "dataset_materialization": materialized.telemetry,
         }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _modal_stage_telemetry_enabled() -> bool:
-    return _bool(os.getenv("MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY"), default=False)
 
 
 def _modal_remote_progress_reporter(
@@ -2331,19 +2150,6 @@ def _modal_training_phase(job_id: str, phase: str, started_at: float, **fields: 
     import time
 
     elapsed = max(0.0, time.time() - started_at)
-    events = _MODAL_STAGE_EVENTS.get()
-    if events is not None:
-        events.append(
-            {
-                "phase": phase,
-                "elapsed_seconds": round(elapsed, 6),
-                "fields": {
-                    key: _modal_stage_field_value(value)
-                    for key, value in fields.items()
-                    if value is not None
-                },
-            }
-        )
     field_text = " ".join(
         f"{key}={_modal_training_phase_value(value)}"
         for key, value in fields.items()
@@ -2358,19 +2164,7 @@ def _modal_training_phase_value(value: object) -> str:
     return text.replace("\n", " ").replace("\r", " ")[:120]
 
 
-def _modal_stage_field_value(value: object) -> object:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int | float):
-        return round(float(value), 6)
-    return _modal_training_phase_value(value)
-
-
 def _modal_stage_telemetry_payload(
-    job: dict,
-    runtime_seconds: float,
-    stage_events: list[dict],
-    dataset_materialization: dict,
     gpu_type: str,
     *,
     modal_resources: dict | None = None,
@@ -2380,62 +2174,8 @@ def _modal_stage_telemetry_payload(
         if isinstance(modal_resources, dict)
         else resource_telemetry({"effective_gpu_type": gpu_type})
     )
-    if not _modal_stage_telemetry_enabled():
-        return {
-            "schema_version": "remote_gpu_stage_telemetry_v1",
-            "gpu_type": gpu_type,
-            "modal_resources": resources,
-            "requested_gpu_type": resources.get("requested_gpu_type", ""),
-            "effective_gpu_type": resources.get("effective_gpu_type", gpu_type),
-            "memory_mb": resources.get("memory_mb", 0),
-            "requested_batch_size": resources.get("requested_batch_size", 0),
-            "effective_batch_size": resources.get("effective_batch_size", 0),
-            "batch_size_policy": resources.get("batch_size_policy", ""),
-            "resource_signature": resources.get("resource_signature", ""),
-            "warm_container_policy": _modal_warm_container_policy(),
-        }
-    materialization_seconds = _stage_duration(
-        stage_events,
-        "dataset_local_materialization_start",
-        "dataset_local_materialization_done",
-    )
-    active_training_seconds = _sum_stage_durations(
-        stage_events,
-        ("epoch_train_start", "epoch_train_done"),
-    ) + _stage_duration(stage_events, "yolo_train_start", "yolo_train_done")
-    evaluation_seconds = _sum_stage_durations(
-        stage_events,
-        ("epoch_eval_start", "epoch_eval_done"),
-    ) + _stage_duration(stage_events, "final_eval_start", "final_eval_done") + _stage_duration(
-        stage_events,
-        "yolo_eval_start",
-        "yolo_eval_done",
-    )
-    export_seconds = _stage_duration(stage_events, "export_start", "export_done")
-    known_seconds = materialization_seconds + active_training_seconds + evaluation_seconds + export_seconds
-    payload = {
+    return {
         "schema_version": "remote_gpu_stage_telemetry_v1",
-        "current_stage": stage_events[-1]["phase"] if stage_events else "",
-        "events": stage_events[-80:],
-        "queue_wait_seconds": _job_queue_wait_seconds(job),
-        "dataset_materialization_seconds": round(materialization_seconds, 6),
-        "dataset_download_seconds": _float_from_payload(
-            dataset_materialization,
-            "dataset_materialization_download_seconds",
-        ),
-        "dataset_extract_seconds": _float_from_payload(
-            dataset_materialization,
-            "dataset_materialization_extract_seconds",
-        ),
-        "dataset_materialization_wait_seconds": _float_from_payload(
-            dataset_materialization,
-            "dataset_materialization_wait_seconds",
-        ),
-        "active_training_seconds": round(active_training_seconds, 6),
-        "evaluation_seconds": round(evaluation_seconds, 6),
-        "export_seconds": round(export_seconds, 6),
-        "idle_wait_seconds": round(max(0.0, runtime_seconds - known_seconds), 6),
-        "runtime_seconds": round(max(0.0, runtime_seconds), 6),
         "gpu_type": gpu_type,
         "modal_resources": resources,
         "requested_gpu_type": resources.get("requested_gpu_type", ""),
@@ -2447,62 +2187,6 @@ def _modal_stage_telemetry_payload(
         "resource_signature": resources.get("resource_signature", ""),
         "warm_container_policy": _modal_warm_container_policy(),
     }
-    return payload
-
-
-def _stage_duration(stage_events: list[dict], start_phase: str, done_phase: str) -> float:
-    started = None
-    for event in stage_events:
-        phase = str(event.get("phase") or "")
-        elapsed = _float_from_payload(event, "elapsed_seconds")
-        if phase == start_phase:
-            started = elapsed
-        elif phase == done_phase and started is not None:
-            return max(0.0, elapsed - started)
-    return 0.0
-
-
-def _sum_stage_durations(stage_events: list[dict], phase_pair: tuple[str, str]) -> float:
-    start_phase, done_phase = phase_pair
-    total = 0.0
-    started = None
-    for event in stage_events:
-        phase = str(event.get("phase") or "")
-        elapsed = _float_from_payload(event, "elapsed_seconds")
-        if phase == start_phase:
-            started = elapsed
-        elif phase == done_phase and started is not None:
-            total += max(0.0, elapsed - started)
-            started = None
-    return round(total, 6)
-
-
-def _float_from_payload(payload: dict, key: str) -> float:
-    try:
-        value = float(payload.get(key) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-    return round(max(0.0, value), 6)
-
-
-def _job_queue_wait_seconds(job: dict) -> float:
-    created_at = _parse_datetime(job.get("created_at"))
-    if created_at is None:
-        return 0.0
-    return round(max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds()), 6)
-
-
-def _parse_datetime(value: object) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _modal_warm_container_policy() -> dict:
@@ -3762,10 +3446,6 @@ def _union_annotation_bbox(objects: object) -> tuple[int, int, int, int] | None:
         max(box[2] for box in boxes),
         max(box[3] for box in boxes),
     )
-
-
-
-
 
 
 def _class_weights(
@@ -5056,22 +4736,6 @@ def _export_self_test_failed(manifest: dict) -> bool:
     return export_self_test_failed(self_test)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _holistic_scores(best_macro_f1: float, best_accuracy: float, estimated_cost_usd: float, runtime_seconds: float, model_profile: dict) -> dict:
     latency_ms = float(model_profile.get("estimated_pipeline_latency_ms") or model_profile.get("estimated_latency_ms") or 0)
     quality_score = (best_macro_f1 * 0.65) + (best_accuracy * 0.35)
@@ -5694,12 +5358,6 @@ def _is_inline_image_data_uri(value: str) -> bool:
 
 def _string_value(value) -> str:
     return str(value or "").strip()
-
-
-
-
-
-
 
 
 def _should_stop_training_early(

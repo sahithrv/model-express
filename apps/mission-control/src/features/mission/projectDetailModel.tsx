@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Activity, AlertTriangle, CheckCircle2, X } from "lucide-react";
 
 import { readyONNXExport } from "../../championLocalInference";
-import type { ActivityStreamState } from "../../hooks/useActivityStream";
+import type { ActivityStreamState } from "../activity/activityStreamState";
 import type { DatasetMetadataDetail, ProjectDetail, VisualAnalysisDetail } from "../../hooks/useProjectDetail";
 import { projectTabs, type ActivityFilterKey, type ProjectTabKey, type ProjectTabTarget } from "./workflowTabs";
 import {
@@ -3673,32 +3673,6 @@ export const activityWindowsPathPattern = /\b[A-Z]:\\[^\s,;"')\]}]+/gi;
 export const activityUnixPathPattern = /(^|\s)\/(?:Users|home|tmp|var|mnt|data|datasets|artifacts|workspace|app|srv)[^\s,;"')\]}]+/gi;
 export const activityBase64Pattern = /\b[A-Za-z0-9+/]{80,}={0,2}\b/g;
 export const activitySecretPattern = /\b(?:sk|pk|rk|xox[baprs]?)-[A-Za-z0-9_-]{16,}\b/gi;
-
-export function activityEventFromMessage(event: MessageEvent): AgentActivityEvent | null {
-  try {
-    const parsed = recordObject(JSON.parse(String(event.data)));
-    const id = recordString(parsed, "id");
-    const projectId = recordString(parsed, "project_id");
-    const type = recordString(parsed, "type");
-    const createdAt = recordString(parsed, "created_at");
-    if (!id || !projectId || !type || !createdAt) return null;
-    return {
-      id,
-      project_id: projectId,
-      plan_id: recordString(parsed, "plan_id") || undefined,
-      job_id: recordString(parsed, "job_id") || undefined,
-      type,
-      severity: activitySeverity(recordString(parsed, "severity")),
-      title: activitySafeDisplayText(recordString(parsed, "title"), 96) || "Activity",
-      message: activitySafeDisplayText(recordString(parsed, "message"), 240),
-      status: activityStatus(recordString(parsed, "status")),
-      created_at: createdAt,
-      metadata: activityMetadataObject(parsed.metadata),
-    };
-  } catch {
-    return null;
-  }
-}
 
 export function mergeActivityEvents(current: AgentActivityEvent[], event: AgentActivityEvent) {
   const byId = new Map<string, AgentActivityEvent>();

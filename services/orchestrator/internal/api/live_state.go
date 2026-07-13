@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/store"
@@ -20,6 +21,7 @@ const (
 	projectLiveStateSchema       = "project_live_state.v1"
 	projectLiveStateStaleAfter   = 60 * time.Second
 	projectLiveStateMaxSafeBytes = 16 * 1024
+	projectLiveStateQueryBudget  = 6
 )
 
 var liveStateMetadataTokenPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
@@ -66,11 +68,21 @@ type projectLiveStateProgress struct {
 }
 
 func (s *Server) getProjectLiveState(c *gin.Context) {
+	startedAt := time.Now()
+	bytesBefore := c.Writer.Size()
 	snapshot, err := s.store.GetProjectLiveState(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		if c.Request.Context().Err() != nil {
 			return
 		}
+		diagnostics.Event("warn", "project_live_state_read", map[string]any{
+			"duration_ms":      time.Since(startedAt).Milliseconds(),
+			"response_bytes":   0,
+			"store_call_count": 1,
+			"query_count":      projectLiveStateQueryBudget,
+			"error_count":      1,
+			"reason_code":      "snapshot_read_failed",
+		})
 		writeStoreError(c, err)
 		return
 	}
@@ -83,9 +95,30 @@ func (s *Server) getProjectLiveState(c *gin.Context) {
 	c.Header("ETag", etag)
 	if ifNoneMatchContains(c.GetHeader("If-None-Match"), etag) {
 		c.Status(http.StatusNotModified)
+		recordProjectLiveStateDiagnostic(startedAt, bytesBefore, c.Writer.Size(), response, "not_modified")
 		return
 	}
 	c.JSON(http.StatusOK, response)
+	recordProjectLiveStateDiagnostic(startedAt, bytesBefore, c.Writer.Size(), response, "snapshot")
+}
+
+func recordProjectLiveStateDiagnostic(
+	startedAt time.Time,
+	bytesBefore int,
+	bytesAfter int,
+	response projectLiveStateEnvelope,
+	reasonCode string,
+) {
+	diagnostics.Event("info", "project_live_state_read", map[string]any{
+		"duration_ms":           time.Since(startedAt).Milliseconds(),
+		"response_bytes":        activityResponseByteDelta(bytesBefore, bytesAfter),
+		"store_call_count":      1,
+		"query_count":           projectLiveStateQueryBudget,
+		"active_progress_count": len(response.ActiveProgress),
+		"job_count":             response.Jobs.Total,
+		"error_count":           0,
+		"reason_code":           reasonCode,
+	})
 }
 
 func projectLiveStateProjection(snapshot store.ProjectLiveStateSnapshot) projectLiveStateEnvelope {
