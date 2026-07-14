@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plannervalidation"
@@ -37,6 +39,17 @@ func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, dec
 		return decisions.AgentDecision{}, err
 	}
 
+	decision, err := createAgentDecisionTx(ctx, tx, projectID, planID, decisionType, rationale, payloadJSON)
+	if err != nil {
+		return decisions.AgentDecision{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return decisions.AgentDecision{}, err
+	}
+	return decision, nil
+}
+
+func createAgentDecisionTx(ctx context.Context, tx *sql.Tx, projectID string, planID string, decisionType string, rationale string, payloadJSON []byte) (decisions.AgentDecision, error) {
 	const query = `
 		INSERT INTO agent_decisions (project_id, plan_id, decision_type, rationale, payload)
 		VALUES ($1, $2, $3, $4, $5)
@@ -62,10 +75,204 @@ func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, dec
 	if _, _, err := appendExecutionTransitionTx(ctx, tx, create); err != nil {
 		return decisions.AgentDecision{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return decisions.AgentDecision{}, err
-	}
 	return decision, nil
+}
+
+func (s *PostgresStore) CreateAgentDecisionWithCandidateProvenance(
+	projectID string,
+	planID string,
+	decisionType string,
+	rationale string,
+	payload map[string]any,
+	candidates []calibration.CandidateProvenanceCreate,
+) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
+	if strings.ToUpper(strings.TrimSpace(decisionType)) != decisions.TypeAddExperiments {
+		return decisions.AgentDecision{}, nil, fmt.Errorf("%w: candidate provenance is only valid for ADD_EXPERIMENTS decisions", ErrInvalidRequest)
+	}
+	if err := validateCandidateProvenanceCreates(candidates); err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return decisions.AgentDecision{}, nil, fmt.Errorf("marshal agent decision payload: %w", err)
+	}
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	defer tx.Rollback()
+	if err := requireAgentProjectTx(ctx, tx, projectID); err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	decision, err := createAgentDecisionTx(ctx, tx, projectID, planID, decisionType, rationale, payloadJSON)
+	if err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	rows, err := ensureCandidateProvenanceTx(ctx, tx, decision, candidates)
+	if err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	return decision, rows, nil
+}
+
+func (s *PostgresStore) EnsureCandidateProvenance(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error) {
+	if err := validateCandidateProvenanceCreates(candidates); err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var projectID string
+	var decisionType string
+	if err := tx.QueryRowContext(ctx, `SELECT project_id, decision_type FROM agent_decisions WHERE id = $1 FOR SHARE`, decision.ID).Scan(&projectID, &decisionType); err != nil {
+		return nil, normalizeSQLError(err)
+	}
+	if projectID != decision.ProjectID {
+		return nil, fmt.Errorf("%w: candidate decision project mismatch", ErrInvalidRequest)
+	}
+	if strings.ToUpper(strings.TrimSpace(decisionType)) != decisions.TypeAddExperiments {
+		return nil, fmt.Errorf("%w: candidate provenance is only valid for ADD_EXPERIMENTS decisions", ErrInvalidRequest)
+	}
+	rows, err := ensureCandidateProvenanceTx(ctx, tx, decision, candidates)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func validateCandidateProvenanceCreates(candidates []calibration.CandidateProvenanceCreate) error {
+	if len(candidates) == 0 {
+		return fmt.Errorf("%w: accepted planner decision requires candidate provenance", ErrInvalidRequest)
+	}
+	seen := map[int]bool{}
+	for _, candidate := range candidates {
+		if err := calibration.ValidateCandidateProvenanceCreate(candidate); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if seen[candidate.CandidateIndex] {
+			return fmt.Errorf("%w: duplicate candidate_index %d", ErrInvalidRequest, candidate.CandidateIndex)
+		}
+		seen[candidate.CandidateIndex] = true
+	}
+	return nil
+}
+
+func ensureCandidateProvenanceTx(ctx context.Context, tx *sql.Tx, decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error) {
+	const insert = `
+		INSERT INTO planner_candidate_provenance (
+			project_id, invocation_id, decision_id, planner_variant_id, candidate_index,
+			requested_config_hash, accepted_spec_hash, task, mechanism,
+			forecast_target, metric_direction, score_basis, score_version, baseline_job_id,
+			baseline_score, predicted_delta, prediction_source, forecast_units, valid_range_min, valid_range_max,
+			base_score, selection_trace_reference, selected, rejected, selection_state,
+			selected_experiment_index, outcome_status, reasons
+		)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+			$15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+		FROM agent_invocations
+		WHERE id = $2 AND project_id = $1 AND planner_variant_id = $4
+		ON CONFLICT (decision_id, candidate_index) DO NOTHING
+	`
+	for _, candidate := range candidates {
+		reasonsJSON, err := json.Marshal(candidate.Reasons)
+		if err != nil {
+			return nil, fmt.Errorf("marshal candidate provenance reasons: %w", err)
+		}
+		result, err := tx.ExecContext(ctx, insert,
+			decision.ProjectID, candidate.InvocationID, decision.ID, candidate.PlannerVariantID, candidate.CandidateIndex,
+			candidate.RequestedConfigHash, candidate.AcceptedSpecHash, candidate.Task, candidate.Mechanism,
+			candidate.Forecast.ForecastTarget, candidate.Forecast.MetricDirection, candidate.Forecast.ScoreBasis, candidate.Forecast.ScoreVersion, candidate.Forecast.BaselineJobID,
+			candidate.Forecast.BaselineScore, candidate.Forecast.PredictedDelta, candidate.Forecast.PredictionSource, candidate.Forecast.Units, candidate.Forecast.ValidRange.Min, candidate.Forecast.ValidRange.Max,
+			candidate.BaseScore, candidate.SelectionTraceReference, candidate.Selected, candidate.Rejected, candidate.SelectionState,
+			candidate.SelectedExperimentIndex, candidate.OutcomeStatus, reasonsJSON,
+		)
+		if err != nil {
+			return nil, normalizeSQLError(err)
+		}
+		if affected, err := result.RowsAffected(); err == nil && affected == 0 {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM planner_candidate_provenance WHERE decision_id = $1 AND candidate_index = $2)`, decision.ID, candidate.CandidateIndex).Scan(&exists); err != nil {
+				return nil, err
+			}
+			if !exists {
+				return nil, fmt.Errorf("%w: candidate invocation or planner variant does not match project", ErrInvalidRequest)
+			}
+		}
+	}
+	rows, err := listCandidateProvenanceQuery(ctx, tx, `WHERE decision_id = $1 ORDER BY candidate_index`, decision.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) != len(candidates) {
+		return nil, fmt.Errorf("%w: candidate provenance count %d does not match accepted candidate count %d", ErrInvalidRequest, len(rows), len(candidates))
+	}
+	byIndex := make(map[int]calibration.CandidateProvenance, len(rows))
+	for _, row := range rows {
+		byIndex[row.CandidateIndex] = row
+	}
+	for _, candidate := range candidates {
+		row, ok := byIndex[candidate.CandidateIndex]
+		if !ok || !calibration.CandidateProvenanceMatchesCreate(row, candidate) {
+			return nil, fmt.Errorf("%w: candidate provenance at index %d conflicts with the immutable decision-time record", ErrInvalidRequest, candidate.CandidateIndex)
+		}
+	}
+	return rows, nil
+}
+
+func (s *PostgresStore) ListDecisionCandidateProvenance(decisionID string) ([]calibration.CandidateProvenance, error) {
+	return listCandidateProvenanceQuery(context.Background(), s.db, `WHERE decision_id = $1 ORDER BY candidate_index`, decisionID)
+}
+
+func (s *PostgresStore) ListProjectCandidateProvenance(projectID string) ([]calibration.CandidateProvenance, error) {
+	if err := s.requireProject(projectID); err != nil {
+		return nil, err
+	}
+	return listCandidateProvenanceQuery(context.Background(), s.db, `WHERE project_id = $1 ORDER BY created_at DESC, decision_id DESC, candidate_index`, projectID)
+}
+
+type candidateProvenanceQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func listCandidateProvenanceQuery(ctx context.Context, queryer candidateProvenanceQueryer, clause string, value any) ([]calibration.CandidateProvenance, error) {
+	query := `SELECT id, project_id, invocation_id, decision_id, planner_variant_id, candidate_index,
+		requested_config_hash, accepted_spec_hash, task, mechanism,
+		forecast_target, metric_direction, score_basis, score_version, baseline_job_id,
+		baseline_score, predicted_delta, prediction_source, forecast_units, valid_range_min, valid_range_max,
+		base_score, selection_trace_reference, selected, rejected, selection_state,
+		selected_experiment_index, outcome_status, reasons,
+		followup_plan_id, experiment_id, job_id, realized_effective_hash, created_at
+		FROM planner_candidate_provenance ` + clause
+	rows, err := queryer.QueryContext(ctx, query, value)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []calibration.CandidateProvenance{}
+	for rows.Next() {
+		row, err := scanCandidateProvenance(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *PostgresStore) ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {

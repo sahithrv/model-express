@@ -1,0 +1,152 @@
+package store
+
+import (
+	"database/sql"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"model-express/services/orchestrator/internal/calibration"
+	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/memory"
+)
+
+func TestMemoryCandidateProvenanceIsAtomicIdempotentAndOutcomeNeutral(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("candidate provenance", "calibrate planner forecasts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID: project.ID, AgentName: "experiment_planner", PlannerVariantID: memory.LegacyPlannerVariantID,
+		ValidationStatus: memory.InvocationValidationValid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := testCandidateProvenanceCreates(invocation.ID, invocation.PlannerVariantID)
+	decision, rows, err := store.CreateAgentDecisionWithCandidateProvenance(
+		project.ID, "plan_1", decisions.TypeAddExperiments, "accepted planner batch", map[string]any{"preserved": true}, candidates,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].CandidateIndex != 0 || rows[1].CandidateIndex != 1 {
+		t.Fatalf("candidate indexes are not deterministic: %#v", rows)
+	}
+	if rows[0].SelectedExperimentIndex == nil || *rows[0].SelectedExperimentIndex != 0 {
+		t.Fatalf("selected experiment index was not preserved: %#v", rows[0])
+	}
+	if rows[1].SelectedExperimentIndex != nil || rows[1].SelectionState != calibration.CandidateSelectionUnselected || rows[1].OutcomeStatus != calibration.CandidateOutcomeUnknown {
+		t.Fatalf("unselected candidate was incorrectly treated as a negative outcome: %#v", rows[1])
+	}
+	for _, row := range rows {
+		if row.RequestedConfigHash == "" || row.AcceptedSpecHash == "" || row.RealizedEffectiveHash != nil || row.FollowUpPlanID != nil || row.ExperimentID != nil || row.JobID != nil {
+			t.Fatalf("decision-time execution lineage is incorrect: %#v", row)
+		}
+	}
+	again, err := store.EnsureCandidateProvenance(decision, candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 2 || again[0].ID != rows[0].ID || again[1].ID != rows[1].ID {
+		t.Fatalf("idempotent ensure duplicated candidate rows: before=%#v after=%#v", rows, again)
+	}
+	conflicting := testCandidateProvenanceCreates(invocation.ID, invocation.PlannerVariantID)
+	conflicting[0].BaseScore = 0.12
+	if _, err := store.EnsureCandidateProvenance(decision, conflicting); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("immutable provenance conflict was not rejected: %v", err)
+	}
+	invalid := testCandidateProvenanceCreates(invocation.ID, invocation.PlannerVariantID)
+	invalid[0].AcceptedSpecHash = ""
+	if _, _, err := store.CreateAgentDecisionWithCandidateProvenance(
+		project.ID, "plan_2", decisions.TypeAddExperiments, "must roll back", nil, invalid,
+	); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("invalid candidate provenance did not fail atomically: %v", err)
+	}
+	decisionsForProject, err := store.ListProjectAgentDecisions(project.ID)
+	if err != nil || len(decisionsForProject) != 1 || decisionsForProject[0].Payload["preserved"] != true {
+		t.Fatalf("existing decision payload changed: %#v err=%v", decisionsForProject, err)
+	}
+}
+
+func TestMemoryCandidateProvenanceRepairsDecisionCreatedBeforeCandidateInsert(t *testing.T) {
+	store := NewMemoryStore()
+	project, _ := store.CreateProject("repair provenance", "repair partial persistence")
+	invocation, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID: project.ID, AgentName: "experiment_planner", PlannerVariantID: memory.LegacyPlannerVariantID,
+		ValidationStatus: memory.InvocationValidationValid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := store.CreateAgentDecision(project.ID, "plan_1", decisions.TypeAddExperiments, "decision committed first", map[string]any{"accepted": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := testCandidateProvenanceCreates(invocation.ID, invocation.PlannerVariantID)
+	first, err := store.EnsureCandidateProvenance(decision, candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.EnsureCandidateProvenance(decision, candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || !reflect.DeepEqual(first, second) {
+		t.Fatalf("repair was not deterministic and idempotent: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestScanCandidateProvenancePreservesForecastSelectionAndNullableLineage(t *testing.T) {
+	createdAt := time.Date(2026, time.July, 14, 12, 0, 0, 0, time.UTC)
+	row := fakeAgentInvocationRow{values: []any{
+		"candidate_provenance_1", "project_1", "agent_invocation_1", "decision_1", "planner_variant_1", 2,
+		"sha256:requested", "sha256:accepted", "image_classification", "regularization",
+		"macro_f1", calibration.MetricDirectionHigherIsBetter, "macro_f1_score", calibration.CandidateForecastScoreVersionV1, "job_champion",
+		0.70, 0.02, calibration.CandidatePredictionSource, calibration.CandidateForecastUnits, 0.0, 1.0,
+		0.77, "/payload/candidate_selection_trace/0/candidates/0", true, false, calibration.CandidateSelectionSelected,
+		sql.NullInt64{Int64: 0, Valid: true}, calibration.CandidateOutcomeUnknown, []byte(`["selected"]`),
+		sql.NullString{}, sql.NullString{}, sql.NullString{}, sql.NullString{}, createdAt,
+	}}
+	candidate, err := scanCandidateProvenance(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.CandidateIndex != 2 || candidate.SelectedExperimentIndex == nil || *candidate.SelectedExperimentIndex != 0 || candidate.Forecast.PredictedDelta != 0.02 {
+		t.Fatalf("candidate provenance scan lost forecast or selection: %#v", candidate)
+	}
+	if candidate.FollowUpPlanID != nil || candidate.ExperimentID != nil || candidate.JobID != nil || candidate.RealizedEffectiveHash != nil {
+		t.Fatalf("decision-time nullable lineage did not remain null: %#v", candidate)
+	}
+}
+
+func testCandidateProvenanceCreates(invocationID string, variantID string) []calibration.CandidateProvenanceCreate {
+	selectedIndex := 0
+	forecast := calibration.CandidateForecastContract{
+		ForecastTarget: "macro_f1", MetricDirection: calibration.MetricDirectionHigherIsBetter,
+		ScoreBasis: "macro_f1_score", ScoreVersion: calibration.CandidateForecastScoreVersionV1,
+		BaselineJobID: "job_champion", BaselineScore: 0.70, PredictedDelta: 0.02,
+		PredictionSource: calibration.CandidatePredictionSource, Units: calibration.CandidateForecastUnits,
+		ValidRange: calibration.CandidateForecastRange{Min: 0, Max: 1},
+	}
+	return []calibration.CandidateProvenanceCreate{
+		{
+			InvocationID: invocationID, PlannerVariantID: variantID, CandidateIndex: 0,
+			RequestedConfigHash: "sha256:requested-0", AcceptedSpecHash: "sha256:accepted-0",
+			Task: "image_classification", Mechanism: "class_imbalance", Forecast: forecast, BaseScore: 0.81,
+			SelectionTraceReference: "/payload/candidate_selection_trace?candidate_index=0",
+			Selected:                true, SelectionState: calibration.CandidateSelectionSelected, SelectedExperimentIndex: &selectedIndex,
+			OutcomeStatus: calibration.CandidateOutcomeUnknown, Reasons: []string{"selected by deterministic backend ranking"},
+		},
+		{
+			InvocationID: invocationID, PlannerVariantID: variantID, CandidateIndex: 1,
+			RequestedConfigHash: "sha256:requested-1", AcceptedSpecHash: "sha256:accepted-1",
+			Task: "image_classification", Mechanism: "regularization", Forecast: forecast, BaseScore: 0.61,
+			SelectionTraceReference: "/payload/candidate_selection_trace?candidate_index=1",
+			SelectionState:          calibration.CandidateSelectionUnselected,
+			OutcomeStatus:           calibration.CandidateOutcomeUnknown, Reasons: []string{"eligible but not selected"},
+		},
+	}
+}

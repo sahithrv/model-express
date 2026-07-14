@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	datasetmetadata "model-express/services/orchestrator/internal/datasets/metadata"
 	"model-express/services/orchestrator/internal/decisions"
@@ -54,6 +55,7 @@ type MemoryStore struct {
 	metadataImports            map[string]datasets.DatasetMetadataImport
 	visualAnalyses             map[string]datasets.DatasetVisualAnalysis
 	decisions                  map[string]decisions.AgentDecision
+	candidateProvenance        map[string]calibration.CandidateProvenance
 	workerRequirements         map[string]execution.WorkerRequirement
 	executionEvents            map[string]execution.ExecutionEvent
 	jobExecutionSpecs          map[string]execution.JobExecutionSpec
@@ -90,6 +92,7 @@ func NewMemoryStore() *MemoryStore {
 		metadataImports:         make(map[string]datasets.DatasetMetadataImport),
 		visualAnalyses:          make(map[string]datasets.DatasetVisualAnalysis),
 		decisions:               make(map[string]decisions.AgentDecision),
+		candidateProvenance:     make(map[string]calibration.CandidateProvenance),
 		workerRequirements:      make(map[string]execution.WorkerRequirement),
 		executionEvents:         make(map[string]execution.ExecutionEvent),
 		jobExecutionSpecs:       make(map[string]execution.JobExecutionSpec),
@@ -1330,7 +1333,10 @@ func (s *MemoryStore) ListProjectChampionFeedback(projectID string) ([]runs.Cham
 func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload)
+}
 
+func (s *MemoryStore) createAgentDecisionLocked(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
 	if _, ok := s.projects[projectID]; !ok {
 		return decisions.AgentDecision{}, ErrNotFound
 	}
@@ -1357,6 +1363,157 @@ func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decis
 	}
 	s.decisions[decision.ID] = decision
 	return decision, nil
+}
+
+func (s *MemoryStore) CreateAgentDecisionWithCandidateProvenance(
+	projectID string,
+	planID string,
+	decisionType string,
+	rationale string,
+	payload map[string]any,
+	candidates []calibration.CandidateProvenanceCreate,
+) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.ToUpper(strings.TrimSpace(decisionType)) != decisions.TypeAddExperiments {
+		return decisions.AgentDecision{}, nil, fmt.Errorf("%w: candidate provenance is only valid for ADD_EXPERIMENTS decisions", ErrInvalidRequest)
+	}
+	if len(candidates) == 0 {
+		return decisions.AgentDecision{}, nil, fmt.Errorf("%w: accepted planner decision requires candidate provenance", ErrInvalidRequest)
+	}
+	if err := s.validateCandidateProvenanceCreatesLocked(projectID, candidates); err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	decision, err := s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload)
+	if err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	rows, err := s.ensureCandidateProvenanceLocked(decision, candidates)
+	if err != nil {
+		delete(s.decisions, decision.ID)
+		return decisions.AgentDecision{}, nil, err
+	}
+	return decision, rows, nil
+}
+
+func (s *MemoryStore) EnsureCandidateProvenance(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok := s.decisions[decision.ID]
+	if !ok || stored.ProjectID != decision.ProjectID {
+		return nil, ErrNotFound
+	}
+	if strings.ToUpper(strings.TrimSpace(stored.DecisionType)) != decisions.TypeAddExperiments {
+		return nil, fmt.Errorf("%w: candidate provenance is only valid for ADD_EXPERIMENTS decisions", ErrInvalidRequest)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("%w: accepted planner decision requires candidate provenance", ErrInvalidRequest)
+	}
+	if err := s.validateCandidateProvenanceCreatesLocked(decision.ProjectID, candidates); err != nil {
+		return nil, err
+	}
+	return s.ensureCandidateProvenanceLocked(stored, candidates)
+}
+
+func (s *MemoryStore) validateCandidateProvenanceCreatesLocked(projectID string, candidates []calibration.CandidateProvenanceCreate) error {
+	seen := map[int]bool{}
+	for _, candidate := range candidates {
+		if err := calibration.ValidateCandidateProvenanceCreate(candidate); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if seen[candidate.CandidateIndex] {
+			return fmt.Errorf("%w: duplicate candidate_index %d", ErrInvalidRequest, candidate.CandidateIndex)
+		}
+		seen[candidate.CandidateIndex] = true
+		invocation, ok := s.agentInvocations[candidate.InvocationID]
+		if !ok || invocation.ProjectID != projectID || invocation.PlannerVariantID != candidate.PlannerVariantID {
+			return fmt.Errorf("%w: candidate invocation or planner variant does not match project", ErrInvalidRequest)
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) ensureCandidateProvenanceLocked(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error) {
+	existingByIndex := map[int]calibration.CandidateProvenance{}
+	for _, row := range s.candidateProvenance {
+		if row.DecisionID == decision.ID {
+			existingByIndex[row.CandidateIndex] = row
+		}
+	}
+	now := time.Now().UTC()
+	for _, candidate := range candidates {
+		if existing, ok := existingByIndex[candidate.CandidateIndex]; ok {
+			if !calibration.CandidateProvenanceMatchesCreate(existing, candidate) {
+				return nil, fmt.Errorf("%w: candidate provenance at index %d conflicts with the immutable decision-time record", ErrInvalidRequest, candidate.CandidateIndex)
+			}
+			continue
+		}
+		candidate = cloneCandidateProvenanceCreate(candidate)
+		row := calibration.CandidateProvenance{
+			ID:                        s.newID("candidate_provenance"),
+			ProjectID:                 decision.ProjectID,
+			DecisionID:                decision.ID,
+			CandidateProvenanceCreate: candidate,
+			CreatedAt:                 now,
+		}
+		s.candidateProvenance[row.ID] = row
+		existingByIndex[row.CandidateIndex] = row
+	}
+	rows := make([]calibration.CandidateProvenance, 0, len(existingByIndex))
+	for _, row := range existingByIndex {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CandidateIndex < rows[j].CandidateIndex })
+	return rows, nil
+}
+
+func (s *MemoryStore) ListDecisionCandidateProvenance(decisionID string) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.decisions[decisionID]; !ok {
+		return nil, ErrNotFound
+	}
+	rows := []calibration.CandidateProvenance{}
+	for _, row := range s.candidateProvenance {
+		if row.DecisionID == decisionID {
+			rows = append(rows, row)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CandidateIndex < rows[j].CandidateIndex })
+	return rows, nil
+}
+
+func (s *MemoryStore) ListProjectCandidateProvenance(projectID string) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	rows := []calibration.CandidateProvenance{}
+	for _, row := range s.candidateProvenance {
+		if row.ProjectID == projectID {
+			rows = append(rows, row)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+			if rows[i].DecisionID == rows[j].DecisionID {
+				return rows[i].CandidateIndex < rows[j].CandidateIndex
+			}
+			return rows[i].DecisionID > rows[j].DecisionID
+		}
+		return rows[i].CreatedAt.After(rows[j].CreatedAt)
+	})
+	return rows, nil
+}
+
+func cloneCandidateProvenanceCreate(candidate calibration.CandidateProvenanceCreate) calibration.CandidateProvenanceCreate {
+	candidate.Reasons = append([]string(nil), candidate.Reasons...)
+	if candidate.SelectedExperimentIndex != nil {
+		index := *candidate.SelectedExperimentIndex
+		candidate.SelectedExperimentIndex = &index
+	}
+	return candidate
 }
 
 func (s *MemoryStore) ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {

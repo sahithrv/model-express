@@ -13,6 +13,7 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/diagnostics"
@@ -451,6 +452,9 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		return false, err
 	}
 	if decision, ok := experimentPlannerDecisionForPlan(agentDecisions, input.SourcePlan.ID); ok {
+		if err := s.ensurePlannerCandidateProvenance(decision); err != nil {
+			return true, err
+		}
 		if err := s.persistProjectChampionFromDecision(job.ProjectID, decision); err != nil {
 			log.Printf("persist planner champion failed for project %s decision %s: %v", job.ProjectID, decision.ID, err)
 		}
@@ -550,13 +554,29 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 		return true, nil
 	}
 
-	decision, err := s.store.CreateAgentDecision(
-		job.ProjectID,
-		input.SourcePlan.ID,
-		decisionType,
-		recommendation.Rationale,
-		payload,
-	)
+	var decision decisions.AgentDecision
+	if decisionType == decisions.TypeAddExperiments {
+		candidateRows, provenanceErr := candidateProvenanceCreatesFromPayload(payload)
+		if provenanceErr != nil {
+			return false, provenanceErr
+		}
+		decision, _, err = s.store.CreateAgentDecisionWithCandidateProvenance(
+			job.ProjectID,
+			input.SourcePlan.ID,
+			decisionType,
+			recommendation.Rationale,
+			payload,
+			candidateRows,
+		)
+	} else {
+		decision, err = s.store.CreateAgentDecision(
+			job.ProjectID,
+			input.SourcePlan.ID,
+			decisionType,
+			recommendation.Rationale,
+			payload,
+		)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -1105,6 +1125,9 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			continue
 		}
 		payload, err := experimentPlannerDecisionPayload(recommendation, invocation, agentMode, attemptInput)
+		if err == nil && strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
+			_, err = candidateProvenanceCreatesFromPayload(payload)
+		}
 		if err == nil {
 			verdict := plannerStrictVerdictFromPayload(trace.StrictValidationVerdict, payload)
 			if persistErr := s.persistPlannerValidationAttempt(invocation, verdict, attempt, true, false); persistErr != nil {
@@ -1692,6 +1715,10 @@ func experimentPlannerDecisionPayload(
 	}
 
 	if strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
+		if len(recommendation.CandidateHypotheses) > 0 && len(recommendation.CandidateRankings) == len(recommendation.CandidateHypotheses) {
+			payload[candidateProvenanceSchemaPayloadKey] = calibration.CandidateProvenanceSchemaVersionV1
+			payload["execution_capability_card"] = input.ExecutionCapabilityCard
+		}
 		mode := plannervalidation.ModeFromEnvironment()
 		relaxedValidationWarnings := []string{}
 		relaxedExperiments, relaxedWarnings := plannerExperimentsWithProposalMechanismsRelaxed(recommendation)

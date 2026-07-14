@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
@@ -32,6 +33,75 @@ type PostgresStore struct {
 
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+func scanCandidateProvenance(row rowScanner) (calibration.CandidateProvenance, error) {
+	var candidate calibration.CandidateProvenance
+	var selectedExperimentIndex sql.NullInt64
+	var followUpPlanID sql.NullString
+	var experimentID sql.NullString
+	var jobID sql.NullString
+	var realizedEffectiveHash sql.NullString
+	var reasonsJSON []byte
+	err := row.Scan(
+		&candidate.ID,
+		&candidate.ProjectID,
+		&candidate.InvocationID,
+		&candidate.DecisionID,
+		&candidate.PlannerVariantID,
+		&candidate.CandidateIndex,
+		&candidate.RequestedConfigHash,
+		&candidate.AcceptedSpecHash,
+		&candidate.Task,
+		&candidate.Mechanism,
+		&candidate.Forecast.ForecastTarget,
+		&candidate.Forecast.MetricDirection,
+		&candidate.Forecast.ScoreBasis,
+		&candidate.Forecast.ScoreVersion,
+		&candidate.Forecast.BaselineJobID,
+		&candidate.Forecast.BaselineScore,
+		&candidate.Forecast.PredictedDelta,
+		&candidate.Forecast.PredictionSource,
+		&candidate.Forecast.Units,
+		&candidate.Forecast.ValidRange.Min,
+		&candidate.Forecast.ValidRange.Max,
+		&candidate.BaseScore,
+		&candidate.SelectionTraceReference,
+		&candidate.Selected,
+		&candidate.Rejected,
+		&candidate.SelectionState,
+		&selectedExperimentIndex,
+		&candidate.OutcomeStatus,
+		&reasonsJSON,
+		&followUpPlanID,
+		&experimentID,
+		&jobID,
+		&realizedEffectiveHash,
+		&candidate.CreatedAt,
+	)
+	if err != nil {
+		return calibration.CandidateProvenance{}, normalizeSQLError(err)
+	}
+	if err := json.Unmarshal(reasonsJSON, &candidate.Reasons); err != nil {
+		return calibration.CandidateProvenance{}, fmt.Errorf("unmarshal candidate provenance reasons: %w", err)
+	}
+	if selectedExperimentIndex.Valid {
+		value := int(selectedExperimentIndex.Int64)
+		candidate.SelectedExperimentIndex = &value
+	}
+	if followUpPlanID.Valid {
+		candidate.FollowUpPlanID = &followUpPlanID.String
+	}
+	if experimentID.Valid {
+		candidate.ExperimentID = &experimentID.String
+	}
+	if jobID.Valid {
+		candidate.JobID = &jobID.String
+	}
+	if realizedEffectiveHash.Valid {
+		candidate.RealizedEffectiveHash = &realizedEffectiveHash.String
+	}
+	return candidate, nil
 }
 
 func (s *PostgresStore) CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error) {

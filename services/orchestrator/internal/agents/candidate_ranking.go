@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
@@ -22,8 +23,13 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 	if len(recommendation.CandidateHypotheses) == 0 {
 		return recommendation, fmt.Errorf("experiment planner ADD_EXPERIMENTS requires candidate_hypotheses for backend ranking")
 	}
+	candidates, err := freezeCandidateForecastContracts(input, recommendation.CandidateHypotheses)
+	if err != nil {
+		return recommendation, err
+	}
+	recommendation.CandidateHypotheses = candidates
 
-	rankings, selected, mechanisms, selectionTrace := rankPlannerCandidateHypotheses(input, recommendation.CandidateHypotheses, effectiveMaxPlannerExperiments(input))
+	rankings, selected, mechanisms, selectionTrace := rankPlannerCandidateHypotheses(input, candidates, effectiveMaxPlannerExperiments(input))
 	recommendation.CandidateRankings = rankings
 	recommendation.CandidateSelectionTrace = selectionTrace
 	recommendation.ProposedExperiments = selected
@@ -40,6 +46,81 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 		}
 	}
 	return recommendation, nil
+}
+
+func freezeCandidateForecastContracts(input ExperimentPlannerInput, candidates []CandidateHypothesis) ([]CandidateHypothesis, error) {
+	target := normalizedDiagnosisMetric(input.SourcePlan.TargetMetric)
+	if target == "" {
+		target = "deployment_readiness"
+	}
+	baselineJobID := ""
+	baselineScore := 0.0
+	scoreBasis := target + "_score"
+	baseline := input.CurrentChampion
+	if baseline == nil {
+		baseline = input.SourcePlanBaselineChampion
+	}
+	if baseline != nil {
+		baselineJobID = strings.TrimSpace(baseline.JobID)
+		baselineScore = baseline.Score
+		if normalizedTarget := normalizedDiagnosisMetric(baseline.TargetMetric); normalizedTarget != "" {
+			target = normalizedTarget
+		}
+		if strings.TrimSpace(baseline.ScoreBasis) != "" {
+			scoreBasis = strings.TrimSpace(baseline.ScoreBasis)
+		} else {
+			scoreBasis = target + "_score"
+		}
+	}
+
+	out := append([]CandidateHypothesis(nil), candidates...)
+	for index := range out {
+		frozen := calibration.CandidateForecastContract{
+			ForecastTarget:   target,
+			MetricDirection:  calibration.MetricDirectionHigherIsBetter,
+			ScoreBasis:       scoreBasis,
+			ScoreVersion:     calibration.CandidateForecastScoreVersionV1,
+			BaselineJobID:    baselineJobID,
+			BaselineScore:    baselineScore,
+			PredictedDelta:   out[index].ExpectedMetricImpact,
+			PredictionSource: calibration.CandidatePredictionSource,
+			Units:            calibration.CandidateForecastUnits,
+			ValidRange:       calibration.CandidateForecastRange{Min: 0, Max: 1},
+		}
+		if supplied := out[index].Forecast; supplied != nil {
+			if err := validateCandidateForecastMatchesFrozen(*supplied, frozen); err != nil {
+				return nil, fmt.Errorf("candidate_hypotheses[%d] forecast: %w", index, err)
+			}
+		}
+		if err := calibration.ValidateForecastContract(frozen); err != nil {
+			return nil, fmt.Errorf("candidate_hypotheses[%d] forecast: %w", index, err)
+		}
+		out[index].Forecast = &frozen
+	}
+	return out, nil
+}
+
+func validateCandidateForecastMatchesFrozen(supplied calibration.CandidateForecastContract, frozen calibration.CandidateForecastContract) error {
+	if supplied.ForecastTarget != frozen.ForecastTarget ||
+		supplied.MetricDirection != frozen.MetricDirection ||
+		supplied.ScoreBasis != frozen.ScoreBasis ||
+		supplied.ScoreVersion != frozen.ScoreVersion ||
+		supplied.BaselineJobID != frozen.BaselineJobID ||
+		supplied.PredictionSource != frozen.PredictionSource ||
+		supplied.Units != frozen.Units {
+		return fmt.Errorf("target, direction, score basis/version, baseline, source, and units must match the backend-frozen contract")
+	}
+	if !nearlyEqualCandidateForecast(supplied.BaselineScore, frozen.BaselineScore) ||
+		!nearlyEqualCandidateForecast(supplied.PredictedDelta, frozen.PredictedDelta) ||
+		!nearlyEqualCandidateForecast(supplied.ValidRange.Min, frozen.ValidRange.Min) ||
+		!nearlyEqualCandidateForecast(supplied.ValidRange.Max, frozen.ValidRange.Max) {
+		return fmt.Errorf("baseline_score, predicted_delta, and valid_range must match the backend-frozen contract")
+	}
+	return calibration.ValidateForecastContract(supplied)
+}
+
+func nearlyEqualCandidateForecast(left, right float64) bool {
+	return math.Abs(left-right) <= 1e-9
 }
 
 func mechanismExhausted(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (bool, string) {

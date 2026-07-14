@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
@@ -26,10 +27,10 @@ import (
 const (
 	ExperimentPlannerAgentName     = "experiment_planner"
 	ExperimentPlannerAgentVersion  = "v2"
-	ExperimentPlannerPromptVersion = "experiment_planner_v3"
+	ExperimentPlannerPromptVersion = "experiment_planner_v4"
 
 	ExperimentPlannerToolPolicyVersion      = "planner_information_tools_v1"
-	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v2"
+	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v3"
 	ExperimentPlannerRankerVersion          = "candidate_ranker_v1"
 	ExperimentPlannerRetrievalPolicyVersion = "planner_memory_retrieval_v1"
 )
@@ -767,21 +768,22 @@ type PlannerProposalMechanism struct {
 }
 
 type CandidateHypothesis struct {
-	Hypothesis              string                  `json:"hypothesis"`
-	PlanningMode            string                  `json:"planning_mode"`
-	Mechanism               string                  `json:"mechanism"`
-	Intervention            string                  `json:"intervention"`
-	ProposedChanges         map[string]any          `json:"proposed_changes"`
-	ExpectedEffect          string                  `json:"expected_effect"`
-	ExpectedMetricImpact    float64                 `json:"expected_metric_impact"`
-	ExpectedTradeoffs       []string                `json:"expected_tradeoffs"`
-	Risk                    string                  `json:"risk"`
-	CostLevel               string                  `json:"cost_level"`
-	NoveltyScore            float64                 `json:"novelty_score"`
-	EvidenceUsed            []string                `json:"evidence_used"`
-	SimilarSuccessMemoryIDs []string                `json:"similar_success_memory_ids"`
-	SimilarFailureMemoryIDs []string                `json:"similar_failure_memory_ids"`
-	ExperimentConfig        plans.PlannedExperiment `json:"experiment_config"`
+	Hypothesis              string                                 `json:"hypothesis"`
+	PlanningMode            string                                 `json:"planning_mode"`
+	Mechanism               string                                 `json:"mechanism"`
+	Intervention            string                                 `json:"intervention"`
+	ProposedChanges         map[string]any                         `json:"proposed_changes"`
+	ExpectedEffect          string                                 `json:"expected_effect"`
+	ExpectedMetricImpact    float64                                `json:"expected_metric_impact"`
+	Forecast                *calibration.CandidateForecastContract `json:"forecast,omitempty"`
+	ExpectedTradeoffs       []string                               `json:"expected_tradeoffs"`
+	Risk                    string                                 `json:"risk"`
+	CostLevel               string                                 `json:"cost_level"`
+	NoveltyScore            float64                                `json:"novelty_score"`
+	EvidenceUsed            []string                               `json:"evidence_used"`
+	SimilarSuccessMemoryIDs []string                               `json:"similar_success_memory_ids"`
+	SimilarFailureMemoryIDs []string                               `json:"similar_failure_memory_ids"`
+	ExperimentConfig        plans.PlannedExperiment                `json:"experiment_config"`
 }
 
 type CandidateRanking struct {
@@ -1182,6 +1184,18 @@ Deterministic backend policy will validate and schedule accepted experiment prop
       "proposed_changes": {"class_balancing": "class_balanced_sampler", "sampling_strategy": "class_balanced_sampler", "target_metric": "macro_f1"},
       "expected_effect": "Improve minority recall and macro-F1 by making rare classes visible to the loss/sampler.",
       "expected_metric_impact": 0.025,
+      "forecast": {
+        "forecast_target": "macro_f1",
+        "metric_direction": "higher_is_better",
+        "score_basis": "macro_f1_score",
+        "score_version": "planner_candidate_score_v1",
+        "baseline_job_id": "job_current_champion",
+        "baseline_score": 0.70,
+        "predicted_delta": 0.025,
+        "prediction_source": "candidate.expected_metric_impact",
+        "units": "fractional_score",
+        "valid_range": {"min": 0.0, "max": 1.0}
+      },
       "expected_tradeoffs": ["may reduce majority-class precision"],
       "risk": "medium",
       "cost_level": "low",
@@ -1313,6 +1327,8 @@ Rules:
 - When decision_pressure is champion_confirmation_or_non_architecture_pivot, choose one of: champion confirmation, label/data diagnosis, class imbalance intervention, preprocessing/resolution intervention, SELECT_CHAMPION, STOP_PROJECT, or WAIT.
 - If decision_type is ADD_EXPERIMENTS, propose candidate_hypotheses with complete, novel experiment_config objects.
 - Every candidate_hypothesis must include mechanism, intervention, evidence_used, and expected_effect.
+- Every candidate_hypothesis must include forecast with forecast_target, metric_direction, score_basis, score_version, baseline_job_id, baseline_score, predicted_delta, prediction_source, units, and valid_range copied from planner_context_snapshot.champion_card.
+- candidate_hypotheses[].forecast.predicted_delta must exactly equal that candidate's expected_metric_impact, with prediction_source candidate.expected_metric_impact and fractional_score units. Keep recommendation-level expected_delta_vs_champion separate.
 - Every proposed_experiment must have a matching proposal_mechanisms item with experiment_index, mechanism, intervention, evidence_used, and expected_effect.
 - Prefer returning 6-12 candidate_hypotheses. The backend will score/rank candidates and select 1-5 final proposed_experiments plus proposal_mechanisms.
 - If you include both candidate_hypotheses and proposed_experiments, proposed_experiments are draft-only and must not contradict the candidate set.
@@ -1416,7 +1432,8 @@ func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.J
 
 	outputContract := strings.TrimSpace(strings.Join([]string{
 		"Return JSON with these required top-level keys: summary, decision_type, rationale, confidence, planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, primary_mechanism, governor_compliance, expected_failure_modes, dataset_preprocessing_rationale, changed_variables, success_criteria, stop_condition, deployment_tradeoff, candidate_hypotheses, proposed_experiments, proposal_mechanisms, champion_job_id, why_can_beat_champion, expected_delta_vs_champion, stop_reason, risks, expected_tradeoffs, novelty_notes, rejected_options, tags.",
-		"ADD_EXPERIMENTS also requires candidate_hypotheses[] items with hypothesis, planning_mode, mechanism, intervention, proposed_changes, expected_effect, expected_metric_impact, expected_tradeoffs, risk, cost_level, novelty_score, evidence_used, similar_success_memory_ids, similar_failure_memory_ids, and experiment_config.",
+		"ADD_EXPERIMENTS also requires candidate_hypotheses[] items with hypothesis, planning_mode, mechanism, intervention, proposed_changes, expected_effect, expected_metric_impact, forecast, expected_tradeoffs, risk, cost_level, novelty_score, evidence_used, similar_success_memory_ids, similar_failure_memory_ids, and experiment_config.",
+		"Each forecast must freeze forecast_target, metric_direction, score_basis, score_version, baseline_job_id, baseline_score, predicted_delta, prediction_source, units, and valid_range from planner_context_snapshot.champion_card. predicted_delta must exactly equal expected_metric_impact and prediction_source must be candidate.expected_metric_impact; do not use recommendation-level expected_delta_vs_champion as a candidate forecast.",
 		"experiment_config must still be backend-valid and include template, model, epochs, batch_size, learning_rate, and any other supported knobs only when evidence justifies them.",
 		"proposal_mechanisms[] must mirror selected experiments with experiment_index, mechanism, intervention, evidence_used, and expected_effect.",
 		"Do not rely on direct proposed_experiments to force scheduling; they are draft-only for ADD_EXPERIMENTS.",

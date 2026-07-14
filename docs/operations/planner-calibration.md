@@ -86,6 +86,36 @@ or default-equivalent request differences cannot disguise the same executable
 configuration. Execution-time requested-versus-realized mismatches remain in
 the execution-fidelity reports and are not inferred by planner validation.
 
+## Candidate provenance and forecast contract
+
+Migration `021_candidate_provenance.sql` creates one immutable decision-time
+row for every candidate in an accepted `ADD_EXPERIMENTS` recommendation. Rows
+are written before manual and autonomous scheduling paths diverge and contain
+the invocation, decision, exact planner variant, zero-based candidate and
+selected-experiment indexes, requested and accepted execution hashes, task,
+mechanism, base ranker score, selection state/reasons, and the frozen candidate
+forecast. Unselected and ranker-rejected candidates start with
+`outcome_status=unknown`; selection is not treated as an observed outcome.
+
+The forecast is sourced only from `candidate.expected_metric_impact` and keeps
+`expected_delta_vs_champion` as a separate recommendation-level field. Its
+contract freezes the target, direction, score basis/version, baseline job and
+score, units, and finite delta range at decision time. The backend fills this
+contract for compatibility with responses produced before the prompt update
+and rejects supplied contracts that disagree with the frozen context.
+
+Decision and candidate insertion are atomic in PostgreSQL and the memory
+store. The existing-decision path also performs an idempotent ensure so a
+decision-only partial write from a non-transactional boundary can be repaired
+without duplicate rows. Follow-up plan, experiment, job, and realized-effective
+hash columns intentionally remain null until outcome finalization. Invalid
+pre-acceptance attempts remain only in the invocation audit.
+
+The rollout is additive and has no scheduling flag. Existing historical
+decisions are not inferred or backfilled because they may lack a trustworthy
+frozen forecast or accepted-spec identity; provenance begins with decisions
+that declare `candidate_provenance_v1`.
+
 ## Opt-in paired provider evaluation
 
 Live generation is read-only and requires all of the following:
