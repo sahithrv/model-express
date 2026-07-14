@@ -1,6 +1,7 @@
 package evals
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,10 +18,12 @@ import (
 
 type PlannerReplayFixture struct {
 	Name         string                `json:"name"`
+	Starter      bool                  `json:"starter,omitempty"`
 	Input        map[string]any        `json:"input"`
 	InputSummary map[string]any        `json:"input_summary,omitempty"`
 	Response     map[string]any        `json:"response,omitempty"`
 	Expected     PlannerReplayExpected `json:"expected"`
+	Rubric       PlannerRubric         `json:"rubric,omitempty"`
 }
 
 type PlannerReplayExpected struct {
@@ -28,6 +31,37 @@ type PlannerReplayExpected struct {
 	AllowedDecisions               []string `json:"allowed_decisions"`
 	AllowedAddExperimentMechanisms []string `json:"allowed_add_experiment_mechanisms"`
 	MaxSelectedExperiments         int      `json:"max_selected_experiments"`
+}
+
+//go:embed testdata/*.json
+var plannerFixtureFS embed.FS
+
+// LoadStarterPlannerRubricFixtures loads the small checked-in PR3 corpus from
+// the binary itself, so the deterministic rubric command is independent of
+// its current working directory.
+func LoadStarterPlannerRubricFixtures() ([]PlannerReplayFixture, error) {
+	entries, err := plannerFixtureFS.ReadDir("testdata")
+	if err != nil {
+		return nil, err
+	}
+	fixtures := []PlannerReplayFixture{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		blob, err := plannerFixtureFS.ReadFile("testdata/" + entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		var fixture PlannerReplayFixture
+		if err := json.Unmarshal(blob, &fixture); err != nil {
+			return nil, fmt.Errorf("decode embedded planner fixture %s: %w", entry.Name(), err)
+		}
+		if fixture.Starter {
+			fixtures = append(fixtures, fixture)
+		}
+	}
+	return fixtures, nil
 }
 
 func LoadPlannerReplayFixture(path string) (PlannerReplayFixture, error) {

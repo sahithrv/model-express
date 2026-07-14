@@ -170,15 +170,6 @@ func replayOnePassSelectionOrder(rankings []agents.CandidateRanking, limit int) 
 	return selected
 }
 
-func TestReplayLiveMiniGateDefaultOff(t *testing.T) {
-	if plannerReplayLiveEnabled() {
-		t.Skip("live replay gate is enabled in this environment")
-	}
-	if _, err := ReplayLiveMiniIfEnabled(context.Background(), agents.ExperimentPlannerAgent{}, loadClassificationFixture(t)); err == nil {
-		t.Fatal("expected live replay helper to remain gated off by default")
-	}
-}
-
 func TestReplayPlateauBackboneLotteryRejectsArchitectureChallenge(t *testing.T) {
 	fixture := loadPlateauFixture(t)
 	input := ExperimentPlannerInputFromReplayFixture(fixture)
@@ -498,7 +489,7 @@ func assertReplayArtifactSmoke(t *testing.T, artifact PlannerReplayArtifact, exp
 
 func assertReplayVariantPromptOrdering(t *testing.T, artifact PlannerReplayArtifact) {
 	t.Helper()
-	var current, compact, contextV2, distilled int
+	var current, compact, contextV2 int
 	for _, result := range artifact.Variants {
 		switch result.Variant {
 		case PlannerReplayVariantCurrentV1:
@@ -507,11 +498,9 @@ func assertReplayVariantPromptOrdering(t *testing.T, artifact PlannerReplayArtif
 			compact = result.PromptBytes
 		case PlannerReplayVariantContextV2:
 			contextV2 = result.PromptBytes
-		case PlannerReplayVariantDistilledMemoryFirst:
-			distilled = result.PromptBytes
 		}
 	}
-	if current == 0 || compact == 0 || contextV2 == 0 || distilled == 0 {
+	if current == 0 || compact == 0 || contextV2 == 0 {
 		t.Fatalf("expected all replay variants to have prompt sizes, got %#v", artifact.Variants)
 	}
 	if !(compact < current) {
@@ -519,9 +508,6 @@ func assertReplayVariantPromptOrdering(t *testing.T, artifact PlannerReplayArtif
 	}
 	if !(contextV2 < current) {
 		t.Fatalf("expected context V2 to be smaller than current V1, current=%d context_v2=%d", current, contextV2)
-	}
-	if !(distilled < current) {
-		t.Fatalf("expected distilled-memory-first to be smaller than current V1, current=%d distilled=%d", current, distilled)
 	}
 }
 

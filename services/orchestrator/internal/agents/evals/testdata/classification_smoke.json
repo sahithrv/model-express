@@ -1,5 +1,6 @@
 {
   "name": "classification_smoke",
+  "starter": true,
   "input_summary": {
     "project_name": "Classification Smoke",
     "project_goal": "Improve macro-F1 without making the classifier heavy.",
@@ -295,6 +296,15 @@
     "forbidden_mechanisms": ["architecture_challenge"],
     "allowed_decisions": ["ADD_EXPERIMENTS", "SELECT_CHAMPION", "STOP_PROJECT", "WAIT"],
     "allowed_add_experiment_mechanisms": ["class_imbalance", "resolution_crop", "baseline_control", "preprocessing_ablation"],
+    "max_selected_experiments": 2
+  },
+  "rubric": {
+    "id": "classification_add_experiments_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["class_imbalance", "resolution_crop", "baseline_control", "preprocessing_ablation"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "task_type": "image_classification",
     "max_selected_experiments": 2
   }
 }

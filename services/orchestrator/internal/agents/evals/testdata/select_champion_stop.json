@@ -1,0 +1,52 @@
+{
+  "name": "select_champion_stop",
+  "starter": true,
+  "input_summary": {
+    "project_name": "Select Champion Stop",
+    "project_goal": "Stop low-value follow-ups after a measured plateau.",
+    "dataset_name": "select-champion-stop",
+    "task_type": "image_classification",
+    "target_metric": "macro_f1",
+    "class_count": 4,
+    "total_images": 800,
+    "completed_training_runs": 18,
+    "planner_rounds": 6,
+    "no_improvement_rounds": 4,
+    "first_successful_score": 0.704,
+    "current_best_score": 0.751,
+    "current_best_model": "mobilenet_v3_large",
+    "attempted_models": ["mobilenet_v3_large", "efficientnet_b0", "resnet18"],
+    "dominant_mechanism": "architecture_challenge"
+  },
+  "response": {
+    "summary": "Select the current champion and stop scheduling low-value follow-ups.",
+    "decision_type": "SELECT_CHAMPION",
+    "rationale": "Four follow-up rounds failed to produce a meaningful improvement, while the current champion remains deployment-ready.",
+    "confidence": 0.91,
+    "evidence_used": [
+      "four consecutive follow-up rounds produced less than the meaningful improvement floor",
+      "the current champion has the best validated macro-F1"
+    ],
+    "candidate_hypotheses": [],
+    "proposed_experiments": [],
+    "proposal_mechanisms": [],
+    "champion_job_id": "job_18",
+    "stop_reason": "Observed plateau and exhausted architecture exploration make further scheduling low value."
+  },
+  "expected": {
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "allowed_decisions": ["SELECT_CHAMPION", "STOP_PROJECT"],
+    "allowed_add_experiment_mechanisms": [],
+    "max_selected_experiments": 0
+  },
+  "rubric": {
+    "id": "select_champion_stop_v1",
+    "expected_decision_types": ["SELECT_CHAMPION"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "task_type": "image_classification",
+    "require_stop_reason": true,
+    "require_champion_job_id": true,
+    "require_no_experiments": true
+  }
+}

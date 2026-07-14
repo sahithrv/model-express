@@ -868,6 +868,24 @@ type ExperimentPlanningTrace struct {
 	DryRunValidationResults []map[string]any
 }
 
+// ExperimentPlannerRequestVariant selects only production-supported prompt and
+// context builders. Evaluation code uses this explicit form instead of
+// changing process-wide environment variables between paired calls.
+type ExperimentPlannerRequestVariant struct {
+	StaticPromptVersion string `json:"static_prompt_version"`
+	ContextVersion      string `json:"context_version"`
+}
+
+// ExperimentPlannerRequestBuild is the complete request produced at the same
+// boundary used by PlanWithTrace. It is exposed so read-only evaluators can
+// budget and measure the request before making an opt-in provider call.
+type ExperimentPlannerRequestBuild struct {
+	Request               llm.JSONRequest `json:"request"`
+	PromptContext         map[string]any  `json:"prompt_context"`
+	StaticPromptVersion   string          `json:"static_prompt_version"`
+	ContextBuilderVersion string          `json:"context_builder_version"`
+}
+
 func NewExperimentPlannerAgent(generator llm.JSONGenerator, model string) ExperimentPlannerAgent {
 	return ExperimentPlannerAgent{
 		generator: generator,
@@ -892,25 +910,66 @@ func (a ExperimentPlannerAgent) Plan(ctx context.Context, input ExperimentPlanne
 }
 
 func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input ExperimentPlannerInput) (ExperimentPlanningTrace, error) {
-	staticPromptVersion := plannerStaticPromptVersion()
+	return a.PlanWithVariantTrace(ctx, input, ExperimentPlannerRequestVariant{
+		StaticPromptVersion: plannerStaticPromptVersion(),
+		ContextVersion:      plannerContextSnapshotVersion(),
+	})
+}
+
+// BuildRequest builds a planner request through the production prompt and
+// context builders without invoking the provider or mutating planner input.
+func (a ExperimentPlannerAgent) BuildRequest(input ExperimentPlannerInput, variant ExperimentPlannerRequestVariant) (ExperimentPlannerRequestBuild, error) {
+	staticPromptVersion, err := normalizePlannerStaticPromptVersion(variant.StaticPromptVersion)
+	if err != nil {
+		return ExperimentPlannerRequestBuild{}, err
+	}
+	contextVersion, err := normalizePlannerContextVersion(variant.ContextVersion)
+	if err != nil {
+		return ExperimentPlannerRequestBuild{}, err
+	}
+	promptContext := experimentPlannerPromptContextForVersions(input, contextVersion, staticPromptVersion)
+	contextBlob, err := json.Marshal(promptContext)
+	if err != nil {
+		return ExperimentPlannerRequestBuild{}, fmt.Errorf("marshal experiment planner context: %w", err)
+	}
+	request := experimentPlannerJSONRequestForStaticPromptVersion(a.model, contextBlob, staticPromptVersion)
+	request.ReasoningEffort = a.reasoningEffortForInput(input)
+	return ExperimentPlannerRequestBuild{
+		Request:               request,
+		PromptContext:         promptContext,
+		StaticPromptVersion:   staticPromptVersion,
+		ContextBuilderVersion: plannerContextBuilderVersion(promptContext),
+	}, nil
+}
+
+// PlanWithVariantTrace runs the normal generation, finalization, and backend
+// validation path with an explicit production request variant. The same full
+// input is always passed to the finalizer; context variants affect only the
+// request projection seen by the model.
+func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input ExperimentPlannerInput, variant ExperimentPlannerRequestVariant) (ExperimentPlanningTrace, error) {
 	rankerMultiFidelity := multiFidelityPolicyEnabled()
 	validatorMode := "relaxed"
 	if plannerStrictValidationEnabled() {
 		validatorMode = "strict"
 	}
 	input.RankerMultiFidelityEnabled = &rankerMultiFidelity
-	promptContext := experimentPlannerPromptContext(input)
 	trace := ExperimentPlanningTrace{
-		PromptContext:         promptContext,
-		ParsedOutput:          map[string]any{},
-		ValidationStatus:      memory.InvocationValidationFailed,
-		AgentVersion:          ExperimentPlannerAgentVersion,
-		PromptVersion:         ExperimentPlannerPromptVersion,
-		StaticPromptVersion:   staticPromptVersion,
-		ContextBuilderVersion: plannerContextBuilderVersion(promptContext),
-		ValidatorMode:         validatorMode,
-		RankerMultiFidelity:   rankerMultiFidelity,
+		ParsedOutput:        map[string]any{},
+		ValidationStatus:    memory.InvocationValidationFailed,
+		AgentVersion:        ExperimentPlannerAgentVersion,
+		PromptVersion:       ExperimentPlannerPromptVersion,
+		ValidatorMode:       validatorMode,
+		RankerMultiFidelity: rankerMultiFidelity,
 	}
+	built, err := a.BuildRequest(input, variant)
+	if err != nil {
+		trace.ValidationError = err.Error()
+		return trace, err
+	}
+	trace.Request = built.Request
+	trace.PromptContext = built.PromptContext
+	trace.StaticPromptVersion = built.StaticPromptVersion
+	trace.ContextBuilderVersion = built.ContextBuilderVersion
 
 	if a.generator == nil {
 		err := fmt.Errorf("experiment planner requires an llm generator")
@@ -918,15 +977,6 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 		return trace, err
 	}
 
-	contextBlob, err := json.Marshal(trace.PromptContext)
-	if err != nil {
-		wrapped := fmt.Errorf("marshal experiment planner context: %w", err)
-		trace.ValidationError = wrapped.Error()
-		return trace, wrapped
-	}
-
-	trace.Request = experimentPlannerJSONRequestForStaticPromptVersion(a.model, contextBlob, staticPromptVersion)
-	trace.Request.ReasoningEffort = a.reasoningEffortForInput(input)
 	raw, err := a.generatePlannerJSON(ctx, &trace, input)
 	if err != nil {
 		trace.ValidationError = err.Error()
@@ -944,14 +994,8 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 	}
 
 	recommendation.AgentName = ExperimentPlannerAgentName
-	recommendation, err = FinalizePlannerRecommendation(input, recommendation)
+	recommendation, err = FinalizeAndValidatePlannerRecommendation(input, recommendation)
 	if err != nil {
-		trace.ValidationStatus = memory.InvocationValidationInvalid
-		trace.ValidationError = err.Error()
-		trace.Recommendation = recommendation
-		return trace, err
-	}
-	if err := validateExperimentPlanningRecommendation(recommendation, maxPlannerExperiments(input.MaxExperiments)); err != nil {
 		trace.ValidationStatus = memory.InvocationValidationInvalid
 		trace.ValidationError = err.Error()
 		trace.Recommendation = recommendation
@@ -962,6 +1006,20 @@ func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input Experim
 	trace.ValidationStatus = memory.InvocationValidationValid
 	trace.ValidationError = ""
 	return trace, nil
+}
+
+// FinalizeAndValidatePlannerRecommendation is the production schedulability
+// oracle used by both planner execution and calibration. Rubrics may label the
+// quality of a schedulable result, but they do not replace this backend gate.
+func FinalizeAndValidatePlannerRecommendation(input ExperimentPlannerInput, recommendation ExperimentPlanningRecommendation) (ExperimentPlanningRecommendation, error) {
+	finalized, err := FinalizePlannerRecommendation(input, recommendation)
+	if err != nil {
+		return finalized, err
+	}
+	if err := validateExperimentPlanningRecommendation(finalized, maxPlannerExperiments(input.MaxExperiments)); err != nil {
+		return finalized, err
+	}
+	return finalized, nil
 }
 
 type plannerToolLoopGenerator interface {
@@ -1376,20 +1434,40 @@ Context:
 }
 
 func plannerStaticPromptVersion() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION"))) {
-	case plannerStaticPromptVersionCompactV1:
-		return plannerStaticPromptVersionCompactV1
-	default:
+	version, err := normalizePlannerStaticPromptVersion(os.Getenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION"))
+	if err != nil {
 		return plannerStaticPromptVersionV1
 	}
+	return version
 }
 
 func plannerContextSnapshotVersion() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION"))) {
-	case "v2":
-		return "v2"
-	default:
+	version, err := normalizePlannerContextVersion(os.Getenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION"))
+	if err != nil {
 		return "v1"
+	}
+	return version
+}
+
+func normalizePlannerStaticPromptVersion(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", plannerStaticPromptVersionV1:
+		return plannerStaticPromptVersionV1, nil
+	case plannerStaticPromptVersionCompactV1:
+		return plannerStaticPromptVersionCompactV1, nil
+	default:
+		return "", fmt.Errorf("unsupported planner static prompt version %q", value)
+	}
+}
+
+func normalizePlannerContextVersion(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "v1":
+		return "v1", nil
+	case "v2":
+		return "v2", nil
+	default:
+		return "", fmt.Errorf("unsupported planner context version %q", value)
 	}
 }
 
@@ -1783,13 +1861,20 @@ func plannerAutoMLCovers(experiment plans.PlannedExperiment, name string) bool {
 }
 
 func experimentPlannerPromptContext(input ExperimentPlannerInput) map[string]any {
+	return experimentPlannerPromptContextForVersions(input, plannerContextSnapshotVersion(), plannerStaticPromptVersion())
+}
+
+func experimentPlannerPromptContextForVersions(input ExperimentPlannerInput, contextVersion string, staticPromptVersion string) map[string]any {
 	return map[string]any{
-		"planner_context_snapshot": BuildPlannerContextSnapshot(input),
+		"planner_context_snapshot": buildPlannerContextSnapshot(input, contextVersion, staticPromptVersion),
 	}
 }
 
 func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSnapshot {
-	contextVersion := plannerContextSnapshotVersion()
+	return buildPlannerContextSnapshot(input, plannerContextSnapshotVersion(), plannerStaticPromptVersion())
+}
+
+func buildPlannerContextSnapshot(input ExperimentPlannerInput, contextVersion string, staticPromptVersion string) PlannerContextSnapshot {
 	retrievedMemory := buildPlannerRetrievedMemorySnapshot(input.RetrievedMemory)
 	promptBudget := PlannerPromptBudget{
 		RawSectionsExcluded: []string{
@@ -1857,11 +1942,11 @@ func BuildPlannerContextSnapshot(input ExperimentPlannerInput) PlannerContextSna
 	if contextVersion == "v2" {
 		snapshot = plannerContextSnapshotV2(snapshot)
 	}
-	snapshot.PromptBudget = plannerPromptBudgetWithEstimates(snapshot, promptBudget)
+	snapshot.PromptBudget = plannerPromptBudgetWithEstimates(snapshot, promptBudget, staticPromptVersion)
 	return snapshot
 }
 
-func plannerPromptBudgetWithEstimates(snapshot PlannerContextSnapshot, base PlannerPromptBudget) PlannerPromptBudget {
+func plannerPromptBudgetWithEstimates(snapshot PlannerContextSnapshot, base PlannerPromptBudget, staticPromptVersion string) PlannerPromptBudget {
 	budget := base
 	if snapshot.RetrievedMemory != nil {
 		budget.MaxRetrievedMemoryCards = snapshot.RetrievedMemory.Caps.MaxTotal
@@ -1874,7 +1959,7 @@ func plannerPromptBudgetWithEstimates(snapshot PlannerContextSnapshot, base Plan
 	}
 	budget.SectionEstimates = map[string]PlannerPromptSectionEstimate{}
 
-	measurementRequest := experimentPlannerJSONRequest("", []byte(`{}`))
+	measurementRequest := experimentPlannerJSONRequestForStaticPromptVersion("", []byte(`{}`), staticPromptVersion)
 	if len(measurementRequest.Messages) > 0 {
 		budget.SectionEstimates["static_instructions"] = plannerPromptSectionEstimateFromText(measurementRequest.Messages[0].Content)
 	}
