@@ -1,0 +1,75 @@
+{
+  "name": "memory_success_reuse",
+  "description": "A compatible successful memory should support reusing its mechanism with a new configuration.",
+  "coverage": ["memory_success", "classification", "add_experiments", "class_imbalance"],
+  "input_summary": {
+    "project_name": "Memory Success Reuse",
+    "task_type": "image_classification",
+    "completed_training_runs": 5,
+    "planner_rounds": 2,
+    "first_successful_score": 0.6,
+    "current_best_score": 0.67,
+    "current_best_model": "mobilenet_v3_small",
+    "attempted_models": ["mobilenet_v3_small", "efficientnet_b0"],
+    "dominant_mechanism": "baseline_control",
+    "successful_strategy_memory": [{
+      "memory_id": "memory_success_weighted_loss",
+      "outcome_status": "improved_champion",
+      "lesson": "Weighted loss improved minority recall on a compatible dataset.",
+      "mechanism": "class_imbalance",
+      "proposed_models": ["efficientnet_b0"]
+    }]
+  },
+  "response": {
+    "summary": "Reuse the successful class-balancing mechanism in a novel accepted configuration.",
+    "decision_type": "ADD_EXPERIMENTS",
+    "rationale": "Compatible memory and the current minority gap point to the same mechanism.",
+    "confidence": 0.83,
+    "planning_mode": "class_imbalance_ablation",
+    "evidence_used": ["successful weighted-loss memory improved minority recall", "current macro-F1 trails accuracy"],
+    "candidate_hypotheses": [{
+      "hypothesis": "Weighted loss on EfficientNet will transfer the prior minority-recall gain.",
+      "mechanism": "class_imbalance",
+      "intervention": "Apply weighted loss to a novel EfficientNet configuration.",
+      "expected_effect": "Improve minority recall and macro-F1.",
+      "expected_metric_impact": 0.02,
+      "evidence_used": ["successful memory", "minority gap"],
+      "similar_success_memory_ids": ["memory_success_weighted_loss"],
+      "experiment_config": {
+        "template": "efficientnet_transfer",
+        "model": "efficientnet_b0",
+        "epochs": 11,
+        "batch_size": 16,
+        "learning_rate": 0.00025,
+        "reason": "Reuse successful weighting in a novel config.",
+        "class_balancing": "weighted_loss",
+        "mechanism": "class_imbalance"
+      }
+    }],
+    "proposed_experiments": [{
+      "template": "efficientnet_transfer",
+      "model": "efficientnet_b0",
+      "epochs": 11,
+      "batch_size": 16,
+      "learning_rate": 0.00025,
+      "reason": "Reuse successful weighting in a novel config.",
+      "class_balancing": "weighted_loss",
+      "mechanism": "class_imbalance"
+    }]
+  },
+  "rubric": {
+    "id": "memory_success_reuse_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["class_imbalance"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["successful", "minority"],
+    "task_type": "image_classification",
+    "max_selected_experiments": 1
+  },
+  "mutations": [{
+    "name": "ignore-successful-mechanism",
+    "operation": "set_mechanism",
+    "value": "architecture_challenge",
+    "expected_failed_checks": ["mechanisms"]
+  }]
+}

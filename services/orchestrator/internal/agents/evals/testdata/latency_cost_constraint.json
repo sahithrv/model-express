@@ -1,0 +1,72 @@
+{
+  "name": "latency_cost_constraint",
+  "description": "A live-service budget should favor a compact deployment-latency intervention over an expensive model.",
+  "coverage": ["latency", "cost", "classification", "deployment_constraint", "add_experiments"],
+  "input_summary": {
+    "project_name": "Latency Cost Constraint",
+    "project_goal": "Stay below the live latency and training-cost budget.",
+    "task_type": "image_classification",
+    "completed_training_runs": 7,
+    "planner_rounds": 3,
+    "first_successful_score": 0.62,
+    "current_best_score": 0.7,
+    "current_best_model": "efficientnet_b0",
+    "attempted_models": ["mobilenet_v3_small", "efficientnet_b0"],
+    "dominant_mechanism": "architecture_challenge"
+  },
+  "response": {
+    "summary": "Test the compact model under the explicit serving budget.",
+    "decision_type": "ADD_EXPERIMENTS",
+    "rationale": "The remaining decision is deployment fitness, not maximum offline capacity.",
+    "confidence": 0.81,
+    "planning_mode": "champion_challenge",
+    "evidence_used": ["p95 latency exceeds the live budget", "training cost is capped"],
+    "candidate_hypotheses": [{
+      "hypothesis": "A compact MobileNet can preserve useful macro-F1 while meeting latency.",
+      "mechanism": "deployment_latency",
+      "intervention": "Challenge the quality champion with a compact live-service candidate.",
+      "expected_effect": "Meet p95 latency with bounded quality loss.",
+      "expected_metric_impact": 0.01,
+      "evidence_used": ["latency budget", "training cost cap"],
+      "experiment_config": {
+        "template": "mobilenet_transfer",
+        "model": "mobilenet_v3_small",
+        "epochs": 8,
+        "batch_size": 16,
+        "learning_rate": 0.0003,
+        "reason": "Evaluate a compact deployment candidate.",
+        "image_size": 192,
+        "resolution_strategy": "low_latency",
+        "mechanism": "deployment_latency"
+      }
+    }],
+    "proposed_experiments": [{
+      "template": "mobilenet_transfer",
+      "model": "mobilenet_v3_small",
+      "epochs": 8,
+      "batch_size": 16,
+      "learning_rate": 0.0003,
+      "reason": "Evaluate a compact deployment candidate.",
+      "image_size": 192,
+      "resolution_strategy": "low_latency",
+      "mechanism": "deployment_latency"
+    }]
+  },
+  "rubric": {
+    "id": "latency_cost_constraint_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["deployment_latency"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["latency", "cost"],
+    "task_type": "image_classification",
+    "allowed_models": ["mobilenet_v3_small"],
+    "max_selected_experiments": 1
+  },
+  "mutations": [{
+    "name": "expensive-architecture-pivot",
+    "operation": "set_mechanism",
+    "value": "architecture_challenge",
+    "expected_failed_checks": ["mechanisms"]
+  }]
+}

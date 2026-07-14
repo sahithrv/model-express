@@ -1,0 +1,41 @@
+{
+  "name": "memory_rejection_stop",
+  "description": "Repeated rejected/blocked strategies with no new evidence should stop the project safely.",
+  "coverage": ["memory_rejection", "stop_project", "stop_behavior", "classification"],
+  "input_summary": {
+    "project_name": "Memory Rejection Stop",
+    "task_type": "image_classification",
+    "completed_training_runs": 14,
+    "planner_rounds": 5,
+    "first_successful_score": 0.64,
+    "current_best_score": 0.71,
+    "current_best_model": "mobilenet_v3_large",
+    "attempted_models": ["mobilenet_v3_large", "efficientnet_b0", "resnet18"],
+    "dominant_mechanism": "architecture_challenge"
+  },
+  "response": {
+    "summary": "Stop because every remaining strategy is blocked or previously rejected.",
+    "decision_type": "STOP_PROJECT",
+    "rationale": "No supported, evidence-backed mechanism remains after repeated rejection.",
+    "confidence": 0.94,
+    "evidence_used": ["three proposed mechanisms were previously rejected", "no new dataset or outcome evidence is available"],
+    "candidate_hypotheses": [],
+    "proposed_experiments": [],
+    "stop_reason": "Rejected-strategy memory and exhausted evidence leave no safe useful follow-up."
+  },
+  "rubric": {
+    "id": "memory_rejection_stop_v1",
+    "expected_decision_types": ["STOP_PROJECT"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["rejected", "evidence"],
+    "task_type": "image_classification",
+    "require_stop_reason": true,
+    "require_no_experiments": true
+  },
+  "mutations": [{
+    "name": "stop-without-reason",
+    "operation": "clear_stop_reason",
+    "expected_failed_checks": ["stop_behavior"]
+  }]
+}

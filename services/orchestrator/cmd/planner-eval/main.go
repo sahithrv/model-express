@@ -27,7 +27,7 @@ func main() {
 func run() error {
 	var (
 		live             = flag.Bool("live", false, "run opt-in paired provider evaluation instead of deterministic rubric scoring")
-		fixturePaths     = flag.String("fixtures", "", "comma-separated fixture JSON paths; defaults to embedded starter scenarios")
+		fixturePaths     = flag.String("fixtures", "", "comma-separated fixture JSON paths; defaults to the complete embedded scenario corpus")
 		repeats          = flag.Int("repeats", 1, "live generations per variant")
 		maxAttempts      = flag.Int("max-attempts", 1, "live attempts per variant/repeat (1-3)")
 		maxProviderCalls = flag.Int("max-provider-calls", 0, "required hard live provider-call reservation budget")
@@ -35,13 +35,16 @@ func run() error {
 		maxTotalTokens   = flag.Int("max-total-tokens", 0, "optional observed live token ceiling")
 		maxJSONLBytes    = flag.Int("max-jsonl-bytes", defaultMaxJSONLBytes, "maximum bytes per emitted JSONL record")
 		timeout          = flag.Duration("timeout", 10*time.Minute, "overall live evaluation timeout")
+		checkBaseline    = flag.Bool("check-baseline", false, "compare deterministic results with the checked baseline")
+		baselinePath     = flag.String("baseline", "", "optional baseline JSON path; defaults to the embedded checked baseline")
+		updateBaseline   = flag.String("update-baseline", "", "write a reviewed deterministic baseline to this path")
 	)
 	flag.Parse()
 
 	if *maxJSONLBytes < 1024 || *maxJSONLBytes > 16*1024*1024 {
 		return fmt.Errorf("max-jsonl-bytes must be between 1024 and 16777216")
 	}
-	fixtures, err := loadFixtures(*fixturePaths)
+	fixtures, err := loadFixtures(*fixturePaths, *live)
 	if err != nil {
 		return err
 	}
@@ -50,7 +53,35 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		if strings.TrimSpace(*updateBaseline) != "" {
+			if *checkBaseline {
+				return errors.New("-check-baseline and -update-baseline are mutually exclusive")
+			}
+			return evals.WritePlannerRubricBaseline(filepath.Clean(*updateBaseline), artifact)
+		}
+		if *checkBaseline {
+			var baseline evals.PlannerRubricBaseline
+			if strings.TrimSpace(*baselinePath) == "" {
+				baseline, err = evals.LoadCheckedPlannerRubricBaseline()
+			} else {
+				baseline, err = evals.LoadPlannerRubricBaseline(filepath.Clean(*baselinePath))
+			}
+			if err != nil {
+				return err
+			}
+			comparison := evals.ComparePlannerRubricBaseline(baseline, artifact)
+			if err := writeBoundedJSONL(comparison, *maxJSONLBytes); err != nil {
+				return err
+			}
+			if !comparison.Passed {
+				return errors.New("planner rubric baseline tolerances were exceeded")
+			}
+			return nil
+		}
 		return writeBoundedJSONL(artifact, *maxJSONLBytes)
+	}
+	if *checkBaseline || strings.TrimSpace(*updateBaseline) != "" || strings.TrimSpace(*baselinePath) != "" {
+		return errors.New("baseline flags are available only for deterministic evaluation")
 	}
 
 	if !liveEvalEnabled() {
@@ -101,9 +132,12 @@ func run() error {
 	return nil
 }
 
-func loadFixtures(value string) ([]evals.PlannerReplayFixture, error) {
+func loadFixtures(value string, live bool) ([]evals.PlannerReplayFixture, error) {
 	if strings.TrimSpace(value) == "" {
-		return evals.LoadStarterPlannerRubricFixtures()
+		if live {
+			return evals.LoadStarterPlannerRubricFixtures()
+		}
+		return evals.LoadPlannerRubricFixtures()
 	}
 	fixtures := []evals.PlannerReplayFixture{}
 	for _, path := range strings.Split(value, ",") {

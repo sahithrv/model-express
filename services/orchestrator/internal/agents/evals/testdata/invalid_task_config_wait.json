@@ -1,5 +1,7 @@
 {
   "name": "invalid_task_config_wait",
+  "description": "An invalid task/model configuration should wait without emitting schedulable experiments.",
+  "coverage": ["invalid_task", "invalid_model", "detection", "wait", "safety"],
   "starter": true,
   "input_summary": {
     "project_name": "Invalid Detection Config",
@@ -64,5 +66,11 @@
     "task_type": "object_detection",
     "forbidden_models": ["mobilenet_v3_large", "efficientnet_b0", "resnet18"],
     "require_no_experiments": true
-  }
+  },
+  "mutations": [{
+    "name": "force-invalid-scheduling",
+    "operation": "set_decision_type",
+    "value": "ADD_EXPERIMENTS",
+    "expected_failed_checks": ["decision", "safety"]
+  }]
 }

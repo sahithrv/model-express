@@ -1,5 +1,7 @@
 {
   "name": "yolo_smoke",
+  "description": "Object-detection planning must remain in a detector-capable model family under a live latency constraint.",
+  "coverage": ["detection", "task_sensitive", "latency", "add_experiments"],
   "starter": true,
   "input_summary": {
     "project_name": "YOLO Smoke",
@@ -248,5 +250,11 @@
     "task_type": "object_detection",
     "allowed_models": ["yolo11n.pt", "yolo11s.pt"],
     "max_selected_experiments": 2
-  }
+  },
+  "mutations": [{
+    "name": "classifier-on-yolo",
+    "operation": "set_model",
+    "value": "resnet18",
+    "expected_failed_checks": ["task_compatibility"]
+  }]
 }

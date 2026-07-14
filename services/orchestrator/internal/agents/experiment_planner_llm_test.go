@@ -13,6 +13,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 )
@@ -822,6 +823,43 @@ func TestExperimentPlannerAgentAllowsMinorOnlyTweaksInRelaxedMode(t *testing.T) 
 
 	if err := validateExperimentPlanningRecommendation(recommendation, 5); err != nil {
 		t.Fatalf("expected relaxed planner validation to allow minor-only tweak: %v", err)
+	}
+}
+
+func TestShadowStrictReturnsRelaxedRecommendationWithTypedStrictVerdict(t *testing.T) {
+	input := testExperimentPlannerInput()
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	recommendation.EvidenceUsed = nil
+
+	relaxed, relaxedVerdict, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeRelaxed)
+	if err != nil || relaxedVerdict.Status != plannervalidation.VerdictNotEvaluated {
+		t.Fatalf("relaxed result = %#v verdict=%#v err=%v", relaxed, relaxedVerdict, err)
+	}
+	shadow, shadowVerdict, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeShadowStrict)
+	if err != nil {
+		t.Fatalf("shadow strict blocked the relaxed decision: %v", err)
+	}
+	if !shadowVerdict.WouldBlock || shadowVerdict.Status != plannervalidation.VerdictWouldBlock {
+		t.Fatalf("shadow strict verdict = %#v", shadowVerdict)
+	}
+	foundMissingEvidence := false
+	for _, finding := range shadowVerdict.Findings {
+		if finding.Code == "missing_evidence" && finding.Category == plannervalidation.CategoryMissingEvidence {
+			foundMissingEvidence = true
+		}
+	}
+	if !foundMissingEvidence {
+		t.Fatalf("shadow verdict did not type missing evidence: %#v", shadowVerdict)
+	}
+	relaxedJSON, _ := json.Marshal(relaxed)
+	shadowJSON, _ := json.Marshal(shadow)
+	if string(relaxedJSON) != string(shadowJSON) {
+		t.Fatalf("shadow changed relaxed result:\nrelaxed=%s\nshadow=%s", relaxedJSON, shadowJSON)
+	}
+
+	_, strictVerdict, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeStrict)
+	if err == nil || !strictVerdict.WouldBlock || strictVerdict.Findings[0] != shadowVerdict.Findings[0] {
+		t.Fatalf("strict did not reuse shadow implementation: verdict=%#v err=%v", strictVerdict, err)
 	}
 }
 

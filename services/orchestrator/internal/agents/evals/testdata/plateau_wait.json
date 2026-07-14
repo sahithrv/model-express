@@ -1,0 +1,39 @@
+{
+  "name": "plateau_wait",
+  "description": "A plateau with an in-flight audit should wait rather than schedule another speculative batch.",
+  "coverage": ["plateau", "wait", "classification"],
+  "input_summary": {
+    "project_name": "Plateau Wait",
+    "task_type": "image_classification",
+    "completed_training_runs": 12,
+    "planner_rounds": 4,
+    "first_successful_score": 0.66,
+    "current_best_score": 0.72,
+    "current_best_model": "efficientnet_b0",
+    "attempted_models": ["mobilenet_v3_small", "efficientnet_b0", "resnet18"],
+    "dominant_mechanism": "architecture_challenge"
+  },
+  "response": {
+    "summary": "Wait for the active audit before choosing a new mechanism.",
+    "decision_type": "WAIT",
+    "rationale": "The score plateau is real, but the label audit is still producing evidence needed for the next decision.",
+    "confidence": 0.9,
+    "evidence_used": ["plateau: three rounds are within 0.002 macro-F1", "label audit remains in flight"],
+    "candidate_hypotheses": [],
+    "proposed_experiments": []
+  },
+  "rubric": {
+    "id": "plateau_wait_v1",
+    "expected_decision_types": ["WAIT"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["plateau"],
+    "task_type": "image_classification",
+    "require_no_experiments": true
+  },
+  "mutations": [{
+    "name": "schedule-through-wait",
+    "operation": "set_decision_type",
+    "value": "ADD_EXPERIMENTS",
+    "expected_failed_checks": ["decision", "safety"]
+  }]
+}

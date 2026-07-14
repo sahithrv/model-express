@@ -8,12 +8,14 @@ import (
 
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 )
 
 const agentInvocationSelectColumns = `id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version,
 	planner_variant_id, planner_variant, validation_mode, attempt_group_id, attempt_index, retry_reason, wall_latency_ms,
 	provider_usage, derived_cost, provider, model, input_messages, input_context, raw_output, parsed_output,
-	validation_status, validation_error, accepted_for_memory, human_feedback, downstream_outcome, created_at`
+	validation_status, validation_error, strict_validation_verdict, validation_outcome,
+	accepted_for_memory, human_feedback, downstream_outcome, created_at`
 
 func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
 	if payload == nil {
@@ -196,6 +198,20 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 			return memory.AgentInvocation{}, fmt.Errorf("marshal agent invocation derived cost: %w", err)
 		}
 	}
+	strictVerdictJSON := []byte(`{}`)
+	if invocation.StrictValidationVerdict != nil {
+		strictVerdictJSON, err = json.Marshal(invocation.StrictValidationVerdict)
+		if err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("marshal planner strict validation verdict: %w", err)
+		}
+	}
+	validationOutcomeJSON := []byte(`{}`)
+	if invocation.ValidationOutcome != nil {
+		validationOutcomeJSON, err = json.Marshal(invocation.ValidationOutcome)
+		if err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("marshal planner validation outcome: %w", err)
+		}
+	}
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -232,11 +248,13 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 			parsed_output,
 			validation_status,
 			validation_error,
+			strict_validation_verdict,
+			validation_outcome,
 			accepted_for_memory,
 			human_feedback,
 			downstream_outcome
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
 		RETURNING ` + agentInvocationSelectColumns + `
 	`
 	stored, err := scanAgentInvocation(tx.QueryRowContext(
@@ -266,6 +284,8 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 		parsedOutputJSON,
 		invocation.ValidationStatus,
 		invocation.ValidationError,
+		strictVerdictJSON,
+		validationOutcomeJSON,
 		invocation.AcceptedForMemory,
 		humanFeedbackJSON,
 		downstreamOutcomeJSON,
@@ -335,6 +355,24 @@ func (s *PostgresStore) UpdateAgentInvocationDownstreamOutcome(invocationID stri
 		return memory.AgentInvocation{}, err
 	}
 	return updated, nil
+}
+
+func (s *PostgresStore) UpdateAgentInvocationValidation(invocationID string, verdict plannervalidation.Verdict, outcome plannervalidation.Outcome) (memory.AgentInvocation, error) {
+	verdictJSON, err := json.Marshal(verdict)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal planner strict validation verdict: %w", err)
+	}
+	outcomeJSON, err := json.Marshal(outcome)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("marshal planner validation outcome: %w", err)
+	}
+	const query = `
+		UPDATE agent_invocations
+		SET strict_validation_verdict = $2, validation_outcome = $3
+		WHERE id = $1
+		RETURNING ` + agentInvocationSelectColumns + `
+	`
+	return scanAgentInvocation(s.db.QueryRowContext(context.Background(), query, invocationID, verdictJSON, outcomeJSON))
 }
 
 func requireAgentProjectTx(ctx context.Context, tx *sql.Tx, projectID string) error {

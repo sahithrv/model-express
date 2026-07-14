@@ -12,6 +12,7 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -161,6 +162,7 @@ type Store interface {
 	CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error)
 	GetAgentInvocation(invocationID string) (memory.AgentInvocation, error)
 	UpdateAgentInvocationDownstreamOutcome(invocationID string, outcome map[string]any) (memory.AgentInvocation, error)
+	UpdateAgentInvocationValidation(invocationID string, verdict plannervalidation.Verdict, outcome plannervalidation.Outcome) (memory.AgentInvocation, error)
 	ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error)
 	ListProjectAgentInvocationActivity(projectID string, limit int) ([]memory.AgentInvocationActivity, error)
 	UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord) (memory.MemoryEmbeddingRecord, error)

@@ -1,5 +1,7 @@
 {
   "name": "select_champion_stop",
+  "description": "A measured plateau should select the validated champion with an explicit stop rationale.",
+  "coverage": ["plateau", "select_champion", "stop_behavior", "classification"],
   "starter": true,
   "input_summary": {
     "project_name": "Select Champion Stop",
@@ -48,5 +50,10 @@
     "require_stop_reason": true,
     "require_champion_job_id": true,
     "require_no_experiments": true
-  }
+  },
+  "mutations": [{
+    "name": "select-without-stop-reason",
+    "operation": "clear_stop_reason",
+    "expected_failed_checks": ["stop_behavior"]
+  }]
 }

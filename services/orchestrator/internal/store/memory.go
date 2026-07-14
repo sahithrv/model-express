@@ -18,6 +18,7 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -1845,6 +1846,20 @@ func (s *MemoryStore) UpdateAgentInvocationDownstreamOutcome(invocationID string
 		}
 	}
 	invocation.DownstreamOutcome = outcome
+	s.agentInvocations[invocationID] = invocation
+	return invocation, nil
+}
+
+func (s *MemoryStore) UpdateAgentInvocationValidation(invocationID string, verdict plannervalidation.Verdict, outcome plannervalidation.Outcome) (memory.AgentInvocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	invocation, ok := s.agentInvocations[invocationID]
+	if !ok {
+		return memory.AgentInvocation{}, ErrNotFound
+	}
+	invocation.StrictValidationVerdict = &verdict
+	invocation.ValidationOutcome = &outcome
 	s.agentInvocations[invocationID] = invocation
 	return invocation, nil
 }

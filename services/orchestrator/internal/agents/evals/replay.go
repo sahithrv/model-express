@@ -17,13 +17,16 @@ import (
 )
 
 type PlannerReplayFixture struct {
-	Name         string                `json:"name"`
-	Starter      bool                  `json:"starter,omitempty"`
-	Input        map[string]any        `json:"input"`
-	InputSummary map[string]any        `json:"input_summary,omitempty"`
-	Response     map[string]any        `json:"response,omitempty"`
-	Expected     PlannerReplayExpected `json:"expected"`
-	Rubric       PlannerRubric         `json:"rubric,omitempty"`
+	Name         string                  `json:"name"`
+	Description  string                  `json:"description,omitempty"`
+	Coverage     []string                `json:"coverage,omitempty"`
+	Starter      bool                    `json:"starter,omitempty"`
+	Input        map[string]any          `json:"input"`
+	InputSummary map[string]any          `json:"input_summary,omitempty"`
+	Response     map[string]any          `json:"response,omitempty"`
+	Expected     PlannerReplayExpected   `json:"expected"`
+	Rubric       PlannerRubric           `json:"rubric,omitempty"`
+	Mutations    []PlannerRubricMutation `json:"mutations,omitempty"`
 }
 
 type PlannerReplayExpected struct {
@@ -40,6 +43,22 @@ var plannerFixtureFS embed.FS
 // the binary itself, so the deterministic rubric command is independent of
 // its current working directory.
 func LoadStarterPlannerRubricFixtures() ([]PlannerReplayFixture, error) {
+	fixtures, err := LoadPlannerRubricFixtures()
+	if err != nil {
+		return nil, err
+	}
+	starters := make([]PlannerReplayFixture, 0, len(fixtures))
+	for _, fixture := range fixtures {
+		if fixture.Starter {
+			starters = append(starters, fixture)
+		}
+	}
+	return starters, nil
+}
+
+// LoadPlannerRubricFixtures loads the complete deterministic checked-in
+// scenario corpus. Live provider calls are never involved.
+func LoadPlannerRubricFixtures() ([]PlannerReplayFixture, error) {
 	entries, err := plannerFixtureFS.ReadDir("testdata")
 	if err != nil {
 		return nil, err
@@ -57,9 +76,10 @@ func LoadStarterPlannerRubricFixtures() ([]PlannerReplayFixture, error) {
 		if err := json.Unmarshal(blob, &fixture); err != nil {
 			return nil, fmt.Errorf("decode embedded planner fixture %s: %w", entry.Name(), err)
 		}
-		if fixture.Starter {
-			fixtures = append(fixtures, fixture)
+		if len(fixture.Response) == 0 || (fixture.Rubric.ID == "" && len(fixture.Rubric.ExpectedDecisionTypes) == 0) {
+			continue
 		}
+		fixtures = append(fixtures, fixture)
 	}
 	return fixtures, nil
 }

@@ -12,6 +12,7 @@ import (
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/strategies"
 )
@@ -803,6 +804,29 @@ func TestMemoryStoreAgentInvocationRuntimeIdentityRoundTripAndFilter(t *testing.
 	if reloaded.DerivedCost == nil || reloaded.DerivedCost.PricingVersion != "test-pricing-v1" || reloaded.DerivedCost.TotalCostUSD != "0.0000162" {
 		t.Fatalf("unexpected derived cost %#v", reloaded.DerivedCost)
 	}
+	verdict := plannervalidation.Verdict{
+		SchemaVersion: plannervalidation.VerdictSchemaVersionV1,
+		Mode:          plannervalidation.ModeShadowStrict,
+		Status:        plannervalidation.VerdictWouldBlock,
+		WouldBlock:    true,
+		Findings: []plannervalidation.Finding{{
+			Code: "missing_evidence", Category: plannervalidation.CategoryMissingEvidence, Stage: "recommendation", Message: "missing evidence",
+		}},
+	}
+	outcome := plannervalidation.Outcome{
+		SchemaVersion:   plannervalidation.OutcomeSchemaVersionV1,
+		Mode:            plannervalidation.ModeShadowStrict,
+		FirstPassStatus: plannervalidation.FirstPassAccepted,
+		EventualStatus:  plannervalidation.EventualAccepted,
+		RetryOutcome:    plannervalidation.RetryNotNeeded,
+	}
+	updated, err := store.UpdateAgentInvocationValidation(stored.ID, verdict, outcome)
+	if err != nil {
+		t.Fatalf("UpdateAgentInvocationValidation() error = %v", err)
+	}
+	if updated.StrictValidationVerdict == nil || !updated.StrictValidationVerdict.WouldBlock || updated.ValidationOutcome == nil || updated.ValidationOutcome.FirstPassStatus != plannervalidation.FirstPassAccepted {
+		t.Fatalf("typed planner validation did not round trip: %#v", updated)
+	}
 
 	filtered, err := store.ListProjectAgentInvocations(project.ID, memory.AgentInvocationFilter{PlannerVariantID: variantID})
 	if err != nil {
@@ -841,6 +865,8 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 		[]byte(`{"ok":true}`),
 		"valid",
 		"",
+		[]byte(`{}`),
+		[]byte(`{}`),
 		true,
 		[]byte(`{}`),
 		[]byte(`{}`),
@@ -928,7 +954,7 @@ func TestScanAgentInvocationPreservesPlannerRuntimeIdentity(t *testing.T) {
 		variantID, variantJSON, "strict", "planner_attempt_group", 1, "trace_validation_rejected", float64(8.25),
 		[]byte(`{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}`), costJSON,
 		"openai", "test-model", []byte(`[]`), []byte(`{}`), `{"ok":true}`, []byte(`{"ok":true}`),
-		"valid", "", true, []byte(`{}`), []byte(`{}`), createdAt,
+		"valid", "", []byte(`{}`), []byte(`{}`), true, []byte(`{}`), []byte(`{}`), createdAt,
 	}}
 
 	invocation, err := scanAgentInvocation(row)

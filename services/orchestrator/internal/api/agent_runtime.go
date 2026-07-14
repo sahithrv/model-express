@@ -20,6 +20,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
@@ -832,6 +833,11 @@ func (s *Server) recordExperimentPlannerInvocation(
 		return memory.AgentInvocation{}, err
 	}
 	derivedCost := plannerDerivedCost(config, trace.Usage)
+	var strictVerdict *plannervalidation.Verdict
+	if trace.StrictValidationVerdict.SchemaVersion != "" {
+		verdict := trace.StrictValidationVerdict
+		strictVerdict = &verdict
+	}
 	if runtime, ok := inputContext["invocation_runtime"].(map[string]any); ok {
 		runtime["request_temperature"] = trace.Request.Temperature
 		runtime["request_reasoning_effort"] = trace.Request.ReasoningEffort
@@ -846,32 +852,33 @@ func (s *Server) recordExperimentPlannerInvocation(
 	}
 
 	return s.store.CreateAgentInvocation(memory.AgentInvocation{
-		ProjectID:         input.Project.ID,
-		DatasetID:         input.SourcePlan.DatasetID,
-		PlanID:            input.SourcePlan.ID,
-		AgentName:         agents.ExperimentPlannerAgentName,
-		AgentVersion:      trace.AgentVersion,
-		PromptVersion:     trace.PromptVersion,
-		PlannerVariantID:  variantID,
-		PlannerVariant:    &variant,
-		ValidationMode:    variant.ValidationMode,
-		AttemptGroupID:    facts.AttemptGroupID,
-		AttemptIndex:      facts.AttemptIndex,
-		RetryReason:       facts.RetryReason,
-		WallLatencyMS:     facts.WallLatencyMS,
-		ProviderUsage:     providerUsage,
-		DerivedCost:       derivedCost,
-		Provider:          config.Provider,
-		Model:             config.Model,
-		InputMessages:     llmMessagesForMemory(trace.Request.Messages),
-		InputContext:      inputContext,
-		RawOutput:         string(trace.RawOutput),
-		ParsedOutput:      trace.ParsedOutput,
-		ValidationStatus:  validationStatus,
-		ValidationError:   trace.ValidationError,
-		AcceptedForMemory: acceptedForMemory,
-		HumanFeedback:     map[string]any{},
-		DownstreamOutcome: map[string]any{},
+		ProjectID:               input.Project.ID,
+		DatasetID:               input.SourcePlan.DatasetID,
+		PlanID:                  input.SourcePlan.ID,
+		AgentName:               agents.ExperimentPlannerAgentName,
+		AgentVersion:            trace.AgentVersion,
+		PromptVersion:           trace.PromptVersion,
+		PlannerVariantID:        variantID,
+		PlannerVariant:          &variant,
+		ValidationMode:          variant.ValidationMode,
+		AttemptGroupID:          facts.AttemptGroupID,
+		AttemptIndex:            facts.AttemptIndex,
+		RetryReason:             facts.RetryReason,
+		WallLatencyMS:           facts.WallLatencyMS,
+		ProviderUsage:           providerUsage,
+		DerivedCost:             derivedCost,
+		Provider:                config.Provider,
+		Model:                   config.Model,
+		InputMessages:           llmMessagesForMemory(trace.Request.Messages),
+		InputContext:            inputContext,
+		RawOutput:               string(trace.RawOutput),
+		ParsedOutput:            trace.ParsedOutput,
+		ValidationStatus:        validationStatus,
+		ValidationError:         trace.ValidationError,
+		StrictValidationVerdict: strictVerdict,
+		AcceptedForMemory:       acceptedForMemory,
+		HumanFeedback:           map[string]any{},
+		DownstreamOutcome:       map[string]any{},
 	})
 }
 
@@ -935,10 +942,7 @@ func experimentPlannerVariant(input agents.ExperimentPlannerInput, config llm.Co
 }
 
 func plannerValidationMode() string {
-	if plannerStrictValidationEnabled() {
-		return "strict"
-	}
-	return "relaxed"
+	return plannervalidation.ModeFromEnvironment()
 }
 
 func plannerProviderUsage(usage *llm.Usage) (map[string]any, error) {
@@ -1050,6 +1054,9 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 		if err != nil {
 			lastErr = err
 			willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerTraceValidation(trace, err)
+			if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, willRetry); persistErr != nil {
+				return result, persistErr
+			}
 			s.recordPlannerValidationRejection(invocation, err, attempt, willRetry)
 			if willRetry {
 				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(trace.Recommendation, err, attempt+1))
@@ -1065,8 +1072,12 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			experiments, automlWarnings, prepareErr := s.prepareAutoMLExperimentsForProject(input.Project.ID, recommendation.ProposedExperiments)
 			if prepareErr != nil {
 				lastErr = prepareErr
-				s.recordPlannerValidationRejection(invocation, prepareErr, attempt, attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation))
-				if attempt >= plannerBackendValidationRetryLimit || !shouldRetryExperimentPlannerValidation(recommendation) {
+				willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation)
+				if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, willRetry); persistErr != nil {
+					return result, persistErr
+				}
+				s.recordPlannerValidationRejection(invocation, prepareErr, attempt, willRetry)
+				if !willRetry {
 					result.Recommendation = recommendation
 					return result, prepareErr
 				}
@@ -1080,8 +1091,12 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 		executionReports, capabilityErr := validatePlannerExecutionCapabilities(recommendation.ProposedExperiments, attemptInput)
 		if capabilityErr != nil {
 			lastErr = capabilityErr
-			s.recordPlannerValidationRejection(invocation, capabilityErr, attempt, attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation))
-			if attempt >= plannerBackendValidationRetryLimit || !shouldRetryExperimentPlannerValidation(recommendation) {
+			willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation)
+			if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, willRetry); persistErr != nil {
+				return result, persistErr
+			}
+			s.recordPlannerValidationRejection(invocation, capabilityErr, attempt, willRetry)
+			if !willRetry {
 				result.Recommendation = recommendation
 				return result, capabilityErr
 			}
@@ -1091,6 +1106,10 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 		}
 		payload, err := experimentPlannerDecisionPayload(recommendation, invocation, agentMode, attemptInput)
 		if err == nil {
+			verdict := plannerStrictVerdictFromPayload(trace.StrictValidationVerdict, payload)
+			if persistErr := s.persistPlannerValidationAttempt(invocation, verdict, attempt, true, false); persistErr != nil {
+				return result, persistErr
+			}
 			if len(executionReports) > 0 {
 				payload["execution_validation_reports"] = executionReports
 			}
@@ -1104,8 +1123,13 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 		}
 
 		lastErr = err
-		s.recordPlannerValidationRejection(invocation, err, attempt, attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation))
-		if attempt >= plannerBackendValidationRetryLimit || !shouldRetryExperimentPlannerValidation(recommendation) {
+		willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation)
+		verdict := plannerStrictVerdictFromError(trace.StrictValidationVerdict, trace.ValidatorMode, err)
+		if persistErr := s.persistPlannerValidationAttempt(invocation, verdict, attempt, false, willRetry); persistErr != nil {
+			return result, persistErr
+		}
+		s.recordPlannerValidationRejection(invocation, err, attempt, willRetry)
+		if !willRetry {
 			result.Recommendation = recommendation
 			return result, err
 		}
@@ -1141,6 +1165,80 @@ func (s *Server) recordPlannerValidationRejection(invocation memory.AgentInvocat
 	}
 }
 
+func (s *Server) persistPlannerValidationAttempt(invocation memory.AgentInvocation, verdict plannervalidation.Verdict, attempt int, accepted bool, willRetry bool) error {
+	if invocation.ID == "" {
+		return nil
+	}
+	mode := plannervalidation.NormalizeMode(firstNonEmptyString(verdict.Mode, invocation.ValidationMode))
+	outcome := plannervalidation.Outcome{
+		SchemaVersion:   plannervalidation.OutcomeSchemaVersionV1,
+		Mode:            mode,
+		FirstPassStatus: plannervalidation.FirstPassUnknown,
+		EventualStatus:  plannervalidation.EventualRejected,
+		RetryOutcome:    plannervalidation.RetryExhausted,
+	}
+	if attempt == 0 {
+		if accepted {
+			outcome.FirstPassStatus = plannervalidation.FirstPassAccepted
+		} else {
+			outcome.FirstPassStatus = plannervalidation.FirstPassRejected
+		}
+	} else {
+		outcome.FirstPassStatus = plannervalidation.FirstPassRejected
+	}
+	switch {
+	case accepted && attempt == 0:
+		outcome.EventualStatus = plannervalidation.EventualAccepted
+		outcome.RetryOutcome = plannervalidation.RetryNotNeeded
+	case accepted:
+		outcome.EventualStatus = plannervalidation.EventualAccepted
+		outcome.RetryOutcome = plannervalidation.RetryAccepted
+	case willRetry:
+		outcome.EventualStatus = plannervalidation.EventualPending
+		outcome.RetryOutcome = plannervalidation.RetryScheduled
+	}
+	if verdict.SchemaVersion == "" {
+		verdict = plannervalidation.Verdict{
+			SchemaVersion: plannervalidation.VerdictSchemaVersionV1,
+			Mode:          mode,
+			Status:        plannervalidation.VerdictNotEvaluated,
+		}
+	}
+	if _, err := s.store.UpdateAgentInvocationValidation(invocation.ID, verdict, outcome); err != nil {
+		return fmt.Errorf("persist planner validation outcome for invocation %s: %w", invocation.ID, err)
+	}
+	return nil
+}
+
+func plannerStrictVerdictFromPayload(base plannervalidation.Verdict, payload map[string]any) plannervalidation.Verdict {
+	value, ok := payload["planner_strict_validation_verdict"]
+	if !ok {
+		return base
+	}
+	var verdict plannervalidation.Verdict
+	if typed, ok := value.(plannervalidation.Verdict); ok {
+		verdict = typed
+	} else if blob, err := json.Marshal(value); err == nil {
+		_ = json.Unmarshal(blob, &verdict)
+	}
+	return plannervalidation.Merge(base, verdict)
+}
+
+func plannerStrictVerdictFromError(base plannervalidation.Verdict, mode string, validationErr error) plannervalidation.Verdict {
+	var evaluationErr plannervalidation.EvaluationError
+	if !errors.As(validationErr, &evaluationErr) {
+		return base
+	}
+	verdict := plannervalidation.Verdict{
+		SchemaVersion: plannervalidation.VerdictSchemaVersionV1,
+		Mode:          plannervalidation.NormalizeMode(mode),
+		Status:        plannervalidation.VerdictWouldBlock,
+		WouldBlock:    true,
+		Findings:      append([]plannervalidation.Finding(nil), evaluationErr.Findings...),
+	}
+	return plannervalidation.Merge(base, verdict)
+}
+
 func shouldRetryExperimentPlannerValidation(recommendation agents.ExperimentPlanningRecommendation) bool {
 	return strings.EqualFold(strings.TrimSpace(recommendation.DecisionType), decisions.TypeAddExperiments)
 }
@@ -1173,7 +1271,7 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 			relaxedValidationWarnings := []string{}
 			experiments, err := plannerExperimentsWithProposalMechanisms(recommendation)
 			if err != nil {
-				if plannerStrictValidationEnabled() {
+				if plannervalidation.IsStrict(plannerValidationMode()) {
 					return invalidPlannerDryRunResult(result, err)
 				}
 				experiments, relaxedValidationWarnings = plannerExperimentsWithProposalMechanismsRelaxed(recommendation)
@@ -1210,19 +1308,19 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 				}
 			}
 			if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
-				if plannerStrictValidationEnabled() {
+				if plannervalidation.IsStrict(plannerValidationMode()) {
 					return invalidPlannerDryRunResult(result, err)
 				}
 				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 			}
 			if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
-				if plannerStrictValidationEnabled() {
+				if plannervalidation.IsStrict(plannerValidationMode()) {
 					return invalidPlannerDryRunResult(result, err)
 				}
 				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 			}
 			if err := validateMechanismDatasetEvidence(profileWithAgentSafeMetadataSummary(input.Dataset.Profile, input.DatasetInsights.AgentSafeMetadataSummary), experiments, recommendation.EvidenceUsed); err != nil {
-				if plannerStrictValidationEnabled() {
+				if plannervalidation.IsStrict(plannerValidationMode()) {
 					return invalidPlannerDryRunResult(result, err)
 				}
 				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
@@ -1275,6 +1373,41 @@ func validatePlannerExecutionCapabilities(
 		return reports, fmt.Errorf("%w: execution fidelity enforcement rejected planner proposal: %s", store.ErrInvalidRequest, strings.Join(blocked, "; "))
 	}
 	return reports, nil
+}
+
+// validateProposalAcceptedSpecNovelty compares the executable semantic
+// identity, not the raw requested experiment. This catches proposals whose
+// unsupported or default-equivalent fields make them execution-time no-ops.
+func validateProposalAcceptedSpecNovelty(experiments []plans.PlannedExperiment, input agents.ExperimentPlannerInput) error {
+	if len(experiments) == 0 || strings.TrimSpace(input.ExecutionCapabilityCard.Runner) == "" {
+		return nil
+	}
+	existing := map[string]string{}
+	for _, evidence := range input.ExecutionEvidence {
+		hash := strings.TrimSpace(evidence.AcceptedSpecHash)
+		if hash != "" {
+			existing[hash] = evidence.JobID
+		}
+	}
+	proposed := map[string]int{}
+	provider := providerForExecutionRunner(input.ExecutionCapabilityCard.Runner)
+	for index, experiment := range experiments {
+		if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+			continue
+		}
+		spec, err := buildExecutionSpecV1(experiment, provider)
+		if err != nil {
+			return err
+		}
+		if jobID, ok := existing[spec.AcceptedSpecHash]; ok {
+			return fmt.Errorf("%w: proposed experiment %d is a proposal-time no-op matching accepted spec %s from job %s", store.ErrInvalidRequest, index, spec.AcceptedSpecHash, jobID)
+		}
+		if previous, ok := proposed[spec.AcceptedSpecHash]; ok {
+			return fmt.Errorf("%w: proposed experiment %d is a proposal-time no-op matching accepted spec %s from proposed experiment %d", store.ErrInvalidRequest, index, spec.AcceptedSpecHash, previous)
+		}
+		proposed[spec.AcceptedSpecHash] = index
+	}
+	return nil
 }
 
 func providerForExecutionRunner(runner string) string {
@@ -1559,47 +1692,118 @@ func experimentPlannerDecisionPayload(
 	}
 
 	if strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
+		mode := plannervalidation.ModeFromEnvironment()
 		relaxedValidationWarnings := []string{}
-		var experiments []plans.PlannedExperiment
-		if plannerStrictValidationEnabled() {
-			var err error
-			experiments, err = plannerExperimentsWithProposalMechanisms(recommendation)
-			if err != nil {
-				return nil, err
+		relaxedExperiments, relaxedWarnings := plannerExperimentsWithProposalMechanismsRelaxed(recommendation)
+		relaxedValidationWarnings = append(relaxedValidationWarnings, relaxedWarnings...)
+		for index, experiment := range relaxedExperiments {
+			if err := validatePlannedExperiment(experiment, index); err != nil {
+				return nil, typedPlannerValidationError(mode, "invalid_task_or_model", plannervalidation.CategoryInvalidTaskModel, "decision_payload", err)
 			}
-			if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
-				return nil, err
-			}
-			if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
-				return nil, err
-			}
-		} else {
-			experiments, relaxedValidationWarnings = plannerExperimentsWithProposalMechanismsRelaxed(recommendation)
-			for index, experiment := range experiments {
-				if err := validatePlannedExperiment(experiment, index); err != nil {
-					return nil, err
-				}
-			}
-			if err := validateLLMPlannerMechanismContract(experiments, recommendation.EvidenceUsed); err != nil {
-				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
-			}
-			if err := validateNovelProposedExperiments(experiments, input.PriorPlans); err != nil {
-				relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
-			}
+		}
+		if err := validateLLMPlannerMechanismContract(relaxedExperiments, recommendation.EvidenceUsed); err != nil {
+			relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
+		}
+		if err := validateNovelProposedExperiments(relaxedExperiments, input.PriorPlans); err != nil {
+			relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
+		}
+
+		var strictExperiments []plans.PlannedExperiment
+		var strictMappingErr error
+		if mode != plannervalidation.ModeRelaxed {
+			strictExperiments, strictMappingErr = plannerExperimentsWithProposalMechanisms(recommendation)
+		}
+		strictVerdict, strictErr := plannervalidation.Evaluate(mode, []plannervalidation.Check{
+			{
+				Code:     "proposal_mechanism_mapping",
+				Category: plannervalidation.CategoryMechanismMismatch,
+				Stage:    "decision_payload",
+				Validate: func() error { return strictMappingErr },
+			},
+			{
+				Code:     "mechanism_evidence_mismatch",
+				Category: plannervalidation.CategoryMechanismMismatch,
+				Stage:    "decision_payload",
+				Validate: func() error {
+					if strictMappingErr != nil {
+						return nil
+					}
+					return validateLLMPlannerMechanismContract(strictExperiments, recommendation.EvidenceUsed)
+				},
+			},
+			{
+				Code:     "duplicate_or_minor_only_proposal",
+				Category: plannervalidation.CategoryProposalNoOp,
+				Stage:    "decision_payload",
+				Validate: func() error {
+					if strictMappingErr != nil {
+						return nil
+					}
+					return validateNovelProposedExperiments(strictExperiments, input.PriorPlans)
+				},
+			},
+			{
+				Code:     "accepted_spec_no_op",
+				Category: plannervalidation.CategoryProposalNoOp,
+				Stage:    "decision_payload",
+				Validate: func() error {
+					if strictMappingErr != nil {
+						return nil
+					}
+					return validateProposalAcceptedSpecNovelty(strictExperiments, input)
+				},
+			},
+			{
+				Code:     "invalid_task_or_model",
+				Category: plannervalidation.CategoryInvalidTaskModel,
+				Stage:    "decision_payload",
+				Validate: func() error {
+					if strictMappingErr != nil {
+						return nil
+					}
+					for index, experiment := range strictExperiments {
+						if err := validateExperimentDatasetCompatibility(experiment, input.Dataset, index); err != nil {
+							return err
+						}
+					}
+					return nil
+				},
+			},
+		})
+		if strictErr != nil {
+			return nil, strictErr
+		}
+
+		experiments := relaxedExperiments
+		if mode == plannervalidation.ModeStrict {
+			experiments = strictExperiments
+			relaxedValidationWarnings = nil
 		}
 		for index, experiment := range experiments {
 			if err := validateExperimentDatasetCompatibility(experiment, input.Dataset, index); err != nil {
-				return nil, err
+				return nil, typedPlannerValidationError(mode, "invalid_task_or_model", plannervalidation.CategoryInvalidTaskModel, "decision_payload", err)
 			}
 		}
 		payload["proposed_experiments"] = experiments
+		if strictVerdict.Status != plannervalidation.VerdictNotEvaluated {
+			payload["planner_strict_validation_verdict"] = strictVerdict
+		}
 		if len(relaxedValidationWarnings) > 0 {
-			payload["planner_validation_mode"] = "relaxed"
+			payload["planner_validation_mode"] = mode
 			payload["planner_validation_warnings"] = uniqueStrings(relaxedValidationWarnings)
 		}
 	}
 
 	return payload, nil
+}
+
+func typedPlannerValidationError(mode, code, category, stage string, err error) error {
+	if err == nil || plannervalidation.NormalizeMode(mode) == plannervalidation.ModeRelaxed {
+		return err
+	}
+	return plannervalidation.EvaluationError{Findings: []plannervalidation.Finding{{
+		Code: code, Category: category, Stage: stage, Message: err.Error(),
+	}}}
 }
 
 func planTrainingRunsComplete(plan plans.ExperimentPlan, summaries []runs.TrainingRunSummary) bool {

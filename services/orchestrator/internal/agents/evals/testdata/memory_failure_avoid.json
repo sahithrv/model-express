@@ -1,0 +1,78 @@
+{
+  "name": "memory_failure_avoid",
+  "description": "A compatible failed memory should steer the plan away from the failed architecture mechanism.",
+  "coverage": ["memory_failure", "classification", "add_experiments", "regularization"],
+  "input_summary": {
+    "project_name": "Memory Failure Avoid",
+    "task_type": "image_classification",
+    "completed_training_runs": 8,
+    "planner_rounds": 3,
+    "first_successful_score": 0.62,
+    "current_best_score": 0.69,
+    "current_best_model": "efficientnet_b0",
+    "attempted_models": ["efficientnet_b0", "efficientnet_b1", "resnet18"],
+    "dominant_mechanism": "architecture_challenge",
+    "failed_strategy_memory": [{
+      "memory_id": "memory_failed_architecture",
+      "outcome_status": "failed_to_improve",
+      "lesson": "Larger backbones increased cost without improving validation score.",
+      "mechanism": "architecture_challenge",
+      "proposed_models": ["efficientnet_b1"]
+    }]
+  },
+  "response": {
+    "summary": "Avoid the failed architecture path and test regularization on the champion family.",
+    "decision_type": "ADD_EXPERIMENTS",
+    "rationale": "Failure memory rules out another costly backbone-only change.",
+    "confidence": 0.84,
+    "planning_mode": "exploit",
+    "evidence_used": ["failed architecture memory showed no gain", "validation loss rises late"],
+    "candidate_hypotheses": [{
+      "hypothesis": "Regularization can improve generalization without repeating the failed family change.",
+      "mechanism": "regularization",
+      "intervention": "Increase weight decay and add early stopping on EfficientNet-B0.",
+      "expected_effect": "Improve validation macro-F1 at unchanged serving cost.",
+      "expected_metric_impact": 0.016,
+      "evidence_used": ["failed architecture memory", "late validation loss"],
+      "similar_failure_memory_ids": ["memory_failed_architecture"],
+      "experiment_config": {
+        "template": "efficientnet_transfer",
+        "model": "efficientnet_b0",
+        "epochs": 9,
+        "batch_size": 16,
+        "learning_rate": 0.0002,
+        "reason": "Avoid failed architecture shopping.",
+        "weight_decay": 0.03,
+        "early_stopping_patience": 2,
+        "mechanism": "regularization"
+      }
+    }],
+    "proposed_experiments": [{
+      "template": "efficientnet_transfer",
+      "model": "efficientnet_b0",
+      "epochs": 9,
+      "batch_size": 16,
+      "learning_rate": 0.0002,
+      "reason": "Avoid failed architecture shopping.",
+      "weight_decay": 0.03,
+      "early_stopping_patience": 2,
+      "mechanism": "regularization"
+    }]
+  },
+  "rubric": {
+    "id": "memory_failure_avoid_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["regularization"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["failed", "validation"],
+    "task_type": "image_classification",
+    "max_selected_experiments": 1
+  },
+  "mutations": [{
+    "name": "repeat-failed-architecture",
+    "operation": "set_mechanism",
+    "value": "architecture_challenge",
+    "expected_failed_checks": ["mechanisms"]
+  }]
+}

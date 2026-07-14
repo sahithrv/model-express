@@ -14,6 +14,7 @@ import (
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/strategies"
@@ -417,7 +418,7 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	baseExperiments := append([]plans.PlannedExperiment(nil), experiments...)
 	experiments, err = plannedExperimentsWithStoredProposalMechanisms(decision.Payload, experiments)
 	if err != nil {
-		if plannerStrictValidationEnabled() {
+		if plannervalidation.IsStrict(plannerValidationMode()) {
 			return plans.ExperimentPlan{}, false, err
 		}
 		experiments = baseExperiments
@@ -436,7 +437,26 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err := s.validateExperimentsDatasetCompatibility(sourcePlan.DatasetID, experiments); err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
-	if err := validateLLMPlannerStoredMechanismContract(decision, experiments); err != nil && plannerStrictValidationEnabled() {
+	acceptedSpecVerdict, acceptedSpecErr := plannervalidation.Evaluate(plannerValidationMode(), []plannervalidation.Check{{
+		Code:     "accepted_spec_no_op",
+		Category: plannervalidation.CategoryProposalNoOp,
+		Stage:    "follow_up_proposal",
+		Validate: func() error {
+			return s.validateFollowUpAcceptedSpecNovelty(projectID, experiments)
+		},
+	}})
+	if acceptedSpecErr != nil {
+		message := "Follow-up scheduling blocked because the proposal duplicates an accepted executable spec."
+		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{acceptedSpecErr.Error()})
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, acceptedSpecErr.Error())
+	}
+	if acceptedSpecVerdict.WouldBlock {
+		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarningText(acceptedSpecVerdict.Findings[0].Message))
+		if err := s.persistDecisionShadowStrictVerdict(decision, acceptedSpecVerdict); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
+	}
+	if err := validateLLMPlannerStoredMechanismContract(decision, experiments); err != nil && plannervalidation.IsStrict(plannerValidationMode()) {
 		message := "Follow-up scheduling blocked because the stored planner decision lacks a valid mechanism contract."
 		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{err.Error()})
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
@@ -445,13 +465,13 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	}
 	experiments, err = s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, sourcePlan.DatasetID, sourcePlan.ID, decision.ID, "", experiments, payloadStringSlice(decision.Payload, "evidence_used"))
 	if err != nil {
-		if plannerStrictValidationEnabled() {
+		if plannervalidation.IsStrict(plannerValidationMode()) {
 			return plans.ExperimentPlan{}, false, err
 		}
 		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 	}
 	skippedExperiments := []string{}
-	if plannerStrictValidationEnabled() {
+	if plannervalidation.IsStrict(plannerValidationMode()) {
 		var filtered []plans.PlannedExperiment
 		filtered, skippedExperiments = filterNovelPlannedExperiments(experiments, projectPlans)
 		experiments = filtered
@@ -472,7 +492,7 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		fmt.Sprintf("Follow-up plan generated from reviewer decision %s.", decision.ID),
 		fmt.Sprintf("Previous plan: %s.", sourcePlan.ID),
 	}
-	if plannerStrictValidationEnabled() {
+	if plannervalidation.IsStrict(plannerValidationMode()) {
 		warnings = append(warnings, skippedExperiments...)
 	}
 	warnings = append(warnings, automlWarnings...)
@@ -501,6 +521,66 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	return plan, true, nil
 }
 
+func (s *Server) validateFollowUpAcceptedSpecNovelty(projectID string, experiments []plans.PlannedExperiment) error {
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return err
+	}
+	existing := map[string]string{}
+	for _, job := range projectJobs {
+		if hash := acceptedSpecHashFromJob(job); hash != "" {
+			existing[hash] = job.ID
+		}
+	}
+	provider := s.defaultExecuteExperimentPlanRequest().Provider
+	proposed := map[string]int{}
+	for index, experiment := range experiments {
+		if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+			continue
+		}
+		spec, err := buildExecutionSpecV1(experiment, provider)
+		if err != nil {
+			return err
+		}
+		if jobID, ok := existing[spec.AcceptedSpecHash]; ok {
+			return fmt.Errorf("%w: follow-up experiment %d is a proposal-time no-op matching accepted spec %s from job %s", store.ErrInvalidRequest, index, spec.AcceptedSpecHash, jobID)
+		}
+		if previous, ok := proposed[spec.AcceptedSpecHash]; ok {
+			return fmt.Errorf("%w: follow-up experiment %d is a proposal-time no-op matching proposed experiment %d by accepted spec %s", store.ErrInvalidRequest, index, previous, spec.AcceptedSpecHash)
+		}
+		proposed[spec.AcceptedSpecHash] = index
+	}
+	return nil
+}
+
+func (s *Server) persistDecisionShadowStrictVerdict(decision decisions.AgentDecision, verdict plannervalidation.Verdict) error {
+	invocationID := payloadString(decision.Payload, "invocation_id")
+	if invocationID == "" || !plannervalidation.IsShadow(verdict.Mode) {
+		return nil
+	}
+	invocation, err := s.store.GetAgentInvocation(invocationID)
+	if err != nil {
+		return fmt.Errorf("load planner invocation %s for shadow strict verdict: %w", invocationID, err)
+	}
+	if invocation.StrictValidationVerdict != nil {
+		verdict = plannervalidation.Merge(*invocation.StrictValidationVerdict, verdict)
+	}
+	outcome := plannervalidation.Outcome{
+		SchemaVersion:   plannervalidation.OutcomeSchemaVersionV1,
+		Mode:            plannervalidation.ModeShadowStrict,
+		FirstPassStatus: plannervalidation.FirstPassAccepted,
+		EventualStatus:  plannervalidation.EventualAccepted,
+		RetryOutcome:    plannervalidation.RetryNotNeeded,
+	}
+	if invocation.ValidationOutcome != nil {
+		outcome = *invocation.ValidationOutcome
+	}
+	if _, err := s.store.UpdateAgentInvocationValidation(invocationID, verdict, outcome); err != nil {
+		return fmt.Errorf("persist follow-up shadow strict verdict for invocation %s: %w", invocationID, err)
+	}
+	return nil
+}
+
 func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisionID string, followUpPlan plans.ExperimentPlan, projectPlans []plans.ExperimentPlan) error {
 	priorPlans := make([]plans.ExperimentPlan, 0, len(projectPlans))
 	for _, plan := range projectPlans {
@@ -521,7 +601,7 @@ func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisi
 		s.recordFollowUpValidationBlocked(projectID, followUpPlan.ID, decisionID, followUpPlan.ID, message, []string{err.Error()})
 		return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 	}
-	if !plannerStrictValidationEnabled() {
+	if !plannervalidation.IsStrict(plannerValidationMode()) {
 		return nil
 	}
 	if _, err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, followUpPlan.DatasetID, followUpPlan.ID, decisionID, followUpPlan.ID, followUpPlan.Experiments, nil); err != nil {
@@ -565,7 +645,7 @@ func (s *Server) validateFollowUpExperimentMechanismsAgainstDataset(
 		if followUpPlanID != "" {
 			message = fmt.Sprintf("Existing follow-up plan %s is blocked because one or more mechanisms lack backend-verifiable diagnosis or dataset support.", followUpPlanID)
 		}
-		if plannerStrictValidationEnabled() {
+		if plannervalidation.IsStrict(plannerValidationMode()) {
 			s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, []string{err.Error()})
 		}
 		return enrichedExperiments, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())

@@ -18,6 +18,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 )
@@ -662,29 +663,31 @@ func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
 }
 
 type agentInvocationSummary struct {
-	ID                string                        `json:"id"`
-	ProjectID         string                        `json:"project_id"`
-	DatasetID         string                        `json:"dataset_id,omitempty"`
-	PlanID            string                        `json:"plan_id,omitempty"`
-	JobID             string                        `json:"job_id,omitempty"`
-	AgentName         string                        `json:"agent_name"`
-	AgentVersion      string                        `json:"agent_version,omitempty"`
-	PromptVersion     string                        `json:"prompt_version,omitempty"`
-	PlannerVariantID  string                        `json:"planner_variant_id"`
-	PlannerVariant    *memory.PlannerVariant        `json:"planner_variant,omitempty"`
-	ValidationMode    string                        `json:"validation_mode,omitempty"`
-	AttemptGroupID    string                        `json:"attempt_group_id,omitempty"`
-	AttemptIndex      int                           `json:"attempt_index"`
-	RetryReason       string                        `json:"retry_reason,omitempty"`
-	WallLatencyMS     float64                       `json:"wall_latency_ms"`
-	ProviderUsage     map[string]any                `json:"provider_usage,omitempty"`
-	DerivedCost       *memory.PlannerInvocationCost `json:"derived_cost,omitempty"`
-	Provider          string                        `json:"provider,omitempty"`
-	Model             string                        `json:"model,omitempty"`
-	ValidationStatus  string                        `json:"validation_status"`
-	ValidationError   string                        `json:"validation_error,omitempty"`
-	AcceptedForMemory bool                          `json:"accepted_for_memory"`
-	CreatedAt         time.Time                     `json:"created_at"`
+	ID                      string                        `json:"id"`
+	ProjectID               string                        `json:"project_id"`
+	DatasetID               string                        `json:"dataset_id,omitempty"`
+	PlanID                  string                        `json:"plan_id,omitempty"`
+	JobID                   string                        `json:"job_id,omitempty"`
+	AgentName               string                        `json:"agent_name"`
+	AgentVersion            string                        `json:"agent_version,omitempty"`
+	PromptVersion           string                        `json:"prompt_version,omitempty"`
+	PlannerVariantID        string                        `json:"planner_variant_id"`
+	PlannerVariant          *memory.PlannerVariant        `json:"planner_variant,omitempty"`
+	ValidationMode          string                        `json:"validation_mode,omitempty"`
+	AttemptGroupID          string                        `json:"attempt_group_id,omitempty"`
+	AttemptIndex            int                           `json:"attempt_index"`
+	RetryReason             string                        `json:"retry_reason,omitempty"`
+	WallLatencyMS           float64                       `json:"wall_latency_ms"`
+	ProviderUsage           map[string]any                `json:"provider_usage,omitempty"`
+	DerivedCost             *memory.PlannerInvocationCost `json:"derived_cost,omitempty"`
+	Provider                string                        `json:"provider,omitempty"`
+	Model                   string                        `json:"model,omitempty"`
+	ValidationStatus        string                        `json:"validation_status"`
+	ValidationError         string                        `json:"validation_error,omitempty"`
+	StrictValidationVerdict *plannervalidation.Verdict    `json:"strict_validation_verdict,omitempty"`
+	ValidationOutcome       *plannervalidation.Outcome    `json:"validation_outcome,omitempty"`
+	AcceptedForMemory       bool                          `json:"accepted_for_memory"`
+	CreatedAt               time.Time                     `json:"created_at"`
 }
 
 func agentInvocationResponseRows(invocations []memory.AgentInvocation) any {
@@ -694,29 +697,31 @@ func agentInvocationResponseRows(invocations []memory.AgentInvocation) any {
 	out := make([]agentInvocationSummary, 0, len(invocations))
 	for _, invocation := range invocations {
 		out = append(out, agentInvocationSummary{
-			ID:                invocation.ID,
-			ProjectID:         invocation.ProjectID,
-			DatasetID:         invocation.DatasetID,
-			PlanID:            invocation.PlanID,
-			JobID:             invocation.JobID,
-			AgentName:         invocation.AgentName,
-			AgentVersion:      invocation.AgentVersion,
-			PromptVersion:     invocation.PromptVersion,
-			PlannerVariantID:  invocation.PlannerVariantID,
-			PlannerVariant:    invocation.PlannerVariant,
-			ValidationMode:    invocation.ValidationMode,
-			AttemptGroupID:    invocation.AttemptGroupID,
-			AttemptIndex:      invocation.AttemptIndex,
-			RetryReason:       invocation.RetryReason,
-			WallLatencyMS:     invocation.WallLatencyMS,
-			ProviderUsage:     invocation.ProviderUsage,
-			DerivedCost:       invocation.DerivedCost,
-			Provider:          invocation.Provider,
-			Model:             invocation.Model,
-			ValidationStatus:  invocation.ValidationStatus,
-			ValidationError:   invocation.ValidationError,
-			AcceptedForMemory: invocation.AcceptedForMemory,
-			CreatedAt:         invocation.CreatedAt,
+			ID:                      invocation.ID,
+			ProjectID:               invocation.ProjectID,
+			DatasetID:               invocation.DatasetID,
+			PlanID:                  invocation.PlanID,
+			JobID:                   invocation.JobID,
+			AgentName:               invocation.AgentName,
+			AgentVersion:            invocation.AgentVersion,
+			PromptVersion:           invocation.PromptVersion,
+			PlannerVariantID:        invocation.PlannerVariantID,
+			PlannerVariant:          invocation.PlannerVariant,
+			ValidationMode:          invocation.ValidationMode,
+			AttemptGroupID:          invocation.AttemptGroupID,
+			AttemptIndex:            invocation.AttemptIndex,
+			RetryReason:             invocation.RetryReason,
+			WallLatencyMS:           invocation.WallLatencyMS,
+			ProviderUsage:           invocation.ProviderUsage,
+			DerivedCost:             invocation.DerivedCost,
+			Provider:                invocation.Provider,
+			Model:                   invocation.Model,
+			ValidationStatus:        invocation.ValidationStatus,
+			ValidationError:         invocation.ValidationError,
+			StrictValidationVerdict: invocation.StrictValidationVerdict,
+			ValidationOutcome:       invocation.ValidationOutcome,
+			AcceptedForMemory:       invocation.AcceptedForMemory,
+			CreatedAt:               invocation.CreatedAt,
 		})
 	}
 	return out

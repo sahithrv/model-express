@@ -17,6 +17,7 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -1344,6 +1345,8 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 	var inputMessagesJSON []byte
 	var inputContextJSON []byte
 	var parsedOutputJSON []byte
+	var strictValidationVerdictJSON []byte
+	var validationOutcomeJSON []byte
 	var humanFeedbackJSON []byte
 	var downstreamOutcomeJSON []byte
 
@@ -1373,6 +1376,8 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		&parsedOutputJSON,
 		&invocation.ValidationStatus,
 		&invocation.ValidationError,
+		&strictValidationVerdictJSON,
+		&validationOutcomeJSON,
 		&invocation.AcceptedForMemory,
 		&humanFeedbackJSON,
 		&downstreamOutcomeJSON,
@@ -1403,6 +1408,20 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		if cost.PricingVersion != "" {
 			invocation.DerivedCost = &cost
 		}
+	}
+	if len(strictValidationVerdictJSON) > 0 && string(strictValidationVerdictJSON) != "{}" {
+		var verdict plannervalidation.Verdict
+		if err := json.Unmarshal(strictValidationVerdictJSON, &verdict); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner strict validation verdict: %w", err)
+		}
+		invocation.StrictValidationVerdict = &verdict
+	}
+	if len(validationOutcomeJSON) > 0 && string(validationOutcomeJSON) != "{}" {
+		var outcome plannervalidation.Outcome
+		if err := json.Unmarshal(validationOutcomeJSON, &outcome); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner validation outcome: %w", err)
+		}
+		invocation.ValidationOutcome = &outcome
 	}
 
 	invocation.InputMessages = []map[string]string{}

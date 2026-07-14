@@ -17,6 +17,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -28,7 +29,7 @@ const (
 	ExperimentPlannerPromptVersion = "experiment_planner_v3"
 
 	ExperimentPlannerToolPolicyVersion      = "planner_information_tools_v1"
-	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v1"
+	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v2"
 	ExperimentPlannerRankerVersion          = "candidate_ranker_v1"
 	ExperimentPlannerRetrievalPolicyVersion = "planner_memory_retrieval_v1"
 )
@@ -852,6 +853,7 @@ type ExperimentPlanningTrace struct {
 	ParsedOutput            map[string]any
 	ValidationStatus        string
 	ValidationError         string
+	StrictValidationVerdict plannervalidation.Verdict
 	AgentVersion            string
 	PromptVersion           string
 	StaticPromptVersion     string
@@ -948,10 +950,7 @@ func (a ExperimentPlannerAgent) BuildRequest(input ExperimentPlannerInput, varia
 // request projection seen by the model.
 func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input ExperimentPlannerInput, variant ExperimentPlannerRequestVariant) (ExperimentPlanningTrace, error) {
 	rankerMultiFidelity := multiFidelityPolicyEnabled()
-	validatorMode := "relaxed"
-	if plannerStrictValidationEnabled() {
-		validatorMode = "strict"
-	}
+	validatorMode := plannervalidation.ModeFromEnvironment()
 	input.RankerMultiFidelityEnabled = &rankerMultiFidelity
 	trace := ExperimentPlanningTrace{
 		ParsedOutput:        map[string]any{},
@@ -994,7 +993,7 @@ func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input 
 	}
 
 	recommendation.AgentName = ExperimentPlannerAgentName
-	recommendation, err = FinalizeAndValidatePlannerRecommendation(input, recommendation)
+	recommendation, trace.StrictValidationVerdict, err = FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, validatorMode)
 	if err != nil {
 		trace.ValidationStatus = memory.InvocationValidationInvalid
 		trace.ValidationError = err.Error()
@@ -1012,14 +1011,23 @@ func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input 
 // oracle used by both planner execution and calibration. Rubrics may label the
 // quality of a schedulable result, but they do not replace this backend gate.
 func FinalizeAndValidatePlannerRecommendation(input ExperimentPlannerInput, recommendation ExperimentPlanningRecommendation) (ExperimentPlanningRecommendation, error) {
+	finalized, _, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeFromEnvironment())
+	return finalized, err
+}
+
+// FinalizeAndValidatePlannerRecommendationWithMode makes the validation mode
+// explicit for deterministic tests and shadow evaluation. Shadow returns the
+// relaxed finalized recommendation while retaining the strict verdict.
+func FinalizeAndValidatePlannerRecommendationWithMode(input ExperimentPlannerInput, recommendation ExperimentPlanningRecommendation, mode string) (ExperimentPlanningRecommendation, plannervalidation.Verdict, error) {
 	finalized, err := FinalizePlannerRecommendation(input, recommendation)
 	if err != nil {
-		return finalized, err
+		return finalized, plannervalidation.Verdict{}, err
 	}
-	if err := validateExperimentPlanningRecommendation(finalized, maxPlannerExperiments(input.MaxExperiments)); err != nil {
-		return finalized, err
+	verdict, err := validateExperimentPlanningRecommendationWithMode(finalized, maxPlannerExperiments(input.MaxExperiments), mode)
+	if err != nil {
+		return finalized, verdict, err
 	}
-	return finalized, nil
+	return finalized, verdict, nil
 }
 
 type plannerToolLoopGenerator interface {
@@ -1480,117 +1488,156 @@ func plannerContextBuilderVersion(promptContext map[string]any) string {
 }
 
 func validateExperimentPlanningRecommendation(recommendation ExperimentPlanningRecommendation, maxExperiments int) error {
+	_, err := validateExperimentPlanningRecommendationWithMode(recommendation, maxExperiments, plannervalidation.ModeFromEnvironment())
+	return err
+}
+
+func validateExperimentPlanningRecommendationWithMode(recommendation ExperimentPlanningRecommendation, maxExperiments int, mode string) (plannervalidation.Verdict, error) {
 	if strings.TrimSpace(recommendation.Summary) == "" {
-		return fmt.Errorf("experiment planner recommendation missing summary")
+		return plannervalidation.Verdict{}, fmt.Errorf("experiment planner recommendation missing summary")
 	}
 	if strings.TrimSpace(recommendation.Rationale) == "" {
-		return fmt.Errorf("experiment planner recommendation missing rationale")
+		return plannervalidation.Verdict{}, fmt.Errorf("experiment planner recommendation missing rationale")
 	}
 	if recommendation.Confidence < 0 || recommendation.Confidence > 1 {
-		return fmt.Errorf("experiment planner confidence must be between 0 and 1")
+		return plannervalidation.Verdict{}, fmt.Errorf("experiment planner confidence must be between 0 and 1")
 	}
 	switch strings.ToUpper(strings.TrimSpace(recommendation.DecisionType)) {
 	case decisions.TypeAddExperiments:
 		if len(recommendation.CandidateHypotheses) == 0 {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing candidate_hypotheses")
+			return plannervalidation.Verdict{}, fmt.Errorf("experiment planner ADD_EXPERIMENTS missing candidate_hypotheses")
 		}
 		if len(recommendation.ProposedExperiments) == 0 {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing proposed_experiments")
+			return plannervalidation.Verdict{}, fmt.Errorf("experiment planner ADD_EXPERIMENTS missing proposed_experiments")
 		}
 		if strings.TrimSpace(recommendation.PlanningMode) == "" {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing planning_mode")
+			return plannervalidation.Verdict{}, fmt.Errorf("experiment planner ADD_EXPERIMENTS missing planning_mode")
 		}
 		if err := validatePlanningModeName(recommendation.PlanningMode); err != nil {
-			return err
+			return plannervalidation.Verdict{}, err
 		}
-		if plannerStrictValidationEnabled() && len(nonEmptyStrings(recommendation.DeterministicDiagnosisUsed)) == 0 {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing deterministic_diagnosis_used")
+		if len(recommendation.ProposedExperiments) > maxExperiments {
+			return plannervalidation.Verdict{}, fmt.Errorf("experiment planner proposed %d experiments, max is %d", len(recommendation.ProposedExperiments), maxExperiments)
 		}
-		if plannerStrictValidationEnabled() && len(nonEmptyStrings(recommendation.EvidenceUsed)) == 0 {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing evidence_used")
+		for index, experiment := range recommendation.ProposedExperiments {
+			if err := validatePlannedExperimentShape(experiment, index); err != nil {
+				return plannervalidation.Verdict{}, err
+			}
 		}
-		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.Hypothesis) == "" {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing hypothesis")
+		verdict, err := plannervalidation.Evaluate(mode, plannerRecommendationStrictChecks(recommendation))
+		if err != nil {
+			return verdict, err
 		}
-		if plannerStrictValidationEnabled() && len(nonEmptyStrings(recommendation.ExpectedFailureModes)) == 0 {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing expected_failure_modes")
+		return verdict, nil
+	case decisions.TypeSelectChampion, decisions.TypeStopProject, decisions.TypeWait:
+		if strings.TrimSpace(recommendation.PlanningMode) != "" {
+			if err := validatePlanningModeName(recommendation.PlanningMode); err != nil {
+				return plannervalidation.Verdict{}, err
+			}
 		}
-		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.DatasetPreprocessingRationale) == "" {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing dataset_preprocessing_rationale")
-		}
-		changedVariables := nonEmptyStrings(recommendation.ChangedVariables)
-		if plannerStrictValidationEnabled() && len(changedVariables) < 2 {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS needs at least two changed_variables")
-		}
-		if plannerStrictValidationEnabled() && onlyMinorChangedVariables(changedVariables) {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS changed_variables are only minor tuning knobs")
-		}
-		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.SuccessCriteria) == "" {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing success_criteria")
-		}
-		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.StopCondition) == "" {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing stop_condition")
-		}
-		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.DeploymentTradeoff) == "" {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing deployment_tradeoff")
-		}
-		if plannerStrictValidationEnabled() && len(recommendation.RejectedOptions) == 0 {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing rejected_options")
-		}
-		if plannerStrictValidationEnabled() {
+	default:
+		return plannervalidation.Verdict{}, fmt.Errorf("experiment planner has invalid decision_type %q", recommendation.DecisionType)
+	}
+	return plannervalidation.Evaluate(mode, nil)
+}
+
+func plannerRecommendationStrictChecks(recommendation ExperimentPlanningRecommendation) []plannervalidation.Check {
+	changedVariables := nonEmptyStrings(recommendation.ChangedVariables)
+	return []plannervalidation.Check{
+		plannerStrictCheck("missing_deterministic_diagnosis", plannervalidation.CategoryMissingEvidence, func() error {
+			if len(nonEmptyStrings(recommendation.DeterministicDiagnosisUsed)) == 0 {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing deterministic_diagnosis_used")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_evidence", plannervalidation.CategoryMissingEvidence, func() error {
+			if len(nonEmptyStrings(recommendation.EvidenceUsed)) == 0 {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing evidence_used")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_hypothesis", plannervalidation.CategoryStrictContract, func() error {
+			if strings.TrimSpace(recommendation.Hypothesis) == "" {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing hypothesis")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_failure_modes", plannervalidation.CategoryStrictContract, func() error {
+			if len(nonEmptyStrings(recommendation.ExpectedFailureModes)) == 0 {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing expected_failure_modes")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_preprocessing_rationale", plannervalidation.CategoryStrictContract, func() error {
+			if strings.TrimSpace(recommendation.DatasetPreprocessingRationale) == "" {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing dataset_preprocessing_rationale")
+			}
+			return nil
+		}),
+		plannerStrictCheck("insufficient_changed_variables", plannervalidation.CategoryProposalNoOp, func() error {
+			if len(changedVariables) < 2 {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS needs at least two changed_variables")
+			}
+			return nil
+		}),
+		plannerStrictCheck("minor_only_changed_variables", plannervalidation.CategoryProposalNoOp, func() error {
+			if onlyMinorChangedVariables(changedVariables) {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS changed_variables are only minor tuning knobs")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_success_criteria", plannervalidation.CategoryStrictContract, func() error {
+			if strings.TrimSpace(recommendation.SuccessCriteria) == "" {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing success_criteria")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_stop_condition", plannervalidation.CategoryStrictContract, func() error {
+			if strings.TrimSpace(recommendation.StopCondition) == "" {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing stop_condition")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_deployment_tradeoff", plannervalidation.CategoryStrictContract, func() error {
+			if strings.TrimSpace(recommendation.DeploymentTradeoff) == "" {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing deployment_tradeoff")
+			}
+			return nil
+		}),
+		plannerStrictCheck("missing_rejected_options", plannervalidation.CategoryStrictContract, func() error {
+			if len(recommendation.RejectedOptions) == 0 {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing rejected_options")
+			}
+			return nil
+		}),
+		plannerStrictCheck("candidate_mechanism_contract", plannervalidation.CategoryMechanismMismatch, func() error {
 			for index, candidate := range recommendation.CandidateHypotheses {
 				if err := validateCandidateMechanismExpectation(candidate, index); err != nil {
 					return err
 				}
 			}
-		}
-		if plannerStrictValidationEnabled() && strings.TrimSpace(recommendation.WhyCanBeatChampion) == "" {
-			return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing why_can_beat_champion")
-		}
-		if len(recommendation.ProposedExperiments) > maxExperiments {
-			return fmt.Errorf("experiment planner proposed %d experiments, max is %d", len(recommendation.ProposedExperiments), maxExperiments)
-		}
-		for index, experiment := range recommendation.ProposedExperiments {
-			if err := validatePlannedExperimentShape(experiment, index); err != nil {
-				return err
+			return nil
+		}),
+		plannerStrictCheck("missing_champion_comparison", plannervalidation.CategoryStrictContract, func() error {
+			if strings.TrimSpace(recommendation.WhyCanBeatChampion) == "" {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS missing why_can_beat_champion")
 			}
-		}
-		if plannerStrictValidationEnabled() {
-			if err := validatePlannerProposalMechanisms(recommendation.ProposedExperiments, recommendation.ProposalMechanisms); err != nil {
-				return err
-			}
-			if err := validatePlannerExperimentDiversity(recommendation.ProposedExperiments); err != nil {
-				return err
-			}
-			if err := validatePlanningModeRules(recommendation); err != nil {
-				return err
-			}
-		}
-	case decisions.TypeSelectChampion, decisions.TypeStopProject, decisions.TypeWait:
-		if strings.TrimSpace(recommendation.PlanningMode) != "" {
-			if err := validatePlanningModeName(recommendation.PlanningMode); err != nil {
-				return err
-			}
-		}
-	default:
-		return fmt.Errorf("experiment planner has invalid decision_type %q", recommendation.DecisionType)
+			return nil
+		}),
+		plannerStrictCheck("proposal_mechanism_contract", plannervalidation.CategoryMechanismMismatch, func() error {
+			return validatePlannerProposalMechanisms(recommendation.ProposedExperiments, recommendation.ProposalMechanisms)
+		}),
+		plannerStrictCheck("proposal_diversity", plannervalidation.CategoryProposalNoOp, func() error {
+			return validatePlannerExperimentDiversity(recommendation.ProposedExperiments)
+		}),
+		plannerStrictCheck("planning_mode_rules", plannervalidation.CategoryMechanismMismatch, func() error {
+			return validatePlanningModeRules(recommendation)
+		}),
 	}
-	if recommendation.Risks == nil {
-		recommendation.Risks = []string{}
-	}
-	if recommendation.ExpectedTradeoffs == nil {
-		recommendation.ExpectedTradeoffs = []string{}
-	}
-	if recommendation.NoveltyNotes == nil {
-		recommendation.NoveltyNotes = []string{}
-	}
-	if recommendation.RejectedOptions == nil {
-		recommendation.RejectedOptions = []RejectedPlannerOption{}
-	}
-	if recommendation.Tags == nil {
-		recommendation.Tags = []string{}
-	}
-	return nil
+}
+
+func plannerStrictCheck(code string, category string, validate func() error) plannervalidation.Check {
+	return plannervalidation.Check{Code: code, Category: category, Stage: "recommendation", Validate: validate}
 }
 
 func validateCandidateMechanismExpectation(candidate CandidateHypothesis, index int) error {
@@ -1771,18 +1818,6 @@ func containsAnyText(value string, needles ...string) bool {
 		}
 	}
 	return false
-}
-
-func plannerStrictValidationEnabled() bool {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION")))
-	switch value {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return false
-	}
 }
 
 func nonEmptyStrings(values []string) []string {

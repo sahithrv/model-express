@@ -8,10 +8,20 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 )
 
 const PlannerRubricSchemaVersionV1 = "planner_rubric_v1"
+
+const PlannerRubricArtifactSchemaVersionV2 = "planner_rubric_artifact_v2"
+
+type PlannerRubricMutation struct {
+	Name                 string   `json:"name"`
+	Operation            string   `json:"operation"`
+	Value                string   `json:"value,omitempty"`
+	ExpectedFailedChecks []string `json:"expected_failed_checks"`
+}
 
 // PlannerRubric describes labels that are independent of the candidate ranker
 // under evaluation. Backend schedulability remains a structural oracle; the
@@ -71,16 +81,32 @@ type PlannerRubricScore struct {
 }
 
 type PlannerRubricScenarioResult struct {
-	FixtureName string             `json:"fixture_name"`
-	TaskType    string             `json:"task_type"`
-	Score       PlannerRubricScore `json:"score"`
+	FixtureName   string                        `json:"fixture_name"`
+	Description   string                        `json:"description"`
+	Coverage      []string                      `json:"coverage"`
+	TaskType      string                        `json:"task_type"`
+	ResponseBytes int                           `json:"response_bytes"`
+	Score         PlannerRubricScore            `json:"score"`
+	Mutations     []PlannerRubricMutationResult `json:"mutations,omitempty"`
+}
+
+type PlannerRubricMutationResult struct {
+	Name                 string             `json:"name"`
+	Operation            string             `json:"operation"`
+	ExpectedFailedChecks []string           `json:"expected_failed_checks"`
+	ObservedFailedChecks []string           `json:"observed_failed_checks"`
+	Detected             bool               `json:"detected"`
+	Score                PlannerRubricScore `json:"score"`
 }
 
 type PlannerRubricSummary struct {
-	ScenarioCount       int `json:"scenario_count"`
-	PassedCount         int `json:"passed_count"`
-	FirstPassValidCount int `json:"first_pass_valid_count"`
-	EventualValidCount  int `json:"eventual_valid_count"`
+	ScenarioCount         int `json:"scenario_count"`
+	PassedCount           int `json:"passed_count"`
+	FirstPassValidCount   int `json:"first_pass_valid_count"`
+	EventualValidCount    int `json:"eventual_valid_count"`
+	MutationCount         int `json:"mutation_count"`
+	DetectedMutationCount int `json:"detected_mutation_count"`
+	TotalResponseBytes    int `json:"total_response_bytes"`
 }
 
 type PlannerRubricArtifact struct {
@@ -129,7 +155,7 @@ func ScorePlannerRubric(input agents.ExperimentPlannerInput, rawResponse []byte,
 	score.ParseSuccess = true
 	score.DecisionType = normalizedDecision(recommendation.DecisionType)
 
-	finalized, backendErr := agents.FinalizeAndValidatePlannerRecommendation(input, recommendation)
+	finalized, _, backendErr := agents.FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeRelaxed)
 	if backendErr == nil {
 		score.BackendSchedulable = true
 		score.FirstPassValid = true
@@ -176,7 +202,7 @@ func ScorePlannerRubric(input agents.ExperimentPlannerInput, rawResponse []byte,
 func EvaluatePlannerRubricFixtures(fixtures []PlannerReplayFixture) (PlannerRubricArtifact, error) {
 	ordered := append([]PlannerReplayFixture(nil), fixtures...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
-	artifact := PlannerRubricArtifact{SchemaVersion: PlannerRubricSchemaVersionV1}
+	artifact := PlannerRubricArtifact{SchemaVersion: PlannerRubricArtifactSchemaVersionV2}
 	for _, fixture := range ordered {
 		raw, err := ReplayPlannerResponse(fixture)
 		if err != nil {
@@ -184,12 +210,28 @@ func EvaluatePlannerRubricFixtures(fixtures []PlannerReplayFixture) (PlannerRubr
 		}
 		input := ExperimentPlannerInputFromReplayFixture(fixture)
 		score := ScorePlannerRubric(input, raw, PlannerRubricForFixture(fixture))
-		artifact.Scenarios = append(artifact.Scenarios, PlannerRubricScenarioResult{
-			FixtureName: fixture.Name,
-			TaskType:    replayTaskType(input),
-			Score:       score,
-		})
+		scenario := PlannerRubricScenarioResult{
+			FixtureName:   fixture.Name,
+			Description:   strings.TrimSpace(fixture.Description),
+			Coverage:      append([]string(nil), fixture.Coverage...),
+			TaskType:      replayTaskType(input),
+			ResponseBytes: len(raw),
+			Score:         score,
+		}
+		for _, mutation := range fixture.Mutations {
+			result, err := scorePlannerRubricMutation(input, raw, PlannerRubricForFixture(fixture), mutation)
+			if err != nil {
+				return PlannerRubricArtifact{}, fmt.Errorf("score fixture %q mutation %q: %w", fixture.Name, mutation.Name, err)
+			}
+			scenario.Mutations = append(scenario.Mutations, result)
+			artifact.Summary.MutationCount++
+			if result.Detected {
+				artifact.Summary.DetectedMutationCount++
+			}
+		}
+		artifact.Scenarios = append(artifact.Scenarios, scenario)
 		artifact.Summary.ScenarioCount++
+		artifact.Summary.TotalResponseBytes += len(raw)
 		if score.Passed {
 			artifact.Summary.PassedCount++
 		}
@@ -201,6 +243,91 @@ func EvaluatePlannerRubricFixtures(fixtures []PlannerReplayFixture) (PlannerRubr
 		}
 	}
 	return artifact, nil
+}
+
+func scorePlannerRubricMutation(input agents.ExperimentPlannerInput, raw []byte, rubric PlannerRubric, mutation PlannerRubricMutation) (PlannerRubricMutationResult, error) {
+	var recommendation agents.ExperimentPlanningRecommendation
+	if err := json.Unmarshal(raw, &recommendation); err != nil {
+		return PlannerRubricMutationResult{}, err
+	}
+	switch mutation.Operation {
+	case "set_decision_type":
+		recommendation.DecisionType = mutation.Value
+	case "set_mechanism":
+		for index := range recommendation.CandidateHypotheses {
+			recommendation.CandidateHypotheses[index].Mechanism = mutation.Value
+			recommendation.CandidateHypotheses[index].ExperimentConfig.Mechanism = mutation.Value
+		}
+		for index := range recommendation.ProposalMechanisms {
+			recommendation.ProposalMechanisms[index].Mechanism = mutation.Value
+		}
+		for index := range recommendation.ProposedExperiments {
+			recommendation.ProposedExperiments[index].Mechanism = mutation.Value
+		}
+	case "set_model":
+		for index := range recommendation.CandidateHypotheses {
+			recommendation.CandidateHypotheses[index].ExperimentConfig.Model = mutation.Value
+		}
+		for index := range recommendation.ProposedExperiments {
+			recommendation.ProposedExperiments[index].Model = mutation.Value
+		}
+	case "clear_evidence":
+		recommendation.EvidenceUsed = nil
+		for index := range recommendation.CandidateHypotheses {
+			recommendation.CandidateHypotheses[index].EvidenceUsed = nil
+		}
+		for index := range recommendation.ProposalMechanisms {
+			recommendation.ProposalMechanisms[index].EvidenceUsed = nil
+		}
+	case "clear_stop_reason":
+		recommendation.StopReason = ""
+	case "clear_champion_job_id":
+		recommendation.ChampionJobID = ""
+	default:
+		return PlannerRubricMutationResult{}, fmt.Errorf("unsupported mutation operation %q", mutation.Operation)
+	}
+	mutatedRaw, err := json.Marshal(recommendation)
+	if err != nil {
+		return PlannerRubricMutationResult{}, err
+	}
+	score := ScorePlannerRubric(input, mutatedRaw, rubric)
+	failed := failedPlannerRubricChecks(score)
+	expected := replayStringSet(mutation.ExpectedFailedChecks)
+	detected := !score.Passed
+	for check := range expected {
+		if !replayStringSet(failed)[check] {
+			detected = false
+		}
+	}
+	return PlannerRubricMutationResult{
+		Name:                 mutation.Name,
+		Operation:            mutation.Operation,
+		ExpectedFailedChecks: append([]string(nil), mutation.ExpectedFailedChecks...),
+		ObservedFailedChecks: failed,
+		Detected:             detected,
+		Score:                score,
+	}, nil
+}
+
+func failedPlannerRubricChecks(score PlannerRubricScore) []string {
+	checks := []struct {
+		name  string
+		check PlannerRubricCheck
+	}{
+		{"decision", score.Decision},
+		{"mechanisms", score.Mechanisms},
+		{"evidence", score.Evidence},
+		{"task_compatibility", score.TaskCompatibility},
+		{"stop_behavior", score.StopBehavior},
+		{"safety", score.Safety},
+	}
+	out := []string{}
+	for _, check := range checks {
+		if !check.check.Passed {
+			out = append(out, check.name)
+		}
+	}
+	return out
 }
 
 func scoreRubricDecision(decision string, rubric PlannerRubric) PlannerRubricCheck {

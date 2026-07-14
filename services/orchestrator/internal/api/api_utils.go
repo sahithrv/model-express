@@ -476,10 +476,6 @@ func terminalPlannerGuardsEnabledForMode(agentMode string) bool {
 	return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", false)
 }
 
-func plannerStrictValidationEnabled() bool {
-	return envFlag("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", false)
-}
-
 func plannerRelaxedValidationWarning(err error) string {
 	if err == nil {
 		return ""

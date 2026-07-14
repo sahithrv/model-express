@@ -1,0 +1,71 @@
+{
+  "name": "underfit_classification",
+  "description": "Underfitting should unlock more representation learning, not stop a still-promising search.",
+  "coverage": ["underfit", "classification", "capacity_finetune", "add_experiments"],
+  "input_summary": {
+    "project_name": "Underfit Classification",
+    "task_type": "image_classification",
+    "target_metric": "macro_f1",
+    "completed_training_runs": 4,
+    "planner_rounds": 2,
+    "first_successful_score": 0.44,
+    "current_best_score": 0.49,
+    "current_best_model": "mobilenet_v3_small",
+    "attempted_models": ["mobilenet_v3_small", "efficientnet_b0"],
+    "dominant_mechanism": "baseline_control"
+  },
+  "response": {
+    "summary": "Unfreeze the last representation block for the underfit classifier.",
+    "decision_type": "ADD_EXPERIMENTS",
+    "rationale": "Training and validation scores are both low with no widening gap.",
+    "confidence": 0.82,
+    "planning_mode": "exploit",
+    "evidence_used": ["training macro-F1 remains low", "validation tracks training without an overfit gap"],
+    "candidate_hypotheses": [{
+      "hypothesis": "Last-block fine-tuning will reduce bias without a large latency increase.",
+      "mechanism": "capacity_finetune",
+      "intervention": "Unfreeze the last EfficientNet block.",
+      "expected_effect": "Improve train and validation macro-F1 together.",
+      "expected_metric_impact": 0.03,
+      "evidence_used": ["underfit training score", "stable validation gap"],
+      "experiment_config": {
+        "template": "efficientnet_transfer",
+        "model": "efficientnet_b0",
+        "epochs": 14,
+        "batch_size": 16,
+        "learning_rate": 0.00015,
+        "reason": "Reduce underfit with last-block fine-tuning.",
+        "pretrained": true,
+        "freeze_backbone": false,
+        "fine_tune_strategy": "last_block",
+        "mechanism": "capacity_finetune"
+      }
+    }],
+    "proposed_experiments": [{
+      "template": "efficientnet_transfer",
+      "model": "efficientnet_b0",
+      "epochs": 14,
+      "batch_size": 16,
+      "learning_rate": 0.00015,
+      "reason": "Reduce underfit with last-block fine-tuning.",
+      "pretrained": true,
+      "freeze_backbone": false,
+      "fine_tune_strategy": "last_block",
+      "mechanism": "capacity_finetune"
+    }]
+  },
+  "rubric": {
+    "id": "underfit_classification_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["capacity_finetune", "architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["underfit"],
+    "task_type": "image_classification",
+    "max_selected_experiments": 1
+  },
+  "mutations": [{
+    "name": "unsupported-claim-without-evidence",
+    "operation": "clear_evidence",
+    "expected_failed_checks": ["evidence"]
+  }]
+}

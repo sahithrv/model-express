@@ -4,17 +4,87 @@ The planner calibration tooling has two deliberately separate paths.
 
 ## Deterministic rubric evaluation
 
-Run the checked-in starter scenarios without credentials or network access:
+Run the complete checked-in corpus without credentials or network access:
 
 ```bash
 cd services/orchestrator
 go run ./cmd/planner-eval
 ```
 
-This emits one bounded JSONL artifact. Scenarios are sorted by fixture name, and
-the result records parse status, backend schedulability, first-pass/eventual
-validity, decision/mechanism/evidence/task/stop checks, and safety checks. It
-does not use candidate ranker scores as quality labels.
+This emits one bounded JSONL artifact for 15 scenarios and 15 targeted failing
+mutations. The corpus covers imbalance/minority failure (classification and
+detection), overfit, underfit, plateau, exhausted architecture shopping,
+latency/cost constraints, duplicates/no-ops, label-audit wait behavior, and
+successful/failed/rejected memory. Every supported decision type is present.
+Scenarios are sorted by fixture name and include a review explanation and
+coverage tags alongside parse status, backend schedulability, first-pass/eventual
+validity, decision/mechanism/evidence/task/stop checks, safety, response bytes,
+and mutation detection. Candidate ranker scores are never quality labels.
+
+The deterministic path explicitly uses relaxed backend finalization so shell
+configuration cannot change the checked artifact. It does not make live LLM
+calls.
+
+## Checked baseline and review procedure
+
+Verify the corpus against the checked baseline:
+
+```bash
+cd services/orchestrator
+go run ./cmd/planner-eval -check-baseline
+```
+
+The comparison reports changes per scenario with the scenario's explanation.
+It applies three independent tolerance classes:
+
+- **Critical:** decision, backend schedulability, safety, scenario removal, and
+  expected mutation detection. The checked tolerance is zero regressions.
+- **Quality:** correctness-check regressions and corpus pass rate. The checked
+  pass-rate floor is 100%.
+- **Efficiency:** response-byte growth. The checked allowances are 256 bytes per
+  scenario and 2,048 bytes across the corpus.
+
+To update the baseline, first inspect the normal artifact and the failed
+comparison, explain every changed scenario in review, then run:
+
+```bash
+cd services/orchestrator
+go run ./cmd/planner-eval \
+  -update-baseline internal/agents/evals/baselines/planner_rubric_v1.json
+go run ./cmd/planner-eval -check-baseline
+go test ./internal/agents/evals ./cmd/planner-eval
+```
+
+Do not update the baseline only to make a regression green. New scenarios are
+reported as critical review items until the checked baseline is intentionally
+replaced.
+
+## Planner validation rollout modes
+
+`MODEL_EXPRESS_PLANNER_VALIDATION_MODE` is the source of truth for planner
+validation configuration:
+
+- `relaxed` preserves the compatibility behavior.
+- `shadow_strict` returns the relaxed recommendation but executes the same
+  strict checks used by `strict`, persisting typed would-block verdicts.
+- `strict` blocks and retries on those strict findings.
+
+The old `MODEL_EXPRESS_STRICT_PLANNER_VALIDATION` boolean is read only as a
+compatibility alias when the mode variable is absent. Remove it after one
+compatibility release.
+
+Planner invocations persist `strict_validation_verdict` and
+`validation_outcome`. Findings have stable codes, categories, and stages for
+missing evidence, mechanism mismatches, invalid task/model proposals,
+proposal-time no-ops, and other strict-contract failures. Outcomes record
+first-pass status, eventual status, and retry outcome while the existing
+attempt group/index/reason fields preserve attribution to the exact planner
+variant.
+
+Proposal-time no-op validation compares accepted-spec hashes, so unsupported
+or default-equivalent request differences cannot disguise the same executable
+configuration. Execution-time requested-versus-realized mismatches remain in
+the execution-fidelity reports and are not inferred by planner validation.
 
 ## Opt-in paired provider evaluation
 
@@ -39,7 +109,9 @@ go run ./cmd/planner-eval \
   -max-request-bytes 500000
 ```
 
-The provider-call budget reserves the configured maximum tool rounds before an
+With no `-fixtures` argument, live evaluation keeps the four starter scenarios;
+the expanded corpus is deterministic by default and must be opted into for live
+runs with explicit fixture paths. The provider-call budget reserves the configured maximum tool rounds before an
 invocation, so it is a hard upper bound even if a tool loop or failed request
 does not return complete usage. Each result records the actual production-built
 initial request size/hash, an immutable finalizer-input hash, provider usage,

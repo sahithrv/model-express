@@ -1,0 +1,75 @@
+{
+  "name": "overfit_classification",
+  "description": "Overfitting should trigger a regularization/fine-tuning intervention rather than more capacity.",
+  "coverage": ["overfit", "classification", "add_experiments", "regularization"],
+  "input_summary": {
+    "project_name": "Overfit Classification",
+    "project_goal": "Reduce the train-validation gap while preserving macro-F1.",
+    "dataset_name": "overfit-classification",
+    "task_type": "image_classification",
+    "target_metric": "macro_f1",
+    "completed_training_runs": 6,
+    "planner_rounds": 2,
+    "first_successful_score": 0.61,
+    "current_best_score": 0.69,
+    "current_best_model": "efficientnet_b0",
+    "attempted_models": ["mobilenet_v3_small", "efficientnet_b0", "resnet18"],
+    "dominant_mechanism": "architecture_challenge"
+  },
+  "response": {
+    "summary": "Regularize the current compact family instead of adding capacity.",
+    "decision_type": "ADD_EXPERIMENTS",
+    "rationale": "The validation gap is the limiting signal.",
+    "confidence": 0.86,
+    "planning_mode": "exploit",
+    "evidence_used": ["train-validation loss gap indicates overfit", "validation macro-F1 falls after epoch six"],
+    "candidate_hypotheses": [{
+      "hypothesis": "Stronger regularization and earlier stopping will reduce overfit.",
+      "mechanism": "regularization",
+      "intervention": "Add dropout, weight decay, and bounded early stopping.",
+      "expected_effect": "Improve validation macro-F1 without increasing serving latency.",
+      "expected_metric_impact": 0.018,
+      "evidence_used": ["overfit gap", "late validation decline"],
+      "experiment_config": {
+        "template": "efficientnet_transfer",
+        "model": "efficientnet_b0",
+        "epochs": 10,
+        "batch_size": 16,
+        "learning_rate": 0.0002,
+        "reason": "Regularize the overfit champion.",
+        "weight_decay": 0.04,
+        "dropout": 0.25,
+        "early_stopping_patience": 2,
+        "mechanism": "regularization"
+      }
+    }],
+    "proposed_experiments": [{
+      "template": "efficientnet_transfer",
+      "model": "efficientnet_b0",
+      "epochs": 10,
+      "batch_size": 16,
+      "learning_rate": 0.0002,
+      "reason": "Regularize the overfit champion.",
+      "weight_decay": 0.04,
+      "dropout": 0.25,
+      "early_stopping_patience": 2,
+      "mechanism": "regularization"
+    }]
+  },
+  "rubric": {
+    "id": "overfit_classification_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["regularization", "capacity_finetune"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["overfit"],
+    "task_type": "image_classification",
+    "max_selected_experiments": 1
+  },
+  "mutations": [{
+    "name": "capacity-shopping-regression",
+    "operation": "set_mechanism",
+    "value": "architecture_challenge",
+    "expected_failed_checks": ["mechanisms"]
+  }]
+}
