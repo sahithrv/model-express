@@ -778,7 +778,35 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	input.ProjectTrajectory = agents.ComputeProjectTrajectoryDiagnosis(input)
 	input.RetrievalVariant = plannerRetrievalVariant()
 	input.RetrievedMemory = s.retrievePlannerMemory(context.Background(), input)
+	input.RankerV2PriorSnapshot = s.plannerRankerV2PriorSnapshot(projectID, time.Now().UTC(), minimumMeaningfulImprovement)
 	return input, true, nil
+}
+
+func (s *Server) plannerRankerV2PriorSnapshot(projectID string, evaluationStart time.Time, meaningfulImprovement float64) *calibration.RankerV2PriorSnapshot {
+	evaluationStart = evaluationStart.UTC()
+	if evaluationStart.IsZero() {
+		evaluationStart = time.Now().UTC()
+	}
+	trainingWindow := calibration.TimeWindow{Start: evaluationStart.Add(-90 * 24 * time.Hour), End: evaluationStart}
+	evaluationWindow := calibration.TimeWindow{Start: evaluationStart, End: evaluationStart.Add(30 * 24 * time.Hour)}
+	observations, readErr := s.store.ReadCalibrationObservations(projectID, trainingWindow, 2000)
+	candidates := observations.Candidates
+	if readErr != nil {
+		log.Printf("read ranker v2 calibration priors failed for project %s: %v", projectID, readErr)
+		candidates = nil
+	}
+	snapshot, err := calibration.BuildRankerV2PriorSnapshot(
+		candidates, trainingWindow, evaluationWindow, calibration.RankerV2PriorMinSampleSize,
+		meaningfulImprovement, observations.CandidatesTruncated,
+	)
+	if err != nil {
+		log.Printf("build ranker v2 calibration priors failed for project %s: %v", projectID, err)
+		return nil
+	}
+	if readErr != nil {
+		snapshot.SourceStatus = "read_failed_neutral_fallback"
+	}
+	return &snapshot
 }
 
 func (s *Server) plannerExecutionCapabilityContext(
@@ -1595,6 +1623,9 @@ func selectChampionForPlannerWaitDecision(
 	recommendation.CandidateHypotheses = nil
 	recommendation.CandidateRankings = nil
 	recommendation.CandidateSelectionTrace = nil
+	recommendation.CandidateRankingsV2 = nil
+	recommendation.CandidateSelectionTraceV2 = nil
+	recommendation.RankerShadowComparison = nil
 	recommendation.ProposalMechanisms = nil
 	if strings.TrimSpace(recommendation.Summary) == "" || strings.EqualFold(strings.TrimSpace(recommendation.Summary), "wait") {
 		recommendation.Summary = fmt.Sprintf("Select champion %s; planner pause converted to champion selection.", championJobID)
@@ -1691,6 +1722,11 @@ func experimentPlannerDecisionPayload(
 		"candidate_hypotheses":            recommendation.CandidateHypotheses,
 		"candidate_rankings":              recommendation.CandidateRankings,
 		"candidate_selection_trace":       recommendation.CandidateSelectionTrace,
+		"candidate_rankings_v2":           recommendation.CandidateRankingsV2,
+		"candidate_selection_trace_v2":    recommendation.CandidateSelectionTraceV2,
+		"ranker_shadow_comparison":        recommendation.RankerShadowComparison,
+		"ranker_v2_prior_snapshot":        input.RankerV2PriorSnapshot,
+		"scheduling_ranker_version":       agents.ExperimentPlannerRankerVersion,
 		"proposal_mechanisms":             recommendation.ProposalMechanisms,
 		"risks":                           recommendation.Risks,
 		"expected_tradeoffs":              recommendation.ExpectedTradeoffs,

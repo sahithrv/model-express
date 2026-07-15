@@ -130,6 +130,7 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/projects/:id/agent-memory", server.listProjectAgentMemoryRecords)
 	router.POST("/projects/:id/memory-embeddings/backfill", server.backfillProjectMemoryEmbeddings)
 	router.GET("/projects/:id/agent-invocations", server.listProjectAgentInvocations)
+	router.GET("/projects/:id/calibration-report", server.getProjectCalibrationReport)
 	router.GET("/projects/:id/telemetry-summary", server.getProjectTelemetrySummary)
 	router.GET("/projects/:id/strategy-scorecards", server.listProjectStrategyScorecards)
 	router.GET("/projects/:id/worker-requirements", server.listProjectWorkerRequirements)

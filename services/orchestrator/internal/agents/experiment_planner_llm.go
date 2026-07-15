@@ -32,6 +32,7 @@ const (
 	ExperimentPlannerToolPolicyVersion      = "planner_information_tools_v1"
 	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v3"
 	ExperimentPlannerRankerVersion          = "candidate_ranker_v1"
+	ExperimentPlannerShadowRankerVersion    = "candidate_ranker_v2_shadow_v1"
 	ExperimentPlannerRetrievalPolicyVersion = "planner_memory_retrieval_v1"
 )
 
@@ -122,6 +123,9 @@ type ExperimentPlannerInput struct {
 	// invocation. Nil preserves the existing environment-based behavior for
 	// direct deterministic finalizer callers.
 	RankerMultiFidelityEnabled *bool
+	// RankerV2PriorSnapshot is read-only shadow input. It is never consulted by
+	// the active v1 scheduler and is persisted with the shadow comparison.
+	RankerV2PriorSnapshot *calibration.RankerV2PriorSnapshot
 	// TerminalPlannerGuardsEnabled snapshots the post-generation decision
 	// policy so the persisted variant matches the policy actually applied.
 	TerminalPlannerGuardsEnabled *bool
@@ -732,6 +736,9 @@ type ExperimentPlanningRecommendation struct {
 	CandidateHypotheses           []CandidateHypothesis      `json:"candidate_hypotheses"`
 	CandidateRankings             []CandidateRanking         `json:"candidate_rankings"`
 	CandidateSelectionTrace       []CandidateSelectionRound  `json:"candidate_selection_trace,omitempty"`
+	CandidateRankingsV2           []CandidateRanking         `json:"candidate_rankings_v2,omitempty"`
+	CandidateSelectionTraceV2     []CandidateSelectionRound  `json:"candidate_selection_trace_v2,omitempty"`
+	RankerShadowComparison        *RankerShadowComparison    `json:"ranker_shadow_comparison,omitempty"`
 	ProposedExperiments           []plans.PlannedExperiment  `json:"proposed_experiments"`
 	ProposalMechanisms            []PlannerProposalMechanism `json:"proposal_mechanisms"`
 	ChampionJobID                 string                     `json:"champion_job_id"`
@@ -787,26 +794,51 @@ type CandidateHypothesis struct {
 }
 
 type CandidateRanking struct {
-	CandidateIndex          int                            `json:"candidate_index"`
-	Hypothesis              string                         `json:"hypothesis"`
-	PlanningMode            string                         `json:"planning_mode"`
-	Mechanism               string                         `json:"mechanism,omitempty"`
-	Intervention            string                         `json:"intervention,omitempty"`
-	ExpectedEffect          string                         `json:"expected_effect,omitempty"`
-	Score                   float64                        `json:"score"`
-	BaseScore               float64                        `json:"base_score"`
-	SelectionScore          *float64                       `json:"selection_score,omitempty"`
-	SelectionOrder          *int                           `json:"selection_order,omitempty"`
-	SelectedExperimentIndex *int                           `json:"selected_experiment_index,omitempty"`
-	SelectionAdjustments    []CandidateSelectionAdjustment `json:"selection_adjustments,omitempty"`
-	ScoreComponents         map[string]float64             `json:"score_components"`
-	RetrievedMemoryHits     []CandidateRetrievedMemoryHit  `json:"retrieved_memory_hits,omitempty"`
-	PromotionDecision       string                         `json:"promotion_decision,omitempty"`
-	StopReason              string                         `json:"stop_reason,omitempty"`
-	Selected                bool                           `json:"selected"`
-	Rejected                bool                           `json:"rejected"`
-	Reasons                 []string                       `json:"reasons"`
-	ExperimentSignature     string                         `json:"experiment_signature"`
+	RankerVersion           string                              `json:"ranker_version,omitempty"`
+	CandidateIndex          int                                 `json:"candidate_index"`
+	Hypothesis              string                              `json:"hypothesis"`
+	PlanningMode            string                              `json:"planning_mode"`
+	Mechanism               string                              `json:"mechanism,omitempty"`
+	Intervention            string                              `json:"intervention,omitempty"`
+	ExpectedEffect          string                              `json:"expected_effect,omitempty"`
+	Score                   float64                             `json:"score"`
+	BaseScore               float64                             `json:"base_score"`
+	SelectionScore          *float64                            `json:"selection_score,omitempty"`
+	SelectionOrder          *int                                `json:"selection_order,omitempty"`
+	SelectedExperimentIndex *int                                `json:"selected_experiment_index,omitempty"`
+	SelectionAdjustments    []CandidateSelectionAdjustment      `json:"selection_adjustments,omitempty"`
+	ScoreComponents         map[string]float64                  `json:"score_components"`
+	RetrievedMemoryHits     []CandidateRetrievedMemoryHit       `json:"retrieved_memory_hits,omitempty"`
+	EmpiricalPrior          *calibration.RankerV2PriorSelection `json:"empirical_prior,omitempty"`
+	PromotionDecision       string                              `json:"promotion_decision,omitempty"`
+	StopReason              string                              `json:"stop_reason,omitempty"`
+	Selected                bool                                `json:"selected"`
+	Rejected                bool                                `json:"rejected"`
+	Reasons                 []string                            `json:"reasons"`
+	ExperimentSignature     string                              `json:"experiment_signature"`
+}
+
+type RankerOrderingChange struct {
+	CandidateIndex int `json:"candidate_index"`
+	V1Position     int `json:"v1_position"`
+	V2Position     int `json:"v2_position"`
+}
+
+type RankerShadowComparison struct {
+	PolicyVersion           string                 `json:"policy_version"`
+	SchedulingRankerVersion string                 `json:"scheduling_ranker_version"`
+	ShadowOnly              bool                   `json:"shadow_only"`
+	V1Ordering              []int                  `json:"v1_ordering"`
+	V2Ordering              []int                  `json:"v2_ordering"`
+	V1Selection             []int                  `json:"v1_selection"`
+	V2Selection             []int                  `json:"v2_selection"`
+	OrderingChanges         []RankerOrderingChange `json:"ordering_changes"`
+	SelectionOverlapCount   int                    `json:"selection_overlap_count"`
+	SelectionOverlapRate    float64                `json:"selection_overlap_rate"`
+	SelectionSetChanged     bool                   `json:"selection_set_changed"`
+	V2OnlySelections        []int                  `json:"v2_only_selections"`
+	V1OnlySelections        []int                  `json:"v1_only_selections"`
+	OutcomeDisclosure       string                 `json:"outcome_disclosure"`
 }
 
 type CandidateSelectionAdjustment struct {

@@ -297,9 +297,12 @@ func plannerValidateCandidateExperimentsTool(input ExperimentPlannerInput, toolN
 		WouldWriteRows:          false,
 		WouldScheduleJobs:       false,
 		Details: map[string]any{
-			"dry_run_only":              true,
-			"candidate_rankings":        recommendation.CandidateRankings,
-			"candidate_selection_trace": recommendation.CandidateSelectionTrace,
+			"dry_run_only":                 true,
+			"candidate_rankings":           recommendation.CandidateRankings,
+			"candidate_selection_trace":    recommendation.CandidateSelectionTrace,
+			"candidate_rankings_v2":        recommendation.CandidateRankingsV2,
+			"candidate_selection_trace_v2": recommendation.CandidateSelectionTraceV2,
+			"ranker_shadow_comparison":     recommendation.RankerShadowComparison,
 		},
 	}
 	if finalizeErr != nil {

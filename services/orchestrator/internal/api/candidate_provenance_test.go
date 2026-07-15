@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/calibration"
@@ -13,6 +14,52 @@ import (
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 )
+
+func TestRankerV2ShadowArtifactPersistsWithoutChangingV1Provenance(t *testing.T) {
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 6)})
+	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
+	input, recommendation := candidateProvenancePlannerFixture(t, server, projectID, plan)
+	evaluationStart := plan.CreatedAt.UTC()
+	snapshot, err := calibration.BuildRankerV2PriorSnapshot(
+		nil,
+		calibration.TimeWindow{Start: evaluationStart.Add(-90 * 24 * time.Hour), End: evaluationStart},
+		calibration.TimeWindow{Start: evaluationStart, End: evaluationStart.Add(30 * 24 * time.Hour)},
+		calibration.RankerV2PriorMinSampleSize, 0.01, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.RankerV2PriorSnapshot = &snapshot
+	recommendation, err = agents.FinalizePlannerRecommendation(input, recommendation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := experimentPlannerDecisionPayload(recommendation, invocation, llm.AgentModePropose, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload["scheduling_ranker_version"] != agents.ExperimentPlannerRankerVersion || payload["candidate_rankings_v2"] == nil || payload["ranker_shadow_comparison"] == nil || payload["ranker_v2_prior_snapshot"] == nil {
+		t.Fatalf("shadow fields were not persisted in payload: %#v", payload)
+	}
+	creates, err := candidateProvenanceCreatesFromPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, rows, err := server.store.CreateAgentDecisionWithCandidateProvenance(
+		projectID, plan.ID, decisions.TypeAddExperiments, recommendation.Rationale, payload, creates,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Payload["candidate_rankings_v2"] == nil || decision.Payload["ranker_shadow_comparison"] == nil {
+		t.Fatalf("stored decision lost v2 shadow artifact: %#v", decision.Payload)
+	}
+	for index, row := range rows {
+		if row.BaseScore != recommendation.CandidateRankings[index].BaseScore {
+			t.Fatalf("candidate provenance stopped using v1 score at index %d: row=%#v v1=%#v v2=%#v", index, row, recommendation.CandidateRankings[index], recommendation.CandidateRankingsV2[index])
+		}
+	}
+}
 
 func TestCandidateProvenanceIsIdenticalBeforeManualOrAutoScheduling(t *testing.T) {
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 6)})

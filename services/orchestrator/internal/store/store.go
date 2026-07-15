@@ -146,6 +146,7 @@ type Store interface {
 	FinalizeCandidateOutcomes(decisionID string, updates []calibration.CandidateOutcomeUpdate) ([]calibration.CandidateProvenance, error)
 	ListDecisionCandidateProvenance(decisionID string) ([]calibration.CandidateProvenance, error)
 	ListProjectCandidateProvenance(projectID string) ([]calibration.CandidateProvenance, error)
+	ReadCalibrationObservations(projectID string, window calibration.TimeWindow, limit int) (calibration.ObservationSet, error)
 	ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error)
 	ListProjectAgentDecisionActivity(projectID string, limit int) ([]decisions.AgentDecision, error)
 

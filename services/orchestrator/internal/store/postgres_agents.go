@@ -300,12 +300,106 @@ func (s *PostgresStore) ListProjectCandidateProvenance(projectID string) ([]cali
 	return listCandidateProvenanceQuery(context.Background(), s.db, `WHERE project_id = $1 ORDER BY created_at DESC, decision_id DESC, candidate_index`, projectID)
 }
 
+func (s *PostgresStore) ReadCalibrationObservations(projectID string, window calibration.TimeWindow, limit int) (calibration.ObservationSet, error) {
+	if err := validateCalibrationRead(projectID, window, limit); err != nil {
+		return calibration.ObservationSet{}, err
+	}
+	if err := s.requireProject(projectID); err != nil {
+		return calibration.ObservationSet{}, err
+	}
+	ctx := context.Background()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT bounded.*, decisions.payload
+		FROM (
+			SELECT `+candidateProvenanceSelectColumns+`
+			FROM planner_candidate_provenance
+			WHERE project_id = $1 AND created_at >= $2 AND created_at < $3
+			ORDER BY created_at ASC, decision_id ASC, candidate_index ASC
+			LIMIT $4
+		) AS bounded
+		JOIN agent_decisions AS decisions ON decisions.id = bounded.decision_id
+		ORDER BY bounded.created_at ASC, bounded.decision_id ASC, bounded.candidate_index ASC
+	`, projectID, window.Start.UTC(), window.End.UTC(), limit+1)
+	if err != nil {
+		return calibration.ObservationSet{}, err
+	}
+	candidates := []calibration.CandidateObservation{}
+	for rows.Next() {
+		candidate, err := scanCalibrationCandidateObservation(rows)
+		if err != nil {
+			rows.Close()
+			return calibration.ObservationSet{}, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return calibration.ObservationSet{}, err
+	}
+	rows.Close()
+	candidatesTruncated := len(candidates) > limit
+	if candidatesTruncated {
+		candidates = candidates[:limit]
+	}
+
+	invocationRows, err := s.db.QueryContext(ctx, `
+		SELECT `+agentInvocationSelectColumns+`
+		FROM agent_invocations
+		WHERE project_id = $1 AND agent_name = $2 AND created_at >= $3 AND created_at < $4
+		ORDER BY created_at ASC, id ASC
+		LIMIT $5
+	`, projectID, "experiment_planner", window.Start.UTC(), window.End.UTC(), limit+1)
+	if err != nil {
+		return calibration.ObservationSet{}, err
+	}
+	defer invocationRows.Close()
+	invocations := []calibration.InvocationObservation{}
+	for invocationRows.Next() {
+		invocation, err := scanAgentInvocation(invocationRows)
+		if err != nil {
+			return calibration.ObservationSet{}, err
+		}
+		invocations = append(invocations, calibrationInvocationObservation(invocation))
+	}
+	if err := invocationRows.Err(); err != nil {
+		return calibration.ObservationSet{}, err
+	}
+	invocationsTruncated := len(invocations) > limit
+	if invocationsTruncated {
+		invocations = invocations[:limit]
+	}
+	return calibration.ObservationSet{
+		Candidates: candidates, Invocations: invocations,
+		CandidatesTruncated: candidatesTruncated, InvocationsTruncated: invocationsTruncated,
+	}, nil
+}
+
+func scanCalibrationCandidateObservation(row rowScanner) (calibration.CandidateObservation, error) {
+	var candidate calibration.CandidateProvenance
+	var state candidateProvenanceScanState
+	var payloadJSON []byte
+	destinations := candidateProvenanceScanDestinations(&candidate, &state)
+	destinations = append(destinations, &payloadJSON)
+	if err := row.Scan(destinations...); err != nil {
+		return calibration.CandidateObservation{}, normalizeSQLError(err)
+	}
+	candidate, err := finalizeCandidateProvenanceScan(candidate, state)
+	if err != nil {
+		return calibration.CandidateObservation{}, err
+	}
+	payload := map[string]any{}
+	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+		return calibration.CandidateObservation{}, fmt.Errorf("unmarshal calibration decision payload: %w", err)
+	}
+	family, evidenceCount := calibration.CandidateDecisionMetadata(payload, candidate.CandidateIndex)
+	return calibration.CandidateObservation{CandidateProvenance: candidate, ModelFamily: family, EvidenceCount: evidenceCount}, nil
+}
+
 type candidateProvenanceQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func listCandidateProvenanceQuery(ctx context.Context, queryer candidateProvenanceQueryer, clause string, value any) ([]calibration.CandidateProvenance, error) {
-	query := `SELECT id, project_id, invocation_id, decision_id, planner_variant_id, candidate_index,
+const candidateProvenanceSelectColumns = `id, project_id, invocation_id, decision_id, planner_variant_id, candidate_index,
 		requested_config_hash, accepted_spec_hash, task, mechanism,
 		forecast_target, metric_direction, score_basis, score_version, baseline_job_id,
 		baseline_score, predicted_delta, prediction_source, forecast_units, valid_range_min, valid_range_max,
@@ -313,8 +407,10 @@ func listCandidateProvenanceQuery(ctx context.Context, queryer candidateProvenan
 		selected_experiment_index, outcome_status, reasons,
 		followup_plan_id, experiment_id, job_id, attempt_id, realized_effective_hash,
 		actual_score, actual_delta, terminal_state, cost_usd, runtime_seconds,
-		calibration_eligible, eligibility_reason, finalized_at, created_at
-		FROM planner_candidate_provenance ` + clause
+		calibration_eligible, eligibility_reason, finalized_at, created_at`
+
+func listCandidateProvenanceQuery(ctx context.Context, queryer candidateProvenanceQueryer, clause string, value any) ([]calibration.CandidateProvenance, error) {
+	query := `SELECT ` + candidateProvenanceSelectColumns + ` FROM planner_candidate_provenance ` + clause
 	rows, err := queryer.QueryContext(ctx, query, value)
 	if err != nil {
 		return nil, err

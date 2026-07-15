@@ -32,6 +32,9 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 	rankings, selected, mechanisms, selectionTrace := rankPlannerCandidateHypotheses(input, candidates, effectiveMaxPlannerExperiments(input))
 	recommendation.CandidateRankings = rankings
 	recommendation.CandidateSelectionTrace = selectionTrace
+	recommendation.CandidateRankingsV2, recommendation.CandidateSelectionTraceV2, recommendation.RankerShadowComparison = rankPlannerCandidateHypothesesV2(
+		input, candidates, rankings, effectiveMaxPlannerExperiments(input),
+	)
 	recommendation.ProposedExperiments = selected
 	recommendation.ProposalMechanisms = mechanisms
 	if len(selected) == 0 {
@@ -330,6 +333,7 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	experiment := candidate.ExperimentConfig
 	signature := candidateExperimentSignature(experiment)
 	ranking := CandidateRanking{
+		RankerVersion:       ExperimentPlannerRankerVersion,
 		CandidateIndex:      index,
 		Hypothesis:          candidate.Hypothesis,
 		PlanningMode:        candidate.PlanningMode,

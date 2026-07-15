@@ -37,22 +37,33 @@ type rowScanner interface {
 
 func scanCandidateProvenance(row rowScanner) (calibration.CandidateProvenance, error) {
 	var candidate calibration.CandidateProvenance
-	var selectedExperimentIndex sql.NullInt64
-	var followUpPlanID sql.NullString
-	var experimentID sql.NullString
-	var jobID sql.NullString
-	var attemptID sql.NullString
-	var realizedEffectiveHash sql.NullString
-	var actualScore sql.NullFloat64
-	var actualDelta sql.NullFloat64
-	var terminalState sql.NullString
-	var costUSD sql.NullFloat64
-	var runtimeSeconds sql.NullFloat64
-	var calibrationEligible sql.NullBool
-	var eligibilityReason sql.NullString
-	var finalizedAt sql.NullTime
-	var reasonsJSON []byte
-	err := row.Scan(
+	var state candidateProvenanceScanState
+	if err := row.Scan(candidateProvenanceScanDestinations(&candidate, &state)...); err != nil {
+		return calibration.CandidateProvenance{}, normalizeSQLError(err)
+	}
+	return finalizeCandidateProvenanceScan(candidate, state)
+}
+
+type candidateProvenanceScanState struct {
+	selectedExperimentIndex sql.NullInt64
+	followUpPlanID          sql.NullString
+	experimentID            sql.NullString
+	jobID                   sql.NullString
+	attemptID               sql.NullString
+	realizedEffectiveHash   sql.NullString
+	actualScore             sql.NullFloat64
+	actualDelta             sql.NullFloat64
+	terminalState           sql.NullString
+	costUSD                 sql.NullFloat64
+	runtimeSeconds          sql.NullFloat64
+	calibrationEligible     sql.NullBool
+	eligibilityReason       sql.NullString
+	finalizedAt             sql.NullTime
+	reasonsJSON             []byte
+}
+
+func candidateProvenanceScanDestinations(candidate *calibration.CandidateProvenance, state *candidateProvenanceScanState) []any {
+	return []any{
 		&candidate.ID,
 		&candidate.ProjectID,
 		&candidate.InvocationID,
@@ -79,72 +90,72 @@ func scanCandidateProvenance(row rowScanner) (calibration.CandidateProvenance, e
 		&candidate.Selected,
 		&candidate.Rejected,
 		&candidate.SelectionState,
-		&selectedExperimentIndex,
+		&state.selectedExperimentIndex,
 		&candidate.OutcomeStatus,
-		&reasonsJSON,
-		&followUpPlanID,
-		&experimentID,
-		&jobID,
-		&attemptID,
-		&realizedEffectiveHash,
-		&actualScore,
-		&actualDelta,
-		&terminalState,
-		&costUSD,
-		&runtimeSeconds,
-		&calibrationEligible,
-		&eligibilityReason,
-		&finalizedAt,
+		&state.reasonsJSON,
+		&state.followUpPlanID,
+		&state.experimentID,
+		&state.jobID,
+		&state.attemptID,
+		&state.realizedEffectiveHash,
+		&state.actualScore,
+		&state.actualDelta,
+		&state.terminalState,
+		&state.costUSD,
+		&state.runtimeSeconds,
+		&state.calibrationEligible,
+		&state.eligibilityReason,
+		&state.finalizedAt,
 		&candidate.CreatedAt,
-	)
-	if err != nil {
-		return calibration.CandidateProvenance{}, normalizeSQLError(err)
 	}
-	if err := json.Unmarshal(reasonsJSON, &candidate.Reasons); err != nil {
+}
+
+func finalizeCandidateProvenanceScan(candidate calibration.CandidateProvenance, state candidateProvenanceScanState) (calibration.CandidateProvenance, error) {
+	if err := json.Unmarshal(state.reasonsJSON, &candidate.Reasons); err != nil {
 		return calibration.CandidateProvenance{}, fmt.Errorf("unmarshal candidate provenance reasons: %w", err)
 	}
-	if selectedExperimentIndex.Valid {
-		value := int(selectedExperimentIndex.Int64)
+	if state.selectedExperimentIndex.Valid {
+		value := int(state.selectedExperimentIndex.Int64)
 		candidate.SelectedExperimentIndex = &value
 	}
-	if followUpPlanID.Valid {
-		candidate.FollowUpPlanID = &followUpPlanID.String
+	if state.followUpPlanID.Valid {
+		candidate.FollowUpPlanID = &state.followUpPlanID.String
 	}
-	if experimentID.Valid {
-		candidate.ExperimentID = &experimentID.String
+	if state.experimentID.Valid {
+		candidate.ExperimentID = &state.experimentID.String
 	}
-	if jobID.Valid {
-		candidate.JobID = &jobID.String
+	if state.jobID.Valid {
+		candidate.JobID = &state.jobID.String
 	}
-	if attemptID.Valid {
-		candidate.AttemptID = &attemptID.String
+	if state.attemptID.Valid {
+		candidate.AttemptID = &state.attemptID.String
 	}
-	if realizedEffectiveHash.Valid {
-		candidate.RealizedEffectiveHash = &realizedEffectiveHash.String
+	if state.realizedEffectiveHash.Valid {
+		candidate.RealizedEffectiveHash = &state.realizedEffectiveHash.String
 	}
-	if actualScore.Valid {
-		candidate.ActualScore = &actualScore.Float64
+	if state.actualScore.Valid {
+		candidate.ActualScore = &state.actualScore.Float64
 	}
-	if actualDelta.Valid {
-		candidate.ActualDelta = &actualDelta.Float64
+	if state.actualDelta.Valid {
+		candidate.ActualDelta = &state.actualDelta.Float64
 	}
-	if terminalState.Valid {
-		candidate.TerminalState = &terminalState.String
+	if state.terminalState.Valid {
+		candidate.TerminalState = &state.terminalState.String
 	}
-	if costUSD.Valid {
-		candidate.CostUSD = &costUSD.Float64
+	if state.costUSD.Valid {
+		candidate.CostUSD = &state.costUSD.Float64
 	}
-	if runtimeSeconds.Valid {
-		candidate.RuntimeSeconds = &runtimeSeconds.Float64
+	if state.runtimeSeconds.Valid {
+		candidate.RuntimeSeconds = &state.runtimeSeconds.Float64
 	}
-	if calibrationEligible.Valid {
-		candidate.CalibrationEligible = &calibrationEligible.Bool
+	if state.calibrationEligible.Valid {
+		candidate.CalibrationEligible = &state.calibrationEligible.Bool
 	}
-	if eligibilityReason.Valid {
-		candidate.EligibilityReason = &eligibilityReason.String
+	if state.eligibilityReason.Valid {
+		candidate.EligibilityReason = &state.eligibilityReason.String
 	}
-	if finalizedAt.Valid {
-		candidate.FinalizedAt = &finalizedAt.Time
+	if state.finalizedAt.Valid {
+		candidate.FinalizedAt = &state.finalizedAt.Time
 	}
 	return candidate, nil
 }

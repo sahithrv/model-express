@@ -1551,6 +1551,66 @@ func (s *MemoryStore) ListProjectCandidateProvenance(projectID string) ([]calibr
 	return rows, nil
 }
 
+func (s *MemoryStore) ReadCalibrationObservations(projectID string, window calibration.TimeWindow, limit int) (calibration.ObservationSet, error) {
+	if err := validateCalibrationRead(projectID, window, limit); err != nil {
+		return calibration.ObservationSet{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.projects[projectID]; !ok {
+		return calibration.ObservationSet{}, ErrNotFound
+	}
+
+	candidates := []calibration.CandidateObservation{}
+	for _, row := range s.candidateProvenance {
+		if row.ProjectID != projectID || row.CreatedAt.Before(window.Start) || !row.CreatedAt.Before(window.End) {
+			continue
+		}
+		family, evidenceCount := "unknown", 0
+		if decision, ok := s.decisions[row.DecisionID]; ok {
+			family, evidenceCount = calibration.CandidateDecisionMetadata(decision.Payload, row.CandidateIndex)
+		}
+		candidates = append(candidates, calibration.CandidateObservation{
+			CandidateProvenance: row, ModelFamily: family, EvidenceCount: evidenceCount,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].CreatedAt.Equal(candidates[j].CreatedAt) {
+			if candidates[i].DecisionID == candidates[j].DecisionID {
+				return candidates[i].CandidateIndex < candidates[j].CandidateIndex
+			}
+			return candidates[i].DecisionID < candidates[j].DecisionID
+		}
+		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
+	})
+	candidatesTruncated := len(candidates) > limit
+	if candidatesTruncated {
+		candidates = candidates[:limit]
+	}
+
+	invocations := []calibration.InvocationObservation{}
+	for _, invocation := range s.agentInvocations {
+		if invocation.ProjectID != projectID || invocation.AgentName != "experiment_planner" || invocation.CreatedAt.Before(window.Start) || !invocation.CreatedAt.Before(window.End) {
+			continue
+		}
+		invocations = append(invocations, calibrationInvocationObservation(invocation))
+	}
+	sort.Slice(invocations, func(i, j int) bool {
+		if invocations[i].CreatedAt.Equal(invocations[j].CreatedAt) {
+			return invocations[i].ID < invocations[j].ID
+		}
+		return invocations[i].CreatedAt.Before(invocations[j].CreatedAt)
+	})
+	invocationsTruncated := len(invocations) > limit
+	if invocationsTruncated {
+		invocations = invocations[:limit]
+	}
+	return calibration.ObservationSet{
+		Candidates: candidates, Invocations: invocations,
+		CandidatesTruncated: candidatesTruncated, InvocationsTruncated: invocationsTruncated,
+	}, nil
+}
+
 func cloneCandidateProvenanceCreate(candidate calibration.CandidateProvenanceCreate) calibration.CandidateProvenanceCreate {
 	candidate.Reasons = append([]string(nil), candidate.Reasons...)
 	if candidate.SelectedExperimentIndex != nil {
