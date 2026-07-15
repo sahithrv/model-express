@@ -41,7 +41,16 @@ func scanCandidateProvenance(row rowScanner) (calibration.CandidateProvenance, e
 	var followUpPlanID sql.NullString
 	var experimentID sql.NullString
 	var jobID sql.NullString
+	var attemptID sql.NullString
 	var realizedEffectiveHash sql.NullString
+	var actualScore sql.NullFloat64
+	var actualDelta sql.NullFloat64
+	var terminalState sql.NullString
+	var costUSD sql.NullFloat64
+	var runtimeSeconds sql.NullFloat64
+	var calibrationEligible sql.NullBool
+	var eligibilityReason sql.NullString
+	var finalizedAt sql.NullTime
 	var reasonsJSON []byte
 	err := row.Scan(
 		&candidate.ID,
@@ -76,7 +85,16 @@ func scanCandidateProvenance(row rowScanner) (calibration.CandidateProvenance, e
 		&followUpPlanID,
 		&experimentID,
 		&jobID,
+		&attemptID,
 		&realizedEffectiveHash,
+		&actualScore,
+		&actualDelta,
+		&terminalState,
+		&costUSD,
+		&runtimeSeconds,
+		&calibrationEligible,
+		&eligibilityReason,
+		&finalizedAt,
 		&candidate.CreatedAt,
 	)
 	if err != nil {
@@ -98,8 +116,35 @@ func scanCandidateProvenance(row rowScanner) (calibration.CandidateProvenance, e
 	if jobID.Valid {
 		candidate.JobID = &jobID.String
 	}
+	if attemptID.Valid {
+		candidate.AttemptID = &attemptID.String
+	}
 	if realizedEffectiveHash.Valid {
 		candidate.RealizedEffectiveHash = &realizedEffectiveHash.String
+	}
+	if actualScore.Valid {
+		candidate.ActualScore = &actualScore.Float64
+	}
+	if actualDelta.Valid {
+		candidate.ActualDelta = &actualDelta.Float64
+	}
+	if terminalState.Valid {
+		candidate.TerminalState = &terminalState.String
+	}
+	if costUSD.Valid {
+		candidate.CostUSD = &costUSD.Float64
+	}
+	if runtimeSeconds.Valid {
+		candidate.RuntimeSeconds = &runtimeSeconds.Float64
+	}
+	if calibrationEligible.Valid {
+		candidate.CalibrationEligible = &calibrationEligible.Bool
+	}
+	if eligibilityReason.Valid {
+		candidate.EligibilityReason = &eligibilityReason.String
+	}
+	if finalizedAt.Valid {
+		candidate.FinalizedAt = &finalizedAt.Time
 	}
 	return candidate, nil
 }

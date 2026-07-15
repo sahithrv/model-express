@@ -38,32 +38,46 @@ const (
 )
 
 func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.ExperimentJob) error {
-	summary, err := s.store.GetTrainingRunSummary(job.ID)
-	if err != nil || summary.PlanID == "" {
+	plan, ok, err := s.trainingJobExperimentPlan(job)
+	if err != nil || !ok {
+		return err
+	}
+	return s.recordExperimentPlannerOutcomeForPlan(plan)
+}
+
+func (s *Server) recordExperimentPlannerOutcomeForPlan(plan plans.ExperimentPlan) error {
+	if plan.SourceDecisionID == "" {
 		return nil
 	}
 
 	s.autoReviewMu.Lock()
 	defer s.autoReviewMu.Unlock()
+	return s.recordExperimentPlannerOutcomeForPlanLocked(plan)
+}
 
-	plan, err := s.store.GetExperimentPlan(summary.PlanID)
-	if err != nil {
-		return err
-	}
-	if plan.SourceDecisionID == "" {
-		return nil
-	}
-
-	summaries, err := s.store.ListProjectTrainingRunSummaries(job.ProjectID)
+func (s *Server) recordExperimentPlannerOutcomeForPlanLocked(plan plans.ExperimentPlan) error {
+	summaries, err := s.store.ListProjectTrainingRunSummaries(plan.ProjectID)
 	if err != nil {
 		return err
 	}
 	planSummaries := summariesForPlanID(summaries, plan.ID)
-	if !planTrainingRunsComplete(plan, planSummaries) {
+	projectJobs, err := s.store.ListProjectJobs(plan.ProjectID)
+	if err != nil {
+		return err
+	}
+	candidateRows, candidateErr := s.store.ListDecisionCandidateProvenance(plan.SourceDecisionID)
+	if candidateErr != nil && !errors.Is(candidateErr, store.ErrNotFound) {
+		return candidateErr
+	}
+	if len(candidateRows) > 0 {
+		if !candidatePlanExperimentsTerminal(plan, candidateJobsForPlan(projectJobs, plan.ID), candidateRows) {
+			return nil
+		}
+	} else if !planTrainingRunsComplete(plan, planSummaries) {
 		return nil
 	}
 
-	agentDecisions, err := s.store.ListProjectAgentDecisions(job.ProjectID)
+	agentDecisions, err := s.store.ListProjectAgentDecisions(plan.ProjectID)
 	if err != nil {
 		return err
 	}
@@ -87,11 +101,7 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 		return nil
 	}
 
-	projectPlans, err := s.store.ListProjectExperimentPlans(job.ProjectID)
-	if err != nil {
-		return err
-	}
-	projectJobs, err := s.store.ListProjectJobs(job.ProjectID)
+	projectPlans, err := s.store.ListProjectExperimentPlans(plan.ProjectID)
 	if err != nil {
 		return err
 	}
@@ -99,17 +109,17 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	if err != nil {
 		return err
 	}
-	evaluations, err := s.store.ListProjectTrainingRunEvaluations(job.ProjectID)
+	evaluations, err := s.store.ListProjectTrainingRunEvaluations(plan.ProjectID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
 	goalText := ""
-	if project, err := s.store.GetProject(job.ProjectID); err == nil {
+	if project, err := s.store.GetProject(plan.ProjectID); err == nil {
 		goalText = project.Goal
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
-	outcome, err := experimentPlanningOutcomeForPlan(sourceDecision, plan, projectPlans, summaries, evaluations, projectObjectiveContext(goalText), executionEvidenceByJob)
+	outcome, err := experimentPlanningOutcomeForPlanWithTerminalCount(sourceDecision, plan, projectPlans, summaries, evaluations, projectObjectiveContext(goalText), executionEvidenceByJob, len(plan.Experiments))
 	if err != nil {
 		return err
 	}
@@ -126,7 +136,7 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 	tags := plannerOutcomeTags(outcome)
 	record, err := s.store.CreateAgentMemoryRecord(memory.AgentMemoryRecord{
 		InvocationID: updatedInvocation.ID,
-		ProjectID:    job.ProjectID,
+		ProjectID:    plan.ProjectID,
 		DatasetID:    plan.DatasetID,
 		PlanID:       plan.ID,
 		AgentName:    agents.ExperimentPlannerAgentName,
@@ -142,7 +152,7 @@ func (s *Server) recordExperimentPlannerOutcomeAfterTrainingJob(job jobs.Experim
 		s.indexMemoryCard(context.Background(), memory.NewAgentMemoryCard(record))
 	}
 
-	if _, err := s.store.CreateExecutionEvent(job.ProjectID, plan.ID, execution.EventAgentOutcomeRecorded, fmt.Sprintf("Experiment Planner outcome recorded for follow-up plan %s.", plan.ID), map[string]any{
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventAgentOutcomeRecorded, fmt.Sprintf("Experiment Planner outcome recorded for follow-up plan %s.", plan.ID), map[string]any{
 		"invocation_id":      updatedInvocation.ID,
 		"memory_record_id":   record.ID,
 		"source_decision_id": sourceDecision.ID,

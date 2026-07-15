@@ -99,6 +99,62 @@ func TestMemoryCandidateProvenanceRepairsDecisionCreatedBeforeCandidateInsert(t 
 	}
 }
 
+func TestMemoryCandidateOutcomeFinalizationIsAtomicAndKeepsProposalProvenanceImmutable(t *testing.T) {
+	store := NewMemoryStore()
+	project, _ := store.CreateProject("candidate outcomes", "finalize")
+	invocation, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID: project.ID, AgentName: "experiment_planner", PlannerVariantID: memory.LegacyPlannerVariantID,
+		ValidationStatus: memory.InvocationValidationValid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creates := testCandidateProvenanceCreates(invocation.ID, invocation.PlannerVariantID)
+	decision, before, err := store.CreateAgentDecisionWithCandidateProvenance(
+		project.ID, "plan_1", decisions.TypeAddExperiments, "accepted", nil, creates,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planID, experimentID, jobID, attemptID, hash := "plan_2", "plan_2:experiment-0", "job_1", "job_1:attempt-1", "sha256:realized"
+	actualScore, actualDelta, cost, runtimeSeconds, eligible, reason, terminal := 0.75, 0.05, 0.2, 10.0, true, "matched_finalized", calibration.CandidateTerminalSucceeded
+	update := calibration.CandidateOutcomeUpdate{
+		CandidateIndex: 0, FollowUpPlanID: planID, ExperimentID: experimentID, JobID: &jobID, AttemptID: &attemptID,
+		RealizedEffectiveHash: &hash, OutcomeStatus: calibration.CandidateOutcomeObserved,
+		ActualScore: &actualScore, ActualDelta: &actualDelta, TerminalState: &terminal,
+		CostUSD: &cost, RuntimeSeconds: &runtimeSeconds, CalibrationEligible: &eligible, EligibilityReason: &reason,
+	}
+	first, err := store.FinalizeCandidateOutcomes(decision.ID, []calibration.CandidateOutcomeUpdate{update})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.FinalizeCandidateOutcomes(decision.ID, []calibration.CandidateOutcomeUpdate{update})
+	if err != nil || !reflect.DeepEqual(first, second) {
+		t.Fatalf("idempotent finalization changed rows: first=%#v second=%#v err=%v", first, second, err)
+	}
+	if first[0].Forecast != before[0].Forecast || first[0].RequestedConfigHash != before[0].RequestedConfigHash || first[0].AcceptedSpecHash != before[0].AcceptedSpecHash {
+		t.Fatalf("proposal-time provenance changed: before=%#v after=%#v", before[0], first[0])
+	}
+	if repaired, err := store.EnsureCandidateProvenance(decision, creates); err != nil || !reflect.DeepEqual(repaired, first) {
+		t.Fatalf("post-finalization ensure was not idempotent: rows=%#v err=%v", repaired, err)
+	}
+	conflicting := update
+	otherJob := "job_2"
+	conflicting.JobID = &otherJob
+	if _, err := store.FinalizeCandidateOutcomes(decision.ID, []calibration.CandidateOutcomeUpdate{conflicting}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("conflicting immutable lineage was accepted: %v", err)
+	}
+	afterConflict, _ := store.ListDecisionCandidateProvenance(decision.ID)
+	if !reflect.DeepEqual(afterConflict, first) {
+		t.Fatalf("failed finalization was not atomic: before=%#v after=%#v", first, afterConflict)
+	}
+	unselected := update
+	unselected.CandidateIndex = 1
+	if _, err := store.FinalizeCandidateOutcomes(decision.ID, []calibration.CandidateOutcomeUpdate{unselected}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("unselected candidate received an outcome: %v", err)
+	}
+}
+
 func TestScanCandidateProvenancePreservesForecastSelectionAndNullableLineage(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 14, 12, 0, 0, 0, time.UTC)
 	row := fakeAgentInvocationRow{values: []any{
@@ -108,7 +164,9 @@ func TestScanCandidateProvenancePreservesForecastSelectionAndNullableLineage(t *
 		0.70, 0.02, calibration.CandidatePredictionSource, calibration.CandidateForecastUnits, 0.0, 1.0,
 		0.77, "/payload/candidate_selection_trace/0/candidates/0", true, false, calibration.CandidateSelectionSelected,
 		sql.NullInt64{Int64: 0, Valid: true}, calibration.CandidateOutcomeUnknown, []byte(`["selected"]`),
-		sql.NullString{}, sql.NullString{}, sql.NullString{}, sql.NullString{}, createdAt,
+		sql.NullString{}, sql.NullString{}, sql.NullString{}, sql.NullString{}, sql.NullString{},
+		sql.NullFloat64{}, sql.NullFloat64{}, sql.NullString{}, sql.NullFloat64{}, sql.NullFloat64{},
+		sql.NullBool{}, sql.NullString{}, sql.NullTime{}, createdAt,
 	}}
 	candidate, err := scanCandidateProvenance(row)
 	if err != nil {
@@ -117,7 +175,7 @@ func TestScanCandidateProvenancePreservesForecastSelectionAndNullableLineage(t *
 	if candidate.CandidateIndex != 2 || candidate.SelectedExperimentIndex == nil || *candidate.SelectedExperimentIndex != 0 || candidate.Forecast.PredictedDelta != 0.02 {
 		t.Fatalf("candidate provenance scan lost forecast or selection: %#v", candidate)
 	}
-	if candidate.FollowUpPlanID != nil || candidate.ExperimentID != nil || candidate.JobID != nil || candidate.RealizedEffectiveHash != nil {
+	if candidate.FollowUpPlanID != nil || candidate.ExperimentID != nil || candidate.JobID != nil || candidate.AttemptID != nil || candidate.RealizedEffectiveHash != nil || candidate.FinalizedAt != nil {
 		t.Fatalf("decision-time nullable lineage did not remain null: %#v", candidate)
 	}
 }

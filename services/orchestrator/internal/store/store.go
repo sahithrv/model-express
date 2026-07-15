@@ -143,6 +143,7 @@ type Store interface {
 	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)
 	CreateAgentDecisionWithCandidateProvenance(projectID string, planID string, decisionType string, rationale string, payload map[string]any, candidates []calibration.CandidateProvenanceCreate) (decisions.AgentDecision, []calibration.CandidateProvenance, error)
 	EnsureCandidateProvenance(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error)
+	FinalizeCandidateOutcomes(decisionID string, updates []calibration.CandidateOutcomeUpdate) ([]calibration.CandidateProvenance, error)
 	ListDecisionCandidateProvenance(decisionID string) ([]calibration.CandidateProvenance, error)
 	ListProjectCandidateProvenance(projectID string) ([]calibration.CandidateProvenance, error)
 	ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error)

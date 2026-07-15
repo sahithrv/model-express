@@ -218,6 +218,22 @@ func experimentPlanningOutcomeForPlan(
 	objectiveContext agents.ProjectObjectiveContext,
 	executionEvidenceByJob map[string]agents.ExperimentExecutionEvidence,
 ) (agents.ExperimentPlanningOutcome, error) {
+	return experimentPlanningOutcomeForPlanWithTerminalCount(
+		sourceDecision, followUpPlan, projectPlans, summaries, evaluations, objectiveContext,
+		executionEvidenceByJob, len(summariesForPlanID(summaries, followUpPlan.ID)),
+	)
+}
+
+func experimentPlanningOutcomeForPlanWithTerminalCount(
+	sourceDecision decisions.AgentDecision,
+	followUpPlan plans.ExperimentPlan,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+	evaluations []runs.TrainingRunEvaluation,
+	objectiveContext agents.ProjectObjectiveContext,
+	executionEvidenceByJob map[string]agents.ExperimentExecutionEvidence,
+	terminalExperimentCount int,
+) (agents.ExperimentPlanningOutcome, error) {
 	planSummaries := summariesForPlanID(summaries, followUpPlan.ID)
 	eligibleSummaries := learningEligibleSummaries(planSummaries, executionEvidenceByJob)
 	eligibleProjectSummaries := learningEligibleSummaries(summaries, executionEvidenceByJob)
@@ -275,7 +291,7 @@ func experimentPlanningOutcomeForPlan(
 		MetExpectedDelta:         metExpectedDelta,
 		TotalCostUSD:             totalSummaryCost(planSummaries),
 		TotalRuntimeSeconds:      totalSummaryRuntime(planSummaries),
-		TerminalRunCount:         len(planSummaries),
+		TerminalRunCount:         terminalExperimentCount,
 		SuccessfulRunCount:       successfulSummaryCount(planSummaries),
 		FailedRunCount:           failedSummaryCount(planSummaries),
 		ProposedExperiments:      proposedExperiments,

@@ -105,5 +105,7 @@ func (s *Server) handleRecoveredExpiredLeaseFailure(job jobs.ExperimentJob) {
 
 	if job.Template == jobs.TemplateTrainExperiment {
 		s.enqueueTrainingTerminalHooks(job)
+	} else {
+		s.finalizeCandidateOutcomesAfterNonTrainingJob(job)
 	}
 }

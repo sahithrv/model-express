@@ -589,6 +589,8 @@ func (s *Server) completeJob(c *gin.Context) {
 
 	if job.Template == jobs.TemplateTrainExperiment {
 		s.enqueueTrainingTerminalHooks(job)
+	} else {
+		s.finalizeCandidateOutcomesAfterNonTrainingJob(job)
 	}
 	s.updateWorkerRequirementDemandAfterTerminalJob(job)
 
@@ -682,6 +684,7 @@ func (s *Server) failJob(c *gin.Context) {
 		}
 		if !requeued && job.Template != jobs.TemplateTrainExperiment {
 			s.closeRemoteTrainingSession(job, jobs.StatusFailed)
+			s.finalizeCandidateOutcomesAfterNonTrainingJob(job)
 		}
 		if !requeued && job.Template == jobs.TemplateAnalyzeDatasetVisuals && jobConfigString(job.Config, "trigger_reason") == string(datasets.VisualTriggerInitialProfile) {
 			if err := s.createInitialPlanForDataset(jobConfigString(job.Config, "dataset_id")); err != nil {
@@ -726,6 +729,8 @@ func (s *Server) failJob(c *gin.Context) {
 		}
 		s.enqueueTrainingTerminalHooks(job)
 		s.updateWorkerRequirementDemandAfterTerminalJob(job)
+	} else {
+		s.finalizeCandidateOutcomesAfterNonTrainingJob(job)
 	}
 	if job.Template == jobs.TemplateAnalyzeDatasetVisuals && jobConfigString(job.Config, "trigger_reason") == string(datasets.VisualTriggerInitialProfile) {
 		if err := s.createInitialPlanForDataset(jobConfigString(job.Config, "dataset_id")); err != nil {
@@ -1618,6 +1623,15 @@ func (s *Server) cancelPlanActiveExecutionByID(planID string, req cancelExecutio
 		"late_callbacks_ignored_by_attempt_id": true,
 	}); err != nil {
 		return cancelExecutionResponse{}, err
+	}
+	complete, err := s.finalizeCandidateOutcomesForPlan(plan.ID)
+	if err != nil {
+		return cancelExecutionResponse{}, err
+	}
+	if complete {
+		if err := s.recordExperimentPlannerOutcomeForPlan(plan); err != nil {
+			return cancelExecutionResponse{}, err
+		}
 	}
 	return response, nil
 }

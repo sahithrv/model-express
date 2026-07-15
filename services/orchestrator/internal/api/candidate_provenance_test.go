@@ -104,11 +104,19 @@ func TestExistingDecisionPathRepairsCandidateProvenanceWithoutDuplicates(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := server.ensurePlannerCandidateProvenance(decision); err != nil {
+	followUpPlan, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := server.ensurePlannerCandidateProvenance(decision); err != nil {
+	if !created || followUpPlan.ID == "" {
+		t.Fatalf("existing-decision scheduling did not create a follow-up plan: plan=%#v created=%v", followUpPlan, created)
+	}
+	secondPlan, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if created || secondPlan.ID != followUpPlan.ID {
+		t.Fatalf("existing-decision scheduling was not idempotent: first=%#v second=%#v created=%v", followUpPlan, secondPlan, created)
 	}
 	rows, err := server.store.ListDecisionCandidateProvenance(decision.ID)
 	if err != nil || len(rows) != 3 {

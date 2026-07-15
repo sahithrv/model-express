@@ -1415,6 +1415,50 @@ func (s *MemoryStore) EnsureCandidateProvenance(decision decisions.AgentDecision
 	return s.ensureCandidateProvenanceLocked(stored, candidates)
 }
 
+func (s *MemoryStore) FinalizeCandidateOutcomes(decisionID string, updates []calibration.CandidateOutcomeUpdate) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.decisions[decisionID]; !ok {
+		return nil, ErrNotFound
+	}
+	seen := map[int]bool{}
+	rowsByIndex := map[int]calibration.CandidateProvenance{}
+	rowIDsByIndex := map[int]string{}
+	for id, row := range s.candidateProvenance {
+		if row.DecisionID == decisionID {
+			rowsByIndex[row.CandidateIndex] = row
+			rowIDsByIndex[row.CandidateIndex] = id
+		}
+	}
+	now := time.Now().UTC()
+	merged := map[int]calibration.CandidateProvenance{}
+	for _, update := range updates {
+		if seen[update.CandidateIndex] {
+			return nil, fmt.Errorf("%w: duplicate candidate outcome index %d", ErrInvalidRequest, update.CandidateIndex)
+		}
+		seen[update.CandidateIndex] = true
+		row, ok := rowsByIndex[update.CandidateIndex]
+		if !ok {
+			return nil, fmt.Errorf("%w: candidate outcome index %d does not exist", ErrInvalidRequest, update.CandidateIndex)
+		}
+		next, err := calibration.ApplyCandidateOutcomeUpdate(row, update, now)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		merged[update.CandidateIndex] = next
+	}
+	for index, row := range merged {
+		s.candidateProvenance[rowIDsByIndex[index]] = row
+		rowsByIndex[index] = row
+	}
+	rows := make([]calibration.CandidateProvenance, 0, len(rowsByIndex))
+	for _, row := range rowsByIndex {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CandidateIndex < rows[j].CandidateIndex })
+	return rows, nil
+}
+
 func (s *MemoryStore) validateCandidateProvenanceCreatesLocked(projectID string, candidates []calibration.CandidateProvenanceCreate) error {
 	seen := map[int]bool{}
 	for _, candidate := range candidates {

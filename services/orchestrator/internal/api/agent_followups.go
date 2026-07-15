@@ -391,6 +391,9 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if sourcePlan.ID == "" {
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: follow-up experiments require a source plan", store.ErrInvalidRequest)
 	}
+	if err := s.ensurePlannerCandidateProvenance(decision); err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
 
 	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
 	if err != nil {
@@ -405,6 +408,9 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	}
 	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
 		if err := s.validateExistingFollowUpPlanStillNovel(projectID, decision.ID, existingPlan, projectPlans); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
+		if _, err := s.finalizeCandidateOutcomesForPlan(existingPlan.ID); err != nil {
 			return plans.ExperimentPlan{}, false, err
 		}
 		return existingPlan, false, nil
@@ -516,6 +522,9 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	}
 	if _, err := s.createPendingStrategyScorecard(projectID, sourcePlan, decision, plan); err != nil {
 		log.Printf("create pending strategy scorecard failed for decision %s: %v", decision.ID, err)
+	}
+	if _, err := s.finalizeCandidateOutcomesForPlan(plan.ID); err != nil {
+		return plans.ExperimentPlan{}, false, err
 	}
 
 	return plan, true, nil
@@ -1019,6 +1028,7 @@ func (s *Server) executeAutomaticFollowUpPlan(result automaticExperimentReviewRe
 	}
 
 	req := s.defaultExecuteExperimentPlanRequest()
+	req.deferPlanAggregate = true
 	planExecution, err := s.executeStoredExperimentPlan(result.FollowUpPlan.ID, req)
 	if err != nil {
 		if errors.Is(err, errNoNovelFollowUpExperiments) {
@@ -1037,6 +1047,13 @@ func (s *Server) executeAutomaticFollowUpPlan(result automaticExperimentReviewRe
 	}
 
 	result.Jobs = planExecution.Jobs
+	if complete, err := s.finalizeCandidateOutcomesForPlan(result.FollowUpPlan.ID); err != nil {
+		return automaticExperimentReviewResult{}, err
+	} else if complete {
+		if err := s.recordExperimentPlannerOutcomeForPlanLocked(*result.FollowUpPlan); err != nil {
+			return automaticExperimentReviewResult{}, err
+		}
+	}
 	if err := s.recordAutomaticExecutionQueued(*result.FollowUpPlan, req, planExecution.Jobs); err != nil {
 		return automaticExperimentReviewResult{}, err
 	}
@@ -1234,6 +1251,11 @@ func (s *Server) runTrainingTerminalHooks(jobID string) {
 	}()
 
 	s.recordTrainingTerminalHookEvent(job, "started", fmt.Sprintf("Post-training agent hooks started for job %s.", job.ID), "")
+	if planID := jobConfigString(job.Config, "plan_id"); planID != "" {
+		if _, err := s.finalizeCandidateOutcomesForPlan(planID); err != nil {
+			log.Printf("candidate outcome finalization failed for plan %s after job %s: %v", planID, job.ID, err)
+		}
+	}
 	if err := s.observeAutoMLTrialForJob(job); err != nil {
 		log.Printf("AutoML trial observation failed for job %s: %v", job.ID, err)
 	}

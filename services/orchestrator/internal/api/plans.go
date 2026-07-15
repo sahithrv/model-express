@@ -31,9 +31,10 @@ type createExperimentPlanRequest struct {
 }
 
 type executeExperimentPlanRequest struct {
-	Provider          string `json:"provider"`
-	GPUType           string `json:"gpu_type"`
-	MaxConcurrentJobs int    `json:"max_concurrent_jobs"`
+	Provider           string `json:"provider"`
+	GPUType            string `json:"gpu_type"`
+	MaxConcurrentJobs  int    `json:"max_concurrent_jobs"`
+	deferPlanAggregate bool
 }
 
 type executeExperimentPlanResponse struct {
@@ -374,6 +375,15 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	}
 	if err := s.recordCostPolicySkippedJobs(plan, costPolicy); err != nil {
 		return executeExperimentPlanResponse{}, err
+	}
+	complete, err := s.finalizeCandidateOutcomesForPlan(plan.ID)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+	if complete && !req.deferPlanAggregate {
+		if err := s.recordExperimentPlannerOutcomeForPlan(plan); err != nil {
+			return executeExperimentPlanResponse{}, err
+		}
 	}
 
 	return executeExperimentPlanResponse{

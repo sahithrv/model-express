@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/decisions"
@@ -153,6 +154,62 @@ func (s *PostgresStore) EnsureCandidateProvenance(decision decisions.AgentDecisi
 	return rows, nil
 }
 
+func (s *PostgresStore) FinalizeCandidateOutcomes(decisionID string, updates []calibration.CandidateOutcomeUpdate) ([]calibration.CandidateProvenance, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := listCandidateProvenanceQuery(ctx, tx, `WHERE decision_id = $1 ORDER BY candidate_index FOR UPDATE`, decisionID)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, ErrNotFound
+	}
+	byIndex := make(map[int]calibration.CandidateProvenance, len(rows))
+	for _, row := range rows {
+		byIndex[row.CandidateIndex] = row
+	}
+	seen := map[int]bool{}
+	now := time.Now().UTC()
+	for _, update := range updates {
+		if seen[update.CandidateIndex] {
+			return nil, fmt.Errorf("%w: duplicate candidate outcome index %d", ErrInvalidRequest, update.CandidateIndex)
+		}
+		seen[update.CandidateIndex] = true
+		row, ok := byIndex[update.CandidateIndex]
+		if !ok {
+			return nil, fmt.Errorf("%w: candidate outcome index %d does not exist", ErrInvalidRequest, update.CandidateIndex)
+		}
+		next, err := calibration.ApplyCandidateOutcomeUpdate(row, update, now)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE planner_candidate_provenance
+			SET followup_plan_id=$3, experiment_id=$4, job_id=$5, attempt_id=$6,
+				realized_effective_hash=$7, outcome_status=$8, actual_score=$9, actual_delta=$10,
+				terminal_state=$11, cost_usd=$12, runtime_seconds=$13, calibration_eligible=$14,
+				eligibility_reason=$15, finalized_at=$16
+			WHERE decision_id=$1 AND candidate_index=$2
+		`, decisionID, next.CandidateIndex, next.FollowUpPlanID, next.ExperimentID, next.JobID, next.AttemptID,
+			next.RealizedEffectiveHash, next.OutcomeStatus, next.ActualScore, next.ActualDelta, next.TerminalState,
+			next.CostUSD, next.RuntimeSeconds, next.CalibrationEligible, next.EligibilityReason, next.FinalizedAt); err != nil {
+			return nil, normalizeSQLError(err)
+		}
+		byIndex[next.CandidateIndex] = next
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	for index := range rows {
+		rows[index] = byIndex[rows[index].CandidateIndex]
+	}
+	return rows, nil
+}
+
 func validateCandidateProvenanceCreates(candidates []calibration.CandidateProvenanceCreate) error {
 	if len(candidates) == 0 {
 		return fmt.Errorf("%w: accepted planner decision requires candidate provenance", ErrInvalidRequest)
@@ -254,7 +311,9 @@ func listCandidateProvenanceQuery(ctx context.Context, queryer candidateProvenan
 		baseline_score, predicted_delta, prediction_source, forecast_units, valid_range_min, valid_range_max,
 		base_score, selection_trace_reference, selected, rejected, selection_state,
 		selected_experiment_index, outcome_status, reasons,
-		followup_plan_id, experiment_id, job_id, realized_effective_hash, created_at
+		followup_plan_id, experiment_id, job_id, attempt_id, realized_effective_hash,
+		actual_score, actual_delta, terminal_state, cost_usd, runtime_seconds,
+		calibration_eligible, eligibility_reason, finalized_at, created_at
 		FROM planner_candidate_provenance ` + clause
 	rows, err := queryer.QueryContext(ctx, query, value)
 	if err != nil {
