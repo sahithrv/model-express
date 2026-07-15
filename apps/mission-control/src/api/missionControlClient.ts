@@ -46,6 +46,7 @@ export type OrchestratorHttpErrorResponse = {
 export class OrchestratorHttpError extends Error {
   readonly status: number;
   readonly reasonCode: string;
+  readonly policy: PolicyErrorDetails | null;
 
   constructor(response: OrchestratorHttpErrorResponse) {
     const statusText = response.statusText ? ` ${response.statusText}` : "";
@@ -55,8 +56,26 @@ export class OrchestratorHttpError extends Error {
     this.name = "OrchestratorHttpError";
     this.status = response.status;
     this.reasonCode = httpErrorReasonCode(response.payload);
+    this.policy = policyErrorDetails(response.payload);
   }
 }
+
+export type PolicyErrorFinding = {
+  code: string;
+  catalog?: string;
+  id?: string;
+  fieldPath?: string;
+  scope?: string;
+  remediation?: string;
+};
+
+export type PolicyErrorDetails = {
+  code: string;
+  evaluationId?: string;
+  effectivePolicyHash?: string;
+  blockedDimensions: string[];
+  findings: PolicyErrorFinding[];
+};
 
 export function isUnsupportedIncrementalStatus(status: number): boolean {
   return status === 404 || status === 405 || status === 501;
@@ -68,8 +87,46 @@ export function isCursorRecoveryStatus(status: number): boolean {
 
 export function httpErrorReasonCode(payload: unknown): string {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
-  const value = (payload as { reason_code?: unknown }).reason_code;
-  return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : "";
+  const source = payload as { reason_code?: unknown; code?: unknown };
+  const value = typeof source.reason_code === "string" ? source.reason_code : source.code;
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(value) ? value : "";
+}
+
+function boundedIdentifier(value: unknown, maxLength = 256): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxLength) return undefined;
+  return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : undefined;
+}
+
+export function policyErrorDetails(payload: unknown): PolicyErrorDetails | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const source = payload as Record<string, unknown>;
+  const code = boundedIdentifier(source.code, 64);
+  if (!code?.startsWith("POLICY_")) return null;
+  const findings = Array.isArray(source.findings)
+    ? source.findings.slice(0, 20).flatMap((value): PolicyErrorFinding[] => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+        const finding = value as Record<string, unknown>;
+        const findingCode = boundedIdentifier(finding.code, 64);
+        if (!findingCode?.startsWith("POLICY_")) return [];
+        return [{
+          code: findingCode,
+          catalog: boundedIdentifier(finding.catalog),
+          id: boundedIdentifier(finding.id),
+          fieldPath: boundedIdentifier(finding.field_path),
+          scope: boundedIdentifier(finding.scope, 32),
+          remediation: typeof finding.remediation === "string" ? finding.remediation.slice(0, 500) : undefined,
+        }];
+      })
+    : [];
+  return {
+    code,
+    evaluationId: boundedIdentifier(source.policy_evaluation_id),
+    effectivePolicyHash: boundedIdentifier(source.effective_policy_hash),
+    blockedDimensions: Array.isArray(source.blocked_dimensions)
+      ? source.blocked_dimensions.slice(0, 30).flatMap((value) => boundedIdentifier(value) ?? [])
+      : [],
+    findings,
+  };
 }
 
 const expensiveGetCacheTtlMs = 15_000;

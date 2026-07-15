@@ -25,7 +25,7 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 	defer tx.Rollback()
 
 	worker, err := scanWorker(tx.QueryRowContext(ctx, `
-		SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
 		FROM workers
 		WHERE id = $1
 	`, workerID))
@@ -38,7 +38,7 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 		return nil, err
 	}
 	worker, err = scanWorker(tx.QueryRowContext(ctx, `
-		SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
 		FROM workers
 		WHERE id = $1
 	`, workerID))
@@ -52,7 +52,7 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 			return nil, err
 		}
 		lockedWorker, err := scanWorker(tx.QueryRowContext(ctx, `
-			SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+			SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
 			FROM workers
 			WHERE id = $1
 			FOR UPDATE
@@ -166,7 +166,7 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 		return nil, ErrNoJob
 	}
 	lockedWorker, err := scanWorker(tx.QueryRowContext(ctx, `
-		SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
 		FROM workers
 		WHERE id = $1
 		FOR UPDATE

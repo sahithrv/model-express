@@ -666,6 +666,10 @@ func writeStoreError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if policyConflict(err) {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "POLICY_REVISION_CONFLICT"})
+		return
+	}
 
 	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }

@@ -86,6 +86,14 @@ func (s *MemoryStore) ClaimJobIfQueuedAndPolicyCurrent(workerID string, jobID st
 	if worker.CurrentJobID != "" || worker.ProjectID != job.ProjectID || job.Status != jobs.StatusQueued || job.PolicyEligibilityStatus == jobs.PolicyEligibilityBlocked || !filter.Matches(job) {
 		return nil, policies.Evaluation{}, false, nil
 	}
+	if plan, exists, planErr := artifactPlanFromStoredJobConfig(job.Config); planErr != nil {
+		return nil, policies.Evaluation{}, false, fmt.Errorf("%w: invalid stored artifact plan", ErrInvalidRequest)
+	} else if exists {
+		task, runner := artifactPlanExecutionIdentity(job.Config)
+		if !execution.WorkerCapabilitiesSatisfyForSpec(plan, task, runner, worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions) {
+			return nil, policies.Evaluation{}, false, nil
+		}
+	}
 	if evaluation.Decision != policies.DecisionAllowed {
 		return nil, policies.Evaluation{}, false, fmt.Errorf("%w: dispatch evaluation must be allowed before claim", ErrInvalidRequest)
 	}
@@ -119,6 +127,9 @@ func (s *MemoryStore) ClaimJobIfQueuedAndPolicyCurrent(workerID string, jobID st
 		}
 		record.DispatchPolicyEvaluationID = created.ID
 		record.EffectivePolicyHash = created.EffectivePolicyHash
+		spec := s.jobExecutionSpecs[job.ID]
+		record.WorkerPolicyCapabilityVersion, record.WorkerArtifactCapabilityVersion = execution.NegotiatedWorkerCapabilityVersions(spec.ArtifactPlan, worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions)
+		record.ArtifactPlanHash = spec.ArtifactPlanHash
 		record.UpdatedAt = now
 		s.attemptExecutions[record.ID] = record
 	}
@@ -255,7 +266,7 @@ func (s *PostgresStore) ClaimJobIfQueuedAndPolicyCurrent(workerID string, jobID 
 	if err := lockAndValidatePolicySourcesTx(ctx, tx, evaluation); err != nil {
 		return nil, policies.Evaluation{}, false, err
 	}
-	worker, err := scanWorker(tx.QueryRowContext(ctx, `SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id FROM workers WHERE id=$1 FOR UPDATE`, workerID))
+	worker, err := scanWorker(tx.QueryRowContext(ctx, `SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id FROM workers WHERE id=$1 FOR UPDATE`, workerID))
 	if err != nil {
 		return nil, policies.Evaluation{}, false, err
 	}
@@ -265,6 +276,14 @@ func (s *PostgresStore) ClaimJobIfQueuedAndPolicyCurrent(workerID string, jobID 
 	}
 	if worker.CurrentJobID != "" || worker.ProjectID != job.ProjectID || job.Status != jobs.StatusQueued || job.PolicyEligibilityStatus == jobs.PolicyEligibilityBlocked || !filter.Matches(job) {
 		return nil, policies.Evaluation{}, false, tx.Commit()
+	}
+	if plan, exists, planErr := artifactPlanFromStoredJobConfig(job.Config); planErr != nil {
+		return nil, policies.Evaluation{}, false, fmt.Errorf("%w: invalid stored artifact plan", ErrInvalidRequest)
+	} else if exists {
+		task, runner := artifactPlanExecutionIdentity(job.Config)
+		if !execution.WorkerCapabilitiesSatisfyForSpec(plan, task, runner, worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions) {
+			return nil, policies.Evaluation{}, false, tx.Commit()
+		}
 	}
 	created, err := insertExperimentPolicyEvaluation(ctx, tx, evaluation)
 	if err != nil {
@@ -284,13 +303,16 @@ func (s *PostgresStore) ClaimJobIfQueuedAndPolicyCurrent(workerID string, jobID 
 	if err != nil {
 		return nil, policies.Evaluation{}, false, err
 	}
-	record, recordErr := createAttemptExecutionRecordTx(ctx, tx, assigned.ID, jobAttemptID(assigned.ID, assigned.Attempt), assigned.Attempt)
-	if recordErr == nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET dispatch_policy_evaluation_id=$1, effective_policy_hash=$2, updated_at=$3 WHERE id=$4`, created.ID, created.EffectivePolicyHash, now, record.ID); err != nil {
-			return nil, policies.Evaluation{}, false, err
+	if spec, ok := executionSpecFromConfig(assigned.ID, assigned.ProjectID, assigned.Config, assigned.CreatedAt); ok {
+		record, recordErr := createAttemptExecutionRecordTx(ctx, tx, assigned.ID, jobAttemptID(assigned.ID, assigned.Attempt), assigned.Attempt)
+		if recordErr == nil {
+			policyCapability, artifactCapability := execution.NegotiatedWorkerCapabilityVersions(spec.ArtifactPlan, worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions)
+			if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET dispatch_policy_evaluation_id=$1, effective_policy_hash=$2, worker_policy_capability_version=$3, worker_artifact_capability_version=$4, artifact_plan_hash=$5, updated_at=$6 WHERE id=$7`, created.ID, created.EffectivePolicyHash, policyCapability, artifactCapability, spec.ArtifactPlanHash, now, record.ID); err != nil {
+				return nil, policies.Evaluation{}, false, err
+			}
+		} else if !errors.Is(normalizeSQLError(recordErr), ErrNotFound) {
+			return nil, policies.Evaluation{}, false, recordErr
 		}
-	} else if !errors.Is(normalizeSQLError(recordErr), ErrNotFound) {
-		return nil, policies.Evaluation{}, false, recordErr
 	}
 	transition, progress := newJobLifecycleTransition(assigned, execution.TransitionJobAssigned, assigned.Attempt, jobs.ProgressStageWorkerStarting, jobs.ProgressStatusRunning, progressRevisionAssigned, "worker_assigned", "worker_assignment")
 	if _, _, _, err := commitJobLifecycleTx(ctx, tx, assigned, progress, transition, now); err != nil {

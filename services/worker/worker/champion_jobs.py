@@ -28,6 +28,7 @@ from worker.exporting.inference import demo_prediction_result_from_inference, ru
 from worker.exporting.self_test import export_self_test_failed, export_self_test_validation_errors
 from worker.model_express_catalog import available_catalog_ids, require_catalog_id
 from worker.orchestrator_client import OrchestratorClient
+from worker.artifact_plan import load_artifact_plan, require_requested_artifact
 
 SUPPORTED_EXPORT_FORMATS = available_catalog_ids("export_formats")
 HELPER_EXPORT_FORMATS = {
@@ -47,6 +48,10 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
     config = _config(job)
     job_id = str(job["id"])
     requested_format = _export_format(config)
+    task = str(config.get("task_type") or config.get("task") or "image_classification")
+    runner = str(config.get("runner") or "modal_torchvision")
+    artifact_plan = load_artifact_plan(config, task=task, runner=runner)
+    require_requested_artifact(artifact_plan, requested_format)
     export_dir = _export_dir(config, job_id, requested_format)
     dataset_profile = _dataset_profile(client, config)
     class_names = _class_names(config, dataset_profile)
@@ -167,6 +172,7 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
                     provenance=provenance,
                     validation_errors=validation_errors,
                     execution_contract=execution_contract,
+                    artifact_plan=artifact_plan,
                 )
     else:
         validation_errors.append(

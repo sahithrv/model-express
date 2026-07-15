@@ -252,6 +252,13 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     started_at = time.time()
     job = payload["job"]
     config = job["config"]
+    from worker.artifact_plan import load_artifact_plan
+
+    artifact_plan = load_artifact_plan(
+        config,
+        task="image_classification",
+        runner="modal_torchvision",
+    )
     dataset = payload["dataset"]
     orchestrator_url = payload["orchestrator_url"].rstrip("/")
     progress_reporter = _modal_remote_progress_reporter(payload, orchestrator_url, job)
@@ -626,6 +633,7 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         export_self_test_samples=test_eval_details.get("export_self_test_samples")
         if isinstance(test_eval_details.get("export_self_test_samples"), list)
         else [],
+        artifact_plan=artifact_plan,
     )
     _modal_training_phase(job_id, "export_done", started_at, status=export_bundle.get("status", ""))
     runtime_seconds = time.time() - started_at
@@ -1079,6 +1087,8 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         message="YOLO model artifacts are being exported.",
     )
     _modal_training_phase(job_id, "export_start", started_at)
+    from worker.artifact_plan import load_artifact_plan
+
     export_bundle = _export_yolo_detector_bundle(
         model_path=best_model_path,
         model_name=model_name,
@@ -1088,6 +1098,11 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         training_config=config,
         dataset=dataset,
         job_id=job_id,
+        artifact_plan=load_artifact_plan(
+            config,
+            task="object_detection",
+            runner="modal_ultralytics",
+        ),
     )
     _modal_training_phase(job_id, "export_done", started_at, status=export_bundle.get("status", ""))
     runtime_seconds = time.time() - started_at
@@ -4677,6 +4692,7 @@ def _export_trained_champion_bundle(
     dataset: dict,
     job_id: str,
     export_self_test_samples: list[dict] | None = None,
+    artifact_plan: dict | None = None,
 ) -> dict:
     try:
         from worker.exporting.artifacts import produce_champion_export_artifacts
@@ -4686,6 +4702,12 @@ def _export_trained_champion_bundle(
 
     export_dir = Path(os.getenv("WORKER_CHAMPION_EXPORT_ROOT", ".cache/champion_exports")) / _safe_path_part(job_id) / "training"
     try:
+        from worker.artifact_plan import helper_export_formats
+
+        formats = helper_export_formats(
+            artifact_plan,
+            legacy=("onnx", "torchscript", "framework_native"),
+        )
         manifest = produce_champion_export_artifacts(
             export_dir=export_dir,
             model_name=model_name,
@@ -4695,8 +4717,9 @@ def _export_trained_champion_bundle(
             preprocessing=preprocessing,
             model_profile=model_profile,
             training_config=training_config,
-            formats=("onnx", "torchscript", "framework_native"),
+            formats=formats,
             export_self_test_samples=export_self_test_samples,
+            artifact_plan=artifact_plan,
         )
         remote_base = _artifact_remote_base_uri(dataset, job_id)
         public_manifest, artifact_uris = _upload_manifest_artifacts(manifest, remote_base, upload_file_to_s3_uri)

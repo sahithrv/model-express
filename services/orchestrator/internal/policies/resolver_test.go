@@ -218,6 +218,19 @@ func TestScopeInheritancePrecedenceAndDenyWins(t *testing.T) {
 	}
 }
 
+func TestExplicitDenyOnlyPolicyDoesNotAdvertiseImplicitProfile(t *testing.T) {
+	fixture := newPolicyFixture(t)
+	version := createPolicyVersion(t, fixture, nil, denyIDs("deny_resnet", "models", "resnet18"))
+	bindPolicy(t, fixture, policies.ScopeProject, fixture.projectID, version, 0)
+	result, err := policies.NewResolver(fixture.store).Resolve(fixture.context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Snapshot.ImplicitProfile != nil || len(result.Snapshot.PolicySources) != 1 {
+		t.Fatalf("explicit deny-only policy was represented as implicit: %#v", result.Snapshot)
+	}
+}
+
 func TestCompatibilityProfilesAreClosedWorldAndIntersect(t *testing.T) {
 	fixture := newPolicyFixture(t)
 	first := createProfile(t, fixture, "profile_first", []string{"mobilenet_v3_small", "resnet18"})

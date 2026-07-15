@@ -198,6 +198,8 @@ export type Worker = {
   name: string;
   status: string;
   gpu_type: string;
+  policy_capability_versions?: string[];
+  artifact_capability_versions?: string[];
   last_heartbeat: string;
   current_job_id?: string;
 };
@@ -259,6 +261,9 @@ export type AttemptExecutionRecord = {
   fidelity_verdict?: string;
   realized_effective_hash?: string;
   adjustment_reason_codes?: string[];
+  worker_policy_capability_version?: string;
+  worker_artifact_capability_version?: string;
+  artifact_plan_hash?: string;
   latest_realized_config?: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
@@ -274,6 +279,17 @@ export type JobExecutionSpec = {
   runner?: string;
   requested_config_hash?: string;
   accepted_spec_hash?: string;
+  artifact_plan?: {
+    schema_version: string;
+    artifacts: { format: string; precision: string; runtime: string; execution_provider: string; execution_requirements: string[] }[];
+    fallback_formats: string[];
+    automatic: boolean;
+    policy_restricted: boolean;
+    effective_policy_hash?: string;
+    required_worker_capabilities: { policy_contract_versions: string[]; artifact_plan_versions: string[] };
+    artifact_plan_hash: string;
+  };
+  artifact_plan_hash?: string;
   accepted_spec?: Record<string, unknown>;
   created_at?: string;
 };

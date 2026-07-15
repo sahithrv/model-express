@@ -296,6 +296,34 @@ def test_poll_job_keeps_short_request_timeout(monkeypatch):
     assert "json" not in calls[0] or calls[0]["json"] is None
 
 
+def test_register_worker_advertises_policy_and_artifact_capability_versions(monkeypatch):
+    calls = []
+
+    def fake_post(url: str, *, json: dict | None = None, timeout: int | None = None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setenv("MODEL_EXPRESS_WORKER_REQUEST_TIMEOUT_SECONDS", "12")
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    client = OrchestratorClient("http://orchestrator.test")
+    client.register_worker("project_1", name="worker_1", gpu_type="a10g")
+
+    assert calls == [
+        {
+            "url": "http://orchestrator.test/workers/register",
+            "json": {
+                "project_id": "project_1",
+                "name": "worker_1",
+                "gpu_type": "a10g",
+                "policy_capability_versions": ["policy_contract_v1"],
+                "artifact_capability_versions": ["artifact_plan_v1"],
+            },
+            "timeout": 12,
+        }
+    ]
+
+
 def test_poll_job_sends_api_token_header_when_configured(monkeypatch):
     calls = []
 

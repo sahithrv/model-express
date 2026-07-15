@@ -57,3 +57,29 @@ test("structured HTTP errors retain only bounded recovery identity", async () =>
   assert.equal(isUnsupportedIncrementalStatus(405), true);
   assert.equal(isUnsupportedIncrementalStatus(501), true);
 });
+
+test("policy errors retain actionable bounded findings without retaining raw payload", async () => {
+  const { OrchestratorHttpError } = await loadClient();
+  const error = new OrchestratorHttpError({
+    __mission_control_http_error: true,
+    status: 422,
+    message: "policy denied",
+    payload: {
+      code: "POLICY_CATALOG_ID_DENIED",
+      effective_policy_hash: "sha256:abc123",
+      findings: [{
+        code: "POLICY_CATALOG_ID_DENIED",
+        catalog: "export_formats",
+        id: "pytorch",
+        remediation: "Choose ONNX.",
+        prompt: "must-not-be-retained",
+      }],
+      storage_uri: "s3://private/data",
+    },
+  });
+  assert.equal(error.reasonCode, "POLICY_CATALOG_ID_DENIED");
+  assert.equal(error.policy?.findings[0]?.remediation, "Choose ONNX.");
+  assert.equal("payload" in error, false);
+  assert.equal(JSON.stringify(error).includes("private"), false);
+  assert.equal(JSON.stringify(error).includes("must-not-be-retained"), false);
+});

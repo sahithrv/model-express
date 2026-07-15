@@ -865,16 +865,25 @@ func scanDatasetVisualAnalysis(row rowScanner) (datasets.DatasetVisualAnalysis, 
 
 func scanWorker(row rowScanner) (workers.Worker, error) {
 	var worker workers.Worker
+	var policyVersions, artifactVersions []byte
 	if err := row.Scan(
 		&worker.ID,
 		&worker.ProjectID,
 		&worker.Name,
 		&worker.Status,
 		&worker.GPUType,
+		&policyVersions,
+		&artifactVersions,
 		&worker.LastHeartbeat,
 		&worker.CurrentJobID,
 	); err != nil {
 		return workers.Worker{}, normalizeSQLError(err)
+	}
+	if err := json.Unmarshal(policyVersions, &worker.PolicyCapabilityVersions); err != nil {
+		return workers.Worker{}, err
+	}
+	if err := json.Unmarshal(artifactVersions, &worker.ArtifactCapabilityVersions); err != nil {
+		return workers.Worker{}, err
 	}
 
 	if time.Since(worker.LastHeartbeat) > workers.HeartbeatLimit {

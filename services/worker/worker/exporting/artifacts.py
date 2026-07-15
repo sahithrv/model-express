@@ -120,10 +120,18 @@ def produce_champion_export_artifacts(
     export_self_test_samples: Iterable[dict] | None = None,
     export_self_test_tolerance: dict | None = None,
     execution_contract: dict | None = None,
+    artifact_plan: dict | None = None,
 ) -> dict:
     """Create worker-owned export artifacts without touching backend records."""
     export_dir.mkdir(parents=True, exist_ok=True)
     requested_formats = [str(item).lower() for item in formats]
+    if artifact_plan is not None:
+        from worker.artifact_plan import helper_export_formats
+
+        authorized = set(helper_export_formats(artifact_plan, legacy=()))
+        forbidden = sorted(set(requested_formats) - authorized)
+        if forbidden:
+            raise ValueError(f"ARTIFACT_PLAN_VIOLATION: forbidden automatic artifacts {forbidden}")
     input_shape = _input_shape(sample_input_shape, image_size)
     metadata = build_champion_export_metadata(
         model_name=model_name,

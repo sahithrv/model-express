@@ -16,7 +16,11 @@ func insertJobExecutionSpecTx(ctx context.Context, tx *sql.Tx, spec execution.Jo
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO job_execution_specs (job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, policy_evaluation_id, effective_policy_hash, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,$12)`, spec.JobID, spec.ProjectID, spec.SchemaVersion, spec.CapabilityVersion, spec.Task, spec.Runner, spec.RequestedConfigHash, spec.AcceptedSpecHash, acceptedJSON, spec.PolicyEvaluationID, spec.EffectivePolicyHash, spec.CreatedAt)
+	artifactJSON, err := json.Marshal(spec.ArtifactPlan)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO job_execution_specs (job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, artifact_plan, artifact_plan_hash, policy_evaluation_id, effective_policy_hash, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULLIF($12,''),$13,$14)`, spec.JobID, spec.ProjectID, spec.SchemaVersion, spec.CapabilityVersion, spec.Task, spec.Runner, spec.RequestedConfigHash, spec.AcceptedSpecHash, acceptedJSON, artifactJSON, spec.ArtifactPlanHash, spec.PolicyEvaluationID, spec.EffectivePolicyHash, spec.CreatedAt)
 	return err
 }
 
@@ -192,11 +196,14 @@ func observationSelectSQL() string {
 
 func scanJobExecutionSpec(scanner rowScanner) (execution.JobExecutionSpec, error) {
 	var out execution.JobExecutionSpec
-	var raw []byte
-	if err := scanner.Scan(&out.JobID, &out.ProjectID, &out.SchemaVersion, &out.CapabilityVersion, &out.Task, &out.Runner, &out.RequestedConfigHash, &out.AcceptedSpecHash, &raw, &out.PolicyEvaluationID, &out.EffectivePolicyHash, &out.CreatedAt); err != nil {
+	var raw, artifactRaw []byte
+	if err := scanner.Scan(&out.JobID, &out.ProjectID, &out.SchemaVersion, &out.CapabilityVersion, &out.Task, &out.Runner, &out.RequestedConfigHash, &out.AcceptedSpecHash, &raw, &artifactRaw, &out.ArtifactPlanHash, &out.PolicyEvaluationID, &out.EffectivePolicyHash, &out.CreatedAt); err != nil {
 		return out, normalizeSQLError(err)
 	}
 	if err := json.Unmarshal(raw, &out.AcceptedSpec); err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal(artifactRaw, &out.ArtifactPlan); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -206,7 +213,7 @@ func scanAttemptExecutionRecord(scanner rowScanner) (execution.AttemptExecutionR
 	var verdict sql.NullString
 	var realizedHash sql.NullString
 	var reasons, raw []byte
-	if err := scanner.Scan(&out.ID, &out.JobID, &out.ProjectID, &out.AttemptID, &out.AttemptNumber, &out.LifecycleStatus, &verdict, &realizedHash, &reasons, &raw, &out.DispatchPolicyEvaluationID, &out.EffectivePolicyHash, &out.CreatedAt, &out.UpdatedAt); err != nil {
+	if err := scanner.Scan(&out.ID, &out.JobID, &out.ProjectID, &out.AttemptID, &out.AttemptNumber, &out.LifecycleStatus, &verdict, &realizedHash, &reasons, &raw, &out.DispatchPolicyEvaluationID, &out.EffectivePolicyHash, &out.WorkerPolicyCapabilityVersion, &out.WorkerArtifactCapabilityVersion, &out.ArtifactPlanHash, &out.CreatedAt, &out.UpdatedAt); err != nil {
 		return out, normalizeSQLError(err)
 	}
 	if verdict.Valid {
@@ -225,11 +232,11 @@ func scanAttemptExecutionRecord(scanner rowScanner) (execution.AttemptExecutionR
 }
 
 func jobExecutionSpecSelectColumns() string {
-	return "job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, COALESCE(policy_evaluation_id, ''), effective_policy_hash, created_at"
+	return "job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, artifact_plan, artifact_plan_hash, COALESCE(policy_evaluation_id, ''), effective_policy_hash, created_at"
 }
 
 func attemptExecutionRecordSelectColumns() string {
-	return "id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, COALESCE(dispatch_policy_evaluation_id, ''), effective_policy_hash, created_at, updated_at"
+	return "id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, COALESCE(dispatch_policy_evaluation_id, ''), effective_policy_hash, worker_policy_capability_version, worker_artifact_capability_version, artifact_plan_hash, created_at, updated_at"
 }
 func scanRealizationObservation(scanner rowScanner) (execution.RealizationObservation, error) {
 	var out execution.RealizationObservation

@@ -75,6 +75,7 @@ import {
 } from "./hooks/useIncrementalLiveState";
 import { useWorkerSupervisor } from "./hooks/useWorkerSupervisor";
 import { LiveProgressPanel } from "./features/live/LiveProgressPanel";
+import { ExperimentPolicyPanel } from "./features/policy/ExperimentPolicyPanel";
 import { buildLiveProgressViewModel } from "./features/live/liveProgressViewModel";
 import {
   createLiveRefreshCoordinator,
@@ -3969,6 +3970,14 @@ export function App() {
                 </button>
               </div>
             </div>
+          </Panel>
+          <Panel title="Experiment Policy" icon={<SlidersHorizontal size={17} />} wide id="experiment-policy" tab="settings">
+            <ExperimentPolicyPanel
+              request={request}
+              projectId={selectedProjectId}
+              datasets={detail.datasets}
+              jobs={detail.jobs}
+            />
           </Panel>
         </section>
         <section className="developer-route-stack datasets-route" id="datasets" data-project-tab="datasets">

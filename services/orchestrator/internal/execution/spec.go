@@ -22,6 +22,7 @@ type ExecutionSpecV1 struct {
 	Runner              string         `json:"runner"`
 	RequestedConfig     map[string]any `json:"requested_config"`
 	AcceptedConfig      map[string]any `json:"accepted_config"`
+	ArtifactPlan        ArtifactPlanV1 `json:"artifact_plan"`
 	RequestedConfigHash string         `json:"requested_config_hash"`
 	AcceptedSpecHash    string         `json:"accepted_spec_hash"`
 }
@@ -31,6 +32,20 @@ func BuildExecutionSpecV1(
 	runner string,
 	requestedConfig map[string]any,
 	resolutionInput map[string]any,
+) (ExecutionSpecV1, error) {
+	plan, err := BuildAutomaticArtifactPlanV1(task, runner, ArtifactPolicySelection{})
+	if err != nil {
+		return ExecutionSpecV1{}, err
+	}
+	return BuildExecutionSpecV1WithArtifactPlan(task, runner, requestedConfig, resolutionInput, plan)
+}
+
+func BuildExecutionSpecV1WithArtifactPlan(
+	task string,
+	runner string,
+	requestedConfig map[string]any,
+	resolutionInput map[string]any,
+	artifactPlan ArtifactPlanV1,
 ) (ExecutionSpecV1, error) {
 	if requestedConfig == nil {
 		requestedConfig = map[string]any{}
@@ -45,6 +60,9 @@ func BuildExecutionSpecV1(
 	acceptedConfig, err := ResolveAcceptedConfig(task, runner, resolutionInput)
 	if err != nil {
 		return ExecutionSpecV1{}, err
+	}
+	if err := ValidateArtifactPlanV1(artifactPlan, task, runner); err != nil {
+		return ExecutionSpecV1{}, fmt.Errorf("validate artifact plan: %w", err)
 	}
 	requestedHash, err := CanonicalJSONHash(requestedConfig)
 	if err != nil {
@@ -67,6 +85,7 @@ func BuildExecutionSpecV1(
 		Runner:              runner,
 		RequestedConfig:     cloneCapabilityMap(requestedConfig),
 		AcceptedConfig:      acceptedConfig,
+		ArtifactPlan:        artifactPlan,
 		RequestedConfigHash: requestedHash,
 		AcceptedSpecHash:    acceptedHash,
 	}, nil

@@ -8,6 +8,8 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_REPORT_TIMEOUT_SECONDS = 15 * 60
 POLL_INTERVAL_SECONDS = 5
 ENDPOINT_UNAVAILABLE_STATUS_CODES = {404, 405, 501}
+POLICY_CAPABILITY_VERSIONS = ["policy_contract_v1"]
+ARTIFACT_CAPABILITY_VERSIONS = ["artifact_plan_v1"]
 
 class OrchestratorClient:
     def __init__(self, base_url: str, timeout: int | None = None):
@@ -105,6 +107,8 @@ class OrchestratorClient:
                 "project_id": project_id,
                 "name": name or os.getenv("WORKER_NAME", "local-worker-1"),
                 "gpu_type": gpu_type or os.getenv("GPU_TYPE", "local"),
+                "policy_capability_versions": POLICY_CAPABILITY_VERSIONS,
+                "artifact_capability_versions": ARTIFACT_CAPABILITY_VERSIONS,
             },
             **self._request_kwargs(timeout=request_timeout_seconds()),
         )

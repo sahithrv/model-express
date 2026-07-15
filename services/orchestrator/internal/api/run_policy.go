@@ -67,6 +67,22 @@ func (s *Server) evaluateJobPolicy(projectID, jobID, template string, config map
 			return policies.Evaluation{}, decodeErr
 		}
 		evaluation, evaluateErr = policies.EvaluateProposal(effective, operation, []plans.PlannedExperiment{experiment})
+		if evaluateErr == nil {
+			artifactPlan, exists, planErr := artifactPlanFromJobConfig(config)
+			if planErr != nil {
+				return policies.Evaluation{}, planErr
+			}
+			if !exists || strings.TrimSpace(jobID) == "" {
+				artifactPlan, planErr = automaticArtifactPlanFromEvaluation(task, runner, evaluation)
+			}
+			if planErr != nil {
+				return policies.Evaluation{}, planErr
+			}
+			if err := execution.ValidateArtifactPlanV1(artifactPlan, task, runner); err != nil {
+				return policies.Evaluation{}, fmt.Errorf("%w: invalid server artifact plan: %v", store.ErrInvalidRequest, err)
+			}
+			evaluation, evaluateErr = evaluateArtifactPlan(effective, evaluation, operation, config, artifactPlan)
+		}
 	case jobs.TemplateExportChampion:
 		if resolveErr != nil {
 			evaluation, err = policies.EvaluationFromEffectivePolicy(effective, operation, "system", "")
@@ -77,6 +93,28 @@ func (s *Server) evaluateJobPolicy(projectID, jobID, template string, config map
 		evaluation, evaluateErr = policies.EvaluateCapabilityUses(effective, operation, config, []policies.CapabilityUse{{
 			Catalog: "export_formats", ID: format, FieldPath: "config.format", Origin: "explicit",
 		}})
+		if evaluateErr == nil {
+			artifactPlan, exists, planErr := artifactPlanFromJobConfig(config)
+			if planErr != nil {
+				return policies.Evaluation{}, planErr
+			}
+			if task == "" {
+				task = "image_classification"
+			}
+			if runner == "" {
+				runner = "modal_torchvision"
+			}
+			if !exists || strings.TrimSpace(jobID) == "" {
+				artifactPlan, planErr = manualArtifactPlanFromEvaluation(task, runner, format, evaluation)
+			}
+			if planErr != nil {
+				return policies.Evaluation{}, planErr
+			}
+			if err := execution.ValidateArtifactPlanV1(artifactPlan, task, runner); err != nil {
+				return policies.Evaluation{}, fmt.Errorf("%w: invalid server artifact plan: %v", store.ErrInvalidRequest, err)
+			}
+			evaluation, evaluateErr = evaluateArtifactPlan(effective, evaluation, operation, config, artifactPlan)
+		}
 	default:
 		// Non-training orchestration jobs do not consume proposal capabilities.
 		// They still receive a dispatch snapshot so the atomic policy-head check
@@ -244,7 +282,68 @@ func (s *Server) createJobWithCurrentPolicy(projectID, template string, config m
 		s.recordJobPolicyActivity(placeholder, evaluation, execution.EventJobPolicyBlocked, "Job creation blocked by the current experiment policy.")
 		return jobs.ExperimentJob{}, err
 	}
+	if err := s.attachServerArtifactPlan(projectID, template, config, evaluation); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
 	return s.store.CreateJobWithOptions(projectID, template, config, store.CreateJobOptions{PolicyReference: policyReferenceForEvaluation(evaluation)})
+}
+
+func (s *Server) attachServerArtifactPlan(projectID, template string, config map[string]any, evaluation policies.Evaluation) error {
+	task, runner, err := s.jobPolicyTaskRunner(template, config, configString(config, "dataset_id"))
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(template)) {
+	case jobs.TemplateTrainExperiment:
+		plan, err := automaticArtifactPlanFromEvaluation(task, runner, evaluation)
+		if err != nil {
+			return err
+		}
+		// The artifact plan is server-issued. Do not retain a caller-supplied
+		// top-level value alongside the authoritative execution-spec plan.
+		delete(config, execution.ArtifactPlanConfigKey)
+		spec, err := execution.BuildExecutionSpecV1WithArtifactPlan(task, runner, copyPayloadMap(config), copyPayloadMap(config), plan)
+		if err != nil {
+			return fmt.Errorf("%w: resolve direct-job execution spec: %v", store.ErrInvalidRequest, err)
+		}
+		payload, err := spec.Payload()
+		if err != nil {
+			return err
+		}
+		config[execution.ExecutionSpecConfigKey] = payload
+	case jobs.TemplateExportChampion:
+		format := firstNonEmptyString(configString(config, "format"), configString(config, "export_format"), configString(config, "requested_format"), "onnx")
+		if task == "" {
+			task = "image_classification"
+		}
+		if runner == "" {
+			runner = "modal_torchvision"
+		}
+		config["task_type"] = task
+		config["runner"] = runner
+		plan, err := manualArtifactPlanFromEvaluation(task, runner, format, evaluation)
+		if err != nil {
+			return err
+		}
+		payload, err := artifactPlanPayload(plan)
+		if err != nil {
+			return err
+		}
+		config[execution.ArtifactPlanConfigKey] = payload
+	}
+	return nil
+}
+
+func artifactPlanPayload(plan execution.ArtifactPlanV1) (map[string]any, error) {
+	blob, err := json.Marshal(plan)
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(blob, &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 func (s *Server) recordPlanSchedulePolicy(plan plans.ExperimentPlan, dataset datasets.Dataset, provider string) (policies.Evaluation, error) {
@@ -288,6 +387,15 @@ func (s *Server) recordPlanSchedulePolicy(plan plans.ExperimentPlan, dataset dat
 		evaluateErr = resolveErr
 	} else {
 		evaluation, evaluateErr = policies.EvaluateProposal(effective, policyOperationScheduleRun, plan.Experiments)
+		if evaluateErr == nil {
+			artifactPlan, planErr := automaticArtifactPlanFromEvaluation(task, runner, evaluation)
+			if planErr != nil {
+				return policies.Evaluation{}, planErr
+			}
+			evaluation, evaluateErr = evaluateArtifactPlan(effective, evaluation, policyOperationScheduleRun, map[string]any{
+				"experiments": plan.Experiments, "artifact_plan": artifactPlan,
+			}, artifactPlan)
+		}
 	}
 	if err != nil {
 		return policies.Evaluation{}, err

@@ -24,9 +24,11 @@ import (
 )
 
 type registerWorkerRequest struct {
-	ProjectID string `json:"project_id" binding:"required"`
-	Name      string `json:"name" binding:"required"`
-	GPUType   string `json:"gpu_type"`
+	ProjectID                  string   `json:"project_id" binding:"required"`
+	Name                       string   `json:"name" binding:"required"`
+	GPUType                    string   `json:"gpu_type"`
+	PolicyCapabilityVersions   []string `json:"policy_capability_versions"`
+	ArtifactCapabilityVersions []string `json:"artifact_capability_versions"`
 }
 
 type dispatcherEventRequest struct {
@@ -876,7 +878,7 @@ func (s *Server) registerWorker(c *gin.Context) {
 		return
 	}
 
-	worker, err := s.store.RegisterWorker(req.ProjectID, req.Name, req.GPUType)
+	worker, err := s.store.RegisterWorkerWithCapabilities(req.ProjectID, req.Name, req.GPUType, req.PolicyCapabilityVersions, req.ArtifactCapabilityVersions)
 	if err != nil {
 		writeStoreError(c, err)
 		return
@@ -951,6 +953,23 @@ func (s *Server) pollNextPolicyPermittedJob(workerID string, filter store.JobPol
 		}
 		batchProgress := false
 		for _, candidate := range candidates {
+			compatible, finding, compatibilityErr := s.workerArtifactCompatible(worker, candidate)
+			if compatibilityErr != nil {
+				return nil, compatibilityErr
+			}
+			if !compatible {
+				evaluation, evaluateErr := s.evaluateJobPolicy(candidate.ProjectID, candidate.ID, candidate.Template, candidate.Config, policyOperationDispatchRun)
+				if evaluation.EffectivePolicyHash == "" {
+					return nil, evaluateErr
+				}
+				evaluation.Decision = policies.DecisionDenied
+				evaluation.Findings = append(evaluation.Findings, finding)
+				evaluation.ReasonCodes = appendPolicyReasonCode(evaluation.ReasonCodes, policies.ReasonWorkerCapabilityUnavailable)
+				if _, err := s.store.CreateExperimentPolicyEvaluation(evaluation); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			candidateResolved := false
 			policyChangedDuringClaim := false
 			for revisionAttempt := 0; revisionAttempt < 4; revisionAttempt++ {
@@ -1003,9 +1022,39 @@ func (s *Server) pollNextPolicyPermittedJob(workerID string, filter store.JobPol
 			return nil, store.ErrNoJob
 		}
 		if !batchProgress {
-			return nil, store.ErrPolicyChanged
+			return nil, store.ErrNoJob
 		}
 	}
+}
+
+func (s *Server) workerArtifactCompatible(worker workers.Worker, job jobs.ExperimentJob) (bool, policies.Finding, error) {
+	plan, exists, err := artifactPlanFromJobConfig(job.Config)
+	if err != nil {
+		return false, policies.Finding{}, err
+	}
+	if !exists {
+		return true, policies.Finding{}, nil
+	}
+	task, runner, err := s.jobPolicyTaskRunner(job.Template, job.Config, job.DatasetID)
+	if err != nil {
+		return false, policies.Finding{}, err
+	}
+	if task == "" {
+		task = "image_classification"
+	}
+	if runner == "" {
+		runner = "modal_torchvision"
+	}
+	if err := execution.ValidateArtifactPlanV1(plan, task, runner); err != nil {
+		return false, policies.Finding{
+			Code: policies.ReasonWorkerCapabilityUnavailable, FieldPath: "artifact_plan",
+			Origin: "unknown_capability", Remediation: "Reschedule the job with a server-issued supported artifact plan.",
+		}, nil
+	}
+	if execution.WorkerCapabilitiesSatisfyForSpec(plan, task, runner, worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions) {
+		return true, policies.Finding{}, nil
+	}
+	return false, workerCapabilityFinding(worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions, plan), nil
 }
 
 func appendPolicyReasonCode(values []policies.ReasonCode, code policies.ReasonCode) []policies.ReasonCode {

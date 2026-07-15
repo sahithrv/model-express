@@ -19,6 +19,16 @@ func executionSpecFromConfig(jobID, projectID string, config map[string]any, cre
 	if !ok {
 		return execution.JobExecutionSpec{}, false
 	}
+	var artifactPlan execution.ArtifactPlanV1
+	if artifactPayload, ok := payload["artifact_plan"].(map[string]any); ok {
+		artifactBlob, err := json.Marshal(artifactPayload)
+		if err != nil {
+			return execution.JobExecutionSpec{}, false
+		}
+		if err := json.Unmarshal(artifactBlob, &artifactPlan); err != nil {
+			return execution.JobExecutionSpec{}, false
+		}
+	}
 	return execution.JobExecutionSpec{
 		JobID: jobID, ProjectID: projectID,
 		SchemaVersion:     stringValue(payload["schema_version"]),
@@ -26,8 +36,55 @@ func executionSpecFromConfig(jobID, projectID string, config map[string]any, cre
 		Task:              stringValue(payload["task"]), Runner: stringValue(payload["runner"]),
 		RequestedConfigHash: stringValue(payload["requested_config_hash"]),
 		AcceptedSpecHash:    stringValue(payload["accepted_spec_hash"]),
-		AcceptedSpec:        cloneJSONMap(accepted), CreatedAt: createdAt,
+		AcceptedSpec:        cloneJSONMap(accepted), ArtifactPlan: artifactPlan,
+		ArtifactPlanHash: artifactPlan.ArtifactPlanHash, CreatedAt: createdAt,
 	}, true
+}
+
+func artifactPlanFromStoredJobConfig(config map[string]any) (execution.ArtifactPlanV1, bool, error) {
+	var value any
+	if spec, ok := config[execution.ExecutionSpecConfigKey].(map[string]any); ok {
+		value = spec["artifact_plan"]
+	}
+	if value == nil {
+		value = config[execution.ArtifactPlanConfigKey]
+	}
+	if value == nil {
+		return execution.ArtifactPlanV1{}, false, nil
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return execution.ArtifactPlanV1{}, true, err
+	}
+	var plan execution.ArtifactPlanV1
+	if err := json.Unmarshal(blob, &plan); err != nil {
+		return execution.ArtifactPlanV1{}, true, err
+	}
+	return plan, true, nil
+}
+
+func artifactPlanExecutionIdentity(config map[string]any) (string, string) {
+	task, runner := "", ""
+	if spec, ok := config[execution.ExecutionSpecConfigKey].(map[string]any); ok {
+		task = stringValue(spec["task"])
+		runner = stringValue(spec["runner"])
+	}
+	if task == "" {
+		task = stringValue(config["task_type"])
+	}
+	if task == "" {
+		task = stringValue(config["task"])
+	}
+	if runner == "" {
+		runner = stringValue(config["runner"])
+	}
+	if task == "" {
+		task = "image_classification"
+	}
+	if runner == "" {
+		runner = "modal_torchvision"
+	}
+	return task, runner
 }
 
 func stringValue(value any) string {
@@ -37,6 +94,13 @@ func stringValue(value any) string {
 
 func copyExecutionSpec(spec execution.JobExecutionSpec) execution.JobExecutionSpec {
 	spec.AcceptedSpec = cloneJSONMap(spec.AcceptedSpec)
+	spec.ArtifactPlan.Artifacts = append([]execution.ArtifactDirective(nil), spec.ArtifactPlan.Artifacts...)
+	for index := range spec.ArtifactPlan.Artifacts {
+		spec.ArtifactPlan.Artifacts[index].ExecutionRequirements = append([]string(nil), spec.ArtifactPlan.Artifacts[index].ExecutionRequirements...)
+	}
+	spec.ArtifactPlan.FallbackFormats = append([]string(nil), spec.ArtifactPlan.FallbackFormats...)
+	spec.ArtifactPlan.RequiredWorkerCapabilities.PolicyContractVersions = append([]string(nil), spec.ArtifactPlan.RequiredWorkerCapabilities.PolicyContractVersions...)
+	spec.ArtifactPlan.RequiredWorkerCapabilities.ArtifactPlanVersions = append([]string(nil), spec.ArtifactPlan.RequiredWorkerCapabilities.ArtifactPlanVersions...)
 	return spec
 }
 

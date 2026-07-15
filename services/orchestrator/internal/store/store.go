@@ -108,6 +108,7 @@ type Store interface {
 	ListDatasetVisualAnalyses(datasetID string) ([]datasets.DatasetVisualAnalysis, error)
 
 	RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error)
+	RegisterWorkerWithCapabilities(projectID string, name string, gpuType string, policyVersions []string, artifactVersions []string) (workers.Worker, error)
 	ListWorkers() ([]workers.Worker, error)
 	ListProjectWorkers(projectID string) ([]workers.Worker, error)
 	GetWorker(workerID string) (workers.Worker, error)

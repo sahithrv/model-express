@@ -11085,6 +11085,42 @@ html,
   }
 }
 
+.policy-panel { display: grid; gap: 16px; }
+.policy-panel-heading { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; }
+.policy-panel-heading h3 { margin: 4px 0; }
+.policy-panel-heading p, .policy-card p { margin: 0; color: var(--muted); font-size: 12px; }
+.policy-decision { padding: 5px 9px; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; text-transform: uppercase; font-size: 10px; letter-spacing: .08em; }
+.policy-decision.allowed { color: #8be9b2; border-color: rgba(87,210,145,.34); }
+.policy-decision.blocked { color: #ff9ca5; border-color: rgba(255,104,117,.38); }
+.policy-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.policy-controls label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
+.policy-controls select { width: 100%; }
+.policy-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.policy-card { display: grid; align-content: start; gap: 10px; padding: 14px; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; background: rgba(5,10,20,.42); }
+.policy-card > strong { font-size: 12px; letter-spacing: .03em; }
+.policy-check { display: flex; gap: 9px; align-items: flex-start; font-size: 12px; }
+.policy-check span { display: grid; gap: 2px; text-transform: capitalize; }
+.policy-check small { color: var(--muted); text-transform: none; }
+.policy-catalog-groups { display: grid; gap: 7px; max-height: 520px; overflow: auto; padding-right: 4px; }
+.policy-catalog-groups details { border: 1px solid rgba(255,255,255,.07); border-radius: 8px; background: rgba(255,255,255,.025); }
+.policy-catalog-groups summary { display: flex; justify-content: space-between; gap: 8px; padding: 8px 9px; cursor: pointer; font-size: 11px; font-weight: 700; }
+.policy-catalog-groups summary small { color: var(--muted); font-weight: 500; }
+.policy-catalog-groups details[open] { display: grid; gap: 8px; padding-bottom: 9px; }
+.policy-catalog-groups details[open] .policy-check { padding: 0 9px; }
+.effective-policy-preview dl { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 0; }
+.effective-policy-preview dl div { display: grid; gap: 2px; padding: 8px; border-radius: 8px; background: rgba(255,255,255,.035); }
+.effective-policy-preview dt, .queue-impact small { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.effective-policy-preview dd { margin: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.policy-source-list, .policy-audit ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.policy-source-list li, .policy-audit li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 11px; }
+.policy-source-list code { overflow: hidden; text-overflow: ellipsis; color: #a9c9ff; }
+.queue-impact > div { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
+.queue-impact > div span { display: grid; gap: 3px; text-align: center; padding: 8px; border-radius: 8px; background: rgba(255,255,255,.035); font-weight: 700; }
+.policy-audit li b { font-size: 10px; text-transform: uppercase; color: #a8e6c5; }
+.policy-audit li small { color: var(--muted); }
+.policy-error { display: grid; gap: 5px; padding: 10px 12px; border: 1px solid rgba(255,104,117,.35); border-radius: 9px; background: rgba(255,104,117,.08); color: #ffc0c5; font-size: 11px; }
+@media (max-width: 760px) { .policy-editor-grid, .policy-controls { grid-template-columns: 1fr; } }
+
 /* Non-overview orbital route pass */
 .activity-journal,
 .results-page,

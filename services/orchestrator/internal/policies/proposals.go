@@ -235,6 +235,45 @@ func EvaluateCapabilityUses(effective EffectivePolicy, operation string, subject
 	}
 }
 
+// MergeEvaluations combines proposal and artifact/runtime decisions produced
+// from the same effective-policy snapshot. This keeps lifecycle audit rows
+// single-valued while retaining every requested and realized capability.
+func MergeEvaluations(primary, additional Evaluation) Evaluation {
+	merged := primary
+	if additional.CandidateConfigHash != "" {
+		merged.CandidateConfigHash = additional.CandidateConfigHash
+	}
+	merged.RequestedCapabilityUses = uniqueSortedCapabilityUses(append(
+		append([]CapabilityUse(nil), primary.RequestedCapabilityUses...),
+		additional.RequestedCapabilityUses...,
+	))
+	merged.EffectiveCapabilityUses = uniqueSortedCapabilityUses(append(
+		append([]CapabilityUse(nil), primary.EffectiveCapabilityUses...),
+		additional.EffectiveCapabilityUses...,
+	))
+	merged.Findings = uniqueSortedFindings(append(append([]Finding(nil), primary.Findings...), additional.Findings...))
+	merged.ReasonCodes = findingReasonCodes(merged.Findings)
+	if primary.Decision == DecisionDenied || additional.Decision == DecisionDenied || len(merged.Findings) > 0 {
+		merged.Decision = DecisionDenied
+	}
+	return merged
+}
+
+func ErrorForEvaluation(evaluation Evaluation, message string) error {
+	if evaluation.Decision != DecisionDenied && len(evaluation.Findings) == 0 {
+		return nil
+	}
+	code := ReasonNoValidConfiguration
+	if len(evaluation.Findings) > 0 {
+		code = evaluation.Findings[0].Code
+	}
+	return &PolicyError{
+		Code: code, Message: message, EffectivePolicyHash: evaluation.EffectivePolicyHash,
+		Findings:           append([]Finding(nil), evaluation.Findings...),
+		ContributingScopes: scopeContributions(evaluation.Findings),
+	}
+}
+
 type proposalFieldValue struct {
 	Value   any
 	Present bool

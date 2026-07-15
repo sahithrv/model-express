@@ -80,7 +80,7 @@ type MemoryStore struct {
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
+	storage := &MemoryStore{
 		projects:                make(map[string]projects.Project),
 		datasets:                make(map[string]datasets.Dataset),
 		workers:                 make(map[string]workers.Worker),
@@ -118,6 +118,10 @@ func NewMemoryStore() *MemoryStore {
 		policyBindings:          make(map[string]policies.Binding),
 		policyEvaluations:       make(map[string]policies.Evaluation),
 	}
+	for _, profile := range policies.BuiltinCompatibilityProfiles() {
+		storage.policyProfiles[profile.ProfileKey+"@"+profile.SemanticVersion] = policies.CloneCompatibilityProfile(profile)
+	}
+	return storage
 }
 
 func (s *MemoryStore) CreateProject(name string, goal string) (projects.Project, error) {
@@ -464,6 +468,10 @@ func (s *MemoryStore) ListDatasetVisualAnalyses(datasetID string) ([]datasets.Da
 }
 
 func (s *MemoryStore) RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error) {
+	return s.RegisterWorkerWithCapabilities(projectID, name, gpuType, []string{execution.WorkerPolicyContractV1}, []string{execution.WorkerArtifactPlanV1})
+}
+
+func (s *MemoryStore) RegisterWorkerWithCapabilities(projectID string, name string, gpuType string, policyVersions []string, artifactVersions []string) (workers.Worker, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -475,16 +483,33 @@ func (s *MemoryStore) RegisterWorker(projectID string, name string, gpuType stri
 	}
 
 	worker := workers.Worker{
-		ID:            s.newID("worker"),
-		ProjectID:     projectID,
-		Name:          name,
-		Status:        workers.StatusIdle,
-		GPUType:       gpuType,
-		LastHeartbeat: time.Now().UTC(),
+		ID:                         s.newID("worker"),
+		ProjectID:                  projectID,
+		Name:                       name,
+		Status:                     workers.StatusIdle,
+		GPUType:                    gpuType,
+		PolicyCapabilityVersions:   normalizeCapabilityVersions(policyVersions),
+		ArtifactCapabilityVersions: normalizeCapabilityVersions(artifactVersions),
+		LastHeartbeat:              time.Now().UTC(),
 	}
 
 	s.workers[worker.ID] = worker
 	return worker, nil
+}
+
+func normalizeCapabilityVersions(values []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (s *MemoryStore) ListWorkers() ([]workers.Worker, error) {

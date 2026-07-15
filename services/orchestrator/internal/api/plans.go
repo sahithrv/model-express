@@ -256,7 +256,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 					continue
 				}
 			}
-			spec, err := buildExecutionSpecV1(experiment, provider)
+			spec, err := buildExecutionSpecV1WithPolicy(experiment, provider, schedulePolicyEvaluation)
 			if err != nil {
 				return executeExperimentPlanResponse{}, err
 			}
@@ -341,7 +341,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		}
 		addOptionalExperimentConfig(config, experiment)
 		if jobTemplate == jobs.TemplateTrainExperiment {
-			spec, err := addExecutionSpecV1(config, experiment, provider)
+			spec, err := addExecutionSpecV1WithPolicy(config, experiment, provider, schedulePolicyEvaluation)
 			if err != nil {
 				return executeExperimentPlanResponse{}, err
 			}
@@ -541,6 +541,24 @@ func addExecutionSpecV1(
 	return spec, nil
 }
 
+func addExecutionSpecV1WithPolicy(
+	config map[string]any,
+	experiment plans.PlannedExperiment,
+	provider string,
+	evaluation policies.Evaluation,
+) (execution.ExecutionSpecV1, error) {
+	spec, err := buildExecutionSpecV1WithPolicy(experiment, provider, evaluation)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	payload, err := spec.Payload()
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	config[execution.ExecutionSpecConfigKey] = payload
+	return spec, nil
+}
+
 func buildExecutionSpecV1(
 	experiment plans.PlannedExperiment,
 	provider string,
@@ -571,6 +589,45 @@ func buildExecutionSpecV1(
 		runner,
 		requestedConfig,
 		resolutionInput,
+	)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, fmt.Errorf("resolve execution spec: %w", err)
+	}
+	return spec, nil
+}
+
+func buildExecutionSpecV1WithPolicy(
+	experiment plans.PlannedExperiment,
+	provider string,
+	evaluation policies.Evaluation,
+) (execution.ExecutionSpecV1, error) {
+	modelSpec, ok := supportedModelSpecByName(experiment.Model)
+	if !ok {
+		return execution.ExecutionSpecV1{}, fmt.Errorf("%w: unsupported execution-spec model %q", store.ErrInvalidRequest, experiment.Model)
+	}
+	runner, err := executionRunnerFor(provider, modelSpec.TaskType)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	requestedConfig, err := experiment.RequestedConfig()
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	resolutionInput := make(map[string]any, len(requestedConfig)+1)
+	for key, value := range requestedConfig {
+		resolutionInput[key] = value
+	}
+	if imageSize, ok := resolutionInput["image_size"].(float64); !ok || imageSize <= 0 {
+		if modelSpec.DefaultImageSize > 0 {
+			resolutionInput["image_size"] = modelSpec.DefaultImageSize
+		}
+	}
+	artifactPlan, err := automaticArtifactPlanFromEvaluation(modelSpec.TaskType, runner, evaluation)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	spec, err := execution.BuildExecutionSpecV1WithArtifactPlan(
+		modelSpec.TaskType, runner, requestedConfig, resolutionInput, artifactPlan,
 	)
 	if err != nil {
 		return execution.ExecutionSpecV1{}, fmt.Errorf("resolve execution spec: %w", err)

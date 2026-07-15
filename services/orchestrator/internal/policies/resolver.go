@@ -281,7 +281,7 @@ func (r *Resolver) Resolve(input ScopeContext) (EffectivePolicy, error) {
 		ResolvedDefaults:      resolvedDefaults,
 		RequiredCatalogs:      required,
 	}
-	if len(refs) == 0 {
+	if len(policySources) == 0 {
 		snapshot.ImplicitProfile = &ProfileRef{ID: ImplicitAllowAllProfileKey, Version: ImplicitAllowAllProfileVersion}
 	}
 	_, effectiveHash, hashErr := canonicalJSONAndHash(snapshot)

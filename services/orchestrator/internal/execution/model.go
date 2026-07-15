@@ -34,27 +34,32 @@ type JobExecutionSpec struct {
 	RequestedConfigHash string         `json:"requested_config_hash"`
 	AcceptedSpecHash    string         `json:"accepted_spec_hash"`
 	AcceptedSpec        map[string]any `json:"accepted_spec"`
+	ArtifactPlan        ArtifactPlanV1 `json:"artifact_plan"`
+	ArtifactPlanHash    string         `json:"artifact_plan_hash"`
 	PolicyEvaluationID  string         `json:"policy_evaluation_id,omitempty"`
 	EffectivePolicyHash string         `json:"effective_policy_hash,omitempty"`
 	CreatedAt           time.Time      `json:"created_at"`
 }
 
 type AttemptExecutionRecord struct {
-	ID                         string                   `json:"id"`
-	JobID                      string                   `json:"job_id"`
-	ProjectID                  string                   `json:"project_id"`
-	AttemptID                  string                   `json:"attempt_id"`
-	AttemptNumber              int                      `json:"attempt_number"`
-	LifecycleStatus            string                   `json:"lifecycle_status"`
-	FidelityVerdict            *string                  `json:"fidelity_verdict"`
-	RealizedEffectiveHash      string                   `json:"realized_effective_hash,omitempty"`
-	AdjustmentReasonCodes      []string                 `json:"adjustment_reason_codes,omitempty"`
-	LatestRealizedConfig       map[string]any           `json:"latest_realized_config,omitempty"`
-	DispatchPolicyEvaluationID string                   `json:"dispatch_policy_evaluation_id,omitempty"`
-	EffectivePolicyHash        string                   `json:"effective_policy_hash,omitempty"`
-	CreatedAt                  time.Time                `json:"created_at"`
-	UpdatedAt                  time.Time                `json:"updated_at"`
-	Observations               []RealizationObservation `json:"observations,omitempty"`
+	ID                              string                   `json:"id"`
+	JobID                           string                   `json:"job_id"`
+	ProjectID                       string                   `json:"project_id"`
+	AttemptID                       string                   `json:"attempt_id"`
+	AttemptNumber                   int                      `json:"attempt_number"`
+	LifecycleStatus                 string                   `json:"lifecycle_status"`
+	FidelityVerdict                 *string                  `json:"fidelity_verdict"`
+	RealizedEffectiveHash           string                   `json:"realized_effective_hash,omitempty"`
+	AdjustmentReasonCodes           []string                 `json:"adjustment_reason_codes,omitempty"`
+	LatestRealizedConfig            map[string]any           `json:"latest_realized_config,omitempty"`
+	DispatchPolicyEvaluationID      string                   `json:"dispatch_policy_evaluation_id,omitempty"`
+	EffectivePolicyHash             string                   `json:"effective_policy_hash,omitempty"`
+	WorkerPolicyCapabilityVersion   string                   `json:"worker_policy_capability_version,omitempty"`
+	WorkerArtifactCapabilityVersion string                   `json:"worker_artifact_capability_version,omitempty"`
+	ArtifactPlanHash                string                   `json:"artifact_plan_hash,omitempty"`
+	CreatedAt                       time.Time                `json:"created_at"`
+	UpdatedAt                       time.Time                `json:"updated_at"`
+	Observations                    []RealizationObservation `json:"observations,omitempty"`
 }
 
 type RealizationObservation struct {
