@@ -1003,15 +1003,78 @@ test("ONNX external data mount paths and tunnel logs are sanitized", () => {
   assert(!signed.includes("sk-testtoken"));
 });
 
-test("automatic tunnel readiness is strict for S3 and soft for orchestrator by default", () => {
+test("automatic tunnel readiness defaults to warn for S3 and off for orchestrator", () => {
+  assert.equal(__test.cloudflaredTunnelReadinessMode("orchestrator", {}), "off");
+  assert.equal(__test.cloudflaredTunnelReadinessMode("s3", {}), "warn");
   assert.equal(__test.cloudflaredTunnelReadinessProbe("orchestrator", {}), null);
   assert.equal(typeof __test.cloudflaredTunnelReadinessProbe("s3", {}), "function");
   assert.equal(
-    typeof __test.cloudflaredTunnelReadinessProbe("orchestrator", {
+    __test.cloudflaredTunnelReadinessMode("orchestrator", {
       MODEL_EXPRESS_CLOUDFLARED_STRICT_ORCHESTRATOR_READY: "true",
     }),
-    "function",
+    "enforce",
   );
+  assert.equal(
+    __test.cloudflaredTunnelReadinessMode("s3", {
+      MODEL_EXPRESS_CLOUDFLARED_STRICT_S3_READY: "true",
+    }),
+    "enforce",
+  );
+});
+
+test("automatic tunnel readiness modes can enforce warn or disable checks", () => {
+  assert.equal(
+    __test.cloudflaredTunnelReadinessMode("s3", {
+      MODEL_EXPRESS_CLOUDFLARED_S3_READY_MODE: "enforce",
+    }),
+    "enforce",
+  );
+  assert.equal(
+    __test.cloudflaredTunnelReadinessMode("s3", {
+      MODEL_EXPRESS_CLOUDFLARED_S3_READY_MODE: "off",
+    }),
+    "off",
+  );
+  assert.equal(
+    __test.cloudflaredTunnelReadinessMode("orchestrator", {
+      MODEL_EXPRESS_CLOUDFLARED_READY_MODE: "warn",
+    }),
+    "warn",
+  );
+  assert.equal(
+    __test.cloudflaredTunnelReadinessProbe("s3", {
+      MODEL_EXPRESS_CLOUDFLARED_S3_READY_MODE: "off",
+    }),
+    null,
+  );
+});
+
+test("S3 tunnel warn readiness continues after DNS never resolves", async () => {
+  let now = 0;
+  const probe = __test.cloudflaredTunnelReadinessProbe("s3", {
+    MODEL_EXPRESS_CLOUDFLARED_S3_READY_MODE: "warn",
+  });
+
+  const result = await probe({
+    projectId: "project-warn-ready",
+    label: "s3",
+    url: "https://unit-test.trycloudflare.com",
+    logDir: tempDir("mx-tunnel-warn-"),
+    timeoutMs: 1_000,
+    retryMs: 500,
+    requestTimeoutMs: 750,
+    nowFn: () => now,
+    sleepFn: async (ms) => {
+      now += ms;
+    },
+    lookup: async () => {
+      throw new Error("ENOTFOUND");
+    },
+    fetchImpl: async () => new Response("", { status: 200 }),
+  });
+
+  assert.equal(result.attempts, 0);
+  assert.match(result.warning, /ENOTFOUND/);
 });
 
 test("cloudflared tunnel readiness retries until DNS and HTTP both answer", async () => {

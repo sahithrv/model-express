@@ -2791,11 +2791,51 @@ async function startCloudflaredTunnelWithRetries({
 }
 
 function cloudflaredTunnelReadinessProbe(label, env = process.env) {
-  const normalized = String(label ?? "").trim().toLowerCase();
-  if (normalized === "orchestrator" && !envFlagFrom(env, "MODEL_EXPRESS_CLOUDFLARED_STRICT_ORCHESTRATOR_READY", false)) {
+  const mode = cloudflaredTunnelReadinessMode(label, env);
+  if (mode === "off") {
     return null;
   }
+  if (mode === "warn") {
+    return async (options = {}) => {
+      try {
+        return await waitForCloudflaredTunnelReady(options);
+      } catch (error) {
+        appendDiagnosticLog(options.logDir, "warn", "cloudflared_tunnel_public_unverified", {
+          project_id: options.projectId,
+          label,
+          url: options.url,
+          error: errorMessage(error),
+        });
+        return { attempts: 0, warning: errorMessage(error) };
+      }
+    };
+  }
   return waitForCloudflaredTunnelReady;
+}
+
+function cloudflaredTunnelReadinessMode(label, env = process.env) {
+  const normalized = String(label ?? "").trim().toLowerCase();
+  const configured = firstNonEmpty(
+    normalized === "s3" ? env.MODEL_EXPRESS_CLOUDFLARED_S3_READY_MODE : "",
+    normalized === "orchestrator" ? env.MODEL_EXPRESS_CLOUDFLARED_ORCHESTRATOR_READY_MODE : "",
+    env.MODEL_EXPRESS_CLOUDFLARED_READY_MODE,
+  ).toLowerCase();
+  if (configured === "enforce" || configured === "strict" || configured === "required" || configured === "require") {
+    return "enforce";
+  }
+  if (configured === "warn" || configured === "warning" || configured === "soft") {
+    return "warn";
+  }
+  if (configured === "off" || configured === "disabled" || configured === "disable" || configured === "none" || configured === "false" || configured === "0") {
+    return "off";
+  }
+  if (normalized === "orchestrator") {
+    return envFlagFrom(env, "MODEL_EXPRESS_CLOUDFLARED_STRICT_ORCHESTRATOR_READY", false) ? "enforce" : "off";
+  }
+  if (normalized === "s3") {
+    return envFlagFrom(env, "MODEL_EXPRESS_CLOUDFLARED_STRICT_S3_READY", false) ? "enforce" : "warn";
+  }
+  return "enforce";
 }
 
 function startCloudflaredTunnel({
@@ -4212,6 +4252,7 @@ module.exports = {
     localConfigPath,
     missionControlLiveFeatureFlags,
     missionControlEnv,
+    cloudflaredTunnelReadinessMode,
     cloudflaredTunnelReadinessProbe,
     parseCloudflaredTunnelUrl,
     waitForCloudflaredTunnelReady,
