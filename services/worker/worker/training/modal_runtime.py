@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextvars
 import os
 from pathlib import PurePosixPath
 
@@ -59,10 +58,6 @@ DEFAULT_MODAL_IMAGEFOLDER_DATALOADER_WORKERS = 2
 DEFAULT_MODAL_TRAINING_DATASET_CACHE_ROOT = "/tmp/model-express/training-datasets"
 DEFAULT_METADATA_BUNDLE_PAGE_SIZE = 5000
 DEFAULT_METADATA_BUNDLE_MAX_RECORDS = 50_000
-_MODAL_STAGE_EVENTS: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
-    "model_express_modal_stage_events",
-    default=None,
-)
 METADATA_ENDPOINT_UNAVAILABLE_STATUS_CODES = {404, 405, 501}
 COMMON_IMAGE_ROOT_NAMES = ("images", "image", "imgs", "img", "JPEGImages", "jpegimages", "data")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -126,7 +121,7 @@ if modal is not None:
             "pyyaml",
             "torch",
             "torchvision",
-            "ultralytics",
+            "ultralytics==8.4.66",
         )
         .env({"TORCH_HOME": str(TORCH_CACHE_ROOT)})
         .add_local_python_source("worker")

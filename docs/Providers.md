@@ -175,6 +175,10 @@ PROJECT_ID=optional-project-id
 GPU_TYPE=local
 MODEL_EXPRESS_WORKER_POLL_INTERVAL_SECONDS=5
 MODEL_EXPRESS_WORKER_IDLE_LOG_SECONDS=60
+MODEL_EXPRESS_PROGRESS_REPORTING_ENABLED=true
+MODEL_EXPRESS_PROGRESS_HEARTBEAT_SECONDS=15
+MODEL_EXPRESS_PROGRESS_REPORT_TIMEOUT_SECONDS=5
+MODEL_EXPRESS_PROGRESS_REPORT_MAX_ATTEMPTS=3
 ```
 
 ### What it unlocks
@@ -189,6 +193,12 @@ MODEL_EXPRESS_WORKER_IDLE_LOG_SECONDS=60
 ### Trust boundary
 
 The worker does not decide what work exists. It polls the backend, receives one assigned job, executes that job, and reports back. Job failures are reported with retry-aware metadata when possible.
+
+Attempt-scoped progress reporting is enabled by default. It is best-effort: unsupported endpoints, authentication rejection, timeouts, and reporting outages never change the training result. Workers stop using an unsupported progress endpoint after the first 404/405/501 response, which keeps new-worker/old-backend deployments safe. Unchanged observations are heartbeat-throttled, while stage transitions and changed progress boundaries are sent immediately. Callback attempts are bounded to five and each timeout to 30 seconds even if larger environment values are configured.
+
+Set `MODEL_EXPRESS_PROGRESS_REPORTING_ENABLED=false` to roll back progress callbacks while retaining metric and training-run summaries. This switch requires no data repair and does not disable authoritative job completion/failure callbacks. Local progress diagnostics retain only a bounded list of reason codes, stages, revisions, attempt counts, and HTTP status codes; they never retain callback tokens, attempt identities, storage paths, prompts, or request payload contents. The former `MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY` detailed phase-event dual-write is retired; current progress comes from `job_progress`, while historical stage telemetry remains readable.
+
+Local training and the current `persistent_gpu`/`persistent_disk` path publish the same versioned coarse progress stages as Modal. These paths are deterministic simulators, so their progress metadata explicitly sets `execution_mode=local_simulator`; provider/runtime distinctions stay in bounded detail codes and allowlisted metadata rather than becoming new stages. The persistent provider still performs real persistent-disk dataset materialization before handing the same attempt-scoped reporter to the simulator, preserving monotonic revisions and outage/throttling behavior across that handoff. Workers report only through `finalizing`; the backend remains authoritative for completion, failure, cancellation, retry, and recovery.
 
 ## Modal Provider
 
@@ -525,6 +535,22 @@ Provider pricing changes over time, so this repo should avoid hardcoding pricing
 - Prefer T4/L4-style defaults before trying larger GPUs.
 - Enable embeddings only when memory retrieval is part of the demo.
 - Watch Model Express telemetry for token usage, cached input, reasoning tokens, embedding calls, and cost estimates when available.
+
+Planner invocations always retain provider usage. Cost is derived only when all
+six fields of an explicitly reviewed pricing snapshot are configured, and only
+when its provider and model match the actual request:
+
+```bash
+MODEL_EXPRESS_LLM_PRICING_VERSION=provider-model-YYYY-MM-DD
+MODEL_EXPRESS_LLM_PRICING_PROVIDER=openai
+MODEL_EXPRESS_LLM_PRICING_MODEL=gpt-5.4-mini
+MODEL_EXPRESS_LLM_INPUT_USD_PER_MILLION_TOKENS=...
+MODEL_EXPRESS_LLM_CACHED_INPUT_USD_PER_MILLION_TOKENS=...
+MODEL_EXPRESS_LLM_OUTPUT_USD_PER_MILLION_TOKENS=...
+```
+
+Leaving the snapshot unset records usage without fabricating a cost. A partial
+or unversioned snapshot is ignored and never produces a cost record.
 
 The system is designed so provider costs are visible and bounded rather than hidden.
 

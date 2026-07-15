@@ -8,6 +8,7 @@ import (
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/runs"
 )
 
@@ -31,6 +32,7 @@ func plannerBackendGatedMethods(input ExperimentPlannerInput) []PlannerBackendGa
 		card.Evidence = cappedStrings(card.Evidence, 6)
 		card.MissingRequirements = plannerBackendGatedMissingRequirements(input, card)
 		card.SchedulingAuthority = false
+		card.SupportedConfigHints = policyFilteredSupportedConfigHints(input, card.SupportedConfigHints)
 		if card.ProposalStatus == "" {
 			card.ProposalStatus = plannerBackendGatedProposalStatus(card.Mechanism, card.MissingRequirements)
 		}
@@ -216,6 +218,125 @@ func plannerBackendGatedMethods(input ExperimentPlannerInput) []PlannerBackendGa
 		out = out[:plannerSnapshotMaxBackendGatedMethods]
 	}
 	return out
+}
+
+func policyFilteredSupportedConfigHints(input ExperimentPlannerInput, hints map[string]any) map[string]any {
+	if input.EffectivePolicy == nil || len(hints) == 0 {
+		return hints
+	}
+	out := map[string]any{}
+	for key, value := range hints {
+		category := map[string]string{
+			"class_balancing_options":     "class_balancing_strategies",
+			"sampling_strategy_options":   "sampling_strategies",
+			"resolution_strategy_options": "resolution_strategies",
+			"augmentation_policy_options": "augmentation_policies",
+			"preferred_deployment_models": "models",
+		}[key]
+		if category != "" {
+			values, ok := value.([]string)
+			if !ok {
+				continue
+			}
+			permitted := []string{}
+			for _, candidate := range values {
+				if policies.IsPermitted(*input.EffectivePolicy, category, candidate) {
+					permitted = append(permitted, candidate)
+				}
+			}
+			if len(permitted) > 0 {
+				out[key] = permitted
+			}
+			continue
+		}
+		if key == "preprocessing_options" {
+			stringsValue, ok := value.([]string)
+			if ok {
+				permitted := []string{}
+				for _, candidate := range stringsValue {
+					if policies.IsPermitted(*input.EffectivePolicy, "resize_strategies", candidate) || policies.IsPermitted(*input.EffectivePolicy, "crop_strategies", candidate) {
+						permitted = append(permitted, candidate)
+					}
+				}
+				if len(permitted) > 0 {
+					out[key] = permitted
+				}
+				continue
+			}
+			structured, ok := value.([]plans.Preprocessing)
+			if ok {
+				permitted := make([]plans.Preprocessing, 0, len(structured))
+				for _, preprocessing := range structured {
+					if policyPermitsPreprocessingHint(*input.EffectivePolicy, preprocessing) {
+						permitted = append(permitted, preprocessing)
+					}
+				}
+				if len(permitted) > 0 {
+					out[key] = permitted
+				}
+				continue
+			}
+		}
+		singularCategory := map[string]string{
+			"model":               "models",
+			"resolution_strategy": "resolution_strategies",
+			"augmentation_policy": "augmentation_policies",
+			"class_balancing":     "class_balancing_strategies",
+			"sampling_strategy":   "sampling_strategies",
+		}[key]
+		if singularCategory != "" {
+			candidate, ok := value.(string)
+			if ok && policies.IsPermitted(*input.EffectivePolicy, singularCategory, candidate) {
+				out[key] = value
+			}
+			continue
+		}
+		switch typed := value.(type) {
+		case plans.Preprocessing:
+			if policyPermitsPreprocessingHint(*input.EffectivePolicy, typed) {
+				out[key] = value
+			}
+			continue
+		case plans.AugmentationPolicyConfig:
+			if policies.IsPermitted(*input.EffectivePolicy, "augmentation_policies", typed.PolicyType) {
+				out[key] = value
+			}
+			continue
+		case []int:
+			field := map[string]string{"image_size_options": "image_size", "suggested_image_sizes": "image_size"}[key]
+			if field != "" {
+				permitted := make([]int, 0, len(typed))
+				for _, candidate := range typed {
+					if policies.IsFieldValuePermitted(*input.EffectivePolicy, field, candidate) {
+						permitted = append(permitted, candidate)
+					}
+				}
+				if len(permitted) > 0 {
+					out[key] = permitted
+				}
+				continue
+			}
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func policyPermitsPreprocessingHint(effective policies.EffectivePolicy, preprocessing plans.Preprocessing) bool {
+	for category, value := range map[string]string{
+		"resize_strategies":        preprocessing.ResizeStrategy,
+		"crop_strategies":          preprocessing.CropStrategy,
+		"bounding_box_modes":       preprocessing.BBoxMode,
+		"normalization_strategies": preprocessing.Normalization,
+	} {
+		if strings.TrimSpace(value) != "" && !policies.IsPermitted(effective, category, value) {
+			return false
+		}
+	}
+	if preprocessing.UseDatasetNormalization && !policies.IsPermitted(effective, "normalization_strategies", "dataset") {
+		return false
+	}
+	return true
 }
 
 type plannerBackendGatedRequirement struct {

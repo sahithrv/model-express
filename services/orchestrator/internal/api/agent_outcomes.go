@@ -3,11 +3,13 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
@@ -23,6 +25,9 @@ func plannerStrategyMemory(records []memory.AgentMemoryRecord) ([]agents.Planner
 			continue
 		}
 		entry := plannerStrategyMemoryFromRecord(record)
+		if !entry.LearningEligible {
+			continue
+		}
 		switch entry.OutcomeStatus {
 		case agents.ExperimentPlanningOutcomeImprovedChampion, agents.ExperimentPlanningOutcomeMinorImprovement:
 			if len(successful) < 6 {
@@ -88,34 +93,47 @@ func rejectedOptionApplies(option agents.RejectedPlannerOption, failureModes map
 func plannerStrategyScorecards(scorecards []strategies.StrategyScorecard, datasetID string) []agents.PlannerStrategyScorecard {
 	out := []agents.PlannerStrategyScorecard{}
 	for _, scorecard := range scorecards {
+		evidenceEligible := scorecard.EvidenceEligible
+		fidelityVerdicts := append([]string(nil), scorecard.FidelityVerdicts...)
+		if len(fidelityVerdicts) == 0 {
+			fidelityVerdicts = []string{execution.ExecutionVerdictUnverified}
+			evidenceEligible = legacyExecutionEvidencePolicy() == execution.LegacyEvidencePolicyAllow
+		}
+		if !evidenceEligible {
+			continue
+		}
 		if scorecard.DatasetID != datasetID && len(out) >= 6 {
 			continue
 		}
 		out = append(out, agents.PlannerStrategyScorecard{
-			ID:                scorecard.ID,
-			DatasetID:         scorecard.DatasetID,
-			SourceDecisionID:  scorecard.SourceDecisionID,
-			SourcePlanID:      scorecard.SourcePlanID,
-			FollowUpPlanID:    scorecard.FollowUpPlanID,
-			StrategyType:      scorecard.StrategyType,
-			PlanningMode:      scorecard.PlanningMode,
-			Mechanism:         scorecard.Mechanism,
-			Intervention:      scorecard.Intervention,
-			DiagnosisTriggers: scorecard.DiagnosisTriggers,
-			EvidenceUsed:      scorecard.EvidenceUsed,
-			ExpectedEffect:    scorecard.ExpectedEffect,
-			DatasetTraits:     scorecard.DatasetTraits,
-			ObjectiveProfile:  scorecard.ObjectiveProfile,
-			ProposedChanges:   scorecard.ProposedChanges,
-			ExpectedDelta:     scorecard.ExpectedDelta,
-			ActualDelta:       scorecard.ActualDelta,
-			ConfidenceBefore:  scorecard.ConfidenceBefore,
-			ConfidenceAfter:   scorecard.ConfidenceAfter,
-			CostUSD:           scorecard.CostUSD,
-			RuntimeSeconds:    scorecard.RuntimeSeconds,
-			Outcome:           scorecard.Outcome,
-			Lesson:            scorecard.Lesson,
-			Tags:              scorecard.Tags,
+			ID:                        scorecard.ID,
+			DatasetID:                 scorecard.DatasetID,
+			SourceDecisionID:          scorecard.SourceDecisionID,
+			SourcePlanID:              scorecard.SourcePlanID,
+			FollowUpPlanID:            scorecard.FollowUpPlanID,
+			StrategyType:              scorecard.StrategyType,
+			PlanningMode:              scorecard.PlanningMode,
+			Mechanism:                 scorecard.Mechanism,
+			Intervention:              scorecard.Intervention,
+			DiagnosisTriggers:         scorecard.DiagnosisTriggers,
+			EvidenceUsed:              scorecard.EvidenceUsed,
+			ExpectedEffect:            scorecard.ExpectedEffect,
+			DatasetTraits:             scorecard.DatasetTraits,
+			ObjectiveProfile:          scorecard.ObjectiveProfile,
+			ProposedChanges:           scorecard.ProposedChanges,
+			ExpectedDelta:             scorecard.ExpectedDelta,
+			ActualDelta:               scorecard.ActualDelta,
+			ConfidenceBefore:          scorecard.ConfidenceBefore,
+			ConfidenceAfter:           scorecard.ConfidenceAfter,
+			CostUSD:                   scorecard.CostUSD,
+			RuntimeSeconds:            scorecard.RuntimeSeconds,
+			Outcome:                   scorecard.Outcome,
+			Lesson:                    scorecard.Lesson,
+			Tags:                      scorecard.Tags,
+			FidelityVerdicts:          fidelityVerdicts,
+			EvidenceEligible:          evidenceEligible,
+			RequestedMechanism:        scorecard.RequestedMechanism,
+			RealizedMechanismIdentity: scorecard.RealizedMechanismIdentity,
 		})
 		if len(out) >= 10 {
 			break
@@ -129,6 +147,10 @@ func plannerStrategyMemoryFromRecord(record memory.AgentMemoryRecord) agents.Pla
 	if champion, ok := experimentChampionFromPayload(record.Payload["actual_best_run"]); ok {
 		bestModel = champion.Model
 	}
+	learningEligible := legacyExecutionEvidencePolicy() == execution.LegacyEvidencePolicyAllow
+	if _, ok := record.Payload["evidence_eligible_run_count"]; ok {
+		learningEligible = payloadFloat(record.Payload, "evidence_eligible_run_count") > 0
+	}
 	return agents.PlannerStrategyMemory{
 		MemoryID:                record.ID,
 		OutcomeStatus:           payloadString(record.Payload, "outcome_status"),
@@ -140,7 +162,20 @@ func plannerStrategyMemoryFromRecord(record memory.AgentMemoryRecord) agents.Pla
 		TotalRuntimeSeconds:     payloadFloat(record.Payload, "total_runtime_seconds"),
 		ProposedModels:          proposedModelsFromPayload(record.Payload),
 		Tags:                    record.Tags,
+		FidelityVerdict:         firstNonEmptyString(firstOutcomeFidelityVerdict(record.Payload), execution.ExecutionVerdictUnverified),
+		LearningEligible:        learningEligible,
 	}
+}
+
+func firstOutcomeFidelityVerdict(payload map[string]any) string {
+	values, ok := payload["execution_evidence"].([]any)
+	if !ok || len(values) == 0 {
+		return ""
+	}
+	if item, ok := values[0].(map[string]any); ok {
+		return payloadString(item, "fidelity_verdict")
+	}
+	return ""
 }
 
 func proposedModelsFromPayload(payload map[string]any) []string {
@@ -181,21 +216,44 @@ func experimentPlanningOutcomeForPlan(
 	summaries []runs.TrainingRunSummary,
 	evaluations []runs.TrainingRunEvaluation,
 	objectiveContext agents.ProjectObjectiveContext,
+	executionEvidenceByJob map[string]agents.ExperimentExecutionEvidence,
+) (agents.ExperimentPlanningOutcome, error) {
+	return experimentPlanningOutcomeForPlanWithTerminalCount(
+		sourceDecision, followUpPlan, projectPlans, summaries, evaluations, objectiveContext,
+		executionEvidenceByJob, len(summariesForPlanID(summaries, followUpPlan.ID)),
+	)
+}
+
+func experimentPlanningOutcomeForPlanWithTerminalCount(
+	sourceDecision decisions.AgentDecision,
+	followUpPlan plans.ExperimentPlan,
+	projectPlans []plans.ExperimentPlan,
+	summaries []runs.TrainingRunSummary,
+	evaluations []runs.TrainingRunEvaluation,
+	objectiveContext agents.ProjectObjectiveContext,
+	executionEvidenceByJob map[string]agents.ExperimentExecutionEvidence,
+	terminalExperimentCount int,
 ) (agents.ExperimentPlanningOutcome, error) {
 	planSummaries := summariesForPlanID(summaries, followUpPlan.ID)
+	eligibleSummaries := learningEligibleSummaries(planSummaries, executionEvidenceByJob)
+	eligibleProjectSummaries := learningEligibleSummaries(summaries, executionEvidenceByJob)
+	eligibleEvaluations := evaluationsForEligibleSummaries(evaluations, eligibleProjectSummaries)
 	evaluationsByJob := evaluationsByJobID(evaluations)
 	proposedExperiments, err := plannedExperimentsFromPayload(sourceDecision.Payload)
 	if err != nil {
 		proposedExperiments = []plans.PlannedExperiment{}
 	}
 
-	baselineChampion := baselineChampionForPlannerOutcome(sourceDecision, followUpPlan, projectPlans, summaries, evaluations, objectiveContext)
-	bestSummary, hasBest := bestSuccessfulTrainingSummaryForObjective(followUpPlan.TargetMetric, planSummaries, evaluationsForPlanID(evaluations, followUpPlan.ID), objectiveContext)
+	baselineChampion := baselineChampionForPlannerOutcome(sourceDecision, followUpPlan, projectPlans, eligibleProjectSummaries, eligibleEvaluations, objectiveContext, executionEvidenceByJob)
+	bestSummary, hasBest := bestSuccessfulTrainingSummaryForObjective(followUpPlan.TargetMetric, eligibleSummaries, evaluationsForPlanID(eligibleEvaluations, followUpPlan.ID), objectiveContext)
 
 	var actualBest *agents.ExperimentChampion
 	actualDelta := 0.0
 	if hasBest {
 		best := experimentChampionFromSummaryWithEvaluation(followUpPlan.TargetMetric, bestSummary, evaluationsByJob[bestSummary.JobID], objectiveContext)
+		if evidence, ok := executionEvidenceByJob[bestSummary.JobID]; ok {
+			best.ExecutionEvidence = &evidence
+		}
 		actualBest = &best
 		if baselineChampion != nil {
 			actualDelta = best.Score - baselineChampion.Score
@@ -210,24 +268,36 @@ func experimentPlanningOutcomeForPlan(
 		metExpectedDelta = hasBest && actualDelta >= expectedDelta
 	}
 	outcomeStatus := plannerOutcomeStatus(actualDelta, hasBest)
+	if !hasBest && successfulSummaryCount(planSummaries) > 0 {
+		outcomeStatus = agents.ExperimentPlanningOutcomeExecutionIneligible
+	}
+	planEvidence := make([]agents.ExperimentExecutionEvidence, 0, len(planSummaries))
+	for _, summary := range planSummaries {
+		if evidence, ok := executionEvidenceByJob[summary.JobID]; ok {
+			planEvidence = append(planEvidence, evidence)
+		}
+	}
+	sort.Slice(planEvidence, func(i, j int) bool { return planEvidence[i].JobID < planEvidence[j].JobID })
 	outcome := agents.ExperimentPlanningOutcome{
-		OutcomeType:             "planner_followup_result",
-		OutcomeStatus:           outcomeStatus,
-		SourceDecisionID:        sourceDecision.ID,
-		SourcePlanID:            sourceDecision.PlanID,
-		FollowUpPlanID:          followUpPlan.ID,
-		BaselineChampion:        baselineChampion,
-		ActualBestRun:           actualBest,
-		ExpectedDeltaVsChampion: expectedDelta,
-		ActualDeltaVsChampion:   actualDelta,
-		MetExpectedDelta:        metExpectedDelta,
-		TotalCostUSD:            totalSummaryCost(planSummaries),
-		TotalRuntimeSeconds:     totalSummaryRuntime(planSummaries),
-		TerminalRunCount:        len(planSummaries),
-		SuccessfulRunCount:      successfulSummaryCount(planSummaries),
-		FailedRunCount:          failedSummaryCount(planSummaries),
-		ProposedExperiments:     proposedExperiments,
-		CompletedAt:             time.Now().UTC(),
+		OutcomeType:              "planner_followup_result",
+		OutcomeStatus:            outcomeStatus,
+		SourceDecisionID:         sourceDecision.ID,
+		SourcePlanID:             sourceDecision.PlanID,
+		FollowUpPlanID:           followUpPlan.ID,
+		BaselineChampion:         baselineChampion,
+		ActualBestRun:            actualBest,
+		ExpectedDeltaVsChampion:  expectedDelta,
+		ActualDeltaVsChampion:    actualDelta,
+		MetExpectedDelta:         metExpectedDelta,
+		TotalCostUSD:             totalSummaryCost(planSummaries),
+		TotalRuntimeSeconds:      totalSummaryRuntime(planSummaries),
+		TerminalRunCount:         terminalExperimentCount,
+		SuccessfulRunCount:       successfulSummaryCount(planSummaries),
+		FailedRunCount:           failedSummaryCount(planSummaries),
+		ProposedExperiments:      proposedExperiments,
+		CompletedAt:              time.Now().UTC(),
+		ExecutionEvidence:        planEvidence,
+		EvidenceEligibleRunCount: len(eligibleSummaries),
 	}
 	outcome.Lesson = plannerOutcomeLesson(followUpPlan.TargetMetric, outcome)
 	return outcome, nil
@@ -240,12 +310,17 @@ func baselineChampionForPlannerOutcome(
 	summaries []runs.TrainingRunSummary,
 	evaluations []runs.TrainingRunEvaluation,
 	objectiveContext agents.ProjectObjectiveContext,
+	executionEvidenceByJob map[string]agents.ExperimentExecutionEvidence,
 ) *agents.ExperimentChampion {
 	if champion, ok := experimentChampionFromPayload(sourceDecision.Payload["current_champion"]); ok {
-		return champion
+		if attachEligibleChampionEvidence(champion, executionEvidenceByJob) {
+			return champion
+		}
 	}
 	if champion, ok := experimentChampionFromPayload(sourceDecision.Payload["source_plan_baseline_champion"]); ok {
-		return champion
+		if attachEligibleChampionEvidence(champion, executionEvidenceByJob) {
+			return champion
+		}
 	}
 	evaluationsByJob := evaluationsByJobID(evaluations)
 	if summary, ok := bestSuccessfulTrainingSummaryBeforePlanForObjective(followUpPlan.TargetMetric, projectPlans, summaries, evaluations, objectiveContext, followUpPlan.ID); ok {
@@ -253,6 +328,22 @@ func baselineChampionForPlannerOutcome(
 		return &champion
 	}
 	return nil
+}
+
+func attachEligibleChampionEvidence(champion *agents.ExperimentChampion, evidenceByJob map[string]agents.ExperimentExecutionEvidence) bool {
+	if champion == nil {
+		return false
+	}
+	evidence, ok := evidenceByJob[champion.JobID]
+	if !ok {
+		return legacyExecutionEvidencePolicy() == execution.LegacyEvidencePolicyAllow
+	}
+	if !evidence.LearningEligible {
+		return false
+	}
+	evidenceCopy := evidence
+	champion.ExecutionEvidence = &evidenceCopy
+	return true
 }
 
 func experimentChampionFromPayload(value any) (*agents.ExperimentChampion, bool) {
@@ -301,6 +392,9 @@ func plannerOutcomeConfidence(outcome agents.ExperimentPlanningOutcome) float64 
 
 func plannerOutcomeLesson(targetMetric string, outcome agents.ExperimentPlanningOutcome) string {
 	metric := "deployment readiness"
+	if outcome.OutcomeStatus == agents.ExperimentPlanningOutcomeExecutionIneligible {
+		return fmt.Sprintf("Planner follow-up plan %s produced results, but none were eligible learning evidence under execution-fidelity policy; do not credit its requested mechanism.", outcome.FollowUpPlanID)
+	}
 	if outcome.OutcomeStatus == agents.ExperimentPlanningOutcomeFailed {
 		return fmt.Sprintf("Planner follow-up plan %s produced no successful runs after %.3f total cost; avoid repeating this failed strategy without changing the setup.", outcome.FollowUpPlanID, outcome.TotalCostUSD)
 	}
@@ -328,7 +422,37 @@ func plannerOutcomeTags(outcome agents.ExperimentPlanningOutcome) []string {
 	if outcome.ActualBestRun != nil && outcome.ActualBestRun.Model != "" {
 		tags = append(tags, strings.ToLower(strings.TrimSpace(outcome.ActualBestRun.Model)))
 	}
+	for _, evidence := range outcome.ExecutionEvidence {
+		if evidence.FidelityVerdict != "" {
+			tags = append(tags, strings.ToLower(evidence.FidelityVerdict))
+		}
+	}
+	if outcome.EvidenceEligibleRunCount == 0 {
+		tags = append(tags, "execution_evidence_ineligible")
+	}
 	return tags
+}
+
+func primaryOutcomeExecutionEvidence(outcome agents.ExperimentPlanningOutcome) agents.ExperimentExecutionEvidence {
+	if outcome.ActualBestRun != nil && outcome.ActualBestRun.ExecutionEvidence != nil {
+		return *outcome.ActualBestRun.ExecutionEvidence
+	}
+	if len(outcome.ExecutionEvidence) > 0 {
+		return outcome.ExecutionEvidence[0]
+	}
+	return agents.ExperimentExecutionEvidence{}
+}
+
+func outcomeExecutionFidelityVerdicts(outcome agents.ExperimentPlanningOutcome) []string {
+	values := []string{}
+	for _, evidence := range outcome.ExecutionEvidence {
+		if evidence.FidelityVerdict != "" {
+			values = append(values, evidence.FidelityVerdict)
+		}
+	}
+	values = uniqueStrings(values)
+	sort.Strings(values)
+	return values
 }
 
 func totalSummaryCost(summaries []runs.TrainingRunSummary) float64 {

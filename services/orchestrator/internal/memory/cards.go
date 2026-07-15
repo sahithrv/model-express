@@ -3,11 +3,13 @@ package memory
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 
 	"model-express/services/orchestrator/internal/datasets"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/strategies"
 )
 
@@ -69,25 +71,32 @@ func BuildAgentMemoryCard(record AgentMemoryRecord) (EmbeddableMemoryCard, bool)
 	}
 	rejectedOptions := rejectedOptionSummaries(payload["rejected_options"])
 	tags := cleanStrings(record.Tags, 12)
+	learningEligible := execution.NormalizeLegacyEvidencePolicy(os.Getenv("MODEL_EXPRESS_LEGACY_EXECUTION_EVIDENCE_POLICY")) == execution.LegacyEvidencePolicyAllow
+	if _, ok := payload["evidence_eligible_run_count"]; ok {
+		count, _ := numericValue(payload["evidence_eligible_run_count"])
+		learningEligible = count > 0
+	}
 
 	summary := map[string]any{
-		"source":        SourceAgentMemoryRecord,
-		"memory_id":     record.ID,
-		"agent_name":    record.AgentName,
-		"kind":          record.Kind,
-		"summary":       strings.TrimSpace(record.Summary),
-		"tags":          tags,
-		"outcome":       outcome,
-		"decision_type": decisionType,
-		"lesson":        lesson,
-		"hypothesis":    hypothesis,
-		"evidence":      evidenceUsed,
-		"best_model":    bestModel,
-		"models":        models,
-		"rejections":    rejectedOptions,
-		"planning_mode": planningMode,
-		"mechanism":     mechanism,
-		"intervention":  intervention,
+		"source":            SourceAgentMemoryRecord,
+		"memory_id":         record.ID,
+		"agent_name":        record.AgentName,
+		"kind":              record.Kind,
+		"summary":           strings.TrimSpace(record.Summary),
+		"tags":              tags,
+		"outcome":           outcome,
+		"decision_type":     decisionType,
+		"lesson":            lesson,
+		"hypothesis":        hypothesis,
+		"evidence":          evidenceUsed,
+		"best_model":        bestModel,
+		"models":            models,
+		"rejections":        rejectedOptions,
+		"planning_mode":     planningMode,
+		"mechanism":         mechanism,
+		"intervention":      intervention,
+		"fidelity_verdict":  firstExecutionEvidenceVerdict(payload),
+		"learning_eligible": learningEligible,
 	}
 	removeEmpty(summary)
 
@@ -117,7 +126,7 @@ func BuildAgentMemoryCard(record AgentMemoryRecord) (EmbeddableMemoryCard, bool)
 		"rank_score":                    floatValue(payload["rank_score"]),
 		"recommended_action_type":       recommendedActionType(payload["recommended_action"]),
 		"rejected_option_count":         len(rejectedOptions),
-		"accepted_for_vector_memory":    true,
+		"accepted_for_vector_memory":    learningEligible,
 		"raw_payload_excluded":          true,
 		"embedding_card_schema_version": MemoryCardVersion,
 	}
@@ -160,7 +169,16 @@ func BuildAgentMemoryCard(record AgentMemoryRecord) (EmbeddableMemoryCard, bool)
 		Metadata:     metadata,
 		QualityScore: qualityScoreFromPayload(payload),
 		OutcomeScore: outcomeScore(outcome),
-	}, strings.TrimSpace(record.ID) != ""
+	}, strings.TrimSpace(record.ID) != "" && learningEligible
+}
+
+func firstExecutionEvidenceVerdict(payload map[string]any) string {
+	values, ok := payload["execution_evidence"].([]any)
+	if !ok || len(values) == 0 {
+		return ""
+	}
+	item, _ := values[0].(map[string]any)
+	return firstNonEmptyString(item, "fidelity_verdict")
 }
 
 func NewStrategyScorecardMemoryCard(scorecard strategies.StrategyScorecard) EmbeddableMemoryCard {
@@ -328,27 +346,35 @@ func BuildStrategyScorecardCard(scorecard strategies.StrategyScorecard) (Embedda
 	diagnosisTriggers := cleanStrings(scorecard.DiagnosisTriggers, 12)
 	evidenceUsed := cleanStrings(scorecard.EvidenceUsed, 8)
 	models := stringsFromAny(scorecard.ProposedChanges["models"], 12)
+	evidenceEligible := scorecard.EvidenceEligible
+	if len(scorecard.FidelityVerdicts) == 0 {
+		evidenceEligible = execution.NormalizeLegacyEvidencePolicy(os.Getenv("MODEL_EXPRESS_LEGACY_EXECUTION_EVIDENCE_POLICY")) == execution.LegacyEvidencePolicyAllow
+	}
 	if len(models) == 0 {
 		models = stringsFromAny(scorecard.ProposedChanges["proposed_models"], 12)
 	}
 
 	summary := map[string]any{
-		"source":             SourceStrategyScorecard,
-		"scorecard_id":       scorecard.ID,
-		"strategy_type":      scorecard.StrategyType,
-		"planning_mode":      scorecard.PlanningMode,
-		"mechanism":          scorecard.Mechanism,
-		"intervention":       scorecard.Intervention,
-		"diagnosis_triggers": diagnosisTriggers,
-		"expected_effect":    scorecard.ExpectedEffect,
-		"outcome":            scorecard.Outcome,
-		"lesson":             scorecard.Lesson,
-		"expected_delta":     scorecard.ExpectedDelta,
-		"actual_delta":       scorecard.ActualDelta,
-		"cost_usd":           scorecard.CostUSD,
-		"runtime_seconds":    scorecard.RuntimeSeconds,
-		"models":             models,
-		"tags":               tags,
+		"source":                      SourceStrategyScorecard,
+		"scorecard_id":                scorecard.ID,
+		"strategy_type":               scorecard.StrategyType,
+		"planning_mode":               scorecard.PlanningMode,
+		"mechanism":                   scorecard.Mechanism,
+		"intervention":                scorecard.Intervention,
+		"diagnosis_triggers":          diagnosisTriggers,
+		"expected_effect":             scorecard.ExpectedEffect,
+		"outcome":                     scorecard.Outcome,
+		"lesson":                      scorecard.Lesson,
+		"expected_delta":              scorecard.ExpectedDelta,
+		"actual_delta":                scorecard.ActualDelta,
+		"cost_usd":                    scorecard.CostUSD,
+		"runtime_seconds":             scorecard.RuntimeSeconds,
+		"models":                      models,
+		"tags":                        tags,
+		"fidelity_verdicts":           scorecard.FidelityVerdicts,
+		"evidence_eligible":           evidenceEligible,
+		"requested_mechanism":         scorecard.RequestedMechanism,
+		"realized_mechanism_identity": scorecard.RealizedMechanismIdentity,
 	}
 	removeEmpty(summary)
 
@@ -376,7 +402,7 @@ func BuildStrategyScorecardCard(scorecard strategies.StrategyScorecard) (Embedda
 		"runtime_seconds":               scorecard.RuntimeSeconds,
 		"models":                        models,
 		"tags":                          tags,
-		"accepted_for_vector_memory":    scorecard.Outcome != strategies.OutcomeInvalidated,
+		"accepted_for_vector_memory":    evidenceEligible && scorecard.Outcome != strategies.OutcomeInvalidated,
 		"raw_proposed_changes_excluded": true,
 		"embedding_card_schema_version": MemoryCardVersion,
 	}
@@ -415,7 +441,7 @@ func BuildStrategyScorecardCard(scorecard strategies.StrategyScorecard) (Embedda
 		Metadata:     metadata,
 		QualityScore: scorecardQualityScore(scorecard),
 		OutcomeScore: outcomeScore(scorecard.Outcome),
-	}, strings.TrimSpace(scorecard.ID) != ""
+	}, strings.TrimSpace(scorecard.ID) != "" && evidenceEligible && scorecard.Outcome != strategies.OutcomeInvalidated
 }
 
 func NewDatasetProfileMemoryCard(dataset datasets.Dataset) EmbeddableMemoryCard {

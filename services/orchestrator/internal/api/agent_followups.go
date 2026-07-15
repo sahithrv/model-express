@@ -14,7 +14,11 @@ import (
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
+	"model-express/services/orchestrator/internal/projects"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/strategies"
 )
@@ -346,13 +350,17 @@ func (s *Server) createReviewerDecision(projectID string) (plans.ExperimentPlan,
 		return plans.ExperimentPlan{}, decision, nil
 	}
 
-	recommendation := agents.NewExperimentReviewer().Review(project, latestPlan, summaries)
-	decision, err := s.store.CreateAgentDecision(
+	recommendation, policyReference, err := s.reviewerRecommendationWithPolicy(project, latestPlan, summaries)
+	if err != nil {
+		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+	}
+	decision, err := s.store.CreateAgentDecisionWithPolicy(
 		project.ID,
 		recommendation.PlanID,
 		recommendation.DecisionType,
 		recommendation.Rationale,
 		recommendation.Payload,
+		policyReference,
 	)
 	if err != nil {
 		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
@@ -362,6 +370,44 @@ func (s *Server) createReviewerDecision(projectID string) (plans.ExperimentPlan,
 	}
 
 	return latestPlan, decision, nil
+}
+
+func (s *Server) reviewerRecommendationWithPolicy(project projects.Project, plan plans.ExperimentPlan, summaries []runs.TrainingRunSummary) (decisions.AgentDecisionRecommendation, policies.PersistenceReference, error) {
+	dataset, err := s.store.GetDataset(plan.DatasetID)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	recommendation, err := agents.NewExperimentReviewer().ReviewWithPolicy(project, plan, summaries, &effectivePolicy)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	if recommendation.DecisionType != decisions.TypeAddExperiments {
+		return recommendation, policies.PersistenceReference{}, nil
+	}
+	experiments, err := plannedExperimentsFromPayload(recommendation.Payload)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	experiments, warnings, err := s.prepareAutoMLExperimentsForProjectWithPolicy(project.ID, experiments, &effectivePolicy)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	recommendation.Payload["proposed_experiments"] = experiments
+	if len(warnings) > 0 {
+		recommendation.Payload["automl_warnings"] = warnings
+	}
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistProposal, experiments, "")
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	recommendation.Payload["proposal_policy_evaluation_id"] = evaluation.ID
+	recommendation.Payload["effective_policy_hash"] = evaluation.EffectivePolicyHash
+	recommendation.Payload["effective_policy_card"] = policies.PromptCardFromEffectivePolicy(effectivePolicy)
+	return recommendation, policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed}, nil
 }
 
 func (s *Server) followUpSourceDecision(projectID string) (plans.ExperimentPlan, decisions.AgentDecision, error) {
@@ -390,6 +436,21 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if sourcePlan.ID == "" {
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: follow-up experiments require a source plan", store.ErrInvalidRequest)
 	}
+	if err := s.ensurePlannerCandidateProvenance(decision); err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	dataset, err := s.store.GetDataset(sourcePlan.DatasetID)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
 
 	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
 	if err != nil {
@@ -403,7 +464,13 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
 	}
 	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		if _, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationReusePlan, existingPlan.Experiments, ""); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
 		if err := s.validateExistingFollowUpPlanStillNovel(projectID, decision.ID, existingPlan, projectPlans); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
+		if _, err := s.finalizeCandidateOutcomesForPlan(existingPlan.ID); err != nil {
 			return plans.ExperimentPlan{}, false, err
 		}
 		return existingPlan, false, nil
@@ -417,14 +484,14 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	baseExperiments := append([]plans.PlannedExperiment(nil), experiments...)
 	experiments, err = plannedExperimentsWithStoredProposalMechanisms(decision.Payload, experiments)
 	if err != nil {
-		if plannerStrictValidationEnabled() {
+		if plannervalidation.IsStrict(plannerValidationMode()) {
 			return plans.ExperimentPlan{}, false, err
 		}
 		experiments = baseExperiments
 		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 	}
 	var automlWarnings []string
-	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProject(projectID, experiments)
+	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProjectWithPolicy(projectID, experiments, &effectivePolicy)
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
@@ -436,7 +503,26 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err := s.validateExperimentsDatasetCompatibility(sourcePlan.DatasetID, experiments); err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
-	if err := validateLLMPlannerStoredMechanismContract(decision, experiments); err != nil && plannerStrictValidationEnabled() {
+	acceptedSpecVerdict, acceptedSpecErr := plannervalidation.Evaluate(plannerValidationMode(), []plannervalidation.Check{{
+		Code:     "accepted_spec_no_op",
+		Category: plannervalidation.CategoryProposalNoOp,
+		Stage:    "follow_up_proposal",
+		Validate: func() error {
+			return s.validateFollowUpAcceptedSpecNovelty(projectID, experiments)
+		},
+	}})
+	if acceptedSpecErr != nil {
+		message := "Follow-up scheduling blocked because the proposal duplicates an accepted executable spec."
+		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{acceptedSpecErr.Error()})
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, acceptedSpecErr.Error())
+	}
+	if acceptedSpecVerdict.WouldBlock {
+		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarningText(acceptedSpecVerdict.Findings[0].Message))
+		if err := s.persistDecisionShadowStrictVerdict(decision, acceptedSpecVerdict); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
+	}
+	if err := validateLLMPlannerStoredMechanismContract(decision, experiments); err != nil && plannervalidation.IsStrict(plannerValidationMode()) {
 		message := "Follow-up scheduling blocked because the stored planner decision lacks a valid mechanism contract."
 		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{err.Error()})
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
@@ -445,13 +531,13 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	}
 	experiments, err = s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, sourcePlan.DatasetID, sourcePlan.ID, decision.ID, "", experiments, payloadStringSlice(decision.Payload, "evidence_used"))
 	if err != nil {
-		if plannerStrictValidationEnabled() {
+		if plannervalidation.IsStrict(plannerValidationMode()) {
 			return plans.ExperimentPlan{}, false, err
 		}
 		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 	}
 	skippedExperiments := []string{}
-	if plannerStrictValidationEnabled() {
+	if plannervalidation.IsStrict(plannerValidationMode()) {
 		var filtered []plans.PlannedExperiment
 		filtered, skippedExperiments = filterNovelPlannedExperiments(experiments, projectPlans)
 		experiments = filtered
@@ -472,13 +558,17 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		fmt.Sprintf("Follow-up plan generated from reviewer decision %s.", decision.ID),
 		fmt.Sprintf("Previous plan: %s.", sourcePlan.ID),
 	}
-	if plannerStrictValidationEnabled() {
+	if plannervalidation.IsStrict(plannerValidationMode()) {
 		warnings = append(warnings, skippedExperiments...)
 	}
 	warnings = append(warnings, automlWarnings...)
 	warnings = append(warnings, uniqueStrings(relaxedValidationWarnings)...)
 
-	plan, err := s.store.CreateExperimentPlan(
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistPlan, experiments, "")
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	plan, err := s.store.CreateExperimentPlanWithPolicy(
 		projectID,
 		sourcePlan.DatasetID,
 		sourcePlan.TargetMetric,
@@ -487,6 +577,7 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		experiments,
 		warnings,
 		decision.ID,
+		policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed},
 	)
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
@@ -497,8 +588,71 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if _, err := s.createPendingStrategyScorecard(projectID, sourcePlan, decision, plan); err != nil {
 		log.Printf("create pending strategy scorecard failed for decision %s: %v", decision.ID, err)
 	}
+	if _, err := s.finalizeCandidateOutcomesForPlan(plan.ID); err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
 
 	return plan, true, nil
+}
+
+func (s *Server) validateFollowUpAcceptedSpecNovelty(projectID string, experiments []plans.PlannedExperiment) error {
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return err
+	}
+	existing := map[string]string{}
+	for _, job := range projectJobs {
+		if hash := acceptedSpecHashFromJob(job); hash != "" {
+			existing[hash] = job.ID
+		}
+	}
+	provider := s.defaultExecuteExperimentPlanRequest().Provider
+	proposed := map[string]int{}
+	for index, experiment := range experiments {
+		if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+			continue
+		}
+		spec, err := buildExecutionSpecV1(experiment, provider)
+		if err != nil {
+			return err
+		}
+		if jobID, ok := existing[spec.AcceptedSpecHash]; ok {
+			return fmt.Errorf("%w: follow-up experiment %d is a proposal-time no-op matching accepted spec %s from job %s", store.ErrInvalidRequest, index, spec.AcceptedSpecHash, jobID)
+		}
+		if previous, ok := proposed[spec.AcceptedSpecHash]; ok {
+			return fmt.Errorf("%w: follow-up experiment %d is a proposal-time no-op matching proposed experiment %d by accepted spec %s", store.ErrInvalidRequest, index, previous, spec.AcceptedSpecHash)
+		}
+		proposed[spec.AcceptedSpecHash] = index
+	}
+	return nil
+}
+
+func (s *Server) persistDecisionShadowStrictVerdict(decision decisions.AgentDecision, verdict plannervalidation.Verdict) error {
+	invocationID := payloadString(decision.Payload, "invocation_id")
+	if invocationID == "" || !plannervalidation.IsShadow(verdict.Mode) {
+		return nil
+	}
+	invocation, err := s.store.GetAgentInvocation(invocationID)
+	if err != nil {
+		return fmt.Errorf("load planner invocation %s for shadow strict verdict: %w", invocationID, err)
+	}
+	if invocation.StrictValidationVerdict != nil {
+		verdict = plannervalidation.Merge(*invocation.StrictValidationVerdict, verdict)
+	}
+	outcome := plannervalidation.Outcome{
+		SchemaVersion:   plannervalidation.OutcomeSchemaVersionV1,
+		Mode:            plannervalidation.ModeShadowStrict,
+		FirstPassStatus: plannervalidation.FirstPassAccepted,
+		EventualStatus:  plannervalidation.EventualAccepted,
+		RetryOutcome:    plannervalidation.RetryNotNeeded,
+	}
+	if invocation.ValidationOutcome != nil {
+		outcome = *invocation.ValidationOutcome
+	}
+	if _, err := s.store.UpdateAgentInvocationValidation(invocationID, verdict, outcome); err != nil {
+		return fmt.Errorf("persist follow-up shadow strict verdict for invocation %s: %w", invocationID, err)
+	}
+	return nil
 }
 
 func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisionID string, followUpPlan plans.ExperimentPlan, projectPlans []plans.ExperimentPlan) error {
@@ -521,7 +675,7 @@ func (s *Server) validateExistingFollowUpPlanStillNovel(projectID string, decisi
 		s.recordFollowUpValidationBlocked(projectID, followUpPlan.ID, decisionID, followUpPlan.ID, message, []string{err.Error()})
 		return fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
 	}
-	if !plannerStrictValidationEnabled() {
+	if !plannervalidation.IsStrict(plannerValidationMode()) {
 		return nil
 	}
 	if _, err := s.validateFollowUpExperimentMechanismsAgainstDataset(projectID, followUpPlan.DatasetID, followUpPlan.ID, decisionID, followUpPlan.ID, followUpPlan.Experiments, nil); err != nil {
@@ -565,7 +719,7 @@ func (s *Server) validateFollowUpExperimentMechanismsAgainstDataset(
 		if followUpPlanID != "" {
 			message = fmt.Sprintf("Existing follow-up plan %s is blocked because one or more mechanisms lack backend-verifiable diagnosis or dataset support.", followUpPlanID)
 		}
-		if plannerStrictValidationEnabled() {
+		if plannervalidation.IsStrict(plannerValidationMode()) {
 			s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, []string{err.Error()})
 		}
 		return enrichedExperiments, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
@@ -850,7 +1004,10 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 		return automaticExperimentReviewResult{}, err
 	}
 
-	recommendation := agents.NewExperimentReviewer().Review(project, latestPlan, summaries)
+	recommendation, policyReference, err := s.reviewerRecommendationWithPolicy(project, latestPlan, summaries)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
 	if recommendation.DecisionType == decisions.TypeWait {
 		return automaticExperimentReviewResult{}, nil
 	}
@@ -869,12 +1026,13 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 			s.recordChampionSelectedFollowUpBlocked(project.ID, latestPlan.ID, "", "", message, stopReason, stopDetails)
 			return automaticExperimentReviewResult{}, nil
 		}
-		decision, err = s.store.CreateAgentDecision(
+		decision, err = s.store.CreateAgentDecisionWithPolicy(
 			project.ID,
 			recommendation.PlanID,
 			recommendation.DecisionType,
 			recommendation.Rationale,
 			recommendation.Payload,
+			policyReference,
 		)
 		if err != nil {
 			return automaticExperimentReviewResult{}, err
@@ -939,6 +1097,7 @@ func (s *Server) executeAutomaticFollowUpPlan(result automaticExperimentReviewRe
 	}
 
 	req := s.defaultExecuteExperimentPlanRequest()
+	req.deferPlanAggregate = true
 	planExecution, err := s.executeStoredExperimentPlan(result.FollowUpPlan.ID, req)
 	if err != nil {
 		if errors.Is(err, errNoNovelFollowUpExperiments) {
@@ -957,6 +1116,13 @@ func (s *Server) executeAutomaticFollowUpPlan(result automaticExperimentReviewRe
 	}
 
 	result.Jobs = planExecution.Jobs
+	if complete, err := s.finalizeCandidateOutcomesForPlan(result.FollowUpPlan.ID); err != nil {
+		return automaticExperimentReviewResult{}, err
+	} else if complete {
+		if err := s.recordExperimentPlannerOutcomeForPlanLocked(*result.FollowUpPlan); err != nil {
+			return automaticExperimentReviewResult{}, err
+		}
+	}
 	if err := s.recordAutomaticExecutionQueued(*result.FollowUpPlan, req, planExecution.Jobs); err != nil {
 		return automaticExperimentReviewResult{}, err
 	}
@@ -1154,6 +1320,11 @@ func (s *Server) runTrainingTerminalHooks(jobID string) {
 	}()
 
 	s.recordTrainingTerminalHookEvent(job, "started", fmt.Sprintf("Post-training agent hooks started for job %s.", job.ID), "")
+	if planID := jobConfigString(job.Config, "plan_id"); planID != "" {
+		if _, err := s.finalizeCandidateOutcomesForPlan(planID); err != nil {
+			log.Printf("candidate outcome finalization failed for plan %s after job %s: %v", planID, job.ID, err)
+		}
+	}
 	if err := s.observeAutoMLTrialForJob(job); err != nil {
 		log.Printf("AutoML trial observation failed for job %s: %v", job.ID, err)
 	}

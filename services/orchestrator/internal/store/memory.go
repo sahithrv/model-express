@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -11,13 +12,16 @@ import (
 	"unicode"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	datasetmetadata "model-express/services/orchestrator/internal/datasets/metadata"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
@@ -33,67 +37,91 @@ const (
 type MemoryStore struct {
 	mu sync.Mutex
 
-	nextID               uint64
-	projects             map[string]projects.Project
-	datasets             map[string]datasets.Dataset
-	workers              map[string]workers.Worker
-	jobs                 map[string]jobs.ExperimentJob
-	metrics              map[string][]jobs.EpochMetric
-	remoteSessions       map[string]runs.RemoteTrainingSession
-	plans                map[string]plans.ExperimentPlan
-	summaries            map[string]runs.TrainingRunSummary
-	evaluations          map[string]runs.TrainingRunEvaluation
-	champions            map[string]runs.ProjectChampion
-	championExports      map[string]runs.ChampionExport
-	demoPredictions      map[string]runs.ChampionDemoPrediction
-	championFeedback     map[string]runs.ChampionFeedback
-	metadataImports      map[string]datasets.DatasetMetadataImport
-	visualAnalyses       map[string]datasets.DatasetVisualAnalysis
-	decisions            map[string]decisions.AgentDecision
-	workerRequirements   map[string]execution.WorkerRequirement
-	executionEvents      map[string]execution.ExecutionEvent
-	agentMemoryRecords   map[string]memory.AgentMemoryRecord
-	agentInvocations     map[string]memory.AgentInvocation
-	memoryEmbeddings     map[string]memory.MemoryEmbeddingRecord
-	memoryUsageEvents    map[string]memory.MemoryEmbeddingUsageEvent
-	queryCache           map[string]memory.MemoryRetrievalQueryCacheRecord
-	strategyScorecards   map[string]strategies.StrategyScorecard
-	optimizerStudies     map[string]automl.OptimizerStudy
-	optimizerSuggestions map[string]automl.OptimizerSuggestion
-	optimizerTrials      map[string]automl.OptimizerTrial
-	automationSettings   *settings.AutomationSettings
+	nextID                     uint64
+	nextExecutionEventSequence int64
+	projects                   map[string]projects.Project
+	datasets                   map[string]datasets.Dataset
+	workers                    map[string]workers.Worker
+	jobs                       map[string]jobs.ExperimentJob
+	jobProgress                map[string]jobs.JobProgress
+	metrics                    map[string][]jobs.EpochMetric
+	remoteSessions             map[string]runs.RemoteTrainingSession
+	plans                      map[string]plans.ExperimentPlan
+	summaries                  map[string]runs.TrainingRunSummary
+	evaluations                map[string]runs.TrainingRunEvaluation
+	champions                  map[string]runs.ProjectChampion
+	championExports            map[string]runs.ChampionExport
+	demoPredictions            map[string]runs.ChampionDemoPrediction
+	championFeedback           map[string]runs.ChampionFeedback
+	metadataImports            map[string]datasets.DatasetMetadataImport
+	visualAnalyses             map[string]datasets.DatasetVisualAnalysis
+	decisions                  map[string]decisions.AgentDecision
+	candidateProvenance        map[string]calibration.CandidateProvenance
+	workerRequirements         map[string]execution.WorkerRequirement
+	executionEvents            map[string]execution.ExecutionEvent
+	jobExecutionSpecs          map[string]execution.JobExecutionSpec
+	attemptExecutions          map[string]execution.AttemptExecutionRecord
+	realizationObservations    map[string][]execution.RealizationObservation
+	agentMemoryRecords         map[string]memory.AgentMemoryRecord
+	agentInvocations           map[string]memory.AgentInvocation
+	memoryEmbeddings           map[string]memory.MemoryEmbeddingRecord
+	memoryUsageEvents          map[string]memory.MemoryEmbeddingUsageEvent
+	queryCache                 map[string]memory.MemoryRetrievalQueryCacheRecord
+	strategyScorecards         map[string]strategies.StrategyScorecard
+	optimizerStudies           map[string]automl.OptimizerStudy
+	optimizerSuggestions       map[string]automl.OptimizerSuggestion
+	optimizerTrials            map[string]automl.OptimizerTrial
+	automationSettings         *settings.AutomationSettings
+	policyProfiles             map[string]policies.CompatibilityProfile
+	policyVersions             map[string]policies.PolicyVersion
+	policyBindings             map[string]policies.Binding
+	policyEvaluations          map[string]policies.Evaluation
+	nextPolicyRevision         int64
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
-		projects:             make(map[string]projects.Project),
-		datasets:             make(map[string]datasets.Dataset),
-		workers:              make(map[string]workers.Worker),
-		jobs:                 make(map[string]jobs.ExperimentJob),
-		metrics:              make(map[string][]jobs.EpochMetric),
-		remoteSessions:       make(map[string]runs.RemoteTrainingSession),
-		plans:                make(map[string]plans.ExperimentPlan),
-		summaries:            make(map[string]runs.TrainingRunSummary),
-		evaluations:          make(map[string]runs.TrainingRunEvaluation),
-		champions:            make(map[string]runs.ProjectChampion),
-		championExports:      make(map[string]runs.ChampionExport),
-		demoPredictions:      make(map[string]runs.ChampionDemoPrediction),
-		championFeedback:     make(map[string]runs.ChampionFeedback),
-		metadataImports:      make(map[string]datasets.DatasetMetadataImport),
-		visualAnalyses:       make(map[string]datasets.DatasetVisualAnalysis),
-		decisions:            make(map[string]decisions.AgentDecision),
-		workerRequirements:   make(map[string]execution.WorkerRequirement),
-		executionEvents:      make(map[string]execution.ExecutionEvent),
-		agentMemoryRecords:   make(map[string]memory.AgentMemoryRecord),
-		agentInvocations:     make(map[string]memory.AgentInvocation),
-		memoryEmbeddings:     make(map[string]memory.MemoryEmbeddingRecord),
-		memoryUsageEvents:    make(map[string]memory.MemoryEmbeddingUsageEvent),
-		queryCache:           make(map[string]memory.MemoryRetrievalQueryCacheRecord),
-		strategyScorecards:   make(map[string]strategies.StrategyScorecard),
-		optimizerStudies:     make(map[string]automl.OptimizerStudy),
-		optimizerSuggestions: make(map[string]automl.OptimizerSuggestion),
-		optimizerTrials:      make(map[string]automl.OptimizerTrial),
+	storage := &MemoryStore{
+		projects:                make(map[string]projects.Project),
+		datasets:                make(map[string]datasets.Dataset),
+		workers:                 make(map[string]workers.Worker),
+		jobs:                    make(map[string]jobs.ExperimentJob),
+		jobProgress:             make(map[string]jobs.JobProgress),
+		metrics:                 make(map[string][]jobs.EpochMetric),
+		remoteSessions:          make(map[string]runs.RemoteTrainingSession),
+		plans:                   make(map[string]plans.ExperimentPlan),
+		summaries:               make(map[string]runs.TrainingRunSummary),
+		evaluations:             make(map[string]runs.TrainingRunEvaluation),
+		champions:               make(map[string]runs.ProjectChampion),
+		championExports:         make(map[string]runs.ChampionExport),
+		demoPredictions:         make(map[string]runs.ChampionDemoPrediction),
+		championFeedback:        make(map[string]runs.ChampionFeedback),
+		metadataImports:         make(map[string]datasets.DatasetMetadataImport),
+		visualAnalyses:          make(map[string]datasets.DatasetVisualAnalysis),
+		decisions:               make(map[string]decisions.AgentDecision),
+		candidateProvenance:     make(map[string]calibration.CandidateProvenance),
+		workerRequirements:      make(map[string]execution.WorkerRequirement),
+		executionEvents:         make(map[string]execution.ExecutionEvent),
+		jobExecutionSpecs:       make(map[string]execution.JobExecutionSpec),
+		attemptExecutions:       make(map[string]execution.AttemptExecutionRecord),
+		realizationObservations: make(map[string][]execution.RealizationObservation),
+		agentMemoryRecords:      make(map[string]memory.AgentMemoryRecord),
+		agentInvocations:        make(map[string]memory.AgentInvocation),
+		memoryEmbeddings:        make(map[string]memory.MemoryEmbeddingRecord),
+		memoryUsageEvents:       make(map[string]memory.MemoryEmbeddingUsageEvent),
+		queryCache:              make(map[string]memory.MemoryRetrievalQueryCacheRecord),
+		strategyScorecards:      make(map[string]strategies.StrategyScorecard),
+		optimizerStudies:        make(map[string]automl.OptimizerStudy),
+		optimizerSuggestions:    make(map[string]automl.OptimizerSuggestion),
+		optimizerTrials:         make(map[string]automl.OptimizerTrial),
+		policyProfiles:          make(map[string]policies.CompatibilityProfile),
+		policyVersions:          make(map[string]policies.PolicyVersion),
+		policyBindings:          make(map[string]policies.Binding),
+		policyEvaluations:       make(map[string]policies.Evaluation),
 	}
+	for _, profile := range policies.BuiltinCompatibilityProfiles() {
+		storage.policyProfiles[profile.ProfileKey+"@"+profile.SemanticVersion] = policies.CloneCompatibilityProfile(profile)
+	}
+	return storage
 }
 
 func (s *MemoryStore) CreateProject(name string, goal string) (projects.Project, error) {
@@ -103,6 +131,7 @@ func (s *MemoryStore) CreateProject(name string, goal string) (projects.Project,
 	now := time.Now().UTC()
 	project := projects.Project{
 		ID:        s.newID("project"),
+		AccountID: policies.LocalDefaultAccountID,
 		Name:      name,
 		Goal:      goal,
 		Status:    projects.StatusCreated,
@@ -115,8 +144,18 @@ func (s *MemoryStore) CreateProject(name string, goal string) (projects.Project,
 }
 
 func (s *MemoryStore) GetProject(id string) (projects.Project, error) {
+	return s.GetProjectContext(context.Background(), id)
+}
+
+func (s *MemoryStore) GetProjectContext(ctx context.Context, id string) (projects.Project, error) {
+	if err := ctx.Err(); err != nil {
+		return projects.Project{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return projects.Project{}, err
+	}
 
 	project, ok := s.projects[id]
 	if !ok {
@@ -429,6 +468,10 @@ func (s *MemoryStore) ListDatasetVisualAnalyses(datasetID string) ([]datasets.Da
 }
 
 func (s *MemoryStore) RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error) {
+	return s.RegisterWorkerWithCapabilities(projectID, name, gpuType, []string{execution.WorkerPolicyContractV1}, []string{execution.WorkerArtifactPlanV1})
+}
+
+func (s *MemoryStore) RegisterWorkerWithCapabilities(projectID string, name string, gpuType string, policyVersions []string, artifactVersions []string) (workers.Worker, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -440,16 +483,33 @@ func (s *MemoryStore) RegisterWorker(projectID string, name string, gpuType stri
 	}
 
 	worker := workers.Worker{
-		ID:            s.newID("worker"),
-		ProjectID:     projectID,
-		Name:          name,
-		Status:        workers.StatusIdle,
-		GPUType:       gpuType,
-		LastHeartbeat: time.Now().UTC(),
+		ID:                         s.newID("worker"),
+		ProjectID:                  projectID,
+		Name:                       name,
+		Status:                     workers.StatusIdle,
+		GPUType:                    gpuType,
+		PolicyCapabilityVersions:   normalizeCapabilityVersions(policyVersions),
+		ArtifactCapabilityVersions: normalizeCapabilityVersions(artifactVersions),
+		LastHeartbeat:              time.Now().UTC(),
 	}
 
 	s.workers[worker.ID] = worker
 	return worker, nil
+}
+
+func normalizeCapabilityVersions(values []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (s *MemoryStore) ListWorkers() ([]workers.Worker, error) {
@@ -528,7 +588,9 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		return nil, ErrNotFound
 	}
 	now := time.Now().UTC()
-	s.recoverExpiredJobLeasesLocked(now)
+	if _, err := s.recoverExpiredJobLeasesLocked(now); err != nil {
+		return nil, err
+	}
 	worker = s.workers[workerID]
 
 	if worker.CurrentJobID != "" {
@@ -545,8 +607,11 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		return &job, nil
 	}
 
-	for id, job := range s.jobs {
+	for _, job := range s.jobs {
 		if job.Status != jobs.StatusQueued {
+			continue
+		}
+		if job.PolicyEligibilityStatus == jobs.PolicyEligibilityBlocked {
 			continue
 		}
 		if job.ProjectID != worker.ProjectID {
@@ -569,7 +634,24 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		job.LeaseLastHeartbeatAt = &now
 		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
 		job.LeaseExpiresAt = &leaseExpiresAt
-		s.jobs[id] = job
+		if _, ok := s.jobExecutionSpecs[job.ID]; ok {
+			if _, err := s.createAttemptExecutionRecordLocked(job.ID, jobAttemptID(job.ID, job.Attempt), job.Attempt); err != nil {
+				return nil, err
+			}
+		}
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobAssigned,
+			job.Attempt,
+			jobs.ProgressStageWorkerStarting,
+			jobs.ProgressStatusRunning,
+			progressRevisionAssigned,
+			"worker_assigned",
+			"worker_assignment",
+		)
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return nil, err
+		}
 
 		worker.Status = workers.StatusRunning
 		worker.CurrentJobID = job.ID
@@ -586,6 +668,10 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 }
 
 func (s *MemoryStore) CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error) {
+	return s.CreateJobWithOptions(projectID, template, config, CreateJobOptions{})
+}
+
+func (s *MemoryStore) CreateJobWithOptions(projectID string, template string, config map[string]any, options CreateJobOptions) (jobs.ExperimentJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -597,17 +683,42 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 	}
 
 	job := jobs.ExperimentJob{
-		ID:          s.newID("job"),
-		ProjectID:   projectID,
-		Template:    template,
-		Status:      jobs.StatusQueued,
-		Config:      config,
-		MaxAttempts: defaultJobMaxAttempts,
-		CreatedAt:   time.Now().UTC(),
+		ID:                         s.newID("job"),
+		ProjectID:                  projectID,
+		DatasetID:                  strings.TrimSpace(configString(config, "dataset_id")),
+		PlanID:                     strings.TrimSpace(configString(config, "plan_id")),
+		Template:                   template,
+		Status:                     jobs.StatusQueued,
+		Config:                     config,
+		MaxAttempts:                defaultJobMaxAttempts,
+		SchedulePolicyEvaluationID: options.PolicyReference.EvaluationID,
+		EffectivePolicyHash:        options.PolicyReference.EffectivePolicyHash,
+		PolicyEligibilityStatus:    options.PolicyReference.Status,
+		CreatedAt:                  time.Now().UTC(),
 	}
+	job.Config = jobConfigWithImmutableExecutionSpec(config, job.Config)
+	job.Config = jobConfigWithPendingAttempt(job.Config, job.ID, 1)
+	job = jobs.WithExecutionSpecStatus(job)
 
-	s.jobs[job.ID] = job
-	return job, nil
+	transition, progress := newJobLifecycleTransition(
+		job,
+		execution.TransitionJobQueued,
+		1,
+		jobs.ProgressStageQueued,
+		jobs.ProgressStatusQueued,
+		progressRevisionQueued,
+		"initial_queue",
+		"job_created",
+	)
+	if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, job.CreatedAt); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	if spec, ok := executionSpecFromConfig(job.ID, projectID, job.Config, job.CreatedAt); ok {
+		spec.PolicyEvaluationID = options.PolicyReference.EvaluationID
+		spec.EffectivePolicyHash = options.PolicyReference.EffectivePolicyHash
+		s.jobExecutionSpecs[job.ID] = spec
+	}
+	return jobs.WithExecutionSpecStatus(job), nil
 }
 
 func (s *MemoryStore) GetJob(id string) (jobs.ExperimentJob, error) {
@@ -619,7 +730,7 @@ func (s *MemoryStore) GetJob(id string) (jobs.ExperimentJob, error) {
 		return jobs.ExperimentJob{}, ErrNotFound
 	}
 
-	return job, nil
+	return jobs.WithExecutionSpecStatus(job), nil
 }
 
 func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error) {
@@ -633,7 +744,7 @@ func (s *MemoryStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob, e
 	out := []jobs.ExperimentJob{}
 	for _, job := range s.jobs {
 		if job.ProjectID == projectID {
-			out = append(out, job)
+			out = append(out, jobs.WithExecutionSpecStatus(job))
 		}
 	}
 
@@ -659,6 +770,9 @@ func (s *MemoryStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.
 	if !ok {
 		return jobs.ExperimentJob{}, ErrNotFound
 	}
+	if _, changesAcceptedSpec := patch[execution.ExecutionSpecConfigKey]; changesAcceptedSpec {
+		return jobs.ExperimentJob{}, fmt.Errorf("%w: %s is immutable after scheduling", ErrInvalidRequest, execution.ExecutionSpecConfigKey)
+	}
 	next := copyAnyMap(job.Config)
 	if next == nil {
 		next = map[string]any{}
@@ -667,6 +781,7 @@ func (s *MemoryStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.
 		next[key] = value
 	}
 	job.Config = next
+	job = jobs.WithExecutionSpecStatus(job)
 	s.jobs[jobID] = job
 	return job, nil
 }
@@ -675,12 +790,12 @@ func (s *MemoryStore) RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJ
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.recoverExpiredJobLeasesLocked(now.UTC()), nil
+	return s.recoverExpiredJobLeasesLocked(now.UTC())
 }
 
-func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.ExperimentJob {
+func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) ([]jobs.ExperimentJob, error) {
 	recovered := []jobs.ExperimentJob{}
-	for id, job := range s.jobs {
+	for _, job := range s.jobs {
 		if job.LeaseExpiresAt == nil || job.LeaseExpiresAt.After(now) {
 			continue
 		}
@@ -691,6 +806,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 			job.MaxAttempts = defaultJobMaxAttempts
 		}
 		previousConfig := copyAnyMap(job.Config)
+		_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 		if job.Attempt >= job.MaxAttempts {
 			job.Status = jobs.StatusFailed
 			job.Error = "job lease expired after maximum attempts"
@@ -699,6 +815,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 			job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
 		} else {
 			job.Status = jobs.StatusQueued
+			job.PolicyEligibilityStatus = jobs.PolicyEligibilityPending
 			job.Error = ""
 			job.WorkerID = ""
 			job.StartedAt = nil
@@ -708,11 +825,45 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 		job.LeaseOwnerWorkerID = ""
 		job.LeaseExpiresAt = nil
 		job.LeaseLastHeartbeatAt = nil
-		s.jobs[id] = job
+		if job.Status == jobs.StatusFailed {
+			transition, progress := newJobLifecycleTransition(
+				job,
+				execution.TransitionJobFailed,
+				activeJobProgressAttempt(job),
+				jobs.ProgressStageFailed,
+				jobs.ProgressStatusFailed,
+				progressRevisionTerminal,
+				"lease_attempts_exhausted",
+				"lease_attempts_exhausted",
+			)
+			if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+				return nil, err
+			}
+		} else {
+			// job.Config already points at the pending attempt, while job.Attempt
+			// still identifies the abandoned lease owner.
+			attempt := jobConfigPositiveInt(job.Config, "active_attempt_number")
+			if attempt < 1 {
+				attempt = pendingJobProgressAttempt(job)
+			}
+			transition, progress := newJobLifecycleTransition(
+				job,
+				execution.TransitionJobLeaseRecovered,
+				attempt,
+				jobs.ProgressStageQueued,
+				jobs.ProgressStatusQueued,
+				progressRevisionQueued,
+				"lease_recovered",
+				"lease_expired",
+			)
+			if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+				return nil, err
+			}
+		}
 		recovered = append(recovered, job)
 
 		for workerID, worker := range s.workers {
-			if worker.CurrentJobID != id {
+			if worker.CurrentJobID != job.ID {
 				continue
 			}
 			worker.CurrentJobID = ""
@@ -722,7 +873,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) []jobs.Experi
 			s.workers[workerID] = worker
 		}
 	}
-	return recovered
+	return recovered, nil
 }
 
 func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error) {
@@ -737,17 +888,55 @@ func (s *MemoryStore) ReportMetric(jobID string, epoch int, values map[string]fl
 		return jobs.EpochMetric{}, ErrNotFound
 	}
 
-	if job.Status == jobs.StatusAssigned {
+	becameRunning := job.Status == jobs.StatusAssigned
+	if becameRunning {
 		job.Status = jobs.StatusRunning
 	}
 	now := time.Now().UTC()
-	if job.WorkerID != "" {
+	if job.WorkerID != "" && (job.Status == jobs.StatusAssigned || job.Status == jobs.StatusRunning) {
 		leaseExpiresAt := now.Add(defaultJobLeaseDuration)
 		job.LeaseOwnerWorkerID = job.WorkerID
 		job.LeaseLastHeartbeatAt = &now
 		job.LeaseExpiresAt = &leaseExpiresAt
 	}
-	s.jobs[jobID] = job
+	if becameRunning {
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobRunning,
+			activeJobProgressAttempt(job),
+			jobs.ProgressStageTraining,
+			jobs.ProgressStatusRunning,
+			progressRevisionForEpoch(epoch),
+			"first_metric",
+			"first_metric",
+		)
+		current := int64(epoch)
+		progress.Current = &current
+		progress.Unit = "epoch"
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return jobs.EpochMetric{}, err
+		}
+	} else {
+		s.jobs[jobID] = job
+		if job.Status == jobs.StatusRunning {
+			_, progress := newJobLifecycleTransition(
+				job,
+				execution.TransitionJobRunning,
+				activeJobProgressAttempt(job),
+				jobs.ProgressStageTraining,
+				jobs.ProgressStatusRunning,
+				progressRevisionForEpoch(epoch),
+				"metric_reported",
+				"metric_reported",
+			)
+			current := int64(epoch)
+			progress.Current = &current
+			progress.Unit = "epoch"
+			if _, err := s.upsertJobProgressLocked(job, progress, now); err != nil {
+				return jobs.EpochMetric{}, err
+			}
+		}
+	}
 
 	metric := jobs.EpochMetric{
 		JobID:     jobID,
@@ -873,6 +1062,10 @@ func (s *MemoryStore) UpsertTrainingRunEvaluation(jobID string, update runs.Trai
 	evaluation.ModelProfile = emptyMapIfNil(update.ModelProfile)
 	evaluation.HolisticScores = emptyMapIfNil(update.HolisticScores)
 	evaluation.RecommendationSummary = update.RecommendationSummary
+	if update.ExecutionReferences != nil {
+		references := *update.ExecutionReferences
+		evaluation.ExecutionReferences = &references
+	}
 	evaluation.UpdatedAt = now
 	s.evaluations[jobID] = evaluation
 	return evaluation, nil
@@ -1189,9 +1382,16 @@ func (s *MemoryStore) ListProjectChampionFeedback(projectID string) ([]runs.Cham
 }
 
 func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
+	return s.CreateAgentDecisionWithPolicy(projectID, planID, decisionType, rationale, payload, policies.PersistenceReference{})
+}
+
+func (s *MemoryStore) CreateAgentDecisionWithPolicy(projectID string, planID string, decisionType string, rationale string, payload map[string]any, policy policies.PersistenceReference) (decisions.AgentDecision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload, policy)
+}
 
+func (s *MemoryStore) createAgentDecisionLocked(projectID string, planID string, decisionType string, rationale string, payload map[string]any, policy policies.PersistenceReference) (decisions.AgentDecision, error) {
 	if _, ok := s.projects[projectID]; !ok {
 		return decisions.AgentDecision{}, ErrNotFound
 	}
@@ -1200,17 +1400,294 @@ func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decis
 	}
 
 	decision := decisions.AgentDecision{
-		ID:           s.newID("decision"),
-		ProjectID:    projectID,
-		PlanID:       planID,
-		DecisionType: decisionType,
-		Rationale:    rationale,
-		Payload:      payload,
-		CreatedAt:    time.Now().UTC(),
+		ID:                         s.newID("decision"),
+		ProjectID:                  projectID,
+		PlanID:                     planID,
+		DecisionType:               decisionType,
+		Rationale:                  rationale,
+		Payload:                    payload,
+		ProposalPolicyEvaluationID: policy.EvaluationID,
+		EffectivePolicyHash:        policy.EffectivePolicyHash,
+		CreatedAt:                  time.Now().UTC(),
 	}
 
+	create, err := agentDecisionRecordedEvent(decision)
+	if err != nil {
+		return decisions.AgentDecision{}, invalidAgentTransitionError("create agent decision transition", err)
+	}
+	if _, _, err := s.appendExecutionTransitionLocked(create, decision.CreatedAt); err != nil {
+		return decisions.AgentDecision{}, err
+	}
 	s.decisions[decision.ID] = decision
 	return decision, nil
+}
+
+func (s *MemoryStore) CreateAgentDecisionWithCandidateProvenance(
+	projectID string,
+	planID string,
+	decisionType string,
+	rationale string,
+	payload map[string]any,
+	candidates []calibration.CandidateProvenanceCreate,
+) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
+	return s.CreateAgentDecisionWithCandidateProvenanceAndPolicy(projectID, planID, decisionType, rationale, payload, candidates, policies.PersistenceReference{})
+}
+
+func (s *MemoryStore) CreateAgentDecisionWithCandidateProvenanceAndPolicy(
+	projectID string,
+	planID string,
+	decisionType string,
+	rationale string,
+	payload map[string]any,
+	candidates []calibration.CandidateProvenanceCreate,
+	policy policies.PersistenceReference,
+) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.ToUpper(strings.TrimSpace(decisionType)) != decisions.TypeAddExperiments {
+		return decisions.AgentDecision{}, nil, fmt.Errorf("%w: candidate provenance is only valid for ADD_EXPERIMENTS decisions", ErrInvalidRequest)
+	}
+	if len(candidates) == 0 {
+		return decisions.AgentDecision{}, nil, fmt.Errorf("%w: accepted planner decision requires candidate provenance", ErrInvalidRequest)
+	}
+	if err := s.validateCandidateProvenanceCreatesLocked(projectID, candidates); err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	decision, err := s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload, policy)
+	if err != nil {
+		return decisions.AgentDecision{}, nil, err
+	}
+	rows, err := s.ensureCandidateProvenanceLocked(decision, candidates)
+	if err != nil {
+		delete(s.decisions, decision.ID)
+		return decisions.AgentDecision{}, nil, err
+	}
+	return decision, rows, nil
+}
+
+func (s *MemoryStore) EnsureCandidateProvenance(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok := s.decisions[decision.ID]
+	if !ok || stored.ProjectID != decision.ProjectID {
+		return nil, ErrNotFound
+	}
+	if strings.ToUpper(strings.TrimSpace(stored.DecisionType)) != decisions.TypeAddExperiments {
+		return nil, fmt.Errorf("%w: candidate provenance is only valid for ADD_EXPERIMENTS decisions", ErrInvalidRequest)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("%w: accepted planner decision requires candidate provenance", ErrInvalidRequest)
+	}
+	if err := s.validateCandidateProvenanceCreatesLocked(decision.ProjectID, candidates); err != nil {
+		return nil, err
+	}
+	return s.ensureCandidateProvenanceLocked(stored, candidates)
+}
+
+func (s *MemoryStore) FinalizeCandidateOutcomes(decisionID string, updates []calibration.CandidateOutcomeUpdate) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.decisions[decisionID]; !ok {
+		return nil, ErrNotFound
+	}
+	seen := map[int]bool{}
+	rowsByIndex := map[int]calibration.CandidateProvenance{}
+	rowIDsByIndex := map[int]string{}
+	for id, row := range s.candidateProvenance {
+		if row.DecisionID == decisionID {
+			rowsByIndex[row.CandidateIndex] = row
+			rowIDsByIndex[row.CandidateIndex] = id
+		}
+	}
+	now := time.Now().UTC()
+	merged := map[int]calibration.CandidateProvenance{}
+	for _, update := range updates {
+		if seen[update.CandidateIndex] {
+			return nil, fmt.Errorf("%w: duplicate candidate outcome index %d", ErrInvalidRequest, update.CandidateIndex)
+		}
+		seen[update.CandidateIndex] = true
+		row, ok := rowsByIndex[update.CandidateIndex]
+		if !ok {
+			return nil, fmt.Errorf("%w: candidate outcome index %d does not exist", ErrInvalidRequest, update.CandidateIndex)
+		}
+		next, err := calibration.ApplyCandidateOutcomeUpdate(row, update, now)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		merged[update.CandidateIndex] = next
+	}
+	for index, row := range merged {
+		s.candidateProvenance[rowIDsByIndex[index]] = row
+		rowsByIndex[index] = row
+	}
+	rows := make([]calibration.CandidateProvenance, 0, len(rowsByIndex))
+	for _, row := range rowsByIndex {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CandidateIndex < rows[j].CandidateIndex })
+	return rows, nil
+}
+
+func (s *MemoryStore) validateCandidateProvenanceCreatesLocked(projectID string, candidates []calibration.CandidateProvenanceCreate) error {
+	seen := map[int]bool{}
+	for _, candidate := range candidates {
+		if err := calibration.ValidateCandidateProvenanceCreate(candidate); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if seen[candidate.CandidateIndex] {
+			return fmt.Errorf("%w: duplicate candidate_index %d", ErrInvalidRequest, candidate.CandidateIndex)
+		}
+		seen[candidate.CandidateIndex] = true
+		invocation, ok := s.agentInvocations[candidate.InvocationID]
+		if !ok || invocation.ProjectID != projectID || invocation.PlannerVariantID != candidate.PlannerVariantID ||
+			invocation.RolloutCohortID != candidate.RolloutCohortID || invocation.RolloutPolicyID != candidate.RolloutPolicyID {
+			return fmt.Errorf("%w: candidate invocation or planner variant does not match project", ErrInvalidRequest)
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) ensureCandidateProvenanceLocked(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error) {
+	existingByIndex := map[int]calibration.CandidateProvenance{}
+	for _, row := range s.candidateProvenance {
+		if row.DecisionID == decision.ID {
+			existingByIndex[row.CandidateIndex] = row
+		}
+	}
+	now := time.Now().UTC()
+	for _, candidate := range candidates {
+		if existing, ok := existingByIndex[candidate.CandidateIndex]; ok {
+			if !calibration.CandidateProvenanceMatchesCreate(existing, candidate) {
+				return nil, fmt.Errorf("%w: candidate provenance at index %d conflicts with the immutable decision-time record", ErrInvalidRequest, candidate.CandidateIndex)
+			}
+			continue
+		}
+		candidate = cloneCandidateProvenanceCreate(candidate)
+		row := calibration.CandidateProvenance{
+			ID:                        s.newID("candidate_provenance"),
+			ProjectID:                 decision.ProjectID,
+			DecisionID:                decision.ID,
+			CandidateProvenanceCreate: candidate,
+			CreatedAt:                 now,
+		}
+		s.candidateProvenance[row.ID] = row
+		existingByIndex[row.CandidateIndex] = row
+	}
+	rows := make([]calibration.CandidateProvenance, 0, len(existingByIndex))
+	for _, row := range existingByIndex {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CandidateIndex < rows[j].CandidateIndex })
+	return rows, nil
+}
+
+func (s *MemoryStore) ListDecisionCandidateProvenance(decisionID string) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.decisions[decisionID]; !ok {
+		return nil, ErrNotFound
+	}
+	rows := []calibration.CandidateProvenance{}
+	for _, row := range s.candidateProvenance {
+		if row.DecisionID == decisionID {
+			rows = append(rows, row)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CandidateIndex < rows[j].CandidateIndex })
+	return rows, nil
+}
+
+func (s *MemoryStore) ListProjectCandidateProvenance(projectID string) ([]calibration.CandidateProvenance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	rows := []calibration.CandidateProvenance{}
+	for _, row := range s.candidateProvenance {
+		if row.ProjectID == projectID {
+			rows = append(rows, row)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+			if rows[i].DecisionID == rows[j].DecisionID {
+				return rows[i].CandidateIndex < rows[j].CandidateIndex
+			}
+			return rows[i].DecisionID > rows[j].DecisionID
+		}
+		return rows[i].CreatedAt.After(rows[j].CreatedAt)
+	})
+	return rows, nil
+}
+
+func (s *MemoryStore) ReadCalibrationObservations(projectID string, window calibration.TimeWindow, limit int) (calibration.ObservationSet, error) {
+	if err := validateCalibrationRead(projectID, window, limit); err != nil {
+		return calibration.ObservationSet{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.projects[projectID]; !ok {
+		return calibration.ObservationSet{}, ErrNotFound
+	}
+
+	candidates := []calibration.CandidateObservation{}
+	for _, row := range s.candidateProvenance {
+		if row.ProjectID != projectID || row.CreatedAt.Before(window.Start) || !row.CreatedAt.Before(window.End) {
+			continue
+		}
+		family, evidenceCount := "unknown", 0
+		if decision, ok := s.decisions[row.DecisionID]; ok {
+			family, evidenceCount = calibration.CandidateDecisionMetadata(decision.Payload, row.CandidateIndex)
+		}
+		candidates = append(candidates, calibration.CandidateObservation{
+			CandidateProvenance: row, ModelFamily: family, EvidenceCount: evidenceCount,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].CreatedAt.Equal(candidates[j].CreatedAt) {
+			if candidates[i].DecisionID == candidates[j].DecisionID {
+				return candidates[i].CandidateIndex < candidates[j].CandidateIndex
+			}
+			return candidates[i].DecisionID < candidates[j].DecisionID
+		}
+		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
+	})
+	candidatesTruncated := len(candidates) > limit
+	if candidatesTruncated {
+		candidates = candidates[:limit]
+	}
+
+	invocations := []calibration.InvocationObservation{}
+	for _, invocation := range s.agentInvocations {
+		if invocation.ProjectID != projectID || invocation.AgentName != "experiment_planner" || invocation.CreatedAt.Before(window.Start) || !invocation.CreatedAt.Before(window.End) {
+			continue
+		}
+		invocations = append(invocations, calibrationInvocationObservation(invocation))
+	}
+	sort.Slice(invocations, func(i, j int) bool {
+		if invocations[i].CreatedAt.Equal(invocations[j].CreatedAt) {
+			return invocations[i].ID < invocations[j].ID
+		}
+		return invocations[i].CreatedAt.Before(invocations[j].CreatedAt)
+	})
+	invocationsTruncated := len(invocations) > limit
+	if invocationsTruncated {
+		invocations = invocations[:limit]
+	}
+	return calibration.ObservationSet{
+		Candidates: candidates, Invocations: invocations,
+		CandidatesTruncated: candidatesTruncated, InvocationsTruncated: invocationsTruncated,
+	}, nil
+}
+
+func cloneCandidateProvenanceCreate(candidate calibration.CandidateProvenanceCreate) calibration.CandidateProvenanceCreate {
+	candidate.Reasons = append([]string(nil), candidate.Reasons...)
+	if candidate.SelectedExperimentIndex != nil {
+		index := *candidate.SelectedExperimentIndex
+		candidate.SelectedExperimentIndex = &index
+	}
+	return candidate
 }
 
 func (s *MemoryStore) ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error) {
@@ -1230,7 +1707,32 @@ func (s *MemoryStore) ListProjectAgentDecisions(projectID string) ([]decisions.A
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
+	return out, nil
+}
 
+func (s *MemoryStore) ListProjectAgentDecisionActivity(projectID string, limit int) ([]decisions.AgentDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	limit = boundedActivityReadLimit(limit)
+	out := []decisions.AgentDecision{}
+	for _, decision := range s.decisions {
+		if decision.ProjectID == projectID {
+			out = append(out, decision)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 
@@ -1374,6 +1876,9 @@ func (s *MemoryStore) CreateExecutionEvent(projectID string, planID string, even
 		Payload:   payload,
 		CreatedAt: time.Now().UTC(),
 	}
+	s.nextExecutionEventSequence++
+	event.Sequence = s.nextExecutionEventSequence
+	event.IdempotencyKey = "event:" + event.ID
 	s.executionEvents[event.ID] = event
 	return event, nil
 }
@@ -1402,6 +1907,155 @@ func (s *MemoryStore) ListProjectExecutionEvents(projectID string, limit int) ([
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) ListProjectExecutionEventActivity(projectID string, limit int) ([]execution.ExecutionEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	out := []execution.ExecutionEvent{}
+	for _, event := range s.executionEvents {
+		if event.ProjectID == projectID && executionEventIncludedInV1Activity(event) {
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) ListProjectExecutionEventsAfter(ctx context.Context, projectID string, cursor int64, limit int) ([]execution.ExecutionEvent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	if cursor < 0 {
+		return nil, fmt.Errorf("%w: execution event cursor must be nonnegative", ErrInvalidRequest)
+	}
+	limit = boundedExecutionEventPageLimit(limit)
+	out := []execution.ExecutionEvent{}
+	for _, event := range s.executionEvents {
+		if event.ProjectID == projectID && event.Sequence > cursor {
+			event.Message = boundedExecutionEventProjectionText(event.Message, 512)
+			event.Payload = executionEventStreamPayloadProjection(event.Payload)
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Sequence < out[j].Sequence
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func executionEventStreamPayloadProjection(payload map[string]any) map[string]any {
+	allowed := map[string]bool{}
+	for _, key := range execution.SafeExecutionEventMetadataKeys() {
+		allowed[key] = true
+	}
+	out := map[string]any{}
+	for key, value := range payload {
+		if !allowed[key] {
+			continue
+		}
+		if projected, ok := executionEventStreamMetadataValue(value); ok {
+			out[key] = projected
+		}
+	}
+	return out
+}
+
+func executionEventStreamMetadataValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		return boundedExecutionEventProjectionText(typed, 512), true
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return typed, true
+	case []string:
+		out := make([]string, 0, min(8, len(typed)))
+		for _, item := range typed {
+			if len(out) >= 8 {
+				break
+			}
+			out = append(out, boundedExecutionEventProjectionText(item, 80))
+		}
+		return out, true
+	case []any:
+		out := make([]any, 0, min(8, len(typed)))
+		for _, item := range typed {
+			if len(out) >= 8 {
+				break
+			}
+			if projected, ok := executionEventStreamArrayValue(item); ok {
+				out = append(out, projected)
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func executionEventStreamArrayValue(value any) (any, bool) {
+	if text, ok := value.(string); ok {
+		return boundedExecutionEventProjectionText(text, 80), true
+	}
+	switch value.(type) {
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return value, true
+	default:
+		return nil, false
+	}
+}
+
+func boundedExecutionEventProjectionText(value string, maxRunes int) string {
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes])
+}
+
+func (s *MemoryStore) GetExecutionEventCursorState(ctx context.Context) (execution.ExecutionEventCursorState, error) {
+	if err := ctx.Err(); err != nil {
+		return execution.ExecutionEventCursorState{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return execution.ExecutionEventCursorState{}, err
+	}
+	return execution.ExecutionEventCursorState{LastSequence: s.nextExecutionEventSequence}, nil
+}
+
+func boundedExecutionEventPageLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
 }
 
 func (s *MemoryStore) CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error) {
@@ -1456,6 +2110,11 @@ func (s *MemoryStore) CreateAgentInvocation(invocation memory.AgentInvocation) (
 	if _, ok := s.projects[invocation.ProjectID]; !ok {
 		return memory.AgentInvocation{}, ErrNotFound
 	}
+	var err error
+	invocation, err = memory.NormalizeAgentInvocationRuntime(invocation)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("normalize agent invocation runtime: %w", err)
+	}
 	if invocation.InputMessages == nil {
 		invocation.InputMessages = []map[string]string{}
 	}
@@ -1473,6 +2132,15 @@ func (s *MemoryStore) CreateAgentInvocation(invocation memory.AgentInvocation) (
 	}
 	invocation.ID = s.newID("agent_invocation")
 	invocation.CreatedAt = time.Now().UTC()
+	create, emit, err := agentInvocationValidationEvent(invocation)
+	if err != nil {
+		return memory.AgentInvocation{}, invalidAgentTransitionError("create agent validation transition", err)
+	}
+	if emit {
+		if _, _, err := s.appendExecutionTransitionLocked(create, invocation.CreatedAt); err != nil {
+			return memory.AgentInvocation{}, err
+		}
+	}
 	s.agentInvocations[invocation.ID] = invocation
 	return invocation, nil
 }
@@ -1499,7 +2167,30 @@ func (s *MemoryStore) UpdateAgentInvocationDownstreamOutcome(invocationID string
 	if outcome == nil {
 		outcome = map[string]any{}
 	}
+	create, emit, err := agentInvocationValidationRetryEvent(invocation, outcome)
+	if err != nil {
+		return memory.AgentInvocation{}, invalidAgentTransitionError("create agent validation retry transition", err)
+	}
+	if emit {
+		if _, _, err := s.appendExecutionTransitionLocked(create, time.Now().UTC()); err != nil {
+			return memory.AgentInvocation{}, err
+		}
+	}
 	invocation.DownstreamOutcome = outcome
+	s.agentInvocations[invocationID] = invocation
+	return invocation, nil
+}
+
+func (s *MemoryStore) UpdateAgentInvocationValidation(invocationID string, verdict plannervalidation.Verdict, outcome plannervalidation.Outcome) (memory.AgentInvocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	invocation, ok := s.agentInvocations[invocationID]
+	if !ok {
+		return memory.AgentInvocation{}, ErrNotFound
+	}
+	invocation.StrictValidationVerdict = &verdict
+	invocation.ValidationOutcome = &outcome
 	s.agentInvocations[invocationID] = invocation
 	return invocation, nil
 }
@@ -1528,6 +2219,96 @@ func (s *MemoryStore) ListProjectAgentInvocations(projectID string, filter memor
 		out = out[:filter.Limit]
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) ListProjectAgentInvocationActivity(projectID string, limit int) ([]memory.AgentInvocationActivity, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
+	}
+	limit = boundedActivityReadLimit(limit)
+
+	out := make([]memory.AgentInvocationActivity, 0, min(limit, len(s.agentInvocations)))
+	for _, invocation := range s.agentInvocations {
+		if invocation.ProjectID == projectID {
+			out = append(out, agentInvocationActivityProjection(invocation))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func boundedActivityReadLimit(limit int) int {
+	if limit <= 0 {
+		return 25
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+func agentInvocationActivityProjection(invocation memory.AgentInvocation) memory.AgentInvocationActivity {
+	outcome := map[string]any{}
+	for _, key := range []string{
+		"backend_validation_status",
+		"backend_validation_error",
+		"will_retry",
+		"retry_attempt",
+		"completion_state",
+	} {
+		if value, ok := agentInvocationActivityScalar(key, invocation.DownstreamOutcome[key]); ok {
+			outcome[key] = value
+		}
+	}
+	return memory.AgentInvocationActivity{
+		ID:                invocation.ID,
+		ProjectID:         invocation.ProjectID,
+		PlanID:            invocation.PlanID,
+		JobID:             invocation.JobID,
+		AgentName:         boundedExecutionEventProjectionText(invocation.AgentName, 128),
+		ValidationStatus:  boundedExecutionEventProjectionText(invocation.ValidationStatus, 64),
+		ValidationError:   boundedExecutionEventProjectionText(invocation.ValidationError, 512),
+		DownstreamOutcome: outcome,
+		CreatedAt:         invocation.CreatedAt,
+	}
+}
+
+func agentInvocationActivityScalar(key string, value any) (any, bool) {
+	switch key {
+	case "backend_validation_status":
+		text, ok := value.(string)
+		return boundedExecutionEventProjectionText(text, 64), ok
+	case "backend_validation_error":
+		text, ok := value.(string)
+		return boundedExecutionEventProjectionText(text, 512), ok
+	case "completion_state":
+		text, ok := value.(string)
+		return boundedExecutionEventProjectionText(text, 128), ok
+	case "will_retry":
+		switch typed := value.(type) {
+		case bool:
+			return value, true
+		case string:
+			return boundedExecutionEventProjectionText(typed, 16), true
+		}
+	case "retry_attempt":
+		switch value.(type) {
+		case int, int64, float64:
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func (s *MemoryStore) UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord) (memory.MemoryEmbeddingRecord, error) {
@@ -1949,6 +2730,13 @@ func (s *MemoryStore) UpdateStrategyScorecardOutcomeByFollowUpPlan(followUpPlanI
 		scorecard.Outcome = update.Outcome
 		scorecard.Lesson = update.Lesson
 		scorecard.Tags = append([]string(nil), update.Tags...)
+		scorecard.FidelityVerdicts = append([]string(nil), update.FidelityVerdicts...)
+		scorecard.EvidenceEligible = update.EvidenceEligible
+		scorecard.RequestedMechanism = update.RequestedMechanism
+		scorecard.RealizedMechanismIdentity = update.RealizedMechanismIdentity
+		scorecard.AcceptedSpecHash = update.AcceptedSpecHash
+		scorecard.RealizedEffectiveHash = update.RealizedEffectiveHash
+		scorecard.AdjustmentReasonCodes = append([]string(nil), update.AdjustmentReasonCodes...)
 		s.strategyScorecards[id] = scorecard
 		return scorecard, nil
 	}
@@ -2175,6 +2963,10 @@ func (s *MemoryStore) ListStudyOptimizerTrials(studyID string) ([]automl.Optimiz
 }
 
 func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
+	return s.CreateExperimentPlanWithPolicy(projectID, datasetID, targetMetric, recommendedWorkers, estimatedMinutes, experiments, warnings, sourceDecisionID, policies.PersistenceReference{})
+}
+
+func (s *MemoryStore) CreateExperimentPlanWithPolicy(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string, policy policies.PersistenceReference) (plans.ExperimentPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2201,17 +2993,22 @@ func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, t
 	}
 
 	plan := plans.ExperimentPlan{
-		ID:                 s.newID("plan"),
-		ProjectID:          projectID,
-		DatasetID:          datasetID,
-		Status:             plans.StatusProposed,
-		SourceDecisionID:   sourceDecisionID,
-		TargetMetric:       targetMetric,
-		RecommendedWorkers: recommendedWorkers,
-		EstimatedMinutes:   estimatedMinutes,
-		Experiments:        append([]plans.PlannedExperiment(nil), experiments...),
-		Warnings:           append([]string(nil), warnings...),
-		CreatedAt:          time.Now().UTC(),
+		ID:                         s.newID("plan"),
+		ProjectID:                  projectID,
+		DatasetID:                  datasetID,
+		Status:                     plans.StatusProposed,
+		ExecutionSpecStatus:        execution.ExecutionSpecStatusVersioned,
+		CapabilityVersion:          execution.CapabilitiesV1().CapabilityVersion,
+		SourceDecisionID:           sourceDecisionID,
+		ProposalPolicyEvaluationID: policy.EvaluationID,
+		EffectivePolicyHash:        policy.EffectivePolicyHash,
+		PolicyStatus:               policy.Status,
+		TargetMetric:               targetMetric,
+		RecommendedWorkers:         recommendedWorkers,
+		EstimatedMinutes:           estimatedMinutes,
+		Experiments:                append([]plans.PlannedExperiment(nil), experiments...),
+		Warnings:                   append([]string(nil), warnings...),
+		CreatedAt:                  time.Now().UTC(),
 	}
 
 	s.plans[plan.ID] = plan
@@ -2227,7 +3024,7 @@ func (s *MemoryStore) GetExperimentPlan(id string) (plans.ExperimentPlan, error)
 		return plans.ExperimentPlan{}, ErrNotFound
 	}
 
-	return plan, nil
+	return planWithExecutionSpecStatus(plan), nil
 }
 
 func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error) {
@@ -2241,7 +3038,7 @@ func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.Expe
 	out := []plans.ExperimentPlan{}
 	for _, plan := range s.plans {
 		if plan.ProjectID == projectID {
-			out = append(out, plan)
+			out = append(out, planWithExecutionSpecStatus(plan))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -2249,6 +3046,13 @@ func (s *MemoryStore) ListProjectExperimentPlans(projectID string) ([]plans.Expe
 	})
 
 	return out, nil
+}
+
+func planWithExecutionSpecStatus(plan plans.ExperimentPlan) plans.ExperimentPlan {
+	if plan.ExecutionSpecStatus == "" {
+		plan.ExecutionSpecStatus = execution.ExecutionSpecStatusLegacyUnversioned
+	}
+	return plan
 }
 
 func (s *MemoryStore) CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error) {
@@ -2273,10 +3077,18 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 
 	now := time.Now().UTC()
 	requeued := job.Attempt < job.MaxAttempts && !options.ForceFail
+	terminalAttempt := activeJobProgressAttempt(job)
 	previousConfig := copyAnyMap(job.Config)
+	_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 	nextConfig := copyAnyMap(job.Config)
 	if options.Config != nil {
 		nextConfig = copyAnyMap(options.Config)
+	}
+	nextConfig = jobConfigWithImmutableExecutionSpec(job.Config, nextConfig)
+	if options.PolicyReference.EvaluationID != "" {
+		job.SchedulePolicyEvaluationID = options.PolicyReference.EvaluationID
+		job.EffectivePolicyHash = options.PolicyReference.EffectivePolicyHash
+		job.PolicyEligibilityStatus = options.PolicyReference.Status
 	}
 	if requeued {
 		job.Status = jobs.StatusQueued
@@ -2290,7 +3102,7 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 		job.Status = jobs.StatusFailed
 		job.Error = message
 		job.CompletedAt = &now
-		job.Config = jobConfigWithTerminalAttempt(nextConfig, job.ID, job.Attempt)
+		job.Config = jobConfigWithTerminalAttempt(nextConfig, job.ID, terminalAttempt)
 	}
 	if requeued {
 		s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, runs.RemoteTrainingSessionStatusExpired, now)
@@ -2300,7 +3112,37 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
 	job.LeaseLastHeartbeatAt = nil
-	s.jobs[jobID] = job
+	job = jobs.WithExecutionSpecStatus(job)
+	if requeued {
+		attempt := jobConfigPositiveInt(job.Config, "active_attempt_number")
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobRetryQueued,
+			attempt,
+			jobs.ProgressStageQueued,
+			jobs.ProgressStatusQueued,
+			progressRevisionQueued,
+			"retry_queued",
+			"retryable_failure",
+		)
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return jobs.ExperimentJob{}, false, err
+		}
+	} else {
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobFailed,
+			terminalAttempt,
+			jobs.ProgressStageFailed,
+			jobs.ProgressStatusFailed,
+			progressRevisionTerminal,
+			"attempts_exhausted",
+			"attempts_exhausted",
+		)
+		if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transition, now); err != nil {
+			return jobs.ExperimentJob{}, false, err
+		}
+	}
 
 	for workerID, worker := range s.workers {
 		if worker.CurrentJobID != jobID {
@@ -2321,7 +3163,19 @@ func (s *MemoryStore) FailJob(jobID string, message string) (jobs.ExperimentJob,
 	return s.finishJob(jobID, jobs.StatusFailed, "", message)
 }
 
+func (s *MemoryStore) CancelJob(jobID string, message string, configPatch map[string]any) (jobs.ExperimentJob, error) {
+	return s.finishJobWithTransition(jobID, jobs.StatusFailed, "", message, execution.TransitionJobCancelled, configPatch)
+}
+
 func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string, message string) (jobs.ExperimentJob, error) {
+	transition := execution.TransitionJobFailed
+	if status == jobs.StatusSucceeded {
+		transition = execution.TransitionJobCompleted
+	}
+	return s.finishJobWithTransition(jobID, status, mlflowRunID, message, transition, nil)
+}
+
+func (s *MemoryStore) finishJobWithTransition(jobID string, status string, mlflowRunID string, message string, transition execution.ExecutionTransition, configPatch map[string]any) (jobs.ExperimentJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2335,17 +3189,54 @@ func (s *MemoryStore) finishJob(jobID string, status string, mlflowRunID string,
 	}
 
 	now := time.Now().UTC()
+	terminalAttempt := activeJobProgressAttempt(job)
 	previousConfig := copyAnyMap(job.Config)
+	_, _ = s.markAttemptNotRealizedLocked(job.ID, jobAttemptID(job.ID, job.Attempt))
 	job.Status = status
 	job.MLflowRunID = mlflowRunID
 	job.Error = message
 	job.CompletedAt = &now
-	job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
+	if len(configPatch) > 0 {
+		nextConfig := copyAnyMap(job.Config)
+		for key, value := range configPatch {
+			nextConfig[key] = value
+		}
+		job.Config = nextConfig
+	}
+	job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, terminalAttempt)
+	job = jobs.WithExecutionSpecStatus(job)
 	s.closeRemoteTrainingSessionForJobConfigLocked(previousConfig, status, now)
 	job.LeaseOwnerWorkerID = ""
 	job.LeaseExpiresAt = nil
 	job.LeaseLastHeartbeatAt = nil
-	s.jobs[jobID] = job
+	stage := jobs.ProgressStageFailed
+	progressStatus := jobs.ProgressStatusFailed
+	detailCode := "backend_failure"
+	reasonCode := "backend_failure"
+	if transition == execution.TransitionJobCompleted {
+		stage = jobs.ProgressStageCompleted
+		progressStatus = jobs.ProgressStatusCompleted
+		detailCode = "backend_completion"
+		reasonCode = "backend_completion"
+	} else if transition == execution.TransitionJobCancelled {
+		stage = jobs.ProgressStageCancelled
+		progressStatus = jobs.ProgressStatusCancelled
+		detailCode = "user_cancelled"
+		reasonCode = "user_cancelled"
+	}
+	transitionInput, progress := newJobLifecycleTransition(
+		job,
+		transition,
+		terminalAttempt,
+		stage,
+		progressStatus,
+		progressRevisionTerminal,
+		detailCode,
+		reasonCode,
+	)
+	if _, _, _, err := s.commitJobLifecycleLocked(job, progress, transitionInput, now); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
 
 	if job.WorkerID != "" {
 		if worker, ok := s.workers[job.WorkerID]; ok {
@@ -2441,6 +3332,21 @@ func jobConfigWithTerminalAttempt(config map[string]any, jobID string, attempt i
 	next["active_attempt_id"] = fmt.Sprintf("%s:terminal-after-attempt-%d", jobID, attempt)
 	next["active_attempt_number"] = attempt
 	return next
+}
+
+func jobConfigWithImmutableExecutionSpec(current, next map[string]any) map[string]any {
+	out := copyAnyMap(next)
+	if out == nil {
+		out = map[string]any{}
+	}
+	if accepted, ok := current[execution.ExecutionSpecConfigKey]; ok {
+		if payload, isMap := accepted.(map[string]any); isMap {
+			out[execution.ExecutionSpecConfigKey] = cloneJSONMap(payload)
+		} else {
+			out[execution.ExecutionSpecConfigKey] = accepted
+		}
+	}
+	return out
 }
 
 func jobAttemptID(jobID string, attempt int) string {
@@ -2661,6 +3567,10 @@ func applyTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, update runs
 	if update.StageTelemetry != nil {
 		summary.StageTelemetry = copyAnyMap(update.StageTelemetry)
 	}
+	if update.ExecutionReferences != nil {
+		references := *update.ExecutionReferences
+		summary.ExecutionReferences = &references
+	}
 
 	summary.UpdatedAt = now
 }
@@ -2778,6 +3688,9 @@ func agentInvocationMatchesFilter(invocation memory.AgentInvocation, filter memo
 		return false
 	}
 	if filter.AgentName != "" && invocation.AgentName != filter.AgentName {
+		return false
+	}
+	if filter.PlannerVariantID != "" && invocation.PlannerVariantID != filter.PlannerVariantID {
 		return false
 	}
 	return true

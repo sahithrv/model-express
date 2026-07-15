@@ -47,10 +47,11 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 			modal_input_id,
 			dataset_materialization,
 			stage_telemetry,
+			execution_references,
 			created_at,
 			updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		ON CONFLICT (job_id) DO UPDATE SET
 			project_id = EXCLUDED.project_id,
 			plan_id = EXCLUDED.plan_id,
@@ -70,8 +71,9 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 			modal_input_id = EXCLUDED.modal_input_id,
 			dataset_materialization = EXCLUDED.dataset_materialization,
 			stage_telemetry = EXCLUDED.stage_telemetry,
+			execution_references = EXCLUDED.execution_references,
 			updated_at = EXCLUDED.updated_at
-		RETURNING job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
+		RETURNING job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, execution_references, created_at, updated_at
 	`
 	datasetMaterializationJSON, err := json.Marshal(emptyMapIfNil(summary.DatasetMaterialization))
 	if err != nil {
@@ -80,6 +82,13 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 	stageTelemetryJSON, err := json.Marshal(emptyMapIfNil(summary.StageTelemetry))
 	if err != nil {
 		return runs.TrainingRunSummary{}, fmt.Errorf("marshal stage telemetry: %w", err)
+	}
+	executionReferencesJSON := []byte("{}")
+	if summary.ExecutionReferences != nil {
+		executionReferencesJSON, err = json.Marshal(summary.ExecutionReferences)
+		if err != nil {
+			return runs.TrainingRunSummary{}, fmt.Errorf("marshal execution references: %w", err)
+		}
 	}
 
 	return scanTrainingRunSummary(s.db.QueryRowContext(
@@ -104,6 +113,7 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 		summary.ModalInputID,
 		datasetMaterializationJSON,
 		stageTelemetryJSON,
+		executionReferencesJSON,
 		summary.CreatedAt,
 		summary.UpdatedAt,
 	))
@@ -111,7 +121,7 @@ func (s *PostgresStore) UpsertTrainingRunSummary(jobID string, update runs.Train
 
 func (s *PostgresStore) GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error) {
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, execution_references, created_at, updated_at
 		FROM training_run_summaries
 		WHERE job_id = $1
 	`
@@ -125,7 +135,7 @@ func (s *PostgresStore) ListProjectTrainingRunSummaries(projectID string) ([]run
 	}
 
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, execution_references, created_at, updated_at
 		FROM training_run_summaries
 		WHERE project_id = $1
 		ORDER BY updated_at DESC
@@ -155,7 +165,7 @@ func (s *PostgresStore) ListProjectTrainingRunSummariesPage(projectID string, op
 	}
 	limit, offset := postgresPageLimitOffset(options)
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, model, provider, gpu_type, status, runtime_seconds, estimated_cost_usd, best_macro_f1, best_accuracy, final_train_loss, final_val_loss, epochs_completed, modal_function_call_id, modal_input_id, dataset_materialization, stage_telemetry, execution_references, created_at, updated_at
 		FROM training_run_summaries
 		WHERE project_id = $1
 		ORDER BY updated_at DESC
@@ -203,12 +213,19 @@ func (s *PostgresStore) UpsertTrainingRunEvaluation(jobID string, update runs.Tr
 	if err != nil {
 		return runs.TrainingRunEvaluation{}, fmt.Errorf("marshal holistic scores: %w", err)
 	}
+	executionReferencesJSON := []byte("{}")
+	if update.ExecutionReferences != nil {
+		executionReferencesJSON, err = json.Marshal(update.ExecutionReferences)
+		if err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("marshal execution references: %w", err)
+		}
+	}
 
 	const query = `
 		INSERT INTO training_run_evaluations (
-			job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary
+			job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, execution_references
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (job_id) DO UPDATE SET
 			objective_profile = EXCLUDED.objective_profile,
 			per_class_metrics = EXCLUDED.per_class_metrics,
@@ -216,8 +233,9 @@ func (s *PostgresStore) UpsertTrainingRunEvaluation(jobID string, update runs.Tr
 			model_profile = EXCLUDED.model_profile,
 			holistic_scores = EXCLUDED.holistic_scores,
 			recommendation_summary = EXCLUDED.recommendation_summary,
+			execution_references = CASE WHEN EXCLUDED.execution_references = '{}'::jsonb THEN training_run_evaluations.execution_references ELSE EXCLUDED.execution_references END,
 			updated_at = now()
-		RETURNING job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+		RETURNING job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, execution_references, created_at, updated_at
 	`
 	return scanTrainingRunEvaluation(s.db.QueryRowContext(
 		context.Background(),
@@ -232,12 +250,13 @@ func (s *PostgresStore) UpsertTrainingRunEvaluation(jobID string, update runs.Tr
 		modelProfileJSON,
 		holisticScoresJSON,
 		update.RecommendationSummary,
+		executionReferencesJSON,
 	))
 }
 
 func (s *PostgresStore) GetTrainingRunEvaluation(jobID string) (runs.TrainingRunEvaluation, error) {
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, execution_references, created_at, updated_at
 		FROM training_run_evaluations
 		WHERE job_id = $1
 	`
@@ -249,7 +268,7 @@ func (s *PostgresStore) ListProjectTrainingRunEvaluations(projectID string) ([]r
 		return nil, err
 	}
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, execution_references, created_at, updated_at
 		FROM training_run_evaluations
 		WHERE project_id = $1
 		ORDER BY updated_at DESC
@@ -277,7 +296,7 @@ func (s *PostgresStore) ListProjectTrainingRunEvaluationsPage(projectID string, 
 	}
 	limit, offset := postgresPageLimitOffset(options)
 	const query = `
-		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, created_at, updated_at
+		SELECT job_id, project_id, plan_id, dataset_id, objective_profile, per_class_metrics, confusion_matrix, model_profile, holistic_scores, recommendation_summary, execution_references, created_at, updated_at
 		FROM training_run_evaluations
 		WHERE project_id = $1
 		ORDER BY updated_at DESC

@@ -17,6 +17,7 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/decisions"
+	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
@@ -27,6 +28,9 @@ const (
 	activityDefaultLimit      = 12
 	activityMaxLimit          = 50
 	activityDefaultIntervalMS = 5000
+	executionEventV2PageLimit = 50
+	executionEventV2MaxPages  = 8
+	executionEventV2Keepalive = 15 * time.Second
 )
 
 type agentActivityEvent struct {
@@ -54,74 +58,321 @@ func (s *Server) listProjectExecutionEvents(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"events": events})
 }
 
-func (s *Server) streamProjectExecutionEvents(c *gin.Context) {
-	projectID := c.Param("id")
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	if limit < 1 || limit > 200 {
-		limit = 50
-	}
-	interval, _ := strconv.Atoi(c.DefaultQuery("interval_ms", "2000"))
-	if interval < 500 {
-		interval = 500
-	}
-	if interval > 10000 {
-		interval = 10000
+type executionEventV2Envelope struct {
+	SchemaVersion  string         `json:"schema_version"`
+	Sequence       int64          `json:"sequence"`
+	EventID        string         `json:"event_id"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty"`
+	ProjectID      string         `json:"project_id"`
+	PlanID         string         `json:"plan_id,omitempty"`
+	EventType      string         `json:"event_type"`
+	Message        string         `json:"message"`
+	CreatedAt      time.Time      `json:"created_at"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+}
+
+func activityStreamV2Enabled() bool {
+	return envFlag("MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED", true)
+}
+
+func (s *Server) streamProjectExecutionEventsV2(c *gin.Context) {
+	projectID, cursor, ok := s.validateProjectExecutionEventV2Cursor(c)
+	if !ok {
+		return
 	}
 
+	pageLimit := queryInt(c, "limit", executionEventV2PageLimit, 1, 200)
+	intervalMS := queryInt(c, "interval_ms", 2000, 500, 10000)
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
+	c.Writer.WriteString("retry: 2000\n\n")
+	c.Writer.Flush()
+	connectionReason := executionEventV2ConnectionReason(c)
+	diagnostics.Event("info", "execution_event_stream_v2_connection", map[string]any{
+		"reconnect_count":  map[bool]int{true: 1, false: 0}[connectionReason == "reconnect"],
+		"store_call_count": 2,
+		"query_count":      2,
+		"reason_code":      connectionReason,
+	})
 
-	lastID := c.GetHeader("Last-Event-ID")
-	delivered := map[string]bool{}
-	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
-	defer ticker.Stop()
+	pollTicker := time.NewTicker(time.Duration(intervalMS) * time.Millisecond)
+	keepaliveTicker := time.NewTicker(executionEventV2Keepalive)
+	defer pollTicker.Stop()
+	defer keepaliveTicker.Stop()
 
-	send := func() bool {
-		events, err := s.store.ListProjectExecutionEvents(projectID, limit)
-		if err != nil {
-			c.SSEvent("error", gin.H{"error": err.Error()})
-			c.Writer.Flush()
-			return false
-		}
-		sort.Slice(events, func(i, j int) bool {
-			return events[i].CreatedAt.Before(events[j].CreatedAt)
-		})
-		seenLastID := lastID == ""
-		for _, event := range events {
-			if delivered[event.ID] {
-				continue
-			}
-			if !seenLastID {
-				if event.ID == lastID {
-					seenLastID = true
-				}
-				continue
-			}
-			c.Writer.WriteString("id: " + event.ID + "\n")
-			c.SSEvent("execution_event", event)
-			delivered[event.ID] = true
-			lastID = event.ID
-		}
-		if !seenLastID {
-			lastID = ""
-		}
-		c.Writer.Flush()
-		return true
-	}
-
-	send()
+	catchUp := make(chan string, 1)
+	catchUp <- "initial"
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			return
-		case <-ticker.C:
-			if !send() {
+		case reasonCode := <-catchUp:
+			startedAt := time.Now()
+			bytesBefore := c.Writer.Size()
+			nextCursor, hasMore, stats, err := s.writeProjectExecutionEventV2PagesWithStats(
+				c,
+				projectID,
+				cursor,
+				pageLimit,
+				executionEventV2MaxPages,
+			)
+			cursor = nextCursor
+			if err != nil {
+				if c.Request.Context().Err() != nil {
+					return
+				}
+				c.SSEvent("stream_error", gin.H{"reason_code": "execution_events_read_failed"})
+				c.Writer.Flush()
+				diagnostics.Event("warn", "execution_event_stream_v2_batch", executionEventV2BatchDiagnostic(
+					stats,
+					time.Since(startedAt),
+					activityResponseByteDelta(bytesBefore, c.Writer.Size()),
+					reasonCode,
+					1,
+				))
 				return
 			}
+			diagnostics.Event("info", "execution_event_stream_v2_batch", executionEventV2BatchDiagnostic(
+				stats,
+				time.Since(startedAt),
+				activityResponseByteDelta(bytesBefore, c.Writer.Size()),
+				reasonCode,
+				0,
+			))
+			if hasMore {
+				select {
+				case catchUp <- "catch_up":
+				default:
+				}
+			}
+		case <-pollTicker.C:
+			select {
+			case catchUp <- "poll":
+			default:
+			}
+		case <-keepaliveTicker.C:
+			writeExecutionEventV2Keepalive(c)
 		}
 	}
+}
+
+func executionEventV2ConnectionReason(c *gin.Context) string {
+	value := strings.ToLower(strings.TrimSpace(c.Query("reason")))
+	if value == "stream_reconnect" || strings.TrimSpace(c.GetHeader("Last-Event-ID")) != "" {
+		return "reconnect"
+	}
+	return "initial"
+}
+
+func (s *Server) probeProjectExecutionEventsV2(c *gin.Context) {
+	if _, _, ok := s.validateProjectExecutionEventV2Cursor(c); !ok {
+		return
+	}
+	c.Header("Cache-Control", "no-cache")
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) validateProjectExecutionEventV2Cursor(c *gin.Context) (string, int64, bool) {
+	projectID := c.Param("id")
+	cursor, err := executionEventCursorFromRequest(c)
+	if err != nil {
+		writeExecutionEventCursorError(c, http.StatusBadRequest, "invalid_cursor", 0, 0)
+		return "", 0, false
+	}
+	if _, err := s.store.GetProjectContext(c.Request.Context(), projectID); err != nil {
+		if c.Request.Context().Err() != nil {
+			return "", 0, false
+		}
+		writeStoreError(c, err)
+		return "", 0, false
+	}
+	state, err := s.store.GetExecutionEventCursorState(c.Request.Context())
+	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return "", 0, false
+		}
+		writeStoreError(c, err)
+		return "", 0, false
+	}
+	if cursor > state.LastSequence {
+		writeExecutionEventCursorError(c, http.StatusConflict, "cursor_ahead", state.RetainedSequenceFloor, state.LastSequence)
+		return "", 0, false
+	}
+	if cursor > 0 && cursor < state.RetainedSequenceFloor {
+		writeExecutionEventCursorError(c, http.StatusGone, "cursor_too_old", state.RetainedSequenceFloor, state.LastSequence)
+		return "", 0, false
+	}
+	return projectID, cursor, true
+}
+
+func writeExecutionEventV2Keepalive(c *gin.Context) {
+	c.Writer.WriteString(": keepalive\n\n")
+	c.Writer.Flush()
+}
+
+func executionEventCursorFromRequest(c *gin.Context) (int64, error) {
+	value := strings.TrimSpace(c.GetHeader("Last-Event-ID"))
+	if value == "" {
+		value = strings.TrimSpace(c.Query("cursor"))
+	}
+	if value == "" {
+		return 0, nil
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("invalid cursor")
+		}
+	}
+	cursor, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || cursor < 0 {
+		return 0, fmt.Errorf("invalid cursor")
+	}
+	return cursor, nil
+}
+
+func writeExecutionEventCursorError(c *gin.Context, status int, reasonCode string, floor int64, latest int64) {
+	c.JSON(status, gin.H{
+		"error":              reasonCode,
+		"reason_code":        reasonCode,
+		"recovery":           "resync",
+		"earliest_available": floor,
+		"latest_available":   latest,
+	})
+}
+
+func (s *Server) writeProjectExecutionEventV2Pages(
+	c *gin.Context,
+	projectID string,
+	cursor int64,
+	pageLimit int,
+	maxPages int,
+) (int64, bool, error) {
+	nextCursor, hasMore, _, err := s.writeProjectExecutionEventV2PagesWithStats(
+		c,
+		projectID,
+		cursor,
+		pageLimit,
+		maxPages,
+	)
+	return nextCursor, hasMore, err
+}
+
+type executionEventV2BatchStats struct {
+	StoreCallCount     int
+	PageCount          int
+	EventsReturned     int
+	EventsDelivered    int
+	LatencySampleCount int
+	LatencyTotalMS     int64
+	LatencyMaxMS       int64
+}
+
+func (s *Server) writeProjectExecutionEventV2PagesWithStats(
+	c *gin.Context,
+	projectID string,
+	cursor int64,
+	pageLimit int,
+	maxPages int,
+) (int64, bool, executionEventV2BatchStats, error) {
+	stats := executionEventV2BatchStats{}
+	if maxPages < 1 {
+		maxPages = 1
+	}
+	for page := 0; page < maxPages; page++ {
+		if err := c.Request.Context().Err(); err != nil {
+			return cursor, false, stats, err
+		}
+		stats.StoreCallCount++
+		events, err := s.store.ListProjectExecutionEventsAfter(c.Request.Context(), projectID, cursor, pageLimit)
+		if err != nil {
+			return cursor, false, stats, err
+		}
+		stats.PageCount++
+		stats.EventsReturned += len(events)
+		for _, event := range events {
+			if err := c.Request.Context().Err(); err != nil {
+				return cursor, false, stats, err
+			}
+			if event.Sequence <= cursor {
+				continue
+			}
+			c.Writer.WriteString("id: " + strconv.FormatInt(event.Sequence, 10) + "\n")
+			c.SSEvent("execution_event_v2", executionEventV2Projection(event))
+			cursor = event.Sequence
+			stats.EventsDelivered++
+			latencyMS := time.Since(event.CreatedAt).Milliseconds()
+			if latencyMS < 0 {
+				latencyMS = 0
+			}
+			stats.LatencySampleCount++
+			stats.LatencyTotalMS += latencyMS
+			if latencyMS > stats.LatencyMaxMS {
+				stats.LatencyMaxMS = latencyMS
+			}
+		}
+		c.Writer.Flush()
+		if len(events) < pageLimit {
+			return cursor, false, stats, nil
+		}
+	}
+	return cursor, true, stats, nil
+}
+
+func executionEventV2BatchDiagnostic(
+	stats executionEventV2BatchStats,
+	duration time.Duration,
+	responseBytes int,
+	reasonCode string,
+	errorCount int,
+) map[string]any {
+	latencyAverageMS := int64(0)
+	if stats.LatencySampleCount > 0 {
+		latencyAverageMS = stats.LatencyTotalMS / int64(stats.LatencySampleCount)
+	}
+	return map[string]any{
+		"duration_ms":              duration.Milliseconds(),
+		"events_returned":          stats.EventsReturned,
+		"events_delivered":         stats.EventsDelivered,
+		"response_bytes":           responseBytes,
+		"store_call_count":         stats.StoreCallCount,
+		"query_count":              stats.StoreCallCount,
+		"page_count":               stats.PageCount,
+		"event_latency_samples":    stats.LatencySampleCount,
+		"event_latency_total_ms":   stats.LatencyTotalMS,
+		"event_latency_max_ms":     stats.LatencyMaxMS,
+		"event_latency_average_ms": latencyAverageMS,
+		"cursor_advance_count":     stats.EventsDelivered,
+		"error_count":              errorCount,
+		"reason_code":              reasonCode,
+	}
+}
+
+func executionEventV2Projection(event execution.ExecutionEvent) executionEventV2Envelope {
+	return executionEventV2Envelope{
+		SchemaVersion:  "execution_event.v2",
+		Sequence:       event.Sequence,
+		EventID:        activitySafeIdentifier(event.ID),
+		IdempotencyKey: executionEventV2OpaqueIdempotencyKey(event.IdempotencyKey),
+		ProjectID:      activitySafeIdentifier(event.ProjectID),
+		PlanID:         activitySafeIdentifier(event.PlanID),
+		EventType:      activitySafeIdentifier(event.EventType),
+		Message:        activitySafeText(event.Message, 220),
+		CreatedAt:      event.CreatedAt,
+		Metadata:       activityMetadataFromPayload(event.Payload),
+	}
+}
+
+func executionEventV2OpaqueIdempotencyKey(value string) string {
+	if value == "" {
+		return ""
+	}
+	// The stored key is internal transition identity and can contain database
+	// identifiers. Expose only a fixed-width digest so clients can deduplicate
+	// reconnects without receiving the raw value.
+	digest := sha256.Sum256([]byte(value))
+	return "ik_" + hex.EncodeToString(digest[:])
 }
 
 var (
@@ -134,6 +385,8 @@ var (
 )
 
 func (s *Server) streamProjectActivityEvents(c *gin.Context) {
+	c.Header("Deprecation", "true")
+	c.Header("Warning", `299 model-express "Deprecated activity stream; migrate to live-state plus events/stream/v2"`)
 	projectID := c.Param("id")
 	limit := activityLimitFromQuery(c.DefaultQuery("limit", strconv.Itoa(activityDefaultLimit)))
 	interval, _ := strconv.Atoi(c.DefaultQuery("interval_ms", strconv.Itoa(activityDefaultIntervalMS)))
@@ -152,21 +405,45 @@ func (s *Server) streamProjectActivityEvents(c *gin.Context) {
 	c.Writer.Flush()
 
 	lastID := c.GetHeader("Last-Event-ID")
+	reconnectCount := 0
+	initialReason := "initial"
+	if lastID != "" {
+		reconnectCount = 1
+		initialReason = "reconnect"
+	}
+	diagnostics.Event("info", "activity_stream_connection", map[string]any{
+		"reconnect_count": reconnectCount,
+		"reason_code":     initialReason,
+	})
 	delivered := map[string]bool{}
 	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
 	defer ticker.Stop()
 
-	send := func() bool {
-		events, err := s.listProjectActivityEvents(projectID, limit)
+	send := func(reasonCode string) bool {
+		startedAt := time.Now()
+		bytesBefore := c.Writer.Size()
+		events, queryStats, err := s.listProjectActivityEventsWithStats(projectID, limit)
 		if err != nil {
 			c.SSEvent("stream_error", gin.H{"error": "activity stream unavailable"})
 			c.Writer.Flush()
+			diagnostics.Event("warn", "activity_stream_tick", map[string]any{
+				"duration_ms":         time.Since(startedAt).Milliseconds(),
+				"events_returned":     0,
+				"events_delivered":    0,
+				"response_bytes":      activityResponseByteDelta(bytesBefore, c.Writer.Size()),
+				"store_call_count":    queryStats.StoreCallCount,
+				"source_record_count": queryStats.SourceRecordCount,
+				"reconnect_count":     0,
+				"error_count":         1,
+				"reason_code":         queryStats.ErrorReason,
+			})
 			return false
 		}
 		sort.SliceStable(events, func(i, j int) bool {
 			return events[i].CreatedAt.Before(events[j].CreatedAt)
 		})
 		seenLastID := lastID == ""
+		deliveredCount := 0
 		for _, event := range events {
 			if delivered[event.ID] {
 				continue
@@ -181,65 +458,117 @@ func (s *Server) streamProjectActivityEvents(c *gin.Context) {
 			c.SSEvent("activity_event", event)
 			delivered[event.ID] = true
 			lastID = event.ID
+			deliveredCount++
 		}
 		if !seenLastID {
 			lastID = ""
 		}
 		c.Writer.Flush()
+		diagnostics.Event("info", "activity_stream_tick", map[string]any{
+			"duration_ms":         time.Since(startedAt).Milliseconds(),
+			"events_returned":     len(events),
+			"events_delivered":    deliveredCount,
+			"response_bytes":      activityResponseByteDelta(bytesBefore, c.Writer.Size()),
+			"store_call_count":    queryStats.StoreCallCount,
+			"source_record_count": queryStats.SourceRecordCount,
+			"reconnect_count":     map[bool]int{true: reconnectCount, false: 0}[reasonCode == initialReason],
+			"error_count":         0,
+			"scenario_code":       map[bool]string{true: "active", false: "idle"}[queryStats.ActiveWork],
+			"reason_code":         reasonCode,
+		})
 		return true
 	}
 
-	send()
+	send(initialReason)
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			return
 		case <-ticker.C:
-			if !send() {
+			if !send("poll") {
 				return
 			}
 		}
 	}
 }
 
+func activityResponseByteDelta(before int, after int) int {
+	if before < 0 {
+		before = 0
+	}
+	if after <= before {
+		return 0
+	}
+	return after - before
+}
+
+type activityQueryStats struct {
+	StoreCallCount    int
+	SourceRecordCount int
+	ActiveWork        bool
+	ErrorReason       string
+}
+
 func (s *Server) listProjectActivityEvents(projectID string, limit int) ([]agentActivityEvent, error) {
+	events, _, err := s.listProjectActivityEventsWithStats(projectID, limit)
+	return events, err
+}
+
+func (s *Server) listProjectActivityEventsWithStats(projectID string, limit int) ([]agentActivityEvent, activityQueryStats, error) {
 	limit = activityClampLimit(limit)
 	sourceLimit := limit * 4
 	if sourceLimit < 50 {
 		sourceLimit = 50
 	}
 
-	executionEvents, err := s.store.ListProjectExecutionEvents(projectID, sourceLimit)
+	stats := activityQueryStats{}
+	stats.StoreCallCount++
+	executionEvents, err := s.store.ListProjectExecutionEventActivity(projectID, sourceLimit)
 	if err != nil {
-		return nil, err
+		stats.ErrorReason = "execution_events_read_failed"
+		return nil, stats, err
 	}
+	stats.SourceRecordCount += len(executionEvents)
+	stats.StoreCallCount++
 	projectJobs, err := s.store.ListProjectJobsPage(projectID, store.PageOptions{Limit: sourceLimit, Offset: 0})
 	if err != nil {
-		return nil, err
+		stats.ErrorReason = "jobs_read_failed"
+		return nil, stats, err
 	}
-	agentInvocations, err := s.store.ListProjectAgentInvocations(projectID, memory.AgentInvocationFilter{Limit: sourceLimit})
+	stats.SourceRecordCount += len(projectJobs)
+	stats.StoreCallCount++
+	agentInvocations, err := s.store.ListProjectAgentInvocationActivity(projectID, sourceLimit)
 	if err != nil {
-		return nil, err
+		stats.ErrorReason = "agent_invocations_read_failed"
+		return nil, stats, err
 	}
-	agentDecisions, err := s.store.ListProjectAgentDecisions(projectID)
+	stats.SourceRecordCount += len(agentInvocations)
+	stats.StoreCallCount++
+	agentDecisions, err := s.store.ListProjectAgentDecisionActivity(projectID, sourceLimit)
 	if err != nil {
-		return nil, err
+		stats.ErrorReason = "agent_decisions_read_failed"
+		return nil, stats, err
 	}
+	stats.SourceRecordCount += len(agentDecisions)
 
 	out := []agentActivityEvent{}
 	for _, event := range executionEvents {
+		// The activity store query filters producer-only rows before applying its
+		// bound. Keep this defensive check so alternate Store implementations also
+		// preserve v1 synthesis without duplicate job/agent transitions.
+		if execution.IsDurableTransitionEventType(event.EventType) && !durableTransitionVisibleInV1Activity(event) {
+			continue
+		}
 		out = append(out, activityFromExecutionEvent(event))
 	}
 	activeWork := activityHasActiveWork(projectJobs, agentInvocations)
+	stats.ActiveWork = activeWork
 	for _, invocation := range agentInvocations {
 		if event, ok := activityFromAgentInvocation(invocation, activeWork); ok {
 			out = append(out, event)
 		}
 	}
-	for index, decision := range agentDecisions {
-		if index >= sourceLimit {
-			break
-		}
+	for _, decision := range agentDecisions {
 		out = append(out, activityFromAgentDecision(decision))
 	}
 	out = append(out, activityFromJobs(projectID, projectJobs)...)
@@ -254,7 +583,7 @@ func (s *Server) listProjectActivityEvents(projectID string, limit int) ([]agent
 	if len(out) > limit {
 		out = out[:limit]
 	}
-	return out, nil
+	return out, stats, nil
 }
 
 func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEvent {
@@ -358,8 +687,11 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 		activity.Severity = "success"
 		activity.Title = "Modal dispatcher idle"
 		activity.Status = "succeeded"
-	case execution.EventJobRetryQueued:
+	case execution.EventJobRetryQueued, execution.EventJobRetryQueuedTransition:
 		requeued := activityMetadataBool(event.Payload, "requeued")
+		if event.EventType == execution.EventJobRetryQueuedTransition {
+			requeued = true
+		}
 		activity.Type = "job.retrying"
 		activity.Severity = "warning"
 		activity.Title = "Retrying job"
@@ -370,7 +702,17 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 			activity.Title = "Job attempts exhausted"
 			activity.Status = "failed"
 		}
-	case execution.EventExecutionFailed:
+	case execution.EventJobPolicyBlocked:
+		activity.Type = "job.policy_blocked"
+		activity.Severity = "warning"
+		activity.Title = "Job blocked by policy"
+		activity.Status = "blocked"
+	case execution.EventJobPolicyReconciled:
+		activity.Type = "job.policy_reconciled"
+		activity.Severity = "info"
+		activity.Title = "Job policy revalidated"
+		activity.Status = "waiting"
+	case execution.EventExecutionFailed, execution.EventJobFailed:
 		activity.Type = "system.failed"
 		activity.Severity = "error"
 		activity.Title = "Execution failed"
@@ -412,7 +754,18 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 	return activity
 }
 
-func activityFromAgentInvocation(invocation memory.AgentInvocation, activeWork bool) (agentActivityEvent, bool) {
+func durableTransitionVisibleInV1Activity(event execution.ExecutionEvent) bool {
+	if event.EventType == execution.EventJobRetryQueuedTransition {
+		return true
+	}
+	if event.EventType != execution.EventJobFailed {
+		return false
+	}
+	reason := activityMetadataString(event.Payload, "reason_code")
+	return reason == "attempts_exhausted" || reason == "lease_attempts_exhausted"
+}
+
+func activityFromAgentInvocation(invocation memory.AgentInvocationActivity, activeWork bool) (agentActivityEvent, bool) {
 	validationStatus := strings.ToLower(strings.TrimSpace(invocation.ValidationStatus))
 	outcomeStatus := strings.ToLower(activityMetadataString(invocation.DownstreamOutcome, "backend_validation_status"))
 	if validationStatus != memory.InvocationValidationInvalid && validationStatus != memory.InvocationValidationFailed && outcomeStatus != "rejected" {
@@ -661,51 +1014,11 @@ func activityFromJob(projectID string, job jobs.ExperimentJob) agentActivityEven
 
 func activityMetadataFromPayload(payload map[string]any) map[string]any {
 	out := map[string]any{}
-	allowed := []string{
-		"agent_name",
-		"decision_id",
-		"source_decision_id",
-		"decision_type",
-		"job_id",
-		"job_ids",
-		"worker_requirement_id",
-		"open_job_count",
-		"active_worker_count",
-		"target_count",
-		"previous_slot_count",
-		"slot_count",
-		"desired_slot_count",
-		"registered_slot_count",
-		"active_slot_count",
-		"idle_seconds",
-		"idle_exit_seconds",
-		"dispatcher",
-		"provider",
-		"gpu_type",
-		"requirement_status",
-		"template",
-		"attempt",
-		"max_attempts",
-		"requeued",
-		"backend_validation_status",
-		"backend_stop_guard",
-		"reason",
-		"model",
-		"selection_source",
-		"materialization_status",
-		"max_concurrent_jobs",
-		"max_cold_dataset_materializations",
-		"retry_attempt",
-		"will_retry",
-		"completed_run_count",
-		"memory_count",
-		"evaluation_count",
-		"purpose",
-		"retrieved_count",
-		"log_only",
-		"cross_project_ok",
-	}
-	for _, key := range allowed {
+	for _, key := range execution.SafeExecutionEventMetadataKeys() {
+		switch key {
+		case "backend_validation_error", "error", "last_error":
+			continue
+		}
 		if value, ok := activityMetadataValue(payload[key]); ok {
 			out[key] = value
 		}
@@ -764,7 +1077,7 @@ func activityMetadataValue(value any) (any, bool) {
 	case []any:
 		values := []string{}
 		for _, item := range typed {
-			if text := activitySafeText(fmt.Sprint(item), 80); text != "" {
+			if text, ok := activityMetadataArrayScalar(item); ok {
 				values = append(values, text)
 			}
 			if len(values) >= 8 {
@@ -774,6 +1087,16 @@ func activityMetadataValue(value any) (any, bool) {
 		return values, len(values) > 0
 	default:
 		return nil, false
+	}
+}
+
+func activityMetadataArrayScalar(value any) (string, bool) {
+	switch value.(type) {
+	case string, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		text := activitySafeText(fmt.Sprint(value), 80)
+		return text, text != ""
+	default:
+		return "", false
 	}
 }
 
@@ -806,7 +1129,7 @@ func activityDecisionModels(payload map[string]any) []string {
 	return models
 }
 
-func activityHasActiveWork(projectJobs []jobs.ExperimentJob, invocations []memory.AgentInvocation) bool {
+func activityHasActiveWork(projectJobs []jobs.ExperimentJob, invocations []memory.AgentInvocationActivity) bool {
 	for _, job := range projectJobs {
 		switch strings.ToUpper(strings.TrimSpace(job.Status)) {
 		case jobs.StatusQueued, jobs.StatusAssigned, jobs.StatusRunning:

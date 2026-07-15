@@ -874,6 +874,7 @@ def _export_yolo_detector_bundle(
     training_config: dict,
     dataset: dict,
     job_id: str,
+    artifact_plan: dict | None = None,
 ) -> dict:
     if model_path is None or not model_path.exists():
         return _export_error("YOLO_CHECKPOINT_UNAVAILABLE", "Ultralytics did not produce best.pt or last.pt.")
@@ -887,16 +888,34 @@ def _export_yolo_detector_bundle(
     export_dir = Path(os.getenv("WORKER_CHAMPION_EXPORT_ROOT", ".cache/champion_exports")) / _safe_path_part(job_id) / "yolo"
     validation_errors: list[str] = []
     onnx_path: Path | None = None
-    try:
-        exported = YOLO(str(model_path)).export(format="onnx", imgsz=image_size, opset=12)
-        candidate = Path(str(exported))
-        if candidate.exists():
-            onnx_path = candidate
-    except Exception as exc:
-        validation_errors.append(f"YOLO_ONNX_EXPORT_FAILED: {exc}")
+    from worker.artifact_plan import artifact_fallback_allowed, artifact_format_allowed
 
-    source_path = onnx_path or model_path
-    artifact_format = "onnx" if onnx_path is not None else "pytorch"
+    if artifact_format_allowed(artifact_plan, "onnx"):
+        try:
+            exported = YOLO(str(model_path)).export(format="onnx", imgsz=image_size, opset=12)
+            candidate = Path(str(exported))
+            if candidate.exists():
+                onnx_path = candidate
+            else:
+                validation_errors.append("YOLO_ONNX_EXPORT_FAILED: exporter did not create an ONNX file")
+        except Exception as exc:
+            validation_errors.append(f"YOLO_ONNX_EXPORT_FAILED: {exc}")
+
+    if onnx_path is not None:
+        source_path = onnx_path
+        artifact_format = "onnx"
+    elif artifact_format_allowed(artifact_plan, "pytorch") and (
+        artifact_fallback_allowed(artifact_plan, "pytorch")
+        or not artifact_format_allowed(artifact_plan, "onnx")
+    ):
+        source_path = model_path
+        artifact_format = "pytorch"
+    else:
+        return _export_error(
+            "YOLO_ONNX_EXPORT_FAILED",
+            "; ".join(validation_errors)
+            or "ONNX export failed and the server artifact plan prohibits PyTorch fallback.",
+        )
     try:
         staged_source_path = _stage_yolo_export_source(source_path, export_dir, artifact_format=artifact_format)
         manifest = produce_existing_champion_export_manifest(

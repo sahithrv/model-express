@@ -10,6 +10,27 @@ from worker.exporting.metadata import (
 
 
 class ExportMetadataTests(unittest.TestCase):
+    def test_export_metadata_binds_realized_execution_contract(self) -> None:
+        execution_contract = {
+            "schema_version": "export_execution_contract_v1",
+            "execution_record_ref": "/jobs/train_1/execution-record",
+            "capability_version": "cap-v1",
+            "accepted_spec_hash": "accepted-hash",
+            "realized_effective_hash": "realized-hash",
+            "preprocessing_contract_hash": "preprocessing-hash",
+        }
+        metadata = build_champion_export_metadata(
+            model_name="mobilenet_v3_small",
+            class_names=["cat", "dog"],
+            image_size=256,
+            preprocessing={"resize_strategy": "preserve_aspect_pad", "normalization": "imagenet"},
+            execution_contract=execution_contract,
+        )
+
+        self.assertEqual(metadata["execution_contract"], execution_contract)
+        self.assertEqual(metadata["preprocessing_contract"]["config"]["resize_strategy"], "preserve_aspect_pad")
+        self.assertEqual(metadata["inference_contract"]["input"]["model_tensor_shape"], [1, 3, 256, 256])
+
     def test_champion_export_metadata_includes_demo_ready_shape(self) -> None:
         metadata = build_champion_export_metadata(
             model_name="mobilenet_v3_small",

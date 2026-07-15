@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -10,9 +11,11 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"model-express/services/orchestrator/internal/agents"
+	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/store"
 )
 
@@ -29,16 +32,18 @@ type createExperimentPlanRequest struct {
 }
 
 type executeExperimentPlanRequest struct {
-	Provider          string `json:"provider"`
-	GPUType           string `json:"gpu_type"`
-	MaxConcurrentJobs int    `json:"max_concurrent_jobs"`
+	Provider           string `json:"provider"`
+	GPUType            string `json:"gpu_type"`
+	MaxConcurrentJobs  int    `json:"max_concurrent_jobs"`
+	deferPlanAggregate bool
 }
 
 type executeExperimentPlanResponse struct {
-	Plan              plans.ExperimentPlan         `json:"plan"`
-	Jobs              []jobs.ExperimentJob         `json:"jobs"`
-	CostPolicy        map[string]any               `json:"cost_policy,omitempty"`
-	WorkerRequirement *execution.WorkerRequirement `json:"worker_requirement,omitempty"`
+	Plan              plans.ExperimentPlan                  `json:"plan"`
+	Jobs              []jobs.ExperimentJob                  `json:"jobs"`
+	ValidationReports []execution.ExecutionValidationReport `json:"execution_validation_reports,omitempty"`
+	CostPolicy        map[string]any                        `json:"cost_policy,omitempty"`
+	WorkerRequirement *execution.WorkerRequirement          `json:"worker_requirement,omitempty"`
 }
 
 type cancelExecutionRequest struct {
@@ -109,20 +114,33 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 	if len(metadataSummary) > 0 {
 		dataset.Profile = profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary)
 	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		return err
+	}
 	recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{
-		Priority: agents.PriorityBalanced,
+		Priority:        agents.PriorityBalanced,
+		EffectivePolicy: &effectivePolicy,
 	})
 	if err != nil {
+		var policyErr *policies.PolicyError
+		if errors.As(err, &policyErr) {
+			return err
+		}
 		return fmt.Errorf("%w: %s", store.ErrInvalidRequest, err.Error())
 	}
-	experiments, automlWarnings, err := s.prepareAutoMLExperimentsForProject(project.ID, recommendation.Experiments)
+	experiments, automlWarnings, err := s.prepareAutoMLExperimentsForProjectWithPolicy(project.ID, recommendation.Experiments, &effectivePolicy)
 	if err != nil {
 		return err
 	}
 	warnings := append([]string(nil), recommendation.Warnings...)
 	warnings = append(warnings, automlWarnings...)
 
-	plan, err := s.store.CreateExperimentPlan(
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistPlan, experiments, "")
+	if err != nil {
+		return err
+	}
+	plan, err := s.store.CreateExperimentPlanWithPolicy(
 		project.ID,
 		dataset.ID,
 		recommendation.TargetMetric,
@@ -131,6 +149,7 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 		experiments,
 		warnings,
 		"",
+		policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed},
 	)
 	if err != nil {
 		return err
@@ -177,6 +196,11 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	if err != nil {
 		return executeExperimentPlanResponse{}, err
 	}
+	schedulePolicyEvaluation, err := s.recordPlanSchedulePolicy(plan, dataset, provider)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+	schedulePolicyReference := policyReferenceForEvaluation(schedulePolicyEvaluation)
 	costPolicy, err := s.costPolicyForPlan(plan)
 	if err != nil {
 		return executeExperimentPlanResponse{}, err
@@ -217,8 +241,43 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 		}
 		jobsByExperiment[index] = job
 	}
+	if executionValidationMode() == execution.ValidationModeEnforce {
+		preflightCostPolicy := costPolicy
+		for index, experiment := range plan.Experiments {
+			if _, ok := jobsByExperiment[index]; ok || experimentExecutionTemplate(experiment) != jobs.TemplateTrainExperiment {
+				continue
+			}
+			if err := validateExperimentDatasetCompatibility(experiment, dataset, index); err != nil {
+				return executeExperimentPlanResponse{}, err
+			}
+			if preflightCostPolicy.Enabled {
+				allowed, _ := preflightCostPolicy.AllowTrainingJob(trainingTierForExperiment(experiment))
+				if !allowed {
+					continue
+				}
+			}
+			spec, err := buildExecutionSpecV1WithPolicy(experiment, provider, schedulePolicyEvaluation)
+			if err != nil {
+				return executeExperimentPlanResponse{}, err
+			}
+			modelSpec, _ := supportedModelSpecByName(experiment.Model)
+			report, err := execution.ValidateExecutionSpecV1(spec, modelSpec.Family, execution.ValidationModeEnforce)
+			if err != nil {
+				return executeExperimentPlanResponse{}, fmt.Errorf("validate execution spec: %w", err)
+			}
+			report.SetAcceptedDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs))
+			if report.WouldBlock {
+				s.recordExecutionValidationReport(plan, index, report)
+				return executeExperimentPlanResponse{}, fmt.Errorf(
+					"%w: experiment %d would be blocked by execution fidelity enforcement: %s",
+					store.ErrInvalidRequest, index, executionValidationSummary(report),
+				)
+			}
+		}
+	}
 
 	out := make([]jobs.ExperimentJob, 0, len(plan.Experiments))
+	validationReports := make([]execution.ExecutionValidationReport, 0, len(plan.Experiments))
 	for index, experiment := range plan.Experiments {
 		if err := validateExperimentDatasetCompatibility(experiment, dataset, index); err != nil {
 			return executeExperimentPlanResponse{}, err
@@ -281,6 +340,30 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			config["report_only"] = true
 		}
 		addOptionalExperimentConfig(config, experiment)
+		if jobTemplate == jobs.TemplateTrainExperiment {
+			spec, err := addExecutionSpecV1WithPolicy(config, experiment, provider, schedulePolicyEvaluation)
+			if err != nil {
+				return executeExperimentPlanResponse{}, err
+			}
+			modelSpec, _ := supportedModelSpecByName(experiment.Model)
+			report, err := execution.ValidateExecutionSpecV1(spec, modelSpec.Family, executionValidationMode())
+			if err != nil {
+				return executeExperimentPlanResponse{}, fmt.Errorf("validate execution spec: %w", err)
+			}
+			report.SetAcceptedDuplicate(matchingAcceptedSpecJobIDs(spec.AcceptedSpecHash, existingJobs, out))
+			config[execution.ExecutionValidationConfigKey] = report
+			validationReports = append(validationReports, report)
+			s.recordExecutionValidationReport(plan, index, report)
+			if report.Mode == execution.ValidationModeEnforce && report.WouldBlock {
+				return executeExperimentPlanResponse{}, fmt.Errorf(
+					"%w: experiment %d would be blocked by execution fidelity enforcement: %s",
+					store.ErrInvalidRequest, index, executionValidationSummary(report),
+				)
+			}
+			if report.AcceptedDuplicate.Skip {
+				continue
+			}
+		}
 		if metadataImport, err := s.store.GetActiveDatasetMetadataImport(plan.DatasetID); err == nil {
 			config["metadata_import_id"] = metadataImport.ID
 			config["metadata_summary"] = metadataImport.AgentSafeSummary
@@ -293,7 +376,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			config["automl_summary"] = automlJobSummary(experiment, suggestion)
 		}
 
-		job, err := s.store.CreateJob(plan.ProjectID, jobTemplate, config)
+		job, err := s.store.CreateJobWithOptions(plan.ProjectID, jobTemplate, config, store.CreateJobOptions{PolicyReference: schedulePolicyReference})
 		if err != nil {
 			return executeExperimentPlanResponse{}, err
 		}
@@ -313,10 +396,20 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	if err := s.recordCostPolicySkippedJobs(plan, costPolicy); err != nil {
 		return executeExperimentPlanResponse{}, err
 	}
+	complete, err := s.finalizeCandidateOutcomesForPlan(plan.ID)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+	if complete && !req.deferPlanAggregate {
+		if err := s.recordExperimentPlannerOutcomeForPlan(plan); err != nil {
+			return executeExperimentPlanResponse{}, err
+		}
+	}
 
 	return executeExperimentPlanResponse{
 		Plan:              plan,
 		Jobs:              out,
+		ValidationReports: validationReports,
 		CostPolicy:        costPolicy.Payload(),
 		WorkerRequirement: workerRequirement,
 	}, nil
@@ -348,87 +441,299 @@ func experimentExecutionTemplate(experiment plans.PlannedExperiment) string {
 }
 
 func addOptionalExperimentConfig(config map[string]any, experiment plans.PlannedExperiment) {
-	if experiment.Mechanism != "" {
+	if experiment.Mechanism != "" || experiment.IsFieldPresent("mechanism") {
 		config["mechanism"] = experiment.Mechanism
 	}
-	if experiment.Intervention != "" {
+	if experiment.Intervention != "" || experiment.IsFieldPresent("intervention") {
 		config["intervention"] = experiment.Intervention
 	}
-	if len(experiment.EvidenceUsed) > 0 {
+	if len(experiment.EvidenceUsed) > 0 || experiment.IsFieldPresent("evidence_used") {
 		config["evidence_used"] = experiment.EvidenceUsed
 	}
-	if experiment.ExpectedEffect != "" {
+	if experiment.ExpectedEffect != "" || experiment.IsFieldPresent("expected_effect") {
 		config["expected_effect"] = experiment.ExpectedEffect
 	}
 	if experiment.ImageSize > 0 {
 		config["image_size"] = experiment.ImageSize
 	}
-	if experiment.ResolutionStrategy != "" {
+	if experiment.ResolutionStrategy != "" || experiment.IsFieldPresent("resolution_strategy") {
 		config["resolution_strategy"] = experiment.ResolutionStrategy
 	}
 	if experiment.Preprocessing != nil {
 		config["preprocessing"] = experiment.Preprocessing
 	}
-	if experiment.Optimizer != "" {
+	if experiment.Optimizer != "" || experiment.IsFieldPresent("optimizer") {
 		config["optimizer"] = experiment.Optimizer
 	}
-	if experiment.Scheduler != "" {
+	if experiment.Scheduler != "" || experiment.IsFieldPresent("scheduler") {
 		config["scheduler"] = experiment.Scheduler
 	}
-	if experiment.WeightDecay > 0 {
+	if experiment.WeightDecay > 0 || experiment.IsFieldPresent("weight_decay") {
 		config["weight_decay"] = experiment.WeightDecay
 	}
-	if experiment.Dropout > 0 {
+	if experiment.Dropout > 0 || experiment.IsFieldPresent("dropout") {
 		config["dropout"] = experiment.Dropout
 	}
-	if experiment.OptimizerMomentum > 0 {
+	if experiment.OptimizerMomentum > 0 || experiment.IsFieldPresent("optimizer_momentum") {
 		config["optimizer_momentum"] = experiment.OptimizerMomentum
 	}
-	if experiment.SchedulerStepSize > 0 {
+	if experiment.SchedulerStepSize > 0 || experiment.IsFieldPresent("scheduler_step_size") {
 		config["scheduler_step_size"] = experiment.SchedulerStepSize
 	}
-	if experiment.SchedulerGamma > 0 {
+	if experiment.SchedulerGamma > 0 || experiment.IsFieldPresent("scheduler_gamma") {
 		config["scheduler_gamma"] = experiment.SchedulerGamma
 	}
-	if experiment.LabelSmoothing > 0 {
+	if experiment.LabelSmoothing > 0 || experiment.IsFieldPresent("label_smoothing") {
 		config["label_smoothing"] = experiment.LabelSmoothing
 	}
-	if experiment.GradientClipNorm > 0 {
+	if experiment.GradientClipNorm > 0 || experiment.IsFieldPresent("gradient_clip_norm") {
 		config["gradient_clip_norm"] = experiment.GradientClipNorm
 	}
-	if len(experiment.Augmentation) > 0 {
+	if len(experiment.Augmentation) > 0 || experiment.IsFieldPresent("augmentation") {
 		config["augmentation"] = experiment.Augmentation
 	}
-	if experiment.AugmentationPolicy != "" {
+	if experiment.AugmentationPolicy != "" || experiment.IsFieldPresent("augmentation_policy") {
 		config["augmentation_policy"] = experiment.AugmentationPolicy
 	}
 	if experiment.AugmentationPolicyConfig != nil {
 		config["augmentation_policy_config"] = experiment.AugmentationPolicyConfig
 	}
-	if experiment.ClassBalancing != "" {
+	if experiment.ClassBalancing != "" || experiment.IsFieldPresent("class_balancing") {
 		config["class_balancing"] = experiment.ClassBalancing
 	}
-	if len(experiment.ClassBalancingConfig) > 0 {
+	if len(experiment.ClassBalancingConfig) > 0 || experiment.IsFieldPresent("class_balancing_config") {
 		config["class_balancing_config"] = experiment.ClassBalancingConfig
 	}
-	if experiment.SamplingStrategy != "" {
+	if experiment.SamplingStrategy != "" || experiment.IsFieldPresent("sampling_strategy") {
 		config["sampling_strategy"] = experiment.SamplingStrategy
 	}
-	if experiment.EarlyStoppingPatience > 0 {
+	if experiment.EarlyStoppingPatience > 0 || experiment.IsFieldPresent("early_stopping_patience") {
 		config["early_stopping_patience"] = experiment.EarlyStoppingPatience
 	}
-	if experiment.Strategy != "" {
+	if experiment.Strategy != "" || experiment.IsFieldPresent("strategy") {
 		config["strategy"] = experiment.Strategy
 	}
-	if experiment.Pretrained {
+	if experiment.Pretrained || experiment.IsFieldPresent("pretrained") {
 		config["pretrained"] = experiment.Pretrained
 	}
-	if experiment.FreezeBackbone {
+	if experiment.FreezeBackbone || experiment.IsFieldPresent("freeze_backbone") {
 		config["freeze_backbone"] = experiment.FreezeBackbone
 	}
-	if experiment.FineTuneStrategy != "" {
+	if experiment.FineTuneStrategy != "" || experiment.IsFieldPresent("fine_tune_strategy") {
 		config["fine_tune_strategy"] = experiment.FineTuneStrategy
 	}
+}
+
+func addExecutionSpecV1(
+	config map[string]any,
+	experiment plans.PlannedExperiment,
+	provider string,
+) (execution.ExecutionSpecV1, error) {
+	spec, err := buildExecutionSpecV1(experiment, provider)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	payload, err := spec.Payload()
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	config[execution.ExecutionSpecConfigKey] = payload
+	return spec, nil
+}
+
+func addExecutionSpecV1WithPolicy(
+	config map[string]any,
+	experiment plans.PlannedExperiment,
+	provider string,
+	evaluation policies.Evaluation,
+) (execution.ExecutionSpecV1, error) {
+	spec, err := buildExecutionSpecV1WithPolicy(experiment, provider, evaluation)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	payload, err := spec.Payload()
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	config[execution.ExecutionSpecConfigKey] = payload
+	return spec, nil
+}
+
+func buildExecutionSpecV1(
+	experiment plans.PlannedExperiment,
+	provider string,
+) (execution.ExecutionSpecV1, error) {
+	modelSpec, ok := supportedModelSpecByName(experiment.Model)
+	if !ok {
+		return execution.ExecutionSpecV1{}, fmt.Errorf("%w: unsupported execution-spec model %q", store.ErrInvalidRequest, experiment.Model)
+	}
+	runner, err := executionRunnerFor(provider, modelSpec.TaskType)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	requestedConfig, err := experiment.RequestedConfig()
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	resolutionInput := make(map[string]any, len(requestedConfig)+1)
+	for key, value := range requestedConfig {
+		resolutionInput[key] = value
+	}
+	if imageSize, ok := resolutionInput["image_size"].(float64); !ok || imageSize <= 0 {
+		if modelSpec.DefaultImageSize > 0 {
+			resolutionInput["image_size"] = modelSpec.DefaultImageSize
+		}
+	}
+	spec, err := execution.BuildExecutionSpecV1(
+		modelSpec.TaskType,
+		runner,
+		requestedConfig,
+		resolutionInput,
+	)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, fmt.Errorf("resolve execution spec: %w", err)
+	}
+	return spec, nil
+}
+
+func buildExecutionSpecV1WithPolicy(
+	experiment plans.PlannedExperiment,
+	provider string,
+	evaluation policies.Evaluation,
+) (execution.ExecutionSpecV1, error) {
+	modelSpec, ok := supportedModelSpecByName(experiment.Model)
+	if !ok {
+		return execution.ExecutionSpecV1{}, fmt.Errorf("%w: unsupported execution-spec model %q", store.ErrInvalidRequest, experiment.Model)
+	}
+	runner, err := executionRunnerFor(provider, modelSpec.TaskType)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	requestedConfig, err := experiment.RequestedConfig()
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	resolutionInput := make(map[string]any, len(requestedConfig)+1)
+	for key, value := range requestedConfig {
+		resolutionInput[key] = value
+	}
+	if imageSize, ok := resolutionInput["image_size"].(float64); !ok || imageSize <= 0 {
+		if modelSpec.DefaultImageSize > 0 {
+			resolutionInput["image_size"] = modelSpec.DefaultImageSize
+		}
+	}
+	artifactPlan, err := automaticArtifactPlanFromEvaluation(modelSpec.TaskType, runner, evaluation)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, err
+	}
+	spec, err := execution.BuildExecutionSpecV1WithArtifactPlan(
+		modelSpec.TaskType, runner, requestedConfig, resolutionInput, artifactPlan,
+	)
+	if err != nil {
+		return execution.ExecutionSpecV1{}, fmt.Errorf("resolve execution spec: %w", err)
+	}
+	return spec, nil
+}
+
+func matchingAcceptedSpecJobIDs(hash string, groups ...[]jobs.ExperimentJob) []string {
+	if strings.TrimSpace(hash) == "" {
+		return nil
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, group := range groups {
+		for _, job := range group {
+			if job.ID == "" || seen[job.ID] || acceptedSpecHashFromJob(job) != hash {
+				continue
+			}
+			seen[job.ID] = true
+			out = append(out, job.ID)
+		}
+	}
+	return out
+}
+
+func acceptedSpecHashFromJob(job jobs.ExperimentJob) string {
+	value, ok := job.Config[execution.ExecutionSpecConfigKey]
+	if !ok || value == nil {
+		return ""
+	}
+	if payload, ok := value.(map[string]any); ok {
+		return configString(payload, "accepted_spec_hash")
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	var spec execution.ExecutionSpecV1
+	if err := json.Unmarshal(blob, &spec); err != nil {
+		return ""
+	}
+	return spec.AcceptedSpecHash
+}
+
+func executionValidationSummary(report execution.ExecutionValidationReport) string {
+	parts := []string{}
+	for _, finding := range report.Findings {
+		if !finding.WouldBlock {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s): %s", finding.Field, finding.ReasonCode, finding.SuggestedAlternative))
+	}
+	if len(parts) == 0 {
+		return "no blocking findings"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (s *Server) recordExecutionValidationReport(plan plans.ExperimentPlan, experimentIndex int, report execution.ExecutionValidationReport) {
+	for _, finding := range report.Findings {
+		diagnostics.Event("info", "execution_validation_finding", map[string]any{
+			"project_id": plan.ProjectID, "plan_id": plan.ID, "experiment_index": experimentIndex,
+			"mode": report.Mode, "task": report.Task, "runner": report.Runner, "model_family": report.ModelFamily,
+			"field": finding.Field, "classification": finding.Classification, "reason_code": finding.ReasonCode,
+			"would_block": finding.WouldBlock,
+		})
+	}
+	if len(report.Findings) == 0 && !report.AcceptedDuplicate.Skip {
+		return
+	}
+	message := fmt.Sprintf("Execution fidelity validation reported %d finding(s) for experiment %d.", len(report.Findings), experimentIndex)
+	if report.AcceptedDuplicate.Skip {
+		message = fmt.Sprintf(
+			"Experiment %d was skipped because its accepted execution semantics duplicate an existing job.",
+			experimentIndex,
+		)
+	}
+	if report.Mode == execution.ValidationModeEnforce && report.WouldBlock {
+		message = fmt.Sprintf("Execution fidelity enforcement would block experiment %d.", experimentIndex)
+	}
+	if _, err := s.store.CreateExecutionEvent(plan.ProjectID, plan.ID, execution.EventExecutionValidationReported, message, map[string]any{
+		"experiment_index": experimentIndex,
+		"report":           report,
+	}); err != nil {
+		log.Printf("record execution validation event failed for plan %s experiment %d: %v", plan.ID, experimentIndex, err)
+	}
+}
+
+func executionRunnerFor(provider, task string) (string, error) {
+	switch normalizeTrainingProvider(provider) {
+	case "local", "persistent_gpu", "persistent_disk":
+		return "local_simulator", nil
+	case "modal":
+		if task == "object_detection" {
+			return "modal_ultralytics", nil
+		}
+		if task == "image_classification" {
+			return "modal_torchvision", nil
+		}
+	}
+	return "", fmt.Errorf(
+		"%w: no execution capability runner for provider %q and task %q",
+		store.ErrInvalidRequest,
+		provider,
+		task,
+	)
 }
 
 func addDatasetMaterializationConfig(config map[string]any, policy execution.WorkerRequirementPolicy) {
@@ -491,28 +796,41 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 	estimatedMinutes := req.EstimatedMinutes
 	experiments := req.Experiments
 	warnings := req.Warnings
+	project, err := s.store.GetProject(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	dataset, err := s.store.GetDataset(req.DatasetID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if dataset.ProjectID != project.ID {
+		writeStoreError(c, fmt.Errorf("%w: dataset does not belong to project", store.ErrInvalidRequest))
+		return
+	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
 
 	if len(experiments) == 0 {
-		project, err := s.store.GetProject(c.Param("id"))
-		if err != nil {
-			writeStoreError(c, err)
-			return
-		}
-
-		dataset, err := s.store.GetDataset(req.DatasetID)
-		if err != nil {
-			writeStoreError(c, err)
-			return
-		}
-
 		recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{
 			Priority:          req.Priority,
 			MaxWorkers:        req.MaxWorkers,
 			TimeBudgetMinutes: req.TimeBudgetMinutes,
 			TargetMetric:      req.TargetMetric,
+			EffectivePolicy:   &effectivePolicy,
 		})
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			var policyErr *policies.PolicyError
+			if errors.As(err, &policyErr) {
+				writeStoreError(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
 			return
 		}
 
@@ -523,8 +841,7 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 		warnings = append(warnings, recommendation.Warnings...)
 	}
 	var automlWarnings []string
-	var err error
-	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProject(c.Param("id"), experiments)
+	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProjectWithPolicy(c.Param("id"), experiments, &effectivePolicy)
 	if err != nil {
 		writeStoreError(c, err)
 		return
@@ -537,7 +854,12 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 		}
 	}
 
-	plan, err := s.store.CreateExperimentPlan(
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistPlan, experiments, "")
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	plan, err := s.store.CreateExperimentPlanWithPolicy(
 		c.Param("id"),
 		req.DatasetID,
 		targetMetric,
@@ -546,6 +868,7 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 		experiments,
 		warnings,
 		"",
+		policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed},
 	)
 	if err != nil {
 		writeStoreError(c, err)

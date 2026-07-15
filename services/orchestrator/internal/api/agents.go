@@ -16,13 +16,19 @@ import (
 	"model-express/services/orchestrator/internal/embeddings"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 )
 
 func (s *Server) retrievePlannerMemory(ctx context.Context, input agents.ExperimentPlannerInput) []memory.MemoryRetrievalResult {
-	if !memoryRetrievalEnabled() {
+	retrievalVariant := input.RetrievalVariant
+	if retrievalVariant.MaxCards == 0 {
+		retrievalVariant = plannerRetrievalVariant()
+	}
+	if !retrievalVariant.Enabled {
 		return nil
 	}
 	query := memory.MemoryRetrievalQuery{
@@ -35,15 +41,35 @@ func (s *Server) retrievePlannerMemory(ctx context.Context, input agents.Experim
 		Mechanisms:     plannerMemoryRetrievalMechanisms(input),
 		DatasetTraits:  uniqueStrings(append(input.DatasetInsights.DatasetTraits, datasetProfileTraits(input.Dataset.Profile)...)),
 		Objective:      strings.Join([]string{input.ObjectiveContext.PrimaryObjective, input.ObjectiveContext.GoalText, input.SourcePlan.TargetMetric}, " "),
-		Limit:          memoryRetrievalMaxCards(),
-		CrossProjectOK: memoryRetrievalCrossProjectOK(),
+		Limit:          retrievalVariant.MaxCards,
+		CrossProjectOK: retrievalVariant.CrossProject,
 	}
-	results, usage := s.searchRetrievedMemory(ctx, query, input.SourcePlan.ID, "")
+	results, usage := s.searchRetrievedMemory(ctx, query, input.SourcePlan.ID, "", retrievalVariant)
 	s.logMemoryRetrieval("planner", input.Project.ID, input.Dataset.ID, input.SourcePlan.ID, "", results, usage)
 	if usage.LogOnly {
 		return nil
 	}
 	return results
+}
+
+func plannerRetrievalVariant() memory.PlannerRetrievalVariant {
+	embeddingConfig := embeddings.ConfigFromEnv()
+	return memory.PlannerRetrievalVariant{
+		Enabled:                      memoryRetrievalEnabled(),
+		LogOnly:                      memoryRetrievalLogOnly(),
+		CrossProject:                 memoryRetrievalCrossProjectOK(),
+		MaxCards:                     memoryRetrievalMaxCards(),
+		MinScore:                     memoryRetrievalMinScore(),
+		MinIndexedCards:              memoryRetrievalMinIndexedCards(),
+		QueryCacheTTLSeconds:         int64(memoryRetrievalQueryCacheTTL() / time.Second),
+		LogOnlyEmbeddings:            memoryRetrievalLogOnlyEmbeddings(),
+		EmbeddingsEnabled:            embeddingConfig.EmbeddingsEnabled,
+		EmbeddingProvider:            embeddingConfig.Provider,
+		EmbeddingEndpointFingerprint: llm.EndpointFingerprint(embeddingConfig.BaseURL),
+		EmbeddingModel:               embeddingConfig.Model,
+		EmbeddingDimensions:          embeddingConfig.Dimensions,
+		EmbeddingMaxCallsPerDay:      embeddingConfig.MaxCallsPerDay,
+	}
 }
 
 func (s *Server) retrieveTrainingMonitorMemory(ctx context.Context, plan plans.ExperimentPlan, job jobs.ExperimentJob, summary runs.TrainingRunSummary, objective agents.ProjectObjectiveContext) []memory.MemoryRetrievalResult {
@@ -74,7 +100,11 @@ func (s *Server) retrieveTrainingMonitorMemory(ctx context.Context, plan plans.E
 	return results
 }
 
-func (s *Server) searchRetrievedMemory(ctx context.Context, query memory.MemoryRetrievalQuery, planID string, jobID string) ([]memory.MemoryRetrievalResult, memory.MemoryEmbeddingUsageEvent) {
+func (s *Server) searchRetrievedMemory(ctx context.Context, query memory.MemoryRetrievalQuery, planID string, jobID string, retrievalVariants ...memory.PlannerRetrievalVariant) ([]memory.MemoryRetrievalResult, memory.MemoryEmbeddingUsageEvent) {
+	retrievalVariant := plannerRetrievalVariant()
+	if len(retrievalVariants) > 0 {
+		retrievalVariant = retrievalVariants[0]
+	}
 	query.Text = strings.TrimSpace(query.Text)
 	usage := memory.MemoryEmbeddingUsageEvent{
 		ProjectID:           strings.TrimSpace(query.ProjectID),
@@ -99,24 +129,24 @@ func (s *Server) searchRetrievedMemory(ctx context.Context, query memory.MemoryR
 		return nil, usage
 	}
 	if query.Limit <= 0 {
-		query.Limit = memoryRetrievalMaxCards()
+		query.Limit = retrievalVariant.MaxCards
 	}
 	usage.Metadata["limit"] = query.Limit
-	query, usage = s.withMemoryQueryEmbedding(ctx, query, usage)
+	query, usage = s.withMemoryQueryEmbedding(ctx, query, usage, retrievalVariant)
 	results, err := s.store.SearchMemoryEmbeddings(query)
 	if err != nil {
 		log.Printf("memory retrieval failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, err)
 		usage.Skipped = true
 		usage.SkipReason = err.Error()
-		usage.LogOnly = memoryRetrievalLogOnly()
+		usage.LogOnly = retrievalVariant.LogOnly
 		usage.RetrievedCount = 0
 		if _, recordErr := s.store.CreateMemoryEmbeddingUsageEvent(usage); recordErr != nil {
 			log.Printf("memory retrieval usage event failed for project %s purpose %s: %v", query.ProjectID, query.Purpose, recordErr)
 		}
 		return nil, usage
 	}
-	results = filterMemoryRetrievalResults(results, memoryRetrievalMinScore(), query.Limit)
-	usage.LogOnly = memoryRetrievalLogOnly()
+	results = filterMemoryRetrievalResults(results, retrievalVariant.MinScore, query.Limit)
+	usage.LogOnly = retrievalVariant.LogOnly
 	usage.RetrievedCount = len(results)
 	usage.Injected = !usage.LogOnly && len(results) > 0
 	if _, recordErr := s.store.CreateMemoryEmbeddingUsageEvent(usage); recordErr != nil {
@@ -125,11 +155,17 @@ func (s *Server) searchRetrievedMemory(ctx context.Context, query memory.MemoryR
 	return results, usage
 }
 
-func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.MemoryRetrievalQuery, usage memory.MemoryEmbeddingUsageEvent) (memory.MemoryRetrievalQuery, memory.MemoryEmbeddingUsageEvent) {
+func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.MemoryRetrievalQuery, usage memory.MemoryEmbeddingUsageEvent, retrievalVariant memory.PlannerRetrievalVariant) (memory.MemoryRetrievalQuery, memory.MemoryEmbeddingUsageEvent) {
 	config := embeddings.ConfigFromEnv()
+	config.EmbeddingsEnabled = retrievalVariant.EmbeddingsEnabled
+	config.Provider = retrievalVariant.EmbeddingProvider
+	config.Model = retrievalVariant.EmbeddingModel
+	config.Dimensions = retrievalVariant.EmbeddingDimensions
+	config.MaxCallsPerDay = retrievalVariant.EmbeddingMaxCallsPerDay
+	config = config.Normalized()
 	usage.EmbeddingModel = strings.TrimSpace(config.Model)
 	usage.EmbeddingDimensions = config.Dimensions
-	usage.LogOnly = memoryRetrievalLogOnly()
+	usage.LogOnly = retrievalVariant.LogOnly
 	usage.InputBytes = len([]byte(query.Text))
 	usage.QueryHash = memory.HashRetrievalQueryText(query.Text)
 
@@ -142,19 +178,19 @@ func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.Memo
 		usage.Skipped = true
 		usage.SkipReason = readyErr.Error()
 	}
-	if usage.LogOnly && !memoryRetrievalLogOnlyEmbeddings() {
+	if usage.LogOnly && !retrievalVariant.LogOnlyEmbeddings {
 		shouldEmbed = false
 		usage.Skipped = true
 		usage.SkipReason = "log-only retrieval uses lexical fallback"
 	}
 	if shouldEmbed {
-		if count, err := s.store.CountMemoryEmbeddings(query.ProjectID, query.DatasetID, config.Model); err == nil && count < memoryRetrievalMinIndexedCards() {
+		if count, err := s.store.CountMemoryEmbeddings(query.ProjectID, query.DatasetID, config.Model); err == nil && count < retrievalVariant.MinIndexedCards {
 			shouldEmbed = false
 			usage.Skipped = true
 			usage.SkipReason = "too few indexed cards for semantic retrieval"
 		}
 	}
-	if shouldEmbed && memoryRetrievalCapReached(s.store, query.ProjectID) {
+	if shouldEmbed && memoryRetrievalCapReached(s.store, query.ProjectID, retrievalVariant.EmbeddingMaxCallsPerDay) {
 		shouldEmbed = false
 		usage.Skipped = true
 		usage.SkipReason = "retrieval embedding call cap reached for today"
@@ -165,10 +201,11 @@ func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.Memo
 
 	normalizedQuery := memory.NormalizeRetrievalQueryText(query.Text)
 	queryHash := memory.HashRetrievalQueryText(normalizedQuery)
+	cachePurpose := memoryRetrievalQueryCachePurpose(usage.RetrievalPurpose, retrievalVariant)
 	usage.QueryHash = queryHash
 	if queryHash != "" {
-		if cached, err := s.store.GetMemoryRetrievalQueryCache(query.ProjectID, query.DatasetID, usage.RetrievalPurpose, config.Model, config.Dimensions, queryHash); err == nil {
-			query.EmbeddingModel = cached.EmbeddingModel
+		if cached, err := s.store.GetMemoryRetrievalQueryCache(query.ProjectID, query.DatasetID, cachePurpose, config.Model, config.Dimensions, queryHash); err == nil {
+			query.EmbeddingModel = config.Model
 			query.EmbeddingDimensions = cached.EmbeddingDimensions
 			query.Embedding = append([]float32(nil), cached.Embedding...)
 			usage.Cached = true
@@ -192,11 +229,11 @@ func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.Memo
 	query.Embedding = result.Vector
 	usage.ProviderCallCount = 1
 	usage.ProviderUsage = result.Usage
-	if ttl := memoryRetrievalQueryCacheTTL(); ttl > 0 && queryHash != "" {
+	if ttl := time.Duration(retrievalVariant.QueryCacheTTLSeconds) * time.Second; ttl > 0 && queryHash != "" {
 		if _, err := s.store.UpsertMemoryRetrievalQueryCache(memory.MemoryRetrievalQueryCacheRecord{
 			ProjectID:           query.ProjectID,
 			DatasetID:           query.DatasetID,
-			Purpose:             usage.RetrievalPurpose,
+			Purpose:             cachePurpose,
 			EmbeddingModel:      query.EmbeddingModel,
 			EmbeddingDimensions: query.EmbeddingDimensions,
 			NormalizedQueryHash: queryHash,
@@ -208,6 +245,12 @@ func (s *Server) withMemoryQueryEmbedding(ctx context.Context, query memory.Memo
 		}
 	}
 	return query, usage
+}
+
+func memoryRetrievalQueryCachePurpose(purpose string, retrievalVariant memory.PlannerRetrievalVariant) string {
+	return strings.TrimSpace(purpose) + "|embedding_runtime=" +
+		strings.ToLower(strings.TrimSpace(retrievalVariant.EmbeddingProvider)) + ":" +
+		strings.ToLower(strings.TrimSpace(retrievalVariant.EmbeddingEndpointFingerprint))
 }
 
 func (s *Server) logMemoryRetrieval(purpose string, projectID string, datasetID string, planID string, jobID string, results []memory.MemoryRetrievalResult, usage memory.MemoryEmbeddingUsageEvent) {
@@ -490,9 +533,8 @@ func memoryRetrievalQueryCacheTTL() time.Duration {
 
 func memoryRetrievalCapReached(storer interface {
 	CountProjectMemoryEmbeddingUsageEvents(projectID string, purpose string, since time.Time) (int, error)
-}, projectID string) bool {
-	config := embeddings.ConfigFromEnv()
-	if config.MaxCallsPerDay <= 0 {
+}, projectID string, maxCallsPerDay int) bool {
+	if maxCallsPerDay <= 0 {
 		return false
 	}
 	since := time.Now().UTC().Truncate(24 * time.Hour)
@@ -500,7 +542,7 @@ func memoryRetrievalCapReached(storer interface {
 	if err != nil {
 		return false
 	}
-	return count >= config.MaxCallsPerDay
+	return count >= maxCallsPerDay
 }
 
 func memoryModelFamily(model string) string {
@@ -571,11 +613,12 @@ func (s *Server) backfillProjectMemoryEmbeddings(c *gin.Context) {
 func (s *Server) listProjectAgentInvocations(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "25"))
 	invocations, err := s.store.ListProjectAgentInvocations(c.Param("id"), memory.AgentInvocationFilter{
-		DatasetID: c.Query("dataset_id"),
-		PlanID:    c.Query("plan_id"),
-		JobID:     c.Query("job_id"),
-		AgentName: c.Query("agent_name"),
-		Limit:     limit,
+		DatasetID:        c.Query("dataset_id"),
+		PlanID:           c.Query("plan_id"),
+		JobID:            c.Query("job_id"),
+		AgentName:        c.Query("agent_name"),
+		PlannerVariantID: c.Query("planner_variant_id"),
+		Limit:            limit,
 	})
 	if err != nil {
 		writeStoreError(c, err)
@@ -603,6 +646,11 @@ func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
 		writeStoreError(c, err)
 		return
 	}
+	fidelityMetrics, err := s.executionOperationalMetrics(projectID, limit)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"project_id":                    projectID,
@@ -610,24 +658,36 @@ func (s *Server) getProjectTelemetrySummary(c *gin.Context) {
 		"limit":                         limit,
 		"agent_invocations":             agentInvocationResponseRows(invocations),
 		"memory_embedding_usage_events": usageEvents,
+		"execution_fidelity":            fidelityMetrics,
 	})
 }
 
 type agentInvocationSummary struct {
-	ID                string    `json:"id"`
-	ProjectID         string    `json:"project_id"`
-	DatasetID         string    `json:"dataset_id,omitempty"`
-	PlanID            string    `json:"plan_id,omitempty"`
-	JobID             string    `json:"job_id,omitempty"`
-	AgentName         string    `json:"agent_name"`
-	AgentVersion      string    `json:"agent_version,omitempty"`
-	PromptVersion     string    `json:"prompt_version,omitempty"`
-	Provider          string    `json:"provider,omitempty"`
-	Model             string    `json:"model,omitempty"`
-	ValidationStatus  string    `json:"validation_status"`
-	ValidationError   string    `json:"validation_error,omitempty"`
-	AcceptedForMemory bool      `json:"accepted_for_memory"`
-	CreatedAt         time.Time `json:"created_at"`
+	ID                      string                        `json:"id"`
+	ProjectID               string                        `json:"project_id"`
+	DatasetID               string                        `json:"dataset_id,omitempty"`
+	PlanID                  string                        `json:"plan_id,omitempty"`
+	JobID                   string                        `json:"job_id,omitempty"`
+	AgentName               string                        `json:"agent_name"`
+	AgentVersion            string                        `json:"agent_version,omitempty"`
+	PromptVersion           string                        `json:"prompt_version,omitempty"`
+	PlannerVariantID        string                        `json:"planner_variant_id"`
+	PlannerVariant          *memory.PlannerVariant        `json:"planner_variant,omitempty"`
+	ValidationMode          string                        `json:"validation_mode,omitempty"`
+	AttemptGroupID          string                        `json:"attempt_group_id,omitempty"`
+	AttemptIndex            int                           `json:"attempt_index"`
+	RetryReason             string                        `json:"retry_reason,omitempty"`
+	WallLatencyMS           float64                       `json:"wall_latency_ms"`
+	ProviderUsage           map[string]any                `json:"provider_usage,omitempty"`
+	DerivedCost             *memory.PlannerInvocationCost `json:"derived_cost,omitempty"`
+	Provider                string                        `json:"provider,omitempty"`
+	Model                   string                        `json:"model,omitempty"`
+	ValidationStatus        string                        `json:"validation_status"`
+	ValidationError         string                        `json:"validation_error,omitempty"`
+	StrictValidationVerdict *plannervalidation.Verdict    `json:"strict_validation_verdict,omitempty"`
+	ValidationOutcome       *plannervalidation.Outcome    `json:"validation_outcome,omitempty"`
+	AcceptedForMemory       bool                          `json:"accepted_for_memory"`
+	CreatedAt               time.Time                     `json:"created_at"`
 }
 
 func agentInvocationResponseRows(invocations []memory.AgentInvocation) any {
@@ -637,20 +697,31 @@ func agentInvocationResponseRows(invocations []memory.AgentInvocation) any {
 	out := make([]agentInvocationSummary, 0, len(invocations))
 	for _, invocation := range invocations {
 		out = append(out, agentInvocationSummary{
-			ID:                invocation.ID,
-			ProjectID:         invocation.ProjectID,
-			DatasetID:         invocation.DatasetID,
-			PlanID:            invocation.PlanID,
-			JobID:             invocation.JobID,
-			AgentName:         invocation.AgentName,
-			AgentVersion:      invocation.AgentVersion,
-			PromptVersion:     invocation.PromptVersion,
-			Provider:          invocation.Provider,
-			Model:             invocation.Model,
-			ValidationStatus:  invocation.ValidationStatus,
-			ValidationError:   invocation.ValidationError,
-			AcceptedForMemory: invocation.AcceptedForMemory,
-			CreatedAt:         invocation.CreatedAt,
+			ID:                      invocation.ID,
+			ProjectID:               invocation.ProjectID,
+			DatasetID:               invocation.DatasetID,
+			PlanID:                  invocation.PlanID,
+			JobID:                   invocation.JobID,
+			AgentName:               invocation.AgentName,
+			AgentVersion:            invocation.AgentVersion,
+			PromptVersion:           invocation.PromptVersion,
+			PlannerVariantID:        invocation.PlannerVariantID,
+			PlannerVariant:          invocation.PlannerVariant,
+			ValidationMode:          invocation.ValidationMode,
+			AttemptGroupID:          invocation.AttemptGroupID,
+			AttemptIndex:            invocation.AttemptIndex,
+			RetryReason:             invocation.RetryReason,
+			WallLatencyMS:           invocation.WallLatencyMS,
+			ProviderUsage:           invocation.ProviderUsage,
+			DerivedCost:             invocation.DerivedCost,
+			Provider:                invocation.Provider,
+			Model:                   invocation.Model,
+			ValidationStatus:        invocation.ValidationStatus,
+			ValidationError:         invocation.ValidationError,
+			StrictValidationVerdict: invocation.StrictValidationVerdict,
+			ValidationOutcome:       invocation.ValidationOutcome,
+			AcceptedForMemory:       invocation.AcceptedForMemory,
+			CreatedAt:               invocation.CreatedAt,
 		})
 	}
 	return out

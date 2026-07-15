@@ -52,5 +52,4 @@ mlartifacts/**
 
 # docs
 docs/agents_context/
-docs/plans/
 .tmp/

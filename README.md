@@ -822,6 +822,8 @@ Start with `.env.v1.cloud.example`. These are the settings most users should und
 | `MODEL_EXPRESS_ORCHESTRATOR_TUNNEL_MODE` | `true` | Allows authenticated public tunnel callbacks. |
 | `MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER` | `modal` | Uses Modal workers by default. |
 | `MODEL_EXPRESS_EXECUTION_PROFILE` | `fast-remote` | Cloud-oriented execution profile. |
+| `MODEL_EXPRESS_EXECUTION_VALIDATION_MODE` | `enforce` | Rejects unsupported task/runner settings before GPU scheduling and requires finalized eligible realization evidence before successful real-training completion. Set this single switch to `shadow` for the one-release compatibility rollback; stored execution records are not rewritten. |
+| `MODEL_EXPRESS_LEGACY_EXECUTION_EVIDENCE_POLICY` | `allow` | Controls historical jobs without versioned execution records: `allow` keeps them eligible but marks them `UNVERIFIED`; `visible_only` keeps them readable while excluding them from planner learning and automatic champion selection. Versioned `MISMATCH` and `SIMULATED` runs are always ineligible. |
 | `MODEL_EXPRESS_DEFAULT_GPU_TYPE` | `T4` | Conservative first GPU choice. |
 | `MODEL_EXPRESS_MODAL_DEFAULT_GPU_TYPE` | `T4` | Modal default GPU choice. |
 | `MODEL_EXPRESS_MODAL_TUNNEL_S3` | `true` | Allows Mission Control to tunnel local MinIO API to Modal. |
@@ -830,6 +832,8 @@ Start with `.env.v1.cloud.example`. These are the settings most users should und
 | `MODEL_EXPRESS_BUDGET_CAP_USD` | `5` for first run | Keeps the first cloud run bounded. |
 | `MODEL_EXPRESS_MAX_AUTO_WORKERS` | `1` for first run | Avoids launching too much cloud work at once. |
 | `MODEL_EXPRESS_MAX_FOLLOWUP_ROUNDS` | `5` by default | Controls autonomous follow-up depth. |
+
+The project telemetry response at `GET /projects/:id/telemetry-summary` includes an `execution_fidelity` section for the enforcement rollout gates: unsupported proposals, pending and not-realized attempts, matched/mismatched/simulated verdicts, approved adjustments, legacy unverified jobs and reads, per-task matches, successful mismatches, and successful versioned jobs missing a final realization.
 
 Do not start by copying variables from development env files. Most knobs are advanced tuning flags and are not needed for a new user.
 

@@ -17,15 +17,18 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/workers"
 )
 
 type registerWorkerRequest struct {
-	ProjectID string `json:"project_id" binding:"required"`
-	Name      string `json:"name" binding:"required"`
-	GPUType   string `json:"gpu_type"`
+	ProjectID                  string   `json:"project_id" binding:"required"`
+	Name                       string   `json:"name" binding:"required"`
+	GPUType                    string   `json:"gpu_type"`
+	PolicyCapabilityVersions   []string `json:"policy_capability_versions"`
+	ArtifactCapabilityVersions []string `json:"artifact_capability_versions"`
 }
 
 type dispatcherEventRequest struct {
@@ -875,7 +878,7 @@ func (s *Server) registerWorker(c *gin.Context) {
 		return
 	}
 
-	worker, err := s.store.RegisterWorker(req.ProjectID, req.Name, req.GPUType)
+	worker, err := s.store.RegisterWorkerWithCapabilities(req.ProjectID, req.Name, req.GPUType, req.PolicyCapabilityVersions, req.ArtifactCapabilityVersions)
 	if err != nil {
 		writeStoreError(c, err)
 		return
@@ -905,11 +908,12 @@ func (s *Server) pollJob(c *gin.Context) {
 	if strings.TrimSpace(req.Provider) != "" && len(includeUnspecified) == 0 {
 		includeUnspecified = defaultProviderPollFallbackTemplates()
 	}
-	job, err := s.store.PollJob(c.Param("id"), store.JobPollFilter{
+	filter := store.JobPollFilter{
 		Provider:                            req.Provider,
 		Templates:                           req.Templates,
 		IncludeUnspecifiedProviderTemplates: includeUnspecified,
-	})
+	}
+	job, err := s.pollNextPolicyPermittedJob(c.Param("id"), filter)
 	if err == nil {
 		c.JSON(http.StatusOK, pollJobResponse{Job: s.augmentPolledJob(job, req.Provider)})
 		return
@@ -921,4 +925,143 @@ func (s *Server) pollJob(c *gin.Context) {
 	}
 
 	writeStoreError(c, err)
+}
+
+func (s *Server) pollNextPolicyPermittedJob(workerID string, filter store.JobPollFilter) (*jobs.ExperimentJob, error) {
+	if _, err := s.recoverExpiredLeasesOnce(time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	worker, err := s.store.HeartbeatWorker(workerID)
+	if err != nil {
+		return nil, err
+	}
+	if worker.CurrentJobID != "" {
+		job, err := s.store.GetJob(worker.CurrentJobID)
+		if err != nil {
+			return nil, err
+		}
+		return &job, nil
+	}
+	const candidateLimit = 64
+	for {
+		candidates, err := s.store.ListQueuedJobsForWorker(workerID, filter, candidateLimit)
+		if err != nil {
+			return nil, err
+		}
+		if len(candidates) == 0 {
+			return nil, store.ErrNoJob
+		}
+		batchProgress := false
+		for _, candidate := range candidates {
+			compatible, finding, compatibilityErr := s.workerArtifactCompatible(worker, candidate)
+			if compatibilityErr != nil {
+				return nil, compatibilityErr
+			}
+			if !compatible {
+				evaluation, evaluateErr := s.evaluateJobPolicy(candidate.ProjectID, candidate.ID, candidate.Template, candidate.Config, policyOperationDispatchRun)
+				if evaluation.EffectivePolicyHash == "" {
+					return nil, evaluateErr
+				}
+				evaluation.Decision = policies.DecisionDenied
+				evaluation.Findings = append(evaluation.Findings, finding)
+				evaluation.ReasonCodes = appendPolicyReasonCode(evaluation.ReasonCodes, policies.ReasonWorkerCapabilityUnavailable)
+				if _, err := s.store.CreateExperimentPolicyEvaluation(evaluation); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			candidateResolved := false
+			policyChangedDuringClaim := false
+			for revisionAttempt := 0; revisionAttempt < 4; revisionAttempt++ {
+				evaluation, evaluateErr := s.evaluateJobPolicy(candidate.ProjectID, candidate.ID, candidate.Template, candidate.Config, policyOperationDispatchRun)
+				if evaluation.EffectivePolicyHash == "" {
+					return nil, evaluateErr
+				}
+				if evaluateErr != nil || evaluation.Decision == policies.DecisionDenied {
+					if policyChangedDuringClaim || (candidate.EffectivePolicyHash != "" && candidate.EffectivePolicyHash != evaluation.EffectivePolicyHash) {
+						evaluation.ReasonCodes = appendPolicyReasonCode(evaluation.ReasonCodes, policies.ReasonChangedAfterQueue)
+						evaluation.Findings = append(evaluation.Findings, policies.Finding{
+							Code: policies.ReasonChangedAfterQueue, FieldPath: "job.effective_policy_hash", Origin: "stale_queue",
+							Remediation: "Review the current effective policy and schedule a permitted configuration.",
+						})
+					}
+					blocked, created, applied, applyErr := s.store.ApplyQueuedJobPolicyEvaluation(candidate.ID, evaluation)
+					if errors.Is(applyErr, store.ErrPolicyChanged) {
+						continue
+					}
+					if applyErr != nil {
+						return nil, applyErr
+					}
+					if applied {
+						s.recordJobPolicyActivity(blocked, created, execution.EventJobPolicyBlocked, "Queued job blocked by the current experiment policy.")
+					}
+					candidateResolved = true
+					batchProgress = true
+					break
+				}
+				claimed, _, assigned, claimErr := s.store.ClaimJobIfQueuedAndPolicyCurrent(workerID, candidate.ID, filter, evaluation)
+				if errors.Is(claimErr, store.ErrPolicyChanged) {
+					policyChangedDuringClaim = true
+					continue
+				}
+				if claimErr != nil {
+					return nil, claimErr
+				}
+				if assigned {
+					return claimed, nil
+				}
+				candidateResolved = true
+				batchProgress = true
+				break
+			}
+			if !candidateResolved {
+				return nil, store.ErrPolicyChanged
+			}
+		}
+		if len(candidates) < candidateLimit {
+			return nil, store.ErrNoJob
+		}
+		if !batchProgress {
+			return nil, store.ErrNoJob
+		}
+	}
+}
+
+func (s *Server) workerArtifactCompatible(worker workers.Worker, job jobs.ExperimentJob) (bool, policies.Finding, error) {
+	plan, exists, err := artifactPlanFromJobConfig(job.Config)
+	if err != nil {
+		return false, policies.Finding{}, err
+	}
+	if !exists {
+		return true, policies.Finding{}, nil
+	}
+	task, runner, err := s.jobPolicyTaskRunner(job.Template, job.Config, job.DatasetID)
+	if err != nil {
+		return false, policies.Finding{}, err
+	}
+	if task == "" {
+		task = "image_classification"
+	}
+	if runner == "" {
+		runner = "modal_torchvision"
+	}
+	if err := execution.ValidateArtifactPlanV1(plan, task, runner); err != nil {
+		return false, policies.Finding{
+			Code: policies.ReasonWorkerCapabilityUnavailable, FieldPath: "artifact_plan",
+			Origin: "unknown_capability", Remediation: "Reschedule the job with a server-issued supported artifact plan.",
+		}, nil
+	}
+	if execution.WorkerCapabilitiesSatisfyForSpec(plan, task, runner, worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions) {
+		return true, policies.Finding{}, nil
+	}
+	return false, workerCapabilityFinding(worker.PolicyCapabilityVersions, worker.ArtifactCapabilityVersions, plan), nil
+}
+
+func appendPolicyReasonCode(values []policies.ReasonCode, code policies.ReasonCode) []policies.ReasonCode {
+	for _, existing := range values {
+		if existing == code {
+			return values
+		}
+	}
+	return append(values, code)
 }

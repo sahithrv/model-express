@@ -2933,6 +2933,7 @@ func TestAutomaticReviewMaxFollowUpRoundsNoSuccessfulRunRecordsTerminalEvent(t *
 }
 
 func TestAutomaticReviewAutoExecutionCreatesWorkerRequirement(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	t.Setenv("MODEL_EXPRESS_AUTO_REVIEW_EXPERIMENTS", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_SCHEDULE_FOLLOWUPS", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "true")
@@ -3554,6 +3555,7 @@ func TestCostPolicySkippedFullTrainSelectsChampionAfterAllowedJobsFinish(t *test
 	}); err != nil {
 		t.Fatalf("upsert preview evaluation: %v", err)
 	}
+	finalizeMatchedExecutionForTest(t, memoryStore, previewJob.ID)
 
 	selected, err := server.selectBestAvailableChampionIfCostStoppedAfterTrainingJob(previewJob)
 	if err != nil {
@@ -4247,6 +4249,7 @@ func TestPrepareAutoMLExperimentsAutoEnablesBackendDefaultWhenEnabled(t *testing
 	settings := server.currentAutomationSettings()
 	settings.AutoMLEnabled = true
 	settings.AutoMLSampler = automl.SamplerSeededRandom
+	settings.DefaultTrainingProvider = "modal"
 	if _, err := server.store.SaveAutomationSettings(settings); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
@@ -4446,6 +4449,7 @@ func TestPrepareAutoMLExperimentSamplesDeferredHyperparameters(t *testing.T) {
 }
 
 func TestExecuteExperimentPlanIncludesStructuredAugmentationPolicyConfig(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
 		func() plans.PlannedExperiment {
 			experiment := testExperiment("efficientnet_b0", 8)
@@ -5102,6 +5106,7 @@ func TestProposedExperimentPlannerDecisionDoesNotAutoSchedule(t *testing.T) {
 }
 
 func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "shadow")
 	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
 
 	responses := []string{
@@ -5332,6 +5337,42 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 	}
 	if len(invocations) != 2 {
 		t.Fatalf("expected two planner invocations, got %d", len(invocations))
+	}
+	attemptGroupID := invocations[0].AttemptGroupID
+	plannerVariantID := invocations[0].PlannerVariantID
+	if attemptGroupID == "" {
+		t.Fatal("expected retry attempts to have a shared non-empty attempt group")
+	}
+	if plannerVariantID == "" || plannerVariantID == memory.LegacyPlannerVariantID {
+		t.Fatalf("expected exact non-legacy planner variant identity, got %q", plannerVariantID)
+	}
+	byAttempt := map[int]memory.AgentInvocation{}
+	for _, invocation := range invocations {
+		if invocation.AttemptGroupID != attemptGroupID {
+			t.Fatalf("retry attempts have different groups: %#v", invocations)
+		}
+		if invocation.PlannerVariantID != plannerVariantID {
+			t.Fatalf("retry attempts have different planner variants: %#v", invocations)
+		}
+		if invocation.PlannerVariant == nil {
+			t.Fatalf("planner invocation is missing canonical variant components: %#v", invocation)
+		}
+		if invocation.WallLatencyMS <= 0 {
+			t.Fatalf("planner invocation is missing locally measured latency: %#v", invocation)
+		}
+		if _, duplicate := byAttempt[invocation.AttemptIndex]; duplicate {
+			t.Fatalf("duplicate retry attempt index %d", invocation.AttemptIndex)
+		}
+		byAttempt[invocation.AttemptIndex] = invocation
+	}
+	if len(byAttempt) != 2 || byAttempt[0].RetryReason != "" || byAttempt[1].RetryReason == "" {
+		t.Fatalf("unexpected retry attempt facts: %#v", byAttempt)
+	}
+	if payloadString(agentDecisions[0].Payload, "planner_variant_id") != plannerVariantID {
+		t.Fatalf("decision is not attributed to accepted planner variant %q: %#v", plannerVariantID, agentDecisions[0].Payload)
+	}
+	if payloadString(agentDecisions[0].Payload, "invocation_id") != byAttempt[1].ID {
+		t.Fatalf("decision is not linked to accepted retry invocation %s: %#v", byAttempt[1].ID, agentDecisions[0].Payload)
 	}
 	foundRejected := false
 	for _, invocation := range invocations {
@@ -8460,6 +8501,13 @@ func (s *championExportFailureStore) CreateJob(projectID string, template string
 		return jobs.ExperimentJob{}, errors.New("forced export job failure")
 	}
 	return s.Store.CreateJob(projectID, template, config)
+}
+
+func (s *championExportFailureStore) CreateJobWithOptions(projectID string, template string, config map[string]any, options store.CreateJobOptions) (jobs.ExperimentJob, error) {
+	if s.failExportJobCreate && template == jobs.TemplateExportChampion {
+		return jobs.ExperimentJob{}, errors.New("forced export job failure")
+	}
+	return s.Store.CreateJobWithOptions(projectID, template, config, options)
 }
 
 func recordTrainingSummary(

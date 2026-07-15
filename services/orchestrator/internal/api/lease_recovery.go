@@ -1,7 +1,7 @@
 package api
 
 import (
-	"fmt"
+	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -11,7 +11,9 @@ import (
 	"model-express/services/orchestrator/internal/diagnostics"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/runs"
+	"model-express/services/orchestrator/internal/store"
 )
 
 const (
@@ -72,11 +74,19 @@ func (s *Server) recoverExpiredLeasesOnce(now time.Time) ([]jobs.ExperimentJob, 
 
 	requeuedCount := 0
 	failedCount := 0
-	for _, job := range recovered {
+	for index, job := range recovered {
 		if job.Status == jobs.StatusFailed {
 			failedCount++
 			s.handleRecoveredExpiredLeaseFailure(job)
 			continue
+		}
+		if policyControlledJobTemplate(job.Template) {
+			reconciled, reconcileErr := s.reconcileRecoveredJobPolicy(job)
+			if reconcileErr != nil {
+				return recovered, reconcileErr
+			}
+			job = reconciled
+			recovered[index] = reconciled
 		}
 		requeuedCount++
 	}
@@ -88,6 +98,32 @@ func (s *Server) recoverExpiredLeasesOnce(now time.Time) ([]jobs.ExperimentJob, 
 		"job_ids":         experimentJobIDs(recovered),
 	})
 	return recovered, nil
+}
+
+func (s *Server) reconcileRecoveredJobPolicy(job jobs.ExperimentJob) (jobs.ExperimentJob, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		evaluation, evaluateErr := s.evaluateJobPolicy(job.ProjectID, job.ID, job.Template, job.Config, policyOperationRequeueRun)
+		if evaluation.EffectivePolicyHash == "" {
+			return job, evaluateErr
+		}
+		updated, created, applied, err := s.store.ApplyQueuedJobPolicyEvaluation(job.ID, evaluation)
+		if errors.Is(err, store.ErrPolicyChanged) {
+			continue
+		}
+		if err != nil {
+			return job, err
+		}
+		if !applied {
+			return updated, nil
+		}
+		if evaluateErr != nil || created.Decision == policies.DecisionDenied {
+			s.recordJobPolicyActivity(updated, created, execution.EventJobPolicyBlocked, "Lease-recovered job blocked by the current experiment policy.")
+		} else {
+			s.recordJobPolicyActivity(updated, created, execution.EventJobPolicyReconciled, "Lease-recovered job revalidated against the current experiment policy.")
+		}
+		return updated, nil
+	}
+	return job, store.ErrPolicyChanged
 }
 
 func (s *Server) handleRecoveredExpiredLeaseFailure(job jobs.ExperimentJob) {
@@ -105,31 +141,9 @@ func (s *Server) handleRecoveredExpiredLeaseFailure(job jobs.ExperimentJob) {
 		s.updateWorkerRequirementDemandAfterTerminalJob(job)
 	}
 
-	planID := jobConfigString(job.Config, "plan_id")
-	payload := map[string]any{
-		"job_id":          job.ID,
-		"worker_id":       job.WorkerID,
-		"template":        job.Template,
-		"attempt":         job.Attempt,
-		"max_attempts":    job.MaxAttempts,
-		"error":           job.Error,
-		"recovery_reason": "expired_lease",
-	}
-	if _, err := s.store.CreateExecutionEvent(
-		job.ProjectID,
-		planID,
-		execution.EventExecutionFailed,
-		fmt.Sprintf("Job %s failed after its worker lease expired and attempts were exhausted.", job.ID),
-		payload,
-	); err != nil {
-		log.Printf("record expired lease failure event failed for job %s: %v", job.ID, err)
-		diagnostics.Event("warn", "job_lease_recovery_event_failed", map[string]any{
-			"job_id":     job.ID,
-			"project_id": job.ProjectID,
-			"error":      err.Error(),
-		})
-	}
 	if job.Template == jobs.TemplateTrainExperiment {
 		s.enqueueTrainingTerminalHooks(job)
+	} else {
+		s.finalizeCandidateOutcomesAfterNonTrainingJob(job)
 	}
 }

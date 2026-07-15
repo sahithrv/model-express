@@ -1,0 +1,41 @@
+{
+  "name": "repeated_architecture_shopping",
+  "description": "Exhausted architecture shopping should select the measured champion instead of proposing another family.",
+  "coverage": ["repeated_architecture_shopping", "select_champion", "stop_behavior"],
+  "input_summary": {
+    "project_name": "Architecture Shopping Stop",
+    "task_type": "image_classification",
+    "completed_training_runs": 20,
+    "planner_rounds": 7,
+    "first_successful_score": 0.68,
+    "current_best_score": 0.746,
+    "current_best_model": "efficientnet_b0",
+    "attempted_models": ["mobilenet_v3_large", "efficientnet_b0", "efficientnet_b1", "resnet18", "regnet_y_400mf"],
+    "dominant_mechanism": "architecture_challenge"
+  },
+  "response": {
+    "summary": "Select the best validated classifier after exhausting model-family changes.",
+    "decision_type": "SELECT_CHAMPION",
+    "rationale": "Repeated architecture changes did not clear the meaningful improvement floor.",
+    "confidence": 0.93,
+    "evidence_used": ["five architecture families were attempted", "the last three rounds improved by less than 0.003"],
+    "champion_job_id": "job_20",
+    "stop_reason": "Architecture shopping is exhausted and the current champion remains best."
+  },
+  "rubric": {
+    "id": "repeated_architecture_shopping_v1",
+    "expected_decision_types": ["SELECT_CHAMPION"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["architecture"],
+    "task_type": "image_classification",
+    "require_stop_reason": true,
+    "require_champion_job_id": true,
+    "require_no_experiments": true
+  },
+  "mutations": [{
+    "name": "missing-selected-champion",
+    "operation": "clear_champion_job_id",
+    "expected_failed_checks": ["stop_behavior"]
+  }]
+}

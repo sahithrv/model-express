@@ -1,6 +1,7 @@
 package evals
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,11 +17,16 @@ import (
 )
 
 type PlannerReplayFixture struct {
-	Name         string                `json:"name"`
-	Input        map[string]any        `json:"input"`
-	InputSummary map[string]any        `json:"input_summary,omitempty"`
-	Response     map[string]any        `json:"response,omitempty"`
-	Expected     PlannerReplayExpected `json:"expected"`
+	Name         string                  `json:"name"`
+	Description  string                  `json:"description,omitempty"`
+	Coverage     []string                `json:"coverage,omitempty"`
+	Starter      bool                    `json:"starter,omitempty"`
+	Input        map[string]any          `json:"input"`
+	InputSummary map[string]any          `json:"input_summary,omitempty"`
+	Response     map[string]any          `json:"response,omitempty"`
+	Expected     PlannerReplayExpected   `json:"expected"`
+	Rubric       PlannerRubric           `json:"rubric,omitempty"`
+	Mutations    []PlannerRubricMutation `json:"mutations,omitempty"`
 }
 
 type PlannerReplayExpected struct {
@@ -28,6 +34,54 @@ type PlannerReplayExpected struct {
 	AllowedDecisions               []string `json:"allowed_decisions"`
 	AllowedAddExperimentMechanisms []string `json:"allowed_add_experiment_mechanisms"`
 	MaxSelectedExperiments         int      `json:"max_selected_experiments"`
+}
+
+//go:embed testdata/*.json
+var plannerFixtureFS embed.FS
+
+// LoadStarterPlannerRubricFixtures loads the small checked-in PR3 corpus from
+// the binary itself, so the deterministic rubric command is independent of
+// its current working directory.
+func LoadStarterPlannerRubricFixtures() ([]PlannerReplayFixture, error) {
+	fixtures, err := LoadPlannerRubricFixtures()
+	if err != nil {
+		return nil, err
+	}
+	starters := make([]PlannerReplayFixture, 0, len(fixtures))
+	for _, fixture := range fixtures {
+		if fixture.Starter {
+			starters = append(starters, fixture)
+		}
+	}
+	return starters, nil
+}
+
+// LoadPlannerRubricFixtures loads the complete deterministic checked-in
+// scenario corpus. Live provider calls are never involved.
+func LoadPlannerRubricFixtures() ([]PlannerReplayFixture, error) {
+	entries, err := plannerFixtureFS.ReadDir("testdata")
+	if err != nil {
+		return nil, err
+	}
+	fixtures := []PlannerReplayFixture{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		blob, err := plannerFixtureFS.ReadFile("testdata/" + entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		var fixture PlannerReplayFixture
+		if err := json.Unmarshal(blob, &fixture); err != nil {
+			return nil, fmt.Errorf("decode embedded planner fixture %s: %w", entry.Name(), err)
+		}
+		if len(fixture.Response) == 0 || (fixture.Rubric.ID == "" && len(fixture.Rubric.ExpectedDecisionTypes) == 0) {
+			continue
+		}
+		fixtures = append(fixtures, fixture)
+	}
+	return fixtures, nil
 }
 
 func LoadPlannerReplayFixture(path string) (PlannerReplayFixture, error) {
@@ -250,7 +304,7 @@ func ExperimentPlannerInputFromReplayFixture(fixture PlannerReplayFixture) agent
 			BestMacroF1:  currentBest,
 			BestAccuracy: currentBest + 0.08,
 		},
-		NoImprovementRounds:          3,
+		NoImprovementRounds:          replayInt(summary, "no_improvement_rounds", 3),
 		MinimumMeaningfulImprovement: 0.010,
 		PriorPlans:                   priorPlans,
 		PriorJobs:                    priorJobs,
@@ -258,7 +312,7 @@ func ExperimentPlannerInputFromReplayFixture(fixture PlannerReplayFixture) agent
 		PriorMemory:                  replayAgentMemory(summary, "prior_memory"),
 		MaxExperiments:               fixture.Expected.MaxSelectedExperiments,
 		FollowUpRound:                plannerRounds,
-		MaxFollowUpRounds:            plannerRounds,
+		MaxFollowUpRounds:            replayInt(summary, "max_follow_up_rounds", plannerRounds),
 		ModelCatalog:                 modelCatalog,
 		SuccessfulStrategyMemory:     successfulStrategyMemory,
 		FailedStrategyMemory:         failedStrategyMemory,

@@ -1,0 +1,86 @@
+{
+  "name": "imbalance_minority_detection",
+  "description": "Minority-class detector failure should use detector-compatible sampling rather than a classifier model.",
+  "coverage": ["imbalance", "minority_failure", "detection", "task_sensitive", "add_experiments"],
+  "input_summary": {
+    "project_name": "Minority Detection Failure",
+    "task_type": "object_detection",
+    "target_metric": "mAP50_95",
+    "yolo_available": true,
+    "object_detection_available": true,
+    "bbox_available": true,
+    "completed_training_runs": 5,
+    "planner_rounds": 2,
+    "first_successful_score": 0.29,
+    "current_best_score": 0.36,
+    "current_best_model": "yolo11n.pt",
+    "attempted_models": ["yolo11n.pt", "yolo11s.pt"],
+    "dominant_mechanism": "baseline_control",
+    "model_catalog": [{
+      "name": "yolo11n.pt",
+      "family": "yolo11",
+      "task_type": "object_detection",
+      "model_kind": "ultralytics_yolo_detector",
+      "training_enabled": true,
+      "supports_transfer": true,
+      "default_image_size": 640
+    }]
+  },
+  "response": {
+    "summary": "Target rare detector classes with balanced sampling on YOLO.",
+    "decision_type": "ADD_EXPERIMENTS",
+    "rationale": "Per-class recall, not overall detector capacity, is the measured weakness.",
+    "confidence": 0.84,
+    "planning_mode": "class_imbalance_ablation",
+    "evidence_used": ["minority detector recall is 0.18", "bounding-box labels confirm object detection"],
+    "candidate_hypotheses": [{
+      "hypothesis": "Balanced image sampling will expose rare detector classes more often.",
+      "mechanism": "minority_targeting",
+      "intervention": "Use class-balanced sampling with the compact YOLO detector.",
+      "expected_effect": "Improve minority recall and mAP50_95 without changing task family.",
+      "expected_metric_impact": 0.021,
+      "evidence_used": ["minority detector recall", "YOLO bounding boxes"],
+      "experiment_config": {
+        "template": "yolo11_detection",
+        "model": "yolo11n.pt",
+        "epochs": 12,
+        "batch_size": 8,
+        "learning_rate": 0.001,
+        "reason": "Target rare detector classes.",
+        "image_size": 640,
+        "class_balancing": "class_balanced_sampler",
+        "sampling_strategy": "class_balanced_sampler",
+        "mechanism": "minority_targeting"
+      }
+    }],
+    "proposed_experiments": [{
+      "template": "yolo11_detection",
+      "model": "yolo11n.pt",
+      "epochs": 12,
+      "batch_size": 8,
+      "learning_rate": 0.001,
+      "reason": "Target rare detector classes.",
+      "image_size": 640,
+      "class_balancing": "class_balanced_sampler",
+      "sampling_strategy": "class_balanced_sampler",
+      "mechanism": "minority_targeting"
+    }]
+  },
+  "rubric": {
+    "id": "imbalance_minority_detection_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["minority_targeting", "class_imbalance"],
+    "forbidden_mechanisms": ["architecture_challenge"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["detector"],
+    "task_type": "object_detection",
+    "allowed_models": ["yolo11n.pt"],
+    "max_selected_experiments": 1
+  },
+  "mutations": [{
+    "name": "classifier-model-on-detection",
+    "operation": "set_model",
+    "value": "efficientnet_b0",
+    "expected_failed_checks": ["task_compatibility"]
+  }]
+}

@@ -4,16 +4,44 @@ import os
 import time
 
 from worker.orchestrator_client import OrchestratorClient
+from worker.progress import ProgressReporter
 from worker.training.augmentation import normalize_augmentation_config, structured_policy_type
+from worker.training.progress_reporting import (
+    report_simulator_epoch,
+    report_simulator_stage,
+    simulator_progress_metadata,
+    training_progress_reporter,
+)
 
 
-def run_local_training(client: OrchestratorClient, job: dict) -> None:
+def run_local_training(
+    client: OrchestratorClient,
+    job: dict,
+    *,
+    progress_reporter: ProgressReporter | None = None,
+) -> None:
     """Deterministic local training simulator for locking the job/metric contract."""
     config = job["config"]
     job_id = job["id"]
+    owns_progress_reporter = progress_reporter is None
+    if progress_reporter is None:
+        progress_reporter = training_progress_reporter(client, job)
+    progress_metadata = simulator_progress_metadata(job)
+    if owns_progress_reporter:
+        report_simulator_stage(
+            progress_reporter,
+            "worker_starting",
+            metadata=progress_metadata,
+            message="The deterministic training simulator is starting.",
+        )
 
     if _is_detection_training_config(config):
-        _run_local_yolo_detection_training(client, job)
+        _run_local_yolo_detection_training(
+            client,
+            job,
+            progress_reporter=progress_reporter,
+            progress_metadata=progress_metadata,
+        )
         return
 
     model = str(config.get("model", "unknown_model"))
@@ -44,6 +72,19 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
     epoch_sleep = _positive_float(os.getenv("LOCAL_TRAINING_EPOCH_SECONDS"), default=0.5)
     started_at = time.time()
+
+    report_simulator_stage(
+        progress_reporter,
+        "data_loading",
+        metadata=progress_metadata,
+        message="The simulator training data contract is being prepared.",
+    )
+    report_simulator_stage(
+        progress_reporter,
+        "model_initializing",
+        metadata=progress_metadata,
+        message="The deterministic classifier simulation is being initialized.",
+    )
 
     model_score = _model_score(model)
     image_bonus = 0.015 if image_size >= 256 else 0.0
@@ -123,6 +164,12 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     )
     best_macro_f1 = 0.0
     best_accuracy = 0.0
+    report_simulator_epoch(
+        progress_reporter,
+        current=0,
+        total=epochs,
+        metadata=progress_metadata,
+    )
 
     for epoch in range(1, epochs + 1):
         progress = epoch / epochs
@@ -161,9 +208,34 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
                 **_summary_metadata(config),
             },
         )
+        report_simulator_epoch(
+            progress_reporter,
+            current=epoch,
+            total=epochs,
+            metadata=progress_metadata,
+        )
         print(f"Reported training epoch {epoch}/{epochs} for {job_id} ({model})")
         time.sleep(epoch_sleep)
 
+    report_simulator_stage(
+        progress_reporter,
+        "evaluating",
+        metadata=progress_metadata,
+        message="The deterministic classifier evaluation is running.",
+    )
+    evaluation_payload = _local_evaluation_payload(
+        config=config,
+        model=model,
+        best_macro_f1=best_macro_f1,
+        best_accuracy=best_accuracy,
+        runtime_seconds=round(time.time() - started_at, 3),
+    )
+    report_simulator_stage(
+        progress_reporter,
+        "finalizing",
+        metadata=progress_metadata,
+        message="Simulator results are being finalized by the backend.",
+    )
     client.report_training_run_summary(
         job_id,
         {
@@ -183,18 +255,19 @@ def run_local_training(client: OrchestratorClient, job: dict) -> None:
     )
     client.report_training_run_evaluation(
         job_id,
-        _local_evaluation_payload(
-            config=config,
-            model=model,
-            best_macro_f1=best_macro_f1,
-            best_accuracy=best_accuracy,
-            runtime_seconds=round(time.time() - started_at, 3),
-        ),
+        evaluation_payload,
     )
+    _finalize_simulated_execution(client, job)
     client.complete_job(job_id, mlflow_run_id=f"local-training-{job_id}")
 
 
-def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) -> None:
+def _run_local_yolo_detection_training(
+    client: OrchestratorClient,
+    job: dict,
+    *,
+    progress_reporter: ProgressReporter | None,
+    progress_metadata: dict[str, str],
+) -> None:
     config = job["config"]
     job_id = job["id"]
 
@@ -207,6 +280,19 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
     epoch_sleep = _positive_float(os.getenv("LOCAL_TRAINING_EPOCH_SECONDS"), default=0.5)
     started_at = time.time()
 
+    report_simulator_stage(
+        progress_reporter,
+        "data_loading",
+        metadata=progress_metadata,
+        message="The simulator detection data contract is being prepared.",
+    )
+    report_simulator_stage(
+        progress_reporter,
+        "model_initializing",
+        metadata=progress_metadata,
+        message="The deterministic detector simulation is being initialized.",
+    )
+
     model_quality = _detector_model_score(model)
     size_bonus = 0.015 if image_size >= 640 else 0.0
     batch_penalty = 0.015 if batch_size < 4 else 0.0
@@ -218,6 +304,12 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
     box_loss = 0.0
     cls_loss = 0.0
     dfl_loss = 0.0
+    report_simulator_epoch(
+        progress_reporter,
+        current=0,
+        total=epochs,
+        metadata=progress_metadata,
+    )
 
     for epoch in range(1, epochs + 1):
         progress = epoch / epochs
@@ -267,10 +359,38 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
                 **_summary_metadata(config),
             },
         )
+        report_simulator_epoch(
+            progress_reporter,
+            current=epoch,
+            total=epochs,
+            metadata=progress_metadata,
+        )
         print(f"Reported detector epoch {epoch}/{epochs} for {job_id} ({model})")
         time.sleep(epoch_sleep)
 
     runtime_seconds = round(time.time() - started_at, 3)
+    report_simulator_stage(
+        progress_reporter,
+        "evaluating",
+        metadata=progress_metadata,
+        message="The deterministic detector evaluation is running.",
+    )
+    evaluation_payload = _local_detection_evaluation_payload(
+        config=config,
+        model=model,
+        best_map50_95=best_map50_95,
+        best_map50=best_map50,
+        box_loss=box_loss,
+        cls_loss=cls_loss,
+        dfl_loss=dfl_loss,
+        runtime_seconds=runtime_seconds,
+    )
+    report_simulator_stage(
+        progress_reporter,
+        "finalizing",
+        metadata=progress_metadata,
+        message="Simulator results are being finalized by the backend.",
+    )
     client.report_training_run_summary(
         job_id,
         {
@@ -290,18 +410,33 @@ def _run_local_yolo_detection_training(client: OrchestratorClient, job: dict) ->
     )
     client.report_training_run_evaluation(
         job_id,
-        _local_detection_evaluation_payload(
-            config=config,
-            model=model,
-            best_map50_95=best_map50_95,
-            best_map50=best_map50,
-            box_loss=box_loss,
-            cls_loss=cls_loss,
-            dfl_loss=dfl_loss,
-            runtime_seconds=runtime_seconds,
-        ),
+        evaluation_payload,
     )
+    _finalize_simulated_execution(client, job)
     client.complete_job(job_id, mlflow_run_id=f"local-yolo-training-{job_id}")
+
+
+def _finalize_simulated_execution(client: OrchestratorClient, job: dict) -> None:
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    execution_spec = config.get("execution_spec_v1")
+    if not isinstance(execution_spec, dict):
+        return
+    accepted_config = execution_spec.get("accepted_config")
+    if not isinstance(accepted_config, dict):
+        return
+    client.report_execution_observation(
+        str(job.get("id") or ""),
+        {
+            "schema_version": "execution_realization_v1",
+            "stage": "FINALIZED",
+            "idempotency_key": "local-simulator-final-v1",
+            "realized_config": accepted_config,
+            "framework_arguments": {"runtime": "deterministic_local_simulator"},
+            "evidence": {"simulation": True},
+            "simulated": True,
+        },
+        job=job,
+    )
 
 
 def _is_detection_training_config(config: dict) -> bool:

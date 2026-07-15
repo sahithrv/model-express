@@ -1,0 +1,76 @@
+{
+  "name": "invalid_task_config_wait",
+  "description": "An invalid task/model configuration should wait without emitting schedulable experiments.",
+  "coverage": ["invalid_task", "invalid_model", "detection", "wait", "safety"],
+  "starter": true,
+  "input_summary": {
+    "project_name": "Invalid Detection Config",
+    "project_goal": "Avoid scheduling a classifier configuration for a detection dataset.",
+    "dataset_name": "invalid-detection-config",
+    "dataset_summary": "Object-detection labels are present, but the requested classifier-style configuration is incompatible.",
+    "task_type": "object_detection",
+    "target_metric": "mAP50_95",
+    "class_count": 3,
+    "total_images": 240,
+    "yolo_available": true,
+    "object_detection_available": true,
+    "bbox_available": true,
+    "completed_training_runs": 3,
+    "planner_rounds": 1,
+    "first_successful_score": 0.31,
+    "current_best_score": 0.34,
+    "current_best_model": "yolo11n.pt",
+    "attempted_models": ["yolo11n.pt"],
+    "dominant_mechanism": "baseline_control",
+    "model_catalog": [
+      {
+        "name": "yolo11n.pt",
+        "family": "yolo11",
+        "task_type": "object_detection",
+        "model_kind": "ultralytics_yolo_detector",
+        "pretrained_weights": "yolo11n.pt",
+        "deployment_tier": "fast",
+        "default_image_size": 640,
+        "supports_transfer": true,
+        "training_enabled": true
+      }
+    ]
+  },
+  "response": {
+    "summary": "Wait instead of scheduling the incompatible classifier configuration.",
+    "decision_type": "WAIT",
+    "rationale": "The available evidence is object-detection-specific, so a classifier model or classifier preprocessing contract must not be scheduled.",
+    "confidence": 0.95,
+    "evidence_used": [
+      "dataset profile reports object-detection bounding boxes",
+      "the model catalog exposes only a YOLO detector for this task"
+    ],
+    "candidate_hypotheses": [],
+    "proposed_experiments": [],
+    "proposal_mechanisms": [],
+    "champion_job_id": "",
+    "stop_reason": ""
+  },
+  "expected": {
+    "forbidden_mechanisms": ["class_imbalance"],
+    "allowed_decisions": ["WAIT"],
+    "allowed_add_experiment_mechanisms": [],
+    "max_selected_experiments": 0
+  },
+  "rubric": {
+    "id": "invalid_task_config_wait_v1",
+    "expected_decision_types": ["WAIT"],
+    "forbidden_mechanisms": ["class_imbalance"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["object-detection"],
+    "task_type": "object_detection",
+    "forbidden_models": ["mobilenet_v3_large", "efficientnet_b0", "resnet18"],
+    "require_no_experiments": true
+  },
+  "mutations": [{
+    "name": "force-invalid-scheduling",
+    "operation": "set_decision_type",
+    "value": "ADD_EXPERIMENTS",
+    "expected_failed_checks": ["decision", "safety"]
+  }]
+}

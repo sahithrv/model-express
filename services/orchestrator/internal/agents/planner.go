@@ -7,6 +7,7 @@ import (
 
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 )
 
@@ -22,6 +23,7 @@ type PlanPreferences struct {
 	MaxWorkers        int
 	TimeBudgetMinutes int
 	TargetMetric      string
+	EffectivePolicy   *policies.EffectivePolicy
 }
 
 type PlanRecommendation struct {
@@ -79,6 +81,11 @@ func (p DatasetPlanner) BuildExperimentPlan(project projects.Project, dataset da
 	if detectionTask {
 		experiments = plannedDetectionExperiments(priority, totalImages)
 	}
+	var policyErr error
+	experiments, policyErr = policyConstrainedPlannerExperiments(experiments, preferences.EffectivePolicy, detectionTask)
+	if policyErr != nil {
+		return PlanRecommendation{}, policyErr
+	}
 	maxWorkers := preferences.MaxWorkers
 	if maxWorkers <= 0 {
 		maxWorkers = defaultWorkerCap(priority)
@@ -110,6 +117,95 @@ func (p DatasetPlanner) BuildExperimentPlan(project projects.Project, dataset da
 		Experiments:        experiments,
 		Warnings:           warnings,
 	}, nil
+}
+
+func policyConstrainedPlannerExperiments(input []plans.PlannedExperiment, effective *policies.EffectivePolicy, detection bool) ([]plans.PlannedExperiment, error) {
+	if effective == nil {
+		return input, nil
+	}
+	out := make([]plans.PlannedExperiment, 0, len(input))
+	findings := []policies.Finding{}
+	for _, experiment := range input {
+		if evaluation, err := policies.EvaluateProposal(*effective, policyOperationPropose, []plans.PlannedExperiment{experiment}); err == nil {
+			out = append(out, experiment)
+		} else {
+			findings = append(findings, evaluation.Findings...)
+		}
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+	limit := len(input)
+	if limit < 1 {
+		limit = 1
+	}
+	for _, entry := range effective.PermittedCatalog["models"] {
+		if detection != plannerContainsString(entry.Tasks, "object_detection") {
+			continue
+		}
+		experiment := policyFallbackExperiment(entry.ID, detection)
+		if evaluation, err := policies.EvaluateProposal(*effective, policyOperationPropose, []plans.PlannedExperiment{experiment}); err != nil {
+			findings = append(findings, evaluation.Findings...)
+			continue
+		}
+		out = append(out, experiment)
+		if len(out) >= limit {
+			break
+		}
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+	blocked := policies.BlockedDimensionsFromFindings(findings)
+	if len(blocked) == 0 {
+		blocked = append([]string(nil), effective.BlockedDimensions...)
+	}
+	if len(blocked) == 0 {
+		blocked = []string{"models"}
+	}
+	contributingScopes := policies.ContributingScopesFromFindings(findings)
+	if len(contributingScopes) == 0 {
+		contributingScopes = append([]policies.ScopeContribution(nil), effective.ContributingScopes...)
+	}
+	return nil, &policies.PolicyError{
+		Code:                policies.ReasonNoValidConfiguration,
+		Message:             "effective experiment policy leaves no valid deterministic planner configuration",
+		EffectivePolicyHash: effective.EffectivePolicyHash,
+		Findings:            append(append([]policies.Finding(nil), effective.Findings...), findings...),
+		BlockedDimensions:   blocked,
+		ContributingScopes:  contributingScopes,
+	}
+}
+
+func plannerContainsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func policyFallbackExperiment(model string, detection bool) plans.PlannedExperiment {
+	if detection {
+		return plans.PlannedExperiment{
+			Template: "yolo11_detection", Model: model, Mechanism: "baseline_control",
+			Intervention:   "Train a permitted detector baseline on the official dataset splits.",
+			EvidenceUsed:   []string{"effective policy permitted catalog"},
+			ExpectedEffect: "Establish a policy-compliant object-detection baseline.",
+			Epochs:         10, BatchSize: 8, LearningRate: 0.001, ImageSize: 640, Pretrained: true,
+			Reason: "Policy-compliant detector baseline.",
+		}
+	}
+	family := inferExperimentFamily(model)
+	template := family + "_transfer"
+	if family == "" {
+		template = "image_classifier_transfer"
+	}
+	return plans.PlannedExperiment{
+		Template: template, Model: model, Epochs: 10, BatchSize: 16, LearningRate: 0.0002,
+		Reason: "Policy-compliant transfer-learning baseline.",
+	}
 }
 
 func plannedDetectionExperiments(priority string, totalImages int) []plans.PlannedExperiment {

@@ -59,6 +59,7 @@ func TestFakeRunSmokeEndToEndSuccessVisibility(t *testing.T) {
 	}, http.StatusCreated, nil)
 	harness.reportSuccessfulTrainingSummary(assigned, plan.ID, dataset.ID, 0.99)
 	harness.reportSuccessfulTrainingEvaluation(assigned, plan.ID, dataset.ID, 0.99)
+	harness.reportMatchedExecution(assigned)
 	harness.postCallbackJSON("/jobs/"+assigned.ID+"/complete", assigned, map[string]any{
 		"training_attempt_id": callbackAttemptID(t, assigned),
 		"mlflow_run_id":       "smoke-run-1",
@@ -471,6 +472,21 @@ func (h runSmokeHarness) reportSuccessfulTrainingEvaluation(job jobs.ExperimentJ
 		},
 		"recommendation_summary": "Fake smoke trainer produced a deployable result.",
 	}, http.StatusOK, nil)
+}
+
+func (h runSmokeHarness) reportMatchedExecution(job jobs.ExperimentJob) {
+	h.t.Helper()
+	record, err := h.store.GetJobExecutionRecord(job.ID)
+	if err != nil {
+		h.t.Fatalf("get execution record: %v", err)
+	}
+	h.postCallbackJSON("/jobs/"+job.ID+"/execution-observations", job, map[string]any{
+		"training_attempt_id": callbackAttemptID(h.t, job),
+		"schema_version":      execution.ExecutionObservationSchemaV1,
+		"stage":               execution.ExecutionObservationFinalized,
+		"idempotency_key":     "smoke-finalized",
+		"realized_config":     record.AcceptedSpec.AcceptedSpec,
+	}, http.StatusCreated, nil)
 }
 
 func (h runSmokeHarness) postCallbackJSON(path string, job jobs.ExperimentJob, body any, wantStatus int, out any) {

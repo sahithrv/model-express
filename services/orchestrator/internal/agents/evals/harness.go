@@ -4,26 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
-	"os"
 	"sort"
 	"strings"
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/llm"
-	"model-express/services/orchestrator/internal/memory"
-	"model-express/services/orchestrator/internal/plans"
-	"model-express/services/orchestrator/internal/runs"
 )
 
 type PlannerReplayVariant string
 
 const (
-	PlannerReplayVariantCurrentV1            PlannerReplayVariant = "current_v1"
-	PlannerReplayVariantCompactStaticPrompt  PlannerReplayVariant = "compact_static_prompt"
-	PlannerReplayVariantContextV2            PlannerReplayVariant = "context_v2"
-	PlannerReplayVariantDistilledMemoryFirst PlannerReplayVariant = "distilled_memory_first"
+	PlannerReplayVariantCurrentV1           PlannerReplayVariant = "current_v1"
+	PlannerReplayVariantCompactStaticPrompt PlannerReplayVariant = "compact_static_prompt"
+	PlannerReplayVariantContextV2           PlannerReplayVariant = "context_v2"
 )
 
 type PlannerReplayArtifact struct {
@@ -56,19 +50,7 @@ type PlannerReplayVariantResult struct {
 	SelectedModels                  []string             `json:"selected_models,omitempty"`
 	SelectedExperiments             int                  `json:"selected_experiments,omitempty"`
 	Scores                          PlannerReplayScores  `json:"scores"`
-}
-
-type replayTraceGenerator struct {
-	response []byte
-	request  llm.JSONRequest
-}
-
-func (g *replayTraceGenerator) GenerateJSON(_ context.Context, req llm.JSONRequest) ([]byte, error) {
-	g.request = req
-	if len(g.response) == 0 {
-		return nil, errors.New("replay generator has no response payload")
-	}
-	return g.response, nil
+	Rubric                          PlannerRubricScore   `json:"rubric"`
 }
 
 func ReplayPlannerResponse(fixture PlannerReplayFixture) ([]byte, error) {
@@ -87,6 +69,7 @@ func ReplayPlannerResponseJSON(ctx context.Context, fixture PlannerReplayFixture
 }
 
 func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixture, rawResponse []byte) (PlannerReplayArtifact, error) {
+	_ = ctx // Retained for API compatibility; deterministic replay makes no calls.
 	input := ExperimentPlannerInputFromReplayFixture(fixture)
 	artifact := PlannerReplayArtifact{
 		FixtureName: fixture.Name,
@@ -101,7 +84,7 @@ func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixtur
 	artifact.SchemaParseSuccess = true
 	artifact.RecommendationTitle = recommendation.Summary
 
-	_, currentRequest, err := captureCurrentReplayTrace(ctx, input, rawResponse)
+	currentRequest, err := buildCurrentReplayRequest(input)
 	if err != nil {
 		return artifact, err
 	}
@@ -112,15 +95,19 @@ func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixtur
 		PlannerReplayVariantCurrentV1,
 		PlannerReplayVariantCompactStaticPrompt,
 		PlannerReplayVariantContextV2,
-		PlannerReplayVariantDistilledMemoryFirst,
 	}
 	results := make([]PlannerReplayVariantResult, 0, len(variants))
 	for _, variant := range variants {
-		variantInput := replayVariantInput(input, variant)
-		scores, finalized, finalizeErr := scorePlannerRecommendationDetailed(variantInput, recommendation, fixture.Expected)
-		promptBytes := replayVariantPromptBytes(variantInput, variant)
+		// A request variant may change the model-facing projection, but the
+		// backend finalizer always receives the same complete production input.
+		scores, finalized, finalizeErr := scorePlannerRecommendationDetailed(input, recommendation, fixture.Expected)
+		promptBytes, err := replayVariantPromptBytes(input, variant)
+		if err != nil {
+			return artifact, err
+		}
 		selectedMechanisms := selectedReplayMechanisms(finalized)
 		selectedModels := replaySelectedModels(finalized)
+		rubric := ScorePlannerRubric(input, rawResponse, PlannerRubricForFixture(fixture))
 		result := PlannerReplayVariantResult{
 			Variant:                         variant,
 			PromptBytes:                     promptBytes,
@@ -139,6 +126,7 @@ func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixtur
 			SelectedModels:                  selectedModels,
 			SelectedExperiments:             len(finalized.ProposedExperiments),
 			Scores:                          scores,
+			Rubric:                          rubric,
 		}
 		if finalizeErr != nil && result.FinalizerError == "" {
 			result.FinalizerError = finalizeErr.Error()
@@ -150,199 +138,30 @@ func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixtur
 	return artifact, nil
 }
 
-func ReplayLiveMiniIfEnabled(ctx context.Context, agent agents.ExperimentPlannerAgent, fixture PlannerReplayFixture) (PlannerReplayArtifact, error) {
-	if !plannerReplayLiveEnabled() {
-		return PlannerReplayArtifact{}, errors.New("live planner replay disabled")
-	}
-	input := ExperimentPlannerInputFromReplayFixture(fixture)
-	trace, err := agent.PlanWithTrace(ctx, input)
+func buildCurrentReplayRequest(input agents.ExperimentPlannerInput) (llm.JSONRequest, error) {
+	agent := agents.NewExperimentPlannerAgent(nil, "replay-test-model")
+	built, err := agent.BuildRequest(input, replayRequestVariant(PlannerReplayVariantCurrentV1))
+	return built.Request, err
+}
+
+func replayVariantPromptBytes(input agents.ExperimentPlannerInput, variant PlannerReplayVariant) (int, error) {
+	agent := agents.NewExperimentPlannerAgent(nil, "replay-model")
+	built, err := agent.BuildRequest(input, replayRequestVariant(variant))
 	if err != nil {
-		return PlannerReplayArtifact{}, err
+		return 0, err
 	}
-	return ReplayPlannerResponseBytes(ctx, fixture, trace.RawOutput)
+	return replayApproximateJSONBytes(built.Request), nil
 }
 
-func captureCurrentReplayTrace(ctx context.Context, input agents.ExperimentPlannerInput, rawResponse []byte) (agents.ExperimentPlanningTrace, llm.JSONRequest, error) {
-	gen := &replayTraceGenerator{response: rawResponse}
-	agent := agents.NewExperimentPlannerAgent(gen, "replay-test-model")
-	trace, err := agent.PlanWithTrace(ctx, input)
-	return trace, gen.request, err
-}
-
-func replayVariantInput(input agents.ExperimentPlannerInput, variant PlannerReplayVariant) agents.ExperimentPlannerInput {
+func replayRequestVariant(variant PlannerReplayVariant) agents.ExperimentPlannerRequestVariant {
 	switch variant {
-	case PlannerReplayVariantContextV2:
-		input = replayContextV2Input(input, false)
-	case PlannerReplayVariantDistilledMemoryFirst:
-		input = replayContextV2Input(input, true)
-	}
-	return input
-}
-
-func replayVariantPromptBytes(input agents.ExperimentPlannerInput, variant PlannerReplayVariant) int {
-	switch variant {
-	case PlannerReplayVariantCurrentV1:
-		return replayPromptBytesForInput(input, currentPlannerSystemPrompt())
 	case PlannerReplayVariantCompactStaticPrompt:
-		return replayPromptBytesForInput(input, compactPlannerSystemPrompt())
+		return agents.ExperimentPlannerRequestVariant{StaticPromptVersion: "compact_v1", ContextVersion: "v1"}
 	case PlannerReplayVariantContextV2:
-		return replayPromptBytesForInput(replayContextV2Input(input, false), compactPlannerSystemPrompt())
-	case PlannerReplayVariantDistilledMemoryFirst:
-		return replayPromptBytesForInput(replayContextV2Input(input, true), compactPlannerSystemPrompt())
+		return agents.ExperimentPlannerRequestVariant{StaticPromptVersion: "compact_v1", ContextVersion: "v2"}
 	default:
-		return replayPromptBytesForInput(input, currentPlannerSystemPrompt())
+		return agents.ExperimentPlannerRequestVariant{StaticPromptVersion: "v1", ContextVersion: "v1"}
 	}
-}
-
-func replayPromptBytesForInput(input agents.ExperimentPlannerInput, systemPrompt string) int {
-	contextBlob := replayContextBlob(input)
-	request := llm.JSONRequest{
-		Model:       "replay-model",
-		Temperature: 0.35,
-		Messages: []llm.Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: fmt.Sprintf("Context:\n%s", string(contextBlob))},
-		},
-	}
-	return replayApproximateJSONBytes(request)
-}
-
-func replayContextBlob(input agents.ExperimentPlannerInput) []byte {
-	snapshot := agents.BuildPlannerContextSnapshot(input)
-	if blob, err := json.Marshal(snapshot); err == nil {
-		return blob
-	}
-	return nil
-}
-
-func currentPlannerSystemPrompt() string {
-	return strings.TrimSpace(`You are the Model Express Experiment Planning Agent.
-Return only valid JSON.
-Use backend validation, model catalog entries, and planner_context_snapshot evidence.
-Do not bypass validation or invent unsupported fields.`)
-}
-
-func compactPlannerSystemPrompt() string {
-	return strings.TrimSpace(`Return only valid JSON for the Experiment Planner.
-Use planner_context_snapshot evidence, model catalog entries, and backend validation constraints.
-Do not invent unsupported fields.`)
-}
-
-func replayContextV2Input(input agents.ExperimentPlannerInput, distilledMemoryFirst bool) agents.ExperimentPlannerInput {
-	// Keep the decision-critical fields and trim the high-volume history for the V2-style replay
-	// projection. This is only used in replay harness comparisons.
-	input.PlanJobs = nil
-	input.PlanMetrics = nil
-	input.PlanEvaluations = nil
-	input.PlanSummaries = trimTrainingSummaries(input.PlanSummaries, 6)
-	input.PriorJobs = nil
-	input.PriorEvaluations = nil
-	input.PriorMemory = nil
-	input.ExistingExperimentSignatures = trimStrings(input.ExistingExperimentSignatures, 12)
-	input.PriorPlans = trimPlans(input.PriorPlans, 4)
-	input.SuccessfulStrategyMemory = trimStrategyMemory(input.SuccessfulStrategyMemory, 4)
-	input.FailedStrategyMemory = trimStrategyMemory(input.FailedStrategyMemory, 4)
-	input.StrategyScorecards = trimStrategyScorecards(input.StrategyScorecards, 4)
-	if distilledMemoryFirst {
-		input.RetrievedMemory = distilledMemoryFirstResults(input)
-	}
-	return input
-}
-
-func distilledMemoryFirstResults(input agents.ExperimentPlannerInput) []memory.MemoryRetrievalResult {
-	results := append([]memory.MemoryRetrievalResult(nil), input.RetrievedMemory...)
-	if len(results) > 0 {
-		return trimRetrievedMemory(results, 6)
-	}
-	out := []memory.MemoryRetrievalResult{}
-	for _, memoryCard := range input.SuccessfulStrategyMemory {
-		out = append(out, memory.MemoryRetrievalResult{
-			SourceTable:     memory.SourceStrategyScorecard,
-			SourceID:        memoryCard.MemoryID,
-			ProjectID:       input.Project.ID,
-			DatasetID:       input.Dataset.ID,
-			Kind:            memory.KindPlanningOutcome,
-			Score:           0.8,
-			SemanticScore:   0.75,
-			StructuredScore: 0.82,
-			RetrievalReason: "distilled successful strategy lesson",
-			SummaryCard: map[string]any{
-				"outcome":      memoryCard.OutcomeStatus,
-				"mechanism":    "distilled_strategy",
-				"intervention": strings.Join(memoryCard.ProposedModels, ","),
-				"lesson":       memoryCard.Lesson,
-			},
-			Metadata: map[string]any{
-				"outcome": memoryCard.OutcomeStatus,
-				"models":  memoryCard.ProposedModels,
-			},
-		})
-	}
-	for _, memoryCard := range input.FailedStrategyMemory {
-		out = append(out, memory.MemoryRetrievalResult{
-			SourceTable:     memory.SourceStrategyScorecard,
-			SourceID:        memoryCard.MemoryID,
-			ProjectID:       input.Project.ID,
-			DatasetID:       input.Dataset.ID,
-			Kind:            memory.KindPlanningFeedback,
-			Score:           0.55,
-			SemanticScore:   0.52,
-			StructuredScore: 0.48,
-			RetrievalReason: "distilled failed strategy lesson",
-			SummaryCard: map[string]any{
-				"outcome":   memoryCard.OutcomeStatus,
-				"mechanism": "distilled_strategy",
-				"lesson":    memoryCard.Lesson,
-			},
-			Metadata: map[string]any{
-				"outcome": memoryCard.OutcomeStatus,
-				"models":  memoryCard.ProposedModels,
-			},
-		})
-	}
-	return trimRetrievedMemory(out, 6)
-}
-
-func trimPlans(values []plans.ExperimentPlan, limit int) []plans.ExperimentPlan {
-	if len(values) <= limit {
-		return values
-	}
-	return append([]plans.ExperimentPlan(nil), values[:limit]...)
-}
-
-func trimTrainingSummaries(values []runs.TrainingRunSummary, limit int) []runs.TrainingRunSummary {
-	if len(values) <= limit {
-		return values
-	}
-	return append([]runs.TrainingRunSummary(nil), values[:limit]...)
-}
-
-func trimStrategyMemory(values []agents.PlannerStrategyMemory, limit int) []agents.PlannerStrategyMemory {
-	if len(values) <= limit {
-		return values
-	}
-	return append([]agents.PlannerStrategyMemory(nil), values[:limit]...)
-}
-
-func trimStrategyScorecards(values []agents.PlannerStrategyScorecard, limit int) []agents.PlannerStrategyScorecard {
-	if len(values) <= limit {
-		return values
-	}
-	return append([]agents.PlannerStrategyScorecard(nil), values[:limit]...)
-}
-
-func trimRetrievedMemory(values []memory.MemoryRetrievalResult, limit int) []memory.MemoryRetrievalResult {
-	if len(values) <= limit {
-		return values
-	}
-	return append([]memory.MemoryRetrievalResult(nil), values[:limit]...)
-}
-
-func trimStrings(values []string, limit int) []string {
-	if len(values) <= limit {
-		return values
-	}
-	return append([]string(nil), values[:limit]...)
 }
 
 func replayBestPlannerVariant(results []PlannerReplayVariantResult) PlannerReplayVariant {
@@ -351,16 +170,16 @@ func replayBestPlannerVariant(results []PlannerReplayVariantResult) PlannerRepla
 	}
 	ordered := append([]PlannerReplayVariantResult(nil), results...)
 	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].BackendValidationPassed != ordered[j].BackendValidationPassed {
-			return ordered[i].BackendValidationPassed && !ordered[j].BackendValidationPassed
+		if ordered[i].Rubric.QualityTier != ordered[j].Rubric.QualityTier {
+			return ordered[i].Rubric.QualityTier > ordered[j].Rubric.QualityTier
 		}
-		if ordered[i].CandidateRankingScore == ordered[j].CandidateRankingScore {
-			if ordered[i].MechanismDiversity == ordered[j].MechanismDiversity {
-				return ordered[i].PromptBytes < ordered[j].PromptBytes
-			}
-			return ordered[i].MechanismDiversity > ordered[j].MechanismDiversity
+		if ordered[i].Rubric.SafetyPassed != ordered[j].Rubric.SafetyPassed {
+			return ordered[i].Rubric.SafetyPassed && !ordered[j].Rubric.SafetyPassed
 		}
-		return ordered[i].CandidateRankingScore > ordered[j].CandidateRankingScore
+		if ordered[i].Rubric.CorrectnessChecks != ordered[j].Rubric.CorrectnessChecks {
+			return ordered[i].Rubric.CorrectnessChecks > ordered[j].Rubric.CorrectnessChecks
+		}
+		return ordered[i].PromptBytes < ordered[j].PromptBytes
 	})
 	return ordered[0].Variant
 }
@@ -397,17 +216,4 @@ func replayApproximateTokens(bytes int) int {
 		return 0
 	}
 	return int(math.Ceil(float64(bytes) / 4.0))
-}
-
-func plannerReplayLiveEnabled() bool {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_REPLAY_LIVE_MINI")))
-	if value == "" {
-		value = strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_EXPRESS_REPLAY_LIVE")))
-	}
-	switch value {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }

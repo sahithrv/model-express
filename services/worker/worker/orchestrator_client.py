@@ -8,6 +8,8 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_REPORT_TIMEOUT_SECONDS = 15 * 60
 POLL_INTERVAL_SECONDS = 5
 ENDPOINT_UNAVAILABLE_STATUS_CODES = {404, 405, 501}
+POLICY_CAPABILITY_VERSIONS = ["policy_contract_v1"]
+ARTIFACT_CAPABILITY_VERSIONS = ["artifact_plan_v1"]
 
 class OrchestratorClient:
     def __init__(self, base_url: str, timeout: int | None = None):
@@ -105,6 +107,8 @@ class OrchestratorClient:
                 "project_id": project_id,
                 "name": name or os.getenv("WORKER_NAME", "local-worker-1"),
                 "gpu_type": gpu_type or os.getenv("GPU_TYPE", "local"),
+                "policy_capability_versions": POLICY_CAPABILITY_VERSIONS,
+                "artifact_capability_versions": ARTIFACT_CAPABILITY_VERSIONS,
             },
             **self._request_kwargs(timeout=request_timeout_seconds()),
         )
@@ -199,6 +203,39 @@ class OrchestratorClient:
         return response.json()
 
 
+    def report_progress(
+        self,
+        job_id: str,
+        progress: dict,
+        *,
+        job: dict | None = None,
+        timeout: int | float | None = None,
+    ) -> dict:
+        """Send one attempt-authenticated progress observation.
+
+        Retry and failure isolation belong to ``ProgressReporter``. Keeping this
+        method as a single HTTP attempt makes one revision safe to retry
+        idempotently without hiding how many network attempts were made.
+        """
+        response = requests.post(
+            f"{self.base_url}/jobs/{job_id}/progress",
+            json=self._with_callback_identity(job_id, progress, job=job, strict=True),
+            **self._callback_request_kwargs(
+                job_id,
+                job=job,
+                timeout=self.timeout if timeout is None else timeout,
+            ),
+        )
+        if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
+            return {
+                "status": "unavailable",
+                "reason": "progress_endpoint_unavailable",
+                "status_code": response.status_code,
+            }
+        response.raise_for_status()
+        return response.json()
+
+
     def report_training_run_summary(self, job_id: str, summary: dict, *, job: dict | None = None) -> dict:
         response = requests.post(
             f"{self.base_url}/jobs/{job_id}/training-run-summary",
@@ -214,6 +251,21 @@ class OrchestratorClient:
             json=self._with_callback_identity(job_id, evaluation, job=job, strict=True),
             **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
         )
+        response.raise_for_status()
+        return response.json()
+
+    def report_execution_observation(self, job_id: str, observation: dict, *, job: dict | None = None) -> dict:
+        response = requests.post(
+            f"{self.base_url}/jobs/{job_id}/execution-observations",
+            json=self._with_callback_identity(job_id, observation, job=job, strict=True),
+            **self._callback_request_kwargs(job_id, job=job, timeout=report_timeout_seconds()),
+        )
+        if response.status_code in ENDPOINT_UNAVAILABLE_STATUS_CODES:
+            return {
+                "status": "unavailable",
+                "reason": "execution_observation_endpoint_unavailable",
+                "status_code": response.status_code,
+            }
         response.raise_for_status()
         return response.json()
 

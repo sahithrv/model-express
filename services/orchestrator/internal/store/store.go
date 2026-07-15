@@ -1,17 +1,21 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"time"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
@@ -23,6 +27,8 @@ var (
 	ErrNotFound       = errors.New("not found")
 	ErrNoJob          = errors.New("no job available")
 	ErrInvalidRequest = errors.New("invalid request")
+	ErrStaleAttempt   = errors.New("stale job attempt")
+	ErrPolicyChanged  = errors.New("experiment policy changed during job dispatch")
 )
 
 type JobPollFilter struct {
@@ -32,8 +38,13 @@ type JobPollFilter struct {
 }
 
 type RetryJobOptions struct {
-	Config    map[string]any
-	ForceFail bool
+	Config          map[string]any
+	ForceFail       bool
+	PolicyReference policies.PersistenceReference
+}
+
+type CreateJobOptions struct {
+	PolicyReference policies.PersistenceReference
 }
 
 type PageOptions struct {
@@ -68,7 +79,19 @@ func (filter JobPollFilter) Matches(job jobs.ExperimentJob) bool {
 type Store interface {
 	CreateProject(name string, goal string) (projects.Project, error)
 	GetProject(id string) (projects.Project, error)
+	GetProjectContext(ctx context.Context, id string) (projects.Project, error)
 	ListProjects() ([]projects.Project, error)
+
+	CreateCompatibilityProfile(profile policies.CompatibilityProfile) (policies.CompatibilityProfile, error)
+	GetCompatibilityProfile(profileKey string, semanticVersion string) (policies.CompatibilityProfile, error)
+	CreateExperimentPolicyVersion(version policies.PolicyVersion) (policies.PolicyVersion, error)
+	GetExperimentPolicyVersion(id string) (policies.PolicyVersion, error)
+	SetExperimentPolicyBinding(write policies.BindingWrite) (policies.Binding, error)
+	ClearExperimentPolicyBinding(scope policies.Scope, subjectID string, expectedRevision int64) (policies.Binding, error)
+	ListActiveExperimentPolicyBindings(scope policies.ScopeContext) ([]policies.Binding, error)
+	CreateExperimentPolicyEvaluation(evaluation policies.Evaluation) (policies.Evaluation, error)
+	GetExperimentPolicyEvaluation(id string) (policies.Evaluation, error)
+	ListExperimentPolicyEvaluations(projectID string) ([]policies.Evaluation, error)
 
 	CreateDataset(projectID string, name string, storageURI string, checksumSHA256 string, sizeBytes int64) (datasets.Dataset, error)
 	GetDataset(id string) (datasets.Dataset, error)
@@ -85,16 +108,24 @@ type Store interface {
 	ListDatasetVisualAnalyses(datasetID string) ([]datasets.DatasetVisualAnalysis, error)
 
 	RegisterWorker(projectID string, name string, gpuType string) (workers.Worker, error)
+	RegisterWorkerWithCapabilities(projectID string, name string, gpuType string, policyVersions []string, artifactVersions []string) (workers.Worker, error)
 	ListWorkers() ([]workers.Worker, error)
 	ListProjectWorkers(projectID string) ([]workers.Worker, error)
 	GetWorker(workerID string) (workers.Worker, error)
 	HeartbeatWorker(id string) (workers.Worker, error)
 	PollJob(workerID string, filter JobPollFilter) (*jobs.ExperimentJob, error)
+	ListQueuedJobsForWorker(workerID string, filter JobPollFilter, limit int) ([]jobs.ExperimentJob, error)
+	ApplyQueuedJobPolicyEvaluation(jobID string, evaluation policies.Evaluation) (jobs.ExperimentJob, policies.Evaluation, bool, error)
+	ClaimJobIfQueuedAndPolicyCurrent(workerID string, jobID string, filter JobPollFilter, evaluation policies.Evaluation) (*jobs.ExperimentJob, policies.Evaluation, bool, error)
 
 	CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error)
+	CreateJobWithOptions(projectID string, template string, config map[string]any, options CreateJobOptions) (jobs.ExperimentJob, error)
 	GetJob(id string) (jobs.ExperimentJob, error)
 	ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error)
 	ListProjectJobsPage(projectID string, options PageOptions) ([]jobs.ExperimentJob, error)
+	GetJobProgress(jobID string, attempt int) (jobs.JobProgress, error)
+	UpsertJobProgress(jobID string, update jobs.JobProgressUpsert) (jobs.JobProgress, error)
+	ReportJobProgress(jobID string, attemptID string, update jobs.JobProgressUpsert) (jobs.JobProgressReportResult, error)
 	UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error)
 	RecoverExpiredJobLeases(now time.Time) ([]jobs.ExperimentJob, error)
 	ReportMetric(jobID string, epoch int, values map[string]float64) (jobs.EpochMetric, error)
@@ -103,6 +134,12 @@ type Store interface {
 	CompleteJob(jobID string, mlflowRunID string) (jobs.ExperimentJob, error)
 	RetryJob(jobID string, message string, options RetryJobOptions) (jobs.ExperimentJob, bool, error)
 	FailJob(jobID string, message string) (jobs.ExperimentJob, error)
+	CancelJob(jobID string, message string, configPatch map[string]any) (jobs.ExperimentJob, error)
+	GetJobExecutionRecord(jobID string) (execution.ExecutionRecord, error)
+	ListProjectExecutionRecords(projectID string, options PageOptions) ([]execution.ExecutionRecord, error)
+	CreateAttemptExecutionRecord(jobID string, attemptID string, attemptNumber int) (execution.AttemptExecutionRecord, error)
+	AppendRealizationObservation(jobID string, create execution.RealizationObservationCreate) (execution.RealizationObservation, bool, error)
+	MarkAttemptNotRealized(jobID string, attemptID string) (execution.AttemptExecutionRecord, error)
 
 	UpsertTrainingRunSummary(jobID string, update runs.TrainingRunSummaryUpdate) (runs.TrainingRunSummary, error)
 	GetTrainingRunSummary(jobID string) (runs.TrainingRunSummary, error)
@@ -127,7 +164,16 @@ type Store interface {
 	ListProjectChampionFeedback(projectID string) ([]runs.ChampionFeedback, error)
 
 	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)
+	CreateAgentDecisionWithPolicy(projectID string, planID string, decisionType string, rationale string, payload map[string]any, policy policies.PersistenceReference) (decisions.AgentDecision, error)
+	CreateAgentDecisionWithCandidateProvenance(projectID string, planID string, decisionType string, rationale string, payload map[string]any, candidates []calibration.CandidateProvenanceCreate) (decisions.AgentDecision, []calibration.CandidateProvenance, error)
+	CreateAgentDecisionWithCandidateProvenanceAndPolicy(projectID string, planID string, decisionType string, rationale string, payload map[string]any, candidates []calibration.CandidateProvenanceCreate, policy policies.PersistenceReference) (decisions.AgentDecision, []calibration.CandidateProvenance, error)
+	EnsureCandidateProvenance(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error)
+	FinalizeCandidateOutcomes(decisionID string, updates []calibration.CandidateOutcomeUpdate) ([]calibration.CandidateProvenance, error)
+	ListDecisionCandidateProvenance(decisionID string) ([]calibration.CandidateProvenance, error)
+	ListProjectCandidateProvenance(projectID string) ([]calibration.CandidateProvenance, error)
+	ReadCalibrationObservations(projectID string, window calibration.TimeWindow, limit int) (calibration.ObservationSet, error)
 	ListProjectAgentDecisions(projectID string) ([]decisions.AgentDecision, error)
+	ListProjectAgentDecisionActivity(projectID string, limit int) ([]decisions.AgentDecision, error)
 
 	GetAutomationSettings() (settings.AutomationSettings, error)
 	SaveAutomationSettings(automationSettings settings.AutomationSettings) (settings.AutomationSettings, error)
@@ -136,14 +182,21 @@ type Store interface {
 	ListProjectWorkerRequirements(projectID string) ([]execution.WorkerRequirement, error)
 	UpdateWorkerRequirement(id string, update execution.WorkerRequirementUpdate) (execution.WorkerRequirement, error)
 	CreateExecutionEvent(projectID string, planID string, eventType string, message string, payload map[string]any) (execution.ExecutionEvent, error)
+	CreateExecutionTransition(input execution.ExecutionTransitionEventInput) (execution.ExecutionEvent, bool, error)
 	ListProjectExecutionEvents(projectID string, limit int) ([]execution.ExecutionEvent, error)
+	ListProjectExecutionEventActivity(projectID string, limit int) ([]execution.ExecutionEvent, error)
+	ListProjectExecutionEventsAfter(ctx context.Context, projectID string, cursor int64, limit int) ([]execution.ExecutionEvent, error)
+	GetExecutionEventCursorState(ctx context.Context) (execution.ExecutionEventCursorState, error)
+	GetProjectLiveState(ctx context.Context, projectID string) (ProjectLiveStateSnapshot, error)
 
 	CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error)
 	ListProjectAgentMemoryRecords(projectID string, filter memory.AgentMemoryFilter) ([]memory.AgentMemoryRecord, error)
 	CreateAgentInvocation(invocation memory.AgentInvocation) (memory.AgentInvocation, error)
 	GetAgentInvocation(invocationID string) (memory.AgentInvocation, error)
 	UpdateAgentInvocationDownstreamOutcome(invocationID string, outcome map[string]any) (memory.AgentInvocation, error)
+	UpdateAgentInvocationValidation(invocationID string, verdict plannervalidation.Verdict, outcome plannervalidation.Outcome) (memory.AgentInvocation, error)
 	ListProjectAgentInvocations(projectID string, filter memory.AgentInvocationFilter) ([]memory.AgentInvocation, error)
+	ListProjectAgentInvocationActivity(projectID string, limit int) ([]memory.AgentInvocationActivity, error)
 	UpsertMemoryEmbedding(record memory.MemoryEmbeddingRecord) (memory.MemoryEmbeddingRecord, error)
 	SearchMemoryEmbeddings(query memory.MemoryRetrievalQuery) ([]memory.MemoryRetrievalResult, error)
 	CountMemoryEmbeddings(projectID string, datasetID string, embeddingModel string) (int, error)
@@ -167,6 +220,7 @@ type Store interface {
 	ListStudyOptimizerTrials(studyID string) ([]automl.OptimizerTrial, error)
 
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
+	CreateExperimentPlanWithPolicy(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string, policy policies.PersistenceReference) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)
 	ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error)
 }

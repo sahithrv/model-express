@@ -1,0 +1,27 @@
+name: Orchestrator verification
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/orchestrator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/orchestrator/go.mod
+          cache-dependency-path: services/orchestrator/go.sum
+      - name: Required deterministic planner evaluation gate
+        run: go run ./cmd/planner-eval -check-baseline
+      - name: Orchestrator tests
+        run: go test ./... -count=1

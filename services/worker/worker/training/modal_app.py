@@ -3,21 +3,42 @@ from __future__ import annotations
 import base64
 import copy
 import csv
-import contextvars
 import hashlib
 import json
 import os
 import random
 import re
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
+from worker.model_express_catalog import require_catalog_id
+from worker.progress import ProgressReporter
 from worker.training.augmentation import (
     MIXED_SAMPLE_POLICY_TYPES,
     normalize_augmentation_config,
     structured_policy_type,
+)
+from worker.training.classification_execution import (
+    ClassificationExecution,
+    ClassificationExecutionError,
+    OBSERVATION_SCHEMA,
+    load_torchvision_model,
+    realization_matches_policy,
+    resolve_classification_execution,
+)
+from worker.training.yolo_execution import (
+    OBSERVATION_SCHEMA as YOLO_OBSERVATION_SCHEMA,
+    PINNED_ULTRALYTICS_VERSION,
+    YoloExecution,
+    YoloExecutionError,
+    capture_yolo_trainer_arguments,
+    realize_yolo_trainer_arguments,
+    resolve_yolo_execution,
+    ultralytics_train_kwargs,
+    yolo_framework_semantic_arguments,
+    yolo_framework_semantic_hash,
+    yolo_realization_matches_policy,
 )
 from worker.training.preprocessing_registry import (
     bbox_compare_requested,
@@ -64,7 +85,6 @@ from worker.training.modal_runtime import (
     ROOT_METADATA_DIR_NAMES,
     TORCH_CACHE_ROOT,
     TORCH_CACHE_VOLUME_NAME,
-    _MODAL_STAGE_EVENTS,
     _bool,
     _modal_cost_sensitive_defaults_enabled,
     _modal_dataset_materialization_timeout_seconds,
@@ -175,35 +195,6 @@ from worker.training.modal_yolo import (
 )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class _DatasetRelativePathResolver:
     def __init__(self, dataset_dir: Path):
         from worker.datasets.metadata_discovery import is_safe_relative_path
@@ -233,7 +224,6 @@ class _DatasetRelativePathResolver:
         return None
 
 
-
 @app.function(
     image=image,
     gpu=DEFAULT_GPU,
@@ -258,48 +248,72 @@ def train_image_classifier(payload: dict) -> dict:
 
 def _train_image_classifier_impl(payload: dict) -> dict:
     import time
-    import torch
 
     started_at = time.time()
-    stage_events: list[dict] = []
-    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
     job = payload["job"]
     config = job["config"]
+    from worker.artifact_plan import load_artifact_plan
+
+    artifact_plan = load_artifact_plan(
+        config,
+        task="image_classification",
+        runner="modal_torchvision",
+    )
     dataset = payload["dataset"]
     orchestrator_url = payload["orchestrator_url"].rstrip("/")
+    progress_reporter = _modal_remote_progress_reporter(payload, orchestrator_url, job)
+    pre_materialized_dataset = isinstance(payload.get("_modal_pre_materialized_dataset"), dict)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "environment_starting",
+            detail_code="modal_container_starting",
+            message="Modal training environment is starting.",
+        )
+
+    import torch
 
     _configure_storage_env(payload)
 
     job_id = job["id"]
     dataset_id = dataset["id"]
     modal_resources = modal_resources_from_payload(payload, config, detection_job=False)
-    epochs = _positive_int(config.get("epochs"), default=5)
-    batch_size = _positive_int(modal_resources.get("effective_batch_size"), default=16)
-    learning_rate = _positive_float(config.get("learning_rate"), default=0.0003)
-    image_size = _bounded_int(config.get("image_size"), default=224, minimum=96, maximum=384)
-    optimizer_name = str(config.get("optimizer", "adamw")).lower()
-    scheduler_name = str(config.get("scheduler", "none")).lower()
-    weight_decay = _non_negative_float(config.get("weight_decay"), default=0.0)
-    dropout = _bounded_float(config.get("dropout"), default=0.0, minimum=0.0, maximum=0.7)
-    optimizer_momentum = _bounded_float(config.get("optimizer_momentum"), default=0.9, minimum=0.0, maximum=0.99)
-    scheduler_step_size = _bounded_int(config.get("scheduler_step_size"), default=max(1, epochs // 3), minimum=1, maximum=max(1, epochs))
-    scheduler_gamma = _bounded_float(config.get("scheduler_gamma"), default=0.5, minimum=0.05, maximum=0.95)
-    label_smoothing = _bounded_float(config.get("label_smoothing"), default=0.0, minimum=0.0, maximum=0.3)
-    gradient_clip_norm = _bounded_float(config.get("gradient_clip_norm"), default=0.0, minimum=0.0, maximum=10.0)
-    augmentation = normalize_augmentation_config(
-        config.get("augmentation"),
-        config.get("augmentation_policy", ""),
-        config.get("augmentation_policy_config"),
+    accepted_execution = resolve_classification_execution(config)
+    accepted_batch_size = int(accepted_execution.value("batch_size"))
+    resource_batch_size = _positive_int(
+        modal_resources.get("effective_batch_size"),
+        default=accepted_batch_size,
     )
-    class_balancing = str(config.get("class_balancing", "")).lower()
-    sampling_strategy = str(config.get("sampling_strategy", "")).lower()
-    preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
-    class_balancing_config = config.get("class_balancing_config") if isinstance(config.get("class_balancing_config"), dict) else {}
-    early_stopping_patience = _positive_int(config.get("early_stopping_patience"), default=0)
-    model_name = str(config.get("model", "mobilenet_v3_small"))
-    pretrained = _bool(config.get("pretrained"), default=True)
-    freeze_backbone = _bool(config.get("freeze_backbone"), default=True)
-    fine_tune_strategy = str(config.get("fine_tune_strategy", "head_only")).lower()
+    classification_execution = resolve_classification_execution(
+        config,
+        effective_batch_size=resource_batch_size,
+    )
+    realized_config = classification_execution.realized_config
+    epochs = int(classification_execution.value("epochs"))
+    batch_size = int(classification_execution.value("batch_size"))
+    learning_rate = float(classification_execution.value("learning_rate"))
+    image_size = int(classification_execution.value("image_size"))
+    optimizer_name = str(classification_execution.value("optimizer"))
+    scheduler_name = str(classification_execution.value("scheduler"))
+    weight_decay = float(classification_execution.value("weight_decay"))
+    dropout = float(classification_execution.value("dropout"))
+    optimizer_momentum = float(realized_config.get("optimizer_momentum", 0.0))
+    scheduler_step_size = int(realized_config.get("scheduler_step_size", max(1, epochs // 3)))
+    scheduler_gamma = float(realized_config.get("scheduler_gamma", 0.5))
+    label_smoothing = float(classification_execution.value("label_smoothing"))
+    gradient_clip_norm = float(classification_execution.value("gradient_clip_norm"))
+    augmentation = classification_execution.augmentation
+    class_balancing = str(classification_execution.value("class_balancing"))
+    sampling_strategy = str(classification_execution.value("sampling_strategy"))
+    preprocessing = classification_execution.preprocessing
+    class_balancing_config = realized_config.get("class_balancing_config")
+    if not isinstance(class_balancing_config, dict):
+        class_balancing_config = {}
+    early_stopping_patience = int(classification_execution.value("early_stopping_patience"))
+    model_name = str(classification_execution.value("model"))
+    pretrained = bool(classification_execution.value("pretrained"))
+    freeze_backbone = bool(classification_execution.value("freeze_backbone"))
+    fine_tune_strategy = str(classification_execution.value("fine_tune_strategy"))
     gpu_type = str(modal_resources.get("effective_gpu_type") or config.get("gpu_type") or "T4")
     modal_function_call_id, modal_input_id = _modal_identifiers()
     modal_resources = {
@@ -312,6 +326,13 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     _modal_training_phase(job_id, "torch_cache_reload_start", started_at)
     _reload_modal_torch_cache_volume()
     _modal_training_phase(job_id, "torch_cache_reload_done", started_at)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "dataset_materializing",
+            detail_code="classification_dataset_materializing",
+            message="Classification dataset is being materialized.",
+        )
     dataset_dir, dataset_materialization = _modal_training_dataset_for_job(
         payload,
         dataset=dataset,
@@ -319,6 +340,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         job_id=job_id,
         dataset_id=dataset_id,
         started_at=started_at,
+    )
+    _report_modal_progress(
+        progress_reporter,
+        "data_loading",
+        detail_code="classification_data_loading",
+        message="Classification data loaders are being prepared.",
     )
     _modal_training_phase(job_id, "metadata_fetch_start", started_at)
     metadata_bundle = _fetch_training_metadata_bundle(orchestrator_url, dataset_id, config)
@@ -357,6 +384,10 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     if isinstance(subset_manifest, dict):
         dataset_materialization["subset_manifest"] = subset_manifest
     effective_batch_size = _positive_int(getattr(train_loader, "batch_size", None), default=batch_size)
+    classification_execution = resolve_classification_execution(
+        config,
+        effective_batch_size=effective_batch_size,
+    )
     modal_resource_telemetry = resource_telemetry(
         modal_resources,
         effective_batch_size=effective_batch_size,
@@ -374,6 +405,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         loader_workers=dataloader_metadata.get("workers"),
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _report_modal_progress(
+        progress_reporter,
+        "model_initializing",
+        detail_code="classification_model_initializing",
+        message="Classification model and optimizer are being initialized.",
+    )
     _modal_training_phase(job_id, "model_build_start", started_at, model=model_name, pretrained=pretrained, device=str(device))
     model = _build_model(model_name, len(class_names), pretrained, freeze_backbone, fine_tune_strategy, dropout).to(device)
     _modal_training_phase(job_id, "model_build_done", started_at, model=model_name, device=str(device))
@@ -389,6 +426,37 @@ def _train_image_classifier_impl(payload: dict) -> dict:
     optimizer = _build_optimizer(optimizer_name, trainable_parameters, learning_rate, weight_decay, optimizer_momentum)
     scheduler = _build_scheduler(scheduler_name, optimizer, epochs, scheduler_step_size, scheduler_gamma)
     _modal_training_phase(job_id, "optimizer_ready", started_at, trainable_parameters=len(trainable_parameters))
+
+    classification_framework_arguments = _classification_framework_arguments(
+        classification_execution,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        model=model,
+        augmentation=augmentation,
+        effective_preprocessing=effective_preprocessing,
+    )
+    _post_classification_execution_observation(
+        orchestrator_url,
+        job,
+        stage="INITIALIZED",
+        idempotency_key="classification-initialized-v1",
+        execution=classification_execution,
+        framework_arguments=classification_framework_arguments,
+        evidence={
+            "class_count": len(class_names),
+            "trainable_parameter_count": sum(parameter.numel() for parameter in trainable_parameters),
+        },
+        modal_resources=modal_resources,
+    )
+    if classification_execution.fidelity_mode == "enforce" and not realization_matches_policy(classification_execution):
+        raise ValueError(
+            "Runner fidelity enforcement rejected a classification realization mismatch before training."
+        )
+
+    _report_classification_training_progress(progress_reporter, current=0, total=epochs)
 
     best_macro_f1 = 0.0
     best_accuracy = 0.0
@@ -483,16 +551,17 @@ def _train_image_classifier_impl(payload: dict) -> dict:
                 "modal_input_id": modal_input_id,
                 "dataset_materialization": dataset_materialization,
                 "stage_telemetry": _modal_stage_telemetry_payload(
-                    job,
-                    runtime_seconds,
-                    stage_events,
-                    dataset_materialization,
                     gpu_type,
                     modal_resources=modal_resource_telemetry,
                 ),
             },
             job=job,
             modal_resources=modal_resources,
+        )
+        _report_classification_training_progress(
+            progress_reporter,
+            current=epoch,
+            total=epochs,
         )
         if _should_stop_training_early(
             epoch=epoch,
@@ -507,6 +576,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
 
     runtime_seconds = time.time() - started_at
     estimated_cost_usd = runtime_seconds * _modal_gpu_price_per_second(gpu_type)
+    _report_modal_progress(
+        progress_reporter,
+        "evaluating",
+        detail_code="classification_final_evaluation",
+        message="Classification final evaluation is running.",
+    )
     _modal_training_phase(job_id, "final_eval_start", started_at)
     test_loss, test_accuracy, test_macro_f1, test_eval_details = _evaluate(
         model,
@@ -534,6 +609,12 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         dataset=dataset,
         job_id=job_id,
     )
+    _report_modal_progress(
+        progress_reporter,
+        "exporting",
+        detail_code="classification_exporting",
+        message="Classification model artifacts are being exported.",
+    )
     _modal_training_phase(job_id, "export_start", started_at)
     export_bundle = _export_trained_champion_bundle(
         model=model,
@@ -542,12 +623,17 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         image_size=image_size,
         preprocessing=effective_preprocessing,
         model_profile=model_profile,
-        training_config={**config, "preprocessing": effective_preprocessing},
+        training_config={
+            **config,
+            **classification_execution.realized_config,
+            "preprocessing": effective_preprocessing,
+        },
         dataset=dataset,
         job_id=job_id,
         export_self_test_samples=test_eval_details.get("export_self_test_samples")
         if isinstance(test_eval_details.get("export_self_test_samples"), list)
         else [],
+        artifact_plan=artifact_plan,
     )
     _modal_training_phase(job_id, "export_done", started_at, status=export_bundle.get("status", ""))
     runtime_seconds = time.time() - started_at
@@ -576,124 +662,120 @@ def _train_image_classifier_impl(payload: dict) -> dict:
         "export_validation_errors": export_bundle.get("validation_errors", []),
         "modal_resources": modal_resource_telemetry,
     }
-    _post_training_run_summary(
-        orchestrator_url,
-        job_id,
-        {
-            "model": model_name,
-            "provider": "modal",
-            "gpu_type": gpu_type,
-            "status": "SUCCEEDED",
-            "runtime_seconds": round(runtime_seconds, 3),
-            "estimated_cost_usd": round(estimated_cost_usd, 6),
-            "best_macro_f1": round(best_macro_f1, 6),
-            "best_accuracy": round(best_accuracy, 6),
-            "final_train_loss": round(train_loss, 6),
-            "final_val_loss": round(val_loss, 6),
-            "epochs_completed": completed_epochs,
-            "modal_function_call_id": modal_function_call_id,
-            "modal_input_id": modal_input_id,
-            "dataset_materialization": dataset_materialization,
-            "stage_telemetry": _modal_stage_telemetry_payload(
-                job,
+    final_summary_payload = {
+        "model": model_name,
+        "provider": "modal",
+        "gpu_type": gpu_type,
+        "status": "SUCCEEDED",
+        "runtime_seconds": round(runtime_seconds, 3),
+        "estimated_cost_usd": round(estimated_cost_usd, 6),
+        "best_macro_f1": round(best_macro_f1, 6),
+        "best_accuracy": round(best_accuracy, 6),
+        "final_train_loss": round(train_loss, 6),
+        "final_val_loss": round(val_loss, 6),
+        "epochs_completed": completed_epochs,
+        "modal_function_call_id": modal_function_call_id,
+        "modal_input_id": modal_input_id,
+        "dataset_materialization": dataset_materialization,
+        "stage_telemetry": _modal_stage_telemetry_payload(
+            gpu_type,
+            modal_resources=modal_resource_telemetry,
+        ),
+        "execution_references": _training_export_references(export_bundle),
+    }
+    final_evaluation_payload = {
+        "objective_profile": {
+            "target_metric": str(config.get("target_metric", "macro_f1")),
+            "metric_preferences": ["macro_f1", "accuracy", "per_class_f1", "latency"],
+            "split_strategy": "train_validation_with_heldout_test_when_possible",
+            "heldout_test_accuracy": round(test_accuracy, 6),
+            "heldout_test_macro_f1": round(test_macro_f1, 6),
+            "heldout_test_loss": round(test_loss, 6),
+            "heldout_demo_images": demo_images,
+            "modal_resources": modal_resource_telemetry,
+        },
+        "per_class_metrics": final_eval_details.get("per_class_metrics", {}),
+        "confusion_matrix": final_eval_details.get("confusion_matrix", []),
+        "model_profile": {
+            **model_profile,
+            "pretrained": pretrained,
+            "freeze_backbone": freeze_backbone,
+            "fine_tune_strategy": fine_tune_strategy,
+            "dropout": dropout,
+            "modal_resources": modal_resource_telemetry,
+        },
+        "holistic_scores": {
+            **_holistic_scores(
+                best_macro_f1,
+                best_accuracy,
+                estimated_cost_usd,
                 runtime_seconds,
-                stage_events,
-                dataset_materialization,
-                gpu_type,
-                modal_resources=modal_resource_telemetry,
+                model_profile,
             ),
+            "modal_resources": modal_resource_telemetry,
         },
-        job=job,
-        modal_resources=modal_resources,
-    )
-    _post_training_run_evaluation(
-        orchestrator_url,
-        job_id,
-        {
-            "objective_profile": {
-                "target_metric": str(config.get("target_metric", "macro_f1")),
-                "metric_preferences": ["macro_f1", "accuracy", "per_class_f1", "latency"],
-                "split_strategy": "train_validation_with_heldout_test_when_possible",
-                "heldout_test_accuracy": round(test_accuracy, 6),
-                "heldout_test_macro_f1": round(test_macro_f1, 6),
-                "heldout_test_loss": round(test_loss, 6),
-                "heldout_demo_images": demo_images,
-                "modal_resources": modal_resource_telemetry,
-            },
-            "per_class_metrics": final_eval_details.get("per_class_metrics", {}),
-            "confusion_matrix": final_eval_details.get("confusion_matrix", []),
-            "model_profile": {
-                **model_profile,
-                "pretrained": pretrained,
-                "freeze_backbone": freeze_backbone,
-                "fine_tune_strategy": fine_tune_strategy,
+        "preprocessing_summary": {
+            "augmentation_policy": str(
+                classification_execution.realized_config.get("augmentation_policy", "none")
+            ),
+            "augmentation_policy_config": classification_execution.realized_config.get(
+                "augmentation_policy_config", {}
+            ),
+            "class_balancing": class_balancing,
+            "sampling_strategy": sampling_strategy,
+            "preprocessing": preprocessing,
+            "effective_preprocessing": effective_preprocessing,
+            "worker_execution_metadata": _public_execution_metadata(execution_metadata),
+            "dataset_materialization": dataset_materialization,
+            "bbox_crop_ablation": bbox_ablation,
+            "training_hyperparameters": {
+                "optimizer": optimizer_name,
+                "scheduler": scheduler_name,
+                "learning_rate": learning_rate,
+                "weight_decay": weight_decay,
                 "dropout": dropout,
-                "modal_resources": modal_resource_telemetry,
+                "optimizer_momentum": optimizer_momentum if optimizer_name == "sgd" else 0,
+                "scheduler_step_size": scheduler_step_size if scheduler_name == "step" else 0,
+                "scheduler_gamma": scheduler_gamma if scheduler_name == "step" else 0,
+                "label_smoothing": label_smoothing,
+                "gradient_clip_norm": gradient_clip_norm,
+                "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
+                "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
+                "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
+                "focal_loss_gamma": _bounded_float(
+                    class_balancing_config.get("focal_loss_gamma"),
+                    default=2.0,
+                    minimum=0.5,
+                    maximum=5.0,
+                )
+                if class_balancing == "focal_loss"
+                else 0,
             },
-            "holistic_scores": {
-                **_holistic_scores(
-                    best_macro_f1,
-                    best_accuracy,
-                    estimated_cost_usd,
-                    runtime_seconds,
-                    model_profile,
-                ),
-                "modal_resources": modal_resource_telemetry,
-            },
-            "preprocessing_summary": {
-                "augmentation_policy": str(config.get("augmentation_policy", "")),
-                "augmentation_policy_config": config.get("augmentation_policy_config")
-                if isinstance(config.get("augmentation_policy_config"), dict)
-                else {},
-                "class_balancing": class_balancing,
-                "sampling_strategy": sampling_strategy,
-                "preprocessing": preprocessing,
-                "effective_preprocessing": effective_preprocessing,
-                "worker_execution_metadata": _public_execution_metadata(execution_metadata),
-                "dataset_materialization": dataset_materialization,
-                "bbox_crop_ablation": bbox_ablation,
-                "training_hyperparameters": {
-                    "optimizer": optimizer_name,
-                    "scheduler": scheduler_name,
-                    "learning_rate": learning_rate,
-                    "weight_decay": weight_decay,
-                    "dropout": dropout,
-                    "optimizer_momentum": optimizer_momentum if optimizer_name == "sgd" else 0,
-                    "scheduler_step_size": scheduler_step_size if scheduler_name == "step" else 0,
-                    "scheduler_gamma": scheduler_gamma if scheduler_name == "step" else 0,
-                    "label_smoothing": label_smoothing,
-                    "gradient_clip_norm": gradient_clip_norm,
-                    "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
-                    "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
-                    "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
-                    "focal_loss_gamma": _bounded_float(
-                        class_balancing_config.get("focal_loss_gamma"),
-                        default=2.0,
-                        minimum=0.5,
-                        maximum=5.0,
-                    )
-                    if class_balancing == "focal_loss"
-                    else 0,
-                },
-            },
-            "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
-            "export_bundle": export_bundle,
-            "recommendation_summary": (
-                f"{model_name} finished with macro-F1 {best_macro_f1:.3f}, "
-                f"accuracy {best_accuracy:.3f}, and estimated latency "
-                f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
-            ),
         },
+        "label_quality_audit": _label_quality_audit(config, test_eval_details, class_names),
+        "export_bundle": export_bundle,
+        "execution_references": _training_export_references(export_bundle),
+        "recommendation_summary": (
+            f"{model_name} finished with macro-F1 {best_macro_f1:.3f}, "
+            f"accuracy {best_accuracy:.3f}, and estimated latency "
+            f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
+        ),
+    }
+    _publish_classification_final_callbacks(
+        progress_reporter=progress_reporter,
+        orchestrator_url=orchestrator_url,
         job=job,
+        summary_payload=final_summary_payload,
+        evaluation_payload=final_evaluation_payload,
+        execution=classification_execution,
+        framework_arguments=classification_framework_arguments,
+        fidelity_evidence={
+            "completed_epochs": completed_epochs,
+            "export_status": export_bundle.get("status", ""),
+            "class_count": len(class_names),
+        },
         modal_resources=modal_resources,
-    )
-
-    _post_job_json(
-        orchestrator_url,
-        job,
-        "complete",
-        {"mlflow_run_id": f"modal-{job_id}"},
-        modal_resources=modal_resources,
+        mlflow_run_id=f"modal-{job_id}",
     )
 
     return {
@@ -734,26 +816,56 @@ def train_yolo_detector(payload: dict) -> dict:
 def _train_yolo_detector_impl(payload: dict) -> dict:
     import time
 
-    from ultralytics import YOLO
-
     started_at = time.time()
-    stage_events: list[dict] = []
-    _MODAL_STAGE_EVENTS.set(stage_events if _modal_stage_telemetry_enabled() else None)
     job = payload["job"]
     config = job["config"]
     dataset = payload["dataset"]
     orchestrator_url = payload["orchestrator_url"].rstrip("/")
+    progress_reporter = _modal_remote_progress_reporter(payload, orchestrator_url, job)
+    pre_materialized_dataset = isinstance(payload.get("_modal_pre_materialized_dataset"), dict)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "environment_starting",
+            detail_code="modal_yolo_container_starting",
+            message="Modal YOLO training environment is starting.",
+        )
+
+    import ultralytics
+
+    YOLO = ultralytics.YOLO
+    ultralytics_version = str(getattr(ultralytics, "__version__", ""))
+    if ultralytics_version != PINNED_ULTRALYTICS_VERSION:
+        raise YoloExecutionError(
+            "YOLO runner requires Ultralytics "
+            f"{PINNED_ULTRALYTICS_VERSION}, found {ultralytics_version or 'unknown'}."
+        )
 
     _configure_storage_env(payload)
 
     job_id = job["id"]
     dataset_id = dataset["id"]
-    model_name = str(config.get("model") or config.get("pretrained_weights") or "yolo11n.pt")
     modal_resources = modal_resources_from_payload(payload, config, detection_job=True)
-    epochs = _positive_int(config.get("epochs"), default=8)
-    batch_size = _positive_int(modal_resources.get("effective_batch_size"), default=8)
-    image_size = _bounded_int(config.get("image_size"), default=640, minimum=160, maximum=1280)
-    learning_rate = _positive_float(config.get("learning_rate"), default=0.001)
+    accepted_execution = resolve_yolo_execution(config)
+    accepted_batch_size = int(accepted_execution.value("batch_size"))
+    resource_batch_size = _positive_int(
+        modal_resources.get("effective_batch_size"),
+        default=accepted_batch_size,
+    )
+    yolo_execution = resolve_yolo_execution(
+        config,
+        effective_batch_size=resource_batch_size,
+    )
+    model_name = require_catalog_id(
+        "models",
+        str(yolo_execution.value("model")),
+        task="object_detection",
+        runner="modal_ultralytics",
+    )
+    epochs = int(yolo_execution.value("epochs"))
+    batch_size = int(yolo_execution.value("batch_size"))
+    image_size = int(yolo_execution.value("image_size"))
+    learning_rate = float(yolo_execution.value("learning_rate"))
     confidence_threshold = _bounded_float(config.get("confidence_threshold"), default=0.25, minimum=0.01, maximum=0.99)
     iou_threshold = _bounded_float(config.get("iou_threshold"), default=0.7, minimum=0.1, maximum=0.99)
     gpu_type = str(modal_resources.get("effective_gpu_type") or config.get("gpu_type") or "T4")
@@ -766,6 +878,13 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     modal_resource_telemetry = resource_telemetry(modal_resources, effective_batch_size=batch_size)
 
     _modal_training_phase(job_id, "storage_configured", started_at)
+    if not pre_materialized_dataset:
+        _report_modal_progress(
+            progress_reporter,
+            "dataset_materializing",
+            detail_code="yolo_dataset_materializing",
+            message="YOLO dataset is being materialized.",
+        )
     dataset_dir, dataset_materialization = _modal_training_dataset_for_job(
         payload,
         dataset=dataset,
@@ -805,6 +924,12 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     dataset_materialization["yolo_data_config"] = str(data_config_path)
     _modal_training_phase(job_id, "yolo_train_start", started_at, model=model_name, data=str(data_config_path))
     run_root = Path(tempfile.gettempdir()) / "model-express-yolo-runs" / _safe_path_part(job_id)
+    _report_modal_progress(
+        progress_reporter,
+        "model_initializing",
+        detail_code="yolo_model_initializing",
+        message="YOLO model and trainer are being initialized.",
+    )
     detector = YOLO(model_name)
     posted_yolo_epochs: set[int] = set()
     _install_yolo_epoch_metrics_callback(
@@ -817,21 +942,73 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         posted_epochs=posted_yolo_epochs,
         callback_identity=callback_identity(job, modal_resources),
         callback_auth_token=callback_token(job),
+        progress_reporter=progress_reporter,
+        total_epochs=epochs,
     )
-    detector.train(
+    train_kwargs = ultralytics_train_kwargs(
+        yolo_execution,
         data=str(data_config_path),
-        epochs=epochs,
-        batch=batch_size,
-        imgsz=image_size,
-        lr0=learning_rate,
         project=str(run_root),
         name="train",
-        exist_ok=True,
-        pretrained=True,
-        plots=False,
-        val=True,
         workers=_yolo_dataloader_workers(),
     )
+    yolo_fidelity_state: dict = {}
+    fidelity_callback_installed = _install_yolo_fidelity_callback(
+        detector,
+        orchestrator_url=orchestrator_url,
+        job=job,
+        execution=yolo_execution,
+        submitted_train_kwargs=train_kwargs,
+        ultralytics_version=ultralytics_version,
+        state=yolo_fidelity_state,
+        modal_resources=modal_resources,
+    )
+    if yolo_execution.fidelity_mode == "enforce":
+        if not yolo_realization_matches_policy(yolo_execution):
+            raise YoloExecutionError(
+                "Runner fidelity enforcement rejected a YOLO realization mismatch before training."
+            )
+        if yolo_execution.versioned and not fidelity_callback_installed:
+            raise YoloExecutionError(
+                "Runner fidelity enforcement could not register the Ultralytics initialization "
+                "callback before training."
+            )
+    _report_yolo_training_progress(progress_reporter, current=0, total=epochs)
+    detector.train(**train_kwargs)
+    yolo_execution = _finalize_yolo_execution_state(
+        detector,
+        yolo_execution,
+        yolo_fidelity_state,
+    )
+    if yolo_execution.versioned and not yolo_fidelity_state.get("initialized"):
+        _post_yolo_execution_observation(
+            orchestrator_url,
+            job,
+            stage="INITIALIZED",
+            idempotency_key="yolo-initialized-v1",
+            execution=yolo_execution,
+            framework_arguments=_yolo_framework_arguments(
+                yolo_execution,
+                submitted_train_kwargs=train_kwargs,
+                ultralytics_version=ultralytics_version,
+                trainer=getattr(detector, "trainer", None),
+            ),
+            evidence={
+                "trainer_class": getattr(
+                    getattr(detector, "trainer", None),
+                    "__class__",
+                    type(None),
+                ).__name__,
+                "callback_timing": "post_train_shadow_fallback",
+            },
+            modal_resources=modal_resources,
+        )
+    if yolo_execution.fidelity_mode == "enforce" and not yolo_realization_matches_policy(
+        yolo_execution
+    ):
+        raise YoloExecutionError(
+            "Runner fidelity enforcement rejected the realized Ultralytics trainer arguments."
+        )
     _modal_training_phase(job_id, "yolo_train_done", started_at)
     final_yolo_epoch_rows_posted = _post_yolo_epoch_metrics(
         orchestrator_url,
@@ -845,6 +1022,12 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
     )
     yolo_epoch_rows_posted = len(posted_yolo_epochs) or final_yolo_epoch_rows_posted
 
+    _report_modal_progress(
+        progress_reporter,
+        "evaluating",
+        detail_code="yolo_final_evaluation",
+        message="YOLO final evaluation is running.",
+    )
     best_model_path = _yolo_best_model_path(run_root)
     trained_detector = YOLO(str(best_model_path)) if best_model_path is not None else detector
     class_names = _yolo_class_names(trained_detector, config)
@@ -897,7 +1080,15 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         iou_threshold=iou_threshold,
         metrics=final_metrics,
     )
+    _report_modal_progress(
+        progress_reporter,
+        "exporting",
+        detail_code="yolo_exporting",
+        message="YOLO model artifacts are being exported.",
+    )
     _modal_training_phase(job_id, "export_start", started_at)
+    from worker.artifact_plan import load_artifact_plan
+
     export_bundle = _export_yolo_detector_bundle(
         model_path=best_model_path,
         model_name=model_name,
@@ -907,6 +1098,11 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         training_config=config,
         dataset=dataset,
         job_id=job_id,
+        artifact_plan=load_artifact_plan(
+            config,
+            task="object_detection",
+            runner="modal_ultralytics",
+        ),
     )
     _modal_training_phase(job_id, "export_done", started_at, status=export_bundle.get("status", ""))
     runtime_seconds = time.time() - started_at
@@ -946,113 +1142,113 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
             },
             modal_resources=modal_resources,
         )
-    _post_training_run_summary(
-        orchestrator_url,
-        job_id,
-        {
-            "model": model_name,
-            "provider": "modal",
-            "gpu_type": gpu_type,
-            "status": "SUCCEEDED",
-            "runtime_seconds": round(runtime_seconds, 3),
-            "estimated_cost_usd": round(estimated_cost_usd, 6),
-            "best_macro_f1": round(map50_95, 6),
-            "best_accuracy": round(map50, 6),
-            "best_map50_95": round(map50_95, 6),
-            "best_map50": round(map50, 6),
-            "best_precision": round(precision, 6),
-            "best_recall": round(recall, 6),
-            "target_metric": "mAP50_95",
-            "final_train_loss": val_loss,
-            "final_val_loss": val_loss,
+    final_summary_payload = {
+        "model": model_name,
+        "provider": "modal",
+        "gpu_type": gpu_type,
+        "status": "SUCCEEDED",
+        "runtime_seconds": round(runtime_seconds, 3),
+        "estimated_cost_usd": round(estimated_cost_usd, 6),
+        "best_macro_f1": round(map50_95, 6),
+        "best_accuracy": round(map50, 6),
+        "best_map50_95": round(map50_95, 6),
+        "best_map50": round(map50, 6),
+        "best_precision": round(precision, 6),
+        "best_recall": round(recall, 6),
+        "target_metric": "mAP50_95",
+        "final_train_loss": val_loss,
+        "final_val_loss": val_loss,
+        "epochs_completed": epochs,
+        "modal_function_call_id": modal_function_call_id,
+        "modal_input_id": modal_input_id,
+        "dataset_materialization": dataset_materialization,
+        "stage_telemetry": _modal_stage_telemetry_payload(
+            gpu_type,
+            modal_resources=modal_resource_telemetry,
+        ),
+        "execution_references": _training_export_references(export_bundle),
+    }
+    final_evaluation_payload = {
+        "objective_profile": {
+            "target_metric": str(config.get("target_metric", "mAP50_95")),
+            "task_type": "object_detection",
+            "metric_preferences": ["mAP50_95", "mAP50", "precision", "recall", "latency_p95_ms"],
+            "split_strategy": "official_yolo_train_val_test_when_present",
+            "heldout_split": heldout_split,
+            "heldout_demo_images": heldout_demo_images,
+            "heldout_test_map50_95": round(map50_95, 6),
+            "heldout_test_map50": round(map50, 6),
+            "heldout_test_precision": round(precision, 6),
+            "heldout_test_recall": round(recall, 6),
+            "heldout_test_box_loss": round(box_loss, 6),
+            "heldout_test_cls_loss": round(cls_loss, 6),
+            "heldout_test_dfl_loss": round(dfl_loss, 6),
+            "modal_resources": modal_resource_telemetry,
+        },
+        "per_class_metrics": _yolo_per_class_metrics(class_names, final_metrics),
+        "confusion_matrix": [],
+        "model_profile": {
+            **model_profile,
+            "modal_resources": modal_resource_telemetry,
+        },
+        "holistic_scores": {
+            **_detection_holistic_scores(
+                map50_95=map50_95,
+                map50=map50,
+                precision=precision,
+                recall=recall,
+                box_loss=box_loss,
+                cls_loss=cls_loss,
+                dfl_loss=dfl_loss,
+                estimated_cost_usd=estimated_cost_usd,
+                runtime_seconds=runtime_seconds,
+                model_profile=model_profile,
+            ),
+            "modal_resources": modal_resource_telemetry,
+        },
+        "preprocessing_summary": {
+            "task_type": "object_detection",
+            "preserved_yolo_config": str(data_config_path),
+            "preserved_official_splits": True,
+            "worker_execution_metadata": {"dataset_materialization": dataset_materialization},
+            "training_hyperparameters": {
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
+                "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
+                "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
+                "epochs": epochs,
+                "image_size": image_size,
+            },
+        },
+        "export_bundle": export_bundle,
+        "execution_references": _training_export_references(export_bundle),
+        "recommendation_summary": (
+            f"{model_name} detector finished with mAP50-95 {map50_95:.3f}, "
+            f"mAP50 {map50:.3f}, recall {recall:.3f}, and estimated latency "
+            f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
+        ),
+    }
+    _publish_yolo_final_callbacks(
+        progress_reporter=progress_reporter,
+        orchestrator_url=orchestrator_url,
+        job=job,
+        summary_payload=final_summary_payload,
+        evaluation_payload=final_evaluation_payload,
+        execution=yolo_execution,
+        framework_arguments=_yolo_framework_arguments(
+            yolo_execution,
+            submitted_train_kwargs=train_kwargs,
+            ultralytics_version=ultralytics_version,
+            trainer=getattr(detector, "trainer", None),
+        ),
+        evidence={
+            "class_count": len(class_names),
             "epochs_completed": epochs,
-            "modal_function_call_id": modal_function_call_id,
-            "modal_input_id": modal_input_id,
-            "dataset_materialization": dataset_materialization,
-            "stage_telemetry": _modal_stage_telemetry_payload(
-                job,
-                runtime_seconds,
-                stage_events,
-                dataset_materialization,
-                gpu_type,
-                modal_resources=modal_resource_telemetry,
-            ),
+            "checkpoint_available": best_model_path is not None,
         },
-        job=job,
         modal_resources=modal_resources,
-    )
-    _post_training_run_evaluation(
-        orchestrator_url,
-        job_id,
-        {
-            "objective_profile": {
-                "target_metric": str(config.get("target_metric", "mAP50_95")),
-                "task_type": "object_detection",
-                "metric_preferences": ["mAP50_95", "mAP50", "precision", "recall", "latency_p95_ms"],
-                "split_strategy": "official_yolo_train_val_test_when_present",
-                "heldout_split": heldout_split,
-                "heldout_demo_images": heldout_demo_images,
-                "heldout_test_map50_95": round(map50_95, 6),
-                "heldout_test_map50": round(map50, 6),
-                "heldout_test_precision": round(precision, 6),
-                "heldout_test_recall": round(recall, 6),
-                "heldout_test_box_loss": round(box_loss, 6),
-                "heldout_test_cls_loss": round(cls_loss, 6),
-                "heldout_test_dfl_loss": round(dfl_loss, 6),
-                "modal_resources": modal_resource_telemetry,
-            },
-            "per_class_metrics": _yolo_per_class_metrics(class_names, final_metrics),
-            "confusion_matrix": [],
-            "model_profile": {
-                **model_profile,
-                "modal_resources": modal_resource_telemetry,
-            },
-            "holistic_scores": {
-                **_detection_holistic_scores(
-                    map50_95=map50_95,
-                    map50=map50,
-                    precision=precision,
-                    recall=recall,
-                    box_loss=box_loss,
-                    cls_loss=cls_loss,
-                    dfl_loss=dfl_loss,
-                    estimated_cost_usd=estimated_cost_usd,
-                    runtime_seconds=runtime_seconds,
-                    model_profile=model_profile,
-                ),
-                "modal_resources": modal_resource_telemetry,
-            },
-            "preprocessing_summary": {
-                "task_type": "object_detection",
-                "preserved_yolo_config": str(data_config_path),
-                "preserved_official_splits": True,
-                "worker_execution_metadata": {"dataset_materialization": dataset_materialization},
-                "training_hyperparameters": {
-                    "learning_rate": learning_rate,
-                    "batch_size": batch_size,
-                    "requested_batch_size": modal_resource_telemetry["requested_batch_size"],
-                    "effective_batch_size": modal_resource_telemetry["effective_batch_size"],
-                    "batch_size_policy": modal_resource_telemetry["batch_size_policy"],
-                    "epochs": epochs,
-                    "image_size": image_size,
-                },
-            },
-            "export_bundle": export_bundle,
-            "recommendation_summary": (
-                f"{model_name} detector finished with mAP50-95 {map50_95:.3f}, "
-                f"mAP50 {map50:.3f}, recall {recall:.3f}, and estimated latency "
-                f"{model_profile.get('estimated_latency_ms', 0):.1f}ms."
-            ),
-        },
-        job=job,
-        modal_resources=modal_resources,
-    )
-    _post_job_json(
-        orchestrator_url,
-        job,
-        "complete",
-        {"mlflow_run_id": f"modal-yolo-{job_id}"},
-        modal_resources=modal_resources,
+        mlflow_run_id=f"modal-yolo-{job_id}",
     )
     return {
         "job_id": job_id,
@@ -1176,6 +1372,51 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
     _configure_storage_env(payload)
 
     dataset = normalized["dataset"]
+    progress_revisions = dict(
+        payload.get("progress_revisions")
+        if isinstance(payload.get("progress_revisions"), dict)
+        else {}
+    )
+    progress_enabled_by_job = dict(
+        payload.get("progress_reporting_enabled_by_job")
+        if isinstance(payload.get("progress_reporting_enabled_by_job"), dict)
+        else {}
+    )
+    detection_batch = batch["task_type"] == "object_detection"
+    for job in jobs:
+        job_id = str(job.get("id") or "")
+        progress_payload = {
+            "progress_revision": progress_revisions.get(job_id, 2),
+            "progress_reporting_enabled": progress_enabled_by_job.get(job_id, False),
+        }
+        progress_reporter = _modal_remote_progress_reporter(
+            progress_payload,
+            str(payload["orchestrator_url"]).rstrip("/"),
+            job,
+        )
+        _report_modal_progress(
+            progress_reporter,
+            "environment_starting",
+            detail_code="modal_batch_container_starting",
+            message="Modal batch training environment is starting.",
+        )
+        _report_modal_progress(
+            progress_reporter,
+            "dataset_materializing",
+            detail_code=(
+                "yolo_batch_dataset_materializing"
+                if detection_batch
+                else "classification_batch_dataset_materializing"
+            ),
+            message=(
+                "YOLO batch dataset is being materialized."
+                if detection_batch
+                else "Classification batch dataset is being materialized."
+            ),
+        )
+        if progress_reporter is not None:
+            progress_revisions[job_id] = progress_reporter.revision
+            progress_enabled_by_job[job_id] = progress_reporter.enabled
     representative_config = jobs[0].get("config") if isinstance(jobs[0].get("config"), dict) else {}
     batch_cache_root = _modal_preview_batch_cache_root(batch["batch_id"])
     materialized = ensure_dataset_materialized(
@@ -1219,11 +1460,17 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
         runner_status = "yolo_batch_completed"
     job_results: list[dict] = []
     for index, job in enumerate(jobs):
+        job_id = str(job.get("id") or "")
         job_payload = {
             **payload,
             "job": job,
             "dataset": dataset,
             "_modal_pre_materialized_dataset": pre_materialized,
+            "progress_revision": progress_revisions.get(job_id, payload.get("progress_revision", 2)),
+            "progress_reporting_enabled": progress_enabled_by_job.get(
+                job_id,
+                payload.get("progress_reporting_enabled", False),
+            ),
         }
         try:
             if batch["task_type"] == "object_detection":
@@ -1234,7 +1481,7 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
             reported = _report_modal_training_retryable_failure(job_payload, exc)
             job_results.append(
                 {
-                    "job_id": str(job.get("id") or ""),
+                    "job_id": job_id,
                     "status": "retryable_failure_reported" if reported else "failed",
                     "error": _modal_training_error_message(exc),
                     "batch_index": index,
@@ -1244,7 +1491,7 @@ def _train_modal_preview_batch_impl(payload: dict) -> dict:
             continue
         job_results.append(
             {
-                "job_id": str(job.get("id") or ""),
+                "job_id": job_id,
                 "status": "succeeded",
                 "batch_index": index,
                 "batch_size": len(jobs),
@@ -1449,64 +1696,6 @@ def _modal_preview_batch_task_type(config: dict) -> str:
     return "image_classification"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _collect_yolo_validation_metrics(
     detector,
     data_config_path: Path,
@@ -1527,8 +1716,6 @@ def _collect_yolo_validation_metrics(
     return _yolo_metrics_from_object(metrics, class_names=class_names)
 
 
-
-
 def _install_yolo_epoch_metrics_callback(
     detector,
     *,
@@ -1540,8 +1727,12 @@ def _install_yolo_epoch_metrics_callback(
     posted_epochs: set[int],
     callback_identity: dict | None = None,
     callback_auth_token: str = "",
+    progress_reporter: ProgressReporter | None = None,
+    total_epochs: int = 0,
 ) -> None:
-    def post_epoch_metrics(_trainer=None) -> None:
+    progress_state = {"last_epoch": 0}
+
+    def post_epoch_metrics(trainer=None) -> None:
         _post_yolo_epoch_metrics(
             orchestrator_url,
             job_id,
@@ -1552,6 +1743,12 @@ def _install_yolo_epoch_metrics_callback(
             callback_identity=callback_identity,
             callback_auth_token=callback_auth_token,
         )
+        _report_yolo_epoch_callback_progress(
+            progress_reporter,
+            trainer=trainer,
+            total=total_epochs,
+            state=progress_state,
+        )
 
     add_callback = getattr(detector, "add_callback", None)
     if not callable(add_callback):
@@ -1561,6 +1758,115 @@ def _install_yolo_epoch_metrics_callback(
             add_callback(event_name, post_epoch_metrics)
         except Exception as exc:
             print(f"[model-express] failed to register YOLO {event_name} metric callback: {exc}")
+
+
+def _report_yolo_epoch_callback_progress(
+    progress_reporter: ProgressReporter | None,
+    *,
+    trainer,
+    total: int,
+    state: dict,
+) -> bool:
+    """Publish each completed Ultralytics epoch at most once and in order."""
+    try:
+        total_epochs = int(total)
+        current = int(getattr(trainer, "epoch")) + 1
+        previous = int(state.get("last_epoch", 0))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+    if total_epochs < 1:
+        return False
+    current = min(total_epochs, max(0, current))
+    if current <= previous:
+        return False
+    state["last_epoch"] = current
+    return _report_yolo_training_progress(
+        progress_reporter,
+        current=current,
+        total=total_epochs,
+    )
+
+
+def _install_yolo_fidelity_callback(
+    detector,
+    *,
+    orchestrator_url: str,
+    job: dict,
+    execution: YoloExecution,
+    submitted_train_kwargs: dict,
+    ultralytics_version: str,
+    state: dict,
+    modal_resources: dict | None = None,
+) -> bool:
+    add_callback = getattr(detector, "add_callback", None)
+    if not callable(add_callback):
+        return False
+
+    def observe_initialized(trainer) -> None:
+        if state.get("initialized"):
+            return
+        captured = capture_yolo_trainer_arguments(trainer)
+        realized = realize_yolo_trainer_arguments(execution, captured)
+        framework_arguments = _yolo_framework_arguments(
+            realized,
+            submitted_train_kwargs=submitted_train_kwargs,
+            ultralytics_version=ultralytics_version,
+            trainer=trainer,
+        )
+        state.update(
+            {
+                "initialized": True,
+                "execution": realized,
+                "framework_arguments": framework_arguments,
+            }
+        )
+        _post_yolo_execution_observation(
+            orchestrator_url,
+            job,
+            stage="INITIALIZED",
+            idempotency_key="yolo-initialized-v1",
+            execution=realized,
+            framework_arguments=framework_arguments,
+            evidence={"trainer_class": trainer.__class__.__name__},
+            modal_resources=modal_resources,
+        )
+        if realized.fidelity_mode == "enforce" and not yolo_realization_matches_policy(
+            realized
+        ):
+            raise YoloExecutionError(
+                "Runner fidelity enforcement rejected realized Ultralytics arguments "
+                "before the training loop."
+            )
+
+    try:
+        add_callback("on_pretrain_routine_end", observe_initialized)
+    except Exception as exc:
+        print(f"[model-express] failed to register YOLO fidelity callback: {exc}")
+        return False
+    return True
+
+
+def _finalize_yolo_execution_state(
+    detector,
+    execution: YoloExecution,
+    state: dict,
+) -> YoloExecution:
+    current = state.get("execution")
+    if isinstance(current, YoloExecution):
+        execution = current
+    trainer = getattr(detector, "trainer", None)
+    if trainer is not None:
+        captured = capture_yolo_trainer_arguments(trainer)
+        execution = realize_yolo_trainer_arguments(execution, captured)
+        state["execution"] = execution
+    if execution.versioned and execution.fidelity_mode == "enforce" and not state.get(
+        "initialized"
+    ):
+        raise YoloExecutionError(
+            "Runner fidelity enforcement did not receive the Ultralytics initialization "
+            "callback before training."
+        )
+    return execution
 
 
 def _post_yolo_epoch_metrics(
@@ -1606,48 +1912,6 @@ def _post_yolo_epoch_metrics(
         print(f"[model-express] failed to post YOLO epoch metrics from {results_path}: {exc}")
         return posted
     return posted
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @app.function(
@@ -1716,53 +1980,197 @@ def profile_image_dataset(payload: dict) -> dict:
         }
 
 
+def _modal_remote_progress_reporter(
+    payload: dict,
+    orchestrator_url: str,
+    job: dict,
+) -> ProgressReporter | None:
+    try:
+        initial_revision = max(2, int(payload.get("progress_revision", 2)))
+    except (TypeError, ValueError):
+        initial_revision = 2
+    try:
+        return ProgressReporter.from_orchestrator_url(
+            orchestrator_url,
+            job,
+            initial_revision=initial_revision,
+            enabled=_bool(payload.get("progress_reporting_enabled"), default=False),
+        )
+    except Exception:
+        return None
 
 
+def _report_modal_progress(
+    progress_reporter: ProgressReporter | None,
+    stage: str,
+    **fields: object,
+) -> bool:
+    if progress_reporter is None:
+        return False
+    try:
+        return bool(progress_reporter.report(stage, **fields))
+    except Exception:
+        return False
 
 
+def _report_classification_training_progress(
+    progress_reporter: ProgressReporter | None,
+    *,
+    current: int,
+    total: int,
+) -> bool:
+    if current <= 0:
+        detail_code = "classification_training"
+        message = f"Classification training is starting for {total} epochs."
+    else:
+        detail_code = "classification_epoch_complete"
+        message = f"Classification training epoch {current} of {total} finished."
+    return _report_modal_progress(
+        progress_reporter,
+        "training",
+        current=current,
+        total=total,
+        unit="epoch",
+        detail_code=detail_code,
+        message=message,
+    )
 
 
+def _report_yolo_training_progress(
+    progress_reporter: ProgressReporter | None,
+    *,
+    current: int,
+    total: int,
+) -> bool:
+    if current <= 0:
+        detail_code = "yolo_training"
+        message = f"YOLO training is starting for {total} epochs."
+    else:
+        detail_code = "yolo_epoch_complete"
+        message = f"YOLO training epoch {current} of {total} finished."
+    return _report_modal_progress(
+        progress_reporter,
+        "training",
+        current=current,
+        total=total,
+        unit="epoch",
+        detail_code=detail_code,
+        message=message,
+    )
 
 
+def _publish_classification_final_callbacks(
+    *,
+    progress_reporter: ProgressReporter | None,
+    orchestrator_url: str,
+    job: dict,
+    summary_payload: dict,
+    evaluation_payload: dict,
+    execution: ClassificationExecution,
+    framework_arguments: dict,
+    fidelity_evidence: dict,
+    modal_resources: dict,
+    mlflow_run_id: str,
+) -> None:
+    """Publish backend-owned completion only after every final callback succeeds."""
+    _report_modal_progress(
+        progress_reporter,
+        "finalizing",
+        detail_code="classification_finalizing",
+        message="Classification results are being finalized by the backend.",
+    )
+    job_id = str(job.get("id") or "")
+    _post_training_run_summary(
+        orchestrator_url,
+        job_id,
+        summary_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_training_run_evaluation(
+        orchestrator_url,
+        job_id,
+        evaluation_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_classification_execution_observation(
+        orchestrator_url,
+        job,
+        stage="FINALIZED",
+        idempotency_key="classification-finalized-v1",
+        execution=execution,
+        framework_arguments=framework_arguments,
+        evidence=fidelity_evidence,
+        modal_resources=modal_resources,
+    )
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "complete",
+        {"mlflow_run_id": mlflow_run_id},
+        modal_resources=modal_resources,
+    )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _modal_stage_telemetry_enabled() -> bool:
-    return _bool(os.getenv("MODEL_EXPRESS_REMOTE_GPU_STAGE_TELEMETRY"), default=False)
+def _publish_yolo_final_callbacks(
+    *,
+    progress_reporter: ProgressReporter | None,
+    orchestrator_url: str,
+    job: dict,
+    summary_payload: dict,
+    evaluation_payload: dict,
+    execution: YoloExecution,
+    framework_arguments: dict,
+    evidence: dict,
+    modal_resources: dict,
+    mlflow_run_id: str,
+) -> None:
+    """Keep YOLO finalization observable while backend completion stays authoritative."""
+    _report_modal_progress(
+        progress_reporter,
+        "finalizing",
+        detail_code="yolo_finalizing",
+        message="YOLO results are being finalized by the backend.",
+    )
+    job_id = str(job.get("id") or "")
+    _post_training_run_summary(
+        orchestrator_url,
+        job_id,
+        summary_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_training_run_evaluation(
+        orchestrator_url,
+        job_id,
+        evaluation_payload,
+        job=job,
+        modal_resources=modal_resources,
+    )
+    _post_yolo_execution_observation(
+        orchestrator_url,
+        job,
+        stage="FINALIZED",
+        idempotency_key="yolo-finalized-v1",
+        execution=execution,
+        framework_arguments=framework_arguments,
+        evidence=evidence,
+        modal_resources=modal_resources,
+    )
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "complete",
+        {"mlflow_run_id": mlflow_run_id},
+        modal_resources=modal_resources,
+    )
 
 
 def _modal_training_phase(job_id: str, phase: str, started_at: float, **fields: object) -> None:
     import time
 
     elapsed = max(0.0, time.time() - started_at)
-    events = _MODAL_STAGE_EVENTS.get()
-    if events is not None:
-        events.append(
-            {
-                "phase": phase,
-                "elapsed_seconds": round(elapsed, 6),
-                "fields": {
-                    key: _modal_stage_field_value(value)
-                    for key, value in fields.items()
-                    if value is not None
-                },
-            }
-        )
     field_text = " ".join(
         f"{key}={_modal_training_phase_value(value)}"
         for key, value in fields.items()
@@ -1777,19 +2185,7 @@ def _modal_training_phase_value(value: object) -> str:
     return text.replace("\n", " ").replace("\r", " ")[:120]
 
 
-def _modal_stage_field_value(value: object) -> object:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int | float):
-        return round(float(value), 6)
-    return _modal_training_phase_value(value)
-
-
 def _modal_stage_telemetry_payload(
-    job: dict,
-    runtime_seconds: float,
-    stage_events: list[dict],
-    dataset_materialization: dict,
     gpu_type: str,
     *,
     modal_resources: dict | None = None,
@@ -1799,62 +2195,8 @@ def _modal_stage_telemetry_payload(
         if isinstance(modal_resources, dict)
         else resource_telemetry({"effective_gpu_type": gpu_type})
     )
-    if not _modal_stage_telemetry_enabled():
-        return {
-            "schema_version": "remote_gpu_stage_telemetry_v1",
-            "gpu_type": gpu_type,
-            "modal_resources": resources,
-            "requested_gpu_type": resources.get("requested_gpu_type", ""),
-            "effective_gpu_type": resources.get("effective_gpu_type", gpu_type),
-            "memory_mb": resources.get("memory_mb", 0),
-            "requested_batch_size": resources.get("requested_batch_size", 0),
-            "effective_batch_size": resources.get("effective_batch_size", 0),
-            "batch_size_policy": resources.get("batch_size_policy", ""),
-            "resource_signature": resources.get("resource_signature", ""),
-            "warm_container_policy": _modal_warm_container_policy(),
-        }
-    materialization_seconds = _stage_duration(
-        stage_events,
-        "dataset_local_materialization_start",
-        "dataset_local_materialization_done",
-    )
-    active_training_seconds = _sum_stage_durations(
-        stage_events,
-        ("epoch_train_start", "epoch_train_done"),
-    ) + _stage_duration(stage_events, "yolo_train_start", "yolo_train_done")
-    evaluation_seconds = _sum_stage_durations(
-        stage_events,
-        ("epoch_eval_start", "epoch_eval_done"),
-    ) + _stage_duration(stage_events, "final_eval_start", "final_eval_done") + _stage_duration(
-        stage_events,
-        "yolo_eval_start",
-        "yolo_eval_done",
-    )
-    export_seconds = _stage_duration(stage_events, "export_start", "export_done")
-    known_seconds = materialization_seconds + active_training_seconds + evaluation_seconds + export_seconds
-    payload = {
+    return {
         "schema_version": "remote_gpu_stage_telemetry_v1",
-        "current_stage": stage_events[-1]["phase"] if stage_events else "",
-        "events": stage_events[-80:],
-        "queue_wait_seconds": _job_queue_wait_seconds(job),
-        "dataset_materialization_seconds": round(materialization_seconds, 6),
-        "dataset_download_seconds": _float_from_payload(
-            dataset_materialization,
-            "dataset_materialization_download_seconds",
-        ),
-        "dataset_extract_seconds": _float_from_payload(
-            dataset_materialization,
-            "dataset_materialization_extract_seconds",
-        ),
-        "dataset_materialization_wait_seconds": _float_from_payload(
-            dataset_materialization,
-            "dataset_materialization_wait_seconds",
-        ),
-        "active_training_seconds": round(active_training_seconds, 6),
-        "evaluation_seconds": round(evaluation_seconds, 6),
-        "export_seconds": round(export_seconds, 6),
-        "idle_wait_seconds": round(max(0.0, runtime_seconds - known_seconds), 6),
-        "runtime_seconds": round(max(0.0, runtime_seconds), 6),
         "gpu_type": gpu_type,
         "modal_resources": resources,
         "requested_gpu_type": resources.get("requested_gpu_type", ""),
@@ -1866,62 +2208,6 @@ def _modal_stage_telemetry_payload(
         "resource_signature": resources.get("resource_signature", ""),
         "warm_container_policy": _modal_warm_container_policy(),
     }
-    return payload
-
-
-def _stage_duration(stage_events: list[dict], start_phase: str, done_phase: str) -> float:
-    started = None
-    for event in stage_events:
-        phase = str(event.get("phase") or "")
-        elapsed = _float_from_payload(event, "elapsed_seconds")
-        if phase == start_phase:
-            started = elapsed
-        elif phase == done_phase and started is not None:
-            return max(0.0, elapsed - started)
-    return 0.0
-
-
-def _sum_stage_durations(stage_events: list[dict], phase_pair: tuple[str, str]) -> float:
-    start_phase, done_phase = phase_pair
-    total = 0.0
-    started = None
-    for event in stage_events:
-        phase = str(event.get("phase") or "")
-        elapsed = _float_from_payload(event, "elapsed_seconds")
-        if phase == start_phase:
-            started = elapsed
-        elif phase == done_phase and started is not None:
-            total += max(0.0, elapsed - started)
-            started = None
-    return round(total, 6)
-
-
-def _float_from_payload(payload: dict, key: str) -> float:
-    try:
-        value = float(payload.get(key) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-    return round(max(0.0, value), 6)
-
-
-def _job_queue_wait_seconds(job: dict) -> float:
-    created_at = _parse_datetime(job.get("created_at"))
-    if created_at is None:
-        return 0.0
-    return round(max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds()), 6)
-
-
-def _parse_datetime(value: object) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _modal_warm_container_policy() -> dict:
@@ -3183,10 +3469,6 @@ def _union_annotation_bbox(objects: object) -> tuple[int, int, int, int] | None:
     )
 
 
-
-
-
-
 def _class_weights(
     targets: list[int],
     train_indices: list[int],
@@ -3234,7 +3516,17 @@ def _dataset_normalization_metadata(dataset_dir: Path, preprocessing: dict) -> d
     from worker.datasets.profiler import compute_image_normalization_metadata
 
     metadata = compute_image_normalization_metadata(dataset_dir)
-    return metadata if metadata.get("status") == "computed" else None
+    if metadata.get("status") != "computed":
+        raise ValueError(
+            "Dataset normalization was accepted, but dataset statistics could not be computed."
+        )
+    mean = _three_float_tuple(metadata.get("mean"))
+    std = _three_positive_float_tuple(metadata.get("std"))
+    if mean is None or std is None:
+        raise ValueError(
+            "Dataset normalization was accepted, but computed dataset statistics are invalid."
+        )
+    return metadata
 
 
 def _normalization_values(normalization: str, preprocessing: dict) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
@@ -3273,23 +3565,40 @@ def _build_criterion(class_weights, class_balancing: str, device, label_smoothin
     )
     if class_balancing == "focal_loss":
         class FocalLoss(nn.Module):
-            def __init__(self, weight=None, gamma: float = 2.0):
+            def __init__(self, weight=None, gamma: float = 2.0, label_smoothing: float = 0.0):
                 super().__init__()
                 self.weight = weight
                 self.gamma = gamma
+                self.label_smoothing = label_smoothing
 
             def forward(self, logits, targets):
                 if targets.dtype.is_floating_point:
+                    if self.label_smoothing > 0:
+                        class_count = max(1, int(targets.shape[1]))
+                        targets = (
+                            targets * (1.0 - self.label_smoothing)
+                            + self.label_smoothing / class_count
+                        )
                     log_probabilities = F.log_softmax(logits, dim=1)
                     weights = self.weight.view(1, -1) if self.weight is not None else 1.0
                     cross_entropy = -(targets * log_probabilities * weights).sum(dim=1)
                 else:
-                    cross_entropy = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+                    cross_entropy = F.cross_entropy(
+                        logits,
+                        targets,
+                        weight=self.weight,
+                        reduction="none",
+                        label_smoothing=self.label_smoothing,
+                    )
                 probability = torch.exp(-cross_entropy)
                 loss = ((1 - probability) ** self.gamma) * cross_entropy
                 return loss.mean()
 
-        return FocalLoss(weight=weight_tensor, gamma=focal_gamma)
+        return FocalLoss(
+            weight=weight_tensor,
+            gamma=focal_gamma,
+            label_smoothing=label_smoothing,
+        )
     return nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
 
 
@@ -3348,78 +3657,89 @@ def _build_model(
     fine_tune_strategy: str = "head_only",
     dropout: float = 0.0,
 ):
+    normalized = require_catalog_id(
+        "models",
+        model_name,
+        task="image_classification",
+        runner="modal_torchvision",
+    )
+
     from torch import nn
     from torchvision import models
 
-    normalized = model_name.lower()
     dropout = _bounded_float(dropout, default=0.0, minimum=0.0, maximum=0.7)
 
-    if "efficientnet_b2" in normalized:
+    if normalized == "efficientnet_b2":
         model = _torchvision_model(models.efficientnet_b2, models.EfficientNet_B2_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet_b1" in normalized:
+    if normalized == "efficientnet_b1":
         model = _torchvision_model(models.efficientnet_b1, models.EfficientNet_B1_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet" in normalized:
+    if normalized == "efficientnet_b0":
         model = _torchvision_model(models.efficientnet_b0, models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "resnet34" in normalized:
+    if normalized == "resnet34":
         model = _torchvision_model(models.resnet34, models.ResNet34_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "resnet" in normalized:
+    if normalized == "resnet18":
         model = _torchvision_model(models.resnet18, models.ResNet18_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "regnet_y_400mf" in normalized:
+    if normalized == "regnet_y_400mf":
         model = _torchvision_model(models.regnet_y_400mf, models.RegNet_Y_400MF_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "convnext_tiny" in normalized:
+    if normalized == "convnext_tiny":
         model = _torchvision_model(models.convnext_tiny, models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "swin_t" in normalized:
+    if normalized == "swin_t":
         model = _torchvision_model(models.swin_t, models.Swin_T_Weights.DEFAULT if pretrained else None)
         in_features = model.head.in_features
         _apply_transfer_strategy(model, "head", freeze_backbone, fine_tune_strategy)
         model.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "vit_b_16" in normalized:
+    if normalized == "vit_b_16":
         model = _torchvision_model(models.vit_b_16, models.ViT_B_16_Weights.DEFAULT if pretrained else None)
         in_features = model.heads.head.in_features
         _apply_transfer_strategy(model, "heads", freeze_backbone, fine_tune_strategy)
         model.heads.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "mobilenet_v3_large" in normalized:
+    if normalized == "mobilenet_v3_large":
         model = _torchvision_model(models.mobilenet_v3_large, models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
 
-    model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
-    in_features = model.classifier[-1].in_features
-    _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-    _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
-    return model
+    if normalized == "mobilenet_v3_small":
+        model = _torchvision_model(
+            models.mobilenet_v3_small,
+            models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None,
+        )
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    raise ValueError(f"Unsupported torchvision classification model {model_name!r}.")
 
 
 def _classification_head(nn, in_features: int, class_count: int, dropout: float = 0.0):
@@ -3439,10 +3759,10 @@ def _replace_classifier_head(nn, classifier, in_features: int, class_count: int,
 
 
 def _torchvision_model(factory, weights):
-    try:
-        return factory(weights=weights)
-    except Exception:
-        return factory(weights=None)
+    # Pretrained-to-random fallback changes training semantics and must never be
+    # hidden. Let download, cache, compatibility, and integrity errors fail the
+    # attempt so a random initialization requires a new accepted spec.
+    return load_torchvision_model(factory, weights)
 
 
 def _apply_transfer_strategy(model, head_name: str, freeze_backbone: bool, fine_tune_strategy: str) -> None:
@@ -3468,7 +3788,9 @@ def _build_optimizer(optimizer_name: str, parameters, learning_rate: float, weig
         return torch.optim.SGD(parameters, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
     if optimizer_name == "adam":
         return torch.optim.Adam(parameters, lr=learning_rate, weight_decay=weight_decay)
-    return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
+    raise ValueError(f"Unsupported classification optimizer {optimizer_name!r}.")
 
 
 def _build_scheduler(scheduler_name: str, optimizer, epochs: int, step_size: int | None = None, gamma: float = 0.5):
@@ -3482,7 +3804,9 @@ def _build_scheduler(scheduler_name: str, optimizer, epochs: int, step_size: int
             step_size=max(1, int(step_size or max(1, epochs // 3))),
             gamma=_bounded_float(gamma, default=0.5, minimum=0.05, maximum=0.95),
         )
-    return None
+    if scheduler_name == "none":
+        return None
+    raise ValueError(f"Unsupported classification scheduler {scheduler_name!r}.")
 
 
 def _batch_size(labels) -> int:
@@ -4368,6 +4692,7 @@ def _export_trained_champion_bundle(
     dataset: dict,
     job_id: str,
     export_self_test_samples: list[dict] | None = None,
+    artifact_plan: dict | None = None,
 ) -> dict:
     try:
         from worker.exporting.artifacts import produce_champion_export_artifacts
@@ -4377,6 +4702,12 @@ def _export_trained_champion_bundle(
 
     export_dir = Path(os.getenv("WORKER_CHAMPION_EXPORT_ROOT", ".cache/champion_exports")) / _safe_path_part(job_id) / "training"
     try:
+        from worker.artifact_plan import helper_export_formats
+
+        formats = helper_export_formats(
+            artifact_plan,
+            legacy=("onnx", "torchscript", "framework_native"),
+        )
         manifest = produce_champion_export_artifacts(
             export_dir=export_dir,
             model_name=model_name,
@@ -4386,8 +4717,9 @@ def _export_trained_champion_bundle(
             preprocessing=preprocessing,
             model_profile=model_profile,
             training_config=training_config,
-            formats=("onnx", "torchscript", "framework_native"),
+            formats=formats,
             export_self_test_samples=export_self_test_samples,
+            artifact_plan=artifact_plan,
         )
         remote_base = _artifact_remote_base_uri(dataset, job_id)
         public_manifest, artifact_uris = _upload_manifest_artifacts(manifest, remote_base, upload_file_to_s3_uri)
@@ -4437,22 +4769,6 @@ def _export_self_test_failed(manifest: dict) -> bool:
     metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
     self_test = metadata.get("export_self_test") if isinstance(metadata.get("export_self_test"), dict) else {}
     return export_self_test_failed(self_test)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _holistic_scores(best_macro_f1: float, best_accuracy: float, estimated_cost_usd: float, runtime_seconds: float, model_profile: dict) -> dict:
@@ -4544,10 +4860,14 @@ def _report_modal_training_retryable_failure(payload: dict, exc: Exception) -> b
 
 
 def _modal_training_failure_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (ClassificationExecutionError, YoloExecutionError)):
+        return False
     message = str(exc or "").lower()
     if "409 client error" in message and "/complete" in message:
         return False
     if "training completion requires a succeeded summary and exportable evaluation artifact" in message:
+        return False
+    if "runner fidelity enforcement" in message or "dataset normalization was accepted" in message:
         return False
     return True
 
@@ -4569,6 +4889,313 @@ def _post_job_json(
         },
         callback_token(job),
     )
+
+
+def _post_classification_execution_observation(
+    orchestrator_url: str,
+    job: dict,
+    *,
+    stage: str,
+    idempotency_key: str,
+    execution: ClassificationExecution,
+    framework_arguments: dict,
+    evidence: dict,
+    modal_resources: dict | None = None,
+) -> None:
+    if not execution.versioned:
+        return
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "execution-observations",
+        {
+            "schema_version": OBSERVATION_SCHEMA,
+            "stage": stage,
+            "idempotency_key": idempotency_key,
+            "realized_config": execution.realized_config,
+            "framework_arguments": framework_arguments,
+            "evidence": evidence,
+            "adjustment_policy": execution.adjustment_policy,
+            "simulated": False,
+        },
+        modal_resources=modal_resources,
+    )
+
+
+def _post_yolo_execution_observation(
+    orchestrator_url: str,
+    job: dict,
+    *,
+    stage: str,
+    idempotency_key: str,
+    execution: YoloExecution,
+    framework_arguments: dict,
+    evidence: dict,
+    modal_resources: dict | None = None,
+) -> None:
+    if not execution.versioned:
+        return
+    _post_job_json(
+        orchestrator_url,
+        job,
+        "execution-observations",
+        {
+            "schema_version": YOLO_OBSERVATION_SCHEMA,
+            "stage": stage,
+            "idempotency_key": idempotency_key,
+            "realized_config": execution.realized_config,
+            "framework_arguments": framework_arguments,
+            "evidence": evidence,
+            "adjustment_policy": execution.adjustment_policy,
+            "simulated": False,
+        },
+        modal_resources=modal_resources,
+    )
+
+
+def _yolo_framework_arguments(
+    execution: YoloExecution,
+    *,
+    submitted_train_kwargs: dict,
+    ultralytics_version: str,
+    trainer=None,
+) -> dict:
+    import platform
+
+    semantic = yolo_framework_semantic_arguments(execution)
+    submitted_semantic = {
+        key: copy.deepcopy(value)
+        for key, value in submitted_train_kwargs.items()
+        if key not in {"data", "project", "name", "exist_ok", "workers"}
+    }
+    return {
+        "runtime": {
+            "python": platform.python_version(),
+            "ultralytics": ultralytics_version,
+        },
+        "framework_semantic_hash": yolo_framework_semantic_hash(execution),
+        "constructor": semantic["constructor"],
+        "submitted_train": submitted_semantic,
+        "realized_trainer": copy.deepcopy(execution.trainer_arguments or {}),
+        "trainer_runtime": _yolo_trainer_runtime_arguments(trainer),
+        "framework_mismatches": list(execution.framework_mismatches),
+        "preprocessing": semantic["preprocessing"],
+        "native_augmentation": {
+            key: semantic["train"][key]
+            for key in (
+                "hsv_h",
+                "hsv_s",
+                "hsv_v",
+                "degrees",
+                "translate",
+                "scale",
+                "shear",
+                "perspective",
+                "flipud",
+                "fliplr",
+                "bgr",
+                "mosaic",
+                "mixup",
+                "cutmix",
+                "copy_paste",
+                "copy_paste_mode",
+            )
+        },
+    }
+
+
+def _yolo_trainer_runtime_arguments(trainer) -> dict:
+    if trainer is None:
+        return {}
+    optimizer = getattr(trainer, "optimizer", None)
+    optimizer_group = (
+        optimizer.param_groups[0]
+        if optimizer is not None and getattr(optimizer, "param_groups", None)
+        else {}
+    )
+    scheduler = getattr(trainer, "scheduler", None)
+    model = getattr(trainer, "model", None)
+    stride = getattr(model, "stride", None)
+    if hasattr(stride, "tolist"):
+        stride = stride.tolist()
+    elif isinstance(stride, tuple):
+        stride = list(stride)
+    elif stride is not None and not isinstance(stride, (bool, int, float, str, list)):
+        stride = str(stride)
+    return {
+        "trainer": trainer.__class__.__name__,
+        "model": model.__class__.__name__ if model is not None else "",
+        "model_stride": stride,
+        "optimizer": optimizer.__class__.__name__ if optimizer is not None else "",
+        "optimizer_learning_rate": optimizer_group.get("lr"),
+        "optimizer_weight_decay": optimizer_group.get("weight_decay"),
+        "optimizer_momentum": optimizer_group.get("momentum"),
+        "scheduler": scheduler.__class__.__name__ if scheduler is not None else "",
+    }
+
+
+def _classification_framework_arguments(
+    execution: ClassificationExecution,
+    *,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    model,
+    augmentation: dict,
+    effective_preprocessing: dict,
+) -> dict:
+    import platform
+    import torch
+    import torchvision
+
+    normalization = str(effective_preprocessing.get("normalization") or "")
+    normalization_parameters = _normalization_values(normalization, effective_preprocessing)
+    mean, std = normalization_parameters if normalization_parameters is not None else (None, None)
+    optimizer_group = optimizer.param_groups[0] if getattr(optimizer, "param_groups", None) else {}
+    sampler = getattr(train_loader, "sampler", None)
+    criterion_weights = getattr(criterion, "weight", None)
+    return {
+        "runtime": {
+            "python": platform.python_version(),
+            "torch": str(torch.__version__),
+            "torchvision": str(torchvision.__version__),
+            "cuda": str(torch.version.cuda or ""),
+        },
+        "model": {
+            "name": execution.realized_config["model"],
+            "implementation": model.__class__.__name__,
+            "pretrained": execution.realized_config["pretrained"],
+            "freeze_backbone": execution.realized_config["freeze_backbone"],
+            "fine_tune_strategy": execution.realized_config["fine_tune_strategy"],
+            "dropout": execution.realized_config["dropout"],
+        },
+        "optimizer": {
+            "name": optimizer.__class__.__name__,
+            "learning_rate": float(optimizer_group.get("lr", 0.0)),
+            "weight_decay": float(optimizer_group.get("weight_decay", 0.0)),
+            "momentum": float(optimizer_group.get("momentum", 0.0)),
+        },
+        "scheduler": {
+            "name": scheduler.__class__.__name__ if scheduler is not None else "none",
+            "step_size": getattr(scheduler, "step_size", None),
+            "gamma": getattr(scheduler, "gamma", None),
+            "t_max": getattr(scheduler, "T_max", None),
+        },
+        "loss": {
+            "name": criterion.__class__.__name__,
+            "label_smoothing": float(getattr(criterion, "label_smoothing", 0.0)),
+            "focal_gamma": getattr(criterion, "gamma", None),
+            "class_weights_applied": criterion_weights is not None,
+            "class_weights": _numeric_tensor_fingerprint(criterion_weights),
+        },
+        "dataloader": {
+            "batch_size": int(getattr(train_loader, "batch_size", 0) or 0),
+            "sampler": sampler.__class__.__name__ if sampler is not None else "none",
+            "sampler_arguments": _sampler_arguments(sampler),
+            "train_transform": _loader_transform_manifest(train_loader),
+            "eval_transform": _loader_transform_manifest(val_loader),
+        },
+        "preprocessing": {
+            "config": effective_preprocessing,
+            "normalization_mean": list(mean) if mean is not None else None,
+            "normalization_std": list(std) if std is not None else None,
+        },
+        "augmentation": augmentation,
+        "class_balancing": execution.realized_config.get("class_balancing", "none"),
+        "class_balancing_config": execution.realized_config.get("class_balancing_config", {}),
+        "sampling_strategy": execution.realized_config.get("sampling_strategy", "none"),
+        "gradient_clip_norm": execution.realized_config["gradient_clip_norm"],
+        "early_stopping_patience": execution.realized_config["early_stopping_patience"],
+    }
+
+
+def _loader_transform_manifest(loader) -> list[dict]:
+    dataset = getattr(loader, "dataset", None)
+    while dataset is not None:
+        transform = getattr(dataset, "transform", None)
+        if transform is not None:
+            return _transform_manifest(transform)
+        nested = getattr(dataset, "dataset", None)
+        dataset = nested if nested is not None else getattr(dataset, "base_dataset", None)
+    return []
+
+
+def _transform_manifest(transform) -> list[dict]:
+    steps = getattr(transform, "transforms", None)
+    if not isinstance(steps, list):
+        return [{"name": transform.__class__.__name__}]
+    manifest = []
+    for step in steps:
+        item = {"name": step.__class__.__name__}
+        for attribute in (
+            "size",
+            "scale",
+            "ratio",
+            "p",
+            "degrees",
+            "brightness",
+            "contrast",
+            "saturation",
+            "hue",
+            "interpolation",
+            "fill",
+            "mean",
+            "std",
+            "num_ops",
+            "magnitude",
+            "num_magnitude_bins",
+        ):
+            value = getattr(step, attribute, None)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                if value is not None:
+                    item[attribute] = value
+            elif isinstance(value, (list, tuple)):
+                item[attribute] = list(value)
+        manifest.append(item)
+    return manifest
+
+
+def _sampler_arguments(sampler) -> dict:
+    if sampler is None:
+        return {}
+    arguments = {}
+    for attribute in ("num_samples", "replacement"):
+        value = getattr(sampler, attribute, None)
+        if isinstance(value, (int, float, bool, str)):
+            arguments[attribute] = value
+    weights = getattr(sampler, "weights", None)
+    if weights is not None:
+        arguments["weights"] = _numeric_tensor_fingerprint(weights)
+    return arguments
+
+
+def _numeric_tensor_fingerprint(value) -> dict | None:
+    if value is None:
+        return None
+    try:
+        numbers = [float(item) for item in value.detach().cpu().reshape(-1).tolist()]
+    except (AttributeError, TypeError, ValueError):
+        return None
+    canonical = json.dumps(numbers, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {
+        "count": len(numbers),
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
+def _training_export_references(export_bundle: dict) -> dict:
+    manifest_uri = str(export_bundle.get("manifest_uri") or "").strip()
+    artifact_uri = str(export_bundle.get("artifact_uri") or "").strip()
+    references = {
+        "schema_version": "run_execution_references_v1",
+        "training_artifact_uri": artifact_uri,
+        "training_export_manifest_uri": manifest_uri,
+    }
+    if manifest_uri:
+        references["preprocessing_contract_ref"] = manifest_uri + "#/metadata/preprocessing_contract"
+    return references
 
 
 def _post_training_run_summary(
@@ -4768,12 +5395,6 @@ def _string_value(value) -> str:
     return str(value or "").strip()
 
 
-
-
-
-
-
-
 def _should_stop_training_early(
     *,
     epoch: int,
@@ -4814,13 +5435,3 @@ def _target_metric_is_egregiously_low(*, best_accuracy: float, best_macro_f1: fl
     if normalized == "accuracy":
         return best_accuracy < threshold
     return best_macro_f1 < threshold
-
-
-
-
-
-
-
-
-
-

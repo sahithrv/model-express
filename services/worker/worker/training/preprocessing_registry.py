@@ -78,7 +78,9 @@ AUGMENTATION_STRATEGIES: dict[str, PreprocessingStrategySpec] = {
     "none": PreprocessingStrategySpec("augmentation", "none", train_behavior="no_op"),
     "custom": PreprocessingStrategySpec("augmentation", "custom", train_behavior="explicit_flags"),
     "light": PreprocessingStrategySpec("augmentation", "light", train_behavior="legacy_light"),
-    "moderate": PreprocessingStrategySpec("augmentation", "moderate", train_behavior="legacy_moderate"),
+    "moderate": PreprocessingStrategySpec(
+        "augmentation", "moderate", train_behavior="legacy_moderate"
+    ),
     "strong": PreprocessingStrategySpec("augmentation", "strong", train_behavior="legacy_strong"),
     "basic": PreprocessingStrategySpec("augmentation", "basic", train_behavior="horizontal_flip"),
     "randaugment": PreprocessingStrategySpec(
@@ -212,7 +214,9 @@ def bbox_compare_requested(preprocessing: object) -> bool:
     )
 
 
-def build_image_transform(image_size: int, augmentation: dict, preprocessing: object, training: bool):
+def build_image_transform(
+    image_size: int, augmentation: dict, preprocessing: object, training: bool
+):
     from torchvision import transforms
 
     config = normalize_preprocessing_config(preprocessing)
@@ -243,7 +247,9 @@ def build_image_transform(image_size: int, augmentation: dict, preprocessing: ob
     if training and augmentation.get("vertical_flip"):
         steps.append(transforms.RandomVerticalFlip())
     if training and augmentation.get("color_jitter"):
-        steps.append(transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.12, hue=0.03))
+        steps.append(
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.12, hue=0.03)
+        )
     if training and augmentation.get("random_rotation"):
         steps.append(transforms.RandomRotation(10))
     if training:
@@ -284,12 +290,19 @@ def normalization_values(
             std = _three_positive_float_tuple(metadata.get("std"))
             if mean is not None and std is not None:
                 return mean, std
+        raise ValueError(
+            "Dataset normalization was accepted, but valid dataset mean/std metadata is unavailable."
+        )
     return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
 
 def _advanced_augmentation_steps(transforms, augmentation: dict) -> list:
     policy_type = structured_policy_type(augmentation)
-    if policy_type in {"", "basic", "none", "custom", "light", "moderate", "strong"} | MIXED_SAMPLE_POLICY_TYPES:
+    if (
+        policy_type
+        in {"", "basic", "none", "custom", "light", "moderate", "strong"}
+        | MIXED_SAMPLE_POLICY_TYPES
+    ):
         return []
 
     probability = float(augmentation.get("probability", 1.0))

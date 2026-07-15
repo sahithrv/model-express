@@ -26,9 +26,11 @@ from worker.exporting.artifacts import (
 )
 from worker.exporting.inference import demo_prediction_result_from_inference, run_demo_inference_from_manifest
 from worker.exporting.self_test import export_self_test_failed, export_self_test_validation_errors
+from worker.model_express_catalog import available_catalog_ids, require_catalog_id
 from worker.orchestrator_client import OrchestratorClient
+from worker.artifact_plan import load_artifact_plan, require_requested_artifact
 
-SUPPORTED_EXPORT_FORMATS = {"onnx", "torchscript", "pytorch", "safetensors"}
+SUPPORTED_EXPORT_FORMATS = available_catalog_ids("export_formats")
 HELPER_EXPORT_FORMATS = {
     "onnx": "onnx",
     "torchscript": "torchscript",
@@ -46,10 +48,16 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
     config = _config(job)
     job_id = str(job["id"])
     requested_format = _export_format(config)
+    task = str(config.get("task_type") or config.get("task") or "image_classification")
+    runner = str(config.get("runner") or "modal_torchvision")
+    artifact_plan = load_artifact_plan(config, task=task, runner=runner)
+    require_requested_artifact(artifact_plan, requested_format)
     export_dir = _export_dir(config, job_id, requested_format)
     dataset_profile = _dataset_profile(client, config)
     class_names = _class_names(config, dataset_profile)
-    image_size = _positive_int(config.get("image_size"), 224)
+    execution_contract = config.get("execution_contract") if isinstance(config.get("execution_contract"), dict) else {}
+    contract_errors = _execution_contract_errors(execution_contract)
+    image_size = _positive_int(execution_contract.get("image_size"), 224) if execution_contract else _positive_int(config.get("image_size"), 224)
     export_metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
     deployment_profile = export_metadata.get("deployment_profile") if isinstance(export_metadata.get("deployment_profile"), dict) else {}
     model_profile = config.get("model_profile") if isinstance(config.get("model_profile"), dict) else {}
@@ -61,16 +69,23 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
         or _first_string(model_profile, "model", "model_name", "architecture")
         or "unknown_model"
     )
-    preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
-    if not preprocessing and isinstance(deployment_profile.get("preprocessing"), dict):
-        preprocessing = deployment_profile["preprocessing"]
-    training_config = config.get("training_config") if isinstance(config.get("training_config"), dict) else {}
-    if not training_config and isinstance(deployment_profile.get("training_config"), dict):
-        training_config = deployment_profile["training_config"]
-    if not training_config:
-        training_config = config
+    if execution_contract:
+        preprocessing = dict(execution_contract.get("preprocessing") or {})
+        training_config = {
+            "model": model_name,
+            "task": execution_contract.get("task", ""),
+        }
+    else:
+        preprocessing = config.get("preprocessing") if isinstance(config.get("preprocessing"), dict) else {}
+        if not preprocessing and isinstance(deployment_profile.get("preprocessing"), dict):
+            preprocessing = deployment_profile["preprocessing"]
+        training_config = config.get("training_config") if isinstance(config.get("training_config"), dict) else {}
+        if not training_config and isinstance(deployment_profile.get("training_config"), dict):
+            training_config = deployment_profile["training_config"]
+        if not training_config:
+            training_config = config
 
-    validation_errors: list[str] = []
+    validation_errors: list[str] = list(contract_errors)
     if requested_format not in SUPPORTED_EXPORT_FORMATS:
         validation_errors.append(
             f"unsupported export format {requested_format!r}; expected one of {sorted(SUPPORTED_EXPORT_FORMATS)}"
@@ -102,6 +117,7 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
             sample_input_shape=config.get("sample_input_shape"),
             provenance=provenance,
             validation_errors=validation_errors,
+            execution_contract=execution_contract,
         )
     elif source_errors:
         manifest = _error_manifest(export_dir, requested_format, validation_errors, provenance=provenance)
@@ -133,11 +149,11 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
                 if checkpoint_metadata:
                     if not class_names:
                         class_names = _metadata_class_names(checkpoint_metadata)
-                    if not config.get("image_size"):
+                    if not execution_contract and not config.get("image_size"):
                         image_size = _metadata_image_size(checkpoint_metadata, image_size)
                     if not model_profile and isinstance(checkpoint_metadata.get("model_profile"), dict):
                         model_profile = checkpoint_metadata["model_profile"]
-                    if not isinstance(config.get("training_config"), dict) and isinstance(
+                    if not execution_contract and not isinstance(config.get("training_config"), dict) and isinstance(
                         checkpoint_metadata.get("training_config"), dict
                     ):
                         training_config = checkpoint_metadata["training_config"]
@@ -155,6 +171,8 @@ def run_export_champion_job(client: OrchestratorClient, job: dict) -> None:
                     sample_input_shape=config.get("sample_input_shape"),
                     provenance=provenance,
                     validation_errors=validation_errors,
+                    execution_contract=execution_contract,
+                    artifact_plan=artifact_plan,
                 )
     else:
         validation_errors.append(
@@ -299,12 +317,51 @@ def _export_dir(config: dict, job_id: str, requested_format: str) -> Path:
 
 
 def _export_provenance(config: dict, job_id: str, artifact_format: str) -> dict:
-    return {
+    provenance = {
         "export_job_id": job_id,
         "source_job_id": _first_string(config, "champion_job_id", "source_job_id", "training_job_id"),
         "source_export_id": _first_string(config, "source_export_id", "export_id", "champion_export_id"),
         "artifact_format": artifact_format,
     }
+    contract = config.get("execution_contract") if isinstance(config.get("execution_contract"), dict) else {}
+    for key in (
+        "execution_record_ref",
+        "attempt_id",
+        "task",
+        "capability_version",
+        "accepted_spec_hash",
+        "realized_effective_hash",
+        "fidelity_verdict",
+        "preprocessing_contract_hash",
+    ):
+        if contract.get(key) not in (None, ""):
+            provenance[key] = contract[key]
+    return provenance
+
+
+def _execution_contract_errors(contract: dict) -> list[str]:
+    if not contract:
+        return []
+    errors: list[str] = []
+    if contract.get("schema_version") != "export_execution_contract_v1":
+        errors.append("EXPORT_EXECUTION_CONTRACT_INVALID: unsupported schema_version")
+    for key in (
+        "execution_record_ref",
+        "attempt_id",
+        "task",
+        "capability_version",
+        "accepted_spec_hash",
+        "realized_effective_hash",
+        "fidelity_verdict",
+        "preprocessing_contract_hash",
+    ):
+        if not str(contract.get(key) or "").strip():
+            errors.append(f"EXPORT_EXECUTION_CONTRACT_INVALID: missing {key}")
+    if not isinstance(contract.get("preprocessing"), dict) or not contract.get("preprocessing"):
+        errors.append("EXPORT_EXECUTION_CONTRACT_INVALID: missing preprocessing")
+    if _positive_int(contract.get("image_size"), 0) <= 0:
+        errors.append("EXPORT_EXECUTION_CONTRACT_INVALID: missing image_size")
+    return errors
 
 
 def _exemplar_dir(dataset_id: str, job_id: str) -> Path:
@@ -733,7 +790,17 @@ def _inline_manifest_provenance(provenance: dict, artifact_format: str) -> dict:
         "artifact_format": artifact_format,
         "validation_errors": [],
     }
-    for key in ("source_job_id", "source_export_id", "export_job_id"):
+    for key in (
+        "source_job_id",
+        "source_export_id",
+        "export_job_id",
+        "execution_record_ref",
+        "attempt_id",
+        "capability_version",
+        "accepted_spec_hash",
+        "realized_effective_hash",
+        "preprocessing_contract_hash",
+    ):
         value = provenance.get(key)
         if value:
             record[key] = str(value)
@@ -762,78 +829,86 @@ def _build_torchvision_model(
     fine_tune_strategy: str,
     dropout: float,
 ):
+    normalized = require_catalog_id(
+        "models",
+        model_name,
+        task="image_classification",
+        runner="modal_torchvision",
+    )
+
     from torch import nn
     from torchvision import models
 
-    normalized = model_name.lower()
     dropout = max(0.0, min(0.7, dropout))
 
-    if "efficientnet_b2" in normalized:
+    if normalized == "efficientnet_b2":
         model = _torchvision_model(models.efficientnet_b2, models.EfficientNet_B2_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet_b1" in normalized:
+    if normalized == "efficientnet_b1":
         model = _torchvision_model(models.efficientnet_b1, models.EfficientNet_B1_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet" in normalized:
+    if normalized == "efficientnet_b0":
         model = _torchvision_model(models.efficientnet_b0, models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "resnet34" in normalized:
+    if normalized == "resnet34":
         model = _torchvision_model(models.resnet34, models.ResNet34_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "resnet" in normalized:
+    if normalized == "resnet18":
         model = _torchvision_model(models.resnet18, models.ResNet18_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "regnet_y_400mf" in normalized:
+    if normalized == "regnet_y_400mf":
         model = _torchvision_model(models.regnet_y_400mf, models.RegNet_Y_400MF_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "convnext_tiny" in normalized:
+    if normalized == "convnext_tiny":
         model = _torchvision_model(models.convnext_tiny, models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "swin_t" in normalized:
+    if normalized == "swin_t":
         model = _torchvision_model(models.swin_t, models.Swin_T_Weights.DEFAULT if pretrained else None)
         in_features = model.head.in_features
         _apply_transfer_strategy(model, "head", freeze_backbone, fine_tune_strategy)
         model.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "vit_b_16" in normalized:
+    if normalized == "vit_b_16":
         model = _torchvision_model(models.vit_b_16, models.ViT_B_16_Weights.DEFAULT if pretrained else None)
         in_features = model.heads.head.in_features
         _apply_transfer_strategy(model, "heads", freeze_backbone, fine_tune_strategy)
         model.heads.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "mobilenet_v3_large" in normalized:
+    if normalized == "mobilenet_v3_large":
         model = _torchvision_model(models.mobilenet_v3_large, models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
 
-    model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
-    in_features = model.classifier[-1].in_features
-    _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-    _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
-    return model
+    if normalized == "mobilenet_v3_small":
+        model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    raise ValueError(f"Unsupported torchvision classification model {model_name!r}.")
 
 
 def _torchvision_model(factory, weights):
@@ -1137,6 +1212,8 @@ def _export_status_for_manifest(
     if _manifest_export_self_test_failed(manifest):
         return "FAILED", errors
     if primary_artifact:
+        if errors:
+            return "FAILED", list(dict.fromkeys(errors))
         return "READY", errors
     if artifact_errors:
         errors.extend(artifact_errors)
@@ -1195,7 +1272,17 @@ def _error_manifest(
         "validation_errors": [str(error) for error in validation_errors if error],
     }
     if provenance:
-        for key in ("source_job_id", "source_export_id", "export_job_id"):
+        for key in (
+            "source_job_id",
+            "source_export_id",
+            "export_job_id",
+            "execution_record_ref",
+            "attempt_id",
+            "capability_version",
+            "accepted_spec_hash",
+            "realized_effective_hash",
+            "preprocessing_contract_hash",
+        ):
             value = provenance.get(key)
             if value:
                 provenance_record[key] = str(value)

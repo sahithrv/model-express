@@ -37,11 +37,23 @@ test("orchestrator requests are limited to app paths, approved methods, and loop
     method: "post",
     path: "/projects?limit=1",
     body: { name: "demo" },
+    diagnosticReason: "active_poll",
   });
 
   assert.equal(request.method, "POST");
   assert.equal(request.url, "http://127.0.0.1:8080/projects?limit=1");
   assert.equal(request.bodyText, '{"name":"demo"}');
+  assert.equal(request.reasonCode, "active_poll");
+
+  const probe = __test.validateOrchestratorRequest({
+    baseUrl: "http://127.0.0.1:8080",
+    method: "HEAD",
+    path: "/projects/project-1/events/stream/v2?cursor=7",
+    requestId: "live_probe_7",
+    diagnosticReason: "stream_reconnect",
+  });
+  assert.equal(probe.method, "HEAD");
+  assert.equal(probe.requestId, "live_probe_7");
 
   assert.throws(
     () => __test.validateOrchestratorRequest({ baseUrl: "http://127.0.0.1:8080", method: "PUT", path: "/projects" }),
@@ -54,6 +66,138 @@ test("orchestrator requests are limited to app paths, approved methods, and loop
   assert.throws(
     () => __test.validateOrchestratorRequest({ baseUrl: "http://example.com:8080", path: "/projects" }),
     /Non-loopback orchestrator URLs/,
+  );
+  assert.throws(
+    () => __test.validateOrchestratorRequest({ baseUrl: "http://127.0.0.1:8080", path: "/projects", requestId: "../unsafe" }),
+    /bounded opaque identifier/,
+  );
+});
+
+test("incremental live feature flags are bounded booleans with a safe automatic default", () => {
+  assert.deepEqual(__test.missionControlLiveFeatureFlags({}), {
+    incremental_v2_enabled: true,
+    incremental_v2_shadow: false,
+    incremental_v2_rollback: false,
+  });
+  assert.deepEqual(__test.missionControlLiveFeatureFlags({
+    MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ENABLED: "off",
+    MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_SHADOW: "yes",
+    MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ROLLBACK: "1",
+  }), {
+    incremental_v2_enabled: false,
+    incremental_v2_shadow: true,
+    incremental_v2_rollback: true,
+  });
+});
+
+test("event-stream relay accepts only a bounded v2 cursor path", () => {
+  const options = __test.validateOrchestratorEventStreamOptions({
+    streamId: "stream_1",
+    baseUrl: "http://127.0.0.1:8080",
+    path: "/projects/project-1/events/stream/v2?cursor=42&reason=stream_initial",
+    diagnosticReason: "stream_initial",
+  });
+  assert.equal(options.streamId, "stream_1");
+  assert.equal(options.url, "http://127.0.0.1:8080/projects/project-1/events/stream/v2?cursor=42&reason=stream_initial");
+  assert.throws(
+    () => __test.validateOrchestratorEventStreamOptions({
+      streamId: "stream_2",
+      baseUrl: "http://127.0.0.1:8080",
+      path: "/projects/project-1/activity-stream?cursor=42&reason=stream_initial",
+    }),
+    /bounded v2 execution-event stream/,
+  );
+  assert.throws(
+    () => __test.validateOrchestratorEventStreamOptions({
+      streamId: "stream_3",
+      baseUrl: "http://127.0.0.1:8080",
+      path: "/projects/project-1/events/stream/v2?cursor=-1&reason=stream_initial",
+    }),
+    /bounded nonnegative integer/,
+  );
+  assert.throws(
+    () => __test.validateOrchestratorEventStreamOptions({
+      streamId: "stream_4",
+      baseUrl: "http://127.0.0.1:8080",
+      path: "/projects/project-1/events/stream/v2?cursor=42&reason=legacy",
+    }),
+    /reason must be initial or reconnect/,
+  );
+});
+
+test("event-stream HTTP error bodies are read with a strict byte bound", async () => {
+  const response = new Response(`{"reason_code":"cursor_too_old","padding":"${"x".repeat(10_000)}"}`);
+  const text = await __test.readBoundedResponseText(response, 128);
+  assert.ok(Buffer.byteLength(text, "utf8") <= 128);
+  assert.match(text, /cursor_too_old/);
+  await assert.rejects(
+    () => __test.readBoundedResponseText(new Response("{}"), 100_000),
+    /byte limit must be bounded/,
+  );
+});
+
+test("renderer activity visibility diagnostics accept only bounded scalar summaries", () => {
+  const summary = __test.validateActivityVisibilitySummary({
+    source_code: "execution_event_v2",
+    reason_code: "live",
+    sample_count: 2,
+    latency_sample_count: 2,
+    invalid_sample_count: 0,
+    dropped_count: 0,
+    latency_total_ms: 30,
+    latency_min_ms: 10,
+    latency_max_ms: 20,
+    latency_average_ms: 15,
+    commit_delay_total_ms: 4,
+    commit_delay_average_ms: 2,
+    message: "must not be retained",
+    payload: { prompt: "must not be retained" },
+  });
+
+  assert.deepEqual(summary, {
+    source_code: "execution_event_v2",
+    reason_code: "live",
+    sample_count: 2,
+    latency_sample_count: 2,
+    invalid_sample_count: 0,
+    dropped_count: 0,
+    latency_total_ms: 30,
+    latency_min_ms: 10,
+    latency_max_ms: 20,
+    latency_average_ms: 15,
+    commit_delay_total_ms: 4,
+    commit_delay_average_ms: 2,
+  });
+  assert.throws(
+    () => __test.validateActivityVisibilitySummary({ source_code: "execution_event_v2", reason_code: "raw_event", sample_count: 1 }),
+    /supported reason code/,
+  );
+  assert.throws(
+    () => __test.validateActivityVisibilitySummary({ reason_code: "live", sample_count: 1 }),
+    /v2 source code/,
+  );
+});
+
+test("incremental diagnostics discard identities and payload contents", () => {
+  const fields = __test.validateIncrementalLiveDiagnostic({
+    reason_code: "shadow_compare",
+    outcome_code: "mismatched",
+    count: 3,
+    duration_ms: 12,
+    project_id: "private-project",
+    message: "s3://private-bucket/prompt.txt",
+    payload: { prompt: "secret" },
+  });
+  assert.deepEqual(fields, {
+    reason_code: "shadow_compare",
+    outcome_code: "mismatched",
+    count: 3,
+    duration_ms: 12,
+  });
+  assert.equal(JSON.stringify(fields).includes("private-project"), false);
+  assert.throws(
+    () => __test.validateIncrementalLiveDiagnostic({ reason_code: "raw_payload", outcome_code: "applied" }),
+    /supported reason and outcome codes/,
   );
 });
 

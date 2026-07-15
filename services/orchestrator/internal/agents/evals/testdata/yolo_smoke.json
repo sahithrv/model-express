@@ -1,5 +1,8 @@
 {
   "name": "yolo_smoke",
+  "description": "Object-detection planning must remain in a detector-capable model family under a live latency constraint.",
+  "coverage": ["detection", "task_sensitive", "latency", "add_experiments"],
+  "starter": true,
   "input_summary": {
     "project_name": "YOLO Smoke",
     "project_goal": "Improve detector mAP without breaking live latency.",
@@ -237,5 +240,21 @@
     "allowed_decisions": ["ADD_EXPERIMENTS", "SELECT_CHAMPION", "STOP_PROJECT", "WAIT"],
     "allowed_add_experiment_mechanisms": ["baseline_control", "architecture_challenge", "deployment_latency"],
     "max_selected_experiments": 2
-  }
+  },
+  "rubric": {
+    "id": "detection_add_experiments_v1",
+    "expected_decision_types": ["ADD_EXPERIMENTS"],
+    "allowed_mechanisms": ["baseline_control", "architecture_challenge", "deployment_latency"],
+    "forbidden_mechanisms": ["class_imbalance"],
+    "minimum_evidence_items": 2,
+    "task_type": "object_detection",
+    "allowed_models": ["yolo11n.pt", "yolo11s.pt"],
+    "max_selected_experiments": 2
+  },
+  "mutations": [{
+    "name": "classifier-on-yolo",
+    "operation": "set_model",
+    "value": "resnet18",
+    "expected_failed_checks": ["task_compatibility"]
+  }]
 }

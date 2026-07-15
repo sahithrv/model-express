@@ -16,6 +16,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
@@ -417,7 +418,7 @@ func (s *Server) ensureOpenJob(projectID string, template string, config map[str
 			return job, nil
 		}
 	}
-	return s.store.CreateJob(projectID, template, config)
+	return s.createJobWithCurrentPolicy(projectID, template, config, policyOperationCreateJob)
 }
 
 func jobConfigString(config map[string]any, key string) string {
@@ -474,10 +475,6 @@ func terminalPlannerGuardsEnabledForMode(agentMode string) bool {
 		return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", true)
 	}
 	return envFlag("MODEL_EXPRESS_TERMINAL_PLANNER_GUARDS", false)
-}
-
-func plannerStrictValidationEnabled() bool {
-	return envFlag("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", false)
 }
 
 func plannerRelaxedValidationWarning(err error) string {
@@ -645,12 +642,32 @@ func bindOptionalJSON(c *gin.Context, value any) bool {
 }
 
 func writeStoreError(c *gin.Context, err error) {
+	var policyErr *policies.PolicyError
+	if errors.As(err, &policyErr) {
+		status := http.StatusUnprocessableEntity
+		if policyErr.Code == policies.ReasonUnknownCatalogIdentifier {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{
+			"error": policyErr.Error(), "code": policyErr.Code,
+			"policy_evaluation_id":  policyErr.PolicyEvaluationID,
+			"effective_policy_hash": policyErr.EffectivePolicyHash,
+			"findings":              policyErr.Findings,
+			"blocked_dimensions":    policyErr.BlockedDimensions,
+			"contributing_scopes":   policyErr.ContributingScopes,
+		})
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 	if errors.Is(err, store.ErrInvalidRequest) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if policyConflict(err) {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "POLICY_REVISION_CONFLICT"})
 		return
 	}
 

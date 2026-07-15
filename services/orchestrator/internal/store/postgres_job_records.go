@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/workers"
@@ -23,10 +25,9 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 	defer tx.Rollback()
 
 	worker, err := scanWorker(tx.QueryRowContext(ctx, `
-		SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
 		FROM workers
 		WHERE id = $1
-		FOR UPDATE
 	`, workerID))
 	if err != nil {
 		return nil, err
@@ -37,16 +38,35 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 		return nil, err
 	}
 	worker, err = scanWorker(tx.QueryRowContext(ctx, `
-		SELECT id, project_id, name, status, gpu_type, last_heartbeat, current_job_id
+		SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
 		FROM workers
 		WHERE id = $1
-		FOR UPDATE
 	`, workerID))
 	if err != nil {
 		return nil, err
 	}
 
 	if worker.CurrentJobID != "" {
+		job, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id")+" FOR UPDATE", worker.CurrentJobID))
+		if err != nil {
+			return nil, err
+		}
+		lockedWorker, err := scanWorker(tx.QueryRowContext(ctx, `
+			SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
+			FROM workers
+			WHERE id = $1
+			FOR UPDATE
+		`, workerID))
+		if err != nil {
+			return nil, err
+		}
+		if lockedWorker.CurrentJobID != job.ID {
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return s.PollJob(workerID, filter)
+		}
+		worker = lockedWorker
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE workers
 			SET last_heartbeat = now()
@@ -55,10 +75,6 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 			return nil, err
 		}
 
-		job, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL("id"), worker.CurrentJobID))
-		if err != nil {
-			return nil, err
-		}
 		if !isTerminalJobStatus(job.Status) {
 			leaseExpiresAt := now.Add(defaultJobLeaseDuration)
 			job, err = scanJob(tx.QueryRowContext(ctx, `
@@ -149,6 +165,22 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 		}
 		return nil, ErrNoJob
 	}
+	lockedWorker, err := scanWorker(tx.QueryRowContext(ctx, `
+		SELECT id, project_id, name, status, gpu_type, policy_capability_versions, artifact_capability_versions, last_heartbeat, current_job_id
+		FROM workers
+		WHERE id = $1
+		FOR UPDATE
+	`, workerID))
+	if err != nil {
+		return nil, err
+	}
+	if lockedWorker.CurrentJobID != "" || lockedWorker.ProjectID != worker.ProjectID {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return s.PollJob(workerID, filter)
+	}
+	worker = lockedWorker
 
 	assignedConfig := jobConfigWithActiveAttempt(job.Config, job.ID, job.Attempt+1)
 	assignedConfigJSON, err := json.Marshal(assignedConfig)
@@ -173,6 +205,22 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 	if err != nil {
 		return nil, err
 	}
+	if _, err := createAttemptExecutionRecordTx(ctx, tx, assignedJob.ID, jobAttemptID(assignedJob.ID, assignedJob.Attempt), assignedJob.Attempt); err != nil && !errors.Is(normalizeSQLError(err), ErrNotFound) {
+		return nil, err
+	}
+	transition, progress := newJobLifecycleTransition(
+		assignedJob,
+		execution.TransitionJobAssigned,
+		assignedJob.Attempt,
+		jobs.ProgressStageWorkerStarting,
+		jobs.ProgressStatusRunning,
+		progressRevisionAssigned,
+		"worker_assigned",
+		"worker_assignment",
+	)
+	if _, _, _, err := commitJobLifecycleTx(ctx, tx, assignedJob, progress, transition, now); err != nil {
+		return nil, err
+	}
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE workers
@@ -191,7 +239,7 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 
 func pollJobCandidateQuery(projectID string, filter JobPollFilter) (string, []any) {
 	args := []any{jobs.StatusQueued, projectID}
-	clauses := []string{"status = $1", "project_id = $2"}
+	clauses := []string{"status = $1", "project_id = $2", "policy_eligibility_status <> 'POLICY_BLOCKED'"}
 
 	if templates := normalizedPollValues(filter.Templates); len(templates) > 0 {
 		placeholders := make([]string, 0, len(templates))
@@ -218,7 +266,7 @@ func pollJobCandidateQuery(projectID string, filter JobPollFilter) (string, []an
 	}
 
 	query := `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+		SELECT ` + jobSelectColumns() + `
 		FROM experiment_jobs
 		WHERE ` + strings.Join(clauses, " AND ") + `
 		ORDER BY created_at
@@ -251,6 +299,10 @@ func postgresPageLimitOffset(options PageOptions) (int, int) {
 }
 
 func (s *PostgresStore) CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error) {
+	return s.CreateJobWithOptions(projectID, template, config, CreateJobOptions{})
+}
+
+func (s *PostgresStore) CreateJobWithOptions(projectID string, template string, config map[string]any, options CreateJobOptions) (jobs.ExperimentJob, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return jobs.ExperimentJob{}, err
 	}
@@ -263,13 +315,68 @@ func (s *PostgresStore) CreateJob(projectID string, template string, config map[
 		return jobs.ExperimentJob{}, fmt.Errorf("marshal job config: %w", err)
 	}
 
-	const query = `
-		INSERT INTO experiment_jobs (project_id, template, status, config, max_attempts)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
-	`
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	defer tx.Rollback()
+	datasetID := strings.TrimSpace(configString(config, "dataset_id"))
+	planID := strings.TrimSpace(configString(config, "plan_id"))
+	query := `
+		INSERT INTO experiment_jobs (
+			project_id, dataset_id, plan_id, template, status, config, max_attempts,
+			schedule_policy_evaluation_id, effective_policy_hash, policy_eligibility_status
+		)
+		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), $4, $5, $6, $7, NULLIF($8, ''), $9, $10)
+		RETURNING ` + jobSelectColumns()
 
-	return scanJob(s.db.QueryRowContext(context.Background(), query, projectID, template, jobs.StatusQueued, configJSON, defaultJobMaxAttempts))
+	job, err := scanJob(tx.QueryRowContext(
+		ctx, query, projectID, datasetID, planID, template, jobs.StatusQueued, configJSON,
+		defaultJobMaxAttempts, options.PolicyReference.EvaluationID,
+		options.PolicyReference.EffectivePolicyHash, options.PolicyReference.Status,
+	))
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	pendingConfig := jobConfigWithPendingAttempt(job.Config, job.ID, 1)
+	pendingConfigJSON, err := json.Marshal(pendingConfig)
+	if err != nil {
+		return jobs.ExperimentJob{}, fmt.Errorf("marshal pending attempt job config: %w", err)
+	}
+	job, err = scanJob(tx.QueryRowContext(ctx, `
+		UPDATE experiment_jobs
+		SET config = $1
+		WHERE id = $2
+		RETURNING `+jobSelectColumns()+`
+	`, pendingConfigJSON, job.ID))
+	if err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	if spec, ok := executionSpecFromConfig(job.ID, projectID, job.Config, job.CreatedAt); ok {
+		spec.PolicyEvaluationID = options.PolicyReference.EvaluationID
+		spec.EffectivePolicyHash = options.PolicyReference.EffectivePolicyHash
+		if err := insertJobExecutionSpecTx(ctx, tx, spec); err != nil {
+			return jobs.ExperimentJob{}, err
+		}
+	}
+	transition, progress := newJobLifecycleTransition(
+		job,
+		execution.TransitionJobQueued,
+		1,
+		jobs.ProgressStageQueued,
+		jobs.ProgressStatusQueued,
+		progressRevisionQueued,
+		"initial_queue",
+		"job_created",
+	)
+	if _, _, _, err := commitJobLifecycleTx(ctx, tx, job, progress, transition, job.CreatedAt); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return jobs.ExperimentJob{}, err
+	}
+	return job, nil
 }
 
 func (s *PostgresStore) GetJob(id string) (jobs.ExperimentJob, error) {
@@ -281,8 +388,8 @@ func (s *PostgresStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob,
 		return nil, err
 	}
 
-	const query = `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+	query := `
+		SELECT ` + jobSelectColumns() + `
 		FROM experiment_jobs
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -311,8 +418,8 @@ func (s *PostgresStore) ListProjectJobsPage(projectID string, options PageOption
 		return nil, err
 	}
 	limit, offset := postgresPageLimitOffset(options)
-	const query = `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+	query := `
+		SELECT ` + jobSelectColumns() + `
 		FROM experiment_jobs
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -336,6 +443,9 @@ func (s *PostgresStore) ListProjectJobsPage(projectID string, options PageOption
 }
 
 func (s *PostgresStore) UpdateJobConfig(jobID string, patch map[string]any) (jobs.ExperimentJob, error) {
+	if _, changesAcceptedSpec := patch[execution.ExecutionSpecConfigKey]; changesAcceptedSpec {
+		return jobs.ExperimentJob{}, fmt.Errorf("%w: %s is immutable after scheduling", ErrInvalidRequest, execution.ExecutionSpecConfigKey)
+	}
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -424,6 +534,9 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 			job.MaxAttempts = defaultJobMaxAttempts
 		}
 		previousConfig := copyAnyMap(job.Config)
+		if _, err := tx.ExecContext(ctx, `UPDATE attempt_execution_records SET lifecycle_status=$1, updated_at=now() WHERE job_id=$2 AND attempt_id=$3 AND lifecycle_status=$4`, execution.ExecutionLifecycleNotRealized, job.ID, jobAttemptID(job.ID, job.Attempt), execution.ExecutionLifecyclePending); err != nil {
+			return nil, err
+		}
 		var updated jobs.ExperimentJob
 		if job.Attempt >= job.MaxAttempts {
 			nextConfig := jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
@@ -459,10 +572,11 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 					started_at = NULL,
 					lease_owner_worker_id = '',
 					lease_expires_at = NULL,
-					lease_last_heartbeat_at = NULL
+					lease_last_heartbeat_at = NULL,
+					policy_eligibility_status = $4
 				WHERE id = $2
 				RETURNING `+jobSelectColumns()+`
-			`, jobs.StatusQueued, job.ID, configJSON))
+			`, jobs.StatusQueued, job.ID, configJSON, jobs.PolicyEligibilityPending))
 		}
 		if err != nil {
 			return nil, err
@@ -477,6 +591,36 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 		}
 		if err := closeRemoteTrainingSessionForJobConfigTx(ctx, tx, previousConfig, runs.RemoteTrainingSessionStatusExpired, now); err != nil {
 			return nil, err
+		}
+		if updated.Status == jobs.StatusFailed {
+			transition, progress := newJobLifecycleTransition(
+				updated,
+				execution.TransitionJobFailed,
+				activeJobProgressAttempt(updated),
+				jobs.ProgressStageFailed,
+				jobs.ProgressStatusFailed,
+				progressRevisionTerminal,
+				"lease_attempts_exhausted",
+				"lease_attempts_exhausted",
+			)
+			if _, _, _, err := commitJobLifecycleTx(ctx, tx, updated, progress, transition, now); err != nil {
+				return nil, err
+			}
+		} else {
+			attempt := activeJobProgressAttempt(updated)
+			transition, progress := newJobLifecycleTransition(
+				updated,
+				execution.TransitionJobLeaseRecovered,
+				attempt,
+				jobs.ProgressStageQueued,
+				jobs.ProgressStatusQueued,
+				progressRevisionQueued,
+				"lease_recovered",
+				"lease_expired",
+			)
+			if _, _, _, err := commitJobLifecycleTx(ctx, tx, updated, progress, transition, now); err != nil {
+				return nil, err
+			}
 		}
 		recovered = append(recovered, updated)
 	}
@@ -500,7 +644,9 @@ func (s *PostgresStore) ReportMetric(jobID string, epoch int, values map[string]
 		return jobs.EpochMetric{}, err
 	}
 
-	if job.Status == jobs.StatusAssigned {
+	now := time.Now().UTC()
+	becameRunning := job.Status == jobs.StatusAssigned
+	if becameRunning {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE experiment_jobs
 			SET status = $1
@@ -508,9 +654,10 @@ func (s *PostgresStore) ReportMetric(jobID string, epoch int, values map[string]
 		`, jobs.StatusRunning, jobID); err != nil {
 			return jobs.EpochMetric{}, err
 		}
+		job.Status = jobs.StatusRunning
 	}
 
-	if job.WorkerID != "" {
+	if job.WorkerID != "" && (job.Status == jobs.StatusAssigned || job.Status == jobs.StatusRunning) {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE workers
 			SET status = $1, last_heartbeat = now()
@@ -522,7 +669,42 @@ func (s *PostgresStore) ReportMetric(jobID string, epoch int, values map[string]
 			UPDATE experiment_jobs
 			SET lease_owner_worker_id = $1, lease_last_heartbeat_at = now(), lease_expires_at = $2
 			WHERE id = $3
-		`, job.WorkerID, time.Now().UTC().Add(defaultJobLeaseDuration), jobID); err != nil {
+		`, job.WorkerID, now.Add(defaultJobLeaseDuration), jobID); err != nil {
+			return jobs.EpochMetric{}, err
+		}
+	}
+	if becameRunning {
+		transition, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobRunning,
+			activeJobProgressAttempt(job),
+			jobs.ProgressStageTraining,
+			jobs.ProgressStatusRunning,
+			progressRevisionForEpoch(epoch),
+			"first_metric",
+			"first_metric",
+		)
+		current := int64(epoch)
+		progress.Current = &current
+		progress.Unit = "epoch"
+		if _, _, _, err := commitJobLifecycleTx(ctx, tx, job, progress, transition, now); err != nil {
+			return jobs.EpochMetric{}, err
+		}
+	} else if job.Status == jobs.StatusRunning {
+		_, progress := newJobLifecycleTransition(
+			job,
+			execution.TransitionJobRunning,
+			activeJobProgressAttempt(job),
+			jobs.ProgressStageTraining,
+			jobs.ProgressStatusRunning,
+			progressRevisionForEpoch(epoch),
+			"metric_reported",
+			"metric_reported",
+		)
+		current := int64(epoch)
+		progress.Current = &current
+		progress.Unit = "epoch"
+		if _, err := upsertJobProgressTx(ctx, tx, job, progress, now); err != nil {
 			return jobs.EpochMetric{}, err
 		}
 	}

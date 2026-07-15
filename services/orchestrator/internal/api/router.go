@@ -26,6 +26,8 @@ type Server struct {
 	trainingTerminalHooksQueued map[string]bool
 	automationSettings          settings.AutomationSettings
 	settingsMu                  sync.RWMutex
+	fidelityMetricsMu           sync.Mutex
+	unverifiedReadsByProject    map[string]int64
 }
 
 const defaultOrchestratorAddr = "127.0.0.1:8080"
@@ -101,6 +103,10 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/automl/capabilities", server.getAutoMLCapabilities)
 	router.GET("/settings/automation", server.getAutomationSettings)
 	router.PATCH("/settings/automation", server.updateAutomationSettings)
+	router.GET("/compatibility-profiles", server.listCompatibilityProfiles)
+	router.GET("/settings/experiment-policy", server.getAccountExperimentPolicy)
+	router.PUT("/settings/experiment-policy", server.updateAccountExperimentPolicy)
+	router.DELETE("/settings/experiment-policy", server.clearAccountExperimentPolicy)
 	router.POST("/preflight/cloud", server.preflightCloud)
 
 	router.POST("/projects", server.createProject)
@@ -128,13 +134,26 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/projects/:id/agent-memory", server.listProjectAgentMemoryRecords)
 	router.POST("/projects/:id/memory-embeddings/backfill", server.backfillProjectMemoryEmbeddings)
 	router.GET("/projects/:id/agent-invocations", server.listProjectAgentInvocations)
+	router.GET("/projects/:id/calibration-report", server.getProjectCalibrationReport)
 	router.GET("/projects/:id/telemetry-summary", server.getProjectTelemetrySummary)
 	router.GET("/projects/:id/strategy-scorecards", server.listProjectStrategyScorecards)
 	router.GET("/projects/:id/worker-requirements", server.listProjectWorkerRequirements)
 	router.POST("/projects/:id/cancel-active-executions", server.cancelProjectActiveExecutions)
+	router.GET("/projects/:id/live-state", server.getProjectLiveState)
 	router.GET("/projects/:id/execution-events", server.listProjectExecutionEvents)
+	router.GET("/projects/:id/execution-records", server.listProjectExecutionRecords)
+	router.GET("/projects/:id/experiment-policy/preview", server.previewProjectExperimentPolicy)
+	router.GET("/projects/:id/experiment-policy", server.getProjectExperimentPolicy)
+	router.PUT("/projects/:id/experiment-policy", server.updateProjectExperimentPolicy)
+	router.DELETE("/projects/:id/experiment-policy", server.clearProjectExperimentPolicy)
+	router.GET("/projects/:id/experiment-policy/audit", server.listProjectExperimentPolicyAudit)
+	router.GET("/projects/:id/effective-experiment-policy", server.previewProjectExperimentPolicy)
+	router.GET("/projects/:id/permitted-catalog", server.previewProjectExperimentPolicy)
 	router.POST("/projects/:id/dispatcher-events", server.reportProjectDispatcherEvent)
-	router.GET("/projects/:id/events/stream", server.streamProjectExecutionEvents)
+	if activityStreamV2Enabled() {
+		router.HEAD("/projects/:id/events/stream/v2", server.probeProjectExecutionEventsV2)
+		router.GET("/projects/:id/events/stream/v2", server.streamProjectExecutionEventsV2)
+	}
 	router.GET("/projects/:id/activity-stream", server.streamProjectActivityEvents)
 	router.GET("/projects/:id/workers", server.listProjectWorkers)
 	router.POST("/projects/:id/plans", server.createExperimentPlan)
@@ -144,6 +163,9 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/plans/:id/cancel-active-execution", server.cancelPlanActiveExecution)
 
 	router.GET("/datasets/:id", server.getDataset)
+	router.GET("/datasets/:id/experiment-policy", server.getDatasetExperimentPolicy)
+	router.PUT("/datasets/:id/experiment-policy", server.updateDatasetExperimentPolicy)
+	router.DELETE("/datasets/:id/experiment-policy", server.clearDatasetExperimentPolicy)
 	router.POST("/datasets/:id/profile", server.updateDatasetProfile)
 	router.POST("/datasets/:id/metadata/imports", server.importDatasetMetadata)
 	router.GET("/datasets/:id/metadata/imports", server.listDatasetMetadataImports)
@@ -158,6 +180,12 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.POST("/datasets/:id/visual-analysis-result", server.reportDatasetVisualAnalysisResult)
 
 	router.GET("/jobs/:id", server.getJob)
+	router.GET("/jobs/:id/experiment-policy", server.getRunExperimentPolicy)
+	router.PUT("/jobs/:id/experiment-policy", server.updateRunExperimentPolicy)
+	router.DELETE("/jobs/:id/experiment-policy", server.clearRunExperimentPolicy)
+	router.GET("/jobs/:id/execution-record", server.getJobExecutionRecord)
+	router.POST("/jobs/:id/execution-observations", server.reportRealizationObservation)
+	router.POST("/jobs/:id/progress", server.reportJobProgress)
 	router.POST("/jobs/:id/metrics", server.reportMetric)
 	router.GET("/jobs/:id/metrics", server.listJobMetrics)
 	router.POST("/jobs/:id/training-run-summary", server.upsertTrainingRunSummary)
@@ -186,6 +214,7 @@ func newServer(store store.Store) *Server {
 		store:                       store,
 		callbackSecret:              callbackSecretFromEnv(),
 		trainingTerminalHooksQueued: make(map[string]bool),
+		unverifiedReadsByProject:    make(map[string]int64),
 		automationSettings:          automationSettingsFromEnv(),
 	}
 
@@ -297,6 +326,7 @@ func callbackEndpointUsesAttemptToken(method string, path string) bool {
 	}
 	switch parts[2] {
 	case "metrics",
+		"progress",
 		"training-run-summary",
 		"training-run-evaluation",
 		"modal-call",

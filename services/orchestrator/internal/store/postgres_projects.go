@@ -3,32 +3,37 @@ package store
 import (
 	"context"
 
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 )
 
 func (s *PostgresStore) CreateProject(name string, goal string) (projects.Project, error) {
 	const query = `
-		INSERT INTO projects (name, goal, status)
-		VALUES ($1, $2, $3)
-		RETURNING id, name, goal, status, created_at, updated_at
+		INSERT INTO projects (account_id, name, goal, status)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, account_id, name, goal, status, created_at, updated_at
 	`
 
-	return scanProject(s.db.QueryRowContext(context.Background(), query, name, goal, projects.StatusCreated))
+	return scanProject(s.db.QueryRowContext(context.Background(), query, policies.LocalDefaultAccountID, name, goal, projects.StatusCreated))
 }
 
 func (s *PostgresStore) GetProject(id string) (projects.Project, error) {
+	return s.GetProjectContext(context.Background(), id)
+}
+
+func (s *PostgresStore) GetProjectContext(ctx context.Context, id string) (projects.Project, error) {
 	const query = `
-		SELECT id, name, goal, status, created_at, updated_at
+		SELECT id, account_id, name, goal, status, created_at, updated_at
 		FROM projects
 		WHERE id = $1
 	`
 
-	return scanProject(s.db.QueryRowContext(context.Background(), query, id))
+	return scanProject(s.db.QueryRowContext(ctx, query, id))
 }
 
 func (s *PostgresStore) ListProjects() ([]projects.Project, error) {
 	const query = `
-		SELECT id, name, goal, status, created_at, updated_at
+		SELECT id, account_id, name, goal, status, created_at, updated_at
 		FROM projects
 		ORDER BY created_at DESC
 	`

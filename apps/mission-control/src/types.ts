@@ -198,6 +198,8 @@ export type Worker = {
   name: string;
   status: string;
   gpu_type: string;
+  policy_capability_versions?: string[];
+  artifact_capability_versions?: string[];
   last_heartbeat: string;
   current_job_id?: string;
 };
@@ -214,6 +216,87 @@ export type Job = {
   created_at: string;
   started_at?: string;
   completed_at?: string;
+};
+
+export type ExecutionArtifactReferences = {
+  schema_version?: string;
+  lifecycle_status?: string;
+  fidelity_verdict?: string;
+  capability_version?: string;
+  accepted_spec_hash?: string;
+  realized_effective_hash?: string;
+  adjustment_reason_codes?: string[];
+  execution_record_ref?: string;
+  training_artifact_uri?: string;
+  training_export_manifest_uri?: string;
+  preprocessing_contract_ref?: string;
+  champion_export_manifest_uri?: string;
+};
+
+export type RealizationObservation = {
+  id?: string;
+  attempt_record_id?: string;
+  attempt_id?: string;
+  schema_version?: string;
+  stage?: string;
+  idempotency_key?: string;
+  realized_config?: Record<string, unknown>;
+  framework_arguments?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  adjustment_policy?: string;
+  adjustment_reason_codes?: string[];
+  simulated?: boolean;
+  realized_effective_hash?: string;
+  fidelity_verdict?: string;
+  created_at?: string;
+};
+
+export type AttemptExecutionRecord = {
+  id?: string;
+  job_id?: string;
+  project_id?: string;
+  attempt_id?: string;
+  attempt_number?: number;
+  lifecycle_status?: string;
+  fidelity_verdict?: string;
+  realized_effective_hash?: string;
+  adjustment_reason_codes?: string[];
+  worker_policy_capability_version?: string;
+  worker_artifact_capability_version?: string;
+  artifact_plan_hash?: string;
+  latest_realized_config?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+  observations?: RealizationObservation[];
+};
+
+export type JobExecutionSpec = {
+  job_id?: string;
+  project_id?: string;
+  schema_version?: string;
+  capability_version?: string;
+  task?: string;
+  runner?: string;
+  requested_config_hash?: string;
+  accepted_spec_hash?: string;
+  artifact_plan?: {
+    schema_version: string;
+    artifacts: { format: string; precision: string; runtime: string; execution_provider: string; execution_requirements: string[] }[];
+    fallback_formats: string[];
+    automatic: boolean;
+    policy_restricted: boolean;
+    effective_policy_hash?: string;
+    required_worker_capabilities: { policy_contract_versions: string[]; artifact_plan_versions: string[] };
+    artifact_plan_hash: string;
+  };
+  artifact_plan_hash?: string;
+  accepted_spec?: Record<string, unknown>;
+  created_at?: string;
+};
+
+export type ExecutionRecord = {
+  accepted_spec: JobExecutionSpec;
+  attempts: AttemptExecutionRecord[];
 };
 
 export type PlannedExperiment = {
@@ -355,6 +438,7 @@ export type TrainingRunSummary = {
   modal_input_id?: string;
   dataset_materialization?: Record<string, unknown>;
   stage_telemetry?: Record<string, unknown>;
+  execution_references?: ExecutionArtifactReferences;
   created_at: string;
   updated_at: string;
 };
@@ -364,14 +448,15 @@ export type TrainingRunEvaluation = {
   project_id: string;
   plan_id?: string;
   dataset_id?: string;
-  objective_profile: Record<string, unknown>;
-  per_class_metrics: Record<string, unknown>;
-  confusion_matrix: number[][];
-  model_profile: Record<string, unknown>;
-  holistic_scores: Record<string, unknown>;
-  recommendation_summary: string;
-  created_at: string;
-  updated_at: string;
+  objective_profile?: Record<string, unknown>;
+  per_class_metrics?: Record<string, unknown>;
+  confusion_matrix?: number[][];
+  model_profile?: Record<string, unknown>;
+  holistic_scores?: Record<string, unknown>;
+  recommendation_summary?: string;
+  execution_references?: ExecutionArtifactReferences;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type ProjectChampion = {
@@ -588,6 +673,23 @@ export type AgentInvocationRuntime = {
   [key: string]: unknown;
 };
 
+export type PlannerInvocationCost = {
+  pricing_version: string;
+  currency: string;
+  provider: string;
+  model: string;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  input_usd_per_million_tokens: string;
+  cached_input_usd_per_million_tokens: string;
+  output_usd_per_million_tokens: string;
+  uncached_input_cost_usd: string;
+  cached_input_cost_usd: string;
+  output_cost_usd: string;
+  total_cost_usd: string;
+};
+
 export type RetrievedMemoryPayload = {
   retrieval_enabled?: boolean;
   successful_strategy_cards?: RetrievedMemoryCard[];
@@ -611,6 +713,11 @@ export type CandidateRanking = {
   intervention?: string;
   expected_effect?: string;
   score?: number;
+  base_score?: number;
+  selection_score?: number;
+  selection_order?: number;
+  selected_experiment_index?: number;
+  selection_adjustments?: CandidateSelectionAdjustment[];
   total_score?: number;
   score_components?: Record<string, unknown>;
   selected?: boolean;
@@ -629,6 +736,28 @@ export type CandidateRanking = {
   [key: string]: unknown;
 };
 
+export type CandidateSelectionAdjustment = {
+  code?: string;
+  value?: number;
+  detail?: string;
+};
+
+export type CandidateSelectionTraceEntry = {
+  candidate_index?: number;
+  base_score?: number;
+  adjusted_score?: number;
+  selected?: boolean;
+  selection_adjustments?: CandidateSelectionAdjustment[];
+};
+
+export type CandidateSelectionRound = {
+  selection_order?: number;
+  selected_candidate_index?: number;
+  candidates?: CandidateSelectionTraceEntry[];
+  total_candidate_count?: number;
+  truncated?: boolean;
+};
+
 export type AgentDecision = {
   id: string;
   project_id: string;
@@ -639,6 +768,7 @@ export type AgentDecision = {
     retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
     retrieved_run_memory?: RetrievedMemoryCard[];
     candidate_rankings?: CandidateRanking[];
+    candidate_selection_trace?: CandidateSelectionRound[];
     planner_context_snapshot?: {
       retrieved_memory?: RetrievedMemoryCard[] | RetrievedMemoryPayload;
       [key: string]: unknown;
@@ -751,6 +881,15 @@ export type AgentInvocation = {
   agent_name: string;
   agent_version?: string;
   prompt_version?: string;
+  planner_variant_id?: string;
+  planner_variant?: Record<string, unknown>;
+  validation_mode?: string;
+  attempt_group_id?: string;
+  attempt_index?: number;
+  retry_reason?: string;
+  wall_latency_ms?: number;
+  provider_usage?: LLMUsage;
+  derived_cost?: PlannerInvocationCost;
   provider?: string;
   model?: string;
   input_messages?: Array<Record<string, string>>;

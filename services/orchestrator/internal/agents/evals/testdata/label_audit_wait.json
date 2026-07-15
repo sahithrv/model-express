@@ -1,0 +1,38 @@
+{
+  "name": "label_audit_wait",
+  "description": "A pending report-only label audit should pause training decisions until its evidence is accepted.",
+  "coverage": ["label_audit", "wait", "classification", "report_only"],
+  "input_summary": {
+    "project_name": "Label Audit Wait",
+    "task_type": "image_classification",
+    "completed_training_runs": 6,
+    "planner_rounds": 2,
+    "first_successful_score": 0.59,
+    "current_best_score": 0.66,
+    "current_best_model": "mobilenet_v3_small",
+    "attempted_models": ["mobilenet_v3_small", "efficientnet_b0"],
+    "dominant_mechanism": "baseline_control"
+  },
+  "response": {
+    "summary": "Wait for the report-only label audit.",
+    "decision_type": "WAIT",
+    "rationale": "Suspected label noise is not yet accepted evidence for a training intervention.",
+    "confidence": 0.89,
+    "evidence_used": ["label audit job is still pending", "confusion review suggests possible annotation errors"],
+    "candidate_hypotheses": [],
+    "proposed_experiments": []
+  },
+  "rubric": {
+    "id": "label_audit_wait_v1",
+    "expected_decision_types": ["WAIT"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["label audit"],
+    "task_type": "image_classification",
+    "require_no_experiments": true
+  },
+  "mutations": [{
+    "name": "ungrounded-label-claim",
+    "operation": "clear_evidence",
+    "expected_failed_checks": ["evidence"]
+  }]
+}

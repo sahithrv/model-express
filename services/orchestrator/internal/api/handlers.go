@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 )
@@ -53,7 +54,7 @@ const (
 	plannerNoImprovementRoundsToSelect       = 2
 	plannerDefaultMaxFollowUpRounds          = 10
 	plannerAutonomousMaxFollowUpRounds       = 3
-	plannerBackendValidationRetryLimit       = 1
+	plannerBackendValidationRetryLimit       = plannervalidation.DefaultMaxRetriesPerAttemptGroup
 	plannerDefaultMaxToolRounds              = 10
 
 	modalOOMRetryHistoryKey = "modal_oom_retry_history"

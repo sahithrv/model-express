@@ -2,6 +2,8 @@ package llm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"strconv"
 	"strings"
@@ -164,6 +166,28 @@ func NormalizeAPIStyle(value string) string {
 	default:
 		return APIStyleChatCompletions
 	}
+}
+
+// EffectiveAPIStyle reports the endpoint shape the current client will use.
+// Responses are intentionally limited to the native OpenAI provider; other
+// providers use the Chat Completions-compatible path even when Responses was
+// configured.
+func EffectiveAPIStyle(provider string, configuredStyle string) string {
+	if strings.ToLower(strings.TrimSpace(provider)) == ProviderOpenAI && NormalizeAPIStyle(configuredStyle) == APIStyleResponses {
+		return APIStyleResponses
+	}
+	return APIStyleChatCompletions
+}
+
+// EndpointFingerprint distinguishes otherwise identical model deployments
+// without persisting a potentially sensitive endpoint URL in invocation audit.
+func EndpointFingerprint(baseURL string) string {
+	normalized := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if normalized == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(normalized))
+	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
 func NormalizeReasoningEffort(value string) string {

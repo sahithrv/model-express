@@ -15,6 +15,11 @@ const { Transform } = require("stream");
 const { pipeline } = require("stream/promises");
 const { fileURLToPath, pathToFileURL } = require("url");
 const { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
+const {
+  createRollingRequestDiagnostics,
+  normalizeRequestReason,
+} = require("./request-diagnostics.cjs");
+const { readSSEBody } = require("./sse-relay.cjs");
 const { buildDatasetUploadPreflight, collectDatasetFiles, createZipArchiveStream, planZipArchive } = require("./zip-stream.cjs");
 
 let mainWindow;
@@ -27,7 +32,7 @@ const DEFAULT_S3_ENDPOINT_URL = "http://127.0.0.1:9000";
 const DEFAULT_S3_BUCKET = "model-express";
 const DEFAULT_ARTIFACT_PREFIX = "model-express/artifacts";
 const DEFAULT_DATABASE_URL = "postgres://model_express:model_express@127.0.0.1:5432/model_express?sslmode=disable";
-const ALLOWED_ORCHESTRATOR_METHODS = new Set(["GET", "POST", "PATCH", "DELETE"]);
+const ALLOWED_ORCHESTRATOR_METHODS = new Set(["GET", "HEAD", "POST", "PATCH", "DELETE"]);
 const DEFAULT_JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const DATASET_SELECTION_TTL_MS = 4 * 60 * 60 * 1000;
 const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
@@ -48,6 +53,40 @@ const CHAMPION_DEMO_RUNTIME_IDLE_TTL_MS = 3 * 60 * 1000;
 const CHAMPION_DEMO_RUNTIME_TIMEOUT_MS = 45_000;
 const MISSION_CONTROL_MIN_WIDTH = 1460;
 const MISSION_CONTROL_MIN_HEIGHT = 760;
+const ACTIVITY_VISIBILITY_REASON_CODES = new Set([
+  "clock_skew",
+  "initial_catch_up",
+  "invalid_timestamp",
+  "live",
+  "reconnect_catch_up",
+]);
+const INCREMENTAL_LIVE_REASON_CODES = new Set([
+  "cursor_recovery",
+  "fallback",
+  "malformed_event",
+  "out_of_order",
+  "rollback",
+  "shadow_compare",
+  "snapshot",
+  "stream_disconnect",
+  "targeted_invalidation",
+]);
+const INCREMENTAL_LIVE_OUTCOME_CODES = new Set([
+  "applied",
+  "connected",
+  "failed",
+  "matched",
+  "mismatched",
+  "recovered",
+  "scheduled",
+  "unsupported",
+]);
+const missionControlRequestDiagnostics = createRollingRequestDiagnostics();
+const orchestratorRequestControllers = new Map();
+const orchestratorEventStreamControllers = new Map();
+let missionControlRequestMetricsFlushTimer = null;
+let missionControlRequestMetricsFlushEnv = null;
+let missionControlRequestMetricsPendingCount = 0;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -88,6 +127,7 @@ function validateOrchestratorRequest(request = {}, env = process.env) {
   const baseUrl = validateOrchestratorBaseUrl(request.baseUrl ?? DEFAULT_ORCHESTRATOR_URL, env);
   const requestPath = validateAppRequestPath(request.path);
   const bodyText = serializeJsonRequestBody(method, request.body);
+  const requestId = validateOrchestratorRequestId(request.requestId);
   const url = new URL(requestPath, baseUrl).toString();
   return {
     method,
@@ -95,7 +135,240 @@ function validateOrchestratorRequest(request = {}, env = process.env) {
     path: requestPath,
     url,
     bodyText,
+    requestId,
+    reasonCode: normalizeRequestReason(request.diagnosticReason),
   };
+}
+
+function validateOrchestratorRequestId(value) {
+  const requestId = String(value ?? "").trim();
+  if (!requestId) return "";
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(requestId)) {
+    throw new Error("Orchestrator request id must be a bounded opaque identifier.");
+  }
+  return requestId;
+}
+
+function orchestratorRequestControllerKey(senderId, requestId) {
+  return requestId ? `${Number(senderId) || 0}:${requestId}` : "";
+}
+
+function validateOrchestratorEventStreamOptions(options = {}, env = process.env) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error("Orchestrator event stream options must be an object.");
+  }
+  const streamId = validateOrchestratorRequestId(options.streamId);
+  if (!streamId) throw new Error("Orchestrator event stream id is required.");
+  const request = validateOrchestratorRequest({
+    baseUrl: options.baseUrl,
+    method: "GET",
+    path: options.path,
+    diagnosticReason: options.diagnosticReason,
+  }, env);
+  const parsed = new URL(request.url);
+  if (!/^\/projects\/[^/]+\/events\/stream\/v2$/.test(parsed.pathname)) {
+    throw new Error("Only the bounded v2 execution-event stream may be relayed.");
+  }
+  const cursor = parsed.searchParams.get("cursor") ?? "";
+  if (!/^\d+$/.test(cursor) || cursor.length > 19) {
+    throw new Error("Execution-event stream cursor must be a bounded nonnegative integer.");
+  }
+  const reason = parsed.searchParams.get("reason") ?? "";
+  if (!["stream_initial", "stream_reconnect"].includes(reason)) {
+    throw new Error("Execution-event stream reason must be initial or reconnect.");
+  }
+  return { ...request, streamId };
+}
+
+function missionControlLiveFeatureFlags(env = process.env) {
+  return {
+    incremental_v2_enabled: envFlagFrom(env, "MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ENABLED", true),
+    incremental_v2_shadow: envFlagFrom(env, "MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_SHADOW", false),
+    incremental_v2_rollback: envFlagFrom(env, "MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ROLLBACK", false),
+  };
+}
+
+function sendOrchestratorEventStreamMessage(sender, payload) {
+  if (!sender || sender.isDestroyed?.()) return false;
+  try {
+    sender.send("orchestrator:eventStream", payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function relayOrchestratorEventStream({ sender, validated, env, controller, controllerKey }) {
+  const startedAt = Date.now();
+  let response;
+  try {
+    response = await fetch(validated.url, {
+      method: "GET",
+      headers: apiTokenHeaders(env),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      recordMissionControlRequestMetrics({
+        env,
+        method: "GET",
+        path: validated.path,
+        reasonCode: validated.reasonCode,
+        statusCode: 0,
+        durationMs: Date.now() - startedAt,
+        responseBytes: 0,
+        failed: true,
+      });
+      sendOrchestratorEventStreamMessage(sender, {
+        stream_id: validated.streamId,
+        kind: "error",
+        status: 0,
+        reason_code: "network_error",
+      });
+    }
+    clearOrchestratorEventStreamController(controllerKey, controller);
+    return;
+  }
+
+  recordMissionControlRequestMetrics({
+    env,
+    method: "GET",
+    path: validated.path,
+    reasonCode: validated.reasonCode,
+    statusCode: response.status,
+    durationMs: Date.now() - startedAt,
+    responseBytes: 0,
+    failed: !response.ok,
+  });
+  if (!response.ok) {
+    const reasonCode = await boundedEventStreamErrorReason(response);
+    if (!controller.signal.aborted) {
+      sendOrchestratorEventStreamMessage(sender, {
+        stream_id: validated.streamId,
+        kind: "error",
+        status: response.status,
+        reason_code: reasonCode,
+      });
+    }
+    clearOrchestratorEventStreamController(controllerKey, controller);
+    return;
+  }
+
+  const contentType = String(response.headers.get("content-type") ?? "").toLowerCase();
+  if (!contentType.includes("text/event-stream")) {
+    controller.abort();
+    sendOrchestratorEventStreamMessage(sender, {
+      stream_id: validated.streamId,
+      kind: "error",
+      status: response.status,
+      reason_code: "unsupported_content_type",
+    });
+    clearOrchestratorEventStreamController(controllerKey, controller);
+    return;
+  }
+
+  sendOrchestratorEventStreamMessage(sender, {
+    stream_id: validated.streamId,
+    kind: "open",
+    status: response.status,
+  });
+  try {
+    await readSSEBody(response, {
+      signal: controller.signal,
+      onEvent: async (event) => {
+        if (controller.signal.aborted) return;
+        if (!sendOrchestratorEventStreamMessage(sender, {
+          stream_id: validated.streamId,
+          kind: "event",
+          event_type: boundedEventStreamToken(event.event, 128),
+          last_event_id: boundedEventStreamID(event.lastEventId),
+          data: event.data,
+        })) {
+          controller.abort();
+        }
+      },
+    });
+    if (!controller.signal.aborted) {
+      sendOrchestratorEventStreamMessage(sender, {
+        stream_id: validated.streamId,
+        kind: "disconnect",
+        status: response.status,
+        reason_code: "stream_ended",
+      });
+    }
+  } catch {
+    if (!controller.signal.aborted) {
+      sendOrchestratorEventStreamMessage(sender, {
+        stream_id: validated.streamId,
+        kind: "error",
+        status: 0,
+        reason_code: "stream_read_failed",
+      });
+    }
+  } finally {
+    clearOrchestratorEventStreamController(controllerKey, controller);
+  }
+}
+
+function clearOrchestratorEventStreamController(key, controller) {
+  if (orchestratorEventStreamControllers.get(key) === controller) {
+    orchestratorEventStreamControllers.delete(key);
+  }
+}
+
+async function boundedEventStreamErrorReason(response) {
+  try {
+    const text = await readBoundedResponseText(response, 4096);
+    const payload = JSON.parse(text);
+    return boundedEventStreamToken(payload?.reason_code || payload?.error, 64) || "http_error";
+  } catch {
+    return "http_error";
+  }
+}
+
+async function readBoundedResponseText(response, maxBytes) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024) {
+    throw new TypeError("Response text byte limit must be bounded.");
+  }
+  const body = response?.body;
+  if (!body || typeof body.getReader !== "function") return "";
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  let completed = false;
+  try {
+    while (total < maxBytes) {
+      const result = await reader.read();
+      if (!result || result.done) {
+        completed = true;
+        break;
+      }
+      const chunk = Buffer.from(result.value);
+      const remaining = maxBytes - total;
+      const bounded = chunk.subarray(0, remaining);
+      chunks.push(bounded);
+      total += bounded.byteLength;
+      if (chunk.byteLength > remaining) break;
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } finally {
+    if (!completed) await reader.cancel().catch(() => undefined);
+    try {
+      reader.releaseLock();
+    } catch {
+      // Synthetic response bodies may not require lock release.
+    }
+  }
+}
+
+function boundedEventStreamToken(value, maxLength) {
+  const token = String(value ?? "").trim().toLowerCase();
+  return token.length <= maxLength && /^[a-z][a-z0-9_.-]*$/.test(token) ? token : "";
+}
+
+function boundedEventStreamID(value) {
+  const id = String(value ?? "").trim();
+  return /^\d{1,19}$/.test(id) ? id : "";
 }
 
 function validateOrchestratorMethod(method = "GET") {
@@ -948,7 +1221,9 @@ function validateLocalArtifactPathForExtensions(artifactUri, env, allowedExtensi
   if (!allowed) {
     throw new Error(`${label} must be under a configured Model Express artifact or export root.`);
   }
-  if (isPathInsideOrEqual(realCandidate, path.join(repoRoot(env), "artifacts", "logs"))) {
+  const configuredLogRoot = path.join(repoRoot(env), "artifacts", "logs");
+  const realLogRoot = safeRealpath(configuredLogRoot) || path.resolve(configuredLogRoot);
+  if (isPathInsideOrEqual(realCandidate, realLogRoot)) {
     throw new Error(`${label} loading refuses log directories.`);
   }
   if (!isAllowedArtifactFile(realCandidate, allowedExtensions)) {
@@ -1066,6 +1341,15 @@ if (electronRuntimeAvailable) {
   });
 
   app.on("before-quit", () => {
+	flushMissionControlRequestMetrics();
+    for (const controller of orchestratorRequestControllers.values()) {
+      controller.abort();
+    }
+    orchestratorRequestControllers.clear();
+    for (const controller of orchestratorEventStreamControllers.values()) {
+      controller.abort();
+    }
+    orchestratorEventStreamControllers.clear();
     for (const worker of projectWorkers.values()) {
       if (worker.exitCode === null && !worker.killed) {
         worker.kill();
@@ -1076,19 +1360,115 @@ if (electronRuntimeAvailable) {
     stopChampionDemoRuntime({ reason: "app_before_quit" });
   });
 
-  ipcMain.handle("orchestrator:request", async (_event, request) => {
+  ipcMain.handle("runtime:featureFlags", async () => missionControlLiveFeatureFlags(missionControlEnv()));
+
+  ipcMain.handle("orchestrator:eventStream:open", async (event, options) => {
+    const env = missionControlEnv();
+    const validated = validateOrchestratorEventStreamOptions(options, env);
+    const controllerKey = orchestratorRequestControllerKey(event.sender.id, validated.streamId);
+    const controller = new AbortController();
+    orchestratorEventStreamControllers.get(controllerKey)?.abort();
+    orchestratorEventStreamControllers.set(controllerKey, controller);
+    const onDestroyed = () => controller.abort();
+    event.sender.once("destroyed", onDestroyed);
+    relayOrchestratorEventStream({
+      sender: event.sender,
+      validated,
+      env,
+      controller,
+      controllerKey,
+    }).finally(() => event.sender.removeListener?.("destroyed", onDestroyed));
+    return { started: true, stream_id: validated.streamId };
+  });
+
+  ipcMain.handle("orchestrator:eventStream:close", async (event, streamId) => {
+    const key = orchestratorRequestControllerKey(event.sender.id, validateOrchestratorRequestId(streamId));
+    const controller = orchestratorEventStreamControllers.get(key);
+    if (controller) {
+      controller.abort();
+      orchestratorEventStreamControllers.delete(key);
+    }
+    return { closed: Boolean(controller) };
+  });
+
+  ipcMain.handle("orchestrator:abortRequest", async (event, requestId) => {
+    const key = orchestratorRequestControllerKey(event.sender.id, validateOrchestratorRequestId(requestId));
+    const controller = orchestratorRequestControllers.get(key);
+    if (controller) {
+      controller.abort();
+      orchestratorRequestControllers.delete(key);
+    }
+    return { aborted: Boolean(controller) };
+  });
+
+  ipcMain.handle("orchestrator:request", async (event, request) => {
     const env = missionControlEnv();
     const validated = validateOrchestratorRequest(request, env);
-    const response = await fetch(validated.url, {
-      method: validated.method,
-      headers: {
-        "Content-Type": "application/json",
-        ...apiTokenHeaders(env),
-      },
-      body: validated.bodyText,
-    });
+    const controllerKey = orchestratorRequestControllerKey(event.sender.id, validated.requestId);
+    const controller = controllerKey ? new AbortController() : null;
+    if (controllerKey && controller) {
+      orchestratorRequestControllers.get(controllerKey)?.abort();
+      orchestratorRequestControllers.set(controllerKey, controller);
+    }
+    const clearController = () => {
+      if (controllerKey && orchestratorRequestControllers.get(controllerKey) === controller) {
+        orchestratorRequestControllers.delete(controllerKey);
+      }
+    };
+    const startedAt = Date.now();
+    let response;
+    try {
+      response = await fetch(validated.url, {
+        method: validated.method,
+        headers: {
+          "Content-Type": "application/json",
+          ...apiTokenHeaders(env),
+        },
+        body: validated.bodyText,
+        signal: controller?.signal,
+      });
+    } catch (error) {
+      recordMissionControlRequestMetrics({
+        env,
+        method: validated.method,
+        path: validated.path,
+        reasonCode: validated.reasonCode,
+        statusCode: 0,
+        durationMs: Date.now() - startedAt,
+        responseBytes: 0,
+        failed: true,
+      });
+      clearController();
+      throw error;
+    }
 
-    const text = await response.text();
+    let text;
+    try {
+      text = await response.text();
+    } catch (error) {
+      recordMissionControlRequestMetrics({
+        env,
+        method: validated.method,
+        path: validated.path,
+        reasonCode: validated.reasonCode,
+        statusCode: response.status,
+        durationMs: Date.now() - startedAt,
+        responseBytes: 0,
+        failed: true,
+      });
+      clearController();
+      throw error;
+    }
+    recordMissionControlRequestMetrics({
+      env,
+      method: validated.method,
+      path: validated.path,
+      reasonCode: validated.reasonCode,
+      statusCode: response.status,
+      durationMs: Date.now() - startedAt,
+      responseBytes: Buffer.byteLength(text, "utf8"),
+      failed: !response.ok,
+    });
     let payload = null;
     if (text) {
       try {
@@ -1103,7 +1483,7 @@ if (electronRuntimeAvailable) {
         payload && typeof payload === "object" && payload.error
           ? payload.error
           : text || response.statusText;
-      return {
+      const errorResponse = {
         __mission_control_http_error: true,
         status: response.status,
         statusText: response.statusText,
@@ -1112,9 +1492,26 @@ if (electronRuntimeAvailable) {
         url: redactUrlForLog(validated.url),
         payload,
       };
+      clearController();
+      return errorResponse;
     }
 
+    clearController();
     return payload;
+  });
+
+  ipcMain.handle("diagnostics:activityVisibility", async (_event, summary) => {
+    const fields = validateActivityVisibilitySummary(summary);
+    const env = missionControlEnv();
+    setImmediate(() => appendDiagnosticLog(resolveLogDir(repoRoot(env), env), "info", "activity_visibility_latency", fields));
+    return { recorded: true };
+  });
+
+  ipcMain.handle("diagnostics:incrementalLive", async (_event, summary) => {
+    const fields = validateIncrementalLiveDiagnostic(summary);
+    const env = missionControlEnv();
+    setImmediate(() => appendDiagnosticLog(resolveLogDir(repoRoot(env), env), "info", "mission_control_incremental_live", fields));
+    return { recorded: true };
   });
 
   ipcMain.handle("dataset:selectAndUpload", async (_event, options) => {
@@ -2535,6 +2932,103 @@ function resolveLogDir(repoRoot, env = process.env) {
   return env.MODEL_EXPRESS_LOG_DIR ?? path.join(repoRoot, "artifacts", "logs");
 }
 
+function recordMissionControlRequestMetrics(sample) {
+  const metrics = missionControlRequestDiagnostics.record(sample);
+  missionControlRequestMetricsFlushEnv = sample.env;
+  missionControlRequestMetricsPendingCount += 1;
+  if (missionControlRequestMetricsFlushTimer === null) {
+    missionControlRequestMetricsFlushTimer = setTimeout(flushMissionControlRequestMetrics, 5_000);
+    missionControlRequestMetricsFlushTimer.unref?.();
+  }
+  return metrics;
+}
+
+function flushMissionControlRequestMetrics() {
+	if (missionControlRequestMetricsFlushTimer !== null) {
+	  clearTimeout(missionControlRequestMetricsFlushTimer);
+	}
+  missionControlRequestMetricsFlushTimer = null;
+  const env = missionControlRequestMetricsFlushEnv;
+  const flushRequestCount = missionControlRequestMetricsPendingCount;
+  missionControlRequestMetricsFlushEnv = null;
+  missionControlRequestMetricsPendingCount = 0;
+  if (!env || flushRequestCount < 1) return;
+  const metrics = missionControlRequestDiagnostics.snapshot();
+  appendDiagnosticLog(
+    resolveLogDir(repoRoot(env), env),
+    metrics.rolling_error_count > 0 ? "warn" : "info",
+    "mission_control_request_metrics",
+    {
+      ...metrics,
+      flush_request_count: flushRequestCount,
+      rolling_average_duration_ms: metrics.rolling_request_count > 0
+        ? Math.round(metrics.rolling_duration_ms / metrics.rolling_request_count)
+        : 0,
+      rolling_average_response_bytes: metrics.rolling_request_count > 0
+        ? Math.round(metrics.rolling_response_bytes / metrics.rolling_request_count)
+        : 0,
+    },
+  );
+}
+
+function validateIncrementalLiveDiagnostic(summary = {}) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+    throw new Error("Incremental live diagnostics must be an object.");
+  }
+  const reasonCode = String(summary.reason_code ?? "").trim().toLowerCase();
+  const outcomeCode = String(summary.outcome_code ?? "").trim().toLowerCase();
+  if (!INCREMENTAL_LIVE_REASON_CODES.has(reasonCode) || !INCREMENTAL_LIVE_OUTCOME_CODES.has(outcomeCode)) {
+    throw new Error("Incremental live diagnostics require supported reason and outcome codes.");
+  }
+  return {
+    reason_code: reasonCode,
+    outcome_code: outcomeCode,
+    count: boundedDiagnosticInteger(summary.count, 0, 100_000),
+    duration_ms: boundedDiagnosticInteger(summary.duration_ms, 0, 24 * 60 * 60 * 1000),
+  };
+}
+
+function validateActivityVisibilitySummary(summary = {}) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+    throw new Error("Activity visibility diagnostics must be an object.");
+  }
+  const reasonCode = String(summary.reason_code ?? "").trim().toLowerCase();
+  if (!ACTIVITY_VISIBILITY_REASON_CODES.has(reasonCode)) {
+    throw new Error("Activity visibility diagnostics require a supported reason code.");
+  }
+  if (summary.source_code !== "execution_event_v2") {
+    throw new Error("Activity visibility diagnostics require the v2 source code.");
+  }
+  const sampleCount = boundedDiagnosticInteger(summary.sample_count, 0, 32);
+  const latencySampleCount = boundedDiagnosticInteger(summary.latency_sample_count, 0, sampleCount);
+  const invalidSampleCount = boundedDiagnosticInteger(summary.invalid_sample_count, 0, sampleCount);
+  if (sampleCount < 1 || latencySampleCount + invalidSampleCount !== sampleCount) {
+    throw new Error("Activity visibility diagnostic counts are invalid.");
+  }
+  return {
+    source_code: "execution_event_v2",
+    reason_code: reasonCode,
+    sample_count: sampleCount,
+    latency_sample_count: latencySampleCount,
+    invalid_sample_count: invalidSampleCount,
+    dropped_count: boundedDiagnosticInteger(summary.dropped_count, 0, 100_000),
+    latency_total_ms: boundedDiagnosticInteger(summary.latency_total_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    latency_min_ms: boundedDiagnosticInteger(summary.latency_min_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    latency_max_ms: boundedDiagnosticInteger(summary.latency_max_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    latency_average_ms: boundedDiagnosticInteger(summary.latency_average_ms, 0, 7 * 24 * 60 * 60 * 1000),
+    commit_delay_total_ms: boundedDiagnosticInteger(summary.commit_delay_total_ms, 0, 60 * 60 * 1000),
+    commit_delay_average_ms: boundedDiagnosticInteger(summary.commit_delay_average_ms, 0, 60 * 60 * 1000),
+  };
+}
+
+function boundedDiagnosticInteger(value, minimum, maximum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return minimum;
+  }
+  return Math.min(maximum, Math.max(minimum, Math.round(parsed)));
+}
+
 function appendDiagnosticLog(logDir, level, event, fields = {}) {
   try {
     fs.mkdirSync(logDir, { recursive: true });
@@ -3510,11 +4004,13 @@ module.exports = {
     externalDataMountPath,
     isLoopbackHostname,
     localConfigPath,
+    missionControlLiveFeatureFlags,
     missionControlEnv,
     parseCloudflaredTunnelUrl,
     predictChampionDemoLocal,
     preflightCloud,
     preflightDatasetFolder,
+    readBoundedResponseText,
     rememberDatasetFolder,
     requireAuthenticatedOrchestratorExposure,
     remoteTrainingSessionActive,
@@ -3534,6 +4030,10 @@ module.exports = {
     validateLocalPortableBundlePath,
     validateOrchestratorBaseUrl,
     validateOrchestratorRequest,
+    validateOrchestratorRequestId,
+    validateOrchestratorEventStreamOptions,
+    validateActivityVisibilitySummary,
+    validateIncrementalLiveDiagnostic,
     validateRemoteModalUrl,
     validateS3ExportArtifactUri,
     validateUploadEndpoint,

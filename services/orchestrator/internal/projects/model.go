@@ -10,6 +10,7 @@ const (
 
 type Project struct {
 	ID        string    `json:"id"`
+	AccountID string    `json:"account_id"`
 	Name      string    `json:"name"`
 	Goal      string    `json:"goal"`
 	Status    string    `json:"status"`

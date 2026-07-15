@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"reflect"
@@ -8,9 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/strategies"
 )
@@ -58,17 +61,27 @@ func TestMemoryStoreStrategyScorecardHydratesMechanismFields(t *testing.T) {
 	}
 
 	updated, err := store.UpdateStrategyScorecardOutcomeByFollowUpPlan("plan_followup", strategies.StrategyScorecardOutcomeUpdate{
-		ActualDelta:     0.04,
-		ConfidenceAfter: 0.7,
-		Outcome:         strategies.OutcomeMinorImprovement,
-		Lesson:          "Resolution and crop changes helped.",
-		Tags:            []string{"resolution_crop", "minor_improvement"},
+		ActualDelta:               0.04,
+		ConfidenceAfter:           0.7,
+		Outcome:                   strategies.OutcomeMinorImprovement,
+		Lesson:                    "Resolution and crop changes helped.",
+		Tags:                      []string{"resolution_crop", "minor_improvement"},
+		FidelityVerdicts:          []string{"APPROVED_ADJUSTMENT"},
+		EvidenceEligible:          true,
+		RequestedMechanism:        "resolution_crop",
+		RealizedMechanismIdentity: "sha256:realized",
+		AcceptedSpecHash:          "sha256:accepted",
+		RealizedEffectiveHash:     "sha256:realized",
+		AdjustmentReasonCodes:     []string{"batch_size_reduced_by_resource_recovery"},
 	})
 	if err != nil {
 		t.Fatalf("UpdateStrategyScorecardOutcomeByFollowUpPlan() error = %v", err)
 	}
 	if updated.Mechanism != scorecard.Mechanism || updated.Intervention != scorecard.Intervention || updated.ExpectedEffect != scorecard.ExpectedEffect {
 		t.Fatalf("update should preserve mechanism fields, got %#v", updated)
+	}
+	if !updated.EvidenceEligible || !reflect.DeepEqual(updated.FidelityVerdicts, []string{"APPROVED_ADJUSTMENT"}) || updated.RequestedMechanism != "resolution_crop" || updated.RealizedMechanismIdentity != "sha256:realized" {
+		t.Fatalf("fidelity outcome fields were not persisted: %#v", updated)
 	}
 }
 
@@ -695,6 +708,136 @@ func TestMemoryStoreAgentInvocationPersistsLLMUsage(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreAgentInvocationRuntimeIdentityRoundTripAndFilter(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("planner identity project", "maximize macro f1")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	variant := memory.PlannerVariant{
+		IdentitySchemaVersion:       memory.PlannerVariantIdentitySchemaV1,
+		AgentVersion:                "v2",
+		PromptVersion:               "experiment_planner_v3",
+		StaticPromptVersion:         "compact_v1",
+		ContextBuilderVersion:       "planner_context_builder_v2",
+		ToolPolicyVersion:           "planner_information_tools_v1",
+		ValidatorVersion:            "experiment_planner_validator_v1",
+		ValidationMode:              "relaxed",
+		ExecutionValidatorVersion:   "execution_validation_v1",
+		ExecutionValidationMode:     "enforce",
+		RankerVersion:               "candidate_ranker_v1",
+		RetrievalPolicyVersion:      "planner_memory_retrieval_v1",
+		RetryPolicyVersion:          "planner_backend_validation_retry_v1",
+		MaxBackendValidationRetries: 1,
+		Provider:                    "openai",
+		APIStyle:                    "responses",
+		Model:                       "test-model",
+		RequestTemperature:          0.35,
+		RequestReasoningEffort:      "medium",
+		ConfiguredReasoningEffort:   "medium",
+		PlateauReasoningEffort:      "high",
+		StoredResponses:             true,
+		MaxToolRounds:               4,
+		MaxProviderRetries:          2,
+		RequestTimeoutMS:            180000,
+	}
+	variantID, err := memory.ComputePlannerVariantID(variant)
+	if err != nil {
+		t.Fatalf("ComputePlannerVariantID() error = %v", err)
+	}
+	cost := &memory.PlannerInvocationCost{
+		PricingVersion:                 "test-pricing-v1",
+		Currency:                       "USD",
+		Provider:                       "openai",
+		Model:                          "test-model",
+		InputTokens:                    10,
+		CachedInputTokens:              2,
+		OutputTokens:                   4,
+		InputUSDPerMillionTokens:       "1",
+		CachedInputUSDPerMillionTokens: "0.1",
+		OutputUSDPerMillionTokens:      "2",
+		UncachedInputCostUSD:           "0.000008",
+		CachedInputCostUSD:             "0.0000002",
+		OutputCostUSD:                  "0.000008",
+		TotalCostUSD:                   "0.0000162",
+	}
+	stored, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:        project.ID,
+		AgentName:        "experiment_planner",
+		PlannerVariantID: variantID,
+		PlannerVariant:   &variant,
+		ValidationMode:   "relaxed",
+		AttemptGroupID:   "planner-attempt-group",
+		AttemptIndex:     1,
+		RetryReason:      "trace_validation_rejected",
+		WallLatencyMS:    12.75,
+		ProviderUsage:    map[string]any{"input_tokens": 10, "output_tokens": 4},
+		DerivedCost:      cost,
+		ValidationStatus: memory.InvocationValidationValid,
+	})
+	if err != nil {
+		t.Fatalf("CreateAgentInvocation() error = %v", err)
+	}
+
+	otherVariant := variant
+	otherVariant.Provider = "local"
+	if _, err := store.CreateAgentInvocation(memory.AgentInvocation{
+		ProjectID:        project.ID,
+		AgentName:        "experiment_planner",
+		PlannerVariant:   &otherVariant,
+		AttemptGroupID:   "other-group",
+		AttemptIndex:     0,
+		ValidationStatus: memory.InvocationValidationValid,
+	}); err != nil {
+		t.Fatalf("CreateAgentInvocation(other) error = %v", err)
+	}
+
+	reloaded, err := store.GetAgentInvocation(stored.ID)
+	if err != nil {
+		t.Fatalf("GetAgentInvocation() error = %v", err)
+	}
+	if reloaded.PlannerVariantID != variantID || reloaded.PlannerVariant == nil || reloaded.PlannerVariant.Provider != "openai" {
+		t.Fatalf("unexpected planner identity round trip %#v", reloaded)
+	}
+	if reloaded.AttemptGroupID != "planner-attempt-group" || reloaded.AttemptIndex != 1 || reloaded.RetryReason == "" || reloaded.WallLatencyMS != 12.75 {
+		t.Fatalf("unexpected invocation facts %#v", reloaded)
+	}
+	if reloaded.DerivedCost == nil || reloaded.DerivedCost.PricingVersion != "test-pricing-v1" || reloaded.DerivedCost.TotalCostUSD != "0.0000162" {
+		t.Fatalf("unexpected derived cost %#v", reloaded.DerivedCost)
+	}
+	verdict := plannervalidation.Verdict{
+		SchemaVersion: plannervalidation.VerdictSchemaVersionV1,
+		Mode:          plannervalidation.ModeShadowStrict,
+		Status:        plannervalidation.VerdictWouldBlock,
+		WouldBlock:    true,
+		Findings: []plannervalidation.Finding{{
+			Code: "missing_evidence", Category: plannervalidation.CategoryMissingEvidence, Stage: "recommendation", Message: "missing evidence",
+		}},
+	}
+	outcome := plannervalidation.Outcome{
+		SchemaVersion:   plannervalidation.OutcomeSchemaVersionV1,
+		Mode:            plannervalidation.ModeShadowStrict,
+		FirstPassStatus: plannervalidation.FirstPassAccepted,
+		EventualStatus:  plannervalidation.EventualAccepted,
+		RetryOutcome:    plannervalidation.RetryNotNeeded,
+	}
+	updated, err := store.UpdateAgentInvocationValidation(stored.ID, verdict, outcome)
+	if err != nil {
+		t.Fatalf("UpdateAgentInvocationValidation() error = %v", err)
+	}
+	if updated.StrictValidationVerdict == nil || !updated.StrictValidationVerdict.WouldBlock || updated.ValidationOutcome == nil || updated.ValidationOutcome.FirstPassStatus != plannervalidation.FirstPassAccepted {
+		t.Fatalf("typed planner validation did not round trip: %#v", updated)
+	}
+
+	filtered, err := store.ListProjectAgentInvocations(project.ID, memory.AgentInvocationFilter{PlannerVariantID: variantID})
+	if err != nil {
+		t.Fatalf("ListProjectAgentInvocations() error = %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != stored.ID {
+		t.Fatalf("expected exact planner variant filter to return %s, got %#v", stored.ID, filtered)
+	}
+}
+
 func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 	createdAt := time.Date(2026, time.June, 2, 12, 0, 0, 0, time.UTC)
 	row := fakeAgentInvocationRow{values: []any{
@@ -706,6 +849,18 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 		"experiment_planner",
 		"v1",
 		"prompt_v1",
+		memory.LegacyPlannerVariantID,
+		[]byte(`{}`),
+		calibration.PlannerRolloutLegacyIdentity,
+		calibration.PlannerRolloutLegacyIdentity,
+		[]byte(`{}`),
+		"",
+		"",
+		-1,
+		"",
+		float64(0),
+		[]byte(`{"input_tokens":14,"output_tokens":6,"total_tokens":20,"cached_input_tokens":4,"reasoning_tokens":2,"request_model":"test-model","api_style":"responses","tool_rounds":1}`),
+		[]byte(`{}`),
 		"openai",
 		"test-model",
 		[]byte(`[{"role":"user","content":"hello"}]`),
@@ -714,6 +869,8 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 		[]byte(`{"ok":true}`),
 		"valid",
 		"",
+		[]byte(`{}`),
+		[]byte(`{}`),
 		true,
 		[]byte(`{}`),
 		[]byte(`{}`),
@@ -723,6 +880,12 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 	invocation, err := scanAgentInvocation(row)
 	if err != nil {
 		t.Fatalf("scanAgentInvocation() error = %v", err)
+	}
+	if invocation.PlannerVariantID != memory.LegacyPlannerVariantID || invocation.PlannerVariant != nil || invocation.AttemptIndex != -1 {
+		t.Fatalf("expected migrated legacy invocation defaults, got %#v", invocation)
+	}
+	if invocation.ProviderUsage["input_tokens"] != float64(14) || invocation.DerivedCost != nil {
+		t.Fatalf("unexpected provider usage/cost scan: usage=%#v cost=%#v", invocation.ProviderUsage, invocation.DerivedCost)
 	}
 	runtime, ok := invocation.InputContext["invocation_runtime"].(map[string]any)
 	if !ok {
@@ -740,6 +903,93 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 	}
 	if usage["request_model"] != "test-model" || usage["api_style"] != "responses" || usage["tool_rounds"] != float64(1) {
 		t.Fatalf("unexpected scanned usage metadata: %#v", usage)
+	}
+}
+
+func TestScanAgentInvocationPreservesPlannerRuntimeIdentity(t *testing.T) {
+	policy := calibration.DefaultPlannerRolloutPolicy()
+	policy.Enabled = true
+	policy.State = calibration.RolloutStateActive
+	policy.StagePercent = 100
+	assignment, err := calibration.AssignPlannerRollout(policy, "project_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignmentJSON, err := json.Marshal(assignment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	variant := memory.PlannerVariant{
+		IdentitySchemaVersion:  memory.PlannerVariantIdentitySchemaV1,
+		AgentVersion:           "v2",
+		PromptVersion:          "experiment_planner_v3",
+		StaticPromptVersion:    "compact_v1",
+		ContextBuilderVersion:  "planner_context_builder_v2",
+		ToolPolicyVersion:      "planner_information_tools_v1",
+		ValidatorVersion:       "experiment_planner_validator_v1",
+		ValidationMode:         "strict",
+		RankerVersion:          "candidate_ranker_v1",
+		RetrievalPolicyVersion: "planner_memory_retrieval_v1",
+		Provider:               "openai",
+		APIStyle:               "responses",
+		Model:                  "test-model",
+		RequestTemperature:     0.35,
+		RequestReasoningEffort: "high",
+	}
+	variantID, err := memory.ComputePlannerVariantID(variant)
+	if err != nil {
+		t.Fatalf("compute variant ID: %v", err)
+	}
+	variantJSON, err := json.Marshal(variant)
+	if err != nil {
+		t.Fatalf("marshal variant: %v", err)
+	}
+	cost := memory.PlannerInvocationCost{
+		PricingVersion:                 "pricing-v1",
+		Currency:                       "USD",
+		Provider:                       "openai",
+		Model:                          "test-model",
+		InputTokens:                    5,
+		CachedInputTokens:              1,
+		OutputTokens:                   2,
+		InputUSDPerMillionTokens:       "1",
+		CachedInputUSDPerMillionTokens: "0.1",
+		OutputUSDPerMillionTokens:      "2",
+		UncachedInputCostUSD:           "0.000004",
+		CachedInputCostUSD:             "0.0000001",
+		OutputCostUSD:                  "0.000004",
+		TotalCostUSD:                   "0.0000081",
+	}
+	costJSON, err := json.Marshal(cost)
+	if err != nil {
+		t.Fatalf("marshal cost: %v", err)
+	}
+	createdAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	row := fakeAgentInvocationRow{values: []any{
+		"agent_invocation_2", "project_1", "dataset_1", "plan_1", "", "experiment_planner", "v2", "experiment_planner_v3",
+		variantID, variantJSON,
+		assignment.CohortID, assignment.PolicyID, assignmentJSON,
+		"strict", "planner_attempt_group", 1, "trace_validation_rejected", float64(8.25),
+		[]byte(`{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}`), costJSON,
+		"openai", "test-model", []byte(`[]`), []byte(`{}`), `{"ok":true}`, []byte(`{"ok":true}`),
+		"valid", "", []byte(`{}`), []byte(`{}`), true, []byte(`{}`), []byte(`{}`), createdAt,
+	}}
+
+	invocation, err := scanAgentInvocation(row)
+	if err != nil {
+		t.Fatalf("scanAgentInvocation() error = %v", err)
+	}
+	if invocation.PlannerVariantID != variantID || invocation.PlannerVariant == nil || invocation.PlannerVariant.StaticPromptVersion != "compact_v1" {
+		t.Fatalf("unexpected planner variant scan %#v", invocation)
+	}
+	if invocation.AttemptGroupID != "planner_attempt_group" || invocation.AttemptIndex != 1 || invocation.RetryReason == "" || invocation.WallLatencyMS != 8.25 {
+		t.Fatalf("unexpected invocation fact scan %#v", invocation)
+	}
+	if invocation.DerivedCost == nil || invocation.DerivedCost.PricingVersion != "pricing-v1" || invocation.DerivedCost.TotalCostUSD != "0.0000081" {
+		t.Fatalf("unexpected derived cost scan %#v", invocation.DerivedCost)
+	}
+	if invocation.RolloutAssignment == nil || invocation.RolloutCohortID != assignment.CohortID || invocation.RolloutPolicyID != assignment.PolicyID {
+		t.Fatalf("unexpected planner rollout identity scan %#v", invocation)
 	}
 }
 

@@ -13,17 +13,22 @@ const (
 )
 
 type ExperimentPlan struct {
-	ID                 string              `json:"id"`
-	ProjectID          string              `json:"project_id"`
-	DatasetID          string              `json:"dataset_id"`
-	Status             string              `json:"status"`
-	SourceDecisionID   string              `json:"source_decision_id,omitempty"`
-	TargetMetric       string              `json:"target_metric"`
-	RecommendedWorkers int                 `json:"recommended_workers"`
-	EstimatedMinutes   int                 `json:"estimated_minutes"`
-	Experiments        []PlannedExperiment `json:"experiments"`
-	Warnings           []string            `json:"warnings"`
-	CreatedAt          time.Time           `json:"created_at"`
+	ID                         string              `json:"id"`
+	ProjectID                  string              `json:"project_id"`
+	DatasetID                  string              `json:"dataset_id"`
+	Status                     string              `json:"status"`
+	ExecutionSpecStatus        string              `json:"execution_spec_status,omitempty"`
+	CapabilityVersion          string              `json:"capability_version,omitempty"`
+	SourceDecisionID           string              `json:"source_decision_id,omitempty"`
+	ProposalPolicyEvaluationID string              `json:"proposal_policy_evaluation_id,omitempty"`
+	EffectivePolicyHash        string              `json:"effective_policy_hash,omitempty"`
+	PolicyStatus               string              `json:"policy_status,omitempty"`
+	TargetMetric               string              `json:"target_metric"`
+	RecommendedWorkers         int                 `json:"recommended_workers"`
+	EstimatedMinutes           int                 `json:"estimated_minutes"`
+	Experiments                []PlannedExperiment `json:"experiments"`
+	Warnings                   []string            `json:"warnings"`
+	CreatedAt                  time.Time           `json:"created_at"`
 }
 
 type PlannedExperiment struct {
@@ -61,6 +66,7 @@ type PlannedExperiment struct {
 	FreezeBackbone           bool                      `json:"freeze_backbone,omitempty"`
 	FineTuneStrategy         string                    `json:"fine_tune_strategy,omitempty"`
 	AutoML                   *automl.ExperimentAutoML  `json:"automl,omitempty"`
+	presentFields            map[string]struct{}
 }
 
 type AugmentationPolicyConfig struct {
@@ -70,6 +76,7 @@ type AugmentationPolicyConfig struct {
 	NumMagnitudeBins int     `json:"num_magnitude_bins,omitempty"`
 	Probability      float64 `json:"probability,omitempty"`
 	Alpha            float64 `json:"alpha,omitempty"`
+	presentFields    map[string]struct{}
 }
 
 type Preprocessing struct {
@@ -78,4 +85,5 @@ type Preprocessing struct {
 	CropStrategy            string `json:"crop_strategy,omitempty"`
 	BBoxMode                string `json:"bbox_mode,omitempty"`
 	UseDatasetNormalization bool   `json:"use_dataset_normalization,omitempty"`
+	presentFields           map[string]struct{}
 }

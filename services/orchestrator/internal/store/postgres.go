@@ -12,11 +12,13 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
@@ -31,6 +33,133 @@ type PostgresStore struct {
 
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+func scanCandidateProvenance(row rowScanner) (calibration.CandidateProvenance, error) {
+	var candidate calibration.CandidateProvenance
+	var state candidateProvenanceScanState
+	if err := row.Scan(candidateProvenanceScanDestinations(&candidate, &state)...); err != nil {
+		return calibration.CandidateProvenance{}, normalizeSQLError(err)
+	}
+	return finalizeCandidateProvenanceScan(candidate, state)
+}
+
+type candidateProvenanceScanState struct {
+	selectedExperimentIndex sql.NullInt64
+	followUpPlanID          sql.NullString
+	experimentID            sql.NullString
+	jobID                   sql.NullString
+	attemptID               sql.NullString
+	realizedEffectiveHash   sql.NullString
+	actualScore             sql.NullFloat64
+	actualDelta             sql.NullFloat64
+	terminalState           sql.NullString
+	costUSD                 sql.NullFloat64
+	runtimeSeconds          sql.NullFloat64
+	calibrationEligible     sql.NullBool
+	eligibilityReason       sql.NullString
+	finalizedAt             sql.NullTime
+	reasonsJSON             []byte
+}
+
+func candidateProvenanceScanDestinations(candidate *calibration.CandidateProvenance, state *candidateProvenanceScanState) []any {
+	return []any{
+		&candidate.ID,
+		&candidate.ProjectID,
+		&candidate.InvocationID,
+		&candidate.DecisionID,
+		&candidate.PlannerVariantID,
+		&candidate.CandidateIndex,
+		&candidate.RolloutCohortID,
+		&candidate.RolloutPolicyID,
+		&candidate.RequestedConfigHash,
+		&candidate.AcceptedSpecHash,
+		&candidate.Task,
+		&candidate.Mechanism,
+		&candidate.Forecast.ForecastTarget,
+		&candidate.Forecast.MetricDirection,
+		&candidate.Forecast.ScoreBasis,
+		&candidate.Forecast.ScoreVersion,
+		&candidate.Forecast.BaselineJobID,
+		&candidate.Forecast.BaselineScore,
+		&candidate.Forecast.PredictedDelta,
+		&candidate.Forecast.PredictionSource,
+		&candidate.Forecast.Units,
+		&candidate.Forecast.ValidRange.Min,
+		&candidate.Forecast.ValidRange.Max,
+		&candidate.BaseScore,
+		&candidate.SelectionTraceReference,
+		&candidate.Selected,
+		&candidate.Rejected,
+		&candidate.SelectionState,
+		&state.selectedExperimentIndex,
+		&candidate.OutcomeStatus,
+		&state.reasonsJSON,
+		&state.followUpPlanID,
+		&state.experimentID,
+		&state.jobID,
+		&state.attemptID,
+		&state.realizedEffectiveHash,
+		&state.actualScore,
+		&state.actualDelta,
+		&state.terminalState,
+		&state.costUSD,
+		&state.runtimeSeconds,
+		&state.calibrationEligible,
+		&state.eligibilityReason,
+		&state.finalizedAt,
+		&candidate.CreatedAt,
+	}
+}
+
+func finalizeCandidateProvenanceScan(candidate calibration.CandidateProvenance, state candidateProvenanceScanState) (calibration.CandidateProvenance, error) {
+	if err := json.Unmarshal(state.reasonsJSON, &candidate.Reasons); err != nil {
+		return calibration.CandidateProvenance{}, fmt.Errorf("unmarshal candidate provenance reasons: %w", err)
+	}
+	if state.selectedExperimentIndex.Valid {
+		value := int(state.selectedExperimentIndex.Int64)
+		candidate.SelectedExperimentIndex = &value
+	}
+	if state.followUpPlanID.Valid {
+		candidate.FollowUpPlanID = &state.followUpPlanID.String
+	}
+	if state.experimentID.Valid {
+		candidate.ExperimentID = &state.experimentID.String
+	}
+	if state.jobID.Valid {
+		candidate.JobID = &state.jobID.String
+	}
+	if state.attemptID.Valid {
+		candidate.AttemptID = &state.attemptID.String
+	}
+	if state.realizedEffectiveHash.Valid {
+		candidate.RealizedEffectiveHash = &state.realizedEffectiveHash.String
+	}
+	if state.actualScore.Valid {
+		candidate.ActualScore = &state.actualScore.Float64
+	}
+	if state.actualDelta.Valid {
+		candidate.ActualDelta = &state.actualDelta.Float64
+	}
+	if state.terminalState.Valid {
+		candidate.TerminalState = &state.terminalState.String
+	}
+	if state.costUSD.Valid {
+		candidate.CostUSD = &state.costUSD.Float64
+	}
+	if state.runtimeSeconds.Valid {
+		candidate.RuntimeSeconds = &state.runtimeSeconds.Float64
+	}
+	if state.calibrationEligible.Valid {
+		candidate.CalibrationEligible = &state.calibrationEligible.Bool
+	}
+	if state.eligibilityReason.Valid {
+		candidate.EligibilityReason = &state.eligibilityReason.String
+	}
+	if state.finalizedAt.Valid {
+		candidate.FinalizedAt = &state.finalizedAt.Time
+	}
+	return candidate, nil
 }
 
 func (s *PostgresStore) CreateAgentMemoryRecord(record memory.AgentMemoryRecord) (memory.AgentMemoryRecord, error) {
@@ -294,8 +423,12 @@ func (s *PostgresStore) insertDatasetVisualAnalysis(analysis datasets.DatasetVis
 }
 
 func (s *PostgresStore) requireProject(projectID string) error {
+	return s.requireProjectContext(context.Background(), projectID)
+}
+
+func (s *PostgresStore) requireProjectContext(ctx context.Context, projectID string) error {
 	var exists bool
-	if err := s.db.QueryRowContext(context.Background(), `
+	if err := s.db.QueryRowContext(ctx, `
 		SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)
 	`, projectID).Scan(&exists); err != nil {
 		return err
@@ -360,6 +493,7 @@ func scanProject(row rowScanner) (projects.Project, error) {
 	var project projects.Project
 	if err := row.Scan(
 		&project.ID,
+		&project.AccountID,
 		&project.Name,
 		&project.Goal,
 		&project.Status,
@@ -731,16 +865,25 @@ func scanDatasetVisualAnalysis(row rowScanner) (datasets.DatasetVisualAnalysis, 
 
 func scanWorker(row rowScanner) (workers.Worker, error) {
 	var worker workers.Worker
+	var policyVersions, artifactVersions []byte
 	if err := row.Scan(
 		&worker.ID,
 		&worker.ProjectID,
 		&worker.Name,
 		&worker.Status,
 		&worker.GPUType,
+		&policyVersions,
+		&artifactVersions,
 		&worker.LastHeartbeat,
 		&worker.CurrentJobID,
 	); err != nil {
 		return workers.Worker{}, normalizeSQLError(err)
+	}
+	if err := json.Unmarshal(policyVersions, &worker.PolicyCapabilityVersions); err != nil {
+		return workers.Worker{}, err
+	}
+	if err := json.Unmarshal(artifactVersions, &worker.ArtifactCapabilityVersions); err != nil {
+		return workers.Worker{}, err
 	}
 
 	if time.Since(worker.LastHeartbeat) > workers.HeartbeatLimit {
@@ -761,6 +904,8 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 	if err := row.Scan(
 		&job.ID,
 		&job.ProjectID,
+		&job.DatasetID,
+		&job.PlanID,
 		&job.WorkerID,
 		&job.Template,
 		&job.Status,
@@ -772,6 +917,9 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 		&job.LeaseOwnerWorkerID,
 		&leaseExpiresAt,
 		&leaseLastHeartbeatAt,
+		&job.SchedulePolicyEvaluationID,
+		&job.EffectivePolicyHash,
+		&job.PolicyEligibilityStatus,
 		&job.CreatedAt,
 		&startedAt,
 		&completedAt,
@@ -801,7 +949,7 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 		job.MaxAttempts = defaultJobMaxAttempts
 	}
 
-	return job, nil
+	return jobs.WithExecutionSpecStatus(job), nil
 }
 
 func scanMetric(row rowScanner) (jobs.EpochMetric, error) {
@@ -823,6 +971,7 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 	var summary runs.TrainingRunSummary
 	var datasetMaterializationJSON []byte
 	var stageTelemetryJSON []byte
+	var executionReferencesJSON []byte
 	if err := row.Scan(
 		&summary.JobID,
 		&summary.ProjectID,
@@ -843,6 +992,7 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 		&summary.ModalInputID,
 		&datasetMaterializationJSON,
 		&stageTelemetryJSON,
+		&executionReferencesJSON,
 		&summary.CreatedAt,
 		&summary.UpdatedAt,
 	); err != nil {
@@ -860,6 +1010,13 @@ func scanTrainingRunSummary(row rowScanner) (runs.TrainingRunSummary, error) {
 			return runs.TrainingRunSummary{}, fmt.Errorf("unmarshal stage telemetry: %w", err)
 		}
 	}
+	if len(executionReferencesJSON) > 0 && string(executionReferencesJSON) != "{}" {
+		var references runs.ExecutionArtifactReferences
+		if err := json.Unmarshal(executionReferencesJSON, &references); err != nil {
+			return runs.TrainingRunSummary{}, fmt.Errorf("unmarshal execution references: %w", err)
+		}
+		summary.ExecutionReferences = &references
+	}
 
 	return summary, nil
 }
@@ -871,6 +1028,7 @@ func scanTrainingRunEvaluation(row rowScanner) (runs.TrainingRunEvaluation, erro
 	var confusionMatrixJSON []byte
 	var modelProfileJSON []byte
 	var holisticScoresJSON []byte
+	var executionReferencesJSON []byte
 	if err := row.Scan(
 		&evaluation.JobID,
 		&evaluation.ProjectID,
@@ -882,6 +1040,7 @@ func scanTrainingRunEvaluation(row rowScanner) (runs.TrainingRunEvaluation, erro
 		&modelProfileJSON,
 		&holisticScoresJSON,
 		&evaluation.RecommendationSummary,
+		&executionReferencesJSON,
 		&evaluation.CreatedAt,
 		&evaluation.UpdatedAt,
 	); err != nil {
@@ -917,6 +1076,13 @@ func scanTrainingRunEvaluation(row rowScanner) (runs.TrainingRunEvaluation, erro
 		if err := json.Unmarshal(holisticScoresJSON, &evaluation.HolisticScores); err != nil {
 			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal holistic scores: %w", err)
 		}
+	}
+	if len(executionReferencesJSON) > 0 && string(executionReferencesJSON) != "{}" {
+		var references runs.ExecutionArtifactReferences
+		if err := json.Unmarshal(executionReferencesJSON, &references); err != nil {
+			return runs.TrainingRunEvaluation{}, fmt.Errorf("unmarshal execution references: %w", err)
+		}
+		evaluation.ExecutionReferences = &references
 	}
 	return evaluation, nil
 }
@@ -1108,6 +1274,8 @@ func scanAgentDecision(row rowScanner) (decisions.AgentDecision, error) {
 		&decision.DecisionType,
 		&decision.Rationale,
 		&payloadJSON,
+		&decision.ProposalPolicyEvaluationID,
+		&decision.EffectivePolicyHash,
 		&decision.CreatedAt,
 	); err != nil {
 		return decisions.AgentDecision{}, normalizeSQLError(err)
@@ -1165,6 +1333,8 @@ func scanExecutionEvent(row rowScanner) (execution.ExecutionEvent, error) {
 		&event.Message,
 		&payloadJSON,
 		&event.CreatedAt,
+		&event.Sequence,
+		&event.IdempotencyKey,
 	); err != nil {
 		return execution.ExecutionEvent{}, normalizeSQLError(err)
 	}
@@ -1314,9 +1484,15 @@ func scanAgentMemoryRecord(row rowScanner) (memory.AgentMemoryRecord, error) {
 
 func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 	var invocation memory.AgentInvocation
+	var plannerVariantJSON []byte
+	var rolloutAssignmentJSON []byte
+	var providerUsageJSON []byte
+	var derivedCostJSON []byte
 	var inputMessagesJSON []byte
 	var inputContextJSON []byte
 	var parsedOutputJSON []byte
+	var strictValidationVerdictJSON []byte
+	var validationOutcomeJSON []byte
 	var humanFeedbackJSON []byte
 	var downstreamOutcomeJSON []byte
 
@@ -1329,6 +1505,18 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		&invocation.AgentName,
 		&invocation.AgentVersion,
 		&invocation.PromptVersion,
+		&invocation.PlannerVariantID,
+		&plannerVariantJSON,
+		&invocation.RolloutCohortID,
+		&invocation.RolloutPolicyID,
+		&rolloutAssignmentJSON,
+		&invocation.ValidationMode,
+		&invocation.AttemptGroupID,
+		&invocation.AttemptIndex,
+		&invocation.RetryReason,
+		&invocation.WallLatencyMS,
+		&providerUsageJSON,
+		&derivedCostJSON,
 		&invocation.Provider,
 		&invocation.Model,
 		&inputMessagesJSON,
@@ -1337,12 +1525,59 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		&parsedOutputJSON,
 		&invocation.ValidationStatus,
 		&invocation.ValidationError,
+		&strictValidationVerdictJSON,
+		&validationOutcomeJSON,
 		&invocation.AcceptedForMemory,
 		&humanFeedbackJSON,
 		&downstreamOutcomeJSON,
 		&invocation.CreatedAt,
 	); err != nil {
 		return memory.AgentInvocation{}, normalizeSQLError(err)
+	}
+	if len(plannerVariantJSON) > 0 {
+		var variant memory.PlannerVariant
+		if err := json.Unmarshal(plannerVariantJSON, &variant); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner variant: %w", err)
+		}
+		if variant.IdentitySchemaVersion != "" {
+			invocation.PlannerVariant = &variant
+		}
+	}
+	if len(rolloutAssignmentJSON) > 0 && string(rolloutAssignmentJSON) != "{}" {
+		var assignment calibration.PlannerRolloutAssignment
+		if err := json.Unmarshal(rolloutAssignmentJSON, &assignment); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner rollout assignment: %w", err)
+		}
+		invocation.RolloutAssignment = &assignment
+	}
+	invocation.ProviderUsage = map[string]any{}
+	if len(providerUsageJSON) > 0 {
+		if err := json.Unmarshal(providerUsageJSON, &invocation.ProviderUsage); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation provider usage: %w", err)
+		}
+	}
+	if len(derivedCostJSON) > 0 {
+		var cost memory.PlannerInvocationCost
+		if err := json.Unmarshal(derivedCostJSON, &cost); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal agent invocation derived cost: %w", err)
+		}
+		if cost.PricingVersion != "" {
+			invocation.DerivedCost = &cost
+		}
+	}
+	if len(strictValidationVerdictJSON) > 0 && string(strictValidationVerdictJSON) != "{}" {
+		var verdict plannervalidation.Verdict
+		if err := json.Unmarshal(strictValidationVerdictJSON, &verdict); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner strict validation verdict: %w", err)
+		}
+		invocation.StrictValidationVerdict = &verdict
+	}
+	if len(validationOutcomeJSON) > 0 && string(validationOutcomeJSON) != "{}" {
+		var outcome plannervalidation.Outcome
+		if err := json.Unmarshal(validationOutcomeJSON, &outcome); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner validation outcome: %w", err)
+		}
+		invocation.ValidationOutcome = &outcome
 	}
 
 	invocation.InputMessages = []map[string]string{}
@@ -1376,6 +1611,10 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		}
 	}
 
+	invocation, err := memory.NormalizeAgentInvocationRuntime(invocation)
+	if err != nil {
+		return memory.AgentInvocation{}, fmt.Errorf("normalize agent invocation runtime: %w", err)
+	}
 	return invocation, nil
 }
 
@@ -1387,6 +1626,8 @@ func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error)
 	var objectiveProfileJSON []byte
 	var proposedChangesJSON []byte
 	var tagsJSON []byte
+	var fidelityVerdictsJSON []byte
+	var adjustmentReasonCodesJSON []byte
 	if err := row.Scan(
 		&scorecard.ID,
 		&scorecard.ProjectID,
@@ -1413,11 +1654,30 @@ func scanStrategyScorecard(row rowScanner) (strategies.StrategyScorecard, error)
 		&scorecard.Outcome,
 		&scorecard.Lesson,
 		&tagsJSON,
+		&fidelityVerdictsJSON,
+		&scorecard.EvidenceEligible,
+		&scorecard.RequestedMechanism,
+		&scorecard.RealizedMechanismIdentity,
+		&scorecard.AcceptedSpecHash,
+		&scorecard.RealizedEffectiveHash,
+		&adjustmentReasonCodesJSON,
 		&scorecard.CreatedAt,
 	); err != nil {
 		return strategies.StrategyScorecard{}, normalizeSQLError(err)
 	}
 	scorecard.DiagnosisTriggers = []string{}
+	scorecard.FidelityVerdicts = []string{}
+	scorecard.AdjustmentReasonCodes = []string{}
+	if len(fidelityVerdictsJSON) > 0 {
+		if err := json.Unmarshal(fidelityVerdictsJSON, &scorecard.FidelityVerdicts); err != nil {
+			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard fidelity_verdicts: %w", err)
+		}
+	}
+	if len(adjustmentReasonCodesJSON) > 0 {
+		if err := json.Unmarshal(adjustmentReasonCodesJSON, &scorecard.AdjustmentReasonCodes); err != nil {
+			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard adjustment_reason_codes: %w", err)
+		}
+	}
 	if len(diagnosisTriggersJSON) > 0 {
 		if err := json.Unmarshal(diagnosisTriggersJSON, &scorecard.DiagnosisTriggers); err != nil {
 			return strategies.StrategyScorecard{}, fmt.Errorf("unmarshal strategy scorecard diagnosis_triggers: %w", err)
@@ -1462,6 +1722,9 @@ func scanOptimizerStudy(row rowScanner) (automl.OptimizerStudy, error) {
 		&study.Seed,
 		&searchSpaceJSON,
 		&strategyJSON,
+		&study.CapabilityVersion,
+		&study.Task,
+		&study.Runner,
 		&study.CreatedAt,
 	); err != nil {
 		return automl.OptimizerStudy{}, normalizeSQLError(err)
@@ -1507,6 +1770,9 @@ func scanOptimizerSuggestion(row rowScanner) (automl.OptimizerSuggestion, error)
 		&provenanceJSON,
 		&suggestion.ValidationStatus,
 		&validationErrorsJSON,
+		&suggestion.CapabilityVersion,
+		&suggestion.Task,
+		&suggestion.Runner,
 		&suggestion.CreatedAt,
 	); err != nil {
 		return automl.OptimizerSuggestion{}, normalizeSQLError(err)
@@ -1554,6 +1820,9 @@ func scanOptimizerTrial(row rowScanner) (automl.OptimizerTrial, error) {
 		&trial.Score,
 		&metricsJSON,
 		&trial.Error,
+		&trial.CapabilityVersion,
+		&trial.Task,
+		&trial.Runner,
 		&trial.CreatedAt,
 		&trial.UpdatedAt,
 	); err != nil {
@@ -1604,6 +1873,9 @@ func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
 		&plan.DatasetID,
 		&plan.Status,
 		&plan.SourceDecisionID,
+		&plan.ProposalPolicyEvaluationID,
+		&plan.EffectivePolicyHash,
+		&plan.PolicyStatus,
 		&plan.TargetMetric,
 		&plan.RecommendedWorkers,
 		&plan.EstimatedMinutes,
@@ -1616,12 +1888,24 @@ func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
 
 	plan.Experiments = []plans.PlannedExperiment{}
 	if len(experimentsJSON) > 0 {
-		if err := json.Unmarshal(experimentsJSON, &plan.Experiments); err != nil {
+		var legacyUnversioned bool
+		var err error
+		plan.Experiments, plan.CapabilityVersion, legacyUnversioned, err =
+			plans.UnmarshalStoredExperiments(experimentsJSON)
+		if err != nil {
 			return plans.ExperimentPlan{}, fmt.Errorf("unmarshal planned experiments: %w", err)
+		}
+		if legacyUnversioned {
+			plan.ExecutionSpecStatus = execution.ExecutionSpecStatusLegacyUnversioned
+		} else {
+			plan.ExecutionSpecStatus = execution.ExecutionSpecStatusVersioned
 		}
 	}
 	if plan.Experiments == nil {
 		plan.Experiments = []plans.PlannedExperiment{}
+	}
+	if plan.ExecutionSpecStatus == "" {
+		plan.ExecutionSpecStatus = execution.ExecutionSpecStatusLegacyUnversioned
 	}
 
 	plan.Warnings = []string{}
@@ -1654,7 +1938,7 @@ func selectJobSQL(column string) string {
 }
 
 func jobSelectColumns() string {
-	return "id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at"
+	return "id, project_id, COALESCE(dataset_id, ''), COALESCE(plan_id, ''), worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, COALESCE(schedule_policy_evaluation_id, ''), effective_policy_hash, policy_eligibility_status, created_at, started_at, completed_at"
 }
 
 func datasetVisualAnalysisSelectColumns() string {
@@ -1670,19 +1954,19 @@ func memoryEmbeddingSelectColumns() string {
 }
 
 func strategyScorecardSelectColumns() string {
-	return "id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id, strategy_type, planning_mode, mechanism, intervention, diagnosis_triggers, evidence_used, expected_effect, dataset_traits, objective_profile, proposed_changes, expected_delta, actual_delta, confidence_before, confidence_after, cost_usd, runtime_seconds, outcome, lesson, tags, created_at"
+	return "id, project_id, dataset_id, source_decision_id, source_plan_id, followup_plan_id, strategy_type, planning_mode, mechanism, intervention, diagnosis_triggers, evidence_used, expected_effect, dataset_traits, objective_profile, proposed_changes, expected_delta, actual_delta, confidence_before, confidence_after, cost_usd, runtime_seconds, outcome, lesson, tags, fidelity_verdicts, evidence_eligible, requested_mechanism, realized_mechanism_identity, accepted_spec_hash, realized_effective_hash, adjustment_reason_codes, created_at"
 }
 
 func automlStudySelectColumns() string {
-	return "id, project_id, plan_id, dataset_id, source_decision_id, experiment_index, model, intent, sampler, seed, search_space, strategy_snapshot, created_at"
+	return "id, project_id, plan_id, dataset_id, source_decision_id, experiment_index, model, intent, sampler, seed, search_space, strategy_snapshot, capability_version, task, runner, created_at"
 }
 
 func automlSuggestionSelectColumns() string {
-	return "id, study_id, project_id, plan_id, dataset_id, job_id, experiment_index, model, sampler, seed, values, final_values, provenance, validation_status, validation_errors, created_at"
+	return "id, study_id, project_id, plan_id, dataset_id, job_id, experiment_index, model, sampler, seed, values, final_values, provenance, validation_status, validation_errors, capability_version, task, runner, created_at"
 }
 
 func automlTrialSelectColumns() string {
-	return "id, study_id, suggestion_id, project_id, plan_id, dataset_id, job_id, status, target_metric, score, metrics, error, created_at, updated_at"
+	return "id, study_id, suggestion_id, project_id, plan_id, dataset_id, job_id, status, target_metric, score, metrics, error, capability_version, task, runner, created_at, updated_at"
 }
 
 func newPostgresTrainingRunSummaryFromJob(job jobs.ExperimentJob, now time.Time) runs.TrainingRunSummary {
@@ -1752,6 +2036,10 @@ func applyPostgresTrainingRunSummaryUpdate(summary *runs.TrainingRunSummary, upd
 	}
 	if update.StageTelemetry != nil {
 		summary.StageTelemetry = copyAnyMap(update.StageTelemetry)
+	}
+	if update.ExecutionReferences != nil {
+		references := *update.ExecutionReferences
+		summary.ExecutionReferences = &references
 	}
 
 	summary.UpdatedAt = now

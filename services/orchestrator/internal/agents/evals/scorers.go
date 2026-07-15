@@ -16,6 +16,7 @@ type PlannerReplayScores struct {
 	FinalizerSucceeded              bool           `json:"finalizer_succeeded"`
 	FinalizerError                  string         `json:"finalizer_error,omitempty"`
 	CandidateRankingApplied         bool           `json:"candidate_ranking_applied"`
+	SelectionAuditValid             bool           `json:"selection_audit_valid"`
 	AvoidedBlockedMechanisms        bool           `json:"avoided_blocked_mechanisms"`
 	AvoidedDuplicateSignatures      bool           `json:"avoided_duplicate_signatures"`
 	AvoidedArchitectureAfterPlateau bool           `json:"avoided_architecture_after_plateau"`
@@ -64,6 +65,7 @@ func scorePlannerRecommendationDetailed(input agents.ExperimentPlannerInput, rec
 			rankingApplied = len(finalized.CandidateRankings) == len(recommendation.CandidateHypotheses)
 		}
 	}
+	selectionAuditValid := decision != decisions.TypeAddExperiments || (finalizeOK && replaySelectionAuditValid(finalized))
 
 	selectedMechanisms := selectedReplayMechanisms(finalized)
 	schemaValid := replaySchemaValid(recommendation)
@@ -92,6 +94,7 @@ func scorePlannerRecommendationDetailed(input agents.ExperimentPlannerInput, rec
 		decisionAllowed &&
 		finalizeOK &&
 		rankingApplied &&
+		selectionAuditValid &&
 		avoidedBlocked &&
 		duplicatesAvoided &&
 		architectureAvoided &&
@@ -104,6 +107,7 @@ func scorePlannerRecommendationDetailed(input agents.ExperimentPlannerInput, rec
 		SchemaValid:                     schemaValid,
 		BackendValidationPassed:         backendPassed,
 		CandidateRankingApplied:         rankingApplied,
+		SelectionAuditValid:             selectionAuditValid,
 		AvoidedBlockedMechanisms:        avoidedBlocked,
 		AvoidedDuplicateSignatures:      duplicatesAvoided,
 		AvoidedArchitectureAfterPlateau: architectureAvoided,
@@ -131,6 +135,110 @@ func replayFinalizerError(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func replaySelectionAuditValid(recommendation agents.ExperimentPlanningRecommendation) bool {
+	rankingsByCandidate := make(map[int]agents.CandidateRanking, len(recommendation.CandidateRankings))
+	eligibleCount := 0
+	selectedCount := 0
+	seenOrders := map[int]bool{}
+	seenExperimentIndexes := map[int]bool{}
+	for _, ranking := range recommendation.CandidateRankings {
+		if _, exists := rankingsByCandidate[ranking.CandidateIndex]; exists || ranking.Score != ranking.BaseScore {
+			return false
+		}
+		rankingsByCandidate[ranking.CandidateIndex] = ranking
+		if !ranking.Rejected {
+			eligibleCount++
+		}
+		if !ranking.Selected {
+			if ranking.SelectionScore != nil || ranking.SelectionOrder != nil || ranking.SelectedExperimentIndex != nil || len(ranking.SelectionAdjustments) > 0 {
+				return false
+			}
+			continue
+		}
+		selectedCount++
+		if ranking.Rejected || ranking.SelectionScore == nil || ranking.SelectionOrder == nil || ranking.SelectedExperimentIndex == nil {
+			return false
+		}
+		if *ranking.SelectionOrder < 0 || *ranking.SelectionOrder >= len(recommendation.CandidateSelectionTrace) || seenOrders[*ranking.SelectionOrder] {
+			return false
+		}
+		if *ranking.SelectedExperimentIndex < 0 || *ranking.SelectedExperimentIndex >= len(recommendation.ProposedExperiments) || seenExperimentIndexes[*ranking.SelectedExperimentIndex] {
+			return false
+		}
+		if *ranking.SelectionOrder != *ranking.SelectedExperimentIndex {
+			return false
+		}
+		if ranking.CandidateIndex < 0 || ranking.CandidateIndex >= len(recommendation.CandidateHypotheses) {
+			return false
+		}
+		candidateJSON, _ := json.Marshal(recommendation.CandidateHypotheses[ranking.CandidateIndex].ExperimentConfig)
+		selectedJSON, _ := json.Marshal(recommendation.ProposedExperiments[*ranking.SelectedExperimentIndex])
+		if string(candidateJSON) != string(selectedJSON) {
+			return false
+		}
+		adjustmentTotal := 0.0
+		for _, adjustment := range ranking.SelectionAdjustments {
+			adjustmentTotal += adjustment.Value
+		}
+		if *ranking.SelectionScore != replayRoundScore(ranking.BaseScore+adjustmentTotal) {
+			return false
+		}
+		seenOrders[*ranking.SelectionOrder] = true
+		seenExperimentIndexes[*ranking.SelectedExperimentIndex] = true
+	}
+
+	if selectedCount == 0 || selectedCount != len(recommendation.ProposedExperiments) || selectedCount != len(recommendation.CandidateSelectionTrace) {
+		return false
+	}
+	for selectionOrder, round := range recommendation.CandidateSelectionTrace {
+		if round.SelectionOrder != selectionOrder || round.TotalCandidateCount != eligibleCount-selectionOrder || len(round.Candidates) == 0 || len(round.Candidates) > 5 {
+			return false
+		}
+		if round.Truncated != (round.TotalCandidateCount > len(round.Candidates)) {
+			return false
+		}
+		if round.Candidates[0].CandidateIndex != round.SelectedCandidateIndex || !round.Candidates[0].Selected {
+			return false
+		}
+		selectedEntries := 0
+		seenCandidates := map[int]bool{}
+		for index, entry := range round.Candidates {
+			ranking, ok := rankingsByCandidate[entry.CandidateIndex]
+			if !ok || ranking.Rejected || seenCandidates[entry.CandidateIndex] || entry.BaseScore != ranking.BaseScore {
+				return false
+			}
+			seenCandidates[entry.CandidateIndex] = true
+			if entry.Selected {
+				selectedEntries++
+				if entry.CandidateIndex != round.SelectedCandidateIndex {
+					return false
+				}
+			}
+			adjustmentTotal := 0.0
+			for _, adjustment := range entry.SelectionAdjustments {
+				adjustmentTotal += adjustment.Value
+			}
+			if entry.AdjustedScore != replayRoundScore(entry.BaseScore+adjustmentTotal) {
+				return false
+			}
+			if index > 0 {
+				previous := round.Candidates[index-1]
+				if previous.AdjustedScore < entry.AdjustedScore || (previous.AdjustedScore == entry.AdjustedScore && previous.CandidateIndex > entry.CandidateIndex) {
+					return false
+				}
+			}
+		}
+		if selectedEntries != 1 {
+			return false
+		}
+		ranking := rankingsByCandidate[round.SelectedCandidateIndex]
+		if !ranking.Selected || ranking.SelectionOrder == nil || *ranking.SelectionOrder != selectionOrder {
+			return false
+		}
+	}
+	return true
 }
 
 func replayDuplicateSignatureRejections(rankings []agents.CandidateRanking) int {

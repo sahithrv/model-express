@@ -25,6 +25,206 @@ after(async () => {
   await viteServer?.close();
 });
 
+test("execution audit keeps legacy runs visible as unverified", async () => {
+  const { executionAuditView } = await loadMissionModel();
+  const view = executionAuditView(
+    { job_id: "legacy-job", project_id: "project-1", model: "legacy", status: "SUCCEEDED" },
+    null,
+    { id: "legacy-job", project_id: "project-1", template: "train_experiment", status: "SUCCEEDED", config: {} },
+    null,
+  );
+
+  assert.equal(view.status, "UNVERIFIED");
+  assert.equal(view.trustworthy, false);
+  assert.match(view.message, /Legacy or unverifiable/);
+  assert.equal(view.executionRecordRef, "");
+  assert.deepEqual(view.diff, []);
+});
+
+test("execution audit distinguishes mismatch and simulation from verified evidence", async () => {
+  const { executionAuditView } = await loadMissionModel();
+  const job = {
+    id: "job-1",
+    project_id: "project-1",
+    template: "train_experiment",
+    status: "SUCCEEDED",
+    config: { execution_spec_v1: { requested_config: { batch_size: 16, preprocessing: { normalization: "imagenet" } } } },
+  };
+  const baseSummary = {
+    job_id: "job-1",
+    project_id: "project-1",
+    model: "resnet18",
+    status: "SUCCEEDED",
+    execution_references: {
+      execution_record_ref: "/jobs/job-1/execution-record",
+      capability_version: "1.0.0",
+      accepted_spec_hash: "accepted",
+      realized_effective_hash: "realized",
+    },
+  };
+  const record = {
+    accepted_spec: { accepted_spec_hash: "accepted", capability_version: "1.0.0" },
+    attempts: [{
+      attempt_number: 1,
+      lifecycle_status: "FINALIZED",
+      fidelity_verdict: "MISMATCH",
+      realized_effective_hash: "realized",
+      latest_realized_config: { batch_size: 8, preprocessing: { normalization: "none" } },
+      framework_arguments: { should_not_be_here: true },
+    }],
+  };
+
+  const mismatch = executionAuditView(
+    { ...baseSummary, execution_references: { ...baseSummary.execution_references, fidelity_verdict: "MISMATCH" } },
+    null,
+    job,
+    record,
+  );
+  assert.equal(mismatch.status, "MISMATCH");
+  assert.equal(mismatch.trustworthy, false);
+  assert.equal(mismatch.tone, "untrusted");
+  assert.match(mismatch.message, /Not trustworthy/);
+  assert.equal(mismatch.diff.find((row) => row.path === "batch_size")?.change, "changed");
+
+  const simulated = executionAuditView(
+    { ...baseSummary, execution_references: { ...baseSummary.execution_references, fidelity_verdict: "SIMULATED" } },
+    null,
+    job,
+    { ...record, attempts: [{ ...record.attempts[0], fidelity_verdict: "SIMULATED" }] },
+  );
+  assert.equal(simulated.status, "SIMULATED");
+  assert.equal(simulated.trustworthy, false);
+  assert.match(simulated.message, /not verified real-training evidence/);
+});
+
+test("execution audit summarizes approved adjustments and pending states", async () => {
+  const { executionAuditView } = await loadMissionModel();
+  const adjusted = executionAuditView(
+    {
+      job_id: "job-adjusted",
+      project_id: "project-1",
+      model: "resnet18",
+      status: "SUCCEEDED",
+      execution_references: {
+        fidelity_verdict: "APPROVED_ADJUSTMENT",
+        lifecycle_status: "FINALIZED",
+        adjustment_reason_codes: ["batch_size_reduced_by_resource_recovery"],
+      },
+    },
+    null,
+    null,
+    null,
+  );
+  assert.equal(adjusted.trustworthy, true);
+  assert.equal(adjusted.status, "APPROVED_ADJUSTMENT");
+  assert.match(adjusted.adjustmentSummary, /batch size reduced/i);
+
+  const pending = executionAuditView(
+    {
+      job_id: "job-pending",
+      project_id: "project-1",
+      model: "resnet18",
+      status: "RUNNING",
+      execution_references: { lifecycle_status: "INITIALIZED" },
+    },
+    null,
+    null,
+    null,
+  );
+  assert.equal(pending.status, "PENDING_REALIZATION");
+  assert.equal(pending.trustworthy, false);
+});
+
+test("candidate ranking audit parses old and new decision payloads without inventing unselected scores", async () => {
+  const { candidateScoreRows, candidateSelectionTraceRows } = await loadMissionModel();
+  const oldDecision = {
+    id: "decision-old",
+    decision_type: "ADD_EXPERIMENTS",
+    rationale: "legacy ranking",
+    created_at: timestamp,
+    payload: {
+      candidate_rankings: [
+        { candidate_index: 0, hypothesis: "Legacy candidate", score: 0.74, selected: true, reasons: ["legacy reason"] },
+      ],
+    },
+  };
+  const oldRows = candidateScoreRows(oldDecision);
+  assert.equal(oldRows.length, 1);
+  assert.equal(oldRows[0].baseScore, 0.74);
+  assert.equal(oldRows[0].selectionScore, null);
+  assert.equal(oldRows[0].selectionOrder, null);
+  assert.deepEqual(oldRows[0].selectionAdjustments, []);
+  assert.deepEqual(candidateSelectionTraceRows(oldDecision), []);
+
+  const newDecision = {
+    id: "decision-new",
+    decision_type: "ADD_EXPERIMENTS",
+    rationale: "audited ranking",
+    created_at: timestamp,
+    payload: {
+      candidate_rankings: [
+        {
+          candidate_index: 0,
+          hypothesis: "Selected candidate",
+          score: 0.74,
+          base_score: 0.74,
+          selection_score: 0.62,
+          selection_order: 2,
+          selected_experiment_index: 1,
+          selection_adjustments: [
+            {
+              code: "family_diversity",
+              value: -0.12,
+              detail: "two candidates from this model family were already selected",
+            },
+          ],
+          selected: true,
+        },
+        {
+          candidate_index: 1,
+          hypothesis: "Unselected candidate",
+          score: 0.70,
+          base_score: 0.70,
+          selected: false,
+        },
+      ],
+      candidate_selection_trace: [
+        {
+          selection_order: 2,
+          selected_candidate_index: 0,
+          total_candidate_count: 8,
+          truncated: true,
+          candidates: [
+            {
+              candidate_index: 0,
+              base_score: 0.74,
+              adjusted_score: 0.62,
+              selected: true,
+              selection_adjustments: [{ code: "family_diversity", value: -0.12 }],
+            },
+            { candidate_index: 1, base_score: 0.70, adjusted_score: 0.70, selected: false },
+          ],
+        },
+      ],
+    },
+  };
+  const newRows = candidateScoreRows(newDecision);
+  assert.equal(newRows[0].baseScore, 0.74);
+  assert.equal(newRows[0].selectionScore, 0.62);
+  assert.equal(newRows[0].selectionOrder, 2);
+  assert.equal(newRows[0].selectedExperimentIndex, 1);
+  assert.equal(newRows[0].selectionAdjustments[0].label, "Family Diversity");
+  assert.equal(newRows[1].selectionScore, null);
+  assert.equal(newRows[1].selectionOrder, null);
+
+  const traceRows = candidateSelectionTraceRows(newDecision);
+  assert.equal(traceRows.length, 1);
+  assert.equal(traceRows[0].selectedLabel, "Selected candidate");
+  assert.equal(traceRows[0].totalCandidateCount, 8);
+  assert.equal(traceRows[0].truncated, true);
+  assert.equal(traceRows[0].candidates[1].adjustedScore, 0.70);
+});
+
 test("stale failed worker state does not block export-ready champion demo availability", async () => {
   const { buildMissionDigest, buildMissionStages } = await loadMissionModel();
   const project = projectFixture();

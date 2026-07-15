@@ -53,8 +53,16 @@ func TestAgentInvocationResponsesRedactRawTraceByDefault(t *testing.T) {
 		t.Fatalf("create project: %v", err)
 	}
 	if _, err := memoryStore.CreateAgentInvocation(memory.AgentInvocation{
-		ProjectID:        project.ID,
-		AgentName:        "planner",
+		ProjectID: project.ID,
+		AgentName: "planner",
+		PlannerVariant: &memory.PlannerVariant{
+			IdentitySchemaVersion: memory.PlannerVariantIdentitySchemaV1,
+			AgentVersion:          "v2",
+			PromptVersion:         "prompt-v1",
+			Provider:              "openai",
+			APIStyle:              "responses",
+			EffectiveAPIStyle:     "responses",
+		},
 		Provider:         "openai",
 		Model:            "test-model",
 		InputMessages:    []map[string]string{{"role": "user", "content": "secret-token-value"}},
@@ -77,6 +85,58 @@ func TestAgentInvocationResponsesRedactRawTraceByDefault(t *testing.T) {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("agent invocation response leaked %q: %s", forbidden, body)
 		}
+	}
+	if !strings.Contains(body, `"planner_variant"`) || !strings.Contains(body, `"identity_schema_version":"planner_variant_identity_v1"`) {
+		t.Fatalf("redacted response omitted safe canonical planner variant: %s", body)
+	}
+}
+
+func TestAgentInvocationResponsesFilterByExactPlannerVariant(t *testing.T) {
+	memoryStore := store.NewMemoryStore()
+	project, err := memoryStore.CreateProject("variant query", "")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	variantIDs := []string{}
+	for _, provider := range []string{"openai", "local"} {
+		variant := memory.PlannerVariant{
+			IdentitySchemaVersion: memory.PlannerVariantIdentitySchemaV1,
+			AgentVersion:          "v2",
+			Provider:              provider,
+		}
+		variantID, err := memory.ComputePlannerVariantID(variant)
+		if err != nil {
+			t.Fatalf("compute %s variant: %v", provider, err)
+		}
+		variantIDs = append(variantIDs, variantID)
+		if _, err := memoryStore.CreateAgentInvocation(memory.AgentInvocation{
+			ProjectID:        project.ID,
+			AgentName:        "experiment_planner",
+			PlannerVariantID: variantID,
+			PlannerVariant:   &variant,
+			InputMessages:    []map[string]string{{"role": "user", "content": "must-remain-redacted"}},
+			ValidationStatus: memory.InvocationValidationValid,
+		}); err != nil {
+			t.Fatalf("create invocation %s: %v", variantID, err)
+		}
+	}
+	router := NewRouter(memoryStore)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/agent-invocations?planner_variant_id="+variantIDs[1], nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Invocations []agentInvocationSummary `json:"invocations"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Invocations) != 1 || payload.Invocations[0].PlannerVariantID != variantIDs[1] {
+		t.Fatalf("unexpected exact-variant response %#v", payload.Invocations)
+	}
+	if strings.Contains(resp.Body.String(), "must-remain-redacted") {
+		t.Fatalf("variant query leaked raw prompt: %s", resp.Body.String())
 	}
 }
 

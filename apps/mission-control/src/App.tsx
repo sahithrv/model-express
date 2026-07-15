@@ -48,10 +48,18 @@ import {
 import {
   cachedGetRequestTtlMs,
   isOrchestratorHttpErrorResponse,
+  liveRequestPath,
+  OrchestratorHttpError,
   type CachedGetRequest,
+  type MissionControlRequestReason,
   type OrchestratorHttpErrorResponse,
   type RequestOptions,
 } from "./api/missionControlClient";
+import {
+  appendActivityVisibilitySample,
+  summarizeActivityVisibility,
+  type ActivityVisibilitySample,
+} from "./api/activityDiagnostics";
 import {
   emptyProjectDetail,
   type ChampionExportsStatus,
@@ -60,8 +68,25 @@ import {
   type ProjectDetailLoadStatus,
   type VisualAnalysisDetail,
 } from "./hooks/useProjectDetail";
-import { eventNeedsSlowProjectRefresh, type ActivityStreamState } from "./hooks/useActivityStream";
+import type { ActivityStreamState } from "./features/activity/activityStreamState";
+import {
+  useIncrementalLiveState,
+  type IncrementalResourceFetcher,
+} from "./hooks/useIncrementalLiveState";
 import { useWorkerSupervisor } from "./hooks/useWorkerSupervisor";
+import { LiveProgressPanel } from "./features/live/LiveProgressPanel";
+import { ExperimentPolicyPanel } from "./features/policy/ExperimentPolicyPanel";
+import { buildLiveProgressViewModel } from "./features/live/liveProgressViewModel";
+import {
+  createLiveRefreshCoordinator,
+  projectLiveRefreshScope,
+} from "./features/live/liveRefreshCoordinator";
+import {
+  resolveLivePollingPolicy,
+  type IncrementalLiveHealth,
+  type LiveDataFeatureFlags,
+} from "./features/live/livePollingPolicy";
+import type { ExecutionEventV2, LiveOperationalState } from "./features/live/liveStateContract";
 import {
   projectTabs,
   type ActivityFilterKey,
@@ -195,7 +220,6 @@ import {
   missionStateLabel,
   missionHealthLabel,
   missionToneRank,
-  activityEventFromMessage,
   mergeActivityEvents,
   buildFallbackActivityEvents,
   fallbackActivityFromExecutionEvent,
@@ -459,6 +483,7 @@ import {
   DetectionOverlay,
   PredictionRow,
   RunEvaluationDetails,
+  RunExecutionAudit,
   MetricCard,
   Badge,
   MetricChart,
@@ -507,6 +532,7 @@ import type {
   DatasetMetadataSummary,
   DatasetVisualAnalysis,
   EpochMetric,
+  ExecutionRecord,
   ExecutionEvent,
   ExperimentPlan,
   Health,
@@ -530,15 +556,40 @@ import type {
 const defaultBaseUrl = localStorage.getItem("orchestratorUrl") ?? "http://127.0.0.1:8080";
 const datasetPlanetAssetUrl = new URL("../moon3.png", import.meta.url).href;
 const jobsPerPage = 10;
-const activeLiveRefreshIntervalMs = 10_000;
 const idleLiveRefreshIntervalMs = 30_000;
-const eventRefreshMinIntervalMs = 3_000;
-const eventRefreshDebounceMs = 750;
-const projectJobsFetchLimit = 100;
-const trainingSummariesFetchLimit = 100;
 const trainingEvaluationsFetchLimit = 50;
-const selectedJobMetricsFetchLimit = 200;
 const selectedProjectStorageKey = "selectedProjectId";
+const defaultLiveDataFeatureFlags: LiveDataFeatureFlags = {
+  incremental_v2_enabled: true,
+  shadow_mode: false,
+  rollback_to_legacy: false,
+};
+const legacyOnlyLiveDataFeatureFlags: LiveDataFeatureFlags = {
+  incremental_v2_enabled: false,
+  shadow_mode: false,
+  rollback_to_legacy: false,
+};
+
+function legacyOperationalStateForShadow(
+  missionState: MissionDigestState,
+  jobs: Job[],
+): LiveOperationalState {
+  if (missionState === "blocked") return "blocked";
+  const statuses = jobs.map((job) => normalizedStatus(job.status));
+  if (statuses.some((status) => ["ASSIGNED", "RUNNING"].includes(status))) return "active";
+  const queuedJobs = jobs.filter((job) => normalizedStatus(job.status) === "QUEUED");
+  if (queuedJobs.length > 0) {
+    const retrying = queuedJobs.some((job) => {
+      const config = recordObject(job.config);
+      return (recordFirstNumber(config, ["retry_attempt", "attempt", "attempt_number"]) ?? 0) > 0;
+    });
+    return retrying ? "retrying" : "queued";
+  }
+  if (jobs.length > 0 && statuses.every((status) => ["SUCCEEDED", "FAILED", "CANCELLED"].includes(status))) {
+    return "terminal";
+  }
+  return "idle";
+}
 
 function missionControlErrorMessage(error: unknown): string {
   const message = errorMessage(error);
@@ -546,6 +597,10 @@ function missionControlErrorMessage(error: unknown): string {
     return "The backend is in LAN or tunnel mode but is not using the same generated local API token as Mission Control. Restart the backend and Mission Control from the same cloud profile.";
   }
   return message;
+}
+
+function isAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError");
 }
 
 type ProjectCommandPickerProps = {
@@ -723,13 +778,7 @@ function loadedListStatus(count: number, noun: string, emptyMessage: string): Pr
 }
 
 function previousProjectDetailMatches(previous: ProjectDetail, projectId: string) {
-  return (
-    previous.champion?.project_id === projectId ||
-    previous.datasets.some((dataset) => dataset.project_id === projectId) ||
-    previous.jobs.some((job) => job.project_id === projectId) ||
-    previous.plans.some((plan) => plan.project_id === projectId) ||
-    previous.workerRequirements.some((requirement) => requirement.project_id === projectId)
-  );
+  return previous.project_id === projectId;
 }
 
 function championExportsLoadedStatus(exports: ChampionExport[]): ChampionExportsStatus {
@@ -875,6 +924,10 @@ export function App() {
   const [detail, setDetail] = useState<ProjectDetail>(() => emptyProjectDetail());
   const [selectedJobId, setSelectedJobId] = useState<string>("");
   const [metrics, setMetrics] = useState<EpochMetric[]>([]);
+  const [executionAuditRecord, setExecutionAuditRecord] = useState<ExecutionRecord | null>(null);
+  const [executionAuditRecordJobId, setExecutionAuditRecordJobId] = useState("");
+  const [executionAuditLoading, setExecutionAuditLoading] = useState(false);
+  const [executionAuditError, setExecutionAuditError] = useState("");
   const [automationSettings, setAutomationSettings] = useState<AutomationSettings>(defaultAutomationSettings);
   const [settingsDraft, setSettingsDraft] = useState<AutomationSettings>(defaultAutomationSettings);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -904,15 +957,29 @@ export function App() {
   const [championFeedbackSubmitting, setChampionFeedbackSubmitting] = useState(false);
   const [activityEvents, setActivityEvents] = useState<AgentActivityEvent[]>([]);
   const [activityStreamState, setActivityStreamState] = useState<ActivityStreamState>("idle");
+  const [liveDataFeatureFlags, setLiveDataFeatureFlags] = useState<LiveDataFeatureFlags>(
+    defaultLiveDataFeatureFlags,
+  );
+  const [liveDataFeatureFlagsReady, setLiveDataFeatureFlagsReady] = useState(false);
   const localRuntime = useRef<ChampionLocalRuntime | null>(null);
   const demoImagesRef = useRef<ChampionDemoImage[]>([]);
   const demoSlideshowInFlight = useRef(false);
-  const eventRefreshInFlight = useRef(false);
-  const eventRefreshTimer = useRef<number | null>(null);
-  const eventRefreshQueuedSlow = useRef(false);
-  const lastEventRefreshAt = useRef(0);
   const liveRefreshInFlight = useRef(false);
+  const liveRefreshCoordinator = useRef(createLiveRefreshCoordinator());
   const cachedGetRequests = useRef<Map<string, CachedGetRequest>>(new Map());
+  const orchestratorRequestSequence = useRef(0);
+  const selectedProjectIdRef = useRef(selectedProjectId);
+  const selectedJobIdRef = useRef(selectedJobId);
+  const detailRef = useRef(detail);
+  selectedProjectIdRef.current = selectedProjectId;
+  selectedJobIdRef.current = selectedJobId;
+  detailRef.current = detail;
+  const executionAuditRequestId = useRef(0);
+  const lastShadowComparisonKey = useRef("");
+  const incrementalStreamOpenedAtMs = useRef(Date.now());
+  const incrementalStreamCatchUpReason = useRef<ActivityVisibilitySample["catchUpReason"]>("initial_catch_up");
+  const pendingActivityVisibilitySamples = useRef<ActivityVisibilitySample[]>([]);
+  const droppedActivityVisibilitySamples = useRef(0);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -1105,25 +1172,49 @@ export function App() {
     async <T,>(path: string, options: RequestOptions = {}) => {
       const method = (options.method ?? "GET").toUpperCase();
       const runRequest = async () => {
-        const response = await window.missionControl.request<T | OrchestratorHttpErrorResponse>({
-          baseUrl,
-          path,
-          method: options.method,
-          body: options.body,
-        });
-        if (isOrchestratorHttpErrorResponse(response)) {
-          const statusText = response.statusText ? ` ${response.statusText}` : "";
-          const message = response.message || "request failed";
-          const requestPath = response.path ? ` (${response.path})` : "";
-          throw new Error(`${response.status}${statusText} ${message}${requestPath}`);
+        if (options.signal?.aborted) {
+          throw new DOMException("Request aborted.", "AbortError");
         }
-        return response;
+        const requestId = options.signal
+          ? `renderer_${Date.now().toString(36)}_${(++orchestratorRequestSequence.current).toString(36)}`
+          : undefined;
+        const abort = () => {
+          if (requestId) window.missionControl.abortRequest(requestId).catch(() => undefined);
+        };
+        options.signal?.addEventListener("abort", abort, { once: true });
+        try {
+          const response = await window.missionControl.request<T | OrchestratorHttpErrorResponse>({
+            baseUrl,
+            path,
+            method: options.method,
+            body: options.body,
+            diagnosticReason: options.diagnosticReason,
+            requestId,
+          });
+          if (options.signal?.aborted) {
+            throw new DOMException("Request aborted.", "AbortError");
+          }
+          if (isOrchestratorHttpErrorResponse(response)) {
+            throw new OrchestratorHttpError(response);
+          }
+          return response;
+        } finally {
+          options.signal?.removeEventListener("abort", abort);
+        }
       };
 
-      if (method !== "GET") {
+      if (method !== "GET" && method !== "HEAD") {
         const response = await runRequest();
         cachedGetRequests.current.clear();
         return response;
+      }
+
+      if (method === "HEAD") {
+        return runRequest();
+      }
+
+      if (options.signal) {
+        return runRequest();
       }
 
       const cacheTtlMs = options.bypassCache ? 0 : options.cacheTtlMs ?? cachedGetRequestTtlMs(path);
@@ -1169,8 +1260,8 @@ export function App() {
     [baseUrl],
   );
 
-  const refreshProjects = useCallback(async () => {
-    const response = await request<{ projects: Project[] }>("/projects");
+  const refreshProjects = useCallback(async (options: Pick<RequestOptions, "diagnosticReason" | "signal"> = {}) => {
+    const response = await request<{ projects: Project[] }>(liveRequestPath("projectIndex"), options);
     setProjects(response.projects);
     setSelectedProjectId((current) => {
       const projectIds = new Set(response.projects.map((project) => project.id));
@@ -1185,19 +1276,22 @@ export function App() {
     });
   }, [request]);
 
-  const refreshHealth = useCallback(async () => {
-    const response = await request<Health>("/healthz");
+  const refreshHealth = useCallback(async (options: Pick<RequestOptions, "diagnosticReason"> = {}) => {
+    const response = await request<Health>(liveRequestPath("health"), options);
     setHealth(response);
   }, [request]);
 
-  const refreshAutomationSettings = useCallback(async () => {
-    const response = await request<AutomationSettings>("/settings/automation");
+  const refreshAutomationSettings = useCallback(async (options: Pick<RequestOptions, "diagnosticReason"> = {}) => {
+    const response = await request<AutomationSettings>("/settings/automation", options);
     setAutomationSettings(response);
     setSettingsDraft(response);
   }, [request]);
 
   const fetchLatestDatasetVisualAnalysis = useCallback(
-    async (dataset: Dataset | null, options: Pick<RequestOptions, "bypassCache"> = {}): Promise<VisualAnalysisDetail> => {
+    async (
+      dataset: Dataset | null,
+      options: Pick<RequestOptions, "bypassCache" | "diagnosticReason" | "signal"> = {},
+    ): Promise<VisualAnalysisDetail> => {
       if (!dataset) {
         return {
           analysis: null,
@@ -1223,6 +1317,7 @@ export function App() {
           rerunPolicy: visualAnalysisRerunPolicyFromResponse(response),
         };
       } catch (listError) {
+        if (options.signal?.aborted || isAbortError(listError)) throw listError;
         try {
           const response = await request<VisualAnalysisListResponse | DatasetVisualAnalysis>(
             `/datasets/${dataset.id}/visual-analyses/latest`,
@@ -1239,6 +1334,7 @@ export function App() {
             rerunPolicy: visualAnalysisRerunPolicyFromResponse(response),
           };
         } catch (latestError) {
+          if (options.signal?.aborted || isAbortError(latestError)) throw latestError;
           if (profileFallback) {
             return {
               analysis: profileFallback,
@@ -1266,7 +1362,10 @@ export function App() {
   );
 
   const fetchLatestDatasetMetadata = useCallback(
-    async (dataset: Dataset | null, options: Pick<RequestOptions, "bypassCache"> = {}): Promise<DatasetMetadataDetail> => {
+    async (
+      dataset: Dataset | null,
+      options: Pick<RequestOptions, "bypassCache" | "diagnosticReason" | "signal"> = {},
+    ): Promise<DatasetMetadataDetail> => {
       if (!dataset) {
         return {
           summary: null,
@@ -1332,18 +1431,23 @@ export function App() {
     [request],
   );
 
-  const refreshProjectDetail = useCallback(
+  const refreshProjectDetailUncoordinated = useCallback(
     async (projectId: string, options: ProjectDetailRefreshOptions = {}) => {
       if (!projectId) {
         setDetail(emptyProjectDetail());
         return;
       }
       const includeSlowData = options.includeSlowData ?? true;
-      const slowRequestOptions: Pick<RequestOptions, "bypassCache"> = {
+      const liveRequestOptions: Pick<RequestOptions, "diagnosticReason"> = {
+        diagnosticReason: options.diagnosticReason,
+      };
+      const slowRequestOptions: Pick<RequestOptions, "bypassCache" | "diagnosticReason"> = {
         bypassCache: options.forceSlowData ?? false,
+        diagnosticReason: options.diagnosticReason,
       };
       const workerRequirementsRequest = request<{ requirements: WorkerRequirement[] }>(
-        `/projects/${projectId}/worker-requirements`,
+        liveRequestPath("workerRequirements", { projectId }),
+        liveRequestOptions,
       )
         .then((response): WorkerRequirementsFetchResult => {
           const requirements = Array.isArray(response.requirements) ? response.requirements : [];
@@ -1368,13 +1472,19 @@ export function App() {
         workers,
         executionEvents,
       ] = await Promise.all([
-        request<{ datasets: Dataset[] }>(`/projects/${projectId}/datasets`),
-        request<{ jobs: Job[] }>(`/projects/${projectId}/jobs?limit=${projectJobsFetchLimit}`),
-        request<{ plans: ExperimentPlan[] }>(`/projects/${projectId}/plans`),
-        request<{ summaries: TrainingRunSummary[] }>(`/projects/${projectId}/training-run-summaries?limit=${trainingSummariesFetchLimit}`),
-        request<{ champion: ProjectChampion | null }>(`/projects/${projectId}/champion`),
-        request<{ workers: Worker[] }>(`/projects/${projectId}/workers`),
-        request<{ events: ExecutionEvent[] }>(`/projects/${projectId}/execution-events?limit=8`),
+        request<{ datasets: Dataset[] }>(liveRequestPath("datasets", { projectId }), liveRequestOptions),
+        request<{ jobs: Job[] }>(liveRequestPath("jobs", { projectId }), liveRequestOptions),
+        request<{ plans: ExperimentPlan[] }>(liveRequestPath("plans", { projectId }), liveRequestOptions),
+        request<{ summaries: TrainingRunSummary[] }>(
+          liveRequestPath("trainingRunSummaries", { projectId }),
+          liveRequestOptions,
+        ),
+        request<{ champion: ProjectChampion | null }>(liveRequestPath("champion", { projectId }), liveRequestOptions),
+        request<{ workers: Worker[] }>(liveRequestPath("workers", { projectId }), liveRequestOptions),
+        request<{ events: ExecutionEvent[] }>(
+          liveRequestPath("executionEvents", { projectId }),
+          liveRequestOptions,
+        ),
       ]);
       const workerRequirements = await workerRequirementsRequest;
 
@@ -1498,6 +1608,10 @@ export function App() {
       const championDemoImages = championSlowData?.[1];
       const championDemoPredictions = championSlowData?.[2];
       const championFeedback = championSlowData?.[3];
+
+      if (selectedProjectIdRef.current !== projectId) {
+        return;
+      }
 
       setDetail((previous) => {
         const previousProjectMatches = previousProjectDetailMatches(previous, projectId);
@@ -1627,6 +1741,7 @@ export function App() {
           liveRefresh: loadedStatus("Project detail refreshed."),
         };
         return {
+          project_id: projectId,
           decisions: nextDecisions,
           datasets: datasets.datasets,
           visualAnalysis: visualAnalysis ?? previous.visualAnalysis,
@@ -1663,27 +1778,521 @@ export function App() {
     [fetchLatestDatasetMetadata, fetchLatestDatasetVisualAnalysis, request],
   );
 
-  const refreshSelectedJobMetrics = useCallback(async () => {
+  const refreshProjectDetail = useCallback(
+    (projectId: string, options: ProjectDetailRefreshOptions = {}) => {
+      if (!projectId) return refreshProjectDetailUncoordinated(projectId, options);
+      return liveRefreshCoordinator.current.runBroad(
+        projectLiveRefreshScope(projectId),
+        () => refreshProjectDetailUncoordinated(projectId, options),
+      );
+    },
+    [refreshProjectDetailUncoordinated],
+  );
+
+  const refreshSelectedJobMetricsUncoordinated = useCallback(async (options: Pick<RequestOptions, "diagnosticReason" | "signal"> = {}) => {
     if (!selectedJobId) {
       setMetrics([]);
       return;
     }
+    if (
+      selectedProjectIdRef.current !== selectedProjectId ||
+      selectedJobIdRef.current !== selectedJobId
+    ) return;
 
-    const response = await request<{ metrics: EpochMetric[] }>(`/jobs/${selectedJobId}/metrics?limit=${selectedJobMetricsFetchLimit}`);
+    const requestedProjectId = selectedProjectId;
+    const requestedJobId = selectedJobId;
+
+    const response = await request<{ metrics: EpochMetric[] }>(
+      liveRequestPath("jobMetrics", { jobId: requestedJobId }),
+      options,
+    );
+    if (selectedProjectIdRef.current !== requestedProjectId || selectedJobIdRef.current !== requestedJobId) return;
     setMetrics(response.metrics);
-  }, [request, selectedJobId]);
+  }, [request, selectedJobId, selectedProjectId]);
 
-  const refreshAll = useCallback(async () => {
+  const refreshSelectedJobMetrics = useCallback(
+    (options: Pick<RequestOptions, "diagnosticReason" | "signal"> = {}) => {
+      if (!selectedProjectId) return refreshSelectedJobMetricsUncoordinated(options);
+      return liveRefreshCoordinator.current.runBroad(
+        projectLiveRefreshScope(selectedProjectId),
+        () => refreshSelectedJobMetricsUncoordinated(options),
+      );
+    },
+    [refreshSelectedJobMetricsUncoordinated, selectedProjectId],
+  );
+
+  const refreshTargetedJobs = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{ jobs: Job[] }>(liveRequestPath("jobs", { projectId }), {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    const jobs = Array.isArray(response.jobs) ? response.jobs : [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId) ? { ...previous, jobs } : previous);
+    setSelectedJobId((current) => {
+      if (jobs.length === 0) return "";
+      return jobs.some((job) => job.id === current) ? current : jobs[0].id;
+    });
+  }, [request]);
+
+  const refreshTargetedResults = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const options: RequestOptions = {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    };
+    const [summariesResponse, evaluationsResponse] = await Promise.all([
+      request<{ summaries: TrainingRunSummary[] }>(liveRequestPath("trainingRunSummaries", { projectId }), options),
+      request<{ evaluations: TrainingRunEvaluation[] }>(
+        `/projects/${projectId}/training-run-evaluations?limit=${trainingEvaluationsFetchLimit}&compact=1`,
+        options,
+      ),
+    ]);
+    if (selectedProjectIdRef.current !== projectId) return;
+    const summaries = Array.isArray(summariesResponse.summaries) ? summariesResponse.summaries : [];
+    const evaluations = Array.isArray(evaluationsResponse.evaluations) ? evaluationsResponse.evaluations : [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? {
+          ...previous,
+          runSummaries: summaries,
+          runEvaluations: evaluations,
+          loadStatus: {
+            ...previous.loadStatus,
+            runEvaluations: loadedListStatus(evaluations.length, "training evaluation", "No training evaluations have been recorded."),
+          },
+        }
+      : previous);
+  }, [request]);
+
+  const refreshTargetedDecisions = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{ decisions: AgentDecision[] }>(`/projects/${projectId}/agent-decisions`, {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    const decisions = Array.isArray(response.decisions) ? response.decisions : [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? {
+          ...previous,
+          decisions,
+          loadStatus: {
+            ...previous.loadStatus,
+            decisions: loadedListStatus(decisions.length, "agent decision", "No agent decisions have been recorded."),
+          },
+        }
+      : previous);
+  }, [request]);
+
+  const refreshTargetedChampion = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{ champion: ProjectChampion | null }>(liveRequestPath("champion", { projectId }), {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    setDetail((previous) => {
+      if (!previousProjectDetailMatches(previous, projectId)) return previous;
+      const sameChampion = Boolean(
+        response.champion &&
+        previous.champion &&
+        response.champion.project_id === previous.champion.project_id &&
+        response.champion.job_id === previous.champion.job_id,
+      );
+      return {
+        ...previous,
+        champion: response.champion,
+        championDemoImages: sameChampion ? previous.championDemoImages : [],
+        championDemoPredictions: sameChampion ? previous.championDemoPredictions : [],
+        championFeedback: sameChampion ? previous.championFeedback : [],
+      };
+    });
+  }, [request]);
+
+  const refreshTargetedChampionExports = useCallback(async (projectId: string, signal: AbortSignal) => {
+    if (selectedProjectIdRef.current !== projectId || signal.aborted) return;
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? {
+          ...previous,
+          championExports: [],
+          championExportsStatus: championExportsLoadedStatus([]),
+          loadStatus: {
+            ...previous.loadStatus,
+            championExports: championExportsLoadedStatus([]),
+          },
+        }
+      : previous);
+    const response = await request<{ exports: ChampionExport[] }>(`/projects/${projectId}/champion/exports`, {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    const exports = Array.isArray(response.exports) ? response.exports : [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? {
+          ...previous,
+          championExports: exports,
+          championExportsStatus: championExportsLoadedStatus(exports),
+          loadStatus: {
+            ...previous.loadStatus,
+            championExports: championExportsLoadedStatus(exports),
+          },
+        }
+      : previous);
+  }, [request]);
+
+  const refreshTargetedSelectedJobMetrics = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const requestedJobId = selectedJobIdRef.current;
+    if (!requestedJobId) {
+      if (selectedProjectIdRef.current === projectId) setMetrics([]);
+      return;
+    }
+    const response = await request<{ metrics: EpochMetric[] }>(liveRequestPath("jobMetrics", { jobId: requestedJobId }), {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId || selectedJobIdRef.current !== requestedJobId) return;
+    setMetrics(Array.isArray(response.metrics) ? response.metrics : []);
+  }, [request]);
+
+  const refreshTargetedPlans = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{ plans: ExperimentPlan[] }>(liveRequestPath("plans", { projectId }), {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    const plans = Array.isArray(response.plans) ? response.plans : [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId) ? { ...previous, plans } : previous);
+  }, [request]);
+
+  const refreshTargetedWorkers = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{ workers: Worker[] }>(liveRequestPath("workers", { projectId }), {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    const workers = Array.isArray(response.workers) ? response.workers : [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId) ? { ...previous, workers } : previous);
+  }, [request]);
+
+  const refreshTargetedWorkerRequirements = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{ requirements: WorkerRequirement[] }>(liveRequestPath("workerRequirements", { projectId }), {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    const requirements = Array.isArray(response.requirements) ? response.requirements : [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? {
+          ...previous,
+          workerRequirements: requirements,
+          loadStatus: {
+            ...previous.loadStatus,
+            workerRequirements: loadedListStatus(requirements.length, "worker requirement", "No worker requirements have been recorded."),
+          },
+        }
+      : previous);
+  }, [request]);
+
+  const refreshTargetedChampionDemoPredictions = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{
+      predictions?: ChampionDemoPrediction[];
+      history?: ChampionDemoPrediction[];
+      demo_predictions?: ChampionDemoPrediction[];
+    }>(`/projects/${projectId}/champion/demo-predictions?limit=8`, {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (selectedProjectIdRef.current !== projectId) return;
+    const predictions = response.predictions ?? response.history ?? response.demo_predictions ?? [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? {
+          ...previous,
+          championDemoPredictions: predictions,
+          loadStatus: {
+            ...previous.loadStatus,
+            championDemoPredictions: loadedListStatus(predictions.length, "demo prediction", "No demo prediction history has been recorded."),
+          },
+        }
+      : previous);
+  }, [request]);
+
+  const refreshTargetedChampionFeedback = useCallback(async (projectId: string, signal: AbortSignal) => {
+    const response = await request<{ feedback?: ChampionFeedback[]; items?: ChampionFeedback[] }>(
+      `/projects/${projectId}/champion/feedback`,
+      { bypassCache: true, diagnosticReason: "targeted_invalidation", signal },
+    );
+    if (selectedProjectIdRef.current !== projectId) return;
+    const feedback = response.feedback ?? response.items ?? [];
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? {
+          ...previous,
+          championFeedback: feedback,
+          loadStatus: {
+            ...previous.loadStatus,
+            championFeedback: loadedListStatus(feedback.length, "feedback record", "No champion feedback has been recorded."),
+          },
+        }
+      : previous);
+  }, [request]);
+
+  const refreshTargetedDatasetVisualAnalysis = useCallback(async (projectId: string, signal: AbortSignal) => {
+    if (signal.aborted) return;
+    const dataset = detailRef.current.datasets[0] ?? null;
+    const visualAnalysis = await fetchLatestDatasetVisualAnalysis(dataset, {
+      bypassCache: true,
+      diagnosticReason: "targeted_invalidation",
+      signal,
+    });
+    if (signal.aborted || selectedProjectIdRef.current !== projectId) return;
+    setDetail((previous) => previousProjectDetailMatches(previous, projectId)
+      ? { ...previous, visualAnalysis }
+      : previous);
+  }, [fetchLatestDatasetVisualAnalysis]);
+
+  const fetchIncrementalResource = useCallback<IncrementalResourceFetcher>(
+    (projectId, resource, signal) => liveRefreshCoordinator.current.runTargeted(
+      projectLiveRefreshScope(projectId),
+      signal,
+      async (coordinatedSignal) => {
+        switch (resource) {
+          case "project_index":
+            return refreshProjects({ diagnosticReason: "targeted_invalidation", signal: coordinatedSignal });
+          case "jobs":
+            return refreshTargetedJobs(projectId, coordinatedSignal);
+          case "metrics":
+            return refreshTargetedSelectedJobMetrics(projectId, coordinatedSignal);
+          case "training_results":
+            return refreshTargetedResults(projectId, coordinatedSignal);
+          case "decisions":
+            return refreshTargetedDecisions(projectId, coordinatedSignal);
+          case "champion":
+            return refreshTargetedChampion(projectId, coordinatedSignal);
+          case "champion_exports":
+            return refreshTargetedChampionExports(projectId, coordinatedSignal);
+          case "champion_demo_predictions":
+            return refreshTargetedChampionDemoPredictions(projectId, coordinatedSignal);
+          case "champion_feedback":
+            return refreshTargetedChampionFeedback(projectId, coordinatedSignal);
+          case "workers":
+            return refreshTargetedWorkers(projectId, coordinatedSignal);
+          case "worker_requirements":
+            return refreshTargetedWorkerRequirements(projectId, coordinatedSignal);
+          case "plans":
+            return refreshTargetedPlans(projectId, coordinatedSignal);
+          case "dataset_visual_analysis":
+            return refreshTargetedDatasetVisualAnalysis(projectId, coordinatedSignal);
+        }
+      },
+    ),
+    [
+      refreshProjects,
+      refreshTargetedChampion,
+      refreshTargetedChampionDemoPredictions,
+      refreshTargetedChampionExports,
+      refreshTargetedChampionFeedback,
+      refreshTargetedDatasetVisualAnalysis,
+      refreshTargetedDecisions,
+      refreshTargetedJobs,
+      refreshTargetedPlans,
+      refreshTargetedResults,
+      refreshTargetedSelectedJobMetrics,
+      refreshTargetedWorkerRequirements,
+      refreshTargetedWorkers,
+    ],
+  );
+
+  const noteIncrementalStreamOpen = useCallback((connection: {
+    projectId: string;
+    reason: "stream_initial" | "stream_reconnect";
+    openedAtMs: number;
+  }) => {
+    if (selectedProjectIdRef.current !== connection.projectId) return;
+    incrementalStreamOpenedAtMs.current = connection.openedAtMs;
+    incrementalStreamCatchUpReason.current = connection.reason === "stream_reconnect"
+      ? "reconnect_catch_up"
+      : "initial_catch_up";
+  }, []);
+
+  const applyIncrementalActivityEvent = useCallback((event: ExecutionEventV2) => {
+    if (selectedProjectIdRef.current !== event.project_id) return;
+    const activity = {
+      ...fallbackActivityFromExecutionEvent({
+        id: event.event_id,
+        project_id: event.project_id,
+        plan_id: event.plan_id,
+        event_type: event.event_type,
+        message: event.message,
+        payload: { ...event.metadata },
+        created_at: event.created_at,
+      }),
+      // Match the v1 activity identity so a fallback catch-up remains idempotent.
+      id: `activity_execution_${event.event_id}`,
+    };
+    const receivedAtMs = Date.now();
+    const queued = appendActivityVisibilitySample(pendingActivityVisibilitySamples.current, {
+      createdAtMs: Date.parse(event.created_at),
+      receivedAtMs,
+      streamOpenedAtMs: incrementalStreamOpenedAtMs.current,
+      catchUpReason: incrementalStreamCatchUpReason.current,
+    });
+    pendingActivityVisibilitySamples.current = queued.samples;
+    droppedActivityVisibilitySamples.current += queued.dropped;
+    setActivityEvents((current) => mergeActivityEvents(current, activity));
+  }, []);
+
+  const incrementalLive = useIncrementalLiveState({
+    baseUrl,
+    projectId: selectedProjectId,
+    flags: liveDataFeatureFlagsReady ? liveDataFeatureFlags : legacyOnlyLiveDataFeatureFlags,
+    request,
+    fetchResource: fetchIncrementalResource,
+    onAppliedEvent: applyIncrementalActivityEvent,
+    onStreamOpen: noteIncrementalStreamOpen,
+  });
+  const incrementalSnapshot = incrementalLive.session.live.snapshot;
+  const snapshotHasOpenWork = Boolean(
+    incrementalSnapshot &&
+      incrementalSnapshot.jobs.queued +
+        incrementalSnapshot.jobs.retrying +
+        incrementalSnapshot.jobs.assigned +
+        incrementalSnapshot.jobs.running >
+        0,
+  );
+  const pollingHasOpenWork = projectHasOpenWork || snapshotHasOpenWork;
+  const incrementalHealth = useMemo<IncrementalLiveHealth>(() => {
+    const { connection, fallback_reason: fallbackReason, healthy, live, supported } = incrementalLive.session;
+    let streamStatus: IncrementalLiveHealth["stream_status"] = "idle";
+    if (connection === "connected" && healthy) streamStatus = "connected";
+    else if (["connecting", "reconnecting", "recovering"].includes(connection)) streamStatus = "connecting";
+    else if (connection === "disconnected") streamStatus = "disconnected";
+    else if (["fallback", "unsupported"].includes(connection)) streamStatus = "error";
+
+    let cursorStatus: IncrementalLiveHealth["cursor_status"] = "unknown";
+    if (fallbackReason === "cursor_recovery_failed") cursorStatus = "failed";
+    else if (connection === "recovering") cursorStatus = "recovering";
+    else if (live.snapshot_installed && live.cursor_consistent) cursorStatus = "consistent";
+    else if (live.snapshot_installed) cursorStatus = "failed";
+
+    return {
+      endpoint_support: supported === false ? "unsupported" : supported === true ? "supported" : "unknown",
+      snapshot_ready: live.snapshot_installed && Boolean(live.snapshot),
+      stream_status: streamStatus,
+      cursor_status: cursorStatus,
+    };
+  }, [incrementalLive.session]);
+  const livePollingPolicy = useMemo(
+    () => resolveLivePollingPolicy({
+      flags: liveDataFeatureFlagsReady ? liveDataFeatureFlags : legacyOnlyLiveDataFeatureFlags,
+      health: incrementalHealth,
+      has_open_work: pollingHasOpenWork,
+    }),
+    [incrementalHealth, liveDataFeatureFlags, liveDataFeatureFlagsReady, pollingHasOpenWork],
+  );
+  const incrementalProgressPresentation = livePollingPolicy.use_incremental_presentation;
+  const effectiveProjectHasOpenWork = incrementalProgressPresentation
+    ? snapshotHasOpenWork
+    : projectHasOpenWork;
+
+  useEffect(() => {
+    if (!liveDataFeatureFlagsReady || !liveDataFeatureFlags.shadow_mode || !incrementalSnapshot || !selectedProjectId) return;
+    const legacyState = legacyOperationalStateForShadow(missionDigest.state, detail.jobs);
+    const comparisonKey = [
+      selectedProjectId,
+      incrementalSnapshot.snapshot_cursor,
+      incrementalSnapshot.operational_state,
+      legacyState,
+    ].join(":");
+    if (lastShadowComparisonKey.current === comparisonKey) return;
+    lastShadowComparisonKey.current = comparisonKey;
+    window.missionControl.recordIncrementalLiveDiagnostic({
+      reason_code: "shadow_compare",
+      outcome_code: legacyState === incrementalSnapshot.operational_state ? "matched" : "mismatched",
+      count: 1,
+    }).catch(() => undefined);
+  }, [
+    detail.jobs,
+    incrementalSnapshot,
+    liveDataFeatureFlags.shadow_mode,
+    liveDataFeatureFlagsReady,
+    missionDigest.state,
+    selectedProjectId,
+  ]);
+
+  useEffect(() => {
+    if (!incrementalProgressPresentation || !selectedProjectId) return;
+    setDetail((previous) => previousProjectDetailMatches(previous, selectedProjectId)
+      ? {
+          ...previous,
+          loadStatus: {
+            ...previous.loadStatus,
+            liveRefresh: loadedStatus("Incremental live state connected."),
+          },
+        }
+      : previous);
+  }, [incrementalProgressPresentation, selectedProjectId]);
+
+  const loadSelectedExecutionAudit = useCallback(async () => {
+    if (!selectedJobId || executionAuditLoading) return;
+    const references = selectedRunSummary?.execution_references ?? selectedRunEvaluation?.execution_references;
+    const receiptPath = String(references?.execution_record_ref || "").trim();
+    if (!receiptPath) return;
+    setExecutionAuditLoading(true);
+    setExecutionAuditError("");
+    const requestId = ++executionAuditRequestId.current;
+    try {
+      const requestedJobId = selectedJobId;
+      const record = await request<ExecutionRecord>(receiptPath, { bypassCache: true });
+      if (executionAuditRequestId.current !== requestId) return;
+      setExecutionAuditRecord(record);
+      setExecutionAuditRecordJobId(requestedJobId);
+    } catch (error) {
+      if (executionAuditRequestId.current !== requestId) return;
+      setExecutionAuditError(`Execution receipt lookup failed: ${errorMessage(error)}`);
+    } finally {
+      if (executionAuditRequestId.current === requestId) setExecutionAuditLoading(false);
+    }
+  }, [executionAuditLoading, request, selectedJobId, selectedRunEvaluation, selectedRunSummary]);
+
+  useEffect(() => {
+    executionAuditRequestId.current += 1;
+    setExecutionAuditRecord(null);
+    setExecutionAuditRecordJobId("");
+    setExecutionAuditError("");
+    setExecutionAuditLoading(false);
+  }, [selectedJobId]);
+
+  const refreshAllWithReason = useCallback(async (diagnosticReason: MissionControlRequestReason) => {
+    const requestOptions = { diagnosticReason };
+    const requestedProjectId = selectedProjectId;
     setLoading(true);
     setNotice(null);
     try {
-      await refreshHealth();
-      await refreshAutomationSettings();
-      await refreshProjects();
-      if (selectedProjectId) {
-        await refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true });
+      const runRefresh = async () => {
+        await refreshHealth(requestOptions);
+        await refreshAutomationSettings(requestOptions);
+        await refreshProjects(requestOptions);
+        if (requestedProjectId) {
+          await refreshProjectDetailUncoordinated(requestedProjectId, {
+            includeSlowData: true,
+            forceSlowData: true,
+            diagnosticReason,
+          });
+        }
+        await refreshSelectedJobMetricsUncoordinated(requestOptions);
+      };
+      if (requestedProjectId) {
+        await liveRefreshCoordinator.current.runBroad(projectLiveRefreshScope(requestedProjectId), runRefresh);
+      } else {
+        await runRefresh();
       }
-      await refreshSelectedJobMetrics();
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -1692,29 +2301,50 @@ export function App() {
   }, [
     refreshAutomationSettings,
     refreshHealth,
-    refreshProjectDetail,
+    refreshProjectDetailUncoordinated,
     refreshProjects,
-    refreshSelectedJobMetrics,
+    refreshSelectedJobMetricsUncoordinated,
     selectedProjectId,
   ]);
+
+  const refreshAll = useCallback(async () => {
+    await refreshAllWithReason("manual_refresh");
+    if (incrementalLive.session.supported !== false) {
+      await incrementalLive.resync();
+    }
+  }, [incrementalLive.resync, incrementalLive.session.supported, refreshAllWithReason]);
 
   const refreshLive = useCallback(async (options: ProjectDetailRefreshOptions = { includeSlowData: false }) => {
     if (liveRefreshInFlight.current) {
       return;
     }
     const includeSlowData = options.includeSlowData ?? false;
+    const diagnosticReason = options.diagnosticReason ?? "unspecified";
+    const requestOptions = { diagnosticReason };
+    const requestedProjectId = selectedProjectId;
     liveRefreshInFlight.current = true;
     try {
-      await refreshHealth();
-      await refreshProjects();
-      if (selectedProjectId) {
-        await refreshProjectDetail(selectedProjectId, { includeSlowData, forceSlowData: includeSlowData });
+      const runRefresh = async () => {
+        await refreshHealth(requestOptions);
+        await refreshProjects(requestOptions);
+        if (requestedProjectId) {
+          await refreshProjectDetailUncoordinated(requestedProjectId, {
+            includeSlowData,
+            forceSlowData: includeSlowData,
+            diagnosticReason,
+          });
+        }
+        await refreshSelectedJobMetricsUncoordinated(requestOptions);
+      };
+      if (requestedProjectId) {
+        await liveRefreshCoordinator.current.runBroad(projectLiveRefreshScope(requestedProjectId), runRefresh);
+      } else {
+        await runRefresh();
       }
-      await refreshSelectedJobMetrics();
     } catch (error) {
       setHealth(null);
       setDetail((previous) => {
-        if (!selectedProjectId || !previousProjectDetailMatches(previous, selectedProjectId)) {
+        if (!requestedProjectId || !previousProjectDetailMatches(previous, requestedProjectId)) {
           return previous;
         }
         const hasPriorProjectData =
@@ -1737,7 +2367,13 @@ export function App() {
     } finally {
       liveRefreshInFlight.current = false;
     }
-  }, [refreshHealth, refreshProjectDetail, refreshProjects, refreshSelectedJobMetrics, selectedProjectId]);
+  }, [
+    refreshHealth,
+    refreshProjectDetailUncoordinated,
+    refreshProjects,
+    refreshSelectedJobMetricsUncoordinated,
+    selectedProjectId,
+  ]);
 
   const ensureCloudPreflight = useCallback(async (stage: CloudPreflightStage) => {
     const result = await window.missionControl.preflightCloud({ stage, baseUrl, live: true });
@@ -1759,15 +2395,59 @@ export function App() {
   });
 
   useEffect(() => {
+    let cancelled = false;
+    const loadFeatureFlags = async () => {
+      if (typeof window.missionControl.getFeatureFlags !== "function") {
+        if (!cancelled) {
+          setLiveDataFeatureFlags(legacyOnlyLiveDataFeatureFlags);
+          setLiveDataFeatureFlagsReady(true);
+        }
+        return;
+      }
+      try {
+        const flags = await window.missionControl.getFeatureFlags();
+        if (cancelled) return;
+        setLiveDataFeatureFlags({
+          incremental_v2_enabled: flags.incremental_v2_enabled === true,
+          shadow_mode: flags.incremental_v2_shadow === true,
+          rollback_to_legacy: flags.incremental_v2_rollback === true,
+        });
+      } catch {
+        if (!cancelled) setLiveDataFeatureFlags(legacyOnlyLiveDataFeatureFlags);
+      } finally {
+        if (!cancelled) setLiveDataFeatureFlagsReady(true);
+      }
+    };
+    void loadFeatureFlags();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     localStorage.setItem("orchestratorUrl", baseUrl);
   }, [baseUrl]);
 
   useEffect(() => {
-    refreshAll();
+    const requestOptions = { diagnosticReason: "initial_load" as const };
+    setLoading(true);
+    Promise.all([
+      refreshHealth(requestOptions),
+      refreshAutomationSettings(requestOptions),
+      refreshProjects(requestOptions),
+    ])
+      .catch((error) => setNotice({ kind: "error", text: errorMessage(error) }))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
+    selectedJobIdRef.current = "";
+    setSelectedJobId("");
+    setMetrics([]);
     if (selectedProjectId) {
+      setDetail((previous) => previous.project_id === selectedProjectId
+        ? previous
+        : emptyProjectDetail(selectedProjectId));
       setDemoPrediction(null);
       setDemoPredictionError("");
       setSelectedDemoImageIndex(0);
@@ -1782,13 +2462,23 @@ export function App() {
       setLocalInferenceError("");
       setActivityEvents([]);
       setActivityStreamState("connecting");
+      pendingActivityVisibilitySamples.current = [];
+      droppedActivityVisibilitySamples.current = 0;
       localRuntime.current = null;
       window.missionControl.disposeChampionDemoLocalRuntime({ reason: "project_changed" }).catch(() => undefined);
       resetWorkerSupervisor();
       setJobPage(0);
-      refreshProjectDetail(selectedProjectId, { includeSlowData: true, forceSlowData: true }).catch((error) =>
+      refreshProjectDetail(selectedProjectId, {
+        includeSlowData: true,
+        forceSlowData: true,
+        diagnosticReason: "project_change",
+      }).catch((error) =>
         setNotice({ kind: "error", text: error instanceof Error ? error.message : String(error) }),
       );
+    } else {
+      setDetail(emptyProjectDetail());
+      setActivityEvents([]);
+      setActivityStreamState("idle");
     }
   }, [refreshProjectDetail, resetWorkerSupervisor, selectedProjectId]);
 
@@ -1890,82 +2580,64 @@ export function App() {
   }, [refreshSelectedJobMetrics]);
 
   useEffect(() => {
-    const interval = projectHasOpenWork ? activeLiveRefreshIntervalMs : idleLiveRefreshIntervalMs;
+    if (!livePollingPolicy.run_legacy_polling) return;
+    const interval = livePollingPolicy.broad_refresh_interval_ms ?? idleLiveRefreshIntervalMs;
+    const diagnosticReason: MissionControlRequestReason = livePollingPolicy.mode === "rollback"
+      ? "rollback_poll"
+      : livePollingPolicy.mode === "fallback"
+        ? "fallback_poll"
+        : pollingHasOpenWork
+          ? "active_poll"
+          : "idle_poll";
     const timer = window.setInterval(() => {
-      refreshLive();
+      refreshLive({
+        includeSlowData: false,
+        diagnosticReason,
+      });
     }, interval);
 
     return () => window.clearInterval(timer);
-  }, [projectHasOpenWork, refreshLive]);
+  }, [
+    livePollingPolicy.broad_refresh_interval_ms,
+    livePollingPolicy.mode,
+    livePollingPolicy.run_legacy_polling,
+    pollingHasOpenWork,
+    refreshLive,
+  ]);
 
   useEffect(() => {
     if (!selectedProjectId) {
       setActivityStreamState("idle");
       return;
     }
-    if (typeof EventSource === "undefined") {
-      setActivityStreamState("fallback");
-      return;
+    switch (incrementalLive.session.connection) {
+      case "connected":
+        setActivityStreamState("connected");
+        break;
+      case "reconnecting":
+      case "recovering":
+        setActivityStreamState("reconnecting");
+        break;
+      case "connecting":
+        setActivityStreamState("connecting");
+        break;
+      default:
+        setActivityStreamState("fallback");
+        break;
     }
+  }, [incrementalLive.session.connection, selectedProjectId]);
 
-    let closed = false;
-    setActivityStreamState("connecting");
-    const streamUrl = new URL(`/projects/${selectedProjectId}/activity-stream`, baseUrl);
-    streamUrl.searchParams.set("limit", "12");
-    streamUrl.searchParams.set("interval_ms", projectHasOpenWork ? "5000" : "10000");
-    const events = new EventSource(streamUrl.toString());
-    const triggerRefresh = (event: MessageEvent | Event) => {
-      if (closed) return;
-      const includeSlowData = eventNeedsSlowProjectRefresh(event);
-      eventRefreshQueuedSlow.current = eventRefreshQueuedSlow.current || includeSlowData;
-      if (eventRefreshInFlight.current || eventRefreshTimer.current !== null) return;
-      const elapsed = Date.now() - lastEventRefreshAt.current;
-      const delay = Math.max(eventRefreshDebounceMs, eventRefreshMinIntervalMs - elapsed);
-      eventRefreshTimer.current = window.setTimeout(() => {
-        eventRefreshTimer.current = null;
-        eventRefreshInFlight.current = true;
-        lastEventRefreshAt.current = Date.now();
-        const shouldIncludeSlowData = eventRefreshQueuedSlow.current;
-        eventRefreshQueuedSlow.current = false;
-        refreshLive({ includeSlowData: shouldIncludeSlowData })
-          .catch(() => undefined)
-          .finally(() => {
-            eventRefreshInFlight.current = false;
-          });
-      }, delay);
-    };
-
-    const handleActivityEvent = (event: MessageEvent) => {
-      const activity = activityEventFromMessage(event);
-      if (activity) {
-        setActivityEvents((current) => mergeActivityEvents(current, activity));
-      }
-      triggerRefresh(event);
-    };
-
-    events.onopen = () => {
-      if (!closed) setActivityStreamState("connected");
-    };
-    events.onmessage = (event) => {
-      handleActivityEvent(event);
-    };
-    events.addEventListener("activity_event", handleActivityEvent);
-    events.addEventListener("stream_error", () => {
-      if (!closed) setActivityStreamState("fallback");
-    });
-    events.onerror = () => {
-      if (!closed) setActivityStreamState("reconnecting");
-    };
-
-    return () => {
-      closed = true;
-      if (eventRefreshTimer.current !== null) {
-        window.clearTimeout(eventRefreshTimer.current);
-        eventRefreshTimer.current = null;
-      }
-      events.close();
-    };
-  }, [baseUrl, projectHasOpenWork, refreshLive, selectedProjectId]);
+  useEffect(() => {
+    if (pendingActivityVisibilitySamples.current.length === 0) return;
+    const samples = pendingActivityVisibilitySamples.current;
+    const dropped = droppedActivityVisibilitySamples.current;
+    pendingActivityVisibilitySamples.current = [];
+    droppedActivityVisibilitySamples.current = 0;
+    const summaries = summarizeActivityVisibility(samples, Date.now(), dropped);
+    for (const summary of summaries) {
+      window.missionControl.recordActivityVisibility(summary).catch(() => undefined);
+    }
+  }, [activityEvents]);
 
   useEffect(() => {
     if (!workerSupervisorEnabled) return;
@@ -2749,7 +3421,7 @@ export function App() {
       setNotice({ kind: "error", text: "Select a project before resuming work." });
       return;
     }
-    if (!projectHasOpenWork) {
+    if (!effectiveProjectHasOpenWork) {
       setNotice({ kind: "info", text: "No queued or running work to resume for this project." });
       return;
     }
@@ -2821,12 +3493,32 @@ export function App() {
         : 3;
   const commandStepTotal = 4;
   const commandPhaseLabel = ["Baseline", "Experiment Runs", "Evaluation", "Champion Selection"][commandStageIndex];
-  const engineOnline = health?.status === "ok" && !detailLiveRefreshUnhealthy;
-  const runProgressLabel = missionBrief.trialProgress.total > 0
-    ? `${missionBrief.trialProgress.completed}/${missionBrief.trialProgress.total} complete`
-    : missionBrief.progressLabel;
-  const runningLabel = missionBrief.trialProgress.running > 0 ? "Running" : missionDigest.stateLabel;
-  const queuedJobs = detail.jobs.filter((job) => ["QUEUED", "PENDING", "REQUESTED", "ASSIGNED"].includes(normalizedStatus(job.status))).length;
+  const incrementalProgressView = buildLiveProgressViewModel({
+    snapshot: incrementalProgressPresentation ? incrementalSnapshot : null,
+    connectionState: incrementalLive.session.connection,
+    mode: "primary",
+  });
+  const operationalRefreshUnhealthy = incrementalProgressPresentation ? false : detailLiveRefreshUnhealthy;
+  const engineOnline = health?.status === "ok" && !operationalRefreshUnhealthy;
+  const runProgressLabel = incrementalProgressPresentation
+    ? incrementalProgressView.epochLabel || incrementalProgressView.stageLabel
+    : missionBrief.trialProgress.total > 0
+      ? `${missionBrief.trialProgress.completed}/${missionBrief.trialProgress.total} complete`
+      : missionBrief.progressLabel;
+  const runningLabel = incrementalProgressPresentation
+    ? incrementalProgressView.stateLabel
+    : missionBrief.trialProgress.running > 0
+      ? "Running"
+      : missionDigest.stateLabel;
+  const runStatusActive = incrementalProgressPresentation
+    ? ["queued", "active", "retrying"].includes(incrementalProgressView.state)
+    : missionBrief.trialProgress.running > 0;
+  const queuedJobs = incrementalProgressPresentation && incrementalSnapshot
+    ? incrementalSnapshot.jobs.queued + incrementalSnapshot.jobs.retrying + incrementalSnapshot.jobs.assigned
+    : detail.jobs.filter((job) => ["QUEUED", "PENDING", "REQUESTED", "ASSIGNED"].includes(normalizedStatus(job.status))).length;
+  const activeWorkers = incrementalProgressPresentation && incrementalSnapshot
+    ? incrementalSnapshot.workers.running
+    : detail.workers.length;
   const profiledDatasetCount = detail.datasets.filter((dataset) => normalizedStatus(dataset.status) === "PROFILED").length;
   const datasetHeroFacts = [
     { label: "Datasets", value: String(detail.datasets.length) },
@@ -2912,10 +3604,10 @@ export function App() {
           <div className="section-title">System Status</div>
           <div className="system-status-rows">
             <span><Server size={14} />Engine<strong>{engineOnline ? "Online" : "Offline"}</strong></span>
-            <span><MonitorDot size={14} />Workers<strong>{detail.workers.length} Active</strong></span>
+            <span><MonitorDot size={14} />Workers<strong>{activeWorkers} Active</strong></span>
             <span><ListRestart size={14} />Queue<strong>{queuedJobs} Pending</strong></span>
             <span><Database size={14} />Storage<strong>{detail.datasets.length === 0 && detail.loadStatus.liveRefresh.status === "error" ? "Check" : "Healthy"}</strong></span>
-            <span><Activity size={14} />API<strong>{detailLiveRefreshUnhealthy ? "Stale" : "Healthy"}</strong></span>
+            <span><Activity size={14} />API<strong>{operationalRefreshUnhealthy ? "Stale" : "Healthy"}</strong></span>
           </div>
           <button className="command compact diagnostics-wide" type="button" onClick={() => setActiveProjectTab("inDepth")}>
             <SquareTerminal size={15} />
@@ -2960,7 +3652,7 @@ export function App() {
           </div>
           <div className="command-card status-command-card run-status-command-card">
             <span>Run Status</span>
-            <strong className={missionBrief.trialProgress.running > 0 ? "online" : ""}>{runningLabel}</strong>
+            <strong className={runStatusActive ? "online" : ""}>{runningLabel}</strong>
             <small>{runProgressLabel}</small>
           </div>
           <div className="command-actions">
@@ -2973,8 +3665,8 @@ export function App() {
             <button
               className="command primary new-mission-command resume-work-command"
               onClick={resumeProjectWork}
-              disabled={loading || !selectedProjectId || !projectHasOpenWork}
-              title={!selectedProjectId ? "Select a project first" : !projectHasOpenWork ? "No queued or running work to resume" : "Resume workers for open project work"}
+              disabled={loading || !selectedProjectId || !effectiveProjectHasOpenWork}
+              title={!selectedProjectId ? "Select a project first" : !effectiveProjectHasOpenWork ? "No queued or running work to resume" : "Resume workers for open project work"}
               type="button"
             >
               <Play size={17} />
@@ -2983,7 +3675,14 @@ export function App() {
           </div>
         </header>
         {notice && <NoticeBanner notice={notice} />}
-        <DetailLoadStatusNotice status={detail.loadStatus.liveRefresh} />
+        {!incrementalProgressPresentation && <DetailLoadStatusNotice status={detail.loadStatus.liveRefresh} />}
+        {incrementalProgressPresentation && selectedProjectId && (
+          <LiveProgressPanel
+            snapshot={incrementalSnapshot}
+            connectionState={incrementalLive.session.connection}
+            mode="primary"
+          />
+        )}
 
         <nav className="section-tabs" aria-label="Project workflow tabs" role="tablist">
           {projectWorkflowTabs.map((tab, index) => (
@@ -3271,6 +3970,14 @@ export function App() {
                 </button>
               </div>
             </div>
+          </Panel>
+          <Panel title="Experiment Policy" icon={<SlidersHorizontal size={17} />} wide id="experiment-policy" tab="settings">
+            <ExperimentPolicyPanel
+              request={request}
+              projectId={selectedProjectId}
+              datasets={detail.datasets}
+              jobs={detail.jobs}
+            />
           </Panel>
         </section>
         <section className="developer-route-stack datasets-route" id="datasets" data-project-tab="datasets">
@@ -4035,7 +4742,7 @@ export function App() {
                         <span key={chip}>{chip}</span>
                       ))}
                       {selectedRunEvaluation && (
-                        <span>{formatLatency(recordNumber(selectedRunEvaluation.model_profile, "estimated_latency_ms"))}</span>
+                        <span>{formatLatency(recordNumber(recordObject(selectedRunEvaluation.model_profile), "estimated_latency_ms"))}</span>
                       )}
                     </div>
                   )}
@@ -4048,6 +4755,17 @@ export function App() {
                   />
                 ) : (
                   <div className="empty chart-empty">No graphable metrics reported</div>
+                )}
+                {(selectedJob.template === "train_experiment" || selectedRunSummary || selectedRunEvaluation) && (
+                  <RunExecutionAudit
+                    summary={selectedRunSummary}
+                    evaluation={selectedRunEvaluation}
+                    job={selectedJob}
+                    record={executionAuditRecordJobId === selectedJobId ? executionAuditRecord : null}
+                    loading={executionAuditLoading}
+                    error={executionAuditError}
+                    onLoadReceipt={loadSelectedExecutionAudit}
+                  />
                 )}
                 {selectedRunEvaluation && <RunEvaluationDetails evaluation={selectedRunEvaluation} />}
               </div>

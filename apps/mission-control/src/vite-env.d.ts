@@ -5,11 +5,61 @@ interface OrchestratorRequest {
   method?: string;
   path: string;
   body?: unknown;
+  diagnosticReason?: import("./api/missionControlClient").MissionControlRequestReason;
+  requestId?: string;
 }
 
 interface Window {
   missionControl: {
     request<T>(request: OrchestratorRequest): Promise<T>;
+    abortRequest(requestId: string): Promise<{ aborted: boolean }>;
+    getFeatureFlags(): Promise<{
+      incremental_v2_enabled: boolean;
+      incremental_v2_shadow: boolean;
+      incremental_v2_rollback: boolean;
+    }>;
+    openEventStream(options: {
+      streamId: string;
+      baseUrl: string;
+      path: string;
+      diagnosticReason: "stream_initial" | "stream_reconnect";
+    }): Promise<{ started: boolean; stream_id: string }>;
+    closeEventStream(streamId: string): Promise<{ closed: boolean }>;
+    onEventStreamMessage(callback: (message: {
+      stream_id: string;
+      kind: "open" | "event" | "error" | "disconnect";
+      status?: number;
+      reason_code?: string;
+      event_type?: string;
+      last_event_id?: string;
+      data?: string;
+    }) => void): () => void;
+    recordActivityVisibility(summary: import("./api/activityDiagnostics").ActivityVisibilitySummary): Promise<{
+      recorded: boolean;
+    }>;
+    recordIncrementalLiveDiagnostic(summary: {
+      reason_code:
+        | "cursor_recovery"
+        | "fallback"
+        | "malformed_event"
+        | "out_of_order"
+        | "rollback"
+        | "shadow_compare"
+        | "snapshot"
+        | "stream_disconnect"
+        | "targeted_invalidation";
+      outcome_code:
+        | "applied"
+        | "connected"
+        | "failed"
+        | "matched"
+        | "mismatched"
+        | "recovered"
+        | "scheduled"
+        | "unsupported";
+      count?: number;
+      duration_ms?: number;
+    }): Promise<{ recorded: boolean }>;
     selectDatasetFolder(): Promise<{
       token: string;
       path: string;

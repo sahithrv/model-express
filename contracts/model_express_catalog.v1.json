@@ -1,0 +1,167 @@
+{
+  "schema_version": "model_express_catalog.v1",
+  "catalog_version": "1.0.0",
+  "categories": {
+    "tasks": [
+      {"id": "image_classification", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "object_detection", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "runners": [
+      {"id": "local_simulator", "aliases": [], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["local_simulator"], "attributes": {"simulated": true}, "implies": [], "equivalent_to": []},
+      {"id": "modal_torchvision", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {"model_kind": "torchvision_classifier", "simulated": false}, "implies": [], "equivalent_to": []},
+      {"id": "modal_ultralytics", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["modal_ultralytics"], "attributes": {"model_kind": "ultralytics_yolo_detector", "simulated": false}, "implies": [], "equivalent_to": []}
+    ],
+    "models": [
+      {"id": "mobilenet_v3_small", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "mobilenet", "model_kind": "torchvision_classifier", "deployment_tier": "fast_live", "default_image_size": 224, "min_recommended_images": 50, "supports_transfer": true, "training_enabled": true, "latency_tier": "very_fast", "recommended_use": "fast live baseline and compact champion refinement", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/mobilenet", "deployment_tiers/fast_live", "latency_tiers/very_fast"], "equivalent_to": []},
+      {"id": "mobilenet_v3_large", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "mobilenet", "model_kind": "torchvision_classifier", "deployment_tier": "fast_live", "default_image_size": 224, "min_recommended_images": 80, "supports_transfer": true, "training_enabled": true, "latency_tier": "fast", "recommended_use": "higher-capacity MobileNet challenger for live use", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/mobilenet", "deployment_tiers/fast_live", "latency_tiers/fast"], "equivalent_to": []},
+      {"id": "efficientnet_b0", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "efficientnet", "model_kind": "torchvision_classifier", "deployment_tier": "fast_live", "default_image_size": 224, "min_recommended_images": 80, "supports_transfer": true, "training_enabled": true, "latency_tier": "fast", "recommended_use": "strong quality/latency baseline", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/efficientnet", "deployment_tiers/fast_live", "latency_tiers/fast"], "equivalent_to": []},
+      {"id": "regnet_y_400mf", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "regnet", "model_kind": "torchvision_classifier", "deployment_tier": "fast_live", "default_image_size": 224, "min_recommended_images": 100, "supports_transfer": true, "training_enabled": true, "latency_tier": "fast", "recommended_use": "compact architecture challenger", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/regnet", "deployment_tiers/fast_live", "latency_tiers/fast"], "equivalent_to": []},
+      {"id": "efficientnet_b1", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "efficientnet", "model_kind": "torchvision_classifier", "deployment_tier": "balanced", "default_image_size": 240, "min_recommended_images": 150, "supports_transfer": true, "training_enabled": true, "latency_tier": "medium", "recommended_use": "balanced quality challenger", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/efficientnet", "deployment_tiers/balanced", "latency_tiers/medium"], "equivalent_to": []},
+      {"id": "efficientnet_b2", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "efficientnet", "model_kind": "torchvision_classifier", "deployment_tier": "balanced", "default_image_size": 260, "min_recommended_images": 250, "supports_transfer": true, "training_enabled": true, "latency_tier": "medium", "recommended_use": "stronger quality challenger when budget allows", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/efficientnet", "deployment_tiers/balanced", "latency_tiers/medium"], "equivalent_to": []},
+      {"id": "resnet18", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "resnet", "model_kind": "torchvision_classifier", "deployment_tier": "balanced", "default_image_size": 224, "min_recommended_images": 100, "supports_transfer": true, "training_enabled": true, "latency_tier": "medium", "recommended_use": "stable control architecture", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/resnet", "deployment_tiers/balanced", "latency_tiers/medium"], "equivalent_to": []},
+      {"id": "resnet34", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "resnet", "model_kind": "torchvision_classifier", "deployment_tier": "balanced", "default_image_size": 224, "min_recommended_images": 150, "supports_transfer": true, "training_enabled": true, "latency_tier": "medium_slow", "recommended_use": "larger ResNet comparison", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/resnet", "deployment_tiers/balanced", "latency_tiers/medium_slow"], "equivalent_to": []},
+      {"id": "convnext_tiny", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "convnext", "model_kind": "torchvision_classifier", "deployment_tier": "quality_challenger", "default_image_size": 224, "min_recommended_images": 300, "supports_transfer": true, "training_enabled": true, "latency_tier": "slow", "recommended_use": "quality-first challenger", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/convnext", "deployment_tiers/quality_challenger", "latency_tiers/slow"], "equivalent_to": []},
+      {"id": "swin_t", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "swin", "model_kind": "torchvision_classifier", "deployment_tier": "quality_challenger", "default_image_size": 224, "min_recommended_images": 500, "supports_transfer": true, "training_enabled": true, "latency_tier": "slow", "recommended_use": "transformer challenger for larger datasets", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/swin", "deployment_tiers/quality_challenger", "latency_tiers/slow"], "equivalent_to": []},
+      {"id": "vit_b_16", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"family": "vit", "model_kind": "torchvision_classifier", "deployment_tier": "quality_challenger", "default_image_size": 224, "min_recommended_images": 800, "supports_transfer": true, "training_enabled": true, "latency_tier": "slowest", "recommended_use": "explicit quality-first experiments on larger datasets", "fine_tuning_modes": ["head_only", "last_block", "full"]}, "implies": ["model_families/vit", "deployment_tiers/quality_challenger", "latency_tiers/slowest"], "equivalent_to": []},
+      {"id": "yolo11n.pt", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {"family": "yolo11", "model_kind": "ultralytics_yolo_detector", "pretrained_weights": "yolo11n.pt", "deployment_tier": "realtime_detector", "default_image_size": 640, "min_recommended_images": 100, "supports_transfer": true, "training_enabled": true, "latency_tier": "very_fast", "recommended_use": "nano COCO-pretrained detector for the first live-stream baseline; schedule only for YOLO object-detection datasets.", "fine_tuning_modes": []}, "implies": ["model_families/yolo11", "deployment_tiers/realtime_detector", "latency_tiers/very_fast"], "equivalent_to": []},
+      {"id": "yolo11s.pt", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {"family": "yolo11", "model_kind": "ultralytics_yolo_detector", "pretrained_weights": "yolo11s.pt", "deployment_tier": "realtime_detector", "default_image_size": 640, "min_recommended_images": 100, "supports_transfer": true, "training_enabled": true, "latency_tier": "fast", "recommended_use": "small COCO-pretrained detector with stronger accuracy while staying live-friendly; schedule only for YOLO object-detection datasets.", "fine_tuning_modes": []}, "implies": ["model_families/yolo11", "deployment_tiers/realtime_detector", "latency_tiers/fast"], "equivalent_to": []},
+      {"id": "yolo11m.pt", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {"family": "yolo11", "model_kind": "ultralytics_yolo_detector", "pretrained_weights": "yolo11m.pt", "deployment_tier": "quality_detector", "default_image_size": 640, "min_recommended_images": 100, "supports_transfer": true, "training_enabled": true, "latency_tier": "medium", "recommended_use": "medium COCO-pretrained detector for quality challengers when latency budget allows; schedule only for YOLO object-detection datasets.", "fine_tuning_modes": []}, "implies": ["model_families/yolo11", "deployment_tiers/quality_detector", "latency_tiers/medium"], "equivalent_to": []},
+      {"id": "yolo11l.pt", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {"family": "yolo11", "model_kind": "ultralytics_yolo_detector", "pretrained_weights": "yolo11l.pt", "deployment_tier": "quality_detector", "default_image_size": 640, "min_recommended_images": 100, "supports_transfer": true, "training_enabled": true, "latency_tier": "slow", "recommended_use": "large COCO-pretrained detector for high-accuracy offline comparison; schedule only for YOLO object-detection datasets.", "fine_tuning_modes": []}, "implies": ["model_families/yolo11", "deployment_tiers/quality_detector", "latency_tiers/slow"], "equivalent_to": []},
+      {"id": "yolo11x.pt", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {"family": "yolo11", "model_kind": "ultralytics_yolo_detector", "pretrained_weights": "yolo11x.pt", "deployment_tier": "quality_detector", "default_image_size": 640, "min_recommended_images": 100, "supports_transfer": true, "training_enabled": true, "latency_tier": "slowest", "recommended_use": "extra-large COCO-pretrained detector for upper-bound detection quality studies; schedule only for YOLO object-detection datasets.", "fine_tuning_modes": []}, "implies": ["model_families/yolo11", "deployment_tiers/quality_detector", "latency_tiers/slowest"], "equivalent_to": []}
+    ],
+    "model_families": [
+      {"id": "mobilenet", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "efficientnet", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "regnet", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "resnet", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "convnext", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "swin", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "vit", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "yolo11", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "deployment_tiers": [
+      {"id": "fast_live", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "balanced", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "quality_challenger", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "realtime_detector", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "quality_detector", "aliases": [], "available": true, "tasks": ["object_detection"], "runners": ["local_simulator", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "latency_tiers": [
+      {"id": "very_fast", "aliases": [], "available": true, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "fast", "aliases": [], "available": true, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "medium", "aliases": [], "available": true, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "medium_slow", "aliases": [], "available": true, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "slow", "aliases": [], "available": true, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "slowest", "aliases": [], "available": true, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "model_size_tiers": [
+      {"id": "compact", "aliases": [], "available": false, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "standard", "aliases": [], "available": false, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "large", "aliases": [], "available": false, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "fine_tuning_modes": [
+      {"id": "head_only", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "last_block", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "full", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "resize_strategies": [
+      {"id": "squash", "aliases": [], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "preserve_aspect_pad", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "center_crop", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "random_resized_crop", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "bbox_crop_if_available", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "yolo_letterbox", "aliases": ["letterbox"], "available": true, "tasks": ["object_detection"], "runners": ["modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "crop_strategies": [
+      {"id": "none", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "center_crop", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "random_resized_crop", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "bbox_crop_if_available", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "bbox_crop_ablation", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "bounding_box_modes": [
+      {"id": "ignore", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "crop_if_available", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "crop_and_compare_full_image", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "use_boxes_as_metadata", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "normalization_strategies": [
+      {"id": "imagenet", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "dataset", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "none", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "augmentation_operations": [
+      {"id": "horizontal_flip", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "vertical_flip", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "color_jitter", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "random_crop", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "random_rotation", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "random_erasing", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "augmentation_policies": [
+      {"id": "none", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"structured": true}, "implies": [], "equivalent_to": []},
+      {"id": "light", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"structured": false}, "implies": ["augmentation_operations/horizontal_flip"], "equivalent_to": []},
+      {"id": "moderate", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"structured": false}, "implies": ["augmentation_operations/horizontal_flip", "augmentation_operations/color_jitter", "augmentation_operations/random_crop"], "equivalent_to": []},
+      {"id": "strong", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"structured": false}, "implies": ["augmentation_operations/horizontal_flip", "augmentation_operations/color_jitter", "augmentation_operations/random_crop", "augmentation_operations/random_rotation", "augmentation_operations/random_erasing"], "equivalent_to": []},
+      {"id": "custom", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"structured": false}, "implies": [], "equivalent_to": []},
+      {"id": "basic", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {"structured": true}, "implies": ["augmentation_operations/horizontal_flip"], "equivalent_to": []},
+      {"id": "randaugment", "aliases": ["rand_augment"], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {"structured": true}, "implies": [], "equivalent_to": []},
+      {"id": "trivialaugment", "aliases": ["trivial_augment", "trivial_augment_wide", "trivialaugmentwide"], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {"structured": true}, "implies": [], "equivalent_to": []},
+      {"id": "autoaugment", "aliases": ["auto_augment"], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {"structured": true}, "implies": [], "equivalent_to": []},
+      {"id": "mixup", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {"structured": true}, "implies": [], "equivalent_to": []},
+      {"id": "cutmix", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {"structured": true}, "implies": [], "equivalent_to": []}
+    ],
+    "optimizers": [
+      {"id": "adamw", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "adam", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "sgd", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "schedulers": [
+      {"id": "none", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "cosine", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "step", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "resolution_strategies": [
+      {"id": "fixed", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "low_latency", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "compare_224_256", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "high_resolution_ablation", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "class_balancing_strategies": [
+      {"id": "none", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "weighted_loss", "aliases": ["class_weighted_loss"], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "effective_number_loss", "aliases": ["class_balanced_effective_number", "effective_number", "effective_number_class_balanced_loss"], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "class_balanced_sampler", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "weighted_random_sampler", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "focal_loss", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "sampling_strategies": [
+      {"id": "none", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "class_balanced_sampler", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "weighted_random_sampler", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["local_simulator", "modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "export_formats": [
+      {"id": "onnx", "aliases": [], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["modal_torchvision", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "torchscript", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "pytorch", "aliases": [], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["modal_torchvision", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "safetensors", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "precisions": [
+      {"id": "fp32", "aliases": [], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["modal_torchvision", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "fp16", "aliases": [], "available": false, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "int8", "aliases": [], "available": false, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "runtimes": [
+      {"id": "onnxruntime", "aliases": ["onnx_runtime"], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["modal_torchvision", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "torchscript", "aliases": [], "available": true, "tasks": ["image_classification"], "runners": ["modal_torchvision"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "pytorch", "aliases": [], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["modal_torchvision", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "execution_providers": [
+      {"id": "cpu_execution_provider", "aliases": ["CPUExecutionProvider"], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["modal_torchvision", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []}
+    ],
+    "execution_requirements": [
+      {"id": "cpu_compatible", "aliases": [], "available": true, "tasks": ["image_classification", "object_detection"], "runners": ["modal_torchvision", "modal_ultralytics"], "attributes": {}, "implies": [], "equivalent_to": []},
+      {"id": "cuda_required", "aliases": [], "available": false, "tasks": [], "runners": [], "attributes": {}, "implies": [], "equivalent_to": []}
+    ]
+  }
+}

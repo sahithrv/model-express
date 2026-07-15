@@ -11,13 +11,15 @@ const (
 )
 
 type AgentDecision struct {
-	ID           string         `json:"id"`
-	ProjectID    string         `json:"project_id"`
-	PlanID       string         `json:"plan_id,omitempty"`
-	DecisionType string         `json:"decision_type"`
-	Rationale    string         `json:"rationale"`
-	Payload      map[string]any `json:"payload"`
-	CreatedAt    time.Time      `json:"created_at"`
+	ID                         string         `json:"id"`
+	ProjectID                  string         `json:"project_id"`
+	PlanID                     string         `json:"plan_id,omitempty"`
+	DecisionType               string         `json:"decision_type"`
+	Rationale                  string         `json:"rationale"`
+	Payload                    map[string]any `json:"payload"`
+	ProposalPolicyEvaluationID string         `json:"proposal_policy_evaluation_id,omitempty"`
+	EffectivePolicyHash        string         `json:"effective_policy_hash,omitempty"`
+	CreatedAt                  time.Time      `json:"created_at"`
 }
 
 type AgentDecisionRecommendation struct {

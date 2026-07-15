@@ -360,6 +360,24 @@ The orchestrator exposes a broad but conventional API. At a high level:
 
 The API is intentionally not just a training API. It is a control-plane API for an auditable agentic workflow.
 
+### Cursor-safe execution-event stream
+
+The cursor-safe execution-event v2 stream is exposed at `GET /projects/:id/events/stream/v2` by default. `HEAD` on that path validates project and cursor compatibility without opening a stream and returns `204` when the client can connect. `MODEL_EXPRESS_ACTIVITY_STREAM_V2_ENABLED=false` remains the compatibility-window rollback and disables both routes without removing or repairing cursor data. The old unversioned raw stream is removed. The synthesized activity endpoint remains temporarily for the previous Mission Control release and returns explicit deprecation headers.
+
+V2 uses the durable decimal event sequence as the SSE `id`. An initial connection may pass `cursor`; a reconnect uses `Last-Event-ID`, which takes precedence. Missing cursors bootstrap from zero. Invalid, negative, or overflowing cursors return `400 invalid_cursor`; cursors ahead of the committed high-water mark return `409 cursor_ahead`; and positive cursors below `retained_sequence_floor` return `410 cursor_too_old`. Ahead and too-old responses require a state resync instead of silently resetting the cursor.
+
+Catch-up reads are ascending and bounded per page, idle connections receive keepalive comments, and request cancellation stops further reads. Stream data is a bounded allowlist/redaction envelope: stored payload JSON is never serialized directly, and messages and metadata are sanitized at read time. The v2 envelope includes a fixed-width SHA-256 digest of the stored idempotency key so clients can deduplicate safely; the raw stored key remains internal and is still excluded from legacy execution-event JSON.
+
+This v2 endpoint is the authoritative transition stream for job lifecycle, agent-validation, and agent-decision changes produced after Activity PR 4. Those producers use typed allowlisted payloads and deterministic idempotency keys; job lifecycle rows are committed atomically with the job and current attempt snapshot. Historical pre-PR-4 rows can still lack producer coverage, and Mission Control retains the v1 compatibility fallback during the rollout window.
+
+### Compact live state
+
+`GET /projects/:id/live-state` returns one bounded operational snapshot: aggregate job, worker, and worker-requirement counts; up to eight current attempt progress rows; server-derived heartbeat staleness; the next stable taxonomy stage; one safely projected important event; and the global event cursor that follows the snapshot. Each active progress row includes `elapsed_started_at`, derived from the job's backend-owned `started_at` timestamp with `created_at` as the queued-state fallback. It excludes plans, evaluations, histories, prompts, raw configuration, job errors, and storage locations. Progress metadata is reduced to the worker callback allowlist, which preserves bounded provider and simulator identity without exposing arbitrary stored metadata.
+
+Memory reads hold the store mutex across the cursor and all snapshot fields. PostgreSQL reads the cursor first in a read-only repeatable-read transaction and then performs a fixed five additional queries. Therefore a racing transition is either visible in the snapshot or commits with a sequence greater than `snapshot_cursor` and is returned by the v2 stream after that cursor; it cannot fall between the two. The response carries an ETag derived from the full deterministic snapshot rather than from the cursor alone, because snapshot-only heartbeats can change progress and stale status without appending an event.
+
+Mission Control gates the incremental client with `MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ENABLED`, `MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_SHADOW`, and `MODEL_EXPRESS_MISSION_CONTROL_LIVE_V2_ROLLBACK` during the documented compatibility window. Shadow mode consumes and compares v2 state without changing visible data. Primary mode disables broad polling only after the live-state snapshot is installed and the authenticated v2 stream is connected, supported, cursor-consistent, and healthy; typed events then refresh only their allowlisted resources. The current UI never opens the synthesized activity SSE. Compact snapshot progress changes also target metrics, preserving old-worker metric updates that predate per-boundary event reporting, and transient targeted failures receive one bounded follow-up. Unsupported endpoints, disconnects, bounded cursor-recovery exhaustion, or rollback restore conservative ten/thirty-second polling and build activity from bounded project reads. Manual refresh and on-demand detail loading remain available in every mode. Rollout thresholds, diagnostics, and endpoint sunset rules are defined in [Activity V2 Rollout And Retirement Policy](operations/activity-v2-rollout.md).
+
 ## Reliability State
 
 Implemented current-scale hardening includes:
@@ -367,6 +385,7 @@ Implemented current-scale hardening includes:
 - Postgres-backed job assignment with row locks.
 - Worker lease fields with owner, attempt, expiry, and heartbeat metadata.
 - Expired non-terminal job recovery paths.
+- Attempt-scoped `job_progress` snapshots whose active attempt is owned by queue/assignment/retry/recovery transitions; terminal snapshots cannot regress.
 - Idempotent epoch metrics by job and epoch.
 - Durable worker requirements for Mission Control-supervised worker startup.
 - Durable execution events and SSE refresh hints.

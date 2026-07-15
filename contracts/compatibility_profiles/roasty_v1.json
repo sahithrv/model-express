@@ -1,0 +1,37 @@
+{
+  "profile_key": "roasty_v1",
+  "semantic_version": "1.0.0",
+  "document": {
+    "schema_version": "model_express_compatibility_profile.v1",
+    "catalog_version": "1.0.0",
+    "metadata": {
+      "display_name": "Roasty v1",
+      "description": "Immutable FP32 image-classification profile for CPU ONNX Runtime deployment."
+    },
+    "rules": [
+      {"id": "allow_augmentation_operations", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "augmentation_operations", "ids": ["horizontal_flip", "vertical_flip", "color_jitter", "random_crop", "random_rotation", "random_erasing"]}},
+      {"id": "allow_augmentation_policies", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "augmentation_policies", "ids": ["none", "light", "moderate", "strong", "custom", "basic", "randaugment", "trivialaugment", "autoaugment", "mixup", "cutmix"]}},
+      {"id": "allow_bounding_box_modes", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "bounding_box_modes", "ids": ["ignore", "crop_if_available", "crop_and_compare_full_image", "use_boxes_as_metadata"]}},
+      {"id": "allow_class_balancing", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "class_balancing_strategies", "ids": ["none", "weighted_loss", "effective_number_loss", "class_balanced_sampler", "weighted_random_sampler", "focal_loss"]}},
+      {"id": "allow_crop_strategies", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "crop_strategies", "ids": ["none", "center_crop", "random_resized_crop", "bbox_crop_if_available", "bbox_crop_ablation"]}},
+      {"id": "allow_deployment_tiers", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "deployment_tiers", "ids": ["fast_live", "balanced", "quality_challenger"]}},
+      {"id": "allow_execution_providers", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "execution_providers", "ids": ["cpu_execution_provider"]}},
+      {"id": "allow_execution_requirements", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "execution_requirements", "ids": ["cpu_compatible"]}},
+      {"id": "allow_export_formats", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "export_formats", "ids": ["onnx"]}},
+      {"id": "allow_fine_tuning_modes", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "fine_tuning_modes", "ids": ["head_only", "last_block", "full"]}},
+      {"id": "allow_latency_tiers", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "latency_tiers", "ids": ["very_fast", "fast", "medium", "medium_slow", "slow", "slowest"]}},
+      {"id": "allow_model_families", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "model_families", "ids": ["mobilenet", "efficientnet", "regnet", "resnet", "convnext", "swin", "vit"]}},
+      {"id": "allow_models", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "models", "ids": ["mobilenet_v3_small", "mobilenet_v3_large", "efficientnet_b0", "regnet_y_400mf", "efficientnet_b1", "efficientnet_b2", "resnet18", "resnet34", "convnext_tiny", "swin_t", "vit_b_16"]}},
+      {"id": "allow_normalization", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "normalization_strategies", "ids": ["imagenet", "dataset", "none"]}},
+      {"id": "allow_optimizers", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "optimizers", "ids": ["adamw", "adam", "sgd"]}},
+      {"id": "allow_precisions", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "precisions", "ids": ["fp32"]}},
+      {"id": "allow_resize_strategies", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "resize_strategies", "ids": ["squash", "preserve_aspect_pad", "center_crop", "random_resized_crop", "bbox_crop_if_available"]}},
+      {"id": "allow_resolution_strategies", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "resolution_strategies", "ids": ["fixed", "low_latency", "compare_224_256", "high_resolution_ablation"]}},
+      {"id": "allow_runners", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "runners", "ids": ["modal_torchvision"]}},
+      {"id": "allow_runtimes", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "runtimes", "ids": ["onnxruntime"]}},
+      {"id": "allow_sampling", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "sampling_strategies", "ids": ["none", "class_balanced_sampler", "weighted_random_sampler"]}},
+      {"id": "allow_schedulers", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "schedulers", "ids": ["none", "cosine", "step"]}},
+      {"id": "allow_tasks", "effect": "allow", "selector": {"kind": "catalog_ids", "catalog": "tasks", "ids": ["image_classification"]}}
+    ]
+  }
+}

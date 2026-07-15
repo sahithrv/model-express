@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,5 +132,40 @@ func TestConfigFromEnvDefaultsToLongerLLMTimeout(t *testing.T) {
 
 	if config.Timeout != DefaultTimeoutSeconds*time.Second {
 		t.Fatalf("expected default timeout %ds, got %s", DefaultTimeoutSeconds, config.Timeout)
+	}
+}
+
+func TestEffectiveAPIStyleMatchesClientTransport(t *testing.T) {
+	tests := []struct {
+		name       string
+		provider   string
+		configured string
+		want       string
+	}{
+		{name: "native OpenAI responses", provider: ProviderOpenAI, configured: APIStyleResponses, want: APIStyleResponses},
+		{name: "native OpenAI chat", provider: ProviderOpenAI, configured: APIStyleChatCompletions, want: APIStyleChatCompletions},
+		{name: "compatible responses fallback", provider: ProviderOpenAICompatible, configured: APIStyleResponses, want: APIStyleChatCompletions},
+		{name: "local responses fallback", provider: ProviderLocal, configured: APIStyleResponses, want: APIStyleChatCompletions},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := EffectiveAPIStyle(test.provider, test.configured); got != test.want {
+				t.Fatalf("effective API style = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEndpointFingerprintIsStableAndDoesNotExposeURL(t *testing.T) {
+	left := EndpointFingerprint(" https://example.test/v1/ ")
+	right := EndpointFingerprint("https://example.test/v1")
+	if left == "" || left != right {
+		t.Fatalf("equivalent endpoint fingerprints differ: %q and %q", left, right)
+	}
+	if strings.Contains(left, "example.test") {
+		t.Fatalf("endpoint fingerprint exposed its URL: %q", left)
+	}
+	if left == EndpointFingerprint("https://other.test/v1") {
+		t.Fatal("different endpoints produced the same fingerprint")
 	}
 }

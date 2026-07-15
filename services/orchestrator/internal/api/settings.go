@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
@@ -151,6 +152,10 @@ func (s *Server) defaultExecuteExperimentPlanRequest() executeExperimentPlanRequ
 		GPUType:           automationSettings.DefaultGPUType,
 		MaxConcurrentJobs: effectiveExecutionMaxConcurrentJobs(provider, 0),
 	}
+}
+
+func executionValidationMode() string {
+	return execution.NormalizeValidationMode(os.Getenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE"))
 }
 
 func (s *Server) defaultVisualAnalysisProvider() string {

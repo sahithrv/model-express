@@ -1,0 +1,39 @@
+{
+  "name": "duplicate_noop_wait",
+  "description": "When all candidates duplicate accepted work, wait rather than relabel a no-op as progress.",
+  "coverage": ["duplicates", "no_ops", "wait", "accepted_spec_identity"],
+  "input_summary": {
+    "project_name": "Duplicate No-op Wait",
+    "task_type": "image_classification",
+    "completed_training_runs": 9,
+    "planner_rounds": 3,
+    "first_successful_score": 0.65,
+    "current_best_score": 0.72,
+    "current_best_model": "efficientnet_b0",
+    "attempted_models": ["efficientnet_b0", "mobilenet_v3_small"],
+    "dominant_mechanism": "regularization"
+  },
+  "response": {
+    "summary": "Wait because the available candidates are semantic repeats.",
+    "decision_type": "WAIT",
+    "rationale": "Changing prose and unsupported knobs does not change the accepted executable spec.",
+    "confidence": 0.92,
+    "evidence_used": ["candidate accepted-spec hash matches a completed job", "minor-only changes repeat the tested mechanism"],
+    "candidate_hypotheses": [],
+    "proposed_experiments": []
+  },
+  "rubric": {
+    "id": "duplicate_noop_wait_v1",
+    "expected_decision_types": ["WAIT"],
+    "minimum_evidence_items": 2,
+    "required_evidence_terms": ["accepted-spec", "repeat"],
+    "task_type": "image_classification",
+    "require_no_experiments": true
+  },
+  "mutations": [{
+    "name": "schedule-known-noop",
+    "operation": "set_decision_type",
+    "value": "ADD_EXPERIMENTS",
+    "expected_failed_checks": ["decision", "safety"]
+  }]
+}

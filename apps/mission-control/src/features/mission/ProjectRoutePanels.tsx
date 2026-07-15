@@ -46,7 +46,7 @@ import { championLocalInferenceSafety, readyONNXExport, type ChampionLocalRuntim
 import { activityFilters } from "../activity/activityFilters";
 import { exportWaitingSteps } from "../exportDemo/exportWaitingSteps";
 import { resultsEmptySteps } from "../results/resultsEmptySteps";
-import type { ActivityStreamState } from "../../hooks/useActivityStream";
+import type { ActivityStreamState } from "../activity/activityStreamState";
 import type { DatasetMetadataDetail, ProjectDetail, ProjectDetailLoadStatus, VisualAnalysisDetail } from "../../hooks/useProjectDetail";
 import {
   formatBytes,
@@ -84,6 +84,7 @@ import type {
   DatasetMetadataSummary,
   DatasetVisualAnalysis,
   EpochMetric,
+  ExecutionRecord,
   ExecutionEvent,
   ExperimentPlan,
   Health,
@@ -191,6 +192,7 @@ import {
   summarizeTrainingRuns,
   trainingRunCacheSummary,
   trainingRunLifecycleChips,
+  executionAuditView,
   lifecycleSecondsChip,
   workerRequirementMaterializationSummary,
   shortCacheKey,
@@ -203,7 +205,6 @@ import {
   buildActivityFeed,
   buildResultsSummary,
   buildMissionRunRows,
-  heroMetricFacts,
   buildExportSummary,
   userFacingActivityText,
   userFacingActionLabel,
@@ -239,7 +240,6 @@ import {
   missionStateLabel,
   missionHealthLabel,
   missionToneRank,
-  activityEventFromMessage,
   mergeActivityEvents,
   buildFallbackActivityEvents,
   fallbackActivityFromExecutionEvent,
@@ -476,6 +476,28 @@ import {
   perClassMetricRows,
   formatModelSize,
 } from "./projectDetailModel";
+
+export function heroMetricFacts(row: MissionRunRow | null, results: ResultsSummary) {
+  const primaryValue = row?.primaryMetricDisplay && row.primaryMetricDisplay !== "-"
+    ? row.primaryMetricDisplay
+    : results.primaryMetricValue || "-";
+  const primaryLabel = String(row?.primaryMetricLabel || results.primaryMetricLabel || "").toLowerCase();
+  const detection = primaryLabel.includes("map");
+  if (detection) {
+    return [
+      { label: "mAP50", value: row?.map50Display && row.map50Display !== "-" ? row.map50Display : "-" },
+      { label: "mAP50-95", value: primaryValue },
+      { label: "Precision", value: row?.precisionDisplay || "-" },
+      { label: "Recall", value: row?.recallDisplay || "-" },
+    ];
+  }
+  return [
+    { label: "Accuracy", value: row?.accuracyDisplay && row.accuracyDisplay !== "-" ? row.accuracyDisplay : "-" },
+    { label: "Macro F1", value: row?.macroF1Display && row.macroF1Display !== "-" ? row.macroF1Display : primaryValue },
+    { label: "Precision", value: row?.precisionDisplay || "-" },
+    { label: "Recall", value: row?.recallDisplay || "-" },
+  ];
+}
 
 const missionPlanetAssetUrl = new URL("../../../moon1.png", import.meta.url).href;
 const routePlanetAssetUrls = {
@@ -2717,6 +2739,9 @@ export function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                               {[
                                 candidate.mechanism ? `mechanism ${candidate.mechanism}` : "",
                                 candidate.intervention,
+                                ...candidate.selectionAdjustments.map(
+                                  (adjustment) => adjustment.detail || `${adjustment.label} affected selection`,
+                                ),
                                 ...candidate.reasons.slice(0, 2),
                               ]
                                 .filter(Boolean)
@@ -2730,7 +2755,20 @@ export function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                             candidate.mechanism ? { label: "Mechanism", value: candidate.mechanism } : null,
                             candidate.expectedEffect ? { label: "Expected Effect", value: candidate.expectedEffect } : null,
                             candidate.validationStatus ? { label: "Validation", value: candidate.validationStatus } : null,
-                            candidate.totalScore !== null ? { label: "Total", value: candidate.totalScore.toFixed(3) } : null,
+                            candidate.baseScore !== null ? { label: "Base Score", value: candidate.baseScore.toFixed(3) } : null,
+                            candidate.selectionScore !== null
+                              ? { label: "Selection Score", value: candidate.selectionScore.toFixed(3) }
+                              : null,
+                            candidate.selectionOrder !== null
+                              ? { label: "Selection Order", value: `#${candidate.selectionOrder + 1}` }
+                              : null,
+                            ...candidate.selectionAdjustments.map((adjustment) => ({
+                              label: adjustment.label,
+                              value:
+                                adjustment.value === null
+                                  ? adjustment.detail || "applied"
+                                  : `${adjustment.value >= 0 ? "+" : ""}${adjustment.value.toFixed(3)}`,
+                            })),
                           ]
                             .filter((item): item is { label: string; value: string } => item !== null)
                             .map((item) => (
@@ -2766,6 +2804,46 @@ export function AgentDecisionChat({ turns }: { turns: DecisionChatTurn[] }) {
                       </div>
                     ))}
                   </div>
+                  {turn.candidateSelectionTrace.length > 0 && (
+                    <details className="candidate-selection-trace">
+                      <summary>Expert selection trace</summary>
+                      <div className="candidate-score-list">
+                        {turn.candidateSelectionTrace.map((round) => (
+                          <div className="candidate-score-row" key={`${turn.decision.id}-selection-round-${round.selectionOrder}`}>
+                            <div className="candidate-score-head">
+                              <span>
+                                <strong>{`Round ${round.selectionOrder + 1}: ${round.selectedLabel}`}</strong>
+                                <small>
+                                  {`${round.totalCandidateCount} eligible candidate${round.totalCandidateCount === 1 ? "" : "s"}`}
+                                  {round.truncated ? `; showing the selected candidate and top ${round.candidates.length - 1} competitors` : ""}
+                                </small>
+                              </span>
+                              <Badge value="SELECTED" />
+                            </div>
+                            <div className="score-component-list">
+                              {round.candidates.map((candidate) => (
+                                <span key={`${turn.decision.id}-${round.selectionOrder}-${candidate.candidateIndex}`}>
+                                  <small>{candidate.selected ? `${candidate.label} (selected)` : candidate.label}</small>
+                                  <strong>
+                                    {candidate.adjustedScore !== null ? candidate.adjustedScore.toFixed(3) : "-"}
+                                    {candidate.selectionAdjustments.length > 0
+                                      ? ` (${candidate.selectionAdjustments
+                                          .map((adjustment) =>
+                                            adjustment.value === null
+                                              ? adjustment.label
+                                              : `${adjustment.label} ${adjustment.value >= 0 ? "+" : ""}${adjustment.value.toFixed(3)}`,
+                                          )
+                                          .join(", ")})`
+                                      : ""}
+                                  </strong>
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
             </div>
@@ -4389,9 +4467,10 @@ export function PredictionRow({ prediction, index }: { prediction: ChampionDemoP
 }
 
 export function RunEvaluationDetails({ evaluation }: { evaluation: TrainingRunEvaluation }) {
-  const diagnostics = recordObject(evaluation.holistic_scores.training_diagnostics);
-  const perClassRows = perClassMetricRows(evaluation.per_class_metrics);
-  const matrix = normalizedConfusionMatrix(evaluation.confusion_matrix);
+  const holisticScores = recordObject(evaluation.holistic_scores);
+  const diagnostics = recordObject(holisticScores.training_diagnostics);
+  const perClassRows = perClassMetricRows(recordObject(evaluation.per_class_metrics));
+  const matrix = normalizedConfusionMatrix(evaluation.confusion_matrix ?? []);
 
   return (
     <div className="evaluation-details">
@@ -4400,11 +4479,11 @@ export function RunEvaluationDetails({ evaluation }: { evaluation: TrainingRunEv
         <div className="evaluation-facts">
           <span>
             <small>Status</small>
-            <Badge value={recordString(diagnostics, "status") || recordString(evaluation.holistic_scores, "divergence_status") || "stable"} />
+            <Badge value={recordString(diagnostics, "status") || recordString(holisticScores, "divergence_status") || "stable"} />
           </span>
           <span>
             <small>Loss gap</small>
-            <b>{formatLossGap(numberPayload(diagnostics.train_validation_gap) ?? numberPayload(evaluation.holistic_scores.train_validation_gap))}</b>
+            <b>{formatLossGap(numberPayload(diagnostics.train_validation_gap) ?? numberPayload(holisticScores.train_validation_gap))}</b>
           </span>
           <span>
             <small>Severity</small>
@@ -4450,6 +4529,108 @@ export function RunEvaluationDetails({ evaluation }: { evaluation: TrainingRunEv
         </div>
       )}
     </div>
+  );
+}
+
+export function RunExecutionAudit({
+  summary,
+  evaluation,
+  job,
+  record,
+  loading,
+  error,
+  onLoadReceipt,
+}: {
+  summary: TrainingRunSummary | null;
+  evaluation: TrainingRunEvaluation | null;
+  job: Job | null;
+  record: ExecutionRecord | null;
+  loading: boolean;
+  error: string;
+  onLoadReceipt: () => void;
+}) {
+  const audit = executionAuditView(summary, evaluation, job, record);
+  const canLoadReceipt = Boolean(audit.executionRecordRef && !record);
+  const changedRows = audit.diff.filter((row) => row.change !== "same");
+
+  return (
+    <section className={`execution-fidelity-audit execution-fidelity-${audit.tone}`}>
+      <div className="execution-fidelity-summary">
+        <span>
+          <small>Execution fidelity</small>
+          <Badge value={audit.status} />
+        </span>
+        <span>
+          <small>Capability</small>
+          <strong className="mono">{audit.capabilityVersion || "legacy"}</strong>
+        </span>
+        <span>
+          <small>Accepted</small>
+          <strong className="mono" title={audit.acceptedSpecHash}>{audit.acceptedSpecHash ? shortValue(audit.acceptedSpecHash).slice(0, 18) : "-"}</strong>
+        </span>
+        <span>
+          <small>Realized</small>
+          <strong className="mono" title={audit.realizedEffectiveHash}>{audit.realizedEffectiveHash ? shortValue(audit.realizedEffectiveHash).slice(0, 18) : "-"}</strong>
+        </span>
+        <span>
+          <small>Adjustment</small>
+          <strong>{audit.adjustmentSummary}</strong>
+        </span>
+      </div>
+      <p className="execution-fidelity-message">{audit.message}</p>
+
+      <details
+        className="execution-expert-audit"
+        onToggle={(event) => {
+          if (event.currentTarget.open && canLoadReceipt && !loading) onLoadReceipt();
+        }}
+      >
+        <summary>Expert execution audit</summary>
+        {loading && <div className="empty compact">Loading the bounded execution receipt…</div>}
+        {error && <div className="warning-list"><span>{error}</span></div>}
+        {!audit.executionRecordRef && (
+          <div className="execution-audit-note">No versioned receipt exists for this legacy run. It remains visible but unverified.</div>
+        )}
+        {canLoadReceipt && !loading && !error && (
+          <button className="command compact" type="button" onClick={onLoadReceipt}>Load execution receipt</button>
+        )}
+        {record && (
+          <>
+            <div className="execution-receipt-link">
+              <small>Bounded receipt</small>
+              <code>{audit.executionRecordRef}</code>
+            </div>
+            <div className="execution-semantic-diff">
+              <div className="execution-diff-head">
+                <strong>Requested versus realized semantics</strong>
+                <small>{changedRows.length} changed · {audit.diff.length} fields</small>
+              </div>
+              {audit.diff.length > 0 ? (
+                <div className="execution-diff-table">
+                  <div className="execution-diff-row execution-diff-column-head">
+                    <span>Field</span><span>Requested</span><span>Realized</span><span>Result</span>
+                  </div>
+                  {audit.diff.slice(0, 80).map((row) => (
+                    <div className={`execution-diff-row execution-diff-${row.change}`} key={row.path}>
+                      <code>{row.path}</code>
+                      <span>{row.change === "realized_only" ? "—" : formatUnknownValue(row.requested)}</span>
+                      <span>{row.change === "requested_only" ? "—" : formatUnknownValue(row.realized)}</span>
+                      <Badge value={row.change} />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="execution-audit-note">The receipt contains no comparable requested/realized semantic fields.</div>
+              )}
+            </div>
+            <details className="execution-full-receipt">
+              <summary>Full bounded receipt</summary>
+              <pre>{JSON.stringify(record, null, 2)}</pre>
+            </details>
+          </>
+        )}
+      </details>
+    </section>
   );
 }
 

@@ -8,13 +8,77 @@ import (
 	"testing"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
+	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 	"model-express/services/orchestrator/internal/runs"
 )
+
+func TestExperimentPlannerTraceCapturesActualRequestRuntimeIdentityInputs(t *testing.T) {
+	// This test isolates request/identity tracing; strict behavior has dedicated
+	// validation tests and must not change the response fixture under test here.
+	t.Setenv("MODEL_EXPRESS_PLANNER_VALIDATION_MODE", plannervalidation.ModeRelaxed)
+	t.Setenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION", plannerStaticPromptVersionCompactV1)
+	t.Setenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION", "v2")
+	t.Setenv("MODEL_EXPRESS_MULTI_FIDELITY_POLICY", "true")
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	response, err := json.Marshal(recommendation)
+	if err != nil {
+		t.Fatalf("marshal recommendation: %v", err)
+	}
+	config := llm.Config{
+		ReasoningEffort:        llm.ReasoningEffortMedium,
+		PlateauReasoningEffort: llm.ReasoningEffortHigh,
+		MaxToolRounds:          4,
+	}
+	agent := NewExperimentPlannerAgentWithRuntime(fakeJSONGenerator{response: string(response)}, "planner-test-model", config, PlannerInformationToolOptions{})
+	input := testExperimentPlannerInput()
+	input.NoImprovementRounds = 1
+
+	trace, err := agent.PlanWithTrace(context.Background(), input)
+	if err != nil {
+		t.Fatalf("PlanWithTrace() error = %v", err)
+	}
+	if trace.Request.Temperature != 0.35 {
+		t.Fatalf("request temperature = %v, want 0.35", trace.Request.Temperature)
+	}
+	if trace.Request.ReasoningEffort != llm.ReasoningEffortHigh {
+		t.Fatalf("request reasoning effort = %q, want plateau effort %q", trace.Request.ReasoningEffort, llm.ReasoningEffortHigh)
+	}
+	if trace.StaticPromptVersion != plannerStaticPromptVersionCompactV1 {
+		t.Fatalf("static prompt version = %q", trace.StaticPromptVersion)
+	}
+	if trace.ContextBuilderVersion != "planner_context_builder_v2" {
+		t.Fatalf("context builder version = %q", trace.ContextBuilderVersion)
+	}
+	if !trace.RankerMultiFidelity {
+		t.Fatal("expected traced ranker setting to match the setting used by the finalizer")
+	}
+}
+
+func TestPlannerRolloutRequestVariantChangesOnlyAssignedDimension(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION", plannerStaticPromptVersionV1)
+	t.Setenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION", "v2")
+	policy := calibration.DefaultPlannerRolloutPolicy()
+	policy.Enabled = true
+	policy.State = calibration.RolloutStateActive
+	policy.StagePercent = 100
+	policy.Dimensions = []string{calibration.RolloutDimensionPrompt}
+	policy.VariantValues = map[string]string{calibration.RolloutDimensionPrompt: plannerStaticPromptVersionCompactV1}
+	assignment, err := calibration.AssignPlannerRollout(policy, "project-prompt-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	variant := plannerRequestVariantForInput(ExperimentPlannerInput{RolloutAssignment: &assignment})
+	if variant.StaticPromptVersion != plannerStaticPromptVersionCompactV1 || variant.ContextVersion != "v2" {
+		t.Fatalf("prompt-only rollout changed an unintended dimension: %#v", variant)
+	}
+}
 
 func TestExperimentPlannerAgentValidatesAddExperiments(t *testing.T) {
 	agent := NewExperimentPlannerAgent(fakeJSONGenerator{
@@ -185,7 +249,7 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"augmentation_policy values",
 		"class_balancing values",
 		"sampling_strategy values",
-		"focal_loss",
+		"catalog-backed loss values",
 		"Return only valid JSON",
 		"planner_context_snapshot",
 		"retrieved_memory, when present",
@@ -209,7 +273,7 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"create workers",
 		"create jobs",
 		"bypass backend validation",
-		"20-30 classifier epochs",
+		"Longer classifier schedules",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("expected prompt to contain %q", expected)
@@ -237,7 +301,7 @@ func TestExperimentPlannerStaticPromptCompactV1IsShorterAndKeepsContractGuidance
 		"Backend validation remains the gate",
 		"draft-only for ADD_EXPERIMENTS",
 		"Return only valid JSON",
-		"20-30 classifier epochs",
+		"Longer classifier schedules",
 	} {
 		if !strings.Contains(compactPrompt, expected) {
 			t.Fatalf("expected compact static prompt to retain %q, got %q", expected, compactPrompt)
@@ -782,6 +846,43 @@ func TestExperimentPlannerAgentAllowsMinorOnlyTweaksInRelaxedMode(t *testing.T) 
 
 	if err := validateExperimentPlanningRecommendation(recommendation, 5); err != nil {
 		t.Fatalf("expected relaxed planner validation to allow minor-only tweak: %v", err)
+	}
+}
+
+func TestShadowStrictReturnsRelaxedRecommendationWithTypedStrictVerdict(t *testing.T) {
+	input := testExperimentPlannerInput()
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	recommendation.EvidenceUsed = nil
+
+	relaxed, relaxedVerdict, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeRelaxed)
+	if err != nil || relaxedVerdict.Status != plannervalidation.VerdictNotEvaluated {
+		t.Fatalf("relaxed result = %#v verdict=%#v err=%v", relaxed, relaxedVerdict, err)
+	}
+	shadow, shadowVerdict, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeShadowStrict)
+	if err != nil {
+		t.Fatalf("shadow strict blocked the relaxed decision: %v", err)
+	}
+	if !shadowVerdict.WouldBlock || shadowVerdict.Status != plannervalidation.VerdictWouldBlock {
+		t.Fatalf("shadow strict verdict = %#v", shadowVerdict)
+	}
+	foundMissingEvidence := false
+	for _, finding := range shadowVerdict.Findings {
+		if finding.Code == "missing_evidence" && finding.Category == plannervalidation.CategoryMissingEvidence {
+			foundMissingEvidence = true
+		}
+	}
+	if !foundMissingEvidence {
+		t.Fatalf("shadow verdict did not type missing evidence: %#v", shadowVerdict)
+	}
+	relaxedJSON, _ := json.Marshal(relaxed)
+	shadowJSON, _ := json.Marshal(shadow)
+	if string(relaxedJSON) != string(shadowJSON) {
+		t.Fatalf("shadow changed relaxed result:\nrelaxed=%s\nshadow=%s", relaxedJSON, shadowJSON)
+	}
+
+	_, strictVerdict, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeStrict)
+	if err == nil || !strictVerdict.WouldBlock || strictVerdict.Findings[0] != shadowVerdict.Findings[0] {
+		t.Fatalf("strict did not reuse shadow implementation: verdict=%#v err=%v", strictVerdict, err)
 	}
 }
 

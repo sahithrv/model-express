@@ -209,7 +209,8 @@ func ExecuteExperimentPlannerInformationTool(input ExperimentPlannerInput, name 
 		})
 	case PlannerToolModelCatalog:
 		return acceptedPlannerTool(normalized, map[string]any{
-			"model_catalog": compactPlannerModelCatalog(input.ModelCatalog),
+			"model_catalog":         compactPlannerModelCatalog(input.ModelCatalog),
+			"effective_policy_card": plannerEffectivePolicyCard(input),
 		})
 	case PlannerToolRecentPlannerFailures:
 		return acceptedPlannerTool(normalized, map[string]any{
@@ -297,8 +298,12 @@ func plannerValidateCandidateExperimentsTool(input ExperimentPlannerInput, toolN
 		WouldWriteRows:          false,
 		WouldScheduleJobs:       false,
 		Details: map[string]any{
-			"dry_run_only":       true,
-			"candidate_rankings": recommendation.CandidateRankings,
+			"dry_run_only":                 true,
+			"candidate_rankings":           recommendation.CandidateRankings,
+			"candidate_selection_trace":    recommendation.CandidateSelectionTrace,
+			"candidate_rankings_v2":        recommendation.CandidateRankingsV2,
+			"candidate_selection_trace_v2": recommendation.CandidateSelectionTraceV2,
+			"ranker_shadow_comparison":     recommendation.RankerShadowComparison,
 		},
 	}
 	if finalizeErr != nil {

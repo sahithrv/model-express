@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Activity, AlertTriangle, CheckCircle2, X } from "lucide-react";
 
 import { readyONNXExport } from "../../championLocalInference";
-import type { ActivityStreamState } from "../../hooks/useActivityStream";
+import type { ActivityStreamState } from "../activity/activityStreamState";
 import type { DatasetMetadataDetail, ProjectDetail, VisualAnalysisDetail } from "../../hooks/useProjectDetail";
 import { projectTabs, type ActivityFilterKey, type ProjectTabKey, type ProjectTabTarget } from "./workflowTabs";
 import {
@@ -40,7 +40,9 @@ import type {
   DatasetMetadataSummary,
   DatasetVisualAnalysis,
   EpochMetric,
+  ExecutionArtifactReferences,
   ExecutionEvent,
+  ExecutionRecord,
   ExperimentPlan,
   Health,
   Job,
@@ -679,6 +681,7 @@ export type AgentInvocationsResponse = {
 export type ProjectDetailRefreshOptions = {
   includeSlowData?: boolean;
   forceSlowData?: boolean;
+  diagnosticReason?: import("../../api/missionControlClient").MissionControlRequestReason;
 };
 
 export type DatasetMetadataSummaryResponse =
@@ -769,10 +772,40 @@ export type CandidateScoreRow = {
   expectedEffect: string;
   validationStatus: string;
   totalScore: number | null;
+  baseScore: number | null;
+  selectionScore: number | null;
+  selectionOrder: number | null;
+  selectedExperimentIndex: number | null;
+  selectionAdjustments: CandidateSelectionAdjustmentRow[];
   reasons: string[];
   memoryReasons: string[];
   memoryHits: RetrievedMemoryDisplay[];
   components: Array<{ label: string; value: number | string }>;
+};
+
+export type CandidateSelectionAdjustmentRow = {
+  code: string;
+  label: string;
+  value: number | null;
+  detail: string;
+};
+
+export type CandidateSelectionTraceEntryRow = {
+  candidateIndex: number;
+  label: string;
+  baseScore: number | null;
+  adjustedScore: number | null;
+  selected: boolean;
+  selectionAdjustments: CandidateSelectionAdjustmentRow[];
+};
+
+export type CandidateSelectionTraceRoundRow = {
+  selectionOrder: number;
+  selectedCandidateIndex: number;
+  selectedLabel: string;
+  totalCandidateCount: number;
+  truncated: boolean;
+  candidates: CandidateSelectionTraceEntryRow[];
 };
 
 export type RetrievedMemoryDisplay = {
@@ -825,6 +858,7 @@ export type DecisionChatTurn = {
   rejections: Array<{ kind: string; text: string }>;
   mechanismCoverage: MechanismCoverageRow[];
   candidateScores: CandidateScoreRow[];
+  candidateSelectionTrace: CandidateSelectionTraceRoundRow[];
 };
 
 export type MechanismCoverageRow = {
@@ -1037,6 +1071,185 @@ export function trainingRunLifecycleChips(summary: TrainingRunSummary) {
   const reuseStatus = recordString(materialization, "dataset_prewarm_reuse_status");
   if (reuseStatus && !chips.includes(reuseStatus)) chips.push(humanizeAuditKey(reuseStatus));
   return chips.slice(0, 7);
+}
+
+export type ExecutionFidelityStatus =
+  | "MATCHED"
+  | "APPROVED_ADJUSTMENT"
+  | "MISMATCH"
+  | "UNVERIFIED"
+  | "SIMULATED"
+  | "NOT_REALIZED"
+  | "PENDING_REALIZATION";
+
+export type ExecutionSemanticDiffRow = {
+  path: string;
+  requested: unknown;
+  realized: unknown;
+  change: "same" | "changed" | "requested_only" | "realized_only";
+};
+
+export type ExecutionAuditView = {
+  status: ExecutionFidelityStatus;
+  lifecycleStatus: string;
+  capabilityVersion: string;
+  acceptedSpecHash: string;
+  realizedEffectiveHash: string;
+  adjustmentReasonCodes: string[];
+  adjustmentSummary: string;
+  executionRecordRef: string;
+  trustworthy: boolean;
+  tone: "trusted" | "adjusted" | "untrusted" | "unverified" | "pending";
+  message: string;
+  diff: ExecutionSemanticDiffRow[];
+};
+
+export function executionAuditView(
+  summary: TrainingRunSummary | null,
+  evaluation: TrainingRunEvaluation | null,
+  job: Job | null,
+  record: ExecutionRecord | null = null,
+): ExecutionAuditView {
+  const references = executionArtifactReferences(summary, evaluation);
+  const attempt = latestExecutionAttempt(record);
+  const lifecycleStatus = String(references.lifecycle_status || attempt?.lifecycle_status || "").trim().toUpperCase();
+  const rawVerdict = String(references.fidelity_verdict || attempt?.fidelity_verdict || "").trim().toUpperCase();
+  const status = normalizedExecutionFidelityStatus(rawVerdict, lifecycleStatus);
+  const adjustmentReasonCodes = uniqueStrings([
+    ...(references.adjustment_reason_codes ?? []),
+    ...(attempt?.adjustment_reason_codes ?? []),
+  ]);
+  const requested = requestedExecutionConfig(job);
+  const realized = recordObject(attempt?.latest_realized_config);
+  return {
+    status,
+    lifecycleStatus,
+    capabilityVersion: String(references.capability_version || record?.accepted_spec?.capability_version || ""),
+    acceptedSpecHash: String(references.accepted_spec_hash || record?.accepted_spec?.accepted_spec_hash || ""),
+    realizedEffectiveHash: String(references.realized_effective_hash || attempt?.realized_effective_hash || ""),
+    adjustmentReasonCodes,
+    adjustmentSummary:
+      adjustmentReasonCodes.length > 0
+        ? adjustmentReasonCodes.map((code) => humanizeAuditKey(code)).join(", ")
+        : status === "APPROVED_ADJUSTMENT"
+          ? "Approved runtime adjustment"
+          : "None",
+    executionRecordRef: String(references.execution_record_ref || ""),
+    trustworthy: status === "MATCHED" || status === "APPROVED_ADJUSTMENT",
+    tone: executionFidelityTone(status),
+    message: executionFidelityMessage(status),
+    diff: semanticExecutionDiff(requested, realized),
+  };
+}
+
+export function executionArtifactReferences(
+  summary: TrainingRunSummary | null,
+  evaluation: TrainingRunEvaluation | null,
+): ExecutionArtifactReferences {
+  return {
+    ...(evaluation?.execution_references ?? {}),
+    ...(summary?.execution_references ?? {}),
+  };
+}
+
+export function semanticExecutionDiff(
+  requested: Record<string, unknown>,
+  realized: Record<string, unknown>,
+): ExecutionSemanticDiffRow[] {
+  const requestedLeaves = flattenSemanticObject(requested);
+  const realizedLeaves = flattenSemanticObject(realized);
+  const paths = Array.from(new Set([...Object.keys(requestedLeaves), ...Object.keys(realizedLeaves)]));
+  return paths
+    .map((path): ExecutionSemanticDiffRow => {
+      const requestedPresent = Object.prototype.hasOwnProperty.call(requestedLeaves, path);
+      const realizedPresent = Object.prototype.hasOwnProperty.call(realizedLeaves, path);
+      const requestedValue = requestedLeaves[path];
+      const realizedValue = realizedLeaves[path];
+      const change = !requestedPresent
+        ? "realized_only"
+        : !realizedPresent
+          ? "requested_only"
+          : semanticValueKey(requestedValue) === semanticValueKey(realizedValue)
+            ? "same"
+            : "changed";
+      return { path, requested: requestedValue, realized: realizedValue, change };
+    })
+    .sort((left, right) => {
+      if ((left.change === "same") !== (right.change === "same")) return left.change === "same" ? 1 : -1;
+      return left.path.localeCompare(right.path);
+    });
+}
+
+function requestedExecutionConfig(job: Job | null) {
+  const spec = recordObject(recordObject(job?.config).execution_spec_v1);
+  return recordObject(spec.requested_config);
+}
+
+function latestExecutionAttempt(record: ExecutionRecord | null) {
+  return [...(record?.attempts ?? [])].sort((left, right) => {
+    const numberDelta = Number(right.attempt_number ?? 0) - Number(left.attempt_number ?? 0);
+    if (numberDelta !== 0) return numberDelta;
+    return String(right.updated_at || "").localeCompare(String(left.updated_at || ""));
+  })[0];
+}
+
+function normalizedExecutionFidelityStatus(verdict: string, lifecycleStatus: string): ExecutionFidelityStatus {
+  if (["MATCHED", "APPROVED_ADJUSTMENT", "MISMATCH", "UNVERIFIED", "SIMULATED"].includes(verdict)) {
+    return verdict as ExecutionFidelityStatus;
+  }
+  if (lifecycleStatus === "NOT_REALIZED") return "NOT_REALIZED";
+  if (["PENDING", "INITIALIZED"].includes(lifecycleStatus)) return "PENDING_REALIZATION";
+  return "UNVERIFIED";
+}
+
+function executionFidelityTone(status: ExecutionFidelityStatus): ExecutionAuditView["tone"] {
+  if (status === "MATCHED") return "trusted";
+  if (status === "APPROVED_ADJUSTMENT") return "adjusted";
+  if (status === "MISMATCH" || status === "SIMULATED") return "untrusted";
+  if (status === "UNVERIFIED") return "unverified";
+  return "pending";
+}
+
+function executionFidelityMessage(status: ExecutionFidelityStatus) {
+  switch (status) {
+    case "MATCHED":
+      return "Verified: the accepted training semantics were realized.";
+    case "APPROVED_ADJUSTMENT":
+      return "Verified with an explicitly approved runtime adjustment.";
+    case "MISMATCH":
+      return "Not trustworthy as faithful evidence: realized training contradicted the accepted semantics.";
+    case "SIMULATED":
+      return "Simulation only: this is not verified real-training evidence.";
+    case "NOT_REALIZED":
+      return "This attempt ended before training semantics were realized.";
+    case "PENDING_REALIZATION":
+      return "Training realization evidence is still pending.";
+    default:
+      return "Legacy or unverifiable run: no versioned execution receipt proves what ran.";
+  }
+}
+
+function flattenSemanticObject(value: Record<string, unknown>, prefix = ""): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort()) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    const item = value[key];
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      Object.assign(out, flattenSemanticObject(item as Record<string, unknown>, path));
+    } else {
+      out[path] = item;
+    }
+  }
+  return out;
+}
+
+function semanticValueKey(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(semanticValueKey).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${key}:${semanticValueKey(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
 }
 
 export function lifecycleSecondsChip(label: string, seconds: number) {
@@ -3461,32 +3674,6 @@ export const activityUnixPathPattern = /(^|\s)\/(?:Users|home|tmp|var|mnt|data|d
 export const activityBase64Pattern = /\b[A-Za-z0-9+/]{80,}={0,2}\b/g;
 export const activitySecretPattern = /\b(?:sk|pk|rk|xox[baprs]?)-[A-Za-z0-9_-]{16,}\b/gi;
 
-export function activityEventFromMessage(event: MessageEvent): AgentActivityEvent | null {
-  try {
-    const parsed = recordObject(JSON.parse(String(event.data)));
-    const id = recordString(parsed, "id");
-    const projectId = recordString(parsed, "project_id");
-    const type = recordString(parsed, "type");
-    const createdAt = recordString(parsed, "created_at");
-    if (!id || !projectId || !type || !createdAt) return null;
-    return {
-      id,
-      project_id: projectId,
-      plan_id: recordString(parsed, "plan_id") || undefined,
-      job_id: recordString(parsed, "job_id") || undefined,
-      type,
-      severity: activitySeverity(recordString(parsed, "severity")),
-      title: activitySafeDisplayText(recordString(parsed, "title"), 96) || "Activity",
-      message: activitySafeDisplayText(recordString(parsed, "message"), 240),
-      status: activityStatus(recordString(parsed, "status")),
-      created_at: createdAt,
-      metadata: activityMetadataObject(parsed.metadata),
-    };
-  } catch {
-    return null;
-  }
-}
-
 export function mergeActivityEvents(current: AgentActivityEvent[], event: AgentActivityEvent) {
   const byId = new Map<string, AgentActivityEvent>();
   for (const item of current) byId.set(item.id, item);
@@ -5213,6 +5400,7 @@ export function buildDecisionChatTurns(decisions: AgentDecision[]): DecisionChat
       rejections: decisionRejections(decision),
       mechanismCoverage: mechanismCoverageRows(decision.payload),
       candidateScores: candidateScoreRows(decision),
+      candidateSelectionTrace: candidateSelectionTraceRows(decision),
     }));
 }
 
@@ -5709,6 +5897,8 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
       const components = recordObject(record.score_components);
       const memoryHits = candidateRetrievedMemoryRows(record, components);
       const memoryReasons = candidateMemoryReasons(record, components, memoryHits);
+      const baseScore = recordFirstNumber(record, ["base_score", "score", "total_score"]);
+      const selectionAdjustments = candidateSelectionAdjustmentRows(record.selection_adjustments);
       return {
         label:
           recordString(record, "hypothesis") ||
@@ -5721,6 +5911,11 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
         expectedEffect: recordFirstString(record, ["expected_effect", "expected_metric_effect"]),
         validationStatus: recordFirstString(record, ["backend_validation_status", "validation_status"]),
         totalScore: numberPayload(record.score) ?? numberPayload(record.total_score),
+        baseScore,
+        selectionScore: numberPayload(record.selection_score),
+        selectionOrder: numberPayload(record.selection_order),
+        selectedExperimentIndex: numberPayload(record.selected_experiment_index),
+        selectionAdjustments,
         reasons: stringArrayPayload(record.reasons),
         memoryReasons,
         memoryHits,
@@ -5730,6 +5925,10 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
     .filter(
       (row) =>
         row.totalScore !== null ||
+        row.baseScore !== null ||
+        row.selectionScore !== null ||
+        row.selectionOrder !== null ||
+        row.selectionAdjustments.length > 0 ||
         row.components.length > 0 ||
         row.reasons.length > 0 ||
         row.memoryReasons.length > 0 ||
@@ -5737,6 +5936,64 @@ export function candidateScoreRows(decision: AgentDecision): CandidateScoreRow[]
         Boolean(row.mechanism || row.intervention || row.expectedEffect || row.validationStatus),
     )
     .slice(0, 6);
+}
+
+export function candidateSelectionAdjustmentRows(value: unknown): CandidateSelectionAdjustmentRow[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      const record = recordObject(item);
+      const code = recordString(record, "code");
+      return {
+        code,
+        label: humanizeAuditKey(code || "selection_adjustment").replace(/\b\w/g, (character) => character.toUpperCase()),
+        value: numberPayload(record.value),
+        detail: recordString(record, "detail"),
+      };
+    })
+    .filter((adjustment) => Boolean(adjustment.code || adjustment.detail || adjustment.value !== null));
+}
+
+export function candidateSelectionTraceRows(decision: AgentDecision): CandidateSelectionTraceRoundRow[] {
+  const rankings = Array.isArray(decision.payload?.candidate_rankings) ? decision.payload.candidate_rankings : [];
+  const labelsByCandidateIndex = new Map<number, string>();
+  rankings.forEach((item, fallbackIndex) => {
+    const record = recordObject(item);
+    const candidateIndex = recordFirstNumber(record, ["candidate_index"]) ?? fallbackIndex;
+    const label =
+      recordString(record, "hypothesis") ||
+      recordString(record, "experiment_signature") ||
+      recordString(record, "model") ||
+      `Candidate ${candidateIndex + 1}`;
+    labelsByCandidateIndex.set(candidateIndex, label);
+  });
+
+  const trace = Array.isArray(decision.payload?.candidate_selection_trace) ? decision.payload.candidate_selection_trace : [];
+  return trace.slice(0, 5).map((item, fallbackOrder) => {
+    const record = recordObject(item);
+    const selectionOrder = recordFirstNumber(record, ["selection_order"]) ?? fallbackOrder;
+    const selectedCandidateIndex = recordFirstNumber(record, ["selected_candidate_index"]) ?? -1;
+    const candidates = (Array.isArray(record.candidates) ? record.candidates : []).slice(0, 5).map((candidate) => {
+      const candidateRecord = recordObject(candidate);
+      const candidateIndex = recordFirstNumber(candidateRecord, ["candidate_index"]) ?? -1;
+      return {
+        candidateIndex,
+        label: labelsByCandidateIndex.get(candidateIndex) || `Candidate ${candidateIndex + 1}`,
+        baseScore: numberPayload(candidateRecord.base_score),
+        adjustedScore: numberPayload(candidateRecord.adjusted_score),
+        selected: candidateRecord.selected === true,
+        selectionAdjustments: candidateSelectionAdjustmentRows(candidateRecord.selection_adjustments),
+      };
+    });
+    return {
+      selectionOrder,
+      selectedCandidateIndex,
+      selectedLabel: labelsByCandidateIndex.get(selectedCandidateIndex) || `Candidate ${selectedCandidateIndex + 1}`,
+      totalCandidateCount: recordFirstNumber(record, ["total_candidate_count"]) ?? candidates.length,
+      truncated: record.truncated === true,
+      candidates,
+    };
+  });
 }
 
 export function decisionRetrievedMemoryRows(decision: AgentDecision): RetrievedMemoryDisplay[] {
