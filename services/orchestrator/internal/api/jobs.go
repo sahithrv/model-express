@@ -648,6 +648,26 @@ func (s *Server) failJob(c *gin.Context) {
 			return
 		}
 		retryOptions, retryDecision := s.retryOptionsForFailure(currentJob, req)
+		prospectiveConfig := currentJob.Config
+		if retryOptions.Config != nil {
+			prospectiveConfig = retryOptions.Config
+		}
+		if policyControlledJobTemplate(currentJob.Template) {
+			evaluation, policyErr := s.recordJobPolicyEvaluation(currentJob.ProjectID, currentJob.ID, currentJob.Template, prospectiveConfig, policyOperationRetryRun)
+			if policyErr != nil {
+				retryOptions.ForceFail = true
+				retryOptions.PolicyReference = policyReferenceForEvaluation(evaluation)
+				blocked, _, retryErr := s.store.RetryJob(c.Param("id"), req.Error, retryOptions)
+				if retryErr != nil {
+					writeStoreError(c, retryErr)
+					return
+				}
+				s.recordJobPolicyActivity(blocked, evaluation, execution.EventJobPolicyBlocked, "Job retry blocked by the current experiment policy.")
+				writeStoreError(c, policyErr)
+				return
+			}
+			retryOptions.PolicyReference = policyReferenceForEvaluation(evaluation)
+		}
 		job, requeued, err := s.store.RetryJob(c.Param("id"), req.Error, retryOptions)
 		if err != nil {
 			writeStoreError(c, err)
@@ -1881,7 +1901,7 @@ func (s *Server) createJob(c *gin.Context) {
 		return
 	}
 
-	job, err := s.store.CreateJob(c.Param("id"), req.Template, req.Config)
+	job, err := s.createJobWithCurrentPolicy(c.Param("id"), req.Template, req.Config, policyOperationCreateJob)
 	if err != nil {
 		writeStoreError(c, err)
 		return

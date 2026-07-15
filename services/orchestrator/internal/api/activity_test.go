@@ -217,6 +217,8 @@ func TestV1ActivityProducerCoverage(t *testing.T) {
 		"dispatcher.status":                "existing durable execution-event row",
 		"dispatcher.idle_exit":             "existing durable execution-event row",
 		"job.retrying":                     "typed job retry transition",
+		"job.policy_blocked":               "existing durable execution-event row",
+		"job.policy_reconciled":            "existing durable execution-event row",
 		"job.queued":                       "typed job queue transition",
 		"job.running":                      "typed job assignment/running transition",
 		"job.completed":                    "typed job completion transition",

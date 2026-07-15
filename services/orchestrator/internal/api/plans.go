@@ -196,6 +196,11 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 	if err != nil {
 		return executeExperimentPlanResponse{}, err
 	}
+	schedulePolicyEvaluation, err := s.recordPlanSchedulePolicy(plan, dataset, provider)
+	if err != nil {
+		return executeExperimentPlanResponse{}, err
+	}
+	schedulePolicyReference := policyReferenceForEvaluation(schedulePolicyEvaluation)
 	costPolicy, err := s.costPolicyForPlan(plan)
 	if err != nil {
 		return executeExperimentPlanResponse{}, err
@@ -371,7 +376,7 @@ func (s *Server) executeStoredExperimentPlan(planID string, req executeExperimen
 			config["automl_summary"] = automlJobSummary(experiment, suggestion)
 		}
 
-		job, err := s.store.CreateJob(plan.ProjectID, jobTemplate, config)
+		job, err := s.store.CreateJobWithOptions(plan.ProjectID, jobTemplate, config, store.CreateJobOptions{PolicyReference: schedulePolicyReference})
 		if err != nil {
 			return executeExperimentPlanResponse{}, err
 		}

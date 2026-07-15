@@ -166,6 +166,7 @@ func (s *MemoryStore) SetExperimentPolicyBinding(write policies.BindingWrite) (p
 		CreatedBy:       defaultPolicyActor(write.CreatedBy),
 	}
 	s.policyBindings[created.ID] = policies.CloneBinding(created)
+	s.markQueuedJobsPolicyPendingLocked(write.Scope, write.SubjectID)
 	return policies.CloneBinding(created), nil
 }
 
@@ -190,6 +191,7 @@ func (s *MemoryStore) ClearExperimentPolicyBinding(scope policies.Scope, subject
 		binding.Active = false
 		binding.SupersededAt = &now
 		s.policyBindings[id] = policies.CloneBinding(binding)
+		s.markQueuedJobsPolicyPendingLocked(scope, subjectID)
 		return policies.CloneBinding(binding), nil
 	}
 	if expectedRevision != 0 {
@@ -224,12 +226,16 @@ func (s *MemoryStore) ListActiveExperimentPolicyBindings(scope policies.ScopeCon
 }
 
 func (s *MemoryStore) CreateExperimentPolicyEvaluation(input policies.Evaluation) (policies.Evaluation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createExperimentPolicyEvaluationLocked(input)
+}
+
+func (s *MemoryStore) createExperimentPolicyEvaluationLocked(input policies.Evaluation) (policies.Evaluation, error) {
 	normalizeEvaluationSlices(&input)
 	if err := policies.ValidateEvaluation(input); err != nil {
 		return policies.Evaluation{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.validatePolicyEvaluationOwnershipLocked(input); err != nil {
 		return policies.Evaluation{}, err
 	}

@@ -51,6 +51,14 @@ func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobO
 		nextConfig = copyAnyMap(options.Config)
 	}
 	nextConfig = jobConfigWithImmutableExecutionSpec(job.Config, nextConfig)
+	policyEvaluationID := job.SchedulePolicyEvaluationID
+	effectivePolicyHash := job.EffectivePolicyHash
+	policyStatus := job.PolicyEligibilityStatus
+	if options.PolicyReference.EvaluationID != "" {
+		policyEvaluationID = options.PolicyReference.EvaluationID
+		effectivePolicyHash = options.PolicyReference.EffectivePolicyHash
+		policyStatus = options.PolicyReference.Status
+	}
 	if requeued {
 		nextConfig = jobConfigWithPendingAttempt(nextConfig, job.ID, job.Attempt+1)
 		configJSON, marshalErr := json.Marshal(nextConfig)
@@ -68,10 +76,13 @@ func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobO
 				completed_at = NULL,
 				lease_owner_worker_id = '',
 				lease_expires_at = NULL,
-				lease_last_heartbeat_at = NULL
+				lease_last_heartbeat_at = NULL,
+				schedule_policy_evaluation_id = NULLIF($5, ''),
+				effective_policy_hash = $6,
+				policy_eligibility_status = $7
 			WHERE id = $3
 			RETURNING `+jobSelectColumns()+`
-		`, jobs.StatusQueued, message, jobID, configJSON))
+		`, jobs.StatusQueued, message, jobID, configJSON, policyEvaluationID, effectivePolicyHash, policyStatus))
 	} else {
 		nextConfig = jobConfigWithTerminalAttempt(nextConfig, job.ID, terminalAttempt)
 		configJSON, marshalErr := json.Marshal(nextConfig)
@@ -86,10 +97,13 @@ func (s *PostgresStore) RetryJob(jobID string, message string, options RetryJobO
 				completed_at = now(),
 				lease_owner_worker_id = '',
 				lease_expires_at = NULL,
-				lease_last_heartbeat_at = NULL
+				lease_last_heartbeat_at = NULL,
+				schedule_policy_evaluation_id = NULLIF($5, ''),
+				effective_policy_hash = $6,
+				policy_eligibility_status = $7
 			WHERE id = $3
 			RETURNING `+jobSelectColumns()+`
-		`, jobs.StatusFailed, message, jobID, configJSON))
+		`, jobs.StatusFailed, message, jobID, configJSON, policyEvaluationID, effectivePolicyHash, policyStatus))
 	}
 	if err != nil {
 		return jobs.ExperimentJob{}, false, err

@@ -173,6 +173,9 @@ func (s *PostgresStore) SetExperimentPolicyBinding(write policies.BindingWrite) 
 		}
 		return policies.Binding{}, err
 	}
+	if err := markQueuedJobsPolicyPendingTx(ctx, tx, write.Scope, write.SubjectID); err != nil {
+		return policies.Binding{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return policies.Binding{}, err
 	}
@@ -225,6 +228,9 @@ func (s *PostgresStore) ClearExperimentPolicyBinding(scope policies.Scope, subje
 	if err != nil {
 		return policies.Binding{}, err
 	}
+	if err := markQueuedJobsPolicyPendingTx(ctx, tx, scope, subjectID); err != nil {
+		return policies.Binding{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return policies.Binding{}, err
 	}
@@ -268,6 +274,18 @@ func (s *PostgresStore) CreateExperimentPolicyEvaluation(input policies.Evaluati
 	if err := s.validatePolicyEvaluationOwnership(input); err != nil {
 		return policies.Evaluation{}, err
 	}
+	return insertExperimentPolicyEvaluation(context.Background(), s.db, input)
+}
+
+type policyEvaluationQueryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func insertExperimentPolicyEvaluation(ctx context.Context, queryer policyEvaluationQueryRower, input policies.Evaluation) (policies.Evaluation, error) {
+	normalizeEvaluationSlices(&input)
+	if err := policies.ValidateEvaluation(input); err != nil {
+		return policies.Evaluation{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
 	profilesJSON, err := json.Marshal(input.CompatibilityProfiles)
 	if err != nil {
 		return policies.Evaluation{}, err
@@ -309,7 +327,7 @@ func (s *PostgresStore) CreateExperimentPolicyEvaluation(input policies.Evaluati
 	query := `INSERT INTO experiment_policy_evaluations (` + columns + `)
 		VALUES (` + placeholders + `)
 		RETURNING ` + policyEvaluationSelectColumns()
-	created, err := scanPolicyEvaluation(s.db.QueryRowContext(context.Background(), query, args...))
+	created, err := scanPolicyEvaluation(queryer.QueryRowContext(ctx, query, args...))
 	if isUniqueViolation(err) {
 		return policies.Evaluation{}, fmt.Errorf("%w: policy evaluation %s", policies.ErrImmutableConflict, input.ID)
 	}

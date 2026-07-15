@@ -16,7 +16,7 @@ func insertJobExecutionSpecTx(ctx context.Context, tx *sql.Tx, spec execution.Jo
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO job_execution_specs (job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, spec.JobID, spec.ProjectID, spec.SchemaVersion, spec.CapabilityVersion, spec.Task, spec.Runner, spec.RequestedConfigHash, spec.AcceptedSpecHash, acceptedJSON, spec.CreatedAt)
+	_, err = tx.ExecContext(ctx, `INSERT INTO job_execution_specs (job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, policy_evaluation_id, effective_policy_hash, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,$12)`, spec.JobID, spec.ProjectID, spec.SchemaVersion, spec.CapabilityVersion, spec.Task, spec.Runner, spec.RequestedConfigHash, spec.AcceptedSpecHash, acceptedJSON, spec.PolicyEvaluationID, spec.EffectivePolicyHash, spec.CreatedAt)
 	return err
 }
 
@@ -25,7 +25,7 @@ func createAttemptExecutionRecordTx(ctx context.Context, tx *sql.Tx, jobID, atte
 		INSERT INTO attempt_execution_records (job_id, project_id, attempt_id, attempt_number)
 		SELECT $1, project_id, $2, $3 FROM job_execution_specs WHERE job_id = $1
 		ON CONFLICT (job_id, attempt_id) DO UPDATE SET attempt_id = EXCLUDED.attempt_id
-		RETURNING id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at
+		RETURNING `+attemptExecutionRecordSelectColumns()+`
 	`, jobID, attemptID, attemptNumber)
 	return scanAttemptExecutionRecord(row)
 }
@@ -48,7 +48,7 @@ func (s *PostgresStore) CreateAttemptExecutionRecord(jobID, attemptID string, at
 }
 
 func (s *PostgresStore) GetJobExecutionRecord(jobID string) (execution.ExecutionRecord, error) {
-	spec, err := scanJobExecutionSpec(s.db.QueryRowContext(context.Background(), `SELECT job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, created_at FROM job_execution_specs WHERE job_id=$1`, jobID))
+	spec, err := scanJobExecutionSpec(s.db.QueryRowContext(context.Background(), `SELECT `+jobExecutionSpecSelectColumns()+` FROM job_execution_specs WHERE job_id=$1`, jobID))
 	if err != nil {
 		return execution.ExecutionRecord{}, err
 	}
@@ -64,7 +64,7 @@ func (s *PostgresStore) ListProjectExecutionRecords(projectID string, options Pa
 		return nil, err
 	}
 	limit, offset := postgresPageLimitOffset(options)
-	rows, err := s.db.QueryContext(context.Background(), `SELECT job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, created_at FROM job_execution_specs WHERE project_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, projectID, limit, offset)
+	rows, err := s.db.QueryContext(context.Background(), `SELECT `+jobExecutionSpecSelectColumns()+` FROM job_execution_specs WHERE project_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, projectID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +85,7 @@ func (s *PostgresStore) ListProjectExecutionRecords(projectID string, options Pa
 }
 
 func (s *PostgresStore) listAttemptExecutionRecords(where string, arg any) ([]execution.AttemptExecutionRecord, error) {
-	rows, err := s.db.QueryContext(context.Background(), `SELECT id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at FROM attempt_execution_records `+where+` ORDER BY attempt_number ASC`, arg)
+	rows, err := s.db.QueryContext(context.Background(), `SELECT `+attemptExecutionRecordSelectColumns()+` FROM attempt_execution_records `+where+` ORDER BY attempt_number ASC`, arg)
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +135,11 @@ func (s *PostgresStore) AppendRealizationObservation(jobID string, create execut
 		return execution.RealizationObservation{}, false, err
 	}
 	defer tx.Rollback()
-	spec, err := scanJobExecutionSpec(tx.QueryRowContext(ctx, `SELECT job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, created_at FROM job_execution_specs WHERE job_id=$1`, jobID))
+	spec, err := scanJobExecutionSpec(tx.QueryRowContext(ctx, `SELECT `+jobExecutionSpecSelectColumns()+` FROM job_execution_specs WHERE job_id=$1`, jobID))
 	if err != nil {
 		return execution.RealizationObservation{}, false, err
 	}
-	record, err := scanAttemptExecutionRecord(tx.QueryRowContext(ctx, `SELECT id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at FROM attempt_execution_records WHERE job_id=$1 AND attempt_id=$2 FOR UPDATE`, jobID, create.AttemptID))
+	record, err := scanAttemptExecutionRecord(tx.QueryRowContext(ctx, `SELECT `+attemptExecutionRecordSelectColumns()+` FROM attempt_execution_records WHERE job_id=$1 AND attempt_id=$2 FOR UPDATE`, jobID, create.AttemptID))
 	if err != nil {
 		return execution.RealizationObservation{}, false, err
 	}
@@ -183,7 +183,7 @@ func (s *PostgresStore) AppendRealizationObservation(jobID string, create execut
 }
 
 func (s *PostgresStore) MarkAttemptNotRealized(jobID, attemptID string) (execution.AttemptExecutionRecord, error) {
-	return scanAttemptExecutionRecord(s.db.QueryRowContext(context.Background(), `UPDATE attempt_execution_records SET lifecycle_status=CASE WHEN lifecycle_status=$1 THEN $2 ELSE lifecycle_status END, updated_at=CASE WHEN lifecycle_status=$1 THEN now() ELSE updated_at END WHERE job_id=$3 AND attempt_id=$4 RETURNING id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, created_at, updated_at`, execution.ExecutionLifecyclePending, execution.ExecutionLifecycleNotRealized, jobID, attemptID))
+	return scanAttemptExecutionRecord(s.db.QueryRowContext(context.Background(), `UPDATE attempt_execution_records SET lifecycle_status=CASE WHEN lifecycle_status=$1 THEN $2 ELSE lifecycle_status END, updated_at=CASE WHEN lifecycle_status=$1 THEN now() ELSE updated_at END WHERE job_id=$3 AND attempt_id=$4 RETURNING `+attemptExecutionRecordSelectColumns(), execution.ExecutionLifecyclePending, execution.ExecutionLifecycleNotRealized, jobID, attemptID))
 }
 
 func observationSelectSQL() string {
@@ -193,7 +193,7 @@ func observationSelectSQL() string {
 func scanJobExecutionSpec(scanner rowScanner) (execution.JobExecutionSpec, error) {
 	var out execution.JobExecutionSpec
 	var raw []byte
-	if err := scanner.Scan(&out.JobID, &out.ProjectID, &out.SchemaVersion, &out.CapabilityVersion, &out.Task, &out.Runner, &out.RequestedConfigHash, &out.AcceptedSpecHash, &raw, &out.CreatedAt); err != nil {
+	if err := scanner.Scan(&out.JobID, &out.ProjectID, &out.SchemaVersion, &out.CapabilityVersion, &out.Task, &out.Runner, &out.RequestedConfigHash, &out.AcceptedSpecHash, &raw, &out.PolicyEvaluationID, &out.EffectivePolicyHash, &out.CreatedAt); err != nil {
 		return out, normalizeSQLError(err)
 	}
 	if err := json.Unmarshal(raw, &out.AcceptedSpec); err != nil {
@@ -206,7 +206,7 @@ func scanAttemptExecutionRecord(scanner rowScanner) (execution.AttemptExecutionR
 	var verdict sql.NullString
 	var realizedHash sql.NullString
 	var reasons, raw []byte
-	if err := scanner.Scan(&out.ID, &out.JobID, &out.ProjectID, &out.AttemptID, &out.AttemptNumber, &out.LifecycleStatus, &verdict, &realizedHash, &reasons, &raw, &out.CreatedAt, &out.UpdatedAt); err != nil {
+	if err := scanner.Scan(&out.ID, &out.JobID, &out.ProjectID, &out.AttemptID, &out.AttemptNumber, &out.LifecycleStatus, &verdict, &realizedHash, &reasons, &raw, &out.DispatchPolicyEvaluationID, &out.EffectivePolicyHash, &out.CreatedAt, &out.UpdatedAt); err != nil {
 		return out, normalizeSQLError(err)
 	}
 	if verdict.Valid {
@@ -222,6 +222,14 @@ func scanAttemptExecutionRecord(scanner rowScanner) (execution.AttemptExecutionR
 		return out, err
 	}
 	return out, nil
+}
+
+func jobExecutionSpecSelectColumns() string {
+	return "job_id, project_id, schema_version, capability_version, task, runner, requested_config_hash, accepted_spec_hash, accepted_spec, COALESCE(policy_evaluation_id, ''), effective_policy_hash, created_at"
+}
+
+func attemptExecutionRecordSelectColumns() string {
+	return "id, job_id, project_id, attempt_id, attempt_number, lifecycle_status, fidelity_verdict, realized_effective_hash, adjustment_reason_codes, latest_realized_config, COALESCE(dispatch_policy_evaluation_id, ''), effective_policy_hash, created_at, updated_at"
 }
 func scanRealizationObservation(scanner rowScanner) (execution.RealizationObservation, error) {
 	var out execution.RealizationObservation

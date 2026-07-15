@@ -28,6 +28,7 @@ var (
 	ErrNoJob          = errors.New("no job available")
 	ErrInvalidRequest = errors.New("invalid request")
 	ErrStaleAttempt   = errors.New("stale job attempt")
+	ErrPolicyChanged  = errors.New("experiment policy changed during job dispatch")
 )
 
 type JobPollFilter struct {
@@ -37,8 +38,13 @@ type JobPollFilter struct {
 }
 
 type RetryJobOptions struct {
-	Config    map[string]any
-	ForceFail bool
+	Config          map[string]any
+	ForceFail       bool
+	PolicyReference policies.PersistenceReference
+}
+
+type CreateJobOptions struct {
+	PolicyReference policies.PersistenceReference
 }
 
 type PageOptions struct {
@@ -107,8 +113,12 @@ type Store interface {
 	GetWorker(workerID string) (workers.Worker, error)
 	HeartbeatWorker(id string) (workers.Worker, error)
 	PollJob(workerID string, filter JobPollFilter) (*jobs.ExperimentJob, error)
+	ListQueuedJobsForWorker(workerID string, filter JobPollFilter, limit int) ([]jobs.ExperimentJob, error)
+	ApplyQueuedJobPolicyEvaluation(jobID string, evaluation policies.Evaluation) (jobs.ExperimentJob, policies.Evaluation, bool, error)
+	ClaimJobIfQueuedAndPolicyCurrent(workerID string, jobID string, filter JobPollFilter, evaluation policies.Evaluation) (*jobs.ExperimentJob, policies.Evaluation, bool, error)
 
 	CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error)
+	CreateJobWithOptions(projectID string, template string, config map[string]any, options CreateJobOptions) (jobs.ExperimentJob, error)
 	GetJob(id string) (jobs.ExperimentJob, error)
 	ListProjectJobs(projectID string) ([]jobs.ExperimentJob, error)
 	ListProjectJobsPage(projectID string, options PageOptions) ([]jobs.ExperimentJob, error)

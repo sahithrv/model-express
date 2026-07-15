@@ -295,7 +295,7 @@ func TestMemoryLifecycleValidationRollbackLeavesAllThreeRecordsUnchanged(t *test
 
 func TestLifecycleMutationSitesUseAtomicCompositionHelpers(t *testing.T) {
 	postgresSites := map[string][]string{
-		"postgres_job_records.go": {"CreateJob", "PollJob", "ReportMetric", "recoverExpiredJobLeasesTx"},
+		"postgres_job_records.go": {"CreateJobWithOptions", "PollJob", "ReportMetric", "recoverExpiredJobLeasesTx"},
 		"postgres_jobs.go":        {"RetryJob", "finishJobWithTransition"},
 	}
 	for filename, functions := range postgresSites {
@@ -305,7 +305,7 @@ func TestLifecycleMutationSitesUseAtomicCompositionHelpers(t *testing.T) {
 			}
 		}
 	}
-	memorySites := []string{"CreateJob", "PollJob", "ReportMetric", "recoverExpiredJobLeasesLocked", "RetryJob", "finishJobWithTransition"}
+	memorySites := []string{"CreateJobWithOptions", "PollJob", "ReportMetric", "recoverExpiredJobLeasesLocked", "RetryJob", "finishJobWithTransition"}
 	for _, function := range memorySites {
 		if !sourceFunctionCalls(t, "memory.go", function, "commitJobLifecycleLocked") {
 			t.Errorf("memory.go.%s does not compose job, progress, and event through commitJobLifecycleLocked", function)

@@ -418,7 +418,7 @@ func (s *Server) ensureOpenJob(projectID string, template string, config map[str
 			return job, nil
 		}
 	}
-	return s.store.CreateJob(projectID, template, config)
+	return s.createJobWithCurrentPolicy(projectID, template, config, policyOperationCreateJob)
 }
 
 func jobConfigString(config map[string]any, key string) string {

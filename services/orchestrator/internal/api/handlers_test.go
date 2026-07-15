@@ -8503,6 +8503,13 @@ func (s *championExportFailureStore) CreateJob(projectID string, template string
 	return s.Store.CreateJob(projectID, template, config)
 }
 
+func (s *championExportFailureStore) CreateJobWithOptions(projectID string, template string, config map[string]any, options store.CreateJobOptions) (jobs.ExperimentJob, error) {
+	if s.failExportJobCreate && template == jobs.TemplateExportChampion {
+		return jobs.ExperimentJob{}, errors.New("forced export job failure")
+	}
+	return s.Store.CreateJobWithOptions(projectID, template, config, options)
+}
+
 func recordTrainingSummary(
 	t *testing.T,
 	server *Server,

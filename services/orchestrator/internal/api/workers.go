@@ -17,6 +17,7 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/settings"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/workers"
@@ -905,11 +906,12 @@ func (s *Server) pollJob(c *gin.Context) {
 	if strings.TrimSpace(req.Provider) != "" && len(includeUnspecified) == 0 {
 		includeUnspecified = defaultProviderPollFallbackTemplates()
 	}
-	job, err := s.store.PollJob(c.Param("id"), store.JobPollFilter{
+	filter := store.JobPollFilter{
 		Provider:                            req.Provider,
 		Templates:                           req.Templates,
 		IncludeUnspecifiedProviderTemplates: includeUnspecified,
-	})
+	}
+	job, err := s.pollNextPolicyPermittedJob(c.Param("id"), filter)
 	if err == nil {
 		c.JSON(http.StatusOK, pollJobResponse{Job: s.augmentPolledJob(job, req.Provider)})
 		return
@@ -921,4 +923,96 @@ func (s *Server) pollJob(c *gin.Context) {
 	}
 
 	writeStoreError(c, err)
+}
+
+func (s *Server) pollNextPolicyPermittedJob(workerID string, filter store.JobPollFilter) (*jobs.ExperimentJob, error) {
+	if _, err := s.recoverExpiredLeasesOnce(time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	worker, err := s.store.HeartbeatWorker(workerID)
+	if err != nil {
+		return nil, err
+	}
+	if worker.CurrentJobID != "" {
+		job, err := s.store.GetJob(worker.CurrentJobID)
+		if err != nil {
+			return nil, err
+		}
+		return &job, nil
+	}
+	const candidateLimit = 64
+	for {
+		candidates, err := s.store.ListQueuedJobsForWorker(workerID, filter, candidateLimit)
+		if err != nil {
+			return nil, err
+		}
+		if len(candidates) == 0 {
+			return nil, store.ErrNoJob
+		}
+		batchProgress := false
+		for _, candidate := range candidates {
+			candidateResolved := false
+			policyChangedDuringClaim := false
+			for revisionAttempt := 0; revisionAttempt < 4; revisionAttempt++ {
+				evaluation, evaluateErr := s.evaluateJobPolicy(candidate.ProjectID, candidate.ID, candidate.Template, candidate.Config, policyOperationDispatchRun)
+				if evaluation.EffectivePolicyHash == "" {
+					return nil, evaluateErr
+				}
+				if evaluateErr != nil || evaluation.Decision == policies.DecisionDenied {
+					if policyChangedDuringClaim || (candidate.EffectivePolicyHash != "" && candidate.EffectivePolicyHash != evaluation.EffectivePolicyHash) {
+						evaluation.ReasonCodes = appendPolicyReasonCode(evaluation.ReasonCodes, policies.ReasonChangedAfterQueue)
+						evaluation.Findings = append(evaluation.Findings, policies.Finding{
+							Code: policies.ReasonChangedAfterQueue, FieldPath: "job.effective_policy_hash", Origin: "stale_queue",
+							Remediation: "Review the current effective policy and schedule a permitted configuration.",
+						})
+					}
+					blocked, created, applied, applyErr := s.store.ApplyQueuedJobPolicyEvaluation(candidate.ID, evaluation)
+					if errors.Is(applyErr, store.ErrPolicyChanged) {
+						continue
+					}
+					if applyErr != nil {
+						return nil, applyErr
+					}
+					if applied {
+						s.recordJobPolicyActivity(blocked, created, execution.EventJobPolicyBlocked, "Queued job blocked by the current experiment policy.")
+					}
+					candidateResolved = true
+					batchProgress = true
+					break
+				}
+				claimed, _, assigned, claimErr := s.store.ClaimJobIfQueuedAndPolicyCurrent(workerID, candidate.ID, filter, evaluation)
+				if errors.Is(claimErr, store.ErrPolicyChanged) {
+					policyChangedDuringClaim = true
+					continue
+				}
+				if claimErr != nil {
+					return nil, claimErr
+				}
+				if assigned {
+					return claimed, nil
+				}
+				candidateResolved = true
+				batchProgress = true
+				break
+			}
+			if !candidateResolved {
+				return nil, store.ErrPolicyChanged
+			}
+		}
+		if len(candidates) < candidateLimit {
+			return nil, store.ErrNoJob
+		}
+		if !batchProgress {
+			return nil, store.ErrPolicyChanged
+		}
+	}
+}
+
+func appendPolicyReasonCode(values []policies.ReasonCode, code policies.ReasonCode) []policies.ReasonCode {
+	for _, existing := range values {
+		if existing == code {
+			return values
+		}
+	}
+	return append(values, code)
 }

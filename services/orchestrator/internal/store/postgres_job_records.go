@@ -239,7 +239,7 @@ func (s *PostgresStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Ex
 
 func pollJobCandidateQuery(projectID string, filter JobPollFilter) (string, []any) {
 	args := []any{jobs.StatusQueued, projectID}
-	clauses := []string{"status = $1", "project_id = $2"}
+	clauses := []string{"status = $1", "project_id = $2", "policy_eligibility_status <> 'POLICY_BLOCKED'"}
 
 	if templates := normalizedPollValues(filter.Templates); len(templates) > 0 {
 		placeholders := make([]string, 0, len(templates))
@@ -266,7 +266,7 @@ func pollJobCandidateQuery(projectID string, filter JobPollFilter) (string, []an
 	}
 
 	query := `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+		SELECT ` + jobSelectColumns() + `
 		FROM experiment_jobs
 		WHERE ` + strings.Join(clauses, " AND ") + `
 		ORDER BY created_at
@@ -299,6 +299,10 @@ func postgresPageLimitOffset(options PageOptions) (int, int) {
 }
 
 func (s *PostgresStore) CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error) {
+	return s.CreateJobWithOptions(projectID, template, config, CreateJobOptions{})
+}
+
+func (s *PostgresStore) CreateJobWithOptions(projectID string, template string, config map[string]any, options CreateJobOptions) (jobs.ExperimentJob, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return jobs.ExperimentJob{}, err
 	}
@@ -317,13 +321,21 @@ func (s *PostgresStore) CreateJob(projectID string, template string, config map[
 		return jobs.ExperimentJob{}, err
 	}
 	defer tx.Rollback()
-	const query = `
-		INSERT INTO experiment_jobs (project_id, template, status, config, max_attempts)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
-	`
+	datasetID := strings.TrimSpace(configString(config, "dataset_id"))
+	planID := strings.TrimSpace(configString(config, "plan_id"))
+	query := `
+		INSERT INTO experiment_jobs (
+			project_id, dataset_id, plan_id, template, status, config, max_attempts,
+			schedule_policy_evaluation_id, effective_policy_hash, policy_eligibility_status
+		)
+		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), $4, $5, $6, $7, NULLIF($8, ''), $9, $10)
+		RETURNING ` + jobSelectColumns()
 
-	job, err := scanJob(tx.QueryRowContext(ctx, query, projectID, template, jobs.StatusQueued, configJSON, defaultJobMaxAttempts))
+	job, err := scanJob(tx.QueryRowContext(
+		ctx, query, projectID, datasetID, planID, template, jobs.StatusQueued, configJSON,
+		defaultJobMaxAttempts, options.PolicyReference.EvaluationID,
+		options.PolicyReference.EffectivePolicyHash, options.PolicyReference.Status,
+	))
 	if err != nil {
 		return jobs.ExperimentJob{}, err
 	}
@@ -342,6 +354,8 @@ func (s *PostgresStore) CreateJob(projectID string, template string, config map[
 		return jobs.ExperimentJob{}, err
 	}
 	if spec, ok := executionSpecFromConfig(job.ID, projectID, job.Config, job.CreatedAt); ok {
+		spec.PolicyEvaluationID = options.PolicyReference.EvaluationID
+		spec.EffectivePolicyHash = options.PolicyReference.EffectivePolicyHash
 		if err := insertJobExecutionSpecTx(ctx, tx, spec); err != nil {
 			return jobs.ExperimentJob{}, err
 		}
@@ -374,8 +388,8 @@ func (s *PostgresStore) ListProjectJobs(projectID string) ([]jobs.ExperimentJob,
 		return nil, err
 	}
 
-	const query = `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+	query := `
+		SELECT ` + jobSelectColumns() + `
 		FROM experiment_jobs
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -404,8 +418,8 @@ func (s *PostgresStore) ListProjectJobsPage(projectID string, options PageOption
 		return nil, err
 	}
 	limit, offset := postgresPageLimitOffset(options)
-	const query = `
-		SELECT id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at
+	query := `
+		SELECT ` + jobSelectColumns() + `
 		FROM experiment_jobs
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -558,10 +572,11 @@ func (s *PostgresStore) recoverExpiredJobLeasesTx(ctx context.Context, tx *sql.T
 					started_at = NULL,
 					lease_owner_worker_id = '',
 					lease_expires_at = NULL,
-					lease_last_heartbeat_at = NULL
+					lease_last_heartbeat_at = NULL,
+					policy_eligibility_status = $4
 				WHERE id = $2
 				RETURNING `+jobSelectColumns()+`
-			`, jobs.StatusQueued, job.ID, configJSON))
+			`, jobs.StatusQueued, job.ID, configJSON, jobs.PolicyEligibilityPending))
 		}
 		if err != nil {
 			return nil, err

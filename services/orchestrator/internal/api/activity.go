@@ -702,6 +702,16 @@ func activityFromExecutionEvent(event execution.ExecutionEvent) agentActivityEve
 			activity.Title = "Job attempts exhausted"
 			activity.Status = "failed"
 		}
+	case execution.EventJobPolicyBlocked:
+		activity.Type = "job.policy_blocked"
+		activity.Severity = "warning"
+		activity.Title = "Job blocked by policy"
+		activity.Status = "blocked"
+	case execution.EventJobPolicyReconciled:
+		activity.Type = "job.policy_reconciled"
+		activity.Severity = "info"
+		activity.Title = "Job policy revalidated"
+		activity.Status = "waiting"
 	case execution.EventExecutionFailed, execution.EventJobFailed:
 		activity.Type = "system.failed"
 		activity.Severity = "error"

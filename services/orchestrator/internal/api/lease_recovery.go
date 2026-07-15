@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -8,8 +9,11 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/diagnostics"
+	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/runs"
+	"model-express/services/orchestrator/internal/store"
 )
 
 const (
@@ -70,11 +74,19 @@ func (s *Server) recoverExpiredLeasesOnce(now time.Time) ([]jobs.ExperimentJob, 
 
 	requeuedCount := 0
 	failedCount := 0
-	for _, job := range recovered {
+	for index, job := range recovered {
 		if job.Status == jobs.StatusFailed {
 			failedCount++
 			s.handleRecoveredExpiredLeaseFailure(job)
 			continue
+		}
+		if policyControlledJobTemplate(job.Template) {
+			reconciled, reconcileErr := s.reconcileRecoveredJobPolicy(job)
+			if reconcileErr != nil {
+				return recovered, reconcileErr
+			}
+			job = reconciled
+			recovered[index] = reconciled
 		}
 		requeuedCount++
 	}
@@ -86,6 +98,32 @@ func (s *Server) recoverExpiredLeasesOnce(now time.Time) ([]jobs.ExperimentJob, 
 		"job_ids":         experimentJobIDs(recovered),
 	})
 	return recovered, nil
+}
+
+func (s *Server) reconcileRecoveredJobPolicy(job jobs.ExperimentJob) (jobs.ExperimentJob, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		evaluation, evaluateErr := s.evaluateJobPolicy(job.ProjectID, job.ID, job.Template, job.Config, policyOperationRequeueRun)
+		if evaluation.EffectivePolicyHash == "" {
+			return job, evaluateErr
+		}
+		updated, created, applied, err := s.store.ApplyQueuedJobPolicyEvaluation(job.ID, evaluation)
+		if errors.Is(err, store.ErrPolicyChanged) {
+			continue
+		}
+		if err != nil {
+			return job, err
+		}
+		if !applied {
+			return updated, nil
+		}
+		if evaluateErr != nil || created.Decision == policies.DecisionDenied {
+			s.recordJobPolicyActivity(updated, created, execution.EventJobPolicyBlocked, "Lease-recovered job blocked by the current experiment policy.")
+		} else {
+			s.recordJobPolicyActivity(updated, created, execution.EventJobPolicyReconciled, "Lease-recovered job revalidated against the current experiment policy.")
+		}
+		return updated, nil
+	}
+	return job, store.ErrPolicyChanged
 }
 
 func (s *Server) handleRecoveredExpiredLeaseFailure(job jobs.ExperimentJob) {

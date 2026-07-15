@@ -34,23 +34,27 @@ type JobExecutionSpec struct {
 	RequestedConfigHash string         `json:"requested_config_hash"`
 	AcceptedSpecHash    string         `json:"accepted_spec_hash"`
 	AcceptedSpec        map[string]any `json:"accepted_spec"`
+	PolicyEvaluationID  string         `json:"policy_evaluation_id,omitempty"`
+	EffectivePolicyHash string         `json:"effective_policy_hash,omitempty"`
 	CreatedAt           time.Time      `json:"created_at"`
 }
 
 type AttemptExecutionRecord struct {
-	ID                    string                   `json:"id"`
-	JobID                 string                   `json:"job_id"`
-	ProjectID             string                   `json:"project_id"`
-	AttemptID             string                   `json:"attempt_id"`
-	AttemptNumber         int                      `json:"attempt_number"`
-	LifecycleStatus       string                   `json:"lifecycle_status"`
-	FidelityVerdict       *string                  `json:"fidelity_verdict"`
-	RealizedEffectiveHash string                   `json:"realized_effective_hash,omitempty"`
-	AdjustmentReasonCodes []string                 `json:"adjustment_reason_codes,omitempty"`
-	LatestRealizedConfig  map[string]any           `json:"latest_realized_config,omitempty"`
-	CreatedAt             time.Time                `json:"created_at"`
-	UpdatedAt             time.Time                `json:"updated_at"`
-	Observations          []RealizationObservation `json:"observations,omitempty"`
+	ID                         string                   `json:"id"`
+	JobID                      string                   `json:"job_id"`
+	ProjectID                  string                   `json:"project_id"`
+	AttemptID                  string                   `json:"attempt_id"`
+	AttemptNumber              int                      `json:"attempt_number"`
+	LifecycleStatus            string                   `json:"lifecycle_status"`
+	FidelityVerdict            *string                  `json:"fidelity_verdict"`
+	RealizedEffectiveHash      string                   `json:"realized_effective_hash,omitempty"`
+	AdjustmentReasonCodes      []string                 `json:"adjustment_reason_codes,omitempty"`
+	LatestRealizedConfig       map[string]any           `json:"latest_realized_config,omitempty"`
+	DispatchPolicyEvaluationID string                   `json:"dispatch_policy_evaluation_id,omitempty"`
+	EffectivePolicyHash        string                   `json:"effective_policy_hash,omitempty"`
+	CreatedAt                  time.Time                `json:"created_at"`
+	UpdatedAt                  time.Time                `json:"updated_at"`
+	Observations               []RealizationObservation `json:"observations,omitempty"`
 }
 
 type RealizationObservation struct {
@@ -121,6 +125,8 @@ const (
 	EventChampionFeedbackRecorded       = "CHAMPION_FEEDBACK_RECORDED"
 	EventJobRetryQueued                 = "JOB_RETRY_QUEUED"
 	EventJobStaleCallbackIgnored        = "JOB_STALE_CALLBACK_IGNORED"
+	EventJobPolicyBlocked               = "JOB_POLICY_BLOCKED"
+	EventJobPolicyReconciled            = "JOB_POLICY_RECONCILED"
 	EventExecutionCancellationRequested = "EXECUTION_CANCELLATION_REQUESTED"
 	EventExecutionCancelled             = "EXECUTION_CANCELLED"
 	EventRemoteWorkCancelRequested      = "REMOTE_WORK_CANCEL_REQUESTED"
@@ -239,6 +245,10 @@ func SafeExecutionEventMetadataKeys() []string {
 		"backend_stop_guard",
 		"reason",
 		"reason_code",
+		"reason_codes",
+		"policy_evaluation_id",
+		"effective_policy_hash",
+		"policy_eligibility_status",
 		"model",
 		"selection_source",
 		"materialization_status",

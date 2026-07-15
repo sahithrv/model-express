@@ -171,6 +171,70 @@ func EvaluateProposal(effective EffectivePolicy, operation string, experiments [
 	}
 }
 
+// EvaluateCapabilityUses validates a lifecycle action that is not represented
+// by a PlannedExperiment, such as a direct champion-export job. The caller
+// supplies the canonicalizable catalog uses and the concrete subject used for
+// the append-only candidate hash.
+func EvaluateCapabilityUses(effective EffectivePolicy, operation string, subject any, uses []CapabilityUse) (Evaluation, error) {
+	evaluation, err := EvaluationFromEffectivePolicy(effective, operation, "", "")
+	if err != nil {
+		return Evaluation{}, err
+	}
+	_, configHash, err := canonicalJSONAndHash(subject)
+	if err != nil {
+		return Evaluation{}, fmt.Errorf("hash lifecycle policy subject: %w", err)
+	}
+	evaluation.CandidateConfigHash = configHash
+	evaluation.Decision = DecisionAllowed
+	evaluation.Findings = []Finding{}
+	evaluation.ReasonCodes = []ReasonCode{}
+
+	requested := []CapabilityUse{}
+	realized := []CapabilityUse{}
+	findings := []Finding{}
+	for _, use := range uses {
+		canonicalUse, entry, useErr := canonicalizeProposalUse(use)
+		if useErr != nil {
+			findings = append(findings, proposalUnknownFinding(use))
+			continue
+		}
+		requested = append(requested, canonicalUse)
+		if !IsPermitted(effective, canonicalUse.Catalog, canonicalUse.ID) {
+			findings = append(findings, proposalDeniedFinding(effective, canonicalUse))
+			continue
+		}
+		realized = append(realized, canonicalUse)
+		realized = append(realized, impliedCapabilityUses(entry, canonicalUse.FieldPath)...)
+	}
+	for _, resolved := range effective.Snapshot.ResolvedDefaults {
+		use := CapabilityUse{Catalog: resolved.Catalog, ID: resolved.ID, FieldPath: resolved.Field, Origin: resolved.Origin}
+		if IsPermitted(effective, use.Catalog, use.ID) {
+			realized = append(realized, use)
+		}
+	}
+	if task := effective.Snapshot.Context.Task; task != "" {
+		realized = append(realized, CapabilityUse{Catalog: "tasks", ID: task, FieldPath: "task", Origin: "fixed"})
+	}
+	if runner := effective.Snapshot.Context.Runner; runner != "" {
+		realized = append(realized, CapabilityUse{Catalog: "runners", ID: runner, FieldPath: "runner", Origin: "fixed"})
+	}
+	evaluation.RequestedCapabilityUses = uniqueSortedCapabilityUses(requested)
+	evaluation.EffectiveCapabilityUses = uniqueSortedCapabilityUses(realized)
+	evaluation.Findings = uniqueSortedFindings(findings)
+	evaluation.ReasonCodes = findingReasonCodes(evaluation.Findings)
+	if len(evaluation.Findings) == 0 {
+		return evaluation, nil
+	}
+	evaluation.Decision = DecisionDenied
+	return evaluation, &PolicyError{
+		Code:                evaluation.Findings[0].Code,
+		Message:             "requested lifecycle action contains capabilities excluded by the effective experiment policy",
+		EffectivePolicyHash: effective.EffectivePolicyHash,
+		Findings:            append([]Finding(nil), evaluation.Findings...),
+		ContributingScopes:  scopeContributions(evaluation.Findings),
+	}
+}
+
 type proposalFieldValue struct {
 	Value   any
 	Present bool

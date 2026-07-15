@@ -895,6 +895,8 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 	if err := row.Scan(
 		&job.ID,
 		&job.ProjectID,
+		&job.DatasetID,
+		&job.PlanID,
 		&job.WorkerID,
 		&job.Template,
 		&job.Status,
@@ -906,6 +908,9 @@ func scanJob(row rowScanner) (jobs.ExperimentJob, error) {
 		&job.LeaseOwnerWorkerID,
 		&leaseExpiresAt,
 		&leaseLastHeartbeatAt,
+		&job.SchedulePolicyEvaluationID,
+		&job.EffectivePolicyHash,
+		&job.PolicyEligibilityStatus,
 		&job.CreatedAt,
 		&startedAt,
 		&completedAt,
@@ -1924,7 +1929,7 @@ func selectJobSQL(column string) string {
 }
 
 func jobSelectColumns() string {
-	return "id, project_id, worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, created_at, started_at, completed_at"
+	return "id, project_id, COALESCE(dataset_id, ''), COALESCE(plan_id, ''), worker_id, template, status, config, mlflow_run_id, error, attempt, max_attempts, lease_owner_worker_id, lease_expires_at, lease_last_heartbeat_at, COALESCE(schedule_policy_evaluation_id, ''), effective_policy_hash, policy_eligibility_status, created_at, started_at, completed_at"
 }
 
 func datasetVisualAnalysisSelectColumns() string {

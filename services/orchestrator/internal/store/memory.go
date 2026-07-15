@@ -586,6 +586,9 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 		if job.Status != jobs.StatusQueued {
 			continue
 		}
+		if job.PolicyEligibilityStatus == jobs.PolicyEligibilityBlocked {
+			continue
+		}
 		if job.ProjectID != worker.ProjectID {
 			continue
 		}
@@ -640,6 +643,10 @@ func (s *MemoryStore) PollJob(workerID string, filter JobPollFilter) (*jobs.Expe
 }
 
 func (s *MemoryStore) CreateJob(projectID string, template string, config map[string]any) (jobs.ExperimentJob, error) {
+	return s.CreateJobWithOptions(projectID, template, config, CreateJobOptions{})
+}
+
+func (s *MemoryStore) CreateJobWithOptions(projectID string, template string, config map[string]any, options CreateJobOptions) (jobs.ExperimentJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -651,13 +658,18 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 	}
 
 	job := jobs.ExperimentJob{
-		ID:          s.newID("job"),
-		ProjectID:   projectID,
-		Template:    template,
-		Status:      jobs.StatusQueued,
-		Config:      config,
-		MaxAttempts: defaultJobMaxAttempts,
-		CreatedAt:   time.Now().UTC(),
+		ID:                         s.newID("job"),
+		ProjectID:                  projectID,
+		DatasetID:                  strings.TrimSpace(configString(config, "dataset_id")),
+		PlanID:                     strings.TrimSpace(configString(config, "plan_id")),
+		Template:                   template,
+		Status:                     jobs.StatusQueued,
+		Config:                     config,
+		MaxAttempts:                defaultJobMaxAttempts,
+		SchedulePolicyEvaluationID: options.PolicyReference.EvaluationID,
+		EffectivePolicyHash:        options.PolicyReference.EffectivePolicyHash,
+		PolicyEligibilityStatus:    options.PolicyReference.Status,
+		CreatedAt:                  time.Now().UTC(),
 	}
 	job.Config = jobConfigWithImmutableExecutionSpec(config, job.Config)
 	job.Config = jobConfigWithPendingAttempt(job.Config, job.ID, 1)
@@ -677,6 +689,8 @@ func (s *MemoryStore) CreateJob(projectID string, template string, config map[st
 		return jobs.ExperimentJob{}, err
 	}
 	if spec, ok := executionSpecFromConfig(job.ID, projectID, job.Config, job.CreatedAt); ok {
+		spec.PolicyEvaluationID = options.PolicyReference.EvaluationID
+		spec.EffectivePolicyHash = options.PolicyReference.EffectivePolicyHash
 		s.jobExecutionSpecs[job.ID] = spec
 	}
 	return jobs.WithExecutionSpecStatus(job), nil
@@ -776,6 +790,7 @@ func (s *MemoryStore) recoverExpiredJobLeasesLocked(now time.Time) ([]jobs.Exper
 			job.Config = jobConfigWithTerminalAttempt(job.Config, job.ID, job.Attempt)
 		} else {
 			job.Status = jobs.StatusQueued
+			job.PolicyEligibilityStatus = jobs.PolicyEligibilityPending
 			job.Error = ""
 			job.WorkerID = ""
 			job.StartedAt = nil
@@ -3045,6 +3060,11 @@ func (s *MemoryStore) RetryJob(jobID string, message string, options RetryJobOpt
 		nextConfig = copyAnyMap(options.Config)
 	}
 	nextConfig = jobConfigWithImmutableExecutionSpec(job.Config, nextConfig)
+	if options.PolicyReference.EvaluationID != "" {
+		job.SchedulePolicyEvaluationID = options.PolicyReference.EvaluationID
+		job.EffectivePolicyHash = options.PolicyReference.EffectivePolicyHash
+		job.PolicyEligibilityStatus = options.PolicyReference.Status
+	}
 	if requeued {
 		job.Status = jobs.StatusQueued
 		job.Error = message

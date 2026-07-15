@@ -15,6 +15,12 @@ const (
 )
 
 const (
+	PolicyEligibilityAllowed = "ALLOWED"
+	PolicyEligibilityPending = "PENDING"
+	PolicyEligibilityBlocked = "POLICY_BLOCKED"
+)
+
+const (
 	TemplateProfileDataset          = "profile_dataset"
 	TemplateTrainExperiment         = "train_experiment"
 	TemplateLabelQualityAudit       = "label_quality_audit"
@@ -25,23 +31,28 @@ const (
 )
 
 type ExperimentJob struct {
-	ID                   string         `json:"id"`
-	ProjectID            string         `json:"project_id"`
-	WorkerID             string         `json:"worker_id,omitempty"`
-	Template             string         `json:"template"`
-	Status               string         `json:"status"`
-	ExecutionSpecStatus  string         `json:"execution_spec_status,omitempty"`
-	Config               map[string]any `json:"config"`
-	MLflowRunID          string         `json:"mlflow_run_id,omitempty"`
-	Error                string         `json:"error,omitempty"`
-	Attempt              int            `json:"attempt"`
-	MaxAttempts          int            `json:"max_attempts"`
-	LeaseOwnerWorkerID   string         `json:"lease_owner_worker_id,omitempty"`
-	LeaseExpiresAt       *time.Time     `json:"lease_expires_at,omitempty"`
-	LeaseLastHeartbeatAt *time.Time     `json:"lease_last_heartbeat_at,omitempty"`
-	CreatedAt            time.Time      `json:"created_at"`
-	StartedAt            *time.Time     `json:"started_at,omitempty"`
-	CompletedAt          *time.Time     `json:"completed_at,omitempty"`
+	ID                         string         `json:"id"`
+	ProjectID                  string         `json:"project_id"`
+	DatasetID                  string         `json:"dataset_id,omitempty"`
+	PlanID                     string         `json:"plan_id,omitempty"`
+	WorkerID                   string         `json:"worker_id,omitempty"`
+	Template                   string         `json:"template"`
+	Status                     string         `json:"status"`
+	ExecutionSpecStatus        string         `json:"execution_spec_status,omitempty"`
+	Config                     map[string]any `json:"config"`
+	MLflowRunID                string         `json:"mlflow_run_id,omitempty"`
+	Error                      string         `json:"error,omitempty"`
+	Attempt                    int            `json:"attempt"`
+	MaxAttempts                int            `json:"max_attempts"`
+	LeaseOwnerWorkerID         string         `json:"lease_owner_worker_id,omitempty"`
+	LeaseExpiresAt             *time.Time     `json:"lease_expires_at,omitempty"`
+	LeaseLastHeartbeatAt       *time.Time     `json:"lease_last_heartbeat_at,omitempty"`
+	SchedulePolicyEvaluationID string         `json:"schedule_policy_evaluation_id,omitempty"`
+	EffectivePolicyHash        string         `json:"effective_policy_hash,omitempty"`
+	PolicyEligibilityStatus    string         `json:"policy_eligibility_status,omitempty"`
+	CreatedAt                  time.Time      `json:"created_at"`
+	StartedAt                  *time.Time     `json:"started_at,omitempty"`
+	CompletedAt                *time.Time     `json:"completed_at,omitempty"`
 }
 
 func WithExecutionSpecStatus(job ExperimentJob) ExperimentJob {
