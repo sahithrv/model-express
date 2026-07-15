@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"model-express/services/orchestrator/internal/catalog"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
@@ -1702,12 +1703,11 @@ func normalizeChampionExportFormat(format string) string {
 	if format == "" {
 		format = "onnx"
 	}
-	switch format {
-	case "onnx", "torchscript", "pytorch", "safetensors":
-		return format
-	default:
+	entry, ok := catalog.Resolve("export_formats", format)
+	if !ok || !entry.Available {
 		return ""
 	}
+	return entry.ID
 }
 
 func championArtifactURI(deploymentProfile map[string]any) string {

@@ -89,6 +89,10 @@ class ModalTrainingHelperTests(unittest.TestCase):
             },
         }
 
+    def test_unknown_classifier_model_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown or unavailable models ID"):
+            self.modal_app._build_model("unknown_model", 2, pretrained=False)
+
     def test_safe_dataloader_defaults_cap_workers(self) -> None:
         previous_safe = os.environ.get("MODEL_EXPRESS_DATALOADER_SAFE_DEFAULTS")
         previous_workers = os.environ.get("MODEL_EXPRESS_MODAL_DATALOADER_WORKERS")

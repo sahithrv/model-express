@@ -10,6 +10,7 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/catalog"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
@@ -18,36 +19,7 @@ import (
 )
 
 func supportedModelCatalog() []agents.SupportedModelSpec {
-	return []agents.SupportedModelSpec{
-		classificationModelSpec("mobilenet_v3_small", "mobilenet", "fast_live", 224, 50, "very_fast", "fast live baseline and compact champion refinement"),
-		classificationModelSpec("mobilenet_v3_large", "mobilenet", "fast_live", 224, 80, "fast", "higher-capacity MobileNet challenger for live use"),
-		classificationModelSpec("efficientnet_b0", "efficientnet", "fast_live", 224, 80, "fast", "strong quality/latency baseline"),
-		classificationModelSpec("regnet_y_400mf", "regnet", "fast_live", 224, 100, "fast", "compact architecture challenger"),
-		classificationModelSpec("efficientnet_b1", "efficientnet", "balanced", 240, 150, "medium", "balanced quality challenger"),
-		classificationModelSpec("efficientnet_b2", "efficientnet", "balanced", 260, 250, "medium", "stronger quality challenger when budget allows"),
-		classificationModelSpec("resnet18", "resnet", "balanced", 224, 100, "medium", "stable control architecture"),
-		classificationModelSpec("resnet34", "resnet", "balanced", 224, 150, "medium_slow", "larger ResNet comparison"),
-		classificationModelSpec("convnext_tiny", "convnext", "quality_challenger", 224, 300, "slow", "quality-first challenger"),
-		classificationModelSpec("swin_t", "swin", "quality_challenger", 224, 500, "slow", "transformer challenger for larger datasets"),
-		classificationModelSpec("vit_b_16", "vit", "quality_challenger", 224, 800, "slowest", "explicit quality-first experiments on larger datasets"),
-	}
-}
-
-func classificationModelSpec(name, family, deploymentTier string, imageSize, minImages int, latencyClass, recommendedUse string) agents.SupportedModelSpec {
-	return agents.SupportedModelSpec{
-		Name:                  name,
-		Family:                family,
-		TaskType:              "image_classification",
-		ModelKind:             "torchvision_classifier",
-		DeploymentTier:        deploymentTier,
-		DefaultImageSize:      imageSize,
-		MinRecommendedImages:  minImages,
-		SupportsTransfer:      true,
-		TrainingEnabled:       true,
-		ExpectedLatencyClass:  latencyClass,
-		RecommendedUse:        recommendedUse,
-		SupportsFineTuneModes: []string{"head_only", "last_block", "full"},
-	}
+	return supportedModelCatalogForTask("image_classification")
 }
 
 func supportedModelCatalogForDataset(dataset datasets.Dataset, agentSafeMetadataSummary map[string]any) []agents.SupportedModelSpec {
@@ -59,51 +31,74 @@ func supportedModelCatalogForDataset(dataset datasets.Dataset, agentSafeMetadata
 }
 
 func supportedYOLODetectorModelCatalog() []agents.SupportedModelSpec {
-	return []agents.SupportedModelSpec{
-		yoloDetectorModelSpec("yolo11n.pt", "realtime_detector", "very_fast", "nano COCO-pretrained detector for the first live-stream baseline"),
-		yoloDetectorModelSpec("yolo11s.pt", "realtime_detector", "fast", "small COCO-pretrained detector with stronger accuracy while staying live-friendly"),
-		yoloDetectorModelSpec("yolo11m.pt", "quality_detector", "medium", "medium COCO-pretrained detector for quality challengers when latency budget allows"),
-		yoloDetectorModelSpec("yolo11l.pt", "quality_detector", "slow", "large COCO-pretrained detector for high-accuracy offline comparison"),
-		yoloDetectorModelSpec("yolo11x.pt", "quality_detector", "slowest", "extra-large COCO-pretrained detector for upper-bound detection quality studies"),
-	}
+	return supportedModelCatalogForTask("object_detection")
 }
 
-func yoloDetectorModelSpec(name, deploymentTier, latencyClass, recommendedUse string) agents.SupportedModelSpec {
-	return agents.SupportedModelSpec{
-		Name:                 name,
-		Family:               "yolo11",
-		TaskType:             "object_detection",
-		ModelKind:            "ultralytics_yolo_detector",
-		PretrainedWeights:    name,
-		DeploymentTier:       deploymentTier,
-		DefaultImageSize:     640,
-		MinRecommendedImages: 100,
-		SupportsTransfer:     true,
-		TrainingEnabled:      true,
-		ExpectedLatencyClass: latencyClass,
-		RecommendedUse:       recommendedUse + "; schedule only for YOLO object-detection datasets.",
-	}
-}
-
-func supportedModelNames() map[string]bool {
-	out := map[string]bool{}
-	for _, spec := range supportedModelCatalog() {
-		out[strings.ToLower(spec.Name)] = true
-	}
-	for _, spec := range supportedYOLODetectorModelCatalog() {
-		out[strings.ToLower(spec.Name)] = true
+func supportedModelCatalogForTask(task string) []agents.SupportedModelSpec {
+	out := []agents.SupportedModelSpec{}
+	for _, entry := range catalog.Entries("models") {
+		if !entry.Available || !containsString(entry.Tasks, task) {
+			continue
+		}
+		out = append(out, supportedModelSpecFromCatalog(entry, task))
 	}
 	return out
 }
 
+func supportedModelSpecFromCatalog(entry catalog.Entry, task string) agents.SupportedModelSpec {
+	return agents.SupportedModelSpec{
+		Name:                  entry.ID,
+		Family:                catalogStringAttribute(entry, "family"),
+		TaskType:              task,
+		ModelKind:             catalogStringAttribute(entry, "model_kind"),
+		PretrainedWeights:     catalogStringAttribute(entry, "pretrained_weights"),
+		DeploymentTier:        catalogStringAttribute(entry, "deployment_tier"),
+		DefaultImageSize:      catalogIntAttribute(entry, "default_image_size"),
+		MinRecommendedImages:  catalogIntAttribute(entry, "min_recommended_images"),
+		SupportsTransfer:      catalogBoolAttribute(entry, "supports_transfer"),
+		TrainingEnabled:       catalogBoolAttribute(entry, "training_enabled"),
+		ExpectedLatencyClass:  catalogStringAttribute(entry, "latency_tier"),
+		RecommendedUse:        catalogStringAttribute(entry, "recommended_use"),
+		SupportsFineTuneModes: catalogStringSliceAttribute(entry, "fine_tuning_modes"),
+	}
+}
+
+func supportedModelNames() map[string]bool {
+	return catalog.AllowedValues("models")
+}
+
 func supportedModelSpecByName(model string) (agents.SupportedModelSpec, bool) {
-	normalized := strings.ToLower(strings.TrimSpace(model))
-	for _, spec := range append(supportedModelCatalog(), supportedYOLODetectorModelCatalog()...) {
-		if strings.ToLower(spec.Name) == normalized {
-			return spec, true
+	entry, ok := catalog.Resolve("models", model)
+	if !ok || !entry.Available || len(entry.Tasks) != 1 {
+		return agents.SupportedModelSpec{}, false
+	}
+	return supportedModelSpecFromCatalog(entry, entry.Tasks[0]), true
+}
+
+func catalogStringAttribute(entry catalog.Entry, name string) string {
+	value, _ := entry.Attributes[name].(string)
+	return value
+}
+
+func catalogIntAttribute(entry catalog.Entry, name string) int {
+	value, _ := entry.Attributes[name].(float64)
+	return int(value)
+}
+
+func catalogBoolAttribute(entry catalog.Entry, name string) bool {
+	value, _ := entry.Attributes[name].(bool)
+	return value
+}
+
+func catalogStringSliceAttribute(entry catalog.Entry, name string) []string {
+	values, _ := entry.Attributes[name].([]any)
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if text, ok := value.(string); ok {
+			out = append(out, text)
 		}
 	}
-	return agents.SupportedModelSpec{}, false
+	return out
 }
 
 func datasetHasYOLODetectionEvidence(dataset datasets.Dataset, agentSafeMetadataSummary map[string]any) bool {
@@ -1179,119 +1174,53 @@ func allowedPlannerMechanisms() map[string]bool {
 }
 
 func allowedOptimizers() map[string]bool {
-	return map[string]bool{"adamw": true, "adam": true, "sgd": true}
+	return catalog.AllowedValues("optimizers")
 }
 
 func allowedSchedulers() map[string]bool {
-	return map[string]bool{"none": true, "cosine": true, "step": true}
+	return catalog.AllowedValues("schedulers")
 }
 
 func allowedResolutionStrategies() map[string]bool {
-	return map[string]bool{
-		"fixed":                    true,
-		"low_latency":              true,
-		"compare_224_256":          true,
-		"high_resolution_ablation": true,
-	}
+	return catalog.AllowedValues("resolution_strategies")
 }
 
 func allowedResizeStrategies() map[string]bool {
-	return map[string]bool{
-		"squash":                 true,
-		"preserve_aspect_pad":    true,
-		"center_crop":            true,
-		"random_resized_crop":    true,
-		"bbox_crop_if_available": true,
-		"letterbox":              true,
-		"yolo_letterbox":         true,
-	}
+	return catalog.AllowedValues("resize_strategies")
 }
 
 func allowedNormalizations() map[string]bool {
-	return map[string]bool{"imagenet": true, "dataset": true, "none": true}
+	return catalog.AllowedValues("normalization_strategies")
 }
 
 func allowedCropStrategies() map[string]bool {
-	return map[string]bool{
-		"none":                   true,
-		"center_crop":            true,
-		"random_resized_crop":    true,
-		"bbox_crop_if_available": true,
-		"bbox_crop_ablation":     true,
-	}
+	return catalog.AllowedValues("crop_strategies")
 }
 
 func allowedBBoxModes() map[string]bool {
-	return map[string]bool{
-		"ignore":                      true,
-		"crop_if_available":           true,
-		"crop_and_compare_full_image": true,
-		"use_boxes_as_metadata":       true,
-	}
+	return catalog.AllowedValues("bounding_box_modes")
 }
 
 func allowedAugmentationPolicies() map[string]bool {
-	return map[string]bool{
-		"none":               true,
-		"light":              true,
-		"moderate":           true,
-		"strong":             true,
-		"custom":             true,
-		"basic":              true,
-		"randaugment":        true,
-		"trivialaugment":     true,
-		"trivialaugmentwide": true,
-		"autoaugment":        true,
-		"mixup":              true,
-		"cutmix":             true,
-	}
+	return catalog.AllowedValues("augmentation_policies")
 }
 
 func allowedStructuredAugmentationPolicyTypes() map[string]bool {
-	return map[string]bool{
-		"none":               true,
-		"basic":              true,
-		"randaugment":        true,
-		"trivialaugment":     true,
-		"trivialaugmentwide": true,
-		"autoaugment":        true,
-		"mixup":              true,
-		"cutmix":             true,
-	}
+	return catalog.AllowedValuesMatching("augmentation_policies", func(entry catalog.Entry) bool {
+		return catalog.AttributeBool(entry, "structured")
+	})
 }
 
 func allowedAugmentationKeys() map[string]bool {
-	return map[string]bool{
-		"horizontal_flip": true,
-		"vertical_flip":   true,
-		"color_jitter":    true,
-		"random_crop":     true,
-		"random_rotation": true,
-		"random_erasing":  true,
-	}
+	return catalog.AllowedValues("augmentation_operations")
 }
 
 func allowedClassBalancingStrategies() map[string]bool {
-	return map[string]bool{
-		"none":                                 true,
-		"weighted_loss":                        true,
-		"class_weighted_loss":                  true,
-		"effective_number":                     true,
-		"effective_number_loss":                true,
-		"effective_number_class_balanced_loss": true,
-		"class_balanced_effective_number":      true,
-		"class_balanced_sampler":               true,
-		"weighted_random_sampler":              true,
-		"focal_loss":                           true,
-	}
+	return catalog.AllowedValues("class_balancing_strategies")
 }
 
 func allowedSamplingStrategies() map[string]bool {
-	return map[string]bool{
-		"none":                    true,
-		"class_balanced_sampler":  true,
-		"weighted_random_sampler": true,
-	}
+	return catalog.AllowedValues("sampling_strategies")
 }
 
 func recommendedWorkersForExperiments(experiments []plans.PlannedExperiment) int {

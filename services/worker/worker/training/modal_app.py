@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
+from worker.model_express_catalog import require_catalog_id
 from worker.progress import ProgressReporter
 from worker.training.augmentation import (
     MIXED_SAMPLE_POLICY_TYPES,
@@ -847,7 +848,12 @@ def _train_yolo_detector_impl(payload: dict) -> dict:
         config,
         effective_batch_size=resource_batch_size,
     )
-    model_name = str(yolo_execution.value("model"))
+    model_name = require_catalog_id(
+        "models",
+        str(yolo_execution.value("model")),
+        task="object_detection",
+        runner="modal_ultralytics",
+    )
     epochs = int(yolo_execution.value("epochs"))
     batch_size = int(yolo_execution.value("batch_size"))
     image_size = int(yolo_execution.value("image_size"))
@@ -3636,10 +3642,16 @@ def _build_model(
     fine_tune_strategy: str = "head_only",
     dropout: float = 0.0,
 ):
+    normalized = require_catalog_id(
+        "models",
+        model_name,
+        task="image_classification",
+        runner="modal_torchvision",
+    )
+
     from torch import nn
     from torchvision import models
 
-    normalized = model_name.lower()
     dropout = _bounded_float(dropout, default=0.0, minimum=0.0, maximum=0.7)
 
     if normalized == "efficientnet_b2":

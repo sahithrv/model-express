@@ -50,6 +50,17 @@ class RaisingExportResultClient(FakeClient):
 
 
 class ChampionJobTests(unittest.TestCase):
+    def test_unknown_classifier_model_does_not_fall_back_to_mobilenet(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown or unavailable models ID"):
+            _build_torchvision_model(
+                model_name="unknown_model",
+                class_count=2,
+                pretrained=False,
+                freeze_backbone=False,
+                fine_tune_strategy="full",
+                dropout=0,
+            )
+
     def test_versioned_export_uses_realized_preprocessing_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

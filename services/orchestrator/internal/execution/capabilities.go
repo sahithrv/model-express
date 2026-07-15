@@ -28,12 +28,14 @@ type RunnerDefinition struct {
 }
 
 type FieldDefinition struct {
-	Type          string            `json:"type"`
-	Normalization string            `json:"normalization,omitempty"`
-	Values        []string          `json:"values,omitempty"`
-	Aliases       map[string]string `json:"aliases,omitempty"`
-	Range         *NumericRange     `json:"range,omitempty"`
-	Required      bool              `json:"required,omitempty"`
+	Type            string            `json:"type"`
+	Normalization   string            `json:"normalization,omitempty"`
+	CatalogCategory string            `json:"catalog_category,omitempty"`
+	CatalogID       string            `json:"catalog_id,omitempty"`
+	Values          []string          `json:"values,omitempty"`
+	Aliases         map[string]string `json:"aliases,omitempty"`
+	Range           *NumericRange     `json:"range,omitempty"`
+	Required        bool              `json:"required,omitempty"`
 }
 
 type NumericRange struct {

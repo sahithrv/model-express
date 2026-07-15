@@ -26,9 +26,10 @@ from worker.exporting.artifacts import (
 )
 from worker.exporting.inference import demo_prediction_result_from_inference, run_demo_inference_from_manifest
 from worker.exporting.self_test import export_self_test_failed, export_self_test_validation_errors
+from worker.model_express_catalog import available_catalog_ids, require_catalog_id
 from worker.orchestrator_client import OrchestratorClient
 
-SUPPORTED_EXPORT_FORMATS = {"onnx", "torchscript", "pytorch", "safetensors"}
+SUPPORTED_EXPORT_FORMATS = available_catalog_ids("export_formats")
 HELPER_EXPORT_FORMATS = {
     "onnx": "onnx",
     "torchscript": "torchscript",
@@ -822,78 +823,86 @@ def _build_torchvision_model(
     fine_tune_strategy: str,
     dropout: float,
 ):
+    normalized = require_catalog_id(
+        "models",
+        model_name,
+        task="image_classification",
+        runner="modal_torchvision",
+    )
+
     from torch import nn
     from torchvision import models
 
-    normalized = model_name.lower()
     dropout = max(0.0, min(0.7, dropout))
 
-    if "efficientnet_b2" in normalized:
+    if normalized == "efficientnet_b2":
         model = _torchvision_model(models.efficientnet_b2, models.EfficientNet_B2_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet_b1" in normalized:
+    if normalized == "efficientnet_b1":
         model = _torchvision_model(models.efficientnet_b1, models.EfficientNet_B1_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "efficientnet" in normalized:
+    if normalized == "efficientnet_b0":
         model = _torchvision_model(models.efficientnet_b0, models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "resnet34" in normalized:
+    if normalized == "resnet34":
         model = _torchvision_model(models.resnet34, models.ResNet34_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "resnet" in normalized:
+    if normalized == "resnet18":
         model = _torchvision_model(models.resnet18, models.ResNet18_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "regnet_y_400mf" in normalized:
+    if normalized == "regnet_y_400mf":
         model = _torchvision_model(models.regnet_y_400mf, models.RegNet_Y_400MF_Weights.DEFAULT if pretrained else None)
         in_features = model.fc.in_features
         _apply_transfer_strategy(model, "fc", freeze_backbone, fine_tune_strategy)
         model.fc = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "convnext_tiny" in normalized:
+    if normalized == "convnext_tiny":
         model = _torchvision_model(models.convnext_tiny, models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
-    if "swin_t" in normalized:
+    if normalized == "swin_t":
         model = _torchvision_model(models.swin_t, models.Swin_T_Weights.DEFAULT if pretrained else None)
         in_features = model.head.in_features
         _apply_transfer_strategy(model, "head", freeze_backbone, fine_tune_strategy)
         model.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "vit_b_16" in normalized:
+    if normalized == "vit_b_16":
         model = _torchvision_model(models.vit_b_16, models.ViT_B_16_Weights.DEFAULT if pretrained else None)
         in_features = model.heads.head.in_features
         _apply_transfer_strategy(model, "heads", freeze_backbone, fine_tune_strategy)
         model.heads.head = _classification_head(nn, in_features, class_count, dropout)
         return model
-    if "mobilenet_v3_large" in normalized:
+    if normalized == "mobilenet_v3_large":
         model = _torchvision_model(models.mobilenet_v3_large, models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None)
         in_features = model.classifier[-1].in_features
         _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
         _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
         return model
 
-    model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
-    in_features = model.classifier[-1].in_features
-    _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
-    _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
-    return model
+    if normalized == "mobilenet_v3_small":
+        model = _torchvision_model(models.mobilenet_v3_small, models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
+        in_features = model.classifier[-1].in_features
+        _apply_transfer_strategy(model, "classifier", freeze_backbone, fine_tune_strategy)
+        _replace_classifier_head(nn, model.classifier, in_features, class_count, dropout)
+        return model
+    raise ValueError(f"Unsupported torchvision classification model {model_name!r}.")
 
 
 def _torchvision_model(factory, weights):

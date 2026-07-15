@@ -1,5 +1,26 @@
 # Execution Contracts
 
+`model_express_catalog.v1.json` is the canonical, versioned identity source for
+policy-addressable tasks, runners, models, execution options, and export/runtime
+capabilities. Its Go, Python, and TypeScript bindings are deterministic generated
+artifacts. The execution-capability contract references catalog categories for
+all of its enumerated IDs, and catalog generation fails when those references or
+aliases diverge.
+
+After editing the master catalog or its execution-capability references, run:
+
+```sh
+python3 scripts/generate_model_express_catalog.py
+python3 scripts/generate_experiment_execution_capabilities.py
+```
+
+Check both generated surfaces without rewriting them with:
+
+```sh
+python3 scripts/generate_model_express_catalog.py --check
+python3 scripts/generate_experiment_execution_capabilities.py --check
+```
+
 `experiment_execution_capabilities.v1.json` is the canonical, versioned source for experiment execution capabilities. It records the current semantics of each `PlannedExperiment` field for every supported task/runner pair. The classifications mean:
 
 - `executed`: the runner uses the field directly.
