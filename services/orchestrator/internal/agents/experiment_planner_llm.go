@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -897,6 +898,7 @@ type ExperimentPlanningTrace struct {
 	PromptContext           map[string]any
 	RawOutput               []byte
 	ParsedOutput            map[string]any
+	OutputNormalizations    []string
 	ValidationStatus        string
 	ValidationError         string
 	StrictValidationVerdict plannervalidation.Verdict
@@ -1041,8 +1043,9 @@ func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input 
 	trace.RawOutput = append([]byte(nil), raw...)
 	trace.ParsedOutput = rawOutputObject(raw)
 
-	var recommendation ExperimentPlanningRecommendation
-	if err := json.Unmarshal(raw, &recommendation); err != nil {
+	recommendation, normalizations, err := decodeExperimentPlannerRecommendation(raw)
+	trace.OutputNormalizations = normalizations
+	if err != nil {
 		wrapped := fmt.Errorf("decode experiment planner recommendation: %w", err)
 		trace.ValidationStatus = memory.InvocationValidationInvalid
 		trace.ValidationError = wrapped.Error()
@@ -1062,6 +1065,451 @@ func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input 
 	trace.ValidationStatus = memory.InvocationValidationValid
 	trace.ValidationError = ""
 	return trace, nil
+}
+
+func decodeExperimentPlannerRecommendation(raw []byte) (ExperimentPlanningRecommendation, []string, error) {
+	var recommendation ExperimentPlanningRecommendation
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return recommendation, nil, err
+	}
+	normalizations := normalizeExperimentPlannerOutput(root)
+	blob, err := json.Marshal(root)
+	if err != nil {
+		return recommendation, normalizations, err
+	}
+	if err := json.Unmarshal(blob, &recommendation); err != nil {
+		return recommendation, normalizations, err
+	}
+	return recommendation, normalizations, nil
+}
+
+func normalizeExperimentPlannerOutput(root map[string]any) []string {
+	if root == nil {
+		return nil
+	}
+	normalizations := []string{}
+	normalizePlannerStringFields(root, &normalizations, "top_level", []string{
+		"summary", "decision_type", "rationale", "planning_mode", "hypothesis", "primary_mechanism",
+		"dataset_preprocessing_rationale", "success_criteria", "stop_condition", "deployment_tradeoff",
+		"champion_job_id", "why_can_beat_champion", "stop_reason",
+	})
+	normalizePlannerStringSliceFields(root, &normalizations, "top_level", []string{
+		"deterministic_diagnosis_used", "evidence_used", "expected_failure_modes", "changed_variables",
+		"risks", "expected_tradeoffs", "novelty_notes", "tags",
+	})
+	normalizePlannerFloatFields(root, &normalizations, "top_level", []string{"confidence", "expected_delta_vs_champion"})
+	normalizePlannerGovernor(root, &normalizations)
+	normalizePlannerRejectedOptions(root, &normalizations)
+	normalizePlannerProposalMechanisms(root, &normalizations)
+	normalizePlannerCandidateHypotheses(root, &normalizations)
+	normalizePlannerExperiments(root["proposed_experiments"], &normalizations, "proposed_experiments")
+	return uniquePlannerStrings(normalizations)
+}
+
+func normalizePlannerGovernor(root map[string]any, normalizations *[]string) {
+	governor, ok := root["governor_compliance"].(map[string]any)
+	if !ok {
+		return
+	}
+	normalizePlannerStringSliceFields(governor, normalizations, "governor_compliance", []string{"blocked_mechanisms_seen"})
+	normalizePlannerStringFields(governor, normalizations, "governor_compliance", []string{"why_allowed_to_continue", "expected_value_justification"})
+	normalizePlannerBoolFields(governor, normalizations, "governor_compliance", []string{"avoided_blocked_mechanisms"})
+}
+
+func normalizePlannerRejectedOptions(root map[string]any, normalizations *[]string) {
+	items, ok := root["rejected_options"].([]any)
+	if !ok {
+		return
+	}
+	for index, item := range items {
+		option, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		path := fmt.Sprintf("rejected_options[%d]", index)
+		normalizePlannerStringFields(option, normalizations, path, []string{"option", "reason", "evidence"})
+		normalizePlannerStringSliceFields(option, normalizations, path, []string{"applies_when"})
+	}
+}
+
+func normalizePlannerProposalMechanisms(root map[string]any, normalizations *[]string) {
+	items, ok := root["proposal_mechanisms"].([]any)
+	if !ok {
+		return
+	}
+	for index, item := range items {
+		mechanism, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		path := fmt.Sprintf("proposal_mechanisms[%d]", index)
+		normalizePlannerIntFields(mechanism, normalizations, path, []string{"experiment_index"})
+		normalizePlannerStringFields(mechanism, normalizations, path, []string{"mechanism", "intervention", "expected_effect"})
+		normalizePlannerStringSliceFields(mechanism, normalizations, path, []string{"evidence_used"})
+	}
+}
+
+func normalizePlannerCandidateHypotheses(root map[string]any, normalizations *[]string) {
+	items, ok := root["candidate_hypotheses"].([]any)
+	if !ok {
+		return
+	}
+	for index, item := range items {
+		candidate, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		path := fmt.Sprintf("candidate_hypotheses[%d]", index)
+		normalizePlannerStringFields(candidate, normalizations, path, []string{
+			"hypothesis", "planning_mode", "mechanism", "intervention", "expected_effect", "risk", "cost_level",
+		})
+		normalizePlannerStringSliceFields(candidate, normalizations, path, []string{
+			"expected_tradeoffs", "evidence_used", "similar_success_memory_ids", "similar_failure_memory_ids",
+		})
+		normalizePlannerFloatFields(candidate, normalizations, path, []string{"expected_metric_impact", "novelty_score"})
+		normalizePlannerProposedChanges(candidate, normalizations, path)
+		normalizePlannerForecast(candidate, normalizations, path)
+		if experiment, ok := candidate["experiment_config"].(map[string]any); ok {
+			normalizePlannerExperiment(experiment, normalizations, path+".experiment_config")
+		}
+	}
+}
+
+func normalizePlannerProposedChanges(candidate map[string]any, normalizations *[]string, path string) {
+	value, ok := candidate["proposed_changes"]
+	if !ok {
+		return
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		return
+	case []any:
+		changes := map[string]any{}
+		for _, item := range typed {
+			switch entry := item.(type) {
+			case map[string]any:
+				for key, value := range entry {
+					if strings.TrimSpace(key) != "" {
+						changes[strings.TrimSpace(key)] = value
+					}
+				}
+			case string:
+				key, value, found := strings.Cut(entry, "=")
+				key = strings.TrimSpace(key)
+				if key == "" {
+					continue
+				}
+				if found {
+					changes[key] = strings.TrimSpace(value)
+				} else {
+					changes[key] = true
+				}
+			}
+		}
+		candidate["proposed_changes"] = changes
+		*normalizations = append(*normalizations, path+".proposed_changes array converted to object")
+	}
+}
+
+func normalizePlannerForecast(candidate map[string]any, normalizations *[]string, path string) {
+	forecast, ok := candidate["forecast"].(map[string]any)
+	if !ok {
+		return
+	}
+	forecastPath := path + ".forecast"
+	normalizePlannerStringFields(forecast, normalizations, forecastPath, []string{"forecast_target", "score_basis", "score_version", "baseline_job_id"})
+	normalizePlannerFloatFields(forecast, normalizations, forecastPath, []string{"baseline_score", "predicted_delta"})
+	if value, ok := forecast["metric_direction"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "maximize", "max", "higher", "higher_is_better":
+			forecast["metric_direction"] = calibration.MetricDirectionHigherIsBetter
+		case "minimize", "min", "lower", "lower_is_better":
+			forecast["metric_direction"] = calibration.MetricDirectionLowerIsBetter
+		}
+	}
+	if value, ok := forecast["prediction_source"]; ok {
+		if _, stringOK := value.(string); !stringOK {
+			forecast["prediction_source"] = calibration.CandidatePredictionSource
+			*normalizations = append(*normalizations, forecastPath+".prediction_source normalized to candidate.expected_metric_impact")
+		}
+	}
+	if value, ok := forecast["units"].(string); ok && strings.EqualFold(strings.TrimSpace(value), "score points") {
+		forecast["units"] = calibration.CandidateForecastUnits
+		*normalizations = append(*normalizations, forecastPath+".units normalized to fractional_score")
+	}
+	normalizePlannerForecastRange(forecast, normalizations, forecastPath)
+}
+
+func normalizePlannerForecastRange(forecast map[string]any, normalizations *[]string, path string) {
+	value, ok := forecast["valid_range"]
+	if !ok {
+		return
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		normalizePlannerFloatFields(typed, normalizations, path+".valid_range", []string{"min", "max"})
+	case string:
+		min, max, parsed := parsePlannerRangeString(typed)
+		if !parsed {
+			min, max = 0, 1
+		}
+		forecast["valid_range"] = map[string]any{"min": min, "max": max}
+		*normalizations = append(*normalizations, path+".valid_range string converted to object")
+	}
+}
+
+func parsePlannerRangeString(value string) (float64, float64, bool) {
+	trimmed := strings.TrimSpace(value)
+	trimmed = strings.Trim(trimmed, "[](){}")
+	parts := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == ',' || r == ':' || r == ';'
+	})
+	if len(parts) < 2 && strings.Contains(trimmed, "-") {
+		parts = strings.SplitN(trimmed, "-", 2)
+	}
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	min, minErr := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	max, maxErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if minErr != nil || maxErr != nil {
+		return 0, 0, false
+	}
+	return min, max, min < max
+}
+
+func normalizePlannerExperiments(value any, normalizations *[]string, path string) {
+	items, ok := value.([]any)
+	if !ok {
+		return
+	}
+	for index, item := range items {
+		experiment, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		normalizePlannerExperiment(experiment, normalizations, fmt.Sprintf("%s[%d]", path, index))
+	}
+}
+
+func normalizePlannerExperiment(experiment map[string]any, normalizations *[]string, path string) {
+	normalizePlannerStringFields(experiment, normalizations, path, []string{
+		"template", "model", "mechanism", "intervention", "expected_effect", "reason", "resolution_strategy",
+		"optimizer", "scheduler", "augmentation_policy", "class_balancing", "sampling_strategy", "strategy", "fine_tune_strategy",
+	})
+	normalizePlannerStringSliceFields(experiment, normalizations, path, []string{"evidence_used"})
+	normalizePlannerIntFields(experiment, normalizations, path, []string{"epochs", "batch_size", "image_size", "scheduler_step_size", "early_stopping_patience"})
+	normalizePlannerFloatFields(experiment, normalizations, path, []string{"learning_rate", "weight_decay", "dropout", "optimizer_momentum", "scheduler_gamma", "label_smoothing", "gradient_clip_norm"})
+	normalizePlannerBoolFields(experiment, normalizations, path, []string{"pretrained", "freeze_backbone"})
+	if preprocessing, ok := experiment["preprocessing"].(map[string]any); ok {
+		normalizePlannerStringFields(preprocessing, normalizations, path+".preprocessing", []string{"resize_strategy", "normalization", "crop_strategy", "bbox_mode"})
+		normalizePlannerBoolFields(preprocessing, normalizations, path+".preprocessing", []string{"use_dataset_normalization"})
+	}
+	if config, ok := experiment["augmentation_policy_config"].(map[string]any); ok {
+		normalizePlannerStringFields(config, normalizations, path+".augmentation_policy_config", []string{"policy_type"})
+		normalizePlannerIntFields(config, normalizations, path+".augmentation_policy_config", []string{"magnitude", "num_ops", "num_magnitude_bins"})
+		normalizePlannerFloatFields(config, normalizations, path+".augmentation_policy_config", []string{"probability", "alpha"})
+	}
+	if config, ok := experiment["class_balancing_config"].(map[string]any); ok {
+		normalizePlannerFloatFields(config, normalizations, path+".class_balancing_config", []string{"effective_number_beta", "focal_loss_gamma"})
+	}
+}
+
+func normalizePlannerStringFields(root map[string]any, normalizations *[]string, path string, fields []string) {
+	for _, field := range fields {
+		value, ok := root[field]
+		if !ok {
+			continue
+		}
+		text, changed, valid := plannerCoercedString(value)
+		if !valid {
+			continue
+		}
+		root[field] = text
+		if changed {
+			*normalizations = append(*normalizations, path+"."+field+" normalized to string")
+		}
+	}
+}
+
+func normalizePlannerStringSliceFields(root map[string]any, normalizations *[]string, path string, fields []string) {
+	for _, field := range fields {
+		value, ok := root[field]
+		if !ok {
+			continue
+		}
+		values, changed, valid := plannerCoercedStringSlice(value)
+		if !valid {
+			continue
+		}
+		root[field] = values
+		if changed {
+			*normalizations = append(*normalizations, path+"."+field+" normalized to string array")
+		}
+	}
+}
+
+func normalizePlannerIntFields(root map[string]any, normalizations *[]string, path string, fields []string) {
+	for _, field := range fields {
+		value, ok := root[field]
+		if !ok {
+			continue
+		}
+		integer, changed, valid := plannerCoercedInt(value)
+		if !valid {
+			continue
+		}
+		root[field] = integer
+		if changed {
+			*normalizations = append(*normalizations, path+"."+field+" normalized to integer")
+		}
+	}
+}
+
+func normalizePlannerFloatFields(root map[string]any, normalizations *[]string, path string, fields []string) {
+	for _, field := range fields {
+		value, ok := root[field]
+		if !ok {
+			continue
+		}
+		floatValue, changed, valid := plannerCoercedFloat(value)
+		if !valid {
+			continue
+		}
+		root[field] = floatValue
+		if changed {
+			*normalizations = append(*normalizations, path+"."+field+" normalized to number")
+		}
+	}
+}
+
+func normalizePlannerBoolFields(root map[string]any, normalizations *[]string, path string, fields []string) {
+	for _, field := range fields {
+		value, ok := root[field]
+		if !ok {
+			continue
+		}
+		boolValue, changed, valid := plannerCoercedBool(value)
+		if !valid {
+			continue
+		}
+		root[field] = boolValue
+		if changed {
+			*normalizations = append(*normalizations, path+"."+field+" normalized to boolean")
+		}
+	}
+}
+
+func plannerCoercedString(value any) (string, bool, bool) {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed), false, true
+	case []any:
+		values, _, _ := plannerCoercedStringSlice(typed)
+		return strings.Join(values, "; "), true, true
+	case []string:
+		return strings.Join(nonEmptyStrings(typed), "; "), true, true
+	case bool:
+		return strconv.FormatBool(typed), true, true
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64), true, true
+	case int:
+		return strconv.Itoa(typed), true, true
+	case json.Number:
+		return typed.String(), true, true
+	default:
+		return "", false, false
+	}
+}
+
+func plannerCoercedStringSlice(value any) ([]string, bool, bool) {
+	switch typed := value.(type) {
+	case []string:
+		return nonEmptyStrings(typed), false, true
+	case []any:
+		out := []string{}
+		for _, item := range typed {
+			switch value := item.(type) {
+			case string:
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			case map[string]any:
+				if compact := compactJSON(value); compact != "" && compact != "{}" {
+					out = append(out, compact)
+				}
+			}
+		}
+		return out, false, true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return []string{}, true, true
+		}
+		return []string{trimmed}, true, true
+	case bool:
+		return []string{strconv.FormatBool(typed)}, true, true
+	case float64:
+		return []string{strconv.FormatFloat(typed, 'f', -1, 64)}, true, true
+	case int:
+		return []string{strconv.Itoa(typed)}, true, true
+	case json.Number:
+		return []string{typed.String()}, true, true
+	default:
+		return []string{}, false, false
+	}
+}
+
+func plannerCoercedInt(value any) (int, bool, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int(math.Round(typed)), false, true
+	case int:
+		return typed, false, true
+	case json.Number:
+		integer, err := typed.Int64()
+		if err == nil {
+			return int(integer), true, true
+		}
+		floatValue, err := typed.Float64()
+		if err == nil {
+			return int(math.Round(floatValue)), true, true
+		}
+	case string:
+		floatValue, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err == nil {
+			return int(math.Round(floatValue)), true, true
+		}
+	}
+	return 0, false, false
+}
+
+func plannerCoercedFloat(value any) (float64, bool, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, false, true
+	case int:
+		return float64(typed), true, true
+	case json.Number:
+		value, err := typed.Float64()
+		return value, true, err == nil
+	case string:
+		value, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return value, true, err == nil
+	}
+	return 0, false, false
+}
+
+func plannerCoercedBool(value any) (bool, bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, false, true
+	case string:
+		value, err := strconv.ParseBool(strings.ToLower(strings.TrimSpace(typed)))
+		return value, true, err == nil
+	}
+	return false, false, false
 }
 
 // FinalizeAndValidatePlannerRecommendation is the production schedulability
@@ -1897,6 +2345,20 @@ func nonEmptyStrings(values []string) []string {
 		if strings.TrimSpace(value) != "" {
 			out = append(out, value)
 		}
+	}
+	return out
+}
+
+func uniquePlannerStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
 	}
 	return out
 }

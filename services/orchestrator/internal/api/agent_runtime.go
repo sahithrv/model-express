@@ -958,6 +958,9 @@ func (s *Server) recordExperimentPlannerInvocation(
 		if derivedCost != nil {
 			runtime["derived_cost"] = derivedCost
 		}
+		if len(trace.OutputNormalizations) > 0 {
+			runtime["output_normalizations"] = trace.OutputNormalizations
+		}
 	}
 
 	return s.store.CreateAgentInvocation(memory.AgentInvocation{

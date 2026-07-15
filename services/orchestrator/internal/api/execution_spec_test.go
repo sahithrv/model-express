@@ -173,6 +173,44 @@ func TestExecutionValidationEnforceBlocksBeforeJobCreation(t *testing.T) {
 	}
 }
 
+func TestNormalizeFollowUpExperimentDropsExecutionNoOpFields(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "enforce")
+	experiment := testExperiment("resnet18", 8)
+	experiment.ResolutionStrategy = "low_latency"
+	experiment.EarlyStoppingPatience = 3
+	experiment.Pretrained = true
+	experiment.AugmentationPolicyConfig = &plans.AugmentationPolicyConfig{Probability: 0.5, Alpha: 0.2}
+
+	normalized, warnings, err := normalizeFollowUpExperimentForExecution("local", experiment, 0)
+	if err != nil {
+		t.Fatalf("normalize follow-up experiment: %v", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected a warning describing the removed no-op field")
+	}
+	if normalized.ResolutionStrategy != "" {
+		t.Fatalf("resolution_strategy was not removed: %#v", normalized.ResolutionStrategy)
+	}
+	if normalized.EarlyStoppingPatience != 0 || normalized.Pretrained || normalized.AugmentationPolicyConfig != nil {
+		t.Fatalf("execution no-op fields were not removed: %#v", normalized)
+	}
+	if normalized.IsFieldPresent("resolution_strategy") {
+		t.Fatal("resolution_strategy field presence was not cleared")
+	}
+	spec, err := buildExecutionSpecV1(normalized, "local")
+	if err != nil {
+		t.Fatalf("build normalized execution spec: %v", err)
+	}
+	modelSpec, _ := supportedModelSpecByName(normalized.Model)
+	report, err := execution.ValidateExecutionSpecV1(spec, modelSpec.Family, execution.ValidationModeEnforce)
+	if err != nil {
+		t.Fatalf("validate normalized execution spec: %v", err)
+	}
+	if report.WouldBlock {
+		t.Fatalf("normalized follow-up still blocks execution: %#v", report)
+	}
+}
+
 func TestExecutionValidationEnforcePreflightsWholePlanBeforeCreatingJobs(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", "enforce")
 	valid := testExperiment("resnet18", 8)

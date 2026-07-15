@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -503,6 +504,14 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err := s.validateExperimentsDatasetCompatibility(sourcePlan.DatasetID, experiments); err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
+	var executionWarnings []string
+	experiments, executionWarnings, err = s.normalizeFollowUpExperimentsForExecution(projectID, sourcePlan.ID, decision.ID, experiments)
+	if err != nil {
+		message := "Follow-up scheduling blocked because the proposal contains fields the selected runner cannot execute."
+		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, []string{err.Error()})
+		return plans.ExperimentPlan{}, false, err
+	}
+	relaxedValidationWarnings = append(relaxedValidationWarnings, executionWarnings...)
 	acceptedSpecVerdict, acceptedSpecErr := plannervalidation.Evaluate(plannerValidationMode(), []plannervalidation.Check{{
 		Code:     "accepted_spec_no_op",
 		Category: plannervalidation.CategoryProposalNoOp,
@@ -593,6 +602,137 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	}
 
 	return plan, true, nil
+}
+
+func (s *Server) normalizeFollowUpExperimentsForExecution(projectID string, sourcePlanID string, decisionID string, experiments []plans.PlannedExperiment) ([]plans.PlannedExperiment, []string, error) {
+	provider := s.defaultExecuteExperimentPlanRequest().Provider
+	if provider == "" {
+		provider = "local"
+	}
+	provider = normalizeTrainingProvider(provider)
+	out := append([]plans.PlannedExperiment(nil), experiments...)
+	warnings := []string{}
+	for index, experiment := range out {
+		if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+			continue
+		}
+		normalized, experimentWarnings, err := normalizeFollowUpExperimentForExecution(provider, experiment, index)
+		if err != nil {
+			return experiments, warnings, err
+		}
+		out[index] = normalized
+		warnings = append(warnings, experimentWarnings...)
+	}
+	if len(warnings) > 0 {
+		if _, err := s.store.CreateExecutionEvent(projectID, sourcePlanID, execution.EventExecutionValidationReported, "Follow-up proposal was normalized to remove runner no-op fields before scheduling.", map[string]any{
+			"source_decision_id": decisionID,
+			"warnings":           warnings,
+		}); err != nil {
+			log.Printf("record follow-up execution normalization event failed: %v", err)
+		}
+	}
+	return out, warnings, nil
+}
+
+func normalizeFollowUpExperimentForExecution(provider string, experiment plans.PlannedExperiment, index int) (plans.PlannedExperiment, []string, error) {
+	warnings := []string{}
+	for attempt := 0; attempt < 4; attempt++ {
+		spec, err := buildExecutionSpecV1(experiment, provider)
+		if err != nil {
+			return experiment, warnings, err
+		}
+		modelSpec, _ := supportedModelSpecByName(experiment.Model)
+		report, err := execution.ValidateExecutionSpecV1(spec, modelSpec.Family, execution.ValidationModeEnforce)
+		if err != nil {
+			return experiment, warnings, err
+		}
+		if !report.WouldBlock {
+			return experiment, warnings, nil
+		}
+		fields := followUpExecutionNoOpFields(report)
+		if len(fields) == 0 {
+			return experiment, warnings, fmt.Errorf(
+				"%w: experiment %d would be blocked by execution fidelity enforcement: %s",
+				store.ErrInvalidRequest, index, executionValidationSummary(report),
+			)
+		}
+		changed := false
+		for _, field := range fields {
+			normalized, removed, err := removeFollowUpExperimentConfigPath(experiment, field)
+			if err != nil {
+				return experiment, warnings, err
+			}
+			if !removed {
+				continue
+			}
+			experiment = normalized
+			changed = true
+			warnings = append(warnings, fmt.Sprintf("Removed unsupported %s from follow-up experiment %d because the active runner cannot execute that field.", field, index))
+		}
+		if !changed {
+			return experiment, warnings, fmt.Errorf(
+				"%w: experiment %d would be blocked by execution fidelity enforcement and no removable no-op fields were found: %s",
+				store.ErrInvalidRequest, index, executionValidationSummary(report),
+			)
+		}
+	}
+	return experiment, warnings, fmt.Errorf("%w: experiment %d still failed execution fidelity enforcement after follow-up normalization", store.ErrInvalidRequest, index)
+}
+
+func followUpExecutionNoOpFields(report execution.ExecutionValidationReport) []string {
+	fields := []string{}
+	for _, finding := range report.Findings {
+		if !finding.WouldBlock || strings.TrimSpace(finding.Field) == "" {
+			continue
+		}
+		switch finding.ReasonCode {
+		case "runner_does_not_consume", "simulator_does_not_model":
+			fields = append(fields, finding.Field)
+		}
+	}
+	return uniqueStrings(fields)
+}
+
+func removeFollowUpExperimentConfigPath(experiment plans.PlannedExperiment, path string) (plans.PlannedExperiment, bool, error) {
+	config, err := experiment.RequestedConfig()
+	if err != nil {
+		return experiment, false, err
+	}
+	if !deleteNestedConfigPath(config, strings.Split(path, ".")) {
+		return experiment, false, nil
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return experiment, false, err
+	}
+	var normalized plans.PlannedExperiment
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		return experiment, false, err
+	}
+	return normalized, true, nil
+}
+
+func deleteNestedConfigPath(root map[string]any, parts []string) bool {
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return false
+	}
+	key := strings.TrimSpace(parts[0])
+	if len(parts) == 1 {
+		if _, ok := root[key]; !ok {
+			return false
+		}
+		delete(root, key)
+		return true
+	}
+	child, ok := root[key].(map[string]any)
+	if !ok {
+		return false
+	}
+	removed := deleteNestedConfigPath(child, parts[1:])
+	if removed && len(child) == 0 {
+		delete(root, key)
+	}
+	return removed
 }
 
 func (s *Server) validateFollowUpAcceptedSpecNovelty(projectID string, experiments []plans.PlannedExperiment) error {
@@ -1409,13 +1549,6 @@ const (
 )
 
 func (s *Server) runDegradedPlannerFallbackAfterTrainingJob(job jobs.ExperimentJob, plannerErr error) (degradedPlannerFallbackOutcome, error) {
-	result, err := s.runAutomaticExperimentReview(job.ProjectID)
-	if err != nil {
-		return degradedPlannerFallbackNone, err
-	}
-	if result.Decision != nil && result.Decision.DecisionType == decisions.TypeSelectChampion {
-		return degradedPlannerFallbackSelected, nil
-	}
 	if _, err := s.store.GetProjectChampion(job.ProjectID); err == nil {
 		return degradedPlannerFallbackSelected, nil
 	} else if !errors.Is(err, store.ErrNotFound) {

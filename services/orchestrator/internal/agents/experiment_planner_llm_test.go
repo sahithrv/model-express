@@ -19,6 +19,78 @@ import (
 	"model-express/services/orchestrator/internal/runs"
 )
 
+func TestDecodeExperimentPlannerRecommendationNormalizesCommonShapeErrors(t *testing.T) {
+	recommendation := validExperimentPlannerRecommendationForMode("class_imbalance_ablation")
+	encoded, err := json.Marshal(recommendation)
+	if err != nil {
+		t.Fatalf("marshal recommendation: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(encoded, &root); err != nil {
+		t.Fatalf("decode recommendation map: %v", err)
+	}
+	root["success_criteria"] = []any{"macro-F1 improves", "latency stays acceptable"}
+	root["deterministic_diagnosis_used"] = true
+
+	candidates := root["candidate_hypotheses"].([]any)
+	candidate := candidates[0].(map[string]any)
+	candidate["proposed_changes"] = []any{"class_balancing=weighted_loss", "image_size=256"}
+	candidate["forecast"] = map[string]any{
+		"forecast_target":   "macro_f1",
+		"metric_direction":  "maximize",
+		"score_basis":       "validation",
+		"score_version":     calibration.CandidateForecastScoreVersionV1,
+		"baseline_score":    0.72,
+		"predicted_delta":   0.02,
+		"prediction_source": 0.02,
+		"units":             "score points",
+		"valid_range":       "[0,1]",
+	}
+	experiment := candidate["experiment_config"].(map[string]any)
+	experiment["epochs"] = "12"
+	experiment["pretrained"] = "true"
+
+	raw, err := json.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal malformed recommendation: %v", err)
+	}
+	normalized, normalizations, err := decodeExperimentPlannerRecommendation(raw)
+	if err != nil {
+		t.Fatalf("decode malformed recommendation: %v", err)
+	}
+	if !strings.Contains(normalized.SuccessCriteria, "macro-F1 improves") || !strings.Contains(normalized.SuccessCriteria, "latency stays acceptable") {
+		t.Fatalf("success_criteria was not normalized from an array: %q", normalized.SuccessCriteria)
+	}
+	if len(normalized.DeterministicDiagnosisUsed) != 1 || normalized.DeterministicDiagnosisUsed[0] != "true" {
+		t.Fatalf("boolean deterministic_diagnosis_used should normalize to a scalar-preserving string array, got %#v", normalized.DeterministicDiagnosisUsed)
+	}
+	first := normalized.CandidateHypotheses[0]
+	if first.ProposedChanges["class_balancing"] != "weighted_loss" || first.ProposedChanges["image_size"] != "256" {
+		t.Fatalf("proposed_changes were not normalized from key=value strings: %#v", first.ProposedChanges)
+	}
+	if first.Forecast == nil {
+		t.Fatal("forecast was dropped during normalization")
+	}
+	if first.Forecast.ValidRange.Min != 0 || first.Forecast.ValidRange.Max != 1 {
+		t.Fatalf("valid_range was not normalized: %#v", first.Forecast.ValidRange)
+	}
+	if first.Forecast.PredictionSource != calibration.CandidatePredictionSource {
+		t.Fatalf("prediction_source = %q, want %q", first.Forecast.PredictionSource, calibration.CandidatePredictionSource)
+	}
+	if first.Forecast.MetricDirection != calibration.MetricDirectionHigherIsBetter {
+		t.Fatalf("metric_direction = %q, want %q", first.Forecast.MetricDirection, calibration.MetricDirectionHigherIsBetter)
+	}
+	if first.Forecast.Units != calibration.CandidateForecastUnits {
+		t.Fatalf("units = %q, want %q", first.Forecast.Units, calibration.CandidateForecastUnits)
+	}
+	if first.ExperimentConfig.Epochs != 12 || !first.ExperimentConfig.Pretrained {
+		t.Fatalf("experiment_config scalar fields were not normalized: %#v", first.ExperimentConfig)
+	}
+	if len(normalizations) == 0 {
+		t.Fatal("expected normalization telemetry")
+	}
+}
+
 func TestExperimentPlannerTraceCapturesActualRequestRuntimeIdentityInputs(t *testing.T) {
 	// This test isolates request/identity tracing; strict behavior has dedicated
 	// validation tests and must not change the response fixture under test here.

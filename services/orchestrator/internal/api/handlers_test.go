@@ -8342,13 +8342,20 @@ func TestPlanningLoopAfterLLMPlannerFailureFallsBackToChampionSelection(t *testi
 	}
 	agentDecisions := listAgentDecisions(t, server, projectID)
 	fallbackDecisions := 0
+	addExperimentDecisions := 0
 	for _, decision := range agentDecisions {
 		if decision.DecisionType == decisions.TypeSelectChampion && decision.Payload["decision_source"] == llmPlannerDegradedChampionDecisionSource {
 			fallbackDecisions++
 		}
+		if decision.DecisionType == decisions.TypeAddExperiments {
+			addExperimentDecisions++
+		}
 	}
 	if fallbackDecisions != 1 {
 		t.Fatalf("expected degraded fallback decision to be idempotent, got %#v", agentDecisions)
+	}
+	if addExperimentDecisions != 0 {
+		t.Fatalf("planner failure fallback should not create deterministic follow-up proposals, got %#v", agentDecisions)
 	}
 	exports, err = server.store.ListProjectChampionExports(projectID)
 	if err != nil {
