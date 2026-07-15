@@ -7,6 +7,7 @@ try {
 const { app, BrowserWindow, dialog, ipcMain, Menu } = electron;
 const { spawn } = require("child_process");
 const crypto = require("crypto");
+const dns = require("dns");
 const fs = require("fs");
 const net = require("net");
 const os = require("os");
@@ -36,6 +37,11 @@ const ALLOWED_ORCHESTRATOR_METHODS = new Set(["GET", "HEAD", "POST", "PATCH", "D
 const DEFAULT_JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const DATASET_SELECTION_TTL_MS = 4 * 60 * 60 * 1000;
 const CLOUDFLARED_URL_TIMEOUT_MS = 25_000;
+const CLOUDFLARED_PUBLIC_READY_TIMEOUT_MS = 90_000;
+const CLOUDFLARED_PUBLIC_READY_RETRY_MS = 750;
+const CLOUDFLARED_PUBLIC_READY_REQUEST_TIMEOUT_MS = 4_000;
+const CLOUDFLARED_TUNNEL_START_ATTEMPTS = 3;
+const CLOUDFLARED_TUNNEL_START_RETRY_MS = 1_000;
 const DEFAULT_REMOTE_TRAINING_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const LOCAL_RUNTIME_BOOTSTRAP_TIMEOUT_MS = 90_000;
 const MINIO_BOOTSTRAP_ATTEMPTS = 40;
@@ -536,6 +542,18 @@ function envFlagFrom(env, name, fallback = false) {
     return fallback;
   }
   return ["1", "true", "yes", "on"].includes(value);
+}
+
+function clampPositiveInteger(value, fallback, minimum = 1, maximum = Number.MAX_SAFE_INTEGER) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.min(maximum, Math.max(minimum, parsed));
+}
+
+function positiveIntegerEnvFrom(env, name, fallback, minimum = 1, maximum = Number.MAX_SAFE_INTEGER) {
+  return clampPositiveInteger(env?.[name], fallback, minimum, maximum);
 }
 
 function missionControlUserDataDir(env = process.env, runtime = {}) {
@@ -2563,7 +2581,7 @@ function stopProjectWorker(options = {}) {
   };
 }
 
-async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, env: providedEnv, logDir, startTunnel = startCloudflaredTunnel, ensureLocalRuntime = ensureAppLocalRuntime }) {
+async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, env: providedEnv, logDir, startTunnel = startCloudflaredTunnel, ensureLocalRuntime = ensureAppLocalRuntime, tunnelRetrySleep = sleep }) {
   const existing = projectTunnels.get(projectId);
   if (existing && remoteTrainingSessionActive(existing)) {
     return existing;
@@ -2587,12 +2605,15 @@ async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, e
     childEnv.MODAL_ORCHESTRATOR_URL = validateRemoteModalUrl(baseUrl, "MODAL_ORCHESTRATOR_URL");
   } else {
     requireAuthenticatedOrchestratorExposure(env);
-    const orchestratorTunnel = await startTunnel({
+    const orchestratorTunnel = await startCloudflaredTunnelWithRetries({
+      startTunnel,
       projectId,
       label: "orchestrator",
       targetUrl: baseUrl,
       logDir,
       env,
+      waitForReady: cloudflaredTunnelReadinessProbe("orchestrator", env),
+      sleepFn: tunnelRetrySleep,
     });
     childEnv.MODAL_ORCHESTRATOR_URL = orchestratorTunnel.url;
     processes.push(orchestratorTunnel.child);
@@ -2616,12 +2637,15 @@ async function ensureRemoteTrainingSession({ projectId, baseUrl, repoEnv = {}, e
         if (appManagedLocalRuntimeEnabled(env)) {
           await ensureLocalRuntime({ env });
         }
-        const s3Tunnel = await startTunnel({
+        const s3Tunnel = await startCloudflaredTunnelWithRetries({
+          startTunnel,
           projectId,
           label: "s3",
           targetUrl,
           logDir,
           env,
+          waitForReady: cloudflaredTunnelReadinessProbe("s3", env),
+          sleepFn: tunnelRetrySleep,
         });
         childEnv.MODAL_S3_ENDPOINT_URL = s3Tunnel.url;
         processes.push(s3Tunnel.child);
@@ -2714,12 +2738,80 @@ function validateCloudflaredTarget(value, label) {
   return parsed.origin;
 }
 
-function startCloudflaredTunnel({ projectId, label, targetUrl, logDir, env = process.env }) {
+function cloudflaredTunnelStartAttempts(env = process.env) {
+  return positiveIntegerEnvFrom(env, "MODEL_EXPRESS_CLOUDFLARED_START_ATTEMPTS", CLOUDFLARED_TUNNEL_START_ATTEMPTS, 1, 5);
+}
+
+function cloudflaredTunnelStartRetryMs(env = process.env) {
+  return positiveIntegerEnvFrom(env, "MODEL_EXPRESS_CLOUDFLARED_START_RETRY_MS", CLOUDFLARED_TUNNEL_START_RETRY_MS, 100, 30_000);
+}
+
+function isRetryableCloudflaredTunnelStartError(error) {
+  const message = errorMessage(error);
+  return (
+    /published but not reachable/i.test(message) ||
+    /Timed out waiting for cloudflared .* tunnel URL/i.test(message) ||
+    /cloudflared .* tunnel exited before publishing a reachable URL/i.test(message)
+  );
+}
+
+async function startCloudflaredTunnelWithRetries({
+  startTunnel = startCloudflaredTunnel,
+  env = process.env,
+  logDir,
+  label,
+  projectId,
+  sleepFn = sleep,
+  ...options
+}) {
+  const attempts = cloudflaredTunnelStartAttempts(env);
+  const retryMs = cloudflaredTunnelStartRetryMs(env);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await startTunnel({ ...options, projectId, label, logDir, env, attempt, maxAttempts: attempts });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !isRetryableCloudflaredTunnelStartError(error)) {
+        break;
+      }
+      appendDiagnosticLog(logDir, "warn", "cloudflared_tunnel_start_retry", {
+        project_id: projectId,
+        label,
+        attempt,
+        max_attempts: attempts,
+        retry_ms: retryMs,
+        error: errorMessage(error),
+      });
+      await sleepFn(retryMs);
+    }
+  }
+  const message = errorMessage(lastError);
+  throw new Error(`Unable to establish cloudflared ${label} tunnel after ${attempts} attempt${attempts === 1 ? "" : "s"}: ${message}`);
+}
+
+function cloudflaredTunnelReadinessProbe(label, env = process.env) {
+  const normalized = String(label ?? "").trim().toLowerCase();
+  if (normalized === "orchestrator" && !envFlagFrom(env, "MODEL_EXPRESS_CLOUDFLARED_STRICT_ORCHESTRATOR_READY", false)) {
+    return null;
+  }
+  return waitForCloudflaredTunnelReady;
+}
+
+function startCloudflaredTunnel({
+  projectId,
+  label,
+  targetUrl,
+  logDir,
+  env = process.env,
+  waitForReady = waitForCloudflaredTunnelReady,
+}) {
   if (envFlagFrom(env, "MODEL_EXPRESS_DISABLE_AUTO_TUNNELS", false)) {
     throw new Error("Automatic tunnel management is disabled by MODEL_EXPRESS_DISABLE_AUTO_TUNNELS.");
   }
   const target = validateCloudflaredTarget(targetUrl, label);
   const command = env.MODEL_EXPRESS_CLOUDFLARED_PATH || env.CLOUDFLARED_PATH || "cloudflared";
+  const readinessProbe = typeof waitForReady === "function" ? waitForReady : async () => ({ attempts: 0 });
   const child = spawn(command, ["tunnel", "--url", target, "--no-autoupdate"], {
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
@@ -2727,6 +2819,7 @@ function startCloudflaredTunnel({ projectId, label, targetUrl, logDir, env = pro
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let settling = false;
     const timer = setTimeout(() => {
       if (settled) {
         return;
@@ -2736,12 +2829,26 @@ function startCloudflaredTunnel({ projectId, label, targetUrl, logDir, env = pro
       reject(new Error(`Timed out waiting for cloudflared ${label} tunnel URL.`));
     }, CLOUDFLARED_URL_TIMEOUT_MS);
 
-    const finish = (url) => {
+    const finish = async (url) => {
+      if (settled || settling) {
+        return;
+      }
+      settling = true;
+      clearTimeout(timer);
+      try {
+        await readinessProbe({ projectId, label, url, logDir, env });
+      } catch (error) {
+        if (!settled) {
+          settled = true;
+          stopTunnelProcess(child);
+          reject(new Error(`cloudflared ${label} tunnel URL was published but not reachable: ${errorMessage(error)}`));
+        }
+        return;
+      }
       if (settled) {
         return;
       }
       settled = true;
-      clearTimeout(timer);
       appendDiagnosticLog(logDir, "info", "cloudflared_tunnel_ready", {
         project_id: projectId,
         label,
@@ -2775,7 +2882,7 @@ function startCloudflaredTunnel({ projectId, label, targetUrl, logDir, env = pro
       if (!settled) {
         settled = true;
         clearTimeout(timer);
-        reject(new Error(`cloudflared ${label} tunnel exited before publishing a URL (code=${code}, signal=${signal}).`));
+        reject(new Error(`cloudflared ${label} tunnel exited before publishing a reachable URL (code=${code}, signal=${signal}).`));
       }
     });
   });
@@ -2784,6 +2891,105 @@ function startCloudflaredTunnel({ projectId, label, targetUrl, logDir, env = pro
 function parseCloudflaredTunnelUrl(value) {
   const match = String(value ?? "").match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i);
   return match ? match[0] : "";
+}
+
+function cloudflaredReadyTimeoutMs(env = process.env) {
+  return positiveIntegerEnvFrom(env, "MODEL_EXPRESS_CLOUDFLARED_READY_TIMEOUT_SECONDS", CLOUDFLARED_PUBLIC_READY_TIMEOUT_MS / 1000, 1, 180) * 1000;
+}
+
+function cloudflaredReadyRetryMs(env = process.env) {
+  return positiveIntegerEnvFrom(env, "MODEL_EXPRESS_CLOUDFLARED_READY_RETRY_MS", CLOUDFLARED_PUBLIC_READY_RETRY_MS, 100, 10_000);
+}
+
+function cloudflaredReadyRequestTimeoutMs(env = process.env) {
+  return positiveIntegerEnvFrom(env, "MODEL_EXPRESS_CLOUDFLARED_READY_REQUEST_TIMEOUT_MS", CLOUDFLARED_PUBLIC_READY_REQUEST_TIMEOUT_MS, 500, 30_000);
+}
+
+async function waitForCloudflaredTunnelReady({
+  projectId = "",
+  label = "tunnel",
+  url,
+  logDir,
+  env = process.env,
+  lookup = dns.promises.lookup,
+  fetchImpl = globalThis.fetch,
+  sleepFn = sleep,
+  nowFn = () => Date.now(),
+  timeoutMs = cloudflaredReadyTimeoutMs(env),
+  retryMs = cloudflaredReadyRetryMs(env),
+  requestTimeoutMs = cloudflaredReadyRequestTimeoutMs(env),
+} = {}) {
+  const parsed = parseHttpOrigin(url, "cloudflared tunnel URL");
+  const boundedTimeoutMs = clampPositiveInteger(timeoutMs, CLOUDFLARED_PUBLIC_READY_TIMEOUT_MS, 500, 180_000);
+  const boundedRetryMs = clampPositiveInteger(retryMs, CLOUDFLARED_PUBLIC_READY_RETRY_MS, 100, 10_000);
+  const boundedRequestTimeoutMs = clampPositiveInteger(requestTimeoutMs, CLOUDFLARED_PUBLIC_READY_REQUEST_TIMEOUT_MS, 500, 30_000);
+  const deadline = nowFn() + boundedTimeoutMs;
+  let attempts = 0;
+  let lastError = null;
+
+  while (nowFn() < deadline) {
+    attempts += 1;
+    try {
+      await lookup(parsed.hostname);
+      await probeCloudflaredTunnel(parsed.origin, {
+        fetchImpl,
+        requestTimeoutMs: boundedRequestTimeoutMs,
+      });
+      appendDiagnosticLog(logDir, "info", "cloudflared_tunnel_public_reachable", {
+        project_id: projectId,
+        label,
+        url: parsed.origin,
+        attempts,
+      });
+      return { attempts };
+    } catch (error) {
+      lastError = error;
+    }
+    const remainingMs = deadline - nowFn();
+    if (remainingMs <= 0) {
+      break;
+    }
+    await sleepFn(Math.min(boundedRetryMs, remainingMs));
+  }
+
+  const detail = lastError ? ` Last error: ${errorMessage(lastError)}` : "";
+  throw new Error(`Timed out waiting for cloudflared ${label} tunnel to resolve and answer after ${attempts} attempt${attempts === 1 ? "" : "s"}.${detail}`);
+}
+
+async function probeCloudflaredTunnel(url, { fetchImpl = globalThis.fetch, requestTimeoutMs = CLOUDFLARED_PUBLIC_READY_REQUEST_TIMEOUT_MS } = {}) {
+  if (typeof fetchImpl !== "function") {
+    throw new Error("fetch is not available for cloudflared tunnel readiness checks");
+  }
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = controller
+    ? setTimeout(() => {
+        controller.abort();
+      }, requestTimeoutMs)
+    : null;
+  if (timer && typeof timer.unref === "function") {
+    timer.unref();
+  }
+  try {
+    const response = await fetchImpl(url, {
+      method: "HEAD",
+      redirect: "manual",
+      signal: controller?.signal,
+    });
+    const status = Number(response?.status ?? 0);
+    if (!Number.isFinite(status) || status === 0 || status >= 500) {
+      throw new Error(`HTTP ${status || "unknown"}`);
+    }
+    return response;
+  } catch (error) {
+    if (String(error?.name ?? "") === "AbortError") {
+      throw new Error(`request timed out after ${requestTimeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function stopAllProjectTunnels() {
@@ -4006,7 +4212,9 @@ module.exports = {
     localConfigPath,
     missionControlLiveFeatureFlags,
     missionControlEnv,
+    cloudflaredTunnelReadinessProbe,
     parseCloudflaredTunnelUrl,
+    waitForCloudflaredTunnelReady,
     predictChampionDemoLocal,
     preflightCloud,
     preflightDatasetFolder,

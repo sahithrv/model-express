@@ -390,6 +390,7 @@ test("remote training session passes generated API token to Modal worker env", a
   );
   const token = env.MODEL_EXPRESS_API_TOKEN;
   const projectId = `project-${Date.now()}`;
+  const tunnelCalls = [];
   const fakeTunnel = (label) => ({
     url: `https://${label}-auto.trycloudflare.com`,
     child: {
@@ -407,7 +408,10 @@ test("remote training session passes generated API token to Modal worker env", a
     baseUrl: "http://127.0.0.1:8080",
     env,
     logDir: tempDir("mx-session-logs-"),
-    startTunnel: async ({ label }) => fakeTunnel(label),
+    startTunnel: async ({ label, waitForReady }) => {
+      tunnelCalls.push({ label, waitForReady });
+      return fakeTunnel(label);
+    },
     ensureLocalRuntime: async ({ env: runtimeEnv }) => ({ managed: true, env: runtimeEnv }),
   });
 
@@ -415,6 +419,11 @@ test("remote training session passes generated API token to Modal worker env", a
     assert.equal(session.env.MODEL_EXPRESS_API_TOKEN === token, true, "expected worker env to inherit generated token");
     assert.equal(session.env.MODAL_ORCHESTRATOR_URL.startsWith("https://orchestrator-auto."), true);
     assert.equal(session.env.MODAL_S3_ENDPOINT_URL.startsWith("https://s3-auto."), true);
+    assert.equal(tunnelCalls.length, 2);
+    assert.equal(tunnelCalls[0].label, "orchestrator");
+    assert.equal(tunnelCalls[0].waitForReady, null);
+    assert.equal(tunnelCalls[1].label, "s3");
+    assert.equal(typeof tunnelCalls[1].waitForReady, "function");
     assert.equal(session.env.MODEL_EXPRESS_MODAL_TUNNEL_S3, undefined);
   } finally {
     __test.stopProjectTunnels(projectId);
@@ -449,6 +458,54 @@ test("remote training session cleans up partial tunnels when S3 tunnel setup fai
     /s3 tunnel failed/,
   );
   assert.equal(orchestratorChild.killed, true);
+});
+
+test("remote training session retries S3 tunnel when a published quick tunnel hostname is unreachable", async () => {
+  const env = cloudPreflightEnv({
+    MODAL_ORCHESTRATOR_URL: "",
+    MODEL_EXPRESS_MODAL_ORCHESTRATOR_URL: "",
+    S3_ENDPOINT_URL: "http://127.0.0.1:9000",
+    MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_S3_ENDPOINT_URL: "",
+    MODEL_EXPRESS_MODAL_TUNNEL_S3: "true",
+    MODEL_EXPRESS_CLOUDFLARED_START_ATTEMPTS: "3",
+    MODEL_EXPRESS_CLOUDFLARED_START_RETRY_MS: "250",
+  });
+  const projectId = `project-retry-${Date.now()}`;
+  const calls = [];
+  const sleeps = [];
+
+  const session = await __test.ensureRemoteTrainingSession({
+    projectId,
+    baseUrl: "http://127.0.0.1:8080",
+    env,
+    logDir: tempDir("mx-session-retry-"),
+    startTunnel: async ({ label, attempt }) => {
+      calls.push({ label, attempt });
+      if (label === "s3" && attempt === 1) {
+        throw new Error(
+          "cloudflared s3 tunnel URL was published but not reachable: Timed out waiting for cloudflared s3 tunnel to resolve and answer after 158 attempts. Last error: getaddrinfo ENOTFOUND bad.trycloudflare.com",
+        );
+      }
+      return { url: `https://${label}-retry-${attempt}.trycloudflare.com`, child: fakeTunnelChild() };
+    },
+    ensureLocalRuntime: async ({ env: runtimeEnv }) => ({ managed: true, env: runtimeEnv }),
+    tunnelRetrySleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+
+  try {
+    assert.equal(session.env.MODAL_ORCHESTRATOR_URL, "https://orchestrator-retry-1.trycloudflare.com");
+    assert.equal(session.env.MODAL_S3_ENDPOINT_URL, "https://s3-retry-2.trycloudflare.com");
+    assert.deepEqual(
+      calls.map((call) => `${call.label}:${call.attempt}`),
+      ["orchestrator:1", "s3:1", "s3:2"],
+    );
+    assert.deepEqual(sleeps, [250]);
+  } finally {
+    __test.stopProjectTunnels(projectId);
+  }
 });
 
 test("dataset folder operations require a picker-backed selection token", () => {
@@ -944,6 +1001,89 @@ test("ONNX external data mount paths and tunnel logs are sanitized", () => {
   assert(!signed.includes("abc"));
   assert(!signed.includes("def"));
   assert(!signed.includes("sk-testtoken"));
+});
+
+test("automatic tunnel readiness is strict for S3 and soft for orchestrator by default", () => {
+  assert.equal(__test.cloudflaredTunnelReadinessProbe("orchestrator", {}), null);
+  assert.equal(typeof __test.cloudflaredTunnelReadinessProbe("s3", {}), "function");
+  assert.equal(
+    typeof __test.cloudflaredTunnelReadinessProbe("orchestrator", {
+      MODEL_EXPRESS_CLOUDFLARED_STRICT_ORCHESTRATOR_READY: "true",
+    }),
+    "function",
+  );
+});
+
+test("cloudflared tunnel readiness retries until DNS and HTTP both answer", async () => {
+  let now = 0;
+  let lookups = 0;
+  let fetches = 0;
+  const sleeps = [];
+
+  const result = await __test.waitForCloudflaredTunnelReady({
+    projectId: "project-ready",
+    label: "s3",
+    url: "https://unit-test.trycloudflare.com",
+    logDir: tempDir("mx-tunnel-ready-"),
+    timeoutMs: 2_000,
+    retryMs: 250,
+    requestTimeoutMs: 750,
+    nowFn: () => now,
+    sleepFn: async (ms) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+    lookup: async (hostname) => {
+      lookups += 1;
+      assert.equal(hostname, "unit-test.trycloudflare.com");
+      if (lookups === 1) {
+        throw new Error("ENOTFOUND");
+      }
+      return { address: "198.41.200.1", family: 4 };
+    },
+    fetchImpl: async (url, options) => {
+      fetches += 1;
+      assert.equal(url, "https://unit-test.trycloudflare.com");
+      assert.equal(options.method, "HEAD");
+      if (fetches === 1) {
+        throw new Error("connection refused");
+      }
+      return new Response("", { status: 403 });
+    },
+  });
+
+  assert.equal(result.attempts, 3);
+  assert.equal(lookups, 3);
+  assert.equal(fetches, 2);
+  assert.deepEqual(sleeps, [250, 250]);
+});
+
+test("cloudflared tunnel readiness fails after a bounded timeout", async () => {
+  let now = 0;
+  const sleeps = [];
+
+  await assert.rejects(
+    () =>
+      __test.waitForCloudflaredTunnelReady({
+        projectId: "project-timeout",
+        label: "s3",
+        url: "https://unit-test.trycloudflare.com",
+        timeoutMs: 1_000,
+        retryMs: 500,
+        requestTimeoutMs: 750,
+        nowFn: () => now,
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+          now += ms;
+        },
+        lookup: async () => {
+          throw new Error("ENOTFOUND");
+        },
+        fetchImpl: async () => new Response("", { status: 200 }),
+      }),
+    /Timed out waiting for cloudflared s3 tunnel.*ENOTFOUND/,
+  );
+  assert.deepEqual(sleeps, [500, 500]);
 });
 
 test("Modal remote URLs reject local private and unsafe service targets", () => {
