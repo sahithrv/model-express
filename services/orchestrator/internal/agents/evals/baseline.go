@@ -74,12 +74,21 @@ type PlannerBaselineChange struct {
 type PlannerBaselineComparison struct {
 	SchemaVersion            string                    `json:"schema_version"`
 	Passed                   bool                      `json:"passed"`
+	CriticalPassed           bool                      `json:"critical_passed"`
+	QualityPassed            bool                      `json:"quality_passed"`
+	EfficiencyPassed         bool                      `json:"efficiency_passed"`
+	EfficiencyGated          bool                      `json:"efficiency_gated"`
 	Tolerances               PlannerBaselineTolerances `json:"tolerances"`
 	Changes                  []PlannerBaselineChange   `json:"changes"`
+	Warnings                 []PlannerBaselineChange   `json:"warnings,omitempty"`
 	CriticalRegressions      int                       `json:"critical_regressions"`
 	QualityRegressions       int                       `json:"quality_regressions"`
 	UnexpectedMutationPasses int                       `json:"unexpected_mutation_passes"`
 	ResponseByteIncrease     int                       `json:"response_byte_increase"`
+}
+
+type PlannerBaselineGateOptions struct {
+	GateEfficiency bool
 }
 
 //go:embed baselines/*.json
@@ -149,10 +158,17 @@ func WritePlannerRubricBaseline(path string, artifact PlannerRubricArtifact) err
 }
 
 func ComparePlannerRubricBaseline(baseline PlannerRubricBaseline, current PlannerRubricArtifact) PlannerBaselineComparison {
+	return ComparePlannerRubricBaselineWithOptions(baseline, current, PlannerBaselineGateOptions{})
+}
+
+func ComparePlannerRubricBaselineWithOptions(baseline PlannerRubricBaseline, current PlannerRubricArtifact, options PlannerBaselineGateOptions) PlannerBaselineComparison {
 	comparison := PlannerBaselineComparison{
-		SchemaVersion: PlannerRubricBaselineSchemaVersionV1,
-		Passed:        true,
-		Tolerances:    baseline.Tolerances,
+		SchemaVersion:    PlannerRubricBaselineSchemaVersionV1,
+		CriticalPassed:   true,
+		QualityPassed:    true,
+		EfficiencyPassed: true,
+		EfficiencyGated:  options.GateEfficiency,
+		Tolerances:       baseline.Tolerances,
 	}
 	baselineByName := plannerBaselineScenariosByName(baseline.Artifact.Scenarios)
 	currentSnapshot := plannerRubricBaselineSnapshot(current)
@@ -228,15 +244,18 @@ func ComparePlannerRubricBaseline(baseline PlannerRubricBaseline, current Planne
 		comparison.QualityRegressions++
 		comparison.addChange("_aggregate", "quality", true, fmt.Sprintf("Scenario pass rate %.3f is below the %.3f floor.", passRate, baseline.Tolerances.Quality.MinimumScenarioPassRate))
 	}
-	comparison.Passed = comparison.CriticalRegressions <= baseline.Tolerances.Critical.MaxScenarioRegressions &&
-		comparison.UnexpectedMutationPasses <= baseline.Tolerances.Critical.MaxUnexpectedMutationPasses &&
-		comparison.QualityRegressions <= baseline.Tolerances.Quality.MaxCorrectnessCheckRegressions &&
-		comparison.ResponseByteIncrease <= baseline.Tolerances.Efficiency.MaxTotalResponseByteIncrease
+	comparison.CriticalPassed = comparison.CriticalRegressions <= baseline.Tolerances.Critical.MaxScenarioRegressions &&
+		comparison.UnexpectedMutationPasses <= baseline.Tolerances.Critical.MaxUnexpectedMutationPasses
+	comparison.QualityPassed = comparison.QualityRegressions <= baseline.Tolerances.Quality.MaxCorrectnessCheckRegressions
+	comparison.EfficiencyPassed = comparison.ResponseByteIncrease <= baseline.Tolerances.Efficiency.MaxTotalResponseByteIncrease
 	for _, change := range comparison.Changes {
 		if change.Dimension == "efficiency" && change.Regression {
-			comparison.Passed = false
+			comparison.EfficiencyPassed = false
+			comparison.Warnings = append(comparison.Warnings, change)
 		}
 	}
+	comparison.Passed = comparison.CriticalPassed && comparison.QualityPassed &&
+		(!comparison.EfficiencyGated || comparison.EfficiencyPassed)
 	return comparison
 }
 

@@ -51,6 +51,44 @@ func TestRankerV2ShadowCannotChangeV1Scheduling(t *testing.T) {
 	}
 }
 
+func TestGuardedRankerV2TreatmentSchedulesOnlyItsAssignedPolicy(t *testing.T) {
+	policy := calibration.DefaultPlannerRolloutPolicy()
+	policy.Enabled = true
+	policy.State = calibration.RolloutStateActive
+	policy.StagePercent = 100
+	assignment, err := calibration.AssignPlannerRollout(policy, "project-ranker-v2-treatment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := ExperimentPlannerInput{
+		SourcePlan:              plannerSourcePlanForRankerV2(),
+		ExecutionCapabilityCard: execution.PlannerCapabilityCard{Task: "image_classification"},
+		MaxExperiments:          1,
+		RolloutAssignment:       &assignment,
+		RankerV2PriorSnapshot:   rankerV2TestPriorSnapshot(),
+	}
+	first := rankingCandidate("resnet18", 0.04)
+	second := rankingCandidate("efficientnet_b0", 0.02)
+	finalized, err := FinalizePlannerRecommendation(input, ExperimentPlanningRecommendation{
+		DecisionType: decisions.TypeAddExperiments, CandidateHypotheses: []CandidateHypothesis{first, second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if PlannerSchedulingRankerVersion(input) != ExperimentPlannerRankerV2Version || finalized.ProposedExperiments[0].Model != second.ExperimentConfig.Model {
+		t.Fatalf("v2 treatment did not control its isolated ranker dimension: %#v", finalized)
+	}
+	if selected := rankerSelection(finalized.CandidateRankingsV1); !reflect.DeepEqual(selected, []int{0}) {
+		t.Fatalf("v1 comparison was not preserved: %v", selected)
+	}
+	if selected := rankerSelection(finalized.CandidateRankings); !reflect.DeepEqual(selected, []int{1}) {
+		t.Fatalf("active v2 provenance does not match scheduling: %v", selected)
+	}
+	if finalized.RankerShadowComparison == nil || finalized.RankerShadowComparison.ShadowOnly || !strings.Contains(finalized.RankerShadowComparison.OutcomeDisclosure, "unexecuted counterfactuals") {
+		t.Fatalf("active comparison misstates outcome authority: %#v", finalized.RankerShadowComparison)
+	}
+}
+
 func TestRankerV2CapsSelfReportedImpactAndNoveltyAndIsDeterministic(t *testing.T) {
 	candidates := []CandidateHypothesis{
 		rankingCandidate("resnet18", 0.05),

@@ -36,6 +36,7 @@ func run() error {
 		maxJSONLBytes    = flag.Int("max-jsonl-bytes", defaultMaxJSONLBytes, "maximum bytes per emitted JSONL record")
 		timeout          = flag.Duration("timeout", 10*time.Minute, "overall live evaluation timeout")
 		checkBaseline    = flag.Bool("check-baseline", false, "compare deterministic results with the checked baseline")
+		gateEfficiency   = flag.Bool("gate-efficiency", false, "fail baseline checks on response-byte regressions instead of warning")
 		baselinePath     = flag.String("baseline", "", "optional baseline JSON path; defaults to the embedded checked baseline")
 		updateBaseline   = flag.String("update-baseline", "", "write a reviewed deterministic baseline to this path")
 	)
@@ -43,6 +44,9 @@ func run() error {
 
 	if *maxJSONLBytes < 1024 || *maxJSONLBytes > 16*1024*1024 {
 		return fmt.Errorf("max-jsonl-bytes must be between 1024 and 16777216")
+	}
+	if *gateEfficiency && !*checkBaseline {
+		return errors.New("-gate-efficiency requires -check-baseline")
 	}
 	fixtures, err := loadFixtures(*fixturePaths, *live)
 	if err != nil {
@@ -54,8 +58,8 @@ func run() error {
 			return err
 		}
 		if strings.TrimSpace(*updateBaseline) != "" {
-			if *checkBaseline {
-				return errors.New("-check-baseline and -update-baseline are mutually exclusive")
+			if *checkBaseline || *gateEfficiency {
+				return errors.New("-update-baseline cannot be combined with -check-baseline or -gate-efficiency")
 			}
 			return evals.WritePlannerRubricBaseline(filepath.Clean(*updateBaseline), artifact)
 		}
@@ -69,7 +73,9 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			comparison := evals.ComparePlannerRubricBaseline(baseline, artifact)
+			comparison := evals.ComparePlannerRubricBaselineWithOptions(baseline, artifact, evals.PlannerBaselineGateOptions{
+				GateEfficiency: *gateEfficiency,
+			})
 			if err := writeBoundedJSONL(comparison, *maxJSONLBytes); err != nil {
 				return err
 			}
@@ -80,7 +86,7 @@ func run() error {
 		}
 		return writeBoundedJSONL(artifact, *maxJSONLBytes)
 	}
-	if *checkBaseline || strings.TrimSpace(*updateBaseline) != "" || strings.TrimSpace(*baselinePath) != "" {
+	if *checkBaseline || *gateEfficiency || strings.TrimSpace(*updateBaseline) != "" || strings.TrimSpace(*baselinePath) != "" {
 		return errors.New("baseline flags are available only for deterministic evaluation")
 	}
 

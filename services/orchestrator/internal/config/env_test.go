@@ -82,3 +82,38 @@ func TestLoadRepoEnvGeneratesLocalRuntimeStorageEnv(t *testing.T) {
 		t.Fatalf("expected RC local-only root storage allowance")
 	}
 }
+
+func TestCheckedConfigurationExamplesDefaultPlannerValidationToStrict(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", "..", "..", ".."))
+	for _, name := range []string{".env.example", ".env.v1.cloud.example", ".env.v1.local.example"} {
+		body, err := os.ReadFile(filepath.Join(repoRoot, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if !strings.Contains(string(body), "MODEL_EXPRESS_PLANNER_VALIDATION_MODE=strict") {
+			t.Errorf("%s does not default planner validation to strict", name)
+		}
+	}
+}
+
+func TestCheckedConfigurationExamplesKeepGuardedPlannerRolloutDisabled(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", "..", "..", ".."))
+	for _, name := range []string{".env.example", ".env.v1.cloud.example", ".env.v1.local.example"} {
+		body, err := os.ReadFile(filepath.Join(repoRoot, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		contents := string(body)
+		for _, required := range []string{
+			"MODEL_EXPRESS_PLANNER_ROLLOUT_ENABLED=false",
+			"MODEL_EXPRESS_PLANNER_ROLLOUT_STAGE_PERCENT=5",
+			"MODEL_EXPRESS_PLANNER_ROLLOUT_DIMENSIONS=ranker",
+			"MODEL_EXPRESS_PLANNER_ROLLOUT_FACTORIAL=false",
+			"MODEL_EXPRESS_PLANNER_ROLLOUT_ROLLBACK=false",
+		} {
+			if !strings.Contains(contents, required) {
+				t.Errorf("%s does not preserve guarded rollout default %q", name, required)
+			}
+		}
+	}
+}

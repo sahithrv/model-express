@@ -295,6 +295,7 @@ func newCandidateOutcomeFixture(t *testing.T) candidateOutcomeFixture {
 	candidates := []calibration.CandidateProvenanceCreate{
 		{
 			InvocationID: invocation.ID, PlannerVariantID: invocation.PlannerVariantID, CandidateIndex: 0,
+			RolloutCohortID: invocation.RolloutCohortID, RolloutPolicyID: invocation.RolloutPolicyID,
 			RequestedConfigHash: specs[1].RequestedConfigHash, AcceptedSpecHash: specs[1].AcceptedSpecHash,
 			Task: specs[1].Task, Mechanism: "lower metric candidate", Forecast: lowerForecast, BaseScore: 0.9,
 			SelectionTraceReference: "/trace/0", Selected: true, SelectionState: calibration.CandidateSelectionSelected,
@@ -302,6 +303,7 @@ func newCandidateOutcomeFixture(t *testing.T) candidateOutcomeFixture {
 		},
 		{
 			InvocationID: invocation.ID, PlannerVariantID: invocation.PlannerVariantID, CandidateIndex: 1,
+			RolloutCohortID: invocation.RolloutCohortID, RolloutPolicyID: invocation.RolloutPolicyID,
 			RequestedConfigHash: specs[0].RequestedConfigHash, AcceptedSpecHash: specs[0].AcceptedSpecHash,
 			Task: specs[0].Task, Mechanism: "unselected candidate", Forecast: higherForecast, BaseScore: 0.2,
 			SelectionTraceReference: "/trace/1", SelectionState: calibration.CandidateSelectionUnselected,
@@ -309,6 +311,7 @@ func newCandidateOutcomeFixture(t *testing.T) candidateOutcomeFixture {
 		},
 		{
 			InvocationID: invocation.ID, PlannerVariantID: invocation.PlannerVariantID, CandidateIndex: 2,
+			RolloutCohortID: invocation.RolloutCohortID, RolloutPolicyID: invocation.RolloutPolicyID,
 			RequestedConfigHash: specs[0].RequestedConfigHash, AcceptedSpecHash: specs[0].AcceptedSpecHash,
 			Task: specs[0].Task, Mechanism: "higher metric candidate", Forecast: higherForecast, BaseScore: 0.8,
 			SelectionTraceReference: "/trace/2", Selected: true, SelectionState: calibration.CandidateSelectionSelected,

@@ -775,11 +775,43 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		MaxFollowUpRounds:            s.maxAutoFollowUpRounds(),
 		FollowUpRound:                followUpRoundCount(projectPlans),
 	}
+	rolloutPolicy, err := calibration.PlannerRolloutPolicyFromEnvironment()
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, fmt.Errorf("planner rollout policy: %w", err)
+	}
+	rolloutAssignment, err := calibration.AssignPlannerRollout(rolloutPolicy, projectID)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, fmt.Errorf("planner rollout assignment: %w", err)
+	}
+	input.RolloutAssignment = &rolloutAssignment
 	input.ProjectTrajectory = agents.ComputeProjectTrajectoryDiagnosis(input)
-	input.RetrievalVariant = plannerRetrievalVariant()
+	input.RetrievalVariant, err = plannerRetrievalVariantForRollout(plannerRetrievalVariant(), input.RolloutAssignment)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
 	input.RetrievedMemory = s.retrievePlannerMemory(context.Background(), input)
 	input.RankerV2PriorSnapshot = s.plannerRankerV2PriorSnapshot(projectID, time.Now().UTC(), minimumMeaningfulImprovement)
 	return input, true, nil
+}
+
+func plannerRetrievalVariantForRollout(base memory.PlannerRetrievalVariant, assignment *calibration.PlannerRolloutAssignment) (memory.PlannerRetrievalVariant, error) {
+	value := strings.ToLower(calibration.PlannerRolloutVariantValue(assignment, calibration.RolloutDimensionRetrieval))
+	switch value {
+	case "":
+		return base, nil
+	case "enabled":
+		base.Enabled = true
+		base.LogOnly = false
+	case "log_only":
+		base.Enabled = true
+		base.LogOnly = true
+	case "disabled":
+		base.Enabled = false
+		base.LogOnly = false
+	default:
+		return memory.PlannerRetrievalVariant{}, fmt.Errorf("planner rollout retrieval variant %q is invalid", value)
+	}
+	return base, nil
 }
 
 func (s *Server) plannerRankerV2PriorSnapshot(projectID string, evaluationStart time.Time, meaningfulImprovement float64) *calibration.RankerV2PriorSnapshot {
@@ -904,6 +936,9 @@ func (s *Server) recordExperimentPlannerInvocation(
 		runtime["attempt_index"] = facts.AttemptIndex
 		runtime["retry_reason"] = facts.RetryReason
 		runtime["wall_latency_ms"] = facts.WallLatencyMS
+		if input.RolloutAssignment != nil {
+			runtime["planner_rollout_assignment"] = input.RolloutAssignment
+		}
 		if derivedCost != nil {
 			runtime["derived_cost"] = derivedCost
 		}
@@ -918,6 +953,7 @@ func (s *Server) recordExperimentPlannerInvocation(
 		PromptVersion:           trace.PromptVersion,
 		PlannerVariantID:        variantID,
 		PlannerVariant:          &variant,
+		RolloutAssignment:       input.RolloutAssignment,
 		ValidationMode:          variant.ValidationMode,
 		AttemptGroupID:          facts.AttemptGroupID,
 		AttemptIndex:            facts.AttemptIndex,
@@ -964,7 +1000,7 @@ func experimentPlannerVariant(input agents.ExperimentPlannerInput, config llm.Co
 		ValidationMode:               firstNonEmptyString(trace.ValidatorMode, plannerValidationMode()),
 		ExecutionValidatorVersion:    execution.ExecutionValidationSchemaVersionV1,
 		ExecutionValidationMode:      executionValidatorMode,
-		RankerVersion:                agents.ExperimentPlannerRankerVersion,
+		RankerVersion:                agents.PlannerSchedulingRankerVersion(input),
 		RankerMultiFidelityEnabled:   trace.RankerMultiFidelity,
 		RetrievalPolicyVersion:       agents.ExperimentPlannerRetrievalPolicyVersion,
 		Retrieval:                    retrieval,
@@ -1711,6 +1747,8 @@ func experimentPlannerDecisionPayload(
 		"agent_name":                      agents.ExperimentPlannerAgentName,
 		"invocation_id":                   invocation.ID,
 		"planner_variant_id":              invocation.PlannerVariantID,
+		"planner_rollout_cohort_id":       invocation.RolloutCohortID,
+		"planner_rollout_policy_id":       invocation.RolloutPolicyID,
 		"confidence":                      recommendation.Confidence,
 		"auto_executable":                 agentMode == llm.AgentModeAutonomous,
 		"planning_mode":                   recommendation.PlanningMode,
@@ -1721,12 +1759,14 @@ func experimentPlannerDecisionPayload(
 		"deployment_tradeoff":             recommendation.DeploymentTradeoff,
 		"candidate_hypotheses":            recommendation.CandidateHypotheses,
 		"candidate_rankings":              recommendation.CandidateRankings,
+		"candidate_rankings_v1":           recommendation.CandidateRankingsV1,
 		"candidate_selection_trace":       recommendation.CandidateSelectionTrace,
 		"candidate_rankings_v2":           recommendation.CandidateRankingsV2,
 		"candidate_selection_trace_v2":    recommendation.CandidateSelectionTraceV2,
 		"ranker_shadow_comparison":        recommendation.RankerShadowComparison,
 		"ranker_v2_prior_snapshot":        input.RankerV2PriorSnapshot,
-		"scheduling_ranker_version":       agents.ExperimentPlannerRankerVersion,
+		"scheduling_ranker_version":       agents.PlannerSchedulingRankerVersion(input),
+		"planner_rollout_assignment":      input.RolloutAssignment,
 		"proposal_mechanisms":             recommendation.ProposalMechanisms,
 		"risks":                           recommendation.Risks,
 		"expected_tradeoffs":              recommendation.ExpectedTradeoffs,

@@ -33,6 +33,7 @@ const (
 	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v3"
 	ExperimentPlannerRankerVersion          = "candidate_ranker_v1"
 	ExperimentPlannerShadowRankerVersion    = "candidate_ranker_v2_shadow_v1"
+	ExperimentPlannerRankerV2Version        = calibration.PlannerRolloutRankerV2VariantV1
 	ExperimentPlannerRetrievalPolicyVersion = "planner_memory_retrieval_v1"
 )
 
@@ -126,6 +127,9 @@ type ExperimentPlannerInput struct {
 	// RankerV2PriorSnapshot is read-only shadow input. It is never consulted by
 	// the active v1 scheduler and is persisted with the shadow comparison.
 	RankerV2PriorSnapshot *calibration.RankerV2PriorSnapshot
+	// RolloutAssignment freezes cohort and policy identity before selecting any
+	// prompt, context, retrieval, or ranker behavior.
+	RolloutAssignment *calibration.PlannerRolloutAssignment
 	// TerminalPlannerGuardsEnabled snapshots the post-generation decision
 	// policy so the persisted variant matches the policy actually applied.
 	TerminalPlannerGuardsEnabled *bool
@@ -735,6 +739,7 @@ type ExperimentPlanningRecommendation struct {
 	DeploymentTradeoff            string                     `json:"deployment_tradeoff"`
 	CandidateHypotheses           []CandidateHypothesis      `json:"candidate_hypotheses"`
 	CandidateRankings             []CandidateRanking         `json:"candidate_rankings"`
+	CandidateRankingsV1           []CandidateRanking         `json:"candidate_rankings_v1,omitempty"`
 	CandidateSelectionTrace       []CandidateSelectionRound  `json:"candidate_selection_trace,omitempty"`
 	CandidateRankingsV2           []CandidateRanking         `json:"candidate_rankings_v2,omitempty"`
 	CandidateSelectionTraceV2     []CandidateSelectionRound  `json:"candidate_selection_trace_v2,omitempty"`
@@ -946,10 +951,21 @@ func (a ExperimentPlannerAgent) Plan(ctx context.Context, input ExperimentPlanne
 }
 
 func (a ExperimentPlannerAgent) PlanWithTrace(ctx context.Context, input ExperimentPlannerInput) (ExperimentPlanningTrace, error) {
-	return a.PlanWithVariantTrace(ctx, input, ExperimentPlannerRequestVariant{
+	return a.PlanWithVariantTrace(ctx, input, plannerRequestVariantForInput(input))
+}
+
+func plannerRequestVariantForInput(input ExperimentPlannerInput) ExperimentPlannerRequestVariant {
+	variant := ExperimentPlannerRequestVariant{
 		StaticPromptVersion: plannerStaticPromptVersion(),
 		ContextVersion:      plannerContextSnapshotVersion(),
-	})
+	}
+	if value := calibration.PlannerRolloutVariantValue(input.RolloutAssignment, calibration.RolloutDimensionPrompt); value != "" {
+		variant.StaticPromptVersion = value
+	}
+	if value := calibration.PlannerRolloutVariantValue(input.RolloutAssignment, calibration.RolloutDimensionContext); value != "" {
+		variant.ContextVersion = value
+	}
+	return variant
 }
 
 // BuildRequest builds a planner request through the production prompt and

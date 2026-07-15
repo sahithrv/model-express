@@ -51,6 +51,8 @@ type CandidateForecastContract struct {
 type CandidateProvenanceCreate struct {
 	InvocationID            string                    `json:"invocation_id"`
 	PlannerVariantID        string                    `json:"planner_variant_id"`
+	RolloutCohortID         string                    `json:"rollout_cohort_id"`
+	RolloutPolicyID         string                    `json:"rollout_policy_id"`
 	CandidateIndex          int                       `json:"candidate_index"`
 	RequestedConfigHash     string                    `json:"requested_config_hash"`
 	AcceptedSpecHash        string                    `json:"accepted_spec_hash"`
@@ -161,6 +163,9 @@ func ValidateCandidateProvenanceCreate(candidate CandidateProvenanceCreate) erro
 	if strings.TrimSpace(candidate.InvocationID) == "" || strings.TrimSpace(candidate.PlannerVariantID) == "" {
 		return fmt.Errorf("candidate invocation_id and planner_variant_id are required")
 	}
+	if strings.TrimSpace(candidate.RolloutCohortID) == "" || strings.TrimSpace(candidate.RolloutPolicyID) == "" {
+		return fmt.Errorf("candidate rollout cohort and policy identities are required")
+	}
 	if candidate.CandidateIndex < 0 {
 		return fmt.Errorf("candidate_index must be zero-based")
 	}
@@ -206,6 +211,8 @@ func ValidateCandidateProvenanceCreate(candidate CandidateProvenanceCreate) erro
 func CandidateProvenanceMatchesCreate(row CandidateProvenance, create CandidateProvenanceCreate) bool {
 	if row.CandidateProvenanceCreate.InvocationID != create.InvocationID ||
 		row.PlannerVariantID != create.PlannerVariantID ||
+		row.RolloutCohortID != create.RolloutCohortID ||
+		row.RolloutPolicyID != create.RolloutPolicyID ||
 		row.CandidateIndex != create.CandidateIndex ||
 		row.RequestedConfigHash != create.RequestedConfigHash ||
 		row.AcceptedSpecHash != create.AcceptedSpecHash ||

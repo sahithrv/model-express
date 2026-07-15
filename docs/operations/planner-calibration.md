@@ -42,7 +42,18 @@ It applies three independent tolerance classes:
 - **Quality:** correctness-check regressions and corpus pass rate. The checked
   pass-rate floor is 100%.
 - **Efficiency:** response-byte growth. The checked allowances are 256 bytes per
-  scenario and 2,048 bytes across the corpus.
+  scenario and 2,048 bytes across the corpus. Regressions are emitted as
+  warnings by the required gate because response bytes are only a deterministic
+  token/cost proxy. They fail only when `-gate-efficiency` is explicitly set.
+
+The required orchestrator CI workflow runs the checked comparison without live
+provider flags or credentials. Critical safety/validation and quality tolerance
+regressions fail the job. To exercise a hard efficiency gate explicitly, run:
+
+```bash
+cd services/orchestrator
+go run ./cmd/planner-eval -check-baseline -gate-efficiency
+```
 
 To update the baseline, first inspect the normal artifact and the failed
 comparison, explain every changed scenario in review, then run:
@@ -62,16 +73,28 @@ replaced.
 ## Planner validation rollout modes
 
 `MODEL_EXPRESS_PLANNER_VALIDATION_MODE` is the source of truth for planner
-validation configuration:
+validation configuration. New and cloud configurations default to `strict`;
+missing or invalid settings also resolve to strict:
 
-- `relaxed` preserves the compatibility behavior.
+- `relaxed` preserves the compatibility behavior as a one-release rollback.
 - `shadow_strict` returns the relaxed recommendation but executes the same
   strict checks used by `strict`, persisting typed would-block verdicts.
 - `strict` blocks and retries on those strict findings.
 
 The old `MODEL_EXPRESS_STRICT_PLANNER_VALIDATION` boolean is read only as a
-compatibility alias when the mode variable is absent. Remove it after one
-compatibility release.
+compatibility alias when the mode variable is absent. Setting the mode to
+`relaxed` is the one-switch rollback. Every relaxed resolution emits a
+`planner_validation_relaxed_rollback` diagnostic with a monotonically
+increasing process-local count and policy version. Remove the relaxed and
+legacy compatibility paths after one release; do not silently make them the
+default again.
+
+The strict-default rollout policy requires at least 100 observations, at least
+98% eventual validity, no more than 20% retries, and no more than 5%
+unsupported first-pass proposals. One backend-validation retry is allowed per
+attempt group, so a correctable first-pass LLM violation is not itself an
+unsafe schedule. Unsafe schedules and post-validation escapes must both remain
+exactly zero; either is an immediate pause/rollback signal.
 
 Planner invocations persist `strict_validation_verdict` and
 `validation_outcome`. Findings have stable codes, categories, and stages for
@@ -85,6 +108,57 @@ Proposal-time no-op validation compares accepted-spec hashes, so unsupported
 or default-equivalent request differences cannot disguise the same executable
 configuration. Execution-time requested-versus-realized mismatches remain in
 the execution-fidelity reports and are not inferred by planner validation.
+
+## Guarded planner-policy rollout
+
+Planner-policy experiments are disabled in every checked configuration. When
+enabled, each project receives a deterministic SHA-256 cohort bucket under the
+versioned `planner_project_cohort_v1` rule. The bucket is stable across process
+restarts and nested across the guarded `5 -> 25 -> 50 -> 100` stages. Every
+planner invocation and candidate provenance row persists the cohort ID, active
+policy ID, and full assignment, so later outcome comparisons use the policy
+that actually selected and executed the candidate.
+
+The retained rollout controls are:
+
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_ENABLED`
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_POLICY_ID`
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_LAST_APPROVED_POLICY_ID`
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_STAGE_PERCENT`
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_STATE` (`active`, `paused`, or
+  `manual_review`)
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_DIMENSIONS` (`ranker`, `prompt`, `context`, or
+  `retrieval`)
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_FACTORIAL`
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_ROLLBACK`
+- `MODEL_EXPRESS_PLANNER_ROLLOUT_RANKER_VERSION`,
+  `MODEL_EXPRESS_PLANNER_ROLLOUT_PROMPT_VERSION`,
+  `MODEL_EXPRESS_PLANNER_ROLLOUT_CONTEXT_VERSION`, and
+  `MODEL_EXPRESS_PLANNER_ROLLOUT_RETRIEVAL_VARIANT`
+
+Exactly one dimension may differ from the last approved policy. Multiple
+dimensions are rejected unless `MODEL_EXPRESS_PLANNER_ROLLOUT_FACTORIAL=true`
+explicitly declares a factorial experiment. Paused and manual-review policies
+assign every project to the last approved policy. Setting
+`MODEL_EXPRESS_PLANNER_ROLLOUT_ROLLBACK=true` is the one-switch rollback and
+also assigns every project to that last approved policy without removing any
+rollout flag.
+
+Promotion requires at least 50, 100, 200, and 400 treatment/control samples at
+the 5%, 25%, 50%, and 100% checkpoints, respectively, with the same minimum of
+observed executed outcomes. Safety and task-compatibility regressions must be
+zero. First-pass validity may be no more than 2 percentage points inferior,
+eventual validity no more than 0.5 points inferior, and observed outcomes no
+more than 1 point inferior. Cost and latency increases are each capped at 10%,
+failure rate at 5%, and retry rate at 20%. Insufficient samples hold the stage;
+bounded non-critical regressions pause it; any safety, task-compatibility, or
+unexecuted-counterfactual outcome claim requires manual review. At 100%, the
+policy is approved only after the same checks pass.
+
+Ranker shadow artifacts remain comparisons, not outcomes. An outcome is
+attributed only to a candidate selected and actually executed by its persisted
+policy. Candidates selected solely by an inactive comparison policy are
+unexecuted counterfactuals and receive no outcome label.
 
 ## Candidate provenance and forecast contract
 

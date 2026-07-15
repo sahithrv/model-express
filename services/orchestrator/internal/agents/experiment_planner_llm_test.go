@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
@@ -19,6 +20,9 @@ import (
 )
 
 func TestExperimentPlannerTraceCapturesActualRequestRuntimeIdentityInputs(t *testing.T) {
+	// This test isolates request/identity tracing; strict behavior has dedicated
+	// validation tests and must not change the response fixture under test here.
+	t.Setenv("MODEL_EXPRESS_PLANNER_VALIDATION_MODE", plannervalidation.ModeRelaxed)
 	t.Setenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION", plannerStaticPromptVersionCompactV1)
 	t.Setenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION", "v2")
 	t.Setenv("MODEL_EXPRESS_MULTI_FIDELITY_POLICY", "true")
@@ -54,6 +58,25 @@ func TestExperimentPlannerTraceCapturesActualRequestRuntimeIdentityInputs(t *tes
 	}
 	if !trace.RankerMultiFidelity {
 		t.Fatal("expected traced ranker setting to match the setting used by the finalizer")
+	}
+}
+
+func TestPlannerRolloutRequestVariantChangesOnlyAssignedDimension(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_PLANNER_STATIC_PROMPT_VERSION", plannerStaticPromptVersionV1)
+	t.Setenv("MODEL_EXPRESS_PLANNER_CONTEXT_VERSION", "v2")
+	policy := calibration.DefaultPlannerRolloutPolicy()
+	policy.Enabled = true
+	policy.State = calibration.RolloutStateActive
+	policy.StagePercent = 100
+	policy.Dimensions = []string{calibration.RolloutDimensionPrompt}
+	policy.VariantValues = map[string]string{calibration.RolloutDimensionPrompt: plannerStaticPromptVersionCompactV1}
+	assignment, err := calibration.AssignPlannerRollout(policy, "project-prompt-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	variant := plannerRequestVariantForInput(ExperimentPlannerInput{RolloutAssignment: &assignment})
+	if variant.StaticPromptVersion != plannerStaticPromptVersionCompactV1 || variant.ContextVersion != "v2" {
+		t.Fatalf("prompt-only rollout changed an unintended dimension: %#v", variant)
 	}
 }
 

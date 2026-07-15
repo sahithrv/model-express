@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,6 +16,41 @@ import (
 	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
 )
+
+func TestStrictDefaultBlocksUnsupportedProposalAndRelaxedIsOneSwitchRollback(t *testing.T) {
+	logDir := t.TempDir()
+	t.Setenv("MODEL_EXPRESS_LOG_DIR", logDir)
+	t.Setenv("MODEL_EXPRESS_PLANNER_VALIDATION_MODE", "")
+	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "")
+	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 6)})
+	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
+	recommendation := experimentPlannerAddExperimentsRecommendation()
+	recommendation.ProposalMechanisms = nil
+	recommendation.ProposedExperiments[0].Mechanism = ""
+	recommendation.ProposedExperiments[0].Intervention = ""
+	recommendation.ProposedExperiments[0].EvidenceUsed = nil
+	recommendation.ProposedExperiments[0].ExpectedEffect = ""
+
+	if _, err := experimentPlannerDecisionPayload(recommendation, invocation, "autonomous", plannerInputForPayload(t, server, projectID)); err == nil {
+		t.Fatal("strict default allowed an unsupported proposal to reach scheduling payload creation")
+	}
+
+	before := plannervalidation.RelaxedRollbackDiagnosticCount()
+	t.Setenv("MODEL_EXPRESS_PLANNER_VALIDATION_MODE", plannervalidation.ModeRelaxed)
+	payload, err := experimentPlannerDecisionPayload(recommendation, invocation, "autonomous", plannerInputForPayload(t, server, projectID))
+	if err != nil {
+		t.Fatalf("one-switch relaxed rollback did not restore compatibility: %v", err)
+	}
+	if len(payloadStringSlice(payload, "planner_validation_warnings")) == 0 {
+		t.Fatalf("relaxed rollback was not observable in the decision payload: %#v", payload)
+	}
+	if got := plannervalidation.RelaxedRollbackDiagnosticCount(); got <= before {
+		t.Fatalf("rollback diagnostic counter did not increase: before=%d after=%d", before, got)
+	}
+	if _, err := os.Stat(filepath.Join(logDir, "orchestrator.jsonl")); err != nil {
+		t.Fatalf("rollback diagnostic was not emitted: %v", err)
+	}
+}
 
 func TestShadowStrictDecisionPayloadReturnsRelaxedResultAndTypedVerdict(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_PLANNER_VALIDATION_MODE", plannervalidation.ModeShadowStrict)

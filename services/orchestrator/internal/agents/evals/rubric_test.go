@@ -214,6 +214,74 @@ func TestBaselineTolerancesSeparateCriticalQualityAndEfficiency(t *testing.T) {
 	}
 }
 
+func TestRequiredBaselineGateFailsUnsafeMutationsAndWarnsOnEfficiency(t *testing.T) {
+	fixtures, err := LoadPlannerRubricFixtures()
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := EvaluatePlannerRubricFixtures(fixtures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := BuildPlannerRubricBaseline(artifact)
+
+	unsafe := artifact
+	unsafe.Scenarios = append([]PlannerRubricScenarioResult(nil), artifact.Scenarios...)
+	unsafe.Scenarios[0].Score.SafetyPassed = false
+	unsafeComparison := ComparePlannerRubricBaseline(baseline, unsafe)
+	if unsafeComparison.Passed || unsafeComparison.CriticalPassed {
+		t.Fatalf("unsafe mutation passed the required gate: %#v", unsafeComparison)
+	}
+
+	inefficient := artifact
+	inefficient.Scenarios = append([]PlannerRubricScenarioResult(nil), artifact.Scenarios...)
+	inefficient.Scenarios[0].ResponseBytes += baseline.Tolerances.Efficiency.MaxResponseByteIncreasePerScenario + 1
+	warningComparison := ComparePlannerRubricBaseline(baseline, inefficient)
+	if !warningComparison.Passed || !warningComparison.CriticalPassed || !warningComparison.QualityPassed || warningComparison.EfficiencyPassed || len(warningComparison.Warnings) != 1 {
+		t.Fatalf("efficiency regression did not remain a warning by default: %#v", warningComparison)
+	}
+	gatedComparison := ComparePlannerRubricBaselineWithOptions(baseline, inefficient, PlannerBaselineGateOptions{GateEfficiency: true})
+	if gatedComparison.Passed || !gatedComparison.EfficiencyGated {
+		t.Fatalf("explicit efficiency gate did not fail: %#v", gatedComparison)
+	}
+}
+
+func TestUnsafeMutationRequiresExplicitBaselineArtifactChange(t *testing.T) {
+	fixtures, err := LoadPlannerRubricFixtures()
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := EvaluatePlannerRubricFixtures(fixtures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, err := LoadCheckedPlannerRubricBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := artifact
+	mutated.Scenarios = append([]PlannerRubricScenarioResult(nil), artifact.Scenarios...)
+	mutated.Scenarios[0].Score.SafetyPassed = false
+	if comparison := ComparePlannerRubricBaseline(checked, mutated); comparison.Passed {
+		t.Fatalf("unsafe mutation unexpectedly matched the checked artifact: %#v", comparison)
+	}
+
+	updatedPath := t.TempDir() + "/planner_rubric_v1.json"
+	if err := WritePlannerRubricBaseline(updatedPath, mutated); err != nil {
+		t.Fatal(err)
+	}
+	explicitlyUpdated, err := LoadPlannerRubricBaseline(updatedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if comparison := ComparePlannerRubricBaseline(explicitlyUpdated, mutated); !comparison.Passed {
+		t.Fatalf("explicit baseline artifact update did not take effect: %#v", comparison)
+	}
+	if comparison := ComparePlannerRubricBaseline(checked, mutated); comparison.Passed {
+		t.Fatal("writing a separate artifact silently changed the embedded checked baseline")
+	}
+}
+
 func TestBestVariantUsesRubricBeforeEfficiencyAndIgnoresRankerScore(t *testing.T) {
 	valid := PlannerReplayVariantResult{
 		Variant:               PlannerReplayVariantCurrentV1,

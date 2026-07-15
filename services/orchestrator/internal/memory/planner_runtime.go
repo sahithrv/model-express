@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"model-express/services/orchestrator/internal/calibration"
 )
 
 const (
@@ -237,6 +239,38 @@ func NormalizeAgentInvocationRuntime(invocation AgentInvocation) (AgentInvocatio
 			invocation.PlannerVariantID = LegacyPlannerVariantID
 		} else if invocation.PlannerVariantID != LegacyPlannerVariantID {
 			return AgentInvocation{}, fmt.Errorf("non-legacy planner_variant_id requires planner_variant")
+		}
+	}
+	if invocation.RolloutAssignment != nil {
+		assignment := *invocation.RolloutAssignment
+		assignment.Dimensions = append([]string(nil), assignment.Dimensions...)
+		assignment.VariantValues = map[string]string{}
+		for key, value := range invocation.RolloutAssignment.VariantValues {
+			assignment.VariantValues[key] = value
+		}
+		if err := calibration.ValidatePlannerRolloutAssignment(assignment); err != nil {
+			return AgentInvocation{}, err
+		}
+		if strings.TrimSpace(invocation.RolloutCohortID) != "" && invocation.RolloutCohortID != assignment.CohortID {
+			return AgentInvocation{}, fmt.Errorf("rollout_cohort_id does not match rollout_assignment")
+		}
+		if strings.TrimSpace(invocation.RolloutPolicyID) != "" && invocation.RolloutPolicyID != assignment.PolicyID {
+			return AgentInvocation{}, fmt.Errorf("rollout_policy_id does not match rollout_assignment")
+		}
+		invocation.RolloutCohortID = assignment.CohortID
+		invocation.RolloutPolicyID = assignment.PolicyID
+		invocation.RolloutAssignment = &assignment
+	} else {
+		invocation.RolloutCohortID = strings.TrimSpace(invocation.RolloutCohortID)
+		invocation.RolloutPolicyID = strings.TrimSpace(invocation.RolloutPolicyID)
+		if invocation.RolloutCohortID == "" {
+			invocation.RolloutCohortID = calibration.PlannerRolloutLegacyIdentity
+		}
+		if invocation.RolloutPolicyID == "" {
+			invocation.RolloutPolicyID = calibration.PlannerRolloutLegacyIdentity
+		}
+		if invocation.RolloutCohortID != calibration.PlannerRolloutLegacyIdentity || invocation.RolloutPolicyID != calibration.PlannerRolloutLegacyIdentity {
+			return AgentInvocation{}, fmt.Errorf("non-legacy rollout identity requires rollout_assignment")
 		}
 	}
 

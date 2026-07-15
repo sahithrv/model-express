@@ -70,6 +70,8 @@ func candidateProvenanceScanDestinations(candidate *calibration.CandidateProvena
 		&candidate.DecisionID,
 		&candidate.PlannerVariantID,
 		&candidate.CandidateIndex,
+		&candidate.RolloutCohortID,
+		&candidate.RolloutPolicyID,
 		&candidate.RequestedConfigHash,
 		&candidate.AcceptedSpecHash,
 		&candidate.Task,
@@ -1466,6 +1468,7 @@ func scanAgentMemoryRecord(row rowScanner) (memory.AgentMemoryRecord, error) {
 func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 	var invocation memory.AgentInvocation
 	var plannerVariantJSON []byte
+	var rolloutAssignmentJSON []byte
 	var providerUsageJSON []byte
 	var derivedCostJSON []byte
 	var inputMessagesJSON []byte
@@ -1487,6 +1490,9 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		&invocation.PromptVersion,
 		&invocation.PlannerVariantID,
 		&plannerVariantJSON,
+		&invocation.RolloutCohortID,
+		&invocation.RolloutPolicyID,
+		&rolloutAssignmentJSON,
 		&invocation.ValidationMode,
 		&invocation.AttemptGroupID,
 		&invocation.AttemptIndex,
@@ -1519,6 +1525,13 @@ func scanAgentInvocation(row rowScanner) (memory.AgentInvocation, error) {
 		if variant.IdentitySchemaVersion != "" {
 			invocation.PlannerVariant = &variant
 		}
+	}
+	if len(rolloutAssignmentJSON) > 0 && string(rolloutAssignmentJSON) != "{}" {
+		var assignment calibration.PlannerRolloutAssignment
+		if err := json.Unmarshal(rolloutAssignmentJSON, &assignment); err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("unmarshal planner rollout assignment: %w", err)
+		}
+		invocation.RolloutAssignment = &assignment
 	}
 	invocation.ProviderUsage = map[string]any{}
 	if len(providerUsageJSON) > 0 {

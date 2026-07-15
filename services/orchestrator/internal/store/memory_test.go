@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
@@ -850,6 +851,9 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 		"prompt_v1",
 		memory.LegacyPlannerVariantID,
 		[]byte(`{}`),
+		calibration.PlannerRolloutLegacyIdentity,
+		calibration.PlannerRolloutLegacyIdentity,
+		[]byte(`{}`),
 		"",
 		"",
 		-1,
@@ -903,6 +907,18 @@ func TestScanAgentInvocationPreservesLLMUsage(t *testing.T) {
 }
 
 func TestScanAgentInvocationPreservesPlannerRuntimeIdentity(t *testing.T) {
+	policy := calibration.DefaultPlannerRolloutPolicy()
+	policy.Enabled = true
+	policy.State = calibration.RolloutStateActive
+	policy.StagePercent = 100
+	assignment, err := calibration.AssignPlannerRollout(policy, "project_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignmentJSON, err := json.Marshal(assignment)
+	if err != nil {
+		t.Fatal(err)
+	}
 	variant := memory.PlannerVariant{
 		IdentitySchemaVersion:  memory.PlannerVariantIdentitySchemaV1,
 		AgentVersion:           "v2",
@@ -951,7 +967,9 @@ func TestScanAgentInvocationPreservesPlannerRuntimeIdentity(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	row := fakeAgentInvocationRow{values: []any{
 		"agent_invocation_2", "project_1", "dataset_1", "plan_1", "", "experiment_planner", "v2", "experiment_planner_v3",
-		variantID, variantJSON, "strict", "planner_attempt_group", 1, "trace_validation_rejected", float64(8.25),
+		variantID, variantJSON,
+		assignment.CohortID, assignment.PolicyID, assignmentJSON,
+		"strict", "planner_attempt_group", 1, "trace_validation_rejected", float64(8.25),
 		[]byte(`{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}`), costJSON,
 		"openai", "test-model", []byte(`[]`), []byte(`{}`), `{"ok":true}`, []byte(`{"ok":true}`),
 		"valid", "", []byte(`{}`), []byte(`{}`), true, []byte(`{}`), []byte(`{}`), createdAt,
@@ -969,6 +987,9 @@ func TestScanAgentInvocationPreservesPlannerRuntimeIdentity(t *testing.T) {
 	}
 	if invocation.DerivedCost == nil || invocation.DerivedCost.PricingVersion != "pricing-v1" || invocation.DerivedCost.TotalCostUSD != "0.0000081" {
 		t.Fatalf("unexpected derived cost scan %#v", invocation.DerivedCost)
+	}
+	if invocation.RolloutAssignment == nil || invocation.RolloutCohortID != assignment.CohortID || invocation.RolloutPolicyID != assignment.PolicyID {
+		t.Fatalf("unexpected planner rollout identity scan %#v", invocation)
 	}
 }
 

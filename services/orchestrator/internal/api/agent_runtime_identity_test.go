@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"model-express/services/orchestrator/internal/agents"
+	"model-express/services/orchestrator/internal/calibration"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
@@ -193,6 +194,32 @@ func TestMemoryRetrievalExecutesCapturedPlannerPolicy(t *testing.T) {
 	results, _ = server.searchRetrievedMemory(context.Background(), query, "plan_retrieval", "", policy)
 	if len(results) != 0 {
 		t.Fatalf("captured minimum score was not applied: %#v", results)
+	}
+}
+
+func TestPlannerRolloutRetrievalVariantChangesOnlyRetrievalPolicy(t *testing.T) {
+	policy := calibration.DefaultPlannerRolloutPolicy()
+	policy.Enabled = true
+	policy.State = calibration.RolloutStateActive
+	policy.StagePercent = 100
+	policy.Dimensions = []string{calibration.RolloutDimensionRetrieval}
+	policy.VariantValues = map[string]string{calibration.RolloutDimensionRetrieval: "log_only"}
+	assignment, err := calibration.AssignPlannerRollout(policy, "project-retrieval-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := memory.PlannerRetrievalVariant{Enabled: false, LogOnly: false, MaxCards: 7, MinScore: 0.61}
+	got, err := plannerRetrievalVariantForRollout(base, &assignment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Enabled || !got.LogOnly || got.MaxCards != base.MaxCards || got.MinScore != base.MinScore {
+		t.Fatalf("retrieval-only rollout changed unrelated retrieval settings: base=%#v got=%#v", base, got)
+	}
+
+	assignment.VariantValues[calibration.RolloutDimensionRetrieval] = "unsupported"
+	if _, err := plannerRetrievalVariantForRollout(base, &assignment); err == nil {
+		t.Fatal("unsupported retrieval rollout variant was accepted")
 	}
 }
 

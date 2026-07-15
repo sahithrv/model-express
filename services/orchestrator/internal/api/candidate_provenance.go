@@ -37,6 +37,8 @@ func candidateProvenanceCreatesFromPayload(payload map[string]any) ([]calibratio
 	}
 	invocationID := payloadString(payload, "invocation_id")
 	variantID := payloadString(payload, "planner_variant_id")
+	rolloutCohortID := payloadString(payload, "planner_rollout_cohort_id")
+	rolloutPolicyID := payloadString(payload, "planner_rollout_policy_id")
 	var candidates []agents.CandidateHypothesis
 	if err := decodeCandidateProvenancePayload(payload["candidate_hypotheses"], &candidates); err != nil {
 		return nil, fmt.Errorf("decode candidate_hypotheses: %w", err)
@@ -99,6 +101,8 @@ func candidateProvenanceCreatesFromPayload(payload map[string]any) ([]calibratio
 		create := calibration.CandidateProvenanceCreate{
 			InvocationID:            invocationID,
 			PlannerVariantID:        variantID,
+			RolloutCohortID:         rolloutCohortID,
+			RolloutPolicyID:         rolloutPolicyID,
 			CandidateIndex:          index,
 			RequestedConfigHash:     requestedHash,
 			AcceptedSpecHash:        acceptedHash,

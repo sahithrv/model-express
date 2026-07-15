@@ -15,7 +15,8 @@ import (
 )
 
 const agentInvocationSelectColumns = `id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version,
-	planner_variant_id, planner_variant, validation_mode, attempt_group_id, attempt_index, retry_reason, wall_latency_ms,
+	planner_variant_id, planner_variant, rollout_cohort_id, rollout_policy_id, rollout_assignment,
+	validation_mode, attempt_group_id, attempt_index, retry_reason, wall_latency_ms,
 	provider_usage, derived_cost, provider, model, input_messages, input_context, raw_output, parsed_output,
 	validation_status, validation_error, strict_validation_verdict, validation_outcome,
 	accepted_for_memory, human_feedback, downstream_outcome, created_at`
@@ -230,17 +231,18 @@ func validateCandidateProvenanceCreates(candidates []calibration.CandidateProven
 func ensureCandidateProvenanceTx(ctx context.Context, tx *sql.Tx, decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error) {
 	const insert = `
 		INSERT INTO planner_candidate_provenance (
-			project_id, invocation_id, decision_id, planner_variant_id, candidate_index,
+			project_id, invocation_id, decision_id, planner_variant_id, rollout_cohort_id, rollout_policy_id, candidate_index,
 			requested_config_hash, accepted_spec_hash, task, mechanism,
 			forecast_target, metric_direction, score_basis, score_version, baseline_job_id,
 			baseline_score, predicted_delta, prediction_source, forecast_units, valid_range_min, valid_range_max,
 			base_score, selection_trace_reference, selected, rejected, selection_state,
 			selected_experiment_index, outcome_status, reasons
 		)
-		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-			$15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			$17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
 		FROM agent_invocations
 		WHERE id = $2 AND project_id = $1 AND planner_variant_id = $4
+			AND rollout_cohort_id = $5 AND rollout_policy_id = $6
 		ON CONFLICT (decision_id, candidate_index) DO NOTHING
 	`
 	for _, candidate := range candidates {
@@ -249,7 +251,7 @@ func ensureCandidateProvenanceTx(ctx context.Context, tx *sql.Tx, decision decis
 			return nil, fmt.Errorf("marshal candidate provenance reasons: %w", err)
 		}
 		result, err := tx.ExecContext(ctx, insert,
-			decision.ProjectID, candidate.InvocationID, decision.ID, candidate.PlannerVariantID, candidate.CandidateIndex,
+			decision.ProjectID, candidate.InvocationID, decision.ID, candidate.PlannerVariantID, candidate.RolloutCohortID, candidate.RolloutPolicyID, candidate.CandidateIndex,
 			candidate.RequestedConfigHash, candidate.AcceptedSpecHash, candidate.Task, candidate.Mechanism,
 			candidate.Forecast.ForecastTarget, candidate.Forecast.MetricDirection, candidate.Forecast.ScoreBasis, candidate.Forecast.ScoreVersion, candidate.Forecast.BaselineJobID,
 			candidate.Forecast.BaselineScore, candidate.Forecast.PredictedDelta, candidate.Forecast.PredictionSource, candidate.Forecast.Units, candidate.Forecast.ValidRange.Min, candidate.Forecast.ValidRange.Max,
@@ -400,6 +402,7 @@ type candidateProvenanceQueryer interface {
 }
 
 const candidateProvenanceSelectColumns = `id, project_id, invocation_id, decision_id, planner_variant_id, candidate_index,
+		rollout_cohort_id, rollout_policy_id,
 		requested_config_hash, accepted_spec_hash, task, mechanism,
 		forecast_target, metric_direction, score_basis, score_version, baseline_job_id,
 		baseline_score, predicted_delta, prediction_source, forecast_units, valid_range_min, valid_range_max,
@@ -574,6 +577,13 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 			return memory.AgentInvocation{}, fmt.Errorf("marshal planner validation outcome: %w", err)
 		}
 	}
+	rolloutAssignmentJSON := []byte(`{}`)
+	if invocation.RolloutAssignment != nil {
+		rolloutAssignmentJSON, err = json.Marshal(invocation.RolloutAssignment)
+		if err != nil {
+			return memory.AgentInvocation{}, fmt.Errorf("marshal planner rollout assignment: %w", err)
+		}
+	}
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -595,6 +605,9 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 			prompt_version,
 			planner_variant_id,
 			planner_variant,
+			rollout_cohort_id,
+			rollout_policy_id,
+			rollout_assignment,
 			validation_mode,
 			attempt_group_id,
 			attempt_index,
@@ -616,7 +629,7 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 			human_feedback,
 			downstream_outcome
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
 		RETURNING ` + agentInvocationSelectColumns + `
 	`
 	stored, err := scanAgentInvocation(tx.QueryRowContext(
@@ -631,6 +644,9 @@ func (s *PostgresStore) CreateAgentInvocation(invocation memory.AgentInvocation)
 		invocation.PromptVersion,
 		invocation.PlannerVariantID,
 		plannerVariantJSON,
+		invocation.RolloutCohortID,
+		invocation.RolloutPolicyID,
+		rolloutAssignmentJSON,
 		invocation.ValidationMode,
 		invocation.AttemptGroupID,
 		invocation.AttemptIndex,

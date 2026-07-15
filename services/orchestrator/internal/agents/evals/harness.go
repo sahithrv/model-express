@@ -53,19 +53,6 @@ type PlannerReplayVariantResult struct {
 	Rubric                          PlannerRubricScore   `json:"rubric"`
 }
 
-type replayTraceGenerator struct {
-	response []byte
-	request  llm.JSONRequest
-}
-
-func (g *replayTraceGenerator) GenerateJSON(_ context.Context, req llm.JSONRequest) ([]byte, error) {
-	g.request = req
-	if len(g.response) == 0 {
-		return nil, errors.New("replay generator has no response payload")
-	}
-	return g.response, nil
-}
-
 func ReplayPlannerResponse(fixture PlannerReplayFixture) ([]byte, error) {
 	if len(fixture.Response) == 0 {
 		return nil, errors.New("planner replay fixture has no response payload")
@@ -82,6 +69,7 @@ func ReplayPlannerResponseJSON(ctx context.Context, fixture PlannerReplayFixture
 }
 
 func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixture, rawResponse []byte) (PlannerReplayArtifact, error) {
+	_ = ctx // Retained for API compatibility; deterministic replay makes no calls.
 	input := ExperimentPlannerInputFromReplayFixture(fixture)
 	artifact := PlannerReplayArtifact{
 		FixtureName: fixture.Name,
@@ -96,7 +84,7 @@ func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixtur
 	artifact.SchemaParseSuccess = true
 	artifact.RecommendationTitle = recommendation.Summary
 
-	_, currentRequest, err := captureCurrentReplayTrace(ctx, input, rawResponse)
+	currentRequest, err := buildCurrentReplayRequest(input)
 	if err != nil {
 		return artifact, err
 	}
@@ -150,11 +138,10 @@ func ReplayPlannerResponseBytes(ctx context.Context, fixture PlannerReplayFixtur
 	return artifact, nil
 }
 
-func captureCurrentReplayTrace(ctx context.Context, input agents.ExperimentPlannerInput, rawResponse []byte) (agents.ExperimentPlanningTrace, llm.JSONRequest, error) {
-	gen := &replayTraceGenerator{response: rawResponse}
-	agent := agents.NewExperimentPlannerAgent(gen, "replay-test-model")
-	trace, err := agent.PlanWithTrace(ctx, input)
-	return trace, gen.request, err
+func buildCurrentReplayRequest(input agents.ExperimentPlannerInput) (llm.JSONRequest, error) {
+	agent := agents.NewExperimentPlannerAgent(nil, "replay-test-model")
+	built, err := agent.BuildRequest(input, replayRequestVariant(PlannerReplayVariantCurrentV1))
+	return built.Request, err
 }
 
 func replayVariantPromptBytes(input agents.ExperimentPlannerInput, variant PlannerReplayVariant) (int, error) {

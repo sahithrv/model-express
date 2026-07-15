@@ -1470,7 +1470,8 @@ func (s *MemoryStore) validateCandidateProvenanceCreatesLocked(projectID string,
 		}
 		seen[candidate.CandidateIndex] = true
 		invocation, ok := s.agentInvocations[candidate.InvocationID]
-		if !ok || invocation.ProjectID != projectID || invocation.PlannerVariantID != candidate.PlannerVariantID {
+		if !ok || invocation.ProjectID != projectID || invocation.PlannerVariantID != candidate.PlannerVariantID ||
+			invocation.RolloutCohortID != candidate.RolloutCohortID || invocation.RolloutPolicyID != candidate.RolloutPolicyID {
 			return fmt.Errorf("%w: candidate invocation or planner variant does not match project", ErrInvalidRequest)
 		}
 	}

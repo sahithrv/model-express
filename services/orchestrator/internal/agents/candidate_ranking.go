@@ -35,6 +35,27 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 	recommendation.CandidateRankingsV2, recommendation.CandidateSelectionTraceV2, recommendation.RankerShadowComparison = rankPlannerCandidateHypothesesV2(
 		input, candidates, rankings, effectiveMaxPlannerExperiments(input),
 	)
+	if PlannerSchedulingRankerVersion(input) == ExperimentPlannerRankerV2Version {
+		recommendation.CandidateRankingsV1 = append([]CandidateRanking(nil), rankings...)
+		activeRankings := append([]CandidateRanking(nil), recommendation.CandidateRankingsV2...)
+		for index := range activeRankings {
+			activeRankings[index].RankerVersion = ExperimentPlannerRankerV2Version
+			if activeRankings[index].Selected {
+				activeRankings[index].Reasons = append(activeRankings[index].Reasons, "selected by guarded ranker v2 rollout")
+			}
+		}
+		recommendation.CandidateRankings = activeRankings
+		recommendation.CandidateRankingsV2 = append([]CandidateRanking(nil), activeRankings...)
+		recommendation.CandidateSelectionTrace = append([]CandidateSelectionRound(nil), recommendation.CandidateSelectionTraceV2...)
+		selected, mechanisms = selectedPlannerCandidateOutputs(candidates, activeRankings)
+		rankings = activeRankings
+		if recommendation.RankerShadowComparison != nil {
+			recommendation.RankerShadowComparison.PolicyVersion = ExperimentPlannerRankerV2Version
+			recommendation.RankerShadowComparison.SchedulingRankerVersion = ExperimentPlannerRankerV2Version
+			recommendation.RankerShadowComparison.ShadowOnly = false
+			recommendation.RankerShadowComparison.OutcomeDisclosure = "Observed outcomes are attributed only to candidates actually selected and executed by the assigned policy; v1-only candidates are unexecuted counterfactuals and receive no outcome label."
+		}
+	}
 	recommendation.ProposedExperiments = selected
 	recommendation.ProposalMechanisms = mechanisms
 	if len(selected) == 0 {
@@ -49,6 +70,35 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 		}
 	}
 	return recommendation, nil
+}
+
+func PlannerSchedulingRankerVersion(input ExperimentPlannerInput) string {
+	if calibration.PlannerRolloutTreatsDimension(input.RolloutAssignment, calibration.RolloutDimensionRanker) &&
+		calibration.PlannerRolloutVariantValue(input.RolloutAssignment, calibration.RolloutDimensionRanker) == ExperimentPlannerRankerV2Version {
+		return ExperimentPlannerRankerV2Version
+	}
+	return ExperimentPlannerRankerVersion
+}
+
+func selectedPlannerCandidateOutputs(candidates []CandidateHypothesis, rankings []CandidateRanking) ([]plans.PlannedExperiment, []PlannerProposalMechanism) {
+	selectedRankings := []CandidateRanking{}
+	for _, ranking := range rankings {
+		if ranking.Selected && ranking.SelectionOrder != nil && ranking.CandidateIndex >= 0 && ranking.CandidateIndex < len(candidates) {
+			selectedRankings = append(selectedRankings, ranking)
+		}
+	}
+	sort.Slice(selectedRankings, func(i, j int) bool {
+		return *selectedRankings[i].SelectionOrder < *selectedRankings[j].SelectionOrder
+	})
+	selected := make([]plans.PlannedExperiment, 0, len(selectedRankings))
+	mechanisms := make([]PlannerProposalMechanism, 0, len(selectedRankings))
+	for _, ranking := range selectedRankings {
+		experimentIndex := len(selected)
+		candidate := candidates[ranking.CandidateIndex]
+		selected = append(selected, candidate.ExperimentConfig)
+		mechanisms = append(mechanisms, plannerProposalMechanismFromCandidate(candidate, experimentIndex))
+	}
+	return selected, mechanisms
 }
 
 func freezeCandidateForecastContracts(input ExperimentPlannerInput, candidates []CandidateHypothesis) ([]CandidateHypothesis, error) {

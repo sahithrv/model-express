@@ -99,6 +99,45 @@ func TestMemoryCandidateProvenanceRepairsDecisionCreatedBeforeCandidateInsert(t 
 	}
 }
 
+func TestMemoryPlannerRolloutIdentityPersistsWithInvocationAndCandidates(t *testing.T) {
+	store := NewMemoryStore()
+	project, err := store.CreateProject("rollout persistence", "verify policy lineage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := calibration.DefaultPlannerRolloutPolicy()
+	policy.Enabled = true
+	policy.State = calibration.RolloutStateActive
+	policy.StagePercent = 100
+	assignment, err := calibration.AssignPlannerRollout(policy, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation, err := store.CreateAgentInvocation(memory.AgentInvocation{ProjectID: project.ID, RolloutAssignment: &assignment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creates := testCandidateProvenanceCreates(invocation.ID, invocation.PlannerVariantID)
+	for index := range creates {
+		creates[index].RolloutCohortID = assignment.CohortID
+		creates[index].RolloutPolicyID = assignment.PolicyID
+	}
+	decision, rows, err := store.CreateAgentDecisionWithCandidateProvenance(
+		project.ID, "", decisions.TypeAddExperiments, "rollout persistence", nil, creates,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.ID == "" || invocation.RolloutCohortID != assignment.CohortID || invocation.RolloutPolicyID != assignment.PolicyID {
+		t.Fatalf("invocation rollout identity was not persisted: %#v", invocation)
+	}
+	for _, row := range rows {
+		if row.RolloutCohortID != assignment.CohortID || row.RolloutPolicyID != assignment.PolicyID {
+			t.Fatalf("candidate rollout identity was not persisted: %#v", row)
+		}
+	}
+}
+
 func TestMemoryCandidateOutcomeFinalizationIsAtomicAndKeepsProposalProvenanceImmutable(t *testing.T) {
 	store := NewMemoryStore()
 	project, _ := store.CreateProject("candidate outcomes", "finalize")
@@ -159,6 +198,7 @@ func TestScanCandidateProvenancePreservesForecastSelectionAndNullableLineage(t *
 	createdAt := time.Date(2026, time.July, 14, 12, 0, 0, 0, time.UTC)
 	row := fakeAgentInvocationRow{values: []any{
 		"candidate_provenance_1", "project_1", "agent_invocation_1", "decision_1", "planner_variant_1", 2,
+		"planner_project_cohort_v1_42", "planner_policy_ranker_v2_candidate",
 		"sha256:requested", "sha256:accepted", "image_classification", "regularization",
 		"macro_f1", calibration.MetricDirectionHigherIsBetter, "macro_f1_score", calibration.CandidateForecastScoreVersionV1, "job_champion",
 		0.70, 0.02, calibration.CandidatePredictionSource, calibration.CandidateForecastUnits, 0.0, 1.0,
@@ -192,6 +232,7 @@ func testCandidateProvenanceCreates(invocationID string, variantID string) []cal
 	return []calibration.CandidateProvenanceCreate{
 		{
 			InvocationID: invocationID, PlannerVariantID: variantID, CandidateIndex: 0,
+			RolloutCohortID: calibration.PlannerRolloutLegacyIdentity, RolloutPolicyID: calibration.PlannerRolloutLegacyIdentity,
 			RequestedConfigHash: "sha256:requested-0", AcceptedSpecHash: "sha256:accepted-0",
 			Task: "image_classification", Mechanism: "class_imbalance", Forecast: forecast, BaseScore: 0.81,
 			SelectionTraceReference: "/payload/candidate_selection_trace?candidate_index=0",
@@ -200,6 +241,7 @@ func testCandidateProvenanceCreates(invocationID string, variantID string) []cal
 		},
 		{
 			InvocationID: invocationID, PlannerVariantID: variantID, CandidateIndex: 1,
+			RolloutCohortID: calibration.PlannerRolloutLegacyIdentity, RolloutPolicyID: calibration.PlannerRolloutLegacyIdentity,
 			RequestedConfigHash: "sha256:requested-1", AcceptedSpecHash: "sha256:accepted-1",
 			Task: "image_classification", Mechanism: "regularization", Forecast: forecast, BaseScore: 0.61,
 			SelectionTraceReference: "/payload/candidate_selection_trace?candidate_index=1",
