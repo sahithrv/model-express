@@ -493,6 +493,7 @@ func scanProject(row rowScanner) (projects.Project, error) {
 	var project projects.Project
 	if err := row.Scan(
 		&project.ID,
+		&project.AccountID,
 		&project.Name,
 		&project.Goal,
 		&project.Status,
@@ -1259,6 +1260,8 @@ func scanAgentDecision(row rowScanner) (decisions.AgentDecision, error) {
 		&decision.DecisionType,
 		&decision.Rationale,
 		&payloadJSON,
+		&decision.ProposalPolicyEvaluationID,
+		&decision.EffectivePolicyHash,
 		&decision.CreatedAt,
 	); err != nil {
 		return decisions.AgentDecision{}, normalizeSQLError(err)
@@ -1856,6 +1859,9 @@ func scanExperimentPlan(row rowScanner) (plans.ExperimentPlan, error) {
 		&plan.DatasetID,
 		&plan.Status,
 		&plan.SourceDecisionID,
+		&plan.ProposalPolicyEvaluationID,
+		&plan.EffectivePolicyHash,
+		&plan.PolicyStatus,
 		&plan.TargetMetric,
 		&plan.RecommendedWorkers,
 		&plan.EstimatedMinutes,

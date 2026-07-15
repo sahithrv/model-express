@@ -15,6 +15,7 @@ import (
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
@@ -74,6 +75,17 @@ type Store interface {
 	GetProject(id string) (projects.Project, error)
 	GetProjectContext(ctx context.Context, id string) (projects.Project, error)
 	ListProjects() ([]projects.Project, error)
+
+	CreateCompatibilityProfile(profile policies.CompatibilityProfile) (policies.CompatibilityProfile, error)
+	GetCompatibilityProfile(profileKey string, semanticVersion string) (policies.CompatibilityProfile, error)
+	CreateExperimentPolicyVersion(version policies.PolicyVersion) (policies.PolicyVersion, error)
+	GetExperimentPolicyVersion(id string) (policies.PolicyVersion, error)
+	SetExperimentPolicyBinding(write policies.BindingWrite) (policies.Binding, error)
+	ClearExperimentPolicyBinding(scope policies.Scope, subjectID string, expectedRevision int64) (policies.Binding, error)
+	ListActiveExperimentPolicyBindings(scope policies.ScopeContext) ([]policies.Binding, error)
+	CreateExperimentPolicyEvaluation(evaluation policies.Evaluation) (policies.Evaluation, error)
+	GetExperimentPolicyEvaluation(id string) (policies.Evaluation, error)
+	ListExperimentPolicyEvaluations(projectID string) ([]policies.Evaluation, error)
 
 	CreateDataset(projectID string, name string, storageURI string, checksumSHA256 string, sizeBytes int64) (datasets.Dataset, error)
 	GetDataset(id string) (datasets.Dataset, error)
@@ -141,7 +153,9 @@ type Store interface {
 	ListProjectChampionFeedback(projectID string) ([]runs.ChampionFeedback, error)
 
 	CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error)
+	CreateAgentDecisionWithPolicy(projectID string, planID string, decisionType string, rationale string, payload map[string]any, policy policies.PersistenceReference) (decisions.AgentDecision, error)
 	CreateAgentDecisionWithCandidateProvenance(projectID string, planID string, decisionType string, rationale string, payload map[string]any, candidates []calibration.CandidateProvenanceCreate) (decisions.AgentDecision, []calibration.CandidateProvenance, error)
+	CreateAgentDecisionWithCandidateProvenanceAndPolicy(projectID string, planID string, decisionType string, rationale string, payload map[string]any, candidates []calibration.CandidateProvenanceCreate, policy policies.PersistenceReference) (decisions.AgentDecision, []calibration.CandidateProvenance, error)
 	EnsureCandidateProvenance(decision decisions.AgentDecision, candidates []calibration.CandidateProvenanceCreate) ([]calibration.CandidateProvenance, error)
 	FinalizeCandidateOutcomes(decisionID string, updates []calibration.CandidateOutcomeUpdate) ([]calibration.CandidateProvenance, error)
 	ListDecisionCandidateProvenance(decisionID string) ([]calibration.CandidateProvenance, error)
@@ -195,6 +209,7 @@ type Store interface {
 	ListStudyOptimizerTrials(studyID string) ([]automl.OptimizerTrial, error)
 
 	CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error)
+	CreateExperimentPlanWithPolicy(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string, policy policies.PersistenceReference) (plans.ExperimentPlan, error)
 	GetExperimentPlan(id string) (plans.ExperimentPlan, error)
 	ListProjectExperimentPlans(projectID string) ([]plans.ExperimentPlan, error)
 }

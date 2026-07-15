@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"model-express/services/orchestrator/internal/calibration"
+	"model-express/services/orchestrator/internal/policies"
 )
 
 const (
@@ -52,6 +53,7 @@ func rankPlannerCandidateHypothesesV2(
 			RetrievedMemoryHits: append([]CandidateRetrievedMemoryHit(nil), v1.RetrievedMemoryHits...),
 			PromotionDecision:   v1.PromotionDecision, StopReason: v1.StopReason,
 			Rejected: v1.Rejected, Reasons: append([]string(nil), v1.Reasons...), ExperimentSignature: v1.ExperimentSignature,
+			PolicyFindings:  append([]policies.Finding(nil), v1.PolicyFindings...),
 			ScoreComponents: map[string]float64{},
 		}
 		if ranking.Rejected {

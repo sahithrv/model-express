@@ -12,6 +12,7 @@ import (
 
 	"model-express/services/orchestrator/internal/automl"
 	"model-express/services/orchestrator/internal/calibration"
+	"model-express/services/orchestrator/internal/catalog"
 	"model-express/services/orchestrator/internal/datasets"
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/execution"
@@ -20,6 +21,7 @@ import (
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 )
@@ -27,7 +29,7 @@ import (
 const (
 	ExperimentPlannerAgentName     = "experiment_planner"
 	ExperimentPlannerAgentVersion  = "v2"
-	ExperimentPlannerPromptVersion = "experiment_planner_v4"
+	ExperimentPlannerPromptVersion = "experiment_planner_v5"
 
 	ExperimentPlannerToolPolicyVersion      = "planner_information_tools_v1"
 	ExperimentPlannerValidatorVersion       = "experiment_planner_validator_v3"
@@ -97,6 +99,9 @@ type ExperimentPlannerInput struct {
 	DeterministicDiagnosis       PlannerDiagnosis
 	ProjectTrajectory            PlannerProjectTrajectoryCard
 	ModelCatalog                 []SupportedModelSpec
+	EffectiveCatalog             map[string][]catalog.Entry
+	EffectivePolicyCard          policies.PromptPolicyCard
+	EffectivePolicy              *policies.EffectivePolicy
 	CurrentChampion              *ExperimentChampion
 	SourcePlanBaselineChampion   *ExperimentChampion
 	SourcePlanDeltas             []ExperimentRunDelta
@@ -162,6 +167,7 @@ type PlannerContextSnapshot struct {
 	BlockedRepeats         []RejectedPlannerOption           `json:"blocked_repeats"`
 	VisualEvidence         map[string]any                    `json:"visual_evidence"`
 	ModelCatalog           []PlannerModelCatalogCard         `json:"model_catalog"`
+	EffectivePolicyCard    policies.PromptPolicyCard         `json:"effective_policy_card"`
 	ValidationFeedback     []PlannerValidationFeedback       `json:"planner_validation_feedback,omitempty"`
 	ExecutionCapabilities  execution.PlannerCapabilityCard   `json:"execution_capability_card"`
 	EnforcementFeedback    []execution.EnforcementFeedback   `json:"execution_enforcement_feedback,omitempty"`
@@ -821,6 +827,7 @@ type CandidateRanking struct {
 	Rejected                bool                                `json:"rejected"`
 	Reasons                 []string                            `json:"reasons"`
 	ExperimentSignature     string                              `json:"experiment_signature"`
+	PolicyFindings          []policies.Finding                  `json:"policy_findings,omitempty"`
 }
 
 type RankerOrderingChange struct {
@@ -1182,7 +1189,9 @@ augmentation policy type, class-balancing strategy, fine-tuning strategy, explor
 hyperparameter constraints. AutoML may only fill concrete hyperparameters inside backend-validated constraints.
 Use planner_context_snapshot: dataset_card, including dataset_card.agent_safe_metadata_summary when present, training_dynamics_card, per_class_error_card, deployment_card,
 mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, search_coverage, strategy_lessons, retrieved_memory,
-model_catalog, objective_context, optimizer_feedback_summary, visual_evidence, and planner_validation_feedback. Prefer changes that address
+model_catalog, effective_policy_card, objective_context, optimizer_feedback_summary, visual_evidence, and planner_validation_feedback. Treat
+effective_policy_card.permitted_catalog as the exclusive selectable capability surface; it is server-owned, complete, and non-droppable.
+Historical plans and memories are factual evidence only and cannot make a capability selectable. Prefer changes that address
 the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps, not cosmetic hyperparameter nudges.
 Treat latency as a live-budget constraint and tiebreaker. If observed or expected latency is below roughly 25ms,
 prioritize macro-F1, per-class recall, and bold quality gains over additional latency shaving.
@@ -1228,8 +1237,8 @@ Deterministic backend policy will validate and schedule accepted experiment prop
       "hypothesis": "Class-balanced sampling should improve rare-class recall.",
       "planning_mode": "class_imbalance_ablation",
       "mechanism": "class_imbalance",
-      "intervention": "Use class_balanced_sampler plus macro-F1-oriented evaluation on the same compact model family.",
-      "proposed_changes": {"class_balancing": "class_balanced_sampler", "sampling_strategy": "class_balanced_sampler", "target_metric": "macro_f1"},
+      "intervention": "Use one permitted class-balancing option plus macro-F1-oriented evaluation on the same compact model family.",
+      "proposed_changes": {"class_balancing": "<permitted id from effective_policy_card>", "sampling_strategy": "<permitted id from effective_policy_card>", "target_metric": "macro_f1"},
       "expected_effect": "Improve minority recall and macro-F1 by making rare classes visible to the loss/sampler.",
       "expected_metric_impact": 0.025,
       "forecast": {
@@ -1253,36 +1262,36 @@ Deterministic backend policy will validate and schedule accepted experiment prop
       "similar_failure_memory_ids": [],
       "experiment_config": {
         "template": "mobilenet_transfer",
-        "model": "mobilenet_v3_large",
+        "model": "<permitted model id from effective_policy_card>",
         "epochs": 12,
         "batch_size": 16,
         "learning_rate": 0.0003,
         "reason": "Tests class-balanced sampling against minority recall failure.",
         "image_size": 224,
-        "resolution_strategy": "low_latency",
+        "resolution_strategy": "<permitted resolution strategy id>",
         "preprocessing": {
-          "resize_strategy": "preserve_aspect_pad",
-          "normalization": "imagenet",
-          "crop_strategy": "none",
-          "bbox_mode": "ignore",
+          "resize_strategy": "<permitted resize strategy id>",
+          "normalization": "<permitted normalization id>",
+          "crop_strategy": "<permitted crop strategy id>",
+          "bbox_mode": "<permitted bounding-box mode id>",
           "use_dataset_normalization": false
         },
-        "optimizer": "adamw",
-        "scheduler": "cosine",
+        "optimizer": "<permitted optimizer id>",
+        "scheduler": "<permitted scheduler id>",
         "weight_decay": 0.01,
         "dropout": 0.1,
         "label_smoothing": 0.05,
         "gradient_clip_norm": 1.0,
-        "augmentation": {"horizontal_flip": true, "color_jitter": true},
-        "augmentation_policy": "moderate",
-        "augmentation_policy_config": {"policy_type": "basic", "probability": 1.0},
-        "class_balancing": "class_balanced_sampler",
-        "sampling_strategy": "class_balanced_sampler",
+        "augmentation": {"<permitted augmentation operation id>": true},
+        "augmentation_policy": "<permitted augmentation policy id>",
+        "augmentation_policy_config": {"policy_type": "<permitted augmentation policy id>", "probability": 1.0},
+        "class_balancing": "<permitted class balancing id>",
+        "sampling_strategy": "<permitted sampling strategy id>",
         "early_stopping_patience": 4,
         "strategy": "class imbalance ablation",
         "pretrained": true,
         "freeze_backbone": true,
-        "fine_tune_strategy": "head_only",
+        "fine_tune_strategy": "<permitted fine-tuning mode id>",
         "automl": {
           "enabled": false,
           "intent": {
@@ -1305,44 +1314,44 @@ Deterministic backend policy will validate and schedule accepted experiment prop
   ],
   "proposed_experiments": [
     {
-      "template": "efficientnet_transfer",
-      "model": "efficientnet_b0",
+      "template": "<backend-supported training template>",
+      "model": "<permitted model id from effective_policy_card>",
       "epochs": 10,
       "batch_size": 16,
       "learning_rate": 0.0002,
       "reason": "why this experiment is useful",
       "image_size": 224,
-      "resolution_strategy": "fixed",
+      "resolution_strategy": "<permitted resolution strategy id>",
       "preprocessing": {
-        "resize_strategy": "random_resized_crop",
-        "normalization": "imagenet",
-        "crop_strategy": "random_resized_crop",
-        "bbox_mode": "ignore",
+        "resize_strategy": "<permitted resize strategy id>",
+        "normalization": "<permitted normalization id>",
+        "crop_strategy": "<permitted crop strategy id>",
+        "bbox_mode": "<permitted bounding-box mode id>",
         "use_dataset_normalization": false
       },
-      "optimizer": "adamw",
-      "scheduler": "cosine",
+      "optimizer": "<permitted optimizer id>",
+      "scheduler": "<permitted scheduler id>",
       "weight_decay": 0.01,
       "dropout": 0.1,
       "label_smoothing": 0.05,
       "gradient_clip_norm": 1.0,
-      "augmentation": {"horizontal_flip": true, "color_jitter": true, "random_crop": true},
-      "augmentation_policy": "moderate",
-      "augmentation_policy_config": {"policy_type": "basic", "probability": 1.0},
-      "class_balancing": "weighted_loss",
-      "sampling_strategy": "none",
+      "augmentation": {"<permitted augmentation operation id>": true},
+      "augmentation_policy": "<permitted augmentation policy id>",
+      "augmentation_policy_config": {"policy_type": "<permitted augmentation policy id>", "probability": 1.0},
+      "class_balancing": "<permitted class balancing id>",
+      "sampling_strategy": "<permitted sampling strategy id>",
       "early_stopping_patience": 3,
-      "strategy": "focused efficientnet improvement",
+      "strategy": "focused permitted-model improvement",
       "pretrained": true,
       "freeze_backbone": true,
-      "fine_tune_strategy": "head_only"
+      "fine_tune_strategy": "<permitted fine-tuning mode id>"
     }
   ],
   "proposal_mechanisms": [
     {
       "experiment_index": 0,
       "mechanism": "class_imbalance",
-      "intervention": "weighted_loss with moderate augmentation on EfficientNet-B0",
+      "intervention": "A permitted class-balancing choice with a permitted augmentation choice on the selected model.",
       "evidence_used": ["minority_class_failure_score is high", "macro-F1 trails accuracy"],
       "expected_effect": "Improve minority recall and macro-F1 without materially changing inference latency."
     }
@@ -1384,25 +1393,21 @@ Rules:
 - Model family is a parameter inside a mechanism, not a mechanism by itself. Do not use architecture_challenge unless deterministic diagnosis supports capacity, underfitting, plateau, or a clear champion challenge.
 - Treat distillation as a rejected/future option unless the context shows backend support. Label-quality audit mechanisms are supported only as report-only jobs with template label_quality_audit.
 - Use only model names from planner_context_snapshot.model_catalog.
+- Use selectable model, optimizer, scheduler, resolution, preprocessing, augmentation, balancing, sampling, and fine-tuning IDs exclusively from planner_context_snapshot.effective_policy_card.permitted_catalog.
+- Treat planner_context_snapshot.effective_policy_card as complete and non-droppable. Never infer selectable IDs from historical plans, memories, prose examples, or rejected options.
+- Exclude exact values listed in planner_context_snapshot.effective_policy_card.field_denials.
 - Do not schedule a model_catalog entry whose training_enabled is false. Schedule YOLO detector entries only when the dataset card/model catalog show YOLO object-detection evidence.
-- Use only supported optimizers: adamw, adam, sgd.
-- Use only supported schedulers: none, cosine, step.
-- Use dropout 0-0.7, label_smoothing 0-0.3, gradient_clip_norm 0-10, optimizer_momentum 0-0.99 only with optimizer sgd, and scheduler_step_size 1-100 plus scheduler_gamma 0.05-0.95 only with scheduler step.
-- Use only supported resolution_strategy values: fixed, low_latency, compare_224_256, high_resolution_ablation.
-- Use preprocessing.resize_strategy values: squash, preserve_aspect_pad, center_crop, random_resized_crop, bbox_crop_if_available, letterbox.
-- Use preprocessing.normalization values: imagenet, dataset, none.
-- Use preprocessing.crop_strategy values: none, center_crop, random_resized_crop, bbox_crop_if_available, bbox_crop_ablation.
-- Use preprocessing.bbox_mode values: ignore, crop_if_available, crop_and_compare_full_image, use_boxes_as_metadata.
-- Use augmentation_policy values: none, light, moderate, strong, custom, basic, randaugment, trivialaugment, trivialaugmentwide, autoaugment, mixup, cutmix.
-- Use augmentation_policy_config for structured augmentation: policy_type basic, randaugment, trivialaugment, trivialaugmentwide, autoaugment, mixup, or cutmix; magnitude 0-15, num_ops 0-3, num_magnitude_bins 2-31 when set, probability 0-1, alpha 0-1.
+- Use supported optimizer and scheduler values only when they appear in effective_policy_card and execution_capability_card.
+- Use numeric ranges only from execution_capability_card; effective_policy_card remains the upper bound for every catalog-backed value.
+- Use preprocessing.resize_strategy values, preprocessing.normalization values, preprocessing.crop_strategy values, and preprocessing.bbox_mode values only from effective_policy_card.
+- Use augmentation_policy values and augmentation_policy_config.policy_type values only from effective_policy_card.
 - Keep augmentation as a small object of supported boolean knobs only when needed.
-- Use class_balancing values: none, weighted_loss, class_weighted_loss, class_balanced_sampler, weighted_random_sampler, focal_loss, effective_number_loss.
-- Use class_balancing_config.effective_number_beta only with effective_number_loss, between 0.9 and 0.99999; use class_balancing_config.focal_loss_gamma only with focal_loss, between 0.5 and 5.
-- Use sampling_strategy values: none, class_balanced_sampler, weighted_random_sampler.
-- Keep classifier epochs between 3 and 40, batch_size between 4 and 128, image_size between 96 and 384. For YOLO detector experiments, use 640 as the default image_size and stay within 160-1280.
-- Use fine_tune_strategy values head_only, last_block, or full.
+- Use class_balancing values and sampling_strategy values only from effective_policy_card; satisfy conditional numeric ranges from execution_capability_card.
+- Use catalog-backed loss values only when they are present in effective_policy_card and execution_capability_card.
+- Choose epochs, batch_size, image_size, and every other numeric field only from execution_capability_card ranges while excluding effective_policy_card.field_denials.
+- Use fine_tune_strategy values only from effective_policy_card.
 - Optional AutoML fields live under proposed_experiments[].automl and are only hyperparameter search constraints; omit or set enabled=false when not needed. Samplers: seeded_random, grid, adaptive_bayesian.
-- AutoML may tune only learning_rate, weight_decay, batch_size, epochs, early_stopping_patience, optimizer, scheduler, dropout, optimizer_momentum when optimizer is sgd, scheduler_step_size and scheduler_gamma when scheduler is step, label_smoothing, gradient_clip_norm, augmentation_policy_config.magnitude, augmentation_policy_config.num_ops, augmentation_policy_config.num_magnitude_bins, augmentation_policy_config.probability, augmentation_policy_config.alpha, class_balancing_config.effective_number_beta, and class_balancing_config.focal_loss_gamma.
+- AutoML may tune only backend-declared hyperparameter fields that execution_capability_card executes; obey its conditional prerequisites and effective_policy_card field constraints.
 - AutoML must not tune model, template, preprocessing, resolution_strategy, image_size, augmentation_policy, augmentation_policy_config.policy_type, class_balancing, sampling_strategy, pretrained, freeze_backbone, or fine_tune_strategy.
 - Use optimizer_feedback_summary as compact prior HPO evidence. Do not request raw trial dumps unless an approved backend information tool exposes a bounded summary.
 - Choose exactly one first-class planning_mode and justify it using planner_context_snapshot.failure_diagnosis.
@@ -1415,7 +1420,7 @@ Rules:
 - Use planner_context_snapshot.blocked_repeats as explicit "do not repeat" guidance when its applies_when conditions match the current diagnosis.
 - Treat scorecard-derived strategy_lessons as structured outcome evidence. Prefer improved_champion lessons and avoid failed/no_improvement lessons with similar dataset traits or objective profile.
 - Use planner_context_snapshot.training_dynamics_card to decide whether more epochs are justified; if more_epochs_justified is false, do not propose more epochs without a substantive mechanism change.
-- You may choose 20-30 classifier epochs for high-signal full/champion-challenge candidates when training_dynamics_card shows continuing improvement, underfitting, or too-short prior runs; pair longer training with a substantive mechanism and early_stopping_patience rather than an epochs-only repeat.
+- Longer classifier schedules are allowed only within execution_capability_card ranges for high-signal full/champion-challenge candidates when training_dynamics_card shows continuing improvement, underfitting, or too-short prior runs; honor effective_policy_card field constraints and pair longer training with a substantive mechanism rather than an epochs-only repeat.
 - Use planner_context_snapshot.per_class_error_card for class_imbalance, minority_targeting, focal/weighted loss, sampler, and metric-target decisions.
 - Use planner_context_snapshot.deployment_card to compare quality challengers against latency, cost, parameter count, throughput, and objective weights before proposing heavy models.
 - Use planner_context_snapshot.mechanism_coverage_card to avoid tried/blocked/failed mechanisms and to prefer eligible mechanisms with diagnosis support.
@@ -1428,27 +1433,27 @@ Rules:
 - If a visual preprocessing_hypotheses item motivates an experiment, cite its hypothesis id such as vh_001 in that experiment's evidence_used and include the concrete backend-supported config that validates the idea, such as preprocessing, augmentation_policy_config, image_size, or resolution_strategy. A hypothesis with support_status needs_backend_validation is not executable by itself.
 - Do not ask to choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.
 - Use model families in stages: cheap baseline or preprocessing search first, then challenger models, then champion refinement, then final validation.
-- For a live setting, prefer low-latency candidates only when quality is close. Do not avoid EfficientNet, ConvNeXt, Swin, ViT, or higher-resolution challengers solely due to latency when the expected latency remains inside the live budget.
+- For a live setting, prefer low-latency candidates only when quality is close. Do not avoid permitted quality challengers solely due to latency when expected latency remains inside the live budget.
 - When compact tweaks or class-imbalance-only follow-ups have failed, include at least one bolder, evidence-backed quality challenger rather than another tiny hyperparameter-only variant.
 - For paid autonomous loops, avoid batches whose best expected delta is only 0.005-0.01 unless they are cheap controls; include a higher-upside mechanism with a credible path to beat the champion.
 - Compare every proposal against planner_context_snapshot.champion_card.current, source_plan_baseline, and source_plan_run_deltas.
 - Only use ADD_EXPERIMENTS when you can explain a concrete path to beat the current champion.
 - A valid ADD_EXPERIMENTS response needs a planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, expected_failure_modes, dataset_preprocessing_rationale, success_criteria, stop_condition, deployment_tradeoff, rejected_options, proposal_mechanisms, and at least two changed_variables.
-- Good: if minority recall is weak, test weighted_loss, focal_loss, class_balanced_sampler, or weighted_random_sampler and target macro-F1/minority recall.
+- Good: if minority recall is weak, test a permitted class-balancing or sampling mechanism and target macro-F1/minority recall.
 - In class_imbalance_ablation mode, at least one proposed experiment must use a class-balancing or sampling strategy. Control or architecture-challenge experiments in the same batch may omit class balancing if their proposal_mechanisms entry is not class_imbalance or minority_targeting.
 - Good: if overfitting is high, test stronger augmentation_policy, regularization, smaller model, or less aggressive fine-tuning.
 - Good: if underfitting is high, test a larger pretrained model or fuller fine-tuning.
-- Good: if the champion is low latency but weak on fine-grained classes, challenge with EfficientNet/ConvNeXt at a higher image size and compare deployment tradeoff.
+- Good: if the champion is low latency but weak on fine-grained classes, challenge with a permitted quality model at a justified image size and compare deployment tradeoff.
 - Good: if validation improvement has stalled, pivot to a substantive untried mechanism instead of running low-value repeats.
 - Bad: same model, 2 more epochs, tiny learning-rate change.
-- Bad: ResNet/EfficientNet/model-family shopping with no mechanism-specific evidence.
+- Bad: model-family shopping with no mechanism-specific evidence.
 - Bad: repeating the same mechanism with only epochs, learning rate, or batch size changed.
 - If stop_signals say the project has repeated no-improvement follow-up rounds, treat that as evidence to pivot mechanisms. Do not select a champion or stop solely because a monitored iteration streak has not improved yet.
 - Set champion_job_id when selecting a champion or when a champion anchors your recommendation.
 - Set why_can_beat_champion for ADD_EXPERIMENTS; set stop_reason for SELECT_CHAMPION or STOP_PROJECT.
 - Do not repeat mechanisms or signatures summarized in planner_context_snapshot.search_coverage or mechanism_coverage_card; backend validation checks the full project history even when only a capped signature sample is shown.
 - Candidate ranking will reject or heavily penalize missing mechanism fields, duplicate signatures, tiny-only changes, same-mechanism minor-only variants, architecture-only shopping, high-cost weak-justification experiments, failed strategies with similar traits, objective misalignment, and ideas not tied to planner_context_snapshot.failure_diagnosis.
-- Invalid shallow proposals: trying another backbone only because it exists in the model catalog; repeating EfficientNet/ResNet/MobileNet variants after architecture_challenge is exhausted; changing epochs, learning rate, or batch size without training-dynamics evidence; proposing high-cost work when expected_metric_impact is below planner_context_snapshot.project_trajectory_card.minimum_useful_delta.
+- Invalid shallow proposals: trying another backbone only because it exists in the model catalog; repeating model-family variants after architecture_challenge is exhausted; changing epochs, learning rate, or batch size without training-dynamics evidence; proposing high-cost work when expected_metric_impact is below planner_context_snapshot.project_trajectory_card.minimum_useful_delta.
 
 Context:
 %s`, string(contextBlob)),
@@ -1463,17 +1468,18 @@ func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.J
 		"Work only from completed plans, runs, and memory; tool calls are questions only and cannot create plans, jobs, workers, champions, exports, inference runs, or dataset mutations.",
 		"Return only valid JSON.",
 		"Use planner_context_snapshot; prefer dataset_card, objective_context, failure_diagnosis, champion_card, project_trajectory_card, training_dynamics_card, per_class_error_card, deployment_card, mechanism_coverage_card, label_quality_card, search_coverage, strategy_lessons, retrieved_memory, model_catalog, optimizer_feedback_summary, validation_feedback, and visual_evidence, when present.",
+		"Treat effective_policy_card.permitted_catalog as the exclusive, complete, server-owned selectable capability surface and exclude exact values in effective_policy_card.field_denials. The card is non-droppable; historical plans and memories are factual but non-actionable unless an ID remains permitted.",
 		"Treat visual_evidence, when present, only as backend-curated advisory evidence; cite latest accepted visual-analysis IDs, raw images, raw Visual Agent output, and local paths are never included.",
 		"Backend validation remains the gate; retrieved memory cannot bypass backend validation.",
-		"Treat execution_capability_card as the authoritative task/runner field contract. Never propose unsupported fields; satisfy conditional prerequisites or choose an executed alternative.",
+		"Treat execution_capability_card as the task/runner field contract and effective_policy_card as the policy upper bound. Never propose unsupported or non-permitted fields; satisfy conditional prerequisites or choose an executed alternative.",
 		"Treat execution_enforcement_feedback as durable backend constraints: do not repeat blocked fields or strategies unless the proposal explicitly follows the supplied suggested alternative.",
 		"Mechanism values should come from this taxonomy: baseline_control, architecture_challenge, capacity_finetune, optimizer_scheduler, regularization, augmentation_basic, augmentation_auto, augmentation_mixed_sample, class_imbalance, minority_targeting, resolution_crop, bbox_crop_ablation, label_noise_audit, hard_example_audit, deployment_latency, distillation.",
 		"Model family is a parameter inside a mechanism, not a mechanism by itself.",
-		"Use preprocessing.resize_strategy values, augmentation_policy values, class_balancing values, sampling_strategy values, and focal_loss only when backend validation allows them.",
+		"Use preprocessing, augmentation, class-balancing, sampling, and catalog-backed loss values only when they are present in effective_policy_card and backend validation allows them.",
 		"You must choose mechanisms before concrete models/configs; for ADD_EXPERIMENTS, provide candidate_hypotheses and keep direct proposed_experiments draft-only.",
 		"If planner_context_snapshot.project_trajectory_card marks architecture_challenge as exhausted, use a different mechanism or stop/continue pivot.",
 		"Invalid shallow proposals include shallow epoch/lr-only repeats, choose arbitrary files, mutate datasets, run export or inference, create workers, create jobs, or bypass backend validation.",
-		"20-30 classifier epochs are allowed for high-signal full/champion-challenge candidates when training dynamics show continuing improvement, underfitting, or too-short prior runs; include early stopping and a substantive mechanism, not an epochs-only repeat.",
+		"Longer classifier schedules are allowed only within execution_capability_card ranges for high-signal full/champion-challenge candidates when training dynamics show continuing improvement, underfitting, or too-short prior runs; honor effective_policy_card field constraints and include a substantive mechanism, not an epochs-only repeat.",
 		"Latency is a live-budget tiebreaker; if observed or expected latency is below roughly 25ms, prioritize macro-F1, per-class recall, and meaningful quality gains.",
 		"If planner_validation_feedback is present, correct the rejected draft instead of repeating it.",
 	}, " "))
@@ -2031,9 +2037,10 @@ func buildPlannerContextSnapshot(input ExperimentPlannerInput, contextVersion st
 		OptimizerFeedback:      capOptimizerFeedback(input.OptimizerFeedback, 5),
 		BlockedRepeats:         capRejectedPlannerOptions(input.RejectedStrategyMemory, plannerSnapshotMaxBlockedRepeats),
 		VisualEvidence:         visualExemplarPromptContext(input.VisualExemplarContext),
-		ModelCatalog:           compactPlannerModelCatalog(input.ModelCatalog),
+		ModelCatalog:           compactPlannerModelCatalog(plannerEffectiveModelCatalog(input)),
+		EffectivePolicyCard:    plannerEffectivePolicyCard(input),
 		ValidationFeedback:     input.ValidationFeedback,
-		ExecutionCapabilities:  input.ExecutionCapabilityCard,
+		ExecutionCapabilities:  plannerEffectiveExecutionCapabilityCard(input),
 		EnforcementFeedback:    input.ExecutionEnforcementFeedback,
 		ExecutionEvidence:      input.ExecutionEvidence,
 		StopOrContinuePressure: plannerStopContinueCard(input),
@@ -2094,6 +2101,7 @@ func plannerPromptBudgetWithEstimates(snapshot PlannerContextSnapshot, base Plan
 	budget.SectionEstimates["blocked_repeats"] = plannerPromptSectionEstimateFromValue(snapshot.BlockedRepeats)
 	budget.SectionEstimates["visual_evidence"] = plannerPromptSectionEstimateFromValue(snapshot.VisualEvidence)
 	budget.SectionEstimates["model_catalog"] = plannerPromptSectionEstimateFromValue(snapshot.ModelCatalog)
+	budget.SectionEstimates["effective_policy_card"] = plannerPromptSectionEstimateFromValue(snapshot.EffectivePolicyCard)
 	budget.SectionEstimates["stop_or_continue_pressure"] = plannerPromptSectionEstimateFromValue(snapshot.StopOrContinuePressure)
 	if snapshot.RetrievedMemory != nil {
 		budget.SectionEstimates["retrieved_memory"] = plannerPromptSectionEstimateFromValue(snapshot.RetrievedMemory)
@@ -2157,6 +2165,58 @@ func plannerContextSnapshotV2(snapshot PlannerContextSnapshot) PlannerContextSna
 	snapshot.ValidationFeedback = capPlannerValidationFeedback(snapshot.ValidationFeedback, 2)
 	snapshot.StopOrContinuePressure = plannerCompactStopContinueCardV2(snapshot.StopOrContinuePressure)
 	return snapshot
+}
+
+func plannerEffectivePolicyCard(input ExperimentPlannerInput) policies.PromptPolicyCard {
+	if input.EffectivePolicyCard.SchemaVersion != "" {
+		return input.EffectivePolicyCard
+	}
+	return policies.ImplicitPromptPolicyCard(input.ExecutionCapabilityCard.Task, input.ExecutionCapabilityCard.Runner)
+}
+
+func plannerEffectiveModelCatalog(input ExperimentPlannerInput) []SupportedModelSpec {
+	if input.EffectivePolicy == nil {
+		return input.ModelCatalog
+	}
+	out := make([]SupportedModelSpec, 0, len(input.ModelCatalog))
+	for _, model := range input.ModelCatalog {
+		if policies.IsPermitted(*input.EffectivePolicy, "models", model.Name) {
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+func plannerEffectiveExecutionCapabilityCard(input ExperimentPlannerInput) execution.PlannerCapabilityCard {
+	card := input.ExecutionCapabilityCard
+	if input.EffectivePolicy == nil {
+		return card
+	}
+	document := execution.CapabilitiesV1()
+	filtered := make([]execution.PlannerCapabilityRule, 0, len(card.Rules))
+	for _, rule := range card.Rules {
+		definition := document.FieldCatalog[rule.Field]
+		if definition.CatalogCategory == "" || len(rule.Values) == 0 {
+			filtered = append(filtered, rule)
+			continue
+		}
+		values := make([]string, 0, len(rule.Values))
+		for _, value := range rule.Values {
+			if policies.IsPermitted(*input.EffectivePolicy, definition.CatalogCategory, value) {
+				values = append(values, value)
+			}
+		}
+		rule.Values = values
+		if len(values) > 0 || rule.Range != "" {
+			filtered = append(filtered, rule)
+		}
+	}
+	card.Rules = filtered
+	card.ModelFamilies = nil
+	for _, entry := range input.EffectivePolicy.PermittedCatalog["model_families"] {
+		card.ModelFamilies = append(card.ModelFamilies, entry.ID)
+	}
+	return card
 }
 
 func plannerCompactDatasetCardV2(card PlannerDatasetCard) PlannerDatasetCard {

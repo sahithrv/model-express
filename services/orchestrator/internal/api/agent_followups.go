@@ -16,6 +16,9 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
+	"model-express/services/orchestrator/internal/projects"
+	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/strategies"
 )
@@ -347,13 +350,17 @@ func (s *Server) createReviewerDecision(projectID string) (plans.ExperimentPlan,
 		return plans.ExperimentPlan{}, decision, nil
 	}
 
-	recommendation := agents.NewExperimentReviewer().Review(project, latestPlan, summaries)
-	decision, err := s.store.CreateAgentDecision(
+	recommendation, policyReference, err := s.reviewerRecommendationWithPolicy(project, latestPlan, summaries)
+	if err != nil {
+		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
+	}
+	decision, err := s.store.CreateAgentDecisionWithPolicy(
 		project.ID,
 		recommendation.PlanID,
 		recommendation.DecisionType,
 		recommendation.Rationale,
 		recommendation.Payload,
+		policyReference,
 	)
 	if err != nil {
 		return plans.ExperimentPlan{}, decisions.AgentDecision{}, err
@@ -363,6 +370,44 @@ func (s *Server) createReviewerDecision(projectID string) (plans.ExperimentPlan,
 	}
 
 	return latestPlan, decision, nil
+}
+
+func (s *Server) reviewerRecommendationWithPolicy(project projects.Project, plan plans.ExperimentPlan, summaries []runs.TrainingRunSummary) (decisions.AgentDecisionRecommendation, policies.PersistenceReference, error) {
+	dataset, err := s.store.GetDataset(plan.DatasetID)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	recommendation, err := agents.NewExperimentReviewer().ReviewWithPolicy(project, plan, summaries, &effectivePolicy)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	if recommendation.DecisionType != decisions.TypeAddExperiments {
+		return recommendation, policies.PersistenceReference{}, nil
+	}
+	experiments, err := plannedExperimentsFromPayload(recommendation.Payload)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	experiments, warnings, err := s.prepareAutoMLExperimentsForProjectWithPolicy(project.ID, experiments, &effectivePolicy)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	recommendation.Payload["proposed_experiments"] = experiments
+	if len(warnings) > 0 {
+		recommendation.Payload["automl_warnings"] = warnings
+	}
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistProposal, experiments, "")
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, policies.PersistenceReference{}, err
+	}
+	recommendation.Payload["proposal_policy_evaluation_id"] = evaluation.ID
+	recommendation.Payload["effective_policy_hash"] = evaluation.EffectivePolicyHash
+	recommendation.Payload["effective_policy_card"] = policies.PromptCardFromEffectivePolicy(effectivePolicy)
+	return recommendation, policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed}, nil
 }
 
 func (s *Server) followUpSourceDecision(projectID string) (plans.ExperimentPlan, decisions.AgentDecision, error) {
@@ -394,6 +439,18 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if err := s.ensurePlannerCandidateProvenance(decision); err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	dataset, err := s.store.GetDataset(sourcePlan.DatasetID)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
 
 	projectPlans, err := s.store.ListProjectExperimentPlans(projectID)
 	if err != nil {
@@ -407,6 +464,9 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: %s", errChampionSelectedFollowUpBlocked, stopReason)
 	}
 	if existingPlan, ok := followUpPlanForDecision(projectPlans, decision.ID); ok {
+		if _, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationReusePlan, existingPlan.Experiments, ""); err != nil {
+			return plans.ExperimentPlan{}, false, err
+		}
 		if err := s.validateExistingFollowUpPlanStillNovel(projectID, decision.ID, existingPlan, projectPlans); err != nil {
 			return plans.ExperimentPlan{}, false, err
 		}
@@ -431,7 +491,7 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		relaxedValidationWarnings = append(relaxedValidationWarnings, plannerRelaxedValidationWarning(err))
 	}
 	var automlWarnings []string
-	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProject(projectID, experiments)
+	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProjectWithPolicy(projectID, experiments, &effectivePolicy)
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
@@ -504,7 +564,11 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	warnings = append(warnings, automlWarnings...)
 	warnings = append(warnings, uniqueStrings(relaxedValidationWarnings)...)
 
-	plan, err := s.store.CreateExperimentPlan(
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistPlan, experiments, "")
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	plan, err := s.store.CreateExperimentPlanWithPolicy(
 		projectID,
 		sourcePlan.DatasetID,
 		sourcePlan.TargetMetric,
@@ -513,6 +577,7 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		experiments,
 		warnings,
 		decision.ID,
+		policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed},
 	)
 	if err != nil {
 		return plans.ExperimentPlan{}, false, err
@@ -939,7 +1004,10 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 		return automaticExperimentReviewResult{}, err
 	}
 
-	recommendation := agents.NewExperimentReviewer().Review(project, latestPlan, summaries)
+	recommendation, policyReference, err := s.reviewerRecommendationWithPolicy(project, latestPlan, summaries)
+	if err != nil {
+		return automaticExperimentReviewResult{}, err
+	}
 	if recommendation.DecisionType == decisions.TypeWait {
 		return automaticExperimentReviewResult{}, nil
 	}
@@ -958,12 +1026,13 @@ func (s *Server) runAutomaticExperimentReview(projectID string) (automaticExperi
 			s.recordChampionSelectedFollowUpBlocked(project.ID, latestPlan.ID, "", "", message, stopReason, stopDetails)
 			return automaticExperimentReviewResult{}, nil
 		}
-		decision, err = s.store.CreateAgentDecision(
+		decision, err = s.store.CreateAgentDecisionWithPolicy(
 			project.ID,
 			recommendation.PlanID,
 			recommendation.DecisionType,
 			recommendation.Rationale,
 			recommendation.Payload,
+			policyReference,
 		)
 		if err != nil {
 			return automaticExperimentReviewResult{}, err

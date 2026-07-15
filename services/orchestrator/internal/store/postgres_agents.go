@@ -12,6 +12,7 @@ import (
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plannervalidation"
+	"model-express/services/orchestrator/internal/policies"
 )
 
 const agentInvocationSelectColumns = `id, project_id, dataset_id, plan_id, job_id, agent_name, agent_version, prompt_version,
@@ -22,6 +23,10 @@ const agentInvocationSelectColumns = `id, project_id, dataset_id, plan_id, job_i
 	accepted_for_memory, human_feedback, downstream_outcome, created_at`
 
 func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
+	return s.CreateAgentDecisionWithPolicy(projectID, planID, decisionType, rationale, payload, policies.PersistenceReference{})
+}
+
+func (s *PostgresStore) CreateAgentDecisionWithPolicy(projectID string, planID string, decisionType string, rationale string, payload map[string]any, policy policies.PersistenceReference) (decisions.AgentDecision, error) {
 	if payload == nil {
 		payload = map[string]any{}
 	}
@@ -41,7 +46,7 @@ func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, dec
 		return decisions.AgentDecision{}, err
 	}
 
-	decision, err := createAgentDecisionTx(ctx, tx, projectID, planID, decisionType, rationale, payloadJSON)
+	decision, err := createAgentDecisionTx(ctx, tx, projectID, planID, decisionType, rationale, payloadJSON, policy)
 	if err != nil {
 		return decisions.AgentDecision{}, err
 	}
@@ -51,11 +56,11 @@ func (s *PostgresStore) CreateAgentDecision(projectID string, planID string, dec
 	return decision, nil
 }
 
-func createAgentDecisionTx(ctx context.Context, tx *sql.Tx, projectID string, planID string, decisionType string, rationale string, payloadJSON []byte) (decisions.AgentDecision, error) {
+func createAgentDecisionTx(ctx context.Context, tx *sql.Tx, projectID string, planID string, decisionType string, rationale string, payloadJSON []byte, policy policies.PersistenceReference) (decisions.AgentDecision, error) {
 	const query = `
-		INSERT INTO agent_decisions (project_id, plan_id, decision_type, rationale, payload)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, project_id, plan_id, decision_type, rationale, payload, created_at
+		INSERT INTO agent_decisions (project_id, plan_id, decision_type, rationale, payload, proposal_policy_evaluation_id, effective_policy_hash)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7)
+		RETURNING id, project_id, plan_id, decision_type, rationale, payload, COALESCE(proposal_policy_evaluation_id, ''), effective_policy_hash, created_at
 	`
 
 	decision, err := scanAgentDecision(tx.QueryRowContext(
@@ -66,6 +71,8 @@ func createAgentDecisionTx(ctx context.Context, tx *sql.Tx, projectID string, pl
 		decisionType,
 		rationale,
 		payloadJSON,
+		policy.EvaluationID,
+		policy.EffectivePolicyHash,
 	))
 	if err != nil {
 		return decisions.AgentDecision{}, err
@@ -87,6 +94,18 @@ func (s *PostgresStore) CreateAgentDecisionWithCandidateProvenance(
 	rationale string,
 	payload map[string]any,
 	candidates []calibration.CandidateProvenanceCreate,
+) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
+	return s.CreateAgentDecisionWithCandidateProvenanceAndPolicy(projectID, planID, decisionType, rationale, payload, candidates, policies.PersistenceReference{})
+}
+
+func (s *PostgresStore) CreateAgentDecisionWithCandidateProvenanceAndPolicy(
+	projectID string,
+	planID string,
+	decisionType string,
+	rationale string,
+	payload map[string]any,
+	candidates []calibration.CandidateProvenanceCreate,
+	policy policies.PersistenceReference,
 ) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
 	if strings.ToUpper(strings.TrimSpace(decisionType)) != decisions.TypeAddExperiments {
 		return decisions.AgentDecision{}, nil, fmt.Errorf("%w: candidate provenance is only valid for ADD_EXPERIMENTS decisions", ErrInvalidRequest)
@@ -110,7 +129,7 @@ func (s *PostgresStore) CreateAgentDecisionWithCandidateProvenance(
 	if err := requireAgentProjectTx(ctx, tx, projectID); err != nil {
 		return decisions.AgentDecision{}, nil, err
 	}
-	decision, err := createAgentDecisionTx(ctx, tx, projectID, planID, decisionType, rationale, payloadJSON)
+	decision, err := createAgentDecisionTx(ctx, tx, projectID, planID, decisionType, rationale, payloadJSON, policy)
 	if err != nil {
 		return decisions.AgentDecision{}, nil, err
 	}
@@ -447,7 +466,7 @@ func (s *PostgresStore) listProjectAgentDecisions(projectID string) ([]decisions
 	}
 
 	const query = `
-		SELECT id, project_id, plan_id, decision_type, rationale, payload, created_at
+		SELECT id, project_id, plan_id, decision_type, rationale, payload, COALESCE(proposal_policy_evaluation_id, ''), effective_policy_hash, created_at
 		FROM agent_decisions
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -495,7 +514,7 @@ func (s *PostgresStore) listProjectAgentDecisionsActivity(projectID string, limi
 
 func agentDecisionActivitySelectQuery() string {
 	return `
-		SELECT id, project_id, plan_id, decision_type, rationale, payload, created_at
+		SELECT id, project_id, plan_id, decision_type, rationale, payload, COALESCE(proposal_policy_evaluation_id, ''), effective_policy_hash, created_at
 		FROM agent_decisions
 		WHERE project_id = $1
 		ORDER BY created_at DESC, id DESC

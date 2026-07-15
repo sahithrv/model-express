@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -15,9 +16,11 @@ import (
 
 	"model-express/services/orchestrator/internal/agents"
 	"model-express/services/orchestrator/internal/automl"
+	"model-express/services/orchestrator/internal/catalog"
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
@@ -60,6 +63,10 @@ func (s *Server) prepareAutoMLExperiments(experiments []plans.PlannedExperiment)
 }
 
 func (s *Server) prepareAutoMLExperimentsForProject(projectID string, experiments []plans.PlannedExperiment) ([]plans.PlannedExperiment, []string, error) {
+	return s.prepareAutoMLExperimentsForProjectWithPolicy(projectID, experiments, nil)
+}
+
+func (s *Server) prepareAutoMLExperimentsForProjectWithPolicy(projectID string, experiments []plans.PlannedExperiment, effective *policies.EffectivePolicy) ([]plans.PlannedExperiment, []string, error) {
 	out := append([]plans.PlannedExperiment(nil), experiments...)
 	warnings := []string{}
 	automationSettings := s.currentAutomationSettings()
@@ -94,12 +101,29 @@ func (s *Server) prepareAutoMLExperimentsForProject(projectID string, experiment
 			warnings = append(warnings, fmt.Sprintf("AutoML disabled for experiment %d; using LLM-provided concrete hyperparameters.", index))
 			continue
 		}
+		if effective != nil && out[index].AutoML.SearchSpace != nil {
+			filtered, filterErr := policyFilteredAutoMLSearchSpace(*out[index].AutoML.SearchSpace, *effective)
+			if filterErr != nil {
+				return nil, warnings, filterErr
+			}
+			out[index].AutoML.SearchSpace = filtered
+		}
 		prepared, err := prepareAutoMLExperimentWithHistoryForExecution(out[index], index, automationSettings.AutoMLSampler, autoMLHistoryForExecutionScope(history, scope), scope)
 		if err != nil {
 			return nil, warnings, err
 		}
 		out[index] = prepared
+		if effective != nil {
+			if _, err := policies.EvaluateProposal(*effective, policyOperationPersistProposal, []plans.PlannedExperiment{out[index]}); err != nil {
+				return nil, warnings, fmt.Errorf("post-AutoML experiment %d violates effective policy: %w", index, err)
+			}
+		}
 		warnings = append(warnings, fmt.Sprintf("AutoML sampled %d hyperparameter(s) for experiment %d using %s.", len(prepared.AutoML.Suggestion.Values), index, prepared.AutoML.Sampler))
+	}
+	if effective != nil {
+		if _, err := policies.EvaluateProposal(*effective, policyOperationPersistProposal, out); err != nil {
+			return nil, warnings, err
+		}
 	}
 	return out, warnings, nil
 }
@@ -393,6 +417,92 @@ func prepareAutoMLExperimentWithHistoryForExecution(experiment plans.PlannedExpe
 		return experiment, fmt.Errorf("%w: proposed experiment %d AutoML trial is not executable: %s", store.ErrInvalidRequest, index, executionValidationSummary(executionReport))
 	}
 	return experiment, nil
+}
+
+func policyFilteredAutoMLSearchSpace(input automl.HyperparameterSearchSpace, effective policies.EffectivePolicy) (*automl.HyperparameterSearchSpace, error) {
+	out := input
+	out.Parameters = append([]automl.HyperparameterParameterSpec(nil), input.Parameters...)
+	for index := range out.Parameters {
+		spec := &out.Parameters[index]
+		field := automl.NormalizeParameterName(spec.Name)
+		category := map[string]string{"optimizer": "optimizers", "scheduler": "schedulers"}[field]
+		if category != "" && len(spec.Choices) > 0 {
+			original := append([]string(nil), spec.Choices...)
+			spec.Choices = spec.Choices[:0]
+			for _, choice := range original {
+				if _, known := catalog.Resolve(category, choice); !known || policies.IsPermitted(effective, category, choice) {
+					spec.Choices = append(spec.Choices, choice)
+				}
+			}
+			if len(spec.Choices) == 0 {
+				return nil, autoMLPolicyNoChoicesError(effective, category, field)
+			}
+		}
+		if len(spec.IntChoices) > 0 {
+			original := append([]int(nil), spec.IntChoices...)
+			spec.IntChoices = spec.IntChoices[:0]
+			for _, choice := range original {
+				if policies.IsFieldValuePermitted(effective, field, choice) {
+					spec.IntChoices = append(spec.IntChoices, choice)
+				}
+			}
+			if len(spec.IntChoices) == 0 {
+				return nil, autoMLPolicyNoChoicesError(effective, field, field)
+			}
+		} else if spec.Type == automl.ParameterInteger && spec.Min != nil && spec.Max != nil {
+			minimum := int(math.Ceil(*spec.Min))
+			maximum := int(math.Floor(*spec.Max))
+			if maximum >= minimum && maximum-minimum <= 10000 {
+				step := 1
+				if spec.Step != nil && *spec.Step >= 1 && math.Trunc(*spec.Step) == *spec.Step {
+					step = int(*spec.Step)
+				}
+				totalChoices := (maximum-minimum)/step + 1
+				permitted := make([]int, 0, totalChoices)
+				for choice := minimum; choice <= maximum; choice += step {
+					if policies.IsFieldValuePermitted(effective, field, choice) {
+						permitted = append(permitted, choice)
+					}
+				}
+				if len(permitted) == 0 {
+					return nil, autoMLPolicyNoChoicesError(effective, field, field)
+				}
+				if len(permitted) != totalChoices {
+					spec.IntChoices = permitted
+				}
+			}
+		}
+	}
+	return &out, nil
+}
+
+func autoMLPolicyNoChoicesError(effective policies.EffectivePolicy, dimension, field string) error {
+	findings := []policies.Finding{}
+	for _, denial := range effective.Snapshot.FieldDenials {
+		if denial.Field != field {
+			continue
+		}
+		findings = append(findings, policies.Finding{
+			Code: policies.ReasonFieldValueDenied, ID: denial.CanonicalValue, FieldPath: "automl.search_space." + field,
+			Origin: "automl", Scope: denial.Scope, SubjectID: denial.SubjectID, PolicyVersionID: denial.PolicyVersionID,
+			RuleID: denial.RuleID, Remediation: "Add at least one AutoML choice permitted by every inherited policy scope.",
+		})
+	}
+	if len(findings) == 0 {
+		for _, finding := range effective.Findings {
+			if finding.Catalog == dimension {
+				findings = append(findings, finding)
+			}
+		}
+	}
+	if len(findings) == 0 {
+		findings = append(findings, effective.Findings...)
+	}
+	return &policies.PolicyError{
+		Code: policies.ReasonNoValidConfiguration, Message: "effective experiment policy leaves no valid AutoML choices for " + field,
+		EffectivePolicyHash: effective.EffectivePolicyHash, Findings: findings, BlockedDimensions: []string{dimension},
+		ContributingScopes: policies.ContributingScopesFromFindings(findings),
+	}
 }
 
 func autoMLExecutionScopeForExperiment(experiment plans.PlannedExperiment, provider string) (automl.ExecutionScope, error) {

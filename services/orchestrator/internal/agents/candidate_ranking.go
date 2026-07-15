@@ -2,6 +2,7 @@ package agents
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -14,7 +15,10 @@ import (
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 )
+
+const policyOperationPropose = "propose"
 
 func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation ExperimentPlanningRecommendation) (ExperimentPlanningRecommendation, error) {
 	if strings.ToUpper(strings.TrimSpace(recommendation.DecisionType)) != decisions.TypeAddExperiments {
@@ -401,6 +405,19 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 		ranking.Score = 0
 		ranking.Reasons = append(ranking.Reasons, err.Error())
 		return ranking
+	}
+	if input.EffectivePolicy != nil {
+		_, policyErr := policies.EvaluateProposal(*input.EffectivePolicy, policyOperationPropose, []plans.PlannedExperiment{experiment})
+		if policyErr != nil {
+			ranking.Rejected = true
+			ranking.Score = 0
+			ranking.Reasons = append(ranking.Reasons, policyErr.Error())
+			var structured *policies.PolicyError
+			if errors.As(policyErr, &structured) {
+				ranking.PolicyFindings = append([]policies.Finding(nil), structured.Findings...)
+			}
+			return ranking
+		}
 	}
 	if err := validateCandidateMechanismExpectation(candidate, index); err != nil {
 		ranking.Rejected = true

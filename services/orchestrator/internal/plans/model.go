@@ -13,19 +13,22 @@ const (
 )
 
 type ExperimentPlan struct {
-	ID                  string              `json:"id"`
-	ProjectID           string              `json:"project_id"`
-	DatasetID           string              `json:"dataset_id"`
-	Status              string              `json:"status"`
-	ExecutionSpecStatus string              `json:"execution_spec_status,omitempty"`
-	CapabilityVersion   string              `json:"capability_version,omitempty"`
-	SourceDecisionID    string              `json:"source_decision_id,omitempty"`
-	TargetMetric        string              `json:"target_metric"`
-	RecommendedWorkers  int                 `json:"recommended_workers"`
-	EstimatedMinutes    int                 `json:"estimated_minutes"`
-	Experiments         []PlannedExperiment `json:"experiments"`
-	Warnings            []string            `json:"warnings"`
-	CreatedAt           time.Time           `json:"created_at"`
+	ID                         string              `json:"id"`
+	ProjectID                  string              `json:"project_id"`
+	DatasetID                  string              `json:"dataset_id"`
+	Status                     string              `json:"status"`
+	ExecutionSpecStatus        string              `json:"execution_spec_status,omitempty"`
+	CapabilityVersion          string              `json:"capability_version,omitempty"`
+	SourceDecisionID           string              `json:"source_decision_id,omitempty"`
+	ProposalPolicyEvaluationID string              `json:"proposal_policy_evaluation_id,omitempty"`
+	EffectivePolicyHash        string              `json:"effective_policy_hash,omitempty"`
+	PolicyStatus               string              `json:"policy_status,omitempty"`
+	TargetMetric               string              `json:"target_metric"`
+	RecommendedWorkers         int                 `json:"recommended_workers"`
+	EstimatedMinutes           int                 `json:"estimated_minutes"`
+	Experiments                []PlannedExperiment `json:"experiments"`
+	Warnings                   []string            `json:"warnings"`
+	CreatedAt                  time.Time           `json:"created_at"`
 }
 
 type PlannedExperiment struct {

@@ -8,6 +8,7 @@ import (
 	"model-express/services/orchestrator/internal/decisions"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 )
@@ -140,6 +141,24 @@ func (r ExperimentReviewer) Review(project projects.Project, plan plans.Experime
 		),
 		Payload: payload,
 	}
+}
+
+func (r ExperimentReviewer) ReviewWithPolicy(project projects.Project, plan plans.ExperimentPlan, summaries []runs.TrainingRunSummary, effective *policies.EffectivePolicy) (decisions.AgentDecisionRecommendation, error) {
+	recommendation := r.Review(project, plan, summaries)
+	if recommendation.DecisionType != decisions.TypeAddExperiments || effective == nil {
+		return recommendation, nil
+	}
+	experiments, ok := recommendation.Payload["proposed_experiments"].([]plans.PlannedExperiment)
+	if !ok {
+		return recommendation, fmt.Errorf("reviewer ADD_EXPERIMENTS payload has invalid proposed_experiments")
+	}
+	detection := effective.Snapshot.Context.Task == "object_detection"
+	filtered, err := policyConstrainedPlannerExperiments(experiments, effective, detection)
+	if err != nil {
+		return decisions.AgentDecisionRecommendation{}, err
+	}
+	recommendation.Payload["proposed_experiments"] = filtered
+	return recommendation, nil
 }
 
 func summariesForPlan(planID string, summaries []runs.TrainingRunSummary) []runs.TrainingRunSummary {

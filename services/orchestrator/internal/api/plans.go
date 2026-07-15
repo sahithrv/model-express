@@ -15,6 +15,7 @@ import (
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/store"
 )
 
@@ -113,20 +114,33 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 	if len(metadataSummary) > 0 {
 		dataset.Profile = profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary)
 	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		return err
+	}
 	recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{
-		Priority: agents.PriorityBalanced,
+		Priority:        agents.PriorityBalanced,
+		EffectivePolicy: &effectivePolicy,
 	})
 	if err != nil {
+		var policyErr *policies.PolicyError
+		if errors.As(err, &policyErr) {
+			return err
+		}
 		return fmt.Errorf("%w: %s", store.ErrInvalidRequest, err.Error())
 	}
-	experiments, automlWarnings, err := s.prepareAutoMLExperimentsForProject(project.ID, recommendation.Experiments)
+	experiments, automlWarnings, err := s.prepareAutoMLExperimentsForProjectWithPolicy(project.ID, recommendation.Experiments, &effectivePolicy)
 	if err != nil {
 		return err
 	}
 	warnings := append([]string(nil), recommendation.Warnings...)
 	warnings = append(warnings, automlWarnings...)
 
-	plan, err := s.store.CreateExperimentPlan(
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistPlan, experiments, "")
+	if err != nil {
+		return err
+	}
+	plan, err := s.store.CreateExperimentPlanWithPolicy(
 		project.ID,
 		dataset.ID,
 		recommendation.TargetMetric,
@@ -135,6 +149,7 @@ func (s *Server) createInitialPlanForDataset(datasetID string) error {
 		experiments,
 		warnings,
 		"",
+		policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed},
 	)
 	if err != nil {
 		return err
@@ -719,28 +734,41 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 	estimatedMinutes := req.EstimatedMinutes
 	experiments := req.Experiments
 	warnings := req.Warnings
+	project, err := s.store.GetProject(c.Param("id"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	dataset, err := s.store.GetDataset(req.DatasetID)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	if dataset.ProjectID != project.ID {
+		writeStoreError(c, fmt.Errorf("%w: dataset does not belong to project", store.ErrInvalidRequest))
+		return
+	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
 
 	if len(experiments) == 0 {
-		project, err := s.store.GetProject(c.Param("id"))
-		if err != nil {
-			writeStoreError(c, err)
-			return
-		}
-
-		dataset, err := s.store.GetDataset(req.DatasetID)
-		if err != nil {
-			writeStoreError(c, err)
-			return
-		}
-
 		recommendation, err := agents.NewDatasetPlanner().BuildExperimentPlan(project, dataset, agents.PlanPreferences{
 			Priority:          req.Priority,
 			MaxWorkers:        req.MaxWorkers,
 			TimeBudgetMinutes: req.TimeBudgetMinutes,
 			TargetMetric:      req.TargetMetric,
+			EffectivePolicy:   &effectivePolicy,
 		})
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			var policyErr *policies.PolicyError
+			if errors.As(err, &policyErr) {
+				writeStoreError(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
 			return
 		}
 
@@ -751,8 +779,7 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 		warnings = append(warnings, recommendation.Warnings...)
 	}
 	var automlWarnings []string
-	var err error
-	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProject(c.Param("id"), experiments)
+	experiments, automlWarnings, err = s.prepareAutoMLExperimentsForProjectWithPolicy(c.Param("id"), experiments, &effectivePolicy)
 	if err != nil {
 		writeStoreError(c, err)
 		return
@@ -765,7 +792,12 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 		}
 	}
 
-	plan, err := s.store.CreateExperimentPlan(
+	evaluation, err := s.recordProposalPolicyEvaluation(effectivePolicy, policyOperationPersistPlan, experiments, "")
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	plan, err := s.store.CreateExperimentPlanWithPolicy(
 		c.Param("id"),
 		req.DatasetID,
 		targetMetric,
@@ -774,6 +806,7 @@ func (s *Server) createExperimentPlan(c *gin.Context) {
 		experiments,
 		warnings,
 		"",
+		policies.PersistenceReference{EvaluationID: evaluation.ID, EffectivePolicyHash: evaluation.EffectivePolicyHash, Status: policyStatusAllowed},
 	)
 	if err != nil {
 		writeStoreError(c, err)

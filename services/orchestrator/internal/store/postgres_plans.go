@@ -7,9 +7,14 @@ import (
 
 	"model-express/services/orchestrator/internal/execution"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 )
 
 func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
+	return s.CreateExperimentPlanWithPolicy(projectID, datasetID, targetMetric, recommendedWorkers, estimatedMinutes, experiments, warnings, sourceDecisionID, policies.PersistenceReference{})
+}
+
+func (s *PostgresStore) CreateExperimentPlanWithPolicy(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string, policy policies.PersistenceReference) (plans.ExperimentPlan, error) {
 	if err := s.requireProject(projectID); err != nil {
 		return plans.ExperimentPlan{}, err
 	}
@@ -55,10 +60,13 @@ func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string,
 			recommended_workers,
 			estimated_minutes,
 			experiments,
-			warnings
+			warnings,
+			proposal_policy_evaluation_id,
+			effective_policy_hash,
+			policy_status
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		RETURNING id, project_id, dataset_id, status, source_decision_id, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), $11, $12)
+		RETURNING id, project_id, dataset_id, status, source_decision_id, COALESCE(proposal_policy_evaluation_id, ''), effective_policy_hash, policy_status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
 	`
 
 	return scanExperimentPlan(s.db.QueryRowContext(
@@ -73,12 +81,15 @@ func (s *PostgresStore) CreateExperimentPlan(projectID string, datasetID string,
 		estimatedMinutes,
 		experimentsJSON,
 		warningsJSON,
+		policy.EvaluationID,
+		policy.EffectivePolicyHash,
+		policy.Status,
 	))
 }
 
 func (s *PostgresStore) GetExperimentPlan(id string) (plans.ExperimentPlan, error) {
 	const query = `
-		SELECT id, project_id, dataset_id, status, source_decision_id, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		SELECT id, project_id, dataset_id, status, source_decision_id, COALESCE(proposal_policy_evaluation_id, ''), effective_policy_hash, policy_status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
 		FROM experiment_plans
 		WHERE id = $1
 	`
@@ -92,7 +103,7 @@ func (s *PostgresStore) ListProjectExperimentPlans(projectID string) ([]plans.Ex
 	}
 
 	const query = `
-		SELECT id, project_id, dataset_id, status, source_decision_id, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
+		SELECT id, project_id, dataset_id, status, source_decision_id, COALESCE(proposal_policy_evaluation_id, ''), effective_policy_hash, policy_status, target_metric, recommended_workers, estimated_minutes, experiments, warnings, created_at
 		FROM experiment_plans
 		WHERE project_id = $1
 		ORDER BY created_at DESC

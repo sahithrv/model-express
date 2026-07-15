@@ -249,7 +249,7 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"augmentation_policy values",
 		"class_balancing values",
 		"sampling_strategy values",
-		"focal_loss",
+		"catalog-backed loss values",
 		"Return only valid JSON",
 		"planner_context_snapshot",
 		"retrieved_memory, when present",
@@ -273,7 +273,7 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"create workers",
 		"create jobs",
 		"bypass backend validation",
-		"20-30 classifier epochs",
+		"Longer classifier schedules",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("expected prompt to contain %q", expected)
@@ -301,7 +301,7 @@ func TestExperimentPlannerStaticPromptCompactV1IsShorterAndKeepsContractGuidance
 		"Backend validation remains the gate",
 		"draft-only for ADD_EXPERIMENTS",
 		"Return only valid JSON",
-		"20-30 classifier epochs",
+		"Longer classifier schedules",
 	} {
 		if !strings.Contains(compactPrompt, expected) {
 			t.Fatalf("expected compact static prompt to retain %q, got %q", expected, compactPrompt)

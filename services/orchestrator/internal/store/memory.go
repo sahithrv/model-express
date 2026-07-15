@@ -21,6 +21,7 @@ import (
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/projects"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/settings"
@@ -71,6 +72,11 @@ type MemoryStore struct {
 	optimizerSuggestions       map[string]automl.OptimizerSuggestion
 	optimizerTrials            map[string]automl.OptimizerTrial
 	automationSettings         *settings.AutomationSettings
+	policyProfiles             map[string]policies.CompatibilityProfile
+	policyVersions             map[string]policies.PolicyVersion
+	policyBindings             map[string]policies.Binding
+	policyEvaluations          map[string]policies.Evaluation
+	nextPolicyRevision         int64
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -107,6 +113,10 @@ func NewMemoryStore() *MemoryStore {
 		optimizerStudies:        make(map[string]automl.OptimizerStudy),
 		optimizerSuggestions:    make(map[string]automl.OptimizerSuggestion),
 		optimizerTrials:         make(map[string]automl.OptimizerTrial),
+		policyProfiles:          make(map[string]policies.CompatibilityProfile),
+		policyVersions:          make(map[string]policies.PolicyVersion),
+		policyBindings:          make(map[string]policies.Binding),
+		policyEvaluations:       make(map[string]policies.Evaluation),
 	}
 }
 
@@ -117,6 +127,7 @@ func (s *MemoryStore) CreateProject(name string, goal string) (projects.Project,
 	now := time.Now().UTC()
 	project := projects.Project{
 		ID:        s.newID("project"),
+		AccountID: policies.LocalDefaultAccountID,
 		Name:      name,
 		Goal:      goal,
 		Status:    projects.StatusCreated,
@@ -1331,12 +1342,16 @@ func (s *MemoryStore) ListProjectChampionFeedback(projectID string) ([]runs.Cham
 }
 
 func (s *MemoryStore) CreateAgentDecision(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload)
+	return s.CreateAgentDecisionWithPolicy(projectID, planID, decisionType, rationale, payload, policies.PersistenceReference{})
 }
 
-func (s *MemoryStore) createAgentDecisionLocked(projectID string, planID string, decisionType string, rationale string, payload map[string]any) (decisions.AgentDecision, error) {
+func (s *MemoryStore) CreateAgentDecisionWithPolicy(projectID string, planID string, decisionType string, rationale string, payload map[string]any, policy policies.PersistenceReference) (decisions.AgentDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload, policy)
+}
+
+func (s *MemoryStore) createAgentDecisionLocked(projectID string, planID string, decisionType string, rationale string, payload map[string]any, policy policies.PersistenceReference) (decisions.AgentDecision, error) {
 	if _, ok := s.projects[projectID]; !ok {
 		return decisions.AgentDecision{}, ErrNotFound
 	}
@@ -1345,13 +1360,15 @@ func (s *MemoryStore) createAgentDecisionLocked(projectID string, planID string,
 	}
 
 	decision := decisions.AgentDecision{
-		ID:           s.newID("decision"),
-		ProjectID:    projectID,
-		PlanID:       planID,
-		DecisionType: decisionType,
-		Rationale:    rationale,
-		Payload:      payload,
-		CreatedAt:    time.Now().UTC(),
+		ID:                         s.newID("decision"),
+		ProjectID:                  projectID,
+		PlanID:                     planID,
+		DecisionType:               decisionType,
+		Rationale:                  rationale,
+		Payload:                    payload,
+		ProposalPolicyEvaluationID: policy.EvaluationID,
+		EffectivePolicyHash:        policy.EffectivePolicyHash,
+		CreatedAt:                  time.Now().UTC(),
 	}
 
 	create, err := agentDecisionRecordedEvent(decision)
@@ -1373,6 +1390,18 @@ func (s *MemoryStore) CreateAgentDecisionWithCandidateProvenance(
 	payload map[string]any,
 	candidates []calibration.CandidateProvenanceCreate,
 ) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
+	return s.CreateAgentDecisionWithCandidateProvenanceAndPolicy(projectID, planID, decisionType, rationale, payload, candidates, policies.PersistenceReference{})
+}
+
+func (s *MemoryStore) CreateAgentDecisionWithCandidateProvenanceAndPolicy(
+	projectID string,
+	planID string,
+	decisionType string,
+	rationale string,
+	payload map[string]any,
+	candidates []calibration.CandidateProvenanceCreate,
+	policy policies.PersistenceReference,
+) (decisions.AgentDecision, []calibration.CandidateProvenance, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if strings.ToUpper(strings.TrimSpace(decisionType)) != decisions.TypeAddExperiments {
@@ -1384,7 +1413,7 @@ func (s *MemoryStore) CreateAgentDecisionWithCandidateProvenance(
 	if err := s.validateCandidateProvenanceCreatesLocked(projectID, candidates); err != nil {
 		return decisions.AgentDecision{}, nil, err
 	}
-	decision, err := s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload)
+	decision, err := s.createAgentDecisionLocked(projectID, planID, decisionType, rationale, payload, policy)
 	if err != nil {
 		return decisions.AgentDecision{}, nil, err
 	}
@@ -2894,6 +2923,10 @@ func (s *MemoryStore) ListStudyOptimizerTrials(studyID string) ([]automl.Optimiz
 }
 
 func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string) (plans.ExperimentPlan, error) {
+	return s.CreateExperimentPlanWithPolicy(projectID, datasetID, targetMetric, recommendedWorkers, estimatedMinutes, experiments, warnings, sourceDecisionID, policies.PersistenceReference{})
+}
+
+func (s *MemoryStore) CreateExperimentPlanWithPolicy(projectID string, datasetID string, targetMetric string, recommendedWorkers int, estimatedMinutes int, experiments []plans.PlannedExperiment, warnings []string, sourceDecisionID string, policy policies.PersistenceReference) (plans.ExperimentPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2920,19 +2953,22 @@ func (s *MemoryStore) CreateExperimentPlan(projectID string, datasetID string, t
 	}
 
 	plan := plans.ExperimentPlan{
-		ID:                  s.newID("plan"),
-		ProjectID:           projectID,
-		DatasetID:           datasetID,
-		Status:              plans.StatusProposed,
-		ExecutionSpecStatus: execution.ExecutionSpecStatusVersioned,
-		CapabilityVersion:   execution.CapabilitiesV1().CapabilityVersion,
-		SourceDecisionID:    sourceDecisionID,
-		TargetMetric:        targetMetric,
-		RecommendedWorkers:  recommendedWorkers,
-		EstimatedMinutes:    estimatedMinutes,
-		Experiments:         append([]plans.PlannedExperiment(nil), experiments...),
-		Warnings:            append([]string(nil), warnings...),
-		CreatedAt:           time.Now().UTC(),
+		ID:                         s.newID("plan"),
+		ProjectID:                  projectID,
+		DatasetID:                  datasetID,
+		Status:                     plans.StatusProposed,
+		ExecutionSpecStatus:        execution.ExecutionSpecStatusVersioned,
+		CapabilityVersion:          execution.CapabilitiesV1().CapabilityVersion,
+		SourceDecisionID:           sourceDecisionID,
+		ProposalPolicyEvaluationID: policy.EvaluationID,
+		EffectivePolicyHash:        policy.EffectivePolicyHash,
+		PolicyStatus:               policy.Status,
+		TargetMetric:               targetMetric,
+		RecommendedWorkers:         recommendedWorkers,
+		EstimatedMinutes:           estimatedMinutes,
+		Experiments:                append([]plans.PlannedExperiment(nil), experiments...),
+		Warnings:                   append([]string(nil), warnings...),
+		CreatedAt:                  time.Now().UTC(),
 	}
 
 	s.plans[plan.ID] = plan

@@ -23,6 +23,7 @@ import (
 	"model-express/services/orchestrator/internal/memory"
 	"model-express/services/orchestrator/internal/plannervalidation"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 	"model-express/services/orchestrator/internal/strategies"
@@ -565,26 +566,33 @@ func (s *Server) runExperimentPlannerAfterTrainingJob(job jobs.ExperimentJob) (b
 	}
 
 	var decision decisions.AgentDecision
+	policyReference := policies.PersistenceReference{
+		EvaluationID:        plannerAttempt.PolicyEvaluation.ID,
+		EffectivePolicyHash: plannerAttempt.PolicyEvaluation.EffectivePolicyHash,
+		Status:              policyStatusAllowed,
+	}
 	if decisionType == decisions.TypeAddExperiments {
 		candidateRows, provenanceErr := candidateProvenanceCreatesFromPayload(payload)
 		if provenanceErr != nil {
 			return false, provenanceErr
 		}
-		decision, _, err = s.store.CreateAgentDecisionWithCandidateProvenance(
+		decision, _, err = s.store.CreateAgentDecisionWithCandidateProvenanceAndPolicy(
 			job.ProjectID,
 			input.SourcePlan.ID,
 			decisionType,
 			recommendation.Rationale,
 			payload,
 			candidateRows,
+			policyReference,
 		)
 	} else {
-		decision, err = s.store.CreateAgentDecision(
+		decision, err = s.store.CreateAgentDecisionWithPolicy(
 			job.ProjectID,
 			input.SourcePlan.ID,
 			decisionType,
 			recommendation.Rationale,
 			payload,
+			policyReference,
 		)
 	}
 	if err != nil {
@@ -702,6 +710,11 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 	if err != nil {
 		return agents.ExperimentPlannerInput{}, false, err
 	}
+	effectivePolicy, err := s.resolveProposalPolicy(project, dataset, policyOperationPropose)
+	if err != nil {
+		return agents.ExperimentPlannerInput{}, false, err
+	}
+	executionCapabilityCard = filterExecutionCapabilityCardByPolicy(executionCapabilityCard, effectivePolicy)
 
 	partialInput := agents.ExperimentPlannerInput{
 		Project:                      project,
@@ -749,7 +762,10 @@ func (s *Server) buildExperimentPlannerInput(projectID string, planID string) (a
 		VisualExemplarContext:        visualContext,
 		ObjectiveContext:             objectiveContext,
 		DeterministicDiagnosis:       deterministicDiagnosis,
-		ModelCatalog:                 supportedModelCatalogForDataset(dataset, metadataSummary),
+		ModelCatalog:                 effectiveSupportedModelCatalog(effectivePolicy),
+		EffectiveCatalog:             effectivePolicy.PermittedCatalog,
+		EffectivePolicyCard:          policies.PromptCardFromEffectivePolicy(effectivePolicy),
+		EffectivePolicy:              &effectivePolicy,
 		CurrentChampion:              currentChampion,
 		SourcePlanBaselineChampion:   baselineChampion,
 		SourcePlanDeltas:             sourcePlanDeltas,
@@ -1099,11 +1115,12 @@ func newPlannerAttemptGroupID() string {
 }
 
 type experimentPlannerAttemptResult struct {
-	Input          agents.ExperimentPlannerInput
-	Trace          agents.ExperimentPlanningTrace
-	Invocation     memory.AgentInvocation
-	Recommendation agents.ExperimentPlanningRecommendation
-	Payload        map[string]any
+	Input            agents.ExperimentPlannerInput
+	Trace            agents.ExperimentPlanningTrace
+	Invocation       memory.AgentInvocation
+	Recommendation   agents.ExperimentPlanningRecommendation
+	Payload          map[string]any
+	PolicyEvaluation policies.Evaluation
 }
 
 func (s *Server) runExperimentPlannerWithBackendValidationRetry(
@@ -1116,6 +1133,12 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 	agentMode = llm.NormalizeAgentMode(firstNonEmptyString(agentMode, input.AgentMode))
 	attemptInput := input
 	attemptInput.AgentMode = agentMode
+	if attemptInput.EffectivePolicy == nil {
+		implicit := policies.ImplicitEffectivePolicy(attemptInput.ExecutionCapabilityCard.Task, attemptInput.ExecutionCapabilityCard.Runner)
+		attemptInput.EffectivePolicy = &implicit
+		attemptInput.EffectiveCatalog = implicit.PermittedCatalog
+		attemptInput.EffectivePolicyCard = policies.PromptCardFromEffectivePolicy(implicit)
+	}
 	terminalGuards := terminalPlannerGuardsEnabledForMode(agentMode)
 	attemptInput.TerminalPlannerGuardsEnabled = &terminalGuards
 	var result experimentPlannerAttemptResult
@@ -1163,7 +1186,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 
 		recommendation := applyExperimentPlannerStopCriteria(trace.Recommendation, attemptInput)
 		if strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
-			experiments, automlWarnings, prepareErr := s.prepareAutoMLExperimentsForProject(input.Project.ID, recommendation.ProposedExperiments)
+			experiments, automlWarnings, prepareErr := s.prepareAutoMLExperimentsForProjectWithPolicy(input.Project.ID, recommendation.ProposedExperiments, attemptInput.EffectivePolicy)
 			if prepareErr != nil {
 				lastErr = prepareErr
 				willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation)
@@ -1201,6 +1224,20 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 		payload, err := experimentPlannerDecisionPayload(recommendation, invocation, agentMode, attemptInput)
 		if err == nil && strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
 			_, err = candidateProvenanceCreatesFromPayload(payload)
+		}
+		if err == nil && strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
+			var evaluation policies.Evaluation
+			var persistedExperiments []plans.PlannedExperiment
+			persistedExperiments, err = plannedExperimentsFromPayload(payload)
+			if err == nil {
+				evaluation, err = s.recordProposalPolicyEvaluation(*attemptInput.EffectivePolicy, policyOperationPersistProposal, persistedExperiments, invocation.ID)
+			}
+			if err == nil {
+				result.PolicyEvaluation = evaluation
+				payload["proposal_policy_evaluation_id"] = evaluation.ID
+				payload["effective_policy_hash"] = evaluation.EffectivePolicyHash
+				payload["effective_policy_card"] = attemptInput.EffectivePolicyCard
+			}
 		}
 		if err == nil {
 			verdict := plannerStrictVerdictFromPayload(trace.StrictValidationVerdict, payload)
@@ -1401,6 +1438,11 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 					return invalidPlannerDryRunResult(result, err)
 				}
 				if err := validateExperimentDatasetCompatibility(experiment, input.Dataset, index); err != nil {
+					return invalidPlannerDryRunResult(result, err)
+				}
+			}
+			if input.EffectivePolicy != nil {
+				if _, err := policies.EvaluateProposal(*input.EffectivePolicy, policyOperationPersistProposal, experiments); err != nil {
 					return invalidPlannerDryRunResult(result, err)
 				}
 			}

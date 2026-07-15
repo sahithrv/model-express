@@ -16,6 +16,7 @@ import (
 	"model-express/services/orchestrator/internal/jobs"
 	"model-express/services/orchestrator/internal/llm"
 	"model-express/services/orchestrator/internal/plans"
+	"model-express/services/orchestrator/internal/policies"
 	"model-express/services/orchestrator/internal/runs"
 	"model-express/services/orchestrator/internal/store"
 )
@@ -641,6 +642,22 @@ func bindOptionalJSON(c *gin.Context, value any) bool {
 }
 
 func writeStoreError(c *gin.Context, err error) {
+	var policyErr *policies.PolicyError
+	if errors.As(err, &policyErr) {
+		status := http.StatusUnprocessableEntity
+		if policyErr.Code == policies.ReasonUnknownCatalogIdentifier {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{
+			"error": policyErr.Error(), "code": policyErr.Code,
+			"policy_evaluation_id":  policyErr.PolicyEvaluationID,
+			"effective_policy_hash": policyErr.EffectivePolicyHash,
+			"findings":              policyErr.Findings,
+			"blocked_dimensions":    policyErr.BlockedDimensions,
+			"contributing_scopes":   policyErr.ContributingScopes,
+		})
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return

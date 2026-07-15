@@ -138,6 +138,9 @@ func NewRouter(store store.Store) *gin.Engine {
 	router.GET("/projects/:id/live-state", server.getProjectLiveState)
 	router.GET("/projects/:id/execution-events", server.listProjectExecutionEvents)
 	router.GET("/projects/:id/execution-records", server.listProjectExecutionRecords)
+	router.GET("/projects/:id/experiment-policy/preview", server.previewProjectExperimentPolicy)
+	router.GET("/projects/:id/effective-experiment-policy", server.previewProjectExperimentPolicy)
+	router.GET("/projects/:id/permitted-catalog", server.previewProjectExperimentPolicy)
 	router.POST("/projects/:id/dispatcher-events", server.reportProjectDispatcherEvent)
 	if activityStreamV2Enabled() {
 		router.HEAD("/projects/:id/events/stream/v2", server.probeProjectExecutionEventsV2)
