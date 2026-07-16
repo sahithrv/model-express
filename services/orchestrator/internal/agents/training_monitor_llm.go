@@ -132,10 +132,11 @@ func (a TrainingMonitorAgent) EvaluateWithTrace(ctx context.Context, input Train
 		return trace, err
 	}
 	trace.RawOutput = append([]byte(nil), raw...)
-	trace.ParsedOutput = rawOutputObject(raw)
+	decodeRaw, _ := normalizeBareNoneJSONLiterals(raw)
+	trace.ParsedOutput = rawOutputObject(decodeRaw)
 
 	var recommendation TrainingEvaluationRecommendation
-	if err := json.Unmarshal(raw, &recommendation); err != nil {
+	if err := json.Unmarshal(decodeRaw, &recommendation); err != nil {
 		wrapped := fmt.Errorf("decode training monitor recommendation: %w", err)
 		trace.ValidationStatus = memory.InvocationValidationInvalid
 		trace.ValidationError = wrapped.Error()
@@ -228,7 +229,7 @@ func trainingMonitorJSONRequest(model string, contextBlob []byte) llm.JSONReques
 Evaluate image-classification and object-detection training runs holistically.
 When approved information tools are available, you may ask bounded run-scoped backend questions before finalizing.
 Tool calls are questions only: they cannot propose experiments, create plans, create jobs, create workers, export champions, run inference, or mutate datasets.
-After any information requests, return only final valid JSON.
+After any information requests, return only final valid JSON. Use JSON null for absent values; never output Python None or bare none.
 Consider validation quality, macro-F1, accuracy, YOLO detector metrics (mAP50-95, mAP50, precision, recall, box/cls/DFL losses),
 per-class metrics, confusion matrix,
 train/validation gap, metric stability, plateauing, cost, runtime, inference latency,

@@ -251,7 +251,16 @@ func TestLANModeCallbackEndpointUsesAttemptTokenInsteadOfAPIToken(t *testing.T) 
 	if err != nil {
 		t.Fatalf("register worker: %v", err)
 	}
-	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID}); err != nil {
+	requested := map[string]any{"model": "resnet18", "epochs": 3, "batch_size": 16, "learning_rate": 0.001}
+	spec, err := execution.BuildExecutionSpecV1("image_classification", "local_simulator", requested, requested)
+	if err != nil {
+		t.Fatalf("build execution spec: %v", err)
+	}
+	specPayload, err := spec.Payload()
+	if err != nil {
+		t.Fatalf("execution spec payload: %v", err)
+	}
+	if _, err := memoryStore.CreateJob(project.ID, jobs.TemplateTrainExperiment, map[string]any{"dataset_id": dataset.ID, execution.ExecutionSpecConfigKey: specPayload}); err != nil {
 		t.Fatalf("create job: %v", err)
 	}
 	router := NewRouter(memoryStore)
@@ -291,6 +300,27 @@ func TestLANModeCallbackEndpointUsesAttemptTokenInsteadOfAPIToken(t *testing.T) 
 
 	if resp.Code != http.StatusCreated {
 		t.Fatalf("expected callback token to authorize callback without API token, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	observationBody, err := json.Marshal(map[string]any{
+		"training_attempt_id": callbackAttemptID(t, assigned),
+		"schema_version":      execution.ExecutionObservationSchemaV1,
+		"stage":               execution.ExecutionObservationInitialized,
+		"idempotency_key":     "lan-init-1",
+		"realized_config":     spec.AcceptedConfig,
+	})
+	if err != nil {
+		t.Fatalf("marshal observation callback: %v", err)
+	}
+	observationReq := httptest.NewRequest(http.MethodPost, "/jobs/"+assigned.ID+"/execution-observations", bytes.NewReader(observationBody))
+	observationReq.Header.Set("Content-Type", "application/json")
+	setCallbackToken(t, observationReq, assigned)
+	observationResp := httptest.NewRecorder()
+
+	router.ServeHTTP(observationResp, observationReq)
+
+	if observationResp.Code != http.StatusCreated {
+		t.Fatalf("expected execution observation callback token to bypass API token, got %d: %s", observationResp.Code, observationResp.Body.String())
 	}
 }
 

@@ -46,6 +46,50 @@ func TestTrainingMonitorAgentValidatesStructuredRecommendation(t *testing.T) {
 	}
 }
 
+func TestTrainingMonitorAgentNormalizesBareNoneJSONValues(t *testing.T) {
+	agent := NewTrainingMonitorAgent(fakeJSONGenerator{
+		response: `{
+			"summary": "EfficientNet is competitive and stable.",
+			"recommended_action": {
+				"action_type": "RANK_MODELS",
+				"confidence": 0.82,
+				"rationale": "The run has strong validation quality with low instability.",
+				"payload": {"champion_job_id": None, "literal": "none"},
+				"requires_approval": true
+			},
+			"quality_summary": "Strong validation macro-F1.",
+			"training_dynamics": "No obvious overfitting.",
+			"cost_summary": "Moderate cost for the observed quality.",
+			"risks": ["none"],
+			"findings": ["stable validation curve"],
+			"rank_score": 0.78,
+			"tags": ["none"]
+		}`,
+	}, "test-model")
+
+	trace, err := agent.EvaluateWithTrace(context.Background(), testTrainingMonitorInput())
+	if err != nil {
+		t.Fatalf("evaluate with bare None: %v", err)
+	}
+	payload := trace.Recommendation.RecommendedAction.Payload
+	if got, ok := payload["champion_job_id"]; !ok || got != nil {
+		t.Fatalf("bare None payload value was not decoded as JSON null: %#v", payload)
+	}
+	if got := payload["literal"]; got != "none" {
+		t.Fatalf("string literal none should not be normalized, got %#v", got)
+	}
+	if !strings.Contains(string(trace.RawOutput), "None") {
+		t.Fatal("raw output should preserve the provider response for debugging")
+	}
+	action, ok := trace.ParsedOutput["recommended_action"].(map[string]any)
+	if !ok {
+		t.Fatalf("parsed output missing recommended_action: %#v", trace.ParsedOutput)
+	}
+	parsedPayload, ok := action["payload"].(map[string]any)
+	if !ok || parsedPayload["champion_job_id"] != nil || parsedPayload["literal"] != "none" {
+		t.Fatalf("parsed output did not reflect safe null normalization: %#v", action["payload"])
+	}
+}
 func TestTrainingMonitorAgentReturnsInvocationTrace(t *testing.T) {
 	agent := NewTrainingMonitorAgent(fakeJSONGenerator{
 		response: `{
@@ -79,6 +123,9 @@ func TestTrainingMonitorAgentReturnsInvocationTrace(t *testing.T) {
 	}
 	if len(trace.Request.Messages) != 2 {
 		t.Fatalf("expected two prompt messages, got %d", len(trace.Request.Messages))
+	}
+	if !strings.Contains(trace.Request.Messages[0].Content, "JSON null") {
+		t.Fatalf("training monitor prompt should forbid Python None/bare none: %q", trace.Request.Messages[0].Content)
 	}
 	if string(trace.RawOutput) == "" {
 		t.Fatal("expected raw output to be captured")

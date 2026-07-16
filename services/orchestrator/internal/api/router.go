@@ -327,6 +327,7 @@ func callbackEndpointUsesAttemptToken(method string, path string) bool {
 	switch parts[2] {
 	case "metrics",
 		"progress",
+		"execution-observations",
 		"training-run-summary",
 		"training-run-evaluation",
 		"modal-call",

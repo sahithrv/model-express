@@ -138,6 +138,30 @@ func TestExperimentPlannerRequestUsesStrictStructuredOutputSchema(t *testing.T) 
 	}
 }
 
+func TestDecodeExperimentPlannerRecommendationNormalizesBareNoneLiterals(t *testing.T) {
+	raw := []byte(`{
+		"summary": "wait for better evidence",
+		"decision_type": "WAIT",
+		"rationale": "No safe follow-up yet.",
+		"champion_job_id": None,
+		"stop_reason": none,
+		"tags": ["none"]
+	}`)
+
+	recommendation, normalizations, err := decodeExperimentPlannerRecommendation(raw)
+	if err != nil {
+		t.Fatalf("decode planner recommendation with bare None: %v", err)
+	}
+	if recommendation.ChampionJobID != "" || recommendation.StopReason != "" {
+		t.Fatalf("bare None values were not decoded as JSON null: %#v", recommendation)
+	}
+	if len(recommendation.Tags) != 1 || recommendation.Tags[0] != "none" {
+		t.Fatalf("string literal none should not be normalized: %#v", recommendation.Tags)
+	}
+	if !strings.Contains(strings.Join(normalizations, "|"), "bare none literal converted to JSON null") {
+		t.Fatalf("missing bare-none normalization marker: %#v", normalizations)
+	}
+}
 func TestExperimentPlannerTraceCapturesActualRequestRuntimeIdentityInputs(t *testing.T) {
 	// This test isolates request/identity tracing; strict behavior has dedicated
 	// validation tests and must not change the response fixture under test here.
@@ -370,6 +394,7 @@ func TestExperimentPlannerPromptDocumentsPreprocessingContractAndVisualEvidence(
 		"sampling_strategy values",
 		"catalog-backed loss values",
 		"Return only valid JSON",
+		"JSON null",
 		"planner_context_snapshot",
 		"retrieved_memory, when present",
 		"retrieved memory cannot bypass backend validation",
@@ -420,6 +445,7 @@ func TestExperimentPlannerStaticPromptCompactV1IsShorterAndKeepsContractGuidance
 		"Backend validation remains the gate",
 		"draft-only for ADD_EXPERIMENTS",
 		"Return only valid JSON",
+		"JSON null",
 		"Longer classifier schedules",
 	} {
 		if !strings.Contains(compactPrompt, expected) {

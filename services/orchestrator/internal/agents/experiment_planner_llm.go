@@ -1139,7 +1139,8 @@ func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input 
 		return trace, err
 	}
 	trace.RawOutput = append([]byte(nil), raw...)
-	trace.ParsedOutput = rawOutputObject(raw)
+	decodeRaw, _ := normalizeBareNoneJSONLiterals(raw)
+	trace.ParsedOutput = rawOutputObject(decodeRaw)
 
 	recommendation, normalizations, err := decodeExperimentPlannerRecommendation(raw)
 	trace.OutputNormalizations = normalizations
@@ -1167,11 +1168,12 @@ func (a ExperimentPlannerAgent) PlanWithVariantTrace(ctx context.Context, input 
 
 func decodeExperimentPlannerRecommendation(raw []byte) (ExperimentPlanningRecommendation, []string, error) {
 	var recommendation ExperimentPlanningRecommendation
+	decodeRaw, literalNormalizations := normalizeBareNoneJSONLiterals(raw)
 	var root map[string]any
-	if err := json.Unmarshal(raw, &root); err != nil {
+	if err := json.Unmarshal(decodeRaw, &root); err != nil {
 		return recommendation, nil, err
 	}
-	normalizations := normalizeExperimentPlannerOutput(root)
+	normalizations := append(literalNormalizations, normalizeExperimentPlannerOutput(root)...)
 	blob, err := json.Marshal(root)
 	if err != nil {
 		return recommendation, normalizations, err
@@ -1777,7 +1779,7 @@ You run after a whole experiment plan has completed, not after one run.
 Design the next image-classification experiment batch from all plan results and prior memory.
 When approved information tools are available, you may ask bounded backend questions before finalizing.
 Tool calls are questions only: they cannot create plans, jobs, workers, champions, exports, inference runs, or dataset mutations.
-After any information requests, Return only valid JSON as the final answer.
+After any information requests, Return only valid JSON as the final answer. Use JSON null for absent optional values; never output Python None or bare none.
 Be willing to change model family, image size, resolution_strategy, preprocessing, augmentation_policy,
 augmentation_policy_config,
 sampling_strategy, optimizer, scheduler, class balancing or loss strategy,
@@ -2084,7 +2086,7 @@ func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.J
 	}, " "))
 
 	outputContract := strings.TrimSpace(strings.Join([]string{
-		"Return JSON with these required top-level keys: summary, decision_type, rationale, confidence, planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, primary_mechanism, governor_compliance, expected_failure_modes, dataset_preprocessing_rationale, changed_variables, success_criteria, stop_condition, deployment_tradeoff, candidate_hypotheses, proposed_experiments, proposal_mechanisms, champion_job_id, why_can_beat_champion, expected_delta_vs_champion, stop_reason, risks, expected_tradeoffs, novelty_notes, rejected_options, tags.",
+		"Return JSON with these required top-level keys: summary, decision_type, rationale, confidence, planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, primary_mechanism, governor_compliance, expected_failure_modes, dataset_preprocessing_rationale, changed_variables, success_criteria, stop_condition, deployment_tradeoff, candidate_hypotheses, proposed_experiments, proposal_mechanisms, champion_job_id, why_can_beat_champion, expected_delta_vs_champion, stop_reason, risks, expected_tradeoffs, novelty_notes, rejected_options, tags. Use JSON null for absent optional values; never output Python None or bare none.",
 		"Structured output schema is enforced: prose fields such as dataset_preprocessing_rationale, success_criteria, and stop_condition must be strings; rejected_options must be objects; forecast.valid_range must be an object with numeric min and max.",
 		"ADD_EXPERIMENTS also requires candidate_hypotheses[] items with hypothesis, planning_mode, mechanism, intervention, proposed_changes, expected_effect, expected_metric_impact, forecast, expected_tradeoffs, risk, cost_level, novelty_score, evidence_used, similar_success_memory_ids, similar_failure_memory_ids, and experiment_config.",
 		"Each forecast must freeze forecast_target, metric_direction, score_basis, score_version, baseline_job_id, baseline_score, predicted_delta, prediction_source, units, and valid_range from planner_context_snapshot.champion_card. predicted_delta must exactly equal expected_metric_impact and prediction_source must be candidate.expected_metric_impact; do not use recommendation-level expected_delta_vs_champion as a candidate forecast.",
