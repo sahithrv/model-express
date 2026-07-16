@@ -31,7 +31,7 @@ func TestCandidateForecastIsFrozenFromChampionAndKeepsRecommendationDeltaSeparat
 	}
 }
 
-func TestCandidateForecastRejectsMismatchedFrozenContractAndImpossiblePrediction(t *testing.T) {
+func TestCandidateForecastOverwritesMismatchedLLMForecastAndRejectsImpossiblePrediction(t *testing.T) {
 	input := ExperimentPlannerInput{
 		SourcePlan:      plans.ExperimentPlan{TargetMetric: "macro_f1"},
 		CurrentChampion: &ExperimentChampion{JobID: "job_champion", TargetMetric: "macro_f1", Score: 0.99},
@@ -42,14 +42,22 @@ func TestCandidateForecastRejectsMismatchedFrozenContractAndImpossiblePrediction
 
 	input.CurrentChampion.Score = 0.70
 	supplied := calibration.CandidateForecastContract{
-		ForecastTarget: "macro_f1", MetricDirection: calibration.MetricDirectionHigherIsBetter,
-		ScoreBasis: "macro_f1_score", ScoreVersion: calibration.CandidateForecastScoreVersionV1,
-		BaselineJobID: "job_champion", BaselineScore: 0.70, PredictedDelta: 0.02,
+		ForecastTarget: "accuracy", MetricDirection: calibration.MetricDirectionHigherIsBetter,
+		ScoreBasis: "accuracy_score", ScoreVersion: calibration.CandidateForecastScoreVersionV1,
+		BaselineJobID: "wrong_champion", BaselineScore: 0.12, PredictedDelta: 0.99,
 		PredictionSource: calibration.CandidatePredictionSource, Units: "percentage_points",
-		ValidRange: calibration.CandidateForecastRange{Min: 0, Max: 1},
+		ValidRange: calibration.CandidateForecastRange{Min: -1, Max: 2},
 	}
-	if _, err := freezeCandidateForecastContracts(input, []CandidateHypothesis{{ExpectedMetricImpact: 0.02, Forecast: &supplied}}); err == nil || !strings.Contains(err.Error(), "backend-frozen contract") {
-		t.Fatalf("mismatched forecast units were not rejected: %v", err)
+	candidates, err := freezeCandidateForecastContracts(input, []CandidateHypothesis{{ExpectedMetricImpact: 0.02, Forecast: &supplied}})
+	if err != nil {
+		t.Fatalf("mismatched LLM forecast metadata should be overwritten, not rejected: %v", err)
+	}
+	forecast := candidates[0].Forecast
+	if forecast == nil || forecast.ForecastTarget != "macro_f1" || forecast.ScoreBasis != "macro_f1_score" || forecast.BaselineJobID != "job_champion" {
+		t.Fatalf("forecast identity was not backend-frozen: %#v", forecast)
+	}
+	if forecast.BaselineScore != 0.70 || forecast.PredictedDelta != 0.02 || forecast.Units != calibration.CandidateForecastUnits || forecast.ValidRange.Min != 0 || forecast.ValidRange.Max != 1 {
+		t.Fatalf("forecast numeric contract was not backend-frozen: %#v", forecast)
 	}
 }
 

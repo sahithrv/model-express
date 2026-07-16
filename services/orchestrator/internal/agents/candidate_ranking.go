@@ -144,40 +144,12 @@ func freezeCandidateForecastContracts(input ExperimentPlannerInput, candidates [
 			Units:            calibration.CandidateForecastUnits,
 			ValidRange:       calibration.CandidateForecastRange{Min: 0, Max: 1},
 		}
-		if supplied := out[index].Forecast; supplied != nil {
-			if err := validateCandidateForecastMatchesFrozen(*supplied, frozen); err != nil {
-				return nil, fmt.Errorf("candidate_hypotheses[%d] forecast: %w", index, err)
-			}
-		}
 		if err := calibration.ValidateForecastContract(frozen); err != nil {
 			return nil, fmt.Errorf("candidate_hypotheses[%d] forecast: %w", index, err)
 		}
 		out[index].Forecast = &frozen
 	}
 	return out, nil
-}
-
-func validateCandidateForecastMatchesFrozen(supplied calibration.CandidateForecastContract, frozen calibration.CandidateForecastContract) error {
-	if supplied.ForecastTarget != frozen.ForecastTarget ||
-		supplied.MetricDirection != frozen.MetricDirection ||
-		supplied.ScoreBasis != frozen.ScoreBasis ||
-		supplied.ScoreVersion != frozen.ScoreVersion ||
-		supplied.BaselineJobID != frozen.BaselineJobID ||
-		supplied.PredictionSource != frozen.PredictionSource ||
-		supplied.Units != frozen.Units {
-		return fmt.Errorf("target, direction, score basis/version, baseline, source, and units must match the backend-frozen contract")
-	}
-	if !nearlyEqualCandidateForecast(supplied.BaselineScore, frozen.BaselineScore) ||
-		!nearlyEqualCandidateForecast(supplied.PredictedDelta, frozen.PredictedDelta) ||
-		!nearlyEqualCandidateForecast(supplied.ValidRange.Min, frozen.ValidRange.Min) ||
-		!nearlyEqualCandidateForecast(supplied.ValidRange.Max, frozen.ValidRange.Max) {
-		return fmt.Errorf("baseline_score, predicted_delta, and valid_range must match the backend-frozen contract")
-	}
-	return calibration.ValidateForecastContract(supplied)
-}
-
-func nearlyEqualCandidateForecast(left, right float64) bool {
-	return math.Abs(left-right) <= 1e-9
 }
 
 func mechanismExhausted(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (bool, string) {
