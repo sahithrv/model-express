@@ -135,7 +135,29 @@ func ResolveAcceptedConfig(task, runner string, input map[string]any) (map[strin
 	for path, value := range profile.FixedSemantics {
 		setCapabilityValueAtPath(accepted, path, cloneCapabilityValue(value))
 	}
+	canonicalizeAcceptedConfig(task, runner, accepted)
 	return accepted, nil
+}
+
+func canonicalizeAcceptedConfig(task, runner string, accepted map[string]any) {
+	if task != "image_classification" || runner != "modal_torchvision" || accepted == nil {
+		return
+	}
+	freezeBackbone, freezeOK := capabilityValueAtPath(accepted, "freeze_backbone")
+	fineTuneStrategy, strategyOK := capabilityValueAtPath(accepted, "fine_tune_strategy")
+	if (freezeOK && freezeBackbone == false) || (strategyOK && capabilityText(fineTuneStrategy) == "full") {
+		setCapabilityValueAtPath(accepted, "freeze_backbone", false)
+		setCapabilityValueAtPath(accepted, "fine_tune_strategy", "full")
+	}
+	useDatasetNormalization, useDatasetOK := capabilityValueAtPath(accepted, "preprocessing.use_dataset_normalization")
+	if useDatasetOK && useDatasetNormalization == true {
+		setCapabilityValueAtPath(accepted, "preprocessing.normalization", "dataset")
+	}
+}
+
+func capabilityText(value any) string {
+	text, _ := value.(string)
+	return strings.ToLower(strings.TrimSpace(text))
 }
 
 func applyCanonicalEmptyDefaults(config map[string]any, defaults map[string]any) {

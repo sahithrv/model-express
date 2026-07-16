@@ -1024,7 +1024,7 @@ func experimentPlannerVariant(input agents.ExperimentPlannerInput, config llm.Co
 		RetrievalPolicyVersion:       agents.ExperimentPlannerRetrievalPolicyVersion,
 		Retrieval:                    retrieval,
 		RetryPolicyVersion:           plannerRetryPolicyVersion,
-		MaxBackendValidationRetries:  plannerBackendValidationRetryLimit,
+		MaxBackendValidationRetries:  plannerBackendValidationRetryLimit(),
 		DecisionPolicyVersion:        plannerDecisionPolicyVersion,
 		AgentMode:                    llm.NormalizeAgentMode(input.AgentMode),
 		TerminalPlannerGuards:        terminalPlannerGuardsEnabledForInput(input),
@@ -1148,7 +1148,8 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 	var lastErr error
 	attemptGroupID := newPlannerAttemptGroupID()
 	retryReason := ""
-	for attempt := 0; attempt <= plannerBackendValidationRetryLimit; attempt++ {
+	retryLimit := plannerBackendValidationRetryLimit()
+	for attempt := 0; attempt <= retryLimit; attempt++ {
 		startedAt := time.Now()
 		trace, err := agent.PlanWithTrace(ctx, attemptInput)
 		wallLatencyMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
@@ -1173,7 +1174,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 		}
 		if err != nil {
 			lastErr = err
-			willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerTraceValidation(trace, err)
+			willRetry := attempt < retryLimit && shouldRetryExperimentPlannerTraceValidation(trace, err)
 			if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, willRetry); persistErr != nil {
 				return result, persistErr
 			}
@@ -1192,7 +1193,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			experiments, automlWarnings, prepareErr := s.prepareAutoMLExperimentsForProjectWithPolicy(input.Project.ID, recommendation.ProposedExperiments, attemptInput.EffectivePolicy)
 			if prepareErr != nil {
 				lastErr = prepareErr
-				willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation)
+				willRetry := attempt < retryLimit && shouldRetryExperimentPlannerValidation(recommendation)
 				if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, willRetry); persistErr != nil {
 					return result, persistErr
 				}
@@ -1207,11 +1208,14 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			}
 			recommendation.ProposedExperiments = experiments
 			recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, automlWarnings...)
+			experiments, executionNormalizationWarnings := normalizePlannerProposalExperimentsForExecution(recommendation.ProposedExperiments)
+			recommendation.ProposedExperiments = experiments
+			recommendation.NoveltyNotes = append(recommendation.NoveltyNotes, executionNormalizationWarnings...)
 		}
 		executionReports, capabilityErr := validatePlannerExecutionCapabilities(recommendation.ProposedExperiments, attemptInput)
 		if capabilityErr != nil {
 			lastErr = capabilityErr
-			willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation)
+			willRetry := attempt < retryLimit && shouldRetryExperimentPlannerValidation(recommendation)
 			if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, willRetry); persistErr != nil {
 				return result, persistErr
 			}
@@ -1220,7 +1224,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 				result.Recommendation = recommendation
 				return result, capabilityErr
 			}
-			attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, capabilityErr, attempt+1))
+			attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, capabilityErr, attempt+1, executionReports...))
 			retryReason = plannerRetryReasonExecutionCapabilities
 			continue
 		}
@@ -1260,7 +1264,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 		}
 
 		lastErr = err
-		willRetry := attempt < plannerBackendValidationRetryLimit && shouldRetryExperimentPlannerValidation(recommendation)
+		willRetry := attempt < retryLimit && shouldRetryExperimentPlannerValidation(recommendation)
 		verdict := plannerStrictVerdictFromError(trace.StrictValidationVerdict, trace.ValidatorMode, err)
 		if persistErr := s.persistPlannerValidationAttempt(invocation, verdict, attempt, false, willRetry); persistErr != nil {
 			return result, persistErr
@@ -1436,6 +1440,7 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 				}
 				experiments[index] = prepared
 			}
+			experiments, executionNormalizationWarnings := normalizePlannerProposalExperimentsForExecution(experiments)
 			for index, experiment := range experiments {
 				if err := validatePlannedExperiment(experiment, index); err != nil {
 					return invalidPlannerDryRunResult(result, err)
@@ -1474,6 +1479,9 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 				return invalidPlannerDryRunResult(result, err)
 			}
 			result.Details["validated_experiment_count"] = len(experiments)
+			if len(executionNormalizationWarnings) > 0 {
+				result.Details["execution_normalization_warnings"] = uniqueStrings(executionNormalizationWarnings)
+			}
 			if len(relaxedValidationWarnings) > 0 {
 				result.Details["planner_validation_mode"] = "relaxed"
 				result.Details["planner_validation_warnings"] = uniqueStrings(relaxedValidationWarnings)
@@ -1572,7 +1580,7 @@ func invalidPlannerDryRunResult(result agents.PlannerCandidateDryRunResult, err 
 	return result
 }
 
-func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommendation, validationErr error, attempt int) agents.PlannerValidationFeedback {
+func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommendation, validationErr error, attempt int, reports ...execution.ExecutionValidationReport) agents.PlannerValidationFeedback {
 	rejectedExperiments := make([]string, 0, len(recommendation.ProposedExperiments))
 	rejectedModels := []string{}
 	seenModels := map[string]bool{}
@@ -1590,6 +1598,7 @@ func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommend
 		RejectedDecision:    recommendation.DecisionType,
 		RejectedModels:      rejectedModels,
 		RejectedExperiments: rejectedExperiments,
+		FieldFindings:       plannerValidationFieldFindings(validationErr, reports),
 		Instructions: []string{
 			"Return corrected JSON only.",
 			"Do not repeat the rejected experiment configuration unchanged.",
@@ -1610,6 +1619,45 @@ func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommend
 		)
 	}
 	return feedback
+}
+
+func plannerValidationFieldFindings(validationErr error, reports []execution.ExecutionValidationReport) []agents.PlannerValidationFieldFinding {
+	const maxFindings = 24
+	out := []agents.PlannerValidationFieldFinding{}
+	appendFinding := func(finding agents.PlannerValidationFieldFinding) {
+		if len(out) >= maxFindings || strings.TrimSpace(finding.Field) == "" {
+			return
+		}
+		out = append(out, finding)
+	}
+	for _, report := range reports {
+		if !report.WouldBlock {
+			continue
+		}
+		for _, finding := range report.Findings {
+			appendFinding(agents.PlannerValidationFieldFinding{
+				Field:                finding.Field,
+				RequestedValue:       finding.RequestedValue,
+				AcceptedValue:        finding.AcceptedValue,
+				ReasonCode:           finding.ReasonCode,
+				SuggestedAlternative: finding.SuggestedAlternative,
+			})
+		}
+	}
+	if len(out) > 0 || validationErr == nil {
+		return out
+	}
+	var evaluationErr plannervalidation.EvaluationError
+	if errors.As(validationErr, &evaluationErr) {
+		for _, finding := range evaluationErr.Findings {
+			appendFinding(agents.PlannerValidationFieldFinding{
+				Field:                finding.Stage,
+				ReasonCode:           finding.Code,
+				SuggestedAlternative: finding.Message,
+			})
+		}
+	}
+	return out
 }
 
 func experimentFeedbackSummary(experiment plans.PlannedExperiment) string {

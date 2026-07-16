@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,22 +41,23 @@ type createDatasetRequest struct {
 const (
 	callbackTokenHeader = "X-Model-Express-Callback-Token"
 
-	llmExperimentPlannerDecisionSource       = "llm_experiment_planner"
-	llmPlannerDegradedChampionDecisionSource = "llm_planner_degraded_best_available"
-	terminalTrainingChampionDecisionSource   = "terminal_training_best_available"
-	costPolicyChampionDecisionSource         = "cost_policy_budget_stop"
-	maxFollowUpRoundsChampionDecisionSource  = "max_followup_rounds_stop"
-	userCancelChampionDecisionSource         = "user_cancel_best_available"
-	minLLMDecisionConfidence                 = 0.50
-	maxLLMPlannerExperiments                 = 5
-	plannerMinimumMeaningfulImprovement      = 0.005
-	plannerAutonomousMeaningfulImprovement   = 0.010
-	championSelectionOverrideMinDelta        = 0.025
-	plannerNoImprovementRoundsToSelect       = 2
-	plannerDefaultMaxFollowUpRounds          = 10
-	plannerAutonomousMaxFollowUpRounds       = 3
-	plannerBackendValidationRetryLimit       = plannervalidation.DefaultMaxRetriesPerAttemptGroup
-	plannerDefaultMaxToolRounds              = 10
+	llmExperimentPlannerDecisionSource        = "llm_experiment_planner"
+	llmPlannerDegradedChampionDecisionSource  = "llm_planner_degraded_best_available"
+	terminalTrainingChampionDecisionSource    = "terminal_training_best_available"
+	costPolicyChampionDecisionSource          = "cost_policy_budget_stop"
+	maxFollowUpRoundsChampionDecisionSource   = "max_followup_rounds_stop"
+	userCancelChampionDecisionSource          = "user_cancel_best_available"
+	minLLMDecisionConfidence                  = 0.50
+	maxLLMPlannerExperiments                  = 5
+	plannerMinimumMeaningfulImprovement       = 0.005
+	plannerAutonomousMeaningfulImprovement    = 0.010
+	championSelectionOverrideMinDelta         = 0.025
+	plannerNoImprovementRoundsToSelect        = 2
+	plannerDefaultMaxFollowUpRounds           = 10
+	plannerAutonomousMaxFollowUpRounds        = 3
+	plannerBackendValidationRetryLimitDefault = plannervalidation.DefaultMaxRetriesPerAttemptGroup
+	plannerBackendValidationRetryLimitMax     = 3
+	plannerDefaultMaxToolRounds               = 10
 
 	modalOOMRetryHistoryKey = "modal_oom_retry_history"
 
@@ -77,6 +79,21 @@ var (
 	errChampionSelectedFollowUpBlocked = fmt.Errorf("%w: champion selected guard", errNoNovelFollowUpExperiments)
 	modalGPUEscalationLadder           = []string{"T4", "L4", "A10", "L40S", "A100-40GB", "A100-80GB"}
 )
+
+func plannerBackendValidationRetryLimit() int {
+	value := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES"))
+	if value == "" {
+		return plannerBackendValidationRetryLimitDefault
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return plannerBackendValidationRetryLimitDefault
+	}
+	if parsed > plannerBackendValidationRetryLimitMax {
+		return plannerBackendValidationRetryLimitMax
+	}
+	return parsed
+}
 
 func callbackSecretFromEnv() []byte {
 	if secret := strings.TrimSpace(os.Getenv("MODEL_EXPRESS_CALLBACK_SECRET")); secret != "" {

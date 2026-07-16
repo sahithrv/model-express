@@ -1,6 +1,7 @@
 package execution_test
 
 import (
+	"reflect"
 	"testing"
 
 	"model-express/services/orchestrator/internal/execution"
@@ -231,4 +232,121 @@ func TestRequestedAndAcceptedHashesDistinguishExplicitFalseFromOmitted(t *testin
 	if omitted.AcceptedSpecHash == disabled.AcceptedSpecHash {
 		t.Fatal("accepted hash collapsed pretrained=true default and explicit pretrained=false")
 	}
+}
+
+func TestClassificationAcceptedConfigMatchesWorkerSemanticRealization(t *testing.T) {
+	base := map[string]any{
+		"template": "train_experiment", "model": "resnet18", "epochs": 8,
+		"batch_size": 16, "learning_rate": 0.001, "image_size": 224,
+	}
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "full fine-tuning",
+			mutate: func(requested map[string]any) {
+				requested["freeze_backbone"] = true
+				requested["fine_tune_strategy"] = "full"
+			},
+		},
+		{
+			name: "unfrozen backbone",
+			mutate: func(requested map[string]any) {
+				requested["freeze_backbone"] = false
+				requested["fine_tune_strategy"] = "head_only"
+			},
+		},
+		{
+			name: "dataset normalization",
+			mutate: func(requested map[string]any) {
+				requested["preprocessing"] = map[string]any{
+					"normalization":             "imagenet",
+					"use_dataset_normalization": true,
+				}
+			},
+		},
+		{
+			name: "head-only frozen transfer",
+			mutate: func(requested map[string]any) {
+				requested["freeze_backbone"] = true
+				requested["fine_tune_strategy"] = "head_only"
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requested := cloneSpecTestMap(base)
+			tc.mutate(requested)
+			spec, err := execution.BuildExecutionSpecV1("image_classification", "modal_torchvision", requested, requested)
+			if err != nil {
+				t.Fatalf("build spec: %v", err)
+			}
+			realized := workerClassificationRealizedConfig(spec.AcceptedConfig)
+			if !reflect.DeepEqual(spec.AcceptedConfig, realized) {
+				t.Fatalf("accepted config does not match worker realization:\naccepted=%#v\nrealized=%#v", spec.AcceptedConfig, realized)
+			}
+		})
+	}
+}
+
+func TestClassificationBatchSizeRecoveryIsOnlyWorkerRuntimeAdjustment(t *testing.T) {
+	requested := map[string]any{
+		"template": "train_experiment", "model": "resnet18", "epochs": 8,
+		"batch_size": 16, "learning_rate": 0.001, "image_size": 224,
+		"freeze_backbone": true, "fine_tune_strategy": "head_only",
+	}
+	spec, err := execution.BuildExecutionSpecV1("image_classification", "modal_torchvision", requested, requested)
+	if err != nil {
+		t.Fatalf("build spec: %v", err)
+	}
+	realized := workerClassificationRealizedConfig(spec.AcceptedConfig)
+	realized["batch_size"] = 8
+	if !workerClassificationMatchesWithBatchRecovery(spec.AcceptedConfig, realized) {
+		t.Fatalf("smaller realized batch size should be the approved runtime adjustment: accepted=%#v realized=%#v", spec.AcceptedConfig, realized)
+	}
+	realized["fine_tune_strategy"] = "full"
+	if workerClassificationMatchesWithBatchRecovery(spec.AcceptedConfig, realized) {
+		t.Fatalf("non-batch realization drift was accepted: accepted=%#v realized=%#v", spec.AcceptedConfig, realized)
+	}
+}
+
+func workerClassificationRealizedConfig(config map[string]any) map[string]any {
+	realized := cloneSpecTestMap(config)
+	freezeBackbone, _ := realized["freeze_backbone"].(bool)
+	fineTuneStrategy, _ := realized["fine_tune_strategy"].(string)
+	if !freezeBackbone || fineTuneStrategy == "full" {
+		realized["freeze_backbone"] = false
+		realized["fine_tune_strategy"] = "full"
+	}
+	if preprocessing, ok := realized["preprocessing"].(map[string]any); ok && preprocessing["use_dataset_normalization"] == true {
+		preprocessing["normalization"] = "dataset"
+	}
+	return realized
+}
+
+func workerClassificationMatchesWithBatchRecovery(accepted, realized map[string]any) bool {
+	if reflect.DeepEqual(accepted, realized) {
+		return true
+	}
+	acceptedCopy := cloneSpecTestMap(accepted)
+	realizedCopy := cloneSpecTestMap(realized)
+	acceptedBatch, acceptedOK := acceptedCopy["batch_size"].(int)
+	realizedBatch, realizedOK := realizedCopy["batch_size"].(int)
+	delete(acceptedCopy, "batch_size")
+	delete(realizedCopy, "batch_size")
+	return acceptedOK && realizedOK && realizedBatch > 0 && realizedBatch < acceptedBatch && reflect.DeepEqual(acceptedCopy, realizedCopy)
+}
+
+func cloneSpecTestMap(values map[string]any) map[string]any {
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		switch typed := value.(type) {
+		case map[string]any:
+			out[key] = cloneSpecTestMap(typed)
+		default:
+			out[key] = typed
+		}
+	}
+	return out
 }

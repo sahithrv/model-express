@@ -93,6 +93,7 @@ func TestExecutePlanPreservesExplicitFalseAndZeroInLegacyAndCanonicalPayloads(t 
 	accepted := spec["accepted_config"].(map[string]any)
 	assertConfigValue(t, accepted, "pretrained", false)
 	assertConfigValue(t, accepted, "freeze_backbone", false)
+	assertConfigValue(t, accepted, "fine_tune_strategy", "full")
 	assertConfigValue(t, accepted, "optimizer_momentum", float64(0))
 	acceptedPolicy := accepted["augmentation_policy_config"].(map[string]any)
 	assertConfigValue(t, acceptedPolicy, "probability", float64(0))
@@ -311,6 +312,35 @@ func TestPlannerEnforcementErrorCarriesActionableAlternative(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "omit resolution_strategy") {
 		t.Fatalf("planner retry feedback omitted the alternative: %v", err)
+	}
+	feedback := plannerValidationFeedback(agents.ExperimentPlanningRecommendation{
+		ProposedExperiments: []plans.PlannedExperiment{experiment},
+	}, err, 1, reports...)
+	if len(feedback.FieldFindings) == 0 {
+		t.Fatalf("planner validation feedback omitted field findings: %#v", feedback)
+	}
+	finding := feedback.FieldFindings[0]
+	if finding.Field != "resolution_strategy" || finding.RequestedValue != "low_latency" || finding.ReasonCode != "runner_does_not_consume" || !strings.Contains(finding.SuggestedAlternative, "omit resolution_strategy") {
+		t.Fatalf("unexpected planner field finding: %#v", finding)
+	}
+}
+
+func TestPlannerBackendValidationRetryLimitIsEnvConfigurableAndBounded(t *testing.T) {
+	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "")
+	if got := plannerBackendValidationRetryLimit(); got != 1 {
+		t.Fatalf("default retry limit = %d, want 1", got)
+	}
+	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "3")
+	if got := plannerBackendValidationRetryLimit(); got != 3 {
+		t.Fatalf("configured retry limit = %d, want 3", got)
+	}
+	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "99")
+	if got := plannerBackendValidationRetryLimit(); got != 3 {
+		t.Fatalf("bounded retry limit = %d, want 3", got)
+	}
+	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "-1")
+	if got := plannerBackendValidationRetryLimit(); got != 1 {
+		t.Fatalf("invalid retry limit = %d, want default 1", got)
 	}
 }
 

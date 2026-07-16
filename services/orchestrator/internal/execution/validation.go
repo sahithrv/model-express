@@ -159,24 +159,15 @@ func ValidateExecutionSpecV1(spec ExecutionSpecV1, modelFamily, mode string) (Ex
 				RequestedValue:       cloneCapabilityValue(requested), AcceptedValue: cloneCapabilityValue(accepted),
 			})
 			if !capabilityValuesEqual(requested, accepted) {
-				report.Findings = append(report.Findings, ExecutionValidationFinding{
-					Field: path, Classification: "normalized", ReasonCode: "value_normalized",
-					Severity: FindingSeverityInfo, Message: fmt.Sprintf("%s was normalized to the canonical runner value", path),
-					SuggestedAlternative: fmt.Sprintf("use the canonical value reported for %s in future proposals", path),
-					RequestedValue:       cloneCapabilityValue(requested), AcceptedValue: cloneCapabilityValue(accepted),
-				})
+				report.Findings = append(report.Findings, normalizedFinding(spec, path, requested, accepted))
 			}
 		case "executed":
 			if acceptedOK && !capabilityValuesEqual(requested, accepted) {
-				report.Findings = append(report.Findings, ExecutionValidationFinding{
-					Field: path, Classification: "normalized", ReasonCode: "value_normalized",
-					Severity: FindingSeverityInfo, Message: fmt.Sprintf("%s was normalized to the canonical runner value", path),
-					SuggestedAlternative: fmt.Sprintf("use the canonical value reported for %s in future proposals", path),
-					RequestedValue:       cloneCapabilityValue(requested), AcceptedValue: cloneCapabilityValue(accepted),
-				})
+				report.Findings = append(report.Findings, normalizedFinding(spec, path, requested, accepted))
 			}
 		}
 	}
+	appendImplicitClassificationCanonicalFindings(&report, spec, profile)
 
 	for _, finding := range report.Findings {
 		if finding.WouldBlock {
@@ -187,6 +178,79 @@ func ValidateExecutionSpecV1(spec ExecutionSpecV1, modelFamily, mode string) (Ex
 	return report, nil
 }
 
+func normalizedFinding(spec ExecutionSpecV1, path string, requested, accepted any) ExecutionValidationFinding {
+	reasonCode, suggestedAlternative := normalizedFindingMetadata(spec, path)
+	return ExecutionValidationFinding{
+		Field: path, Classification: "normalized", ReasonCode: reasonCode,
+		Severity: FindingSeverityInfo, Message: fmt.Sprintf("%s was normalized to the canonical runner value", path),
+		SuggestedAlternative: suggestedAlternative,
+		RequestedValue:       cloneCapabilityValue(requested), AcceptedValue: cloneCapabilityValue(accepted),
+	}
+}
+
+func normalizedFindingMetadata(spec ExecutionSpecV1, path string) (string, string) {
+	if spec.Task == "image_classification" && spec.Runner == "modal_torchvision" {
+		switch path {
+		case "freeze_backbone", "fine_tune_strategy":
+			return "classification_transfer_semantics_canonicalized", "use freeze_backbone=false with fine_tune_strategy=full when requesting full fine-tuning or an unfrozen backbone"
+		case "preprocessing.normalization":
+			if capabilityBool(spec.AcceptedConfig, "preprocessing.use_dataset_normalization") {
+				return "classification_dataset_normalization_canonicalized", "set preprocessing.normalization=dataset when preprocessing.use_dataset_normalization=true"
+			}
+		}
+	}
+	return "value_normalized", fmt.Sprintf("use the canonical value reported for %s in future proposals", path)
+}
+
+func appendImplicitClassificationCanonicalFindings(report *ExecutionValidationReport, spec ExecutionSpecV1, profile CapabilityProfile) {
+	if report == nil || spec.Task != "image_classification" || spec.Runner != "modal_torchvision" {
+		return
+	}
+	normalized, err := NormalizeExecutionConfig(spec.Task, spec.Runner, spec.RequestedConfig)
+	if err != nil {
+		return
+	}
+	applyCanonicalEmptyDefaults(normalized, profile.Defaults)
+	freezeBackbone, freezeOK := capabilityValueAtPath(normalized, "freeze_backbone")
+	fineTuneStrategy := strings.ToLower(strings.TrimSpace(capabilityString(normalized, "fine_tune_strategy")))
+	if (freezeOK && freezeBackbone == false) || fineTuneStrategy == "full" {
+		appendImplicitCanonicalFinding(report, spec, normalized, "freeze_backbone")
+		appendImplicitCanonicalFinding(report, spec, normalized, "fine_tune_strategy")
+	}
+	if capabilityBool(normalized, "preprocessing.use_dataset_normalization") {
+		appendImplicitCanonicalFinding(report, spec, normalized, "preprocessing.normalization")
+	}
+}
+
+func appendImplicitCanonicalFinding(report *ExecutionValidationReport, spec ExecutionSpecV1, normalized map[string]any, path string) {
+	if reportHasFinding(*report, path) {
+		return
+	}
+	requested, requestedOK := capabilityValueAtPath(normalized, path)
+	accepted, acceptedOK := capabilityValueAtPath(spec.AcceptedConfig, path)
+	if !requestedOK || !acceptedOK || capabilityValuesEqual(requested, accepted) {
+		return
+	}
+	report.Findings = append(report.Findings, normalizedFinding(spec, path, requested, accepted))
+}
+
+func reportHasFinding(report ExecutionValidationReport, path string) bool {
+	for _, finding := range report.Findings {
+		if finding.Field == path {
+			return true
+		}
+	}
+	return false
+}
+
+func capabilityBool(config map[string]any, path string) bool {
+	value, ok := capabilityValueAtPath(config, path)
+	if !ok {
+		return false
+	}
+	boolValue, _ := value.(bool)
+	return boolValue
+}
 func blockedFinding(path, classification, reasonCode string, requested, accepted any, alternative string) ExecutionValidationFinding {
 	return ExecutionValidationFinding{
 		Field: path, Classification: classification, ReasonCode: reasonCode,

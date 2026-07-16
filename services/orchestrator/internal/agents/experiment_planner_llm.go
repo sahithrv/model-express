@@ -646,13 +646,22 @@ type PlannerStrategyScorecard struct {
 	RealizedMechanismIdentity string         `json:"realized_mechanism_identity,omitempty"`
 }
 
+type PlannerValidationFieldFinding struct {
+	Field                string `json:"field"`
+	RequestedValue       any    `json:"requested_value,omitempty"`
+	AcceptedValue        any    `json:"accepted_value,omitempty"`
+	ReasonCode           string `json:"reason_code,omitempty"`
+	SuggestedAlternative string `json:"suggested_alternative,omitempty"`
+}
+
 type PlannerValidationFeedback struct {
-	Attempt             int      `json:"attempt"`
-	ValidationError     string   `json:"validation_error"`
-	RejectedDecision    string   `json:"rejected_decision,omitempty"`
-	RejectedModels      []string `json:"rejected_models,omitempty"`
-	RejectedExperiments []string `json:"rejected_experiments,omitempty"`
-	Instructions        []string `json:"instructions"`
+	Attempt             int                             `json:"attempt"`
+	ValidationError     string                          `json:"validation_error"`
+	RejectedDecision    string                          `json:"rejected_decision,omitempty"`
+	RejectedModels      []string                        `json:"rejected_models,omitempty"`
+	RejectedExperiments []string                        `json:"rejected_experiments,omitempty"`
+	FieldFindings       []PlannerValidationFieldFinding `json:"field_findings,omitempty"`
+	Instructions        []string                        `json:"instructions"`
 }
 
 type ExperimentChampion struct {

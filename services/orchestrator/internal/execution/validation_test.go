@@ -120,6 +120,70 @@ func TestExecutionValidationNormalizationIsNonBlocking(t *testing.T) {
 	}
 }
 
+func TestExecutionValidationReportsClassificationSemanticCanonicalization(t *testing.T) {
+	cases := []struct {
+		name           string
+		requested      map[string]any
+		field          string
+		reason         string
+		requestedValue any
+		acceptedValue  any
+	}{
+		{
+			name: "full fine-tuning freezes false",
+			requested: map[string]any{
+				"template": "resnet_transfer", "model": "resnet18", "epochs": 8,
+				"batch_size": 16, "learning_rate": 0.001, "image_size": 224,
+				"freeze_backbone": true, "fine_tune_strategy": "full",
+			},
+			field: "freeze_backbone", reason: "classification_transfer_semantics_canonicalized",
+			requestedValue: true, acceptedValue: false,
+		},
+		{
+			name: "unfrozen backbone implies full strategy",
+			requested: map[string]any{
+				"template": "resnet_transfer", "model": "resnet18", "epochs": 8,
+				"batch_size": 16, "learning_rate": 0.001, "image_size": 224,
+				"freeze_backbone": false, "fine_tune_strategy": "head_only",
+			},
+			field: "fine_tune_strategy", reason: "classification_transfer_semantics_canonicalized",
+			requestedValue: "head_only", acceptedValue: "full",
+		},
+		{
+			name: "dataset normalization owns normalization value",
+			requested: map[string]any{
+				"template": "resnet_transfer", "model": "resnet18", "epochs": 8,
+				"batch_size": 16, "learning_rate": 0.001, "image_size": 224,
+				"preprocessing": map[string]any{"normalization": "imagenet", "use_dataset_normalization": true},
+			},
+			field: "preprocessing.normalization", reason: "classification_dataset_normalization_canonicalized",
+			requestedValue: "imagenet", acceptedValue: "dataset",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := execution.BuildExecutionSpecV1("image_classification", "modal_torchvision", tc.requested, tc.requested)
+			if err != nil {
+				t.Fatalf("build spec: %v", err)
+			}
+			report, err := execution.ValidateExecutionSpecV1(spec, "resnet", execution.ValidationModeEnforce)
+			if err != nil {
+				t.Fatalf("validate spec: %v", err)
+			}
+			if report.WouldBlock {
+				t.Fatalf("safe semantic canonicalization should not block: %#v", report)
+			}
+			finding, ok := validationFindingByReason(report, tc.field, tc.reason)
+			if !ok {
+				t.Fatalf("missing semantic canonicalization finding for %s: %#v", tc.field, report.Findings)
+			}
+			if finding.ReasonCode != tc.reason || finding.RequestedValue != tc.requestedValue || finding.AcceptedValue != tc.acceptedValue || finding.SuggestedAlternative == "" {
+				t.Fatalf("unexpected semantic finding: %#v", finding)
+			}
+		})
+	}
+}
+
 func TestPlannerCapabilityCardIsTaskAndRunnerScoped(t *testing.T) {
 	card, err := execution.BuildPlannerCapabilityCard(
 		"object_detection", "modal_ultralytics", execution.ValidationModeShadow, []string{"yolo11"},
@@ -136,6 +200,15 @@ func TestPlannerCapabilityCardIsTaskAndRunnerScoped(t *testing.T) {
 	if containsCapabilityField(card.ExecutedFields, "dropout") {
 		t.Fatalf("detection card exposed classification-only dropout as executed: %#v", card.ExecutedFields)
 	}
+}
+
+func validationFindingByReason(report execution.ExecutionValidationReport, field string, reasonCode string) (execution.ExecutionValidationFinding, bool) {
+	for _, finding := range report.Findings {
+		if finding.Field == field && finding.ReasonCode == reasonCode {
+			return finding, true
+		}
+	}
+	return execution.ExecutionValidationFinding{}, false
 }
 
 func validationFinding(report execution.ExecutionValidationReport, field string) (execution.ExecutionValidationFinding, bool) {

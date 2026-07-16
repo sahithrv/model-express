@@ -122,16 +122,6 @@ func plannerValueIsEmpty(value any) bool {
 		return true
 	case map[string]any:
 		return plannerMapHasOnlyEmptyValues(typed)
-	case bool:
-		return !typed
-	case int:
-		return typed == 0
-	case int64:
-		return typed == 0
-	case float64:
-		return typed == 0
-	case float32:
-		return typed == 0
 	default:
 		return false
 	}

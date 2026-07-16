@@ -45,3 +45,51 @@ func TestExperimentPlannerJSONDecodePreservesExplicitFalseAndZero(t *testing.T) 
 		}
 	}
 }
+
+func TestExperimentPlannerNormalizerPreservesExplicitFalseAndZero(t *testing.T) {
+	raw := []byte(`{
+		"proposed_experiments":[{
+			"template":"resnet_transfer",
+			"model":"resnet18",
+			"epochs":8,
+			"batch_size":16,
+			"learning_rate":0.001,
+			"reason":"LLM normalizer presence test",
+			"optimizer":"sgd",
+			"scheduler":"step",
+			"optimizer_momentum":0,
+			"scheduler_step_size":0,
+			"scheduler_gamma":0,
+			"pretrained":false,
+			"freeze_backbone":false,
+			"preprocessing":{"use_dataset_normalization":false},
+			"augmentation_policy_config":{
+				"policy_type":"mixup",
+				"probability":0,
+				"alpha":0
+			}
+		}]
+	}`)
+	recommendation, _, err := decodeExperimentPlannerRecommendation(raw)
+	if err != nil {
+		t.Fatalf("decode planner recommendation: %v", err)
+	}
+	if len(recommendation.ProposedExperiments) != 1 {
+		t.Fatalf("expected one proposed experiment, got %#v", recommendation)
+	}
+	experiment := recommendation.ProposedExperiments[0]
+	for _, field := range []string{
+		"optimizer_momentum",
+		"scheduler_step_size",
+		"scheduler_gamma",
+		"pretrained",
+		"freeze_backbone",
+		"preprocessing.use_dataset_normalization",
+		"augmentation_policy_config.probability",
+		"augmentation_policy_config.alpha",
+	} {
+		if !experiment.IsFieldPresent(field) {
+			t.Fatalf("planner normalizer lost presence for %s", field)
+		}
+	}
+}
