@@ -391,6 +391,7 @@ func TestGenerateJSONWithToolsParsesFunctionCallsAndSendsPreviousResponseID(t *t
 	previousResponseIDSent := false
 	toolOutputSent := false
 	toolDeclared := false
+	structuredSchemaRequests := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -403,6 +404,11 @@ func TestGenerateJSONWithToolsParsesFunctionCallsAndSendsPreviousResponseID(t *t
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode request body: %v", err)
+		}
+		if textConfig, ok := body["text"].(map[string]any); ok {
+			if format, ok := textConfig["format"].(map[string]any); ok && format["type"] == "json_schema" && format["name"] == "strict_test" {
+				structuredSchemaRequests++
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -479,8 +485,9 @@ func TestGenerateJSONWithToolsParsesFunctionCallsAndSendsPreviousResponseID(t *t
 
 	result, err := client.GenerateJSONWithTools(context.Background(), ToolLoopRequest{
 		JSONRequest: JSONRequest{
-			Temperature: 0.2,
-			Messages:    []Message{{Role: "user", Content: "Need a dataset profile."}},
+			Temperature:    0.2,
+			Messages:       []Message{{Role: "user", Content: "Need a dataset profile."}},
+			ResponseSchema: strictTestResponseSchema(),
 		},
 		Tools: []ToolDefinition{
 			{
@@ -549,6 +556,9 @@ func TestGenerateJSONWithToolsParsesFunctionCallsAndSendsPreviousResponseID(t *t
 	if !toolOutputSent {
 		t.Fatalf("expected function_call_output input on second request")
 	}
+	if structuredSchemaRequests != 2 {
+		t.Fatalf("expected structured output schema on both tool-loop requests, got %d", structuredSchemaRequests)
+	}
 }
 
 func TestUnsupportedProvidersIgnoreResponsesStyleAndUseChat(t *testing.T) {
@@ -590,5 +600,115 @@ func TestUnsupportedProvidersIgnoreResponsesStyleAndUseChat(t *testing.T) {
 				t.Fatalf("expected chat path, got %q", seenPath)
 			}
 		})
+	}
+}
+
+func TestGenerateJSONWithUsageSendsChatStructuredOutputSchema(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("expected chat completions path, got %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		format, ok := body["response_format"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected response_format, got %#v", body["response_format"])
+		}
+		if format["type"] != "json_schema" {
+			t.Fatalf("expected json_schema response format, got %#v", format)
+		}
+		schema, ok := format["json_schema"].(map[string]any)
+		if !ok || schema["name"] != "strict_test" || schema["strict"] != true {
+			t.Fatalf("unexpected chat json_schema payload: %#v", format["json_schema"])
+		}
+		bodySchema, ok := schema["schema"].(map[string]any)
+		if !ok || bodySchema["type"] != "object" || bodySchema["additionalProperties"] != false {
+			t.Fatalf("unexpected nested schema: %#v", schema["schema"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"{\"ok\":true}"}}]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Enabled:  true,
+		Provider: ProviderOpenAI,
+		BaseURL:  server.URL,
+		APIKey:   "test-key",
+		Model:    "test-model",
+		APIStyle: APIStyleChatCompletions,
+	})
+	result, err := client.GenerateJSONWithUsage(context.Background(), JSONRequest{
+		Messages:       []Message{{Role: "user", Content: "Return JSON."}},
+		ResponseSchema: strictTestResponseSchema(),
+	})
+	if err != nil {
+		t.Fatalf("GenerateJSONWithUsage returned error: %v", err)
+	}
+	if string(result.RawJSON) != `{"ok":true}` {
+		t.Fatalf("expected structured JSON content, got %s", result.RawJSON)
+	}
+}
+
+func TestGenerateJSONWithUsageSendsResponsesStructuredOutputSchema(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected responses path, got %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		textConfig, ok := body["text"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected text config, got %#v", body["text"])
+		}
+		format, ok := textConfig["format"].(map[string]any)
+		if !ok || format["type"] != "json_schema" || format["name"] != "strict_test" || format["strict"] != true {
+			t.Fatalf("unexpected responses text.format payload: %#v", textConfig["format"])
+		}
+		bodySchema, ok := format["schema"].(map[string]any)
+		if !ok || bodySchema["type"] != "object" || bodySchema["additionalProperties"] != false {
+			t.Fatalf("unexpected nested schema: %#v", format["schema"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"resp_schema","output":[{"type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Enabled:  true,
+		Provider: ProviderOpenAI,
+		BaseURL:  server.URL,
+		APIKey:   "test-key",
+		Model:    "test-model",
+		APIStyle: APIStyleResponses,
+	})
+	result, err := client.GenerateJSONWithUsage(context.Background(), JSONRequest{
+		Messages:       []Message{{Role: "user", Content: "Return JSON."}},
+		ResponseSchema: strictTestResponseSchema(),
+	})
+	if err != nil {
+		t.Fatalf("GenerateJSONWithUsage returned error: %v", err)
+	}
+	if string(result.RawJSON) != `{"ok":true}` {
+		t.Fatalf("expected structured JSON content, got %s", result.RawJSON)
+	}
+}
+
+func strictTestResponseSchema() *JSONSchemaFormat {
+	return &JSONSchemaFormat{
+		Name:   "strict_test",
+		Strict: true,
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"ok": map[string]any{"type": "boolean"},
+			},
+			"required":             []string{"ok"},
+			"additionalProperties": false,
+		},
 	}
 }

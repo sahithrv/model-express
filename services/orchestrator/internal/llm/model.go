@@ -61,6 +61,13 @@ type JSONRequest struct {
 	Temperature        float64
 	ReasoningEffort    string
 	PreviousResponseID string
+	ResponseSchema     *JSONSchemaFormat
+}
+
+type JSONSchemaFormat struct {
+	Name   string
+	Strict bool
+	Schema map[string]any
 }
 
 type Usage struct {

@@ -1122,14 +1122,33 @@ func normalizePlannerRejectedOptions(root map[string]any, normalizations *[]stri
 	if !ok {
 		return
 	}
+	normalized := make([]any, 0, len(items))
+	changed := false
 	for index, item := range items {
+		path := fmt.Sprintf("rejected_options[%d]", index)
 		option, ok := item.(map[string]any)
 		if !ok {
-			continue
+			text, _, valid := plannerCoercedString(item)
+			text = strings.TrimSpace(text)
+			if !valid || text == "" {
+				changed = true
+				continue
+			}
+			option = map[string]any{
+				"option":       text,
+				"reason":       "Rejected by planner.",
+				"evidence":     text,
+				"applies_when": []string{},
+			}
+			changed = true
+			*normalizations = append(*normalizations, path+" scalar converted to rejected option object")
 		}
-		path := fmt.Sprintf("rejected_options[%d]", index)
 		normalizePlannerStringFields(option, normalizations, path, []string{"option", "reason", "evidence"})
 		normalizePlannerStringSliceFields(option, normalizations, path, []string{"applies_when"})
+		normalized = append(normalized, option)
+	}
+	if changed {
+		root["rejected_options"] = normalized
 	}
 }
 
@@ -1183,6 +1202,7 @@ func normalizePlannerProposedChanges(candidate map[string]any, normalizations *[
 	}
 	switch typed := value.(type) {
 	case map[string]any:
+		prunePlannerEmptyProposedChanges(typed, normalizations, path+".proposed_changes")
 		return
 	case []any:
 		changes := map[string]any{}
@@ -1207,6 +1227,7 @@ func normalizePlannerProposedChanges(candidate map[string]any, normalizations *[
 				}
 			}
 		}
+		prunePlannerEmptyProposedChanges(changes, normalizations, path+".proposed_changes")
 		candidate["proposed_changes"] = changes
 		*normalizations = append(*normalizations, path+".proposed_changes array converted to object")
 	}
@@ -1249,6 +1270,19 @@ func normalizePlannerForecastRange(forecast map[string]any, normalizations *[]st
 	switch typed := value.(type) {
 	case map[string]any:
 		normalizePlannerFloatFields(typed, normalizations, path+".valid_range", []string{"min", "max"})
+	case []any:
+		if len(typed) < 2 {
+			forecast["valid_range"] = map[string]any{"min": 0, "max": 1}
+			*normalizations = append(*normalizations, path+".valid_range short array converted to default object")
+			return
+		}
+		min, _, minOK := plannerCoercedFloat(typed[0])
+		max, _, maxOK := plannerCoercedFloat(typed[1])
+		if !minOK || !maxOK || min >= max {
+			min, max = 0, 1
+		}
+		forecast["valid_range"] = map[string]any{"min": min, "max": max}
+		*normalizations = append(*normalizations, path+".valid_range array converted to object")
 	case string:
 		min, max, parsed := parsePlannerRangeString(typed)
 		if !parsed {
@@ -1314,6 +1348,7 @@ func normalizePlannerExperiment(experiment map[string]any, normalizations *[]str
 	if config, ok := experiment["class_balancing_config"].(map[string]any); ok {
 		normalizePlannerFloatFields(config, normalizations, path+".class_balancing_config", []string{"effective_number_beta", "focal_loss_gamma"})
 	}
+	prunePlannerEmptyExperimentFields(experiment, normalizations, path)
 }
 
 func normalizePlannerStringFields(root map[string]any, normalizations *[]string, path string, fields []string) {
@@ -1418,6 +1453,8 @@ func plannerCoercedString(value any) (string, bool, bool) {
 		return strconv.Itoa(typed), true, true
 	case json.Number:
 		return typed.String(), true, true
+	case map[string]any:
+		return compactJSON(typed), true, true
 	default:
 		return "", false, false
 	}
@@ -1429,6 +1466,7 @@ func plannerCoercedStringSlice(value any) ([]string, bool, bool) {
 		return nonEmptyStrings(typed), false, true
 	case []any:
 		out := []string{}
+		changed := false
 		for _, item := range typed {
 			switch value := item.(type) {
 			case string:
@@ -1438,10 +1476,23 @@ func plannerCoercedStringSlice(value any) ([]string, bool, bool) {
 			case map[string]any:
 				if compact := compactJSON(value); compact != "" && compact != "{}" {
 					out = append(out, compact)
+					changed = true
 				}
+			case bool:
+				out = append(out, strconv.FormatBool(value))
+				changed = true
+			case float64:
+				out = append(out, strconv.FormatFloat(value, 'f', -1, 64))
+				changed = true
+			case int:
+				out = append(out, strconv.Itoa(value))
+				changed = true
+			case json.Number:
+				out = append(out, value.String())
+				changed = true
 			}
 		}
-		return out, false, true
+		return out, changed, true
 	case string:
 		trimmed := strings.TrimSpace(typed)
 		if trimmed == "" {
@@ -1617,8 +1668,9 @@ func experimentPlannerJSONRequestForStaticPromptVersion(model string, contextBlo
 		return experimentPlannerJSONRequestCompact(model, contextBlob)
 	}
 	return llm.JSONRequest{
-		Model:       model,
-		Temperature: 0.35,
+		Model:          model,
+		Temperature:    0.35,
+		ResponseSchema: experimentPlannerStructuredOutputSchema(),
 		Messages: []llm.Message{
 			{
 				Role: "system",
@@ -1934,6 +1986,7 @@ func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.J
 
 	outputContract := strings.TrimSpace(strings.Join([]string{
 		"Return JSON with these required top-level keys: summary, decision_type, rationale, confidence, planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, primary_mechanism, governor_compliance, expected_failure_modes, dataset_preprocessing_rationale, changed_variables, success_criteria, stop_condition, deployment_tradeoff, candidate_hypotheses, proposed_experiments, proposal_mechanisms, champion_job_id, why_can_beat_champion, expected_delta_vs_champion, stop_reason, risks, expected_tradeoffs, novelty_notes, rejected_options, tags.",
+		"Structured output schema is enforced: prose fields such as dataset_preprocessing_rationale, success_criteria, and stop_condition must be strings; rejected_options must be objects; forecast.valid_range must be an object with numeric min and max.",
 		"ADD_EXPERIMENTS also requires candidate_hypotheses[] items with hypothesis, planning_mode, mechanism, intervention, proposed_changes, expected_effect, expected_metric_impact, forecast, expected_tradeoffs, risk, cost_level, novelty_score, evidence_used, similar_success_memory_ids, similar_failure_memory_ids, and experiment_config.",
 		"Each forecast must freeze forecast_target, metric_direction, score_basis, score_version, baseline_job_id, baseline_score, predicted_delta, prediction_source, units, and valid_range from planner_context_snapshot.champion_card. predicted_delta must exactly equal expected_metric_impact and prediction_source must be candidate.expected_metric_impact; do not use recommendation-level expected_delta_vs_champion as a candidate forecast.",
 		"experiment_config must still be backend-valid and include template, model, epochs, batch_size, learning_rate, and any other supported knobs only when evidence justifies them.",
@@ -1942,8 +1995,9 @@ func experimentPlannerJSONRequestCompact(model string, contextBlob []byte) llm.J
 	}, " "))
 
 	return llm.JSONRequest{
-		Model:       model,
-		Temperature: 0.35,
+		Model:          model,
+		Temperature:    0.35,
+		ResponseSchema: experimentPlannerStructuredOutputSchema(),
 		Messages: []llm.Message{
 			{
 				Role:    "system",

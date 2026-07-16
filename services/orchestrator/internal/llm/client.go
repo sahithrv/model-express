@@ -55,6 +55,7 @@ func (c OpenAICompatibleClient) GenerateJSONWithUsage(ctx context.Context, req J
 			Temperature:        req.Temperature,
 			ReasoningEffort:    req.ReasoningEffort,
 			PreviousResponseID: req.PreviousResponseID,
+			ResponseSchema:     req.ResponseSchema,
 		})
 		if err != nil {
 			return JSONResult{}, err
@@ -103,6 +104,7 @@ func (c OpenAICompatibleClient) GenerateJSONWithTools(ctx context.Context, req T
 			temperature:        req.Temperature,
 			reasoningEffort:    firstNonEmpty(req.ReasoningEffort, c.config.ReasoningEffort),
 			previousResponseID: previousResponseID,
+			responseSchema:     req.ResponseSchema,
 			tools:              req.Tools,
 			store:              c.config.StoredResponses,
 		})
@@ -167,9 +169,10 @@ func (c OpenAICompatibleClient) GenerateJSONWithTools(ctx context.Context, req T
 func (c OpenAICompatibleClient) CreateResponse(ctx context.Context, req ResponseRequest) (ResponseResult, error) {
 	if !c.useResponses() {
 		raw, usage, err := c.generateChatJSONWithUsage(ctx, JSONRequest{
-			Model:       req.Model,
-			Messages:    req.Messages,
-			Temperature: req.Temperature,
+			Model:          req.Model,
+			Messages:       req.Messages,
+			Temperature:    req.Temperature,
+			ResponseSchema: req.ResponseSchema,
 		})
 		return ResponseResult{FinalJSON: raw, Text: string(raw), Usage: usage}, err
 	}
@@ -190,6 +193,7 @@ func (c OpenAICompatibleClient) CreateResponse(ctx context.Context, req Response
 		temperature:        req.Temperature,
 		reasoningEffort:    firstNonEmpty(req.ReasoningEffort, c.config.ReasoningEffort),
 		previousResponseID: req.PreviousResponseID,
+		responseSchema:     req.ResponseSchema,
 		tools:              req.Tools,
 		store:              store,
 	})
@@ -226,6 +230,10 @@ func (c OpenAICompatibleClient) generateChatJSONWithUsage(ctx context.Context, r
 		Model:       model,
 		Messages:    req.Messages,
 		Temperature: req.Temperature,
+	}
+
+	if req.ResponseSchema != nil {
+		body.ResponseFormat = chatResponseFormatFromSchema(req.ResponseSchema)
 	}
 
 	encoded, err := json.Marshal(body)
@@ -279,6 +287,9 @@ func (c OpenAICompatibleClient) postResponse(ctx context.Context, call responses
 		PreviousResponseID: call.previousResponseID,
 		Store:              &call.store,
 		Tools:              responseToolDefinitions(call.tools),
+	}
+	if call.responseSchema != nil {
+		body.Text = responsesTextConfigFromSchema(call.responseSchema)
 	}
 	if call.reasoningEffort != "" {
 		body.Reasoning = &responsesReasoning{Effort: call.reasoningEffort}
@@ -443,10 +454,64 @@ func (c OpenAICompatibleClient) useResponses() bool {
 	return EffectiveAPIStyle(c.config.Provider, c.config.APIStyle) == APIStyleResponses
 }
 
+func chatResponseFormatFromSchema(schema *JSONSchemaFormat) *chatResponseFormat {
+	if schema == nil {
+		return nil
+	}
+	return &chatResponseFormat{
+		Type: "json_schema",
+		JSONSchema: jsonSchemaPayload{
+			Name:   schemaFormatName(schema),
+			Strict: schema.Strict,
+			Schema: schemaFormatBody(schema),
+		},
+	}
+}
+
+func responsesTextConfigFromSchema(schema *JSONSchemaFormat) *responsesTextConfig {
+	if schema == nil {
+		return nil
+	}
+	return &responsesTextConfig{
+		Format: responsesTextFormat{
+			Type:   "json_schema",
+			Name:   schemaFormatName(schema),
+			Strict: schema.Strict,
+			Schema: schemaFormatBody(schema),
+		},
+	}
+}
+
+func schemaFormatName(schema *JSONSchemaFormat) string {
+	if schema == nil || strings.TrimSpace(schema.Name) == "" {
+		return "json_response"
+	}
+	return strings.TrimSpace(schema.Name)
+}
+
+func schemaFormatBody(schema *JSONSchemaFormat) map[string]any {
+	if schema == nil || schema.Schema == nil {
+		return map[string]any{"type": "object", "additionalProperties": false}
+	}
+	return schema.Schema
+}
+
 type chatCompletionRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
+	Model          string              `json:"model"`
+	Messages       []Message           `json:"messages"`
+	Temperature    float64             `json:"temperature"`
+	ResponseFormat *chatResponseFormat `json:"response_format,omitempty"`
+}
+
+type chatResponseFormat struct {
+	Type       string            `json:"type"`
+	JSONSchema jsonSchemaPayload `json:"json_schema"`
+}
+
+type jsonSchemaPayload struct {
+	Name   string         `json:"name"`
+	Strict bool           `json:"strict"`
+	Schema map[string]any `json:"schema"`
 }
 
 type chatCompletionResponse struct {
@@ -478,6 +543,7 @@ type ResponseRequest struct {
 	Temperature        float64
 	ReasoningEffort    string
 	PreviousResponseID string
+	ResponseSchema     *JSONSchemaFormat
 	Tools              []ToolDefinition
 	ToolOutputs        []ToolResult
 	Store              *bool
@@ -558,6 +624,7 @@ type responsesCall struct {
 	temperature        float64
 	reasoningEffort    string
 	previousResponseID string
+	responseSchema     *JSONSchemaFormat
 	tools              []ToolDefinition
 	store              bool
 }
@@ -569,6 +636,18 @@ type responsesRequest struct {
 	Store              *bool                     `json:"store,omitempty"`
 	Reasoning          *responsesReasoning       `json:"reasoning,omitempty"`
 	Tools              []responsesToolDefinition `json:"tools,omitempty"`
+	Text               *responsesTextConfig      `json:"text,omitempty"`
+}
+
+type responsesTextConfig struct {
+	Format responsesTextFormat `json:"format"`
+}
+
+type responsesTextFormat struct {
+	Type   string         `json:"type"`
+	Name   string         `json:"name"`
+	Strict bool           `json:"strict"`
+	Schema map[string]any `json:"schema"`
 }
 
 type responsesReasoning struct {

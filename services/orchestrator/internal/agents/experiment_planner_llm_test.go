@@ -30,7 +30,10 @@ func TestDecodeExperimentPlannerRecommendationNormalizesCommonShapeErrors(t *tes
 		t.Fatalf("decode recommendation map: %v", err)
 	}
 	root["success_criteria"] = []any{"macro-F1 improves", "latency stays acceptable"}
+	root["dataset_preprocessing_rationale"] = map[string]any{"summary": "preserve aspect ratio and use class balancing", "evidence": []any{"minority recall is weak"}}
+	root["stop_condition"] = map[string]any{"condition": "stop after two no-improvement rounds", "threshold": 2}
 	root["deterministic_diagnosis_used"] = true
+	root["rejected_options"] = []any{"Same model with two more epochs"}
 
 	candidates := root["candidate_hypotheses"].([]any)
 	candidate := candidates[0].(map[string]any)
@@ -44,7 +47,7 @@ func TestDecodeExperimentPlannerRecommendationNormalizesCommonShapeErrors(t *tes
 		"predicted_delta":   0.02,
 		"prediction_source": 0.02,
 		"units":             "score points",
-		"valid_range":       "[0,1]",
+		"valid_range":       []any{0, 1},
 	}
 	experiment := candidate["experiment_config"].(map[string]any)
 	experiment["epochs"] = "12"
@@ -63,6 +66,15 @@ func TestDecodeExperimentPlannerRecommendationNormalizesCommonShapeErrors(t *tes
 	}
 	if len(normalized.DeterministicDiagnosisUsed) != 1 || normalized.DeterministicDiagnosisUsed[0] != "true" {
 		t.Fatalf("boolean deterministic_diagnosis_used should normalize to a scalar-preserving string array, got %#v", normalized.DeterministicDiagnosisUsed)
+	}
+	if !strings.Contains(normalized.DatasetPreprocessingRationale, "preserve aspect ratio") {
+		t.Fatalf("dataset_preprocessing_rationale object should normalize to string, got %q", normalized.DatasetPreprocessingRationale)
+	}
+	if !strings.Contains(normalized.StopCondition, "no-improvement") {
+		t.Fatalf("stop_condition object should normalize to string, got %q", normalized.StopCondition)
+	}
+	if len(normalized.RejectedOptions) != 1 || normalized.RejectedOptions[0].Option != "Same model with two more epochs" {
+		t.Fatalf("scalar rejected_options should normalize to objects, got %#v", normalized.RejectedOptions)
 	}
 	first := normalized.CandidateHypotheses[0]
 	if first.ProposedChanges["class_balancing"] != "weighted_loss" || first.ProposedChanges["image_size"] != "256" {
@@ -88,6 +100,41 @@ func TestDecodeExperimentPlannerRecommendationNormalizesCommonShapeErrors(t *tes
 	}
 	if len(normalizations) == 0 {
 		t.Fatal("expected normalization telemetry")
+	}
+}
+
+func TestExperimentPlannerRequestUsesStrictStructuredOutputSchema(t *testing.T) {
+	request := experimentPlannerJSONRequestForStaticPromptVersion("test-model", []byte(`{"planner_context_snapshot":{}}`), plannerStaticPromptVersionCompactV1)
+	if request.ResponseSchema == nil {
+		t.Fatal("expected planner request to include a structured output schema")
+	}
+	if request.ResponseSchema.Name != "experiment_planning_recommendation" || !request.ResponseSchema.Strict {
+		t.Fatalf("unexpected planner schema identity: %#v", request.ResponseSchema)
+	}
+	properties, ok := request.ResponseSchema.Schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected top-level schema properties, got %#v", request.ResponseSchema.Schema["properties"])
+	}
+	if got := properties["dataset_preprocessing_rationale"].(map[string]any)["type"]; got != "string" {
+		t.Fatalf("dataset_preprocessing_rationale schema type = %#v, want string", got)
+	}
+	if got := properties["stop_condition"].(map[string]any)["type"]; got != "string" {
+		t.Fatalf("stop_condition schema type = %#v, want string", got)
+	}
+	rejectedItems := properties["rejected_options"].(map[string]any)["items"].(map[string]any)
+	if rejectedItems["type"] != "object" {
+		t.Fatalf("rejected_options items should be objects, got %#v", rejectedItems)
+	}
+	candidateItems := properties["candidate_hypotheses"].(map[string]any)["items"].(map[string]any)
+	candidateProperties := candidateItems["properties"].(map[string]any)
+	forecastProperties := candidateProperties["forecast"].(map[string]any)["properties"].(map[string]any)
+	validRange := forecastProperties["valid_range"].(map[string]any)
+	if validRange["type"] != "object" {
+		t.Fatalf("forecast.valid_range should be an object, got %#v", validRange)
+	}
+	proposedExperiments := properties["proposed_experiments"].(map[string]any)
+	if proposedExperiments["type"] != "array" {
+		t.Fatalf("proposed_experiments should remain an array for multi-experiment plans, got %#v", proposedExperiments)
 	}
 }
 
