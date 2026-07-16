@@ -1017,6 +1017,33 @@ func TestExperimentPlannerRejectsProposalWithoutMechanismExpectations(t *testing
 	}
 }
 
+func TestExperimentPlannerFinalizationBackfillsChampionChallengeRationale(t *testing.T) {
+	input := testExperimentPlannerInput()
+	recommendation := validExperimentPlannerRecommendationForMode("champion_challenge")
+	recommendation.WhyCanBeatChampion = ""
+	recommendation.ExpectedTradeoffs = nil
+	recommendation.CandidateHypotheses[0].ExperimentConfig.Reason = "Test a stronger family."
+	recommendation.CandidateHypotheses[0].ExperimentConfig.Strategy = ""
+	recommendation.CandidateHypotheses[1].ExperimentConfig.Reason = "Keep a compact control."
+	recommendation.CandidateHypotheses[1].ExperimentConfig.Strategy = ""
+
+	finalized, _, err := FinalizeAndValidatePlannerRecommendationWithMode(input, recommendation, plannervalidation.ModeStrict)
+	if err != nil {
+		t.Fatalf("expected finalization to backfill champion challenge rationale, got %v", err)
+	}
+	if strings.TrimSpace(finalized.WhyCanBeatChampion) == "" {
+		t.Fatalf("expected why_can_beat_champion to be backfilled")
+	}
+	if len(nonEmptyStrings(finalized.ExpectedTradeoffs)) == 0 {
+		t.Fatalf("expected expected_tradeoffs to be backfilled")
+	}
+	for index, experiment := range finalized.ProposedExperiments {
+		text := strings.ToLower(strings.TrimSpace(experiment.Reason + " " + experiment.Strategy))
+		if !containsAnyText(text, "champion", "beat", "challenge", "tradeoff", "improve") {
+			t.Fatalf("experiment %d did not get champion challenge rationale: %#v", index, experiment)
+		}
+	}
+}
 func TestExperimentPlannerPromptContextIncludesDatasetAndStrategyMemory(t *testing.T) {
 	input := testExperimentPlannerInput()
 	input.Dataset = datasets.Dataset{

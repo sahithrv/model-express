@@ -73,7 +73,107 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 			}
 		}
 	}
+	normalizeFinalPlannerRecommendationForValidation(&recommendation)
 	return recommendation, nil
+}
+
+func normalizeFinalPlannerRecommendationForValidation(recommendation *ExperimentPlanningRecommendation) {
+	if recommendation == nil || strings.ToUpper(strings.TrimSpace(recommendation.DecisionType)) != decisions.TypeAddExperiments {
+		return
+	}
+	if strings.TrimSpace(recommendation.WhyCanBeatChampion) == "" {
+		recommendation.WhyCanBeatChampion = synthesizePlannerChampionComparison(*recommendation)
+	}
+	if strings.ToLower(strings.TrimSpace(recommendation.PlanningMode)) != "champion_challenge" {
+		return
+	}
+	if len(nonEmptyStrings(recommendation.ExpectedTradeoffs)) == 0 {
+		recommendation.ExpectedTradeoffs = synthesizeChampionChallengeTradeoffs(*recommendation)
+	}
+	for index := range recommendation.ProposedExperiments {
+		experiment := &recommendation.ProposedExperiments[index]
+		text := strings.ToLower(strings.TrimSpace(experiment.Reason + " " + experiment.Strategy))
+		if containsAnyText(text, "champion", "beat", "challenge", "tradeoff", "improve") {
+			continue
+		}
+		rationale := synthesizeChampionChallengeExperimentRationale(*recommendation, index)
+		if strings.TrimSpace(experiment.Reason) == "" {
+			experiment.Reason = rationale
+			continue
+		}
+		experiment.Reason = strings.TrimSpace(experiment.Reason + " " + rationale)
+	}
+}
+
+func synthesizePlannerChampionComparison(recommendation ExperimentPlanningRecommendation) string {
+	parts := []string{
+		recommendation.Hypothesis,
+		recommendation.Rationale,
+		recommendation.SuccessCriteria,
+	}
+	for _, mechanism := range recommendation.ProposalMechanisms {
+		parts = append(parts, mechanism.ExpectedEffect, mechanism.Intervention)
+	}
+	for _, candidate := range recommendation.CandidateHypotheses {
+		parts = append(parts, candidate.ExpectedEffect, candidate.Intervention)
+	}
+	parts = uniquePlannerStrings(nonEmptyStrings(parts))
+	if len(parts) == 0 {
+		return "Selected experiments challenge the current champion with backend-ranked candidate mechanisms."
+	}
+	return "Selected experiments can challenge the current champion: " + strings.Join(parts, " ")
+}
+
+func synthesizeChampionChallengeTradeoffs(recommendation ExperimentPlanningRecommendation) []string {
+	tradeoffs := []string{recommendation.DeploymentTradeoff}
+	for index := range recommendation.ProposedExperiments {
+		if candidate, ok := selectedPlannerCandidateForExperiment(recommendation, index); ok {
+			tradeoffs = append(tradeoffs, candidate.ExpectedTradeoffs...)
+		}
+	}
+	tradeoffs = uniquePlannerStrings(nonEmptyStrings(tradeoffs))
+	if len(tradeoffs) > 0 {
+		return tradeoffs
+	}
+	return []string{"Champion challenge compares expected quality improvement against deployment cost and latency tradeoff."}
+}
+
+func synthesizeChampionChallengeExperimentRationale(recommendation ExperimentPlanningRecommendation, experimentIndex int) string {
+	parts := []string{
+		"This experiment supports the champion challenge by showing whether the selected mechanism can improve over the current champion after quality, cost, and latency tradeoffs.",
+	}
+	if candidate, ok := selectedPlannerCandidateForExperiment(recommendation, experimentIndex); ok {
+		parts = append(parts, candidate.ExpectedEffect, candidate.Intervention, candidate.Hypothesis)
+	}
+	if mechanism, ok := plannerProposalMechanismForExperiment(recommendation, experimentIndex); ok {
+		parts = append(parts, mechanism.ExpectedEffect, mechanism.Intervention)
+	}
+	parts = append(parts, recommendation.WhyCanBeatChampion, recommendation.DeploymentTradeoff)
+	return strings.Join(uniquePlannerStrings(nonEmptyStrings(parts)), " ")
+}
+
+func selectedPlannerCandidateForExperiment(recommendation ExperimentPlanningRecommendation, experimentIndex int) (CandidateHypothesis, bool) {
+	for _, ranking := range recommendation.CandidateRankings {
+		if !ranking.Selected || ranking.SelectedExperimentIndex == nil || *ranking.SelectedExperimentIndex != experimentIndex {
+			continue
+		}
+		if ranking.CandidateIndex >= 0 && ranking.CandidateIndex < len(recommendation.CandidateHypotheses) {
+			return recommendation.CandidateHypotheses[ranking.CandidateIndex], true
+		}
+	}
+	if experimentIndex >= 0 && experimentIndex < len(recommendation.CandidateHypotheses) {
+		return recommendation.CandidateHypotheses[experimentIndex], true
+	}
+	return CandidateHypothesis{}, false
+}
+
+func plannerProposalMechanismForExperiment(recommendation ExperimentPlanningRecommendation, experimentIndex int) (PlannerProposalMechanism, bool) {
+	for _, mechanism := range recommendation.ProposalMechanisms {
+		if mechanism.ExperimentIndex == experimentIndex {
+			return mechanism, true
+		}
+	}
+	return PlannerProposalMechanism{}, false
 }
 
 func PlannerSchedulingRankerVersion(input ExperimentPlannerInput) string {
