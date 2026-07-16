@@ -823,6 +823,7 @@ Start with `.env.v1.cloud.example`. These are the settings most users should und
 | `MODEL_EXPRESS_DEFAULT_TRAINING_PROVIDER` | `modal` | Uses Modal workers by default. |
 | `MODEL_EXPRESS_EXECUTION_PROFILE` | `fast-remote` | Cloud-oriented execution profile. |
 | `MODEL_EXPRESS_EXECUTION_VALIDATION_MODE` | `enforce` | Rejects unsupported task/runner settings before GPU scheduling and requires finalized eligible realization evidence before successful real-training completion. Set this single switch to `shadow` for the one-release compatibility rollback; stored execution records are not rewritten. |
+| `MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES` | `2` | Requests up to two candidate-specific repair/replacement attempts after the initial planner response. Overrides are capped at three retries; accepted candidates are retained while open slots are repaired. |
 | `MODEL_EXPRESS_LEGACY_EXECUTION_EVIDENCE_POLICY` | `allow` | Controls historical jobs without versioned execution records: `allow` keeps them eligible but marks them `UNVERIFIED`; `visible_only` keeps them readable while excluding them from planner learning and automatic champion selection. Versioned `MISMATCH` and `SIMULATED` runs are always ineligible. |
 | `MODEL_EXPRESS_DEFAULT_GPU_TYPE` | `T4` | Conservative first GPU choice. |
 | `MODEL_EXPRESS_MODAL_DEFAULT_GPU_TYPE` | `T4` | Modal default GPU choice. |

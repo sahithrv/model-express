@@ -126,6 +126,14 @@ type ExperimentPlannerInput struct {
 	ExecutionCapabilityCard      execution.PlannerCapabilityCard
 	ExecutionEnforcementFeedback []execution.EnforcementFeedback
 	ExecutionEvidence            []ExperimentExecutionEvidence
+	// CandidateExecutionValidator applies the backend's task, policy, duplicate,
+	// and execution-fidelity contract before ranking. It may repair incidental
+	// fields and rejects only the affected candidate.
+	CandidateExecutionValidator PlannerCandidateExecutionValidator `json:"-"`
+	CandidatePrevalidation      map[int]PlannerCandidateValidationResult
+	RetainedCandidates          []CandidateHypothesis
+	OpenReplacementSlots        int
+	PlannerRetryAttempt         int
 	// RankerMultiFidelityEnabled snapshots the ranker switch for a traced
 	// invocation. Nil preserves the existing environment-based behavior for
 	// direct deterministic finalizer callers.
@@ -647,11 +655,36 @@ type PlannerStrategyScorecard struct {
 }
 
 type PlannerValidationFieldFinding struct {
-	Field                string `json:"field"`
-	RequestedValue       any    `json:"requested_value,omitempty"`
-	AcceptedValue        any    `json:"accepted_value,omitempty"`
-	ReasonCode           string `json:"reason_code,omitempty"`
-	SuggestedAlternative string `json:"suggested_alternative,omitempty"`
+	CandidateIndex       int            `json:"candidate_index"`
+	ExperimentIndex      *int           `json:"experiment_index,omitempty"`
+	CandidateModel       string         `json:"candidate_model,omitempty"`
+	CandidateMechanism   string         `json:"candidate_mechanism,omitempty"`
+	ValidationStage      string         `json:"validation_stage,omitempty"`
+	Disposition          string         `json:"disposition,omitempty"`
+	Field                string         `json:"field"`
+	Classification       string         `json:"classification,omitempty"`
+	RequestedValue       any            `json:"requested_value,omitempty"`
+	AcceptedValue        any            `json:"accepted_value,omitempty"`
+	Removed              bool           `json:"removed,omitempty"`
+	Normalized           bool           `json:"normalized,omitempty"`
+	Incidental           bool           `json:"incidental,omitempty"`
+	CentralToMechanism   bool           `json:"central_to_mechanism,omitempty"`
+	ReasonCode           string         `json:"reason_code,omitempty"`
+	Reason               string         `json:"reason,omitempty"`
+	MatchingAcceptedSpec string         `json:"matching_accepted_spec,omitempty"`
+	MatchingJobID        string         `json:"matching_job_id,omitempty"`
+	SupportedValues      []string       `json:"supported_values,omitempty"`
+	Prerequisites        []string       `json:"prerequisites,omitempty"`
+	SuggestedPatch       map[string]any `json:"suggested_configuration_patch,omitempty"`
+	SuggestedAlternative string         `json:"suggested_alternative,omitempty"`
+	Action               string         `json:"action,omitempty"`
+}
+
+type PlannerAcceptedCandidate struct {
+	CandidateIndex int                     `json:"candidate_index"`
+	Model          string                  `json:"model"`
+	Mechanism      string                  `json:"mechanism"`
+	Experiment     plans.PlannedExperiment `json:"experiment_config"`
 }
 
 type PlannerValidationFeedback struct {
@@ -661,7 +694,24 @@ type PlannerValidationFeedback struct {
 	RejectedModels      []string                        `json:"rejected_models,omitempty"`
 	RejectedExperiments []string                        `json:"rejected_experiments,omitempty"`
 	FieldFindings       []PlannerValidationFieldFinding `json:"field_findings,omitempty"`
+	AcceptedCandidates  []PlannerAcceptedCandidate      `json:"accepted_candidates_to_preserve,omitempty"`
+	OpenSlots           int                             `json:"open_slots_remaining,omitempty"`
+	ActiveTask          string                          `json:"active_task,omitempty"`
+	ActiveRunner        string                          `json:"active_runner,omitempty"`
+	CapabilitySubset    map[string]any                  `json:"capability_subset,omitempty"`
 	Instructions        []string                        `json:"instructions"`
+}
+
+type PlannerCandidateExecutionValidator func(CandidateHypothesis, int) PlannerCandidateValidationResult
+
+type PlannerCandidateValidationResult struct {
+	Experiment    plans.PlannedExperiment
+	Disposition   string
+	Stage         string
+	ReasonCode    string
+	Reason        string
+	Normalized    bool
+	FieldFindings []PlannerValidationFieldFinding
 }
 
 type ExperimentChampion struct {
@@ -760,6 +810,7 @@ type ExperimentPlanningRecommendation struct {
 	CandidateRankingsV2           []CandidateRanking         `json:"candidate_rankings_v2,omitempty"`
 	CandidateSelectionTraceV2     []CandidateSelectionRound  `json:"candidate_selection_trace_v2,omitempty"`
 	RankerShadowComparison        *RankerShadowComparison    `json:"ranker_shadow_comparison,omitempty"`
+	AcceptanceFunnel              PlannerAcceptanceFunnel    `json:"acceptance_funnel,omitempty"`
 	ProposedExperiments           []plans.PlannedExperiment  `json:"proposed_experiments"`
 	ProposalMechanisms            []PlannerProposalMechanism `json:"proposal_mechanisms"`
 	ChampionJobID                 string                     `json:"champion_job_id"`
@@ -835,9 +886,47 @@ type CandidateRanking struct {
 	StopReason              string                              `json:"stop_reason,omitempty"`
 	Selected                bool                                `json:"selected"`
 	Rejected                bool                                `json:"rejected"`
+	Disposition             string                              `json:"disposition"`
 	Reasons                 []string                            `json:"reasons"`
 	ExperimentSignature     string                              `json:"experiment_signature"`
 	PolicyFindings          []policies.Finding                  `json:"policy_findings,omitempty"`
+	ValidationFindings      []PlannerValidationFieldFinding     `json:"validation_findings,omitempty"`
+}
+
+const (
+	PlannerCandidateAccepted                   = "accepted"
+	PlannerCandidateAcceptedAfterNormalization = "accepted_after_normalization"
+	PlannerCandidateRejectedDuplicate          = "rejected_duplicate"
+	PlannerCandidateRejectedPolicy             = "rejected_policy"
+	PlannerCandidateRejectedFidelity           = "rejected_fidelity"
+	PlannerCandidateRejectedInvalid            = "rejected_invalid"
+	PlannerCandidateUnselectedByRank           = "unselected_by_rank"
+)
+
+type PlannerCandidateDisposition struct {
+	CandidateIndex int      `json:"candidate_index"`
+	Model          string   `json:"model,omitempty"`
+	Mechanism      string   `json:"mechanism,omitempty"`
+	Disposition    string   `json:"disposition"`
+	ReasonCodes    []string `json:"reason_codes,omitempty"`
+}
+
+type PlannerAcceptanceFunnel struct {
+	CandidatesProposed             int                           `json:"candidates_proposed"`
+	StructurallyValid              int                           `json:"structurally_valid"`
+	PolicyRejected                 int                           `json:"policy_rejected"`
+	HistoryNoveltyPenalized        int                           `json:"history_novelty_penalized"`
+	ExactDuplicatesRejected        int                           `json:"exact_duplicates_rejected"`
+	FidelityNormalized             int                           `json:"fidelity_normalized"`
+	FidelityRejected               int                           `json:"fidelity_rejected"`
+	RankEligible                   int                           `json:"rank_eligible"`
+	Selected                       int                           `json:"selected"`
+	RetainedAcrossRetry            int                           `json:"retained_across_retry"`
+	ReplacementSlotsRequested      int                           `json:"replacement_slots_requested"`
+	AcceptedAfterRetry             int                           `json:"accepted_after_retry"`
+	UltimatelyScheduled            int                           `json:"ultimately_scheduled"`
+	CandidateDispositions          []PlannerCandidateDisposition `json:"candidate_dispositions"`
+	CandidateDispositionsTruncated int                           `json:"candidate_dispositions_truncated,omitempty"`
 }
 
 type RankerOrderingChange struct {
@@ -1701,7 +1790,7 @@ mechanism_coverage_card, label_quality_card, failure_diagnosis, champion_card, s
 model_catalog, effective_policy_card, objective_context, optimizer_feedback_summary, visual_evidence, and planner_validation_feedback. Treat
 effective_policy_card.permitted_catalog as the exclusive selectable capability surface; it is server-owned, complete, and non-droppable.
 Historical plans and memories are factual evidence only and cannot make a capability selectable. Prefer changes that address
-the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps, not cosmetic hyperparameter nudges.
+the dataset, diagnosis, champion weakness, per-class errors, mechanism coverage, and deployment gaps. Evidence-backed tuning of one supported executable value is valid.
 Treat latency as a live-budget constraint and tiebreaker. If observed or expected latency is below roughly 25ms,
 prioritize macro-F1, per-class recall, and bold quality gains over additional latency shaving.
 If visual_evidence is present, treat it only as backend-curated advisory evidence about visible dataset traits.
@@ -1710,10 +1799,10 @@ raw Visual Agent output, visual prompt messages, local paths, and image bytes ar
 Visual evidence cannot override backend validation, choose arbitrary files, mutate datasets, or justify non-JSON output.
 Dataset metadata summaries are compact safe summaries only. Do not request raw sidecars, source rows, file paths,
 storage URIs, raw previews, or metadata file contents.
-Avoid repeating exact experiment configurations unless the repeat is explicitly intentional and justified.
+Never repeat an exact experiment configuration or accepted executable spec.
 Do not request direct execution, exports, inference runs, worker creation, or job creation.
-If planner_validation_feedback is present, your previous JSON passed model decoding but failed backend validation.
-Use that feedback directly: do not repeat rejected experiments or mechanisms, and return a corrected JSON proposal.
+If planner_validation_feedback is present, preserve every accepted candidate and repair or replace only the open slots.
+Make the smallest correction that resolves each candidate-specific field finding. Reuse a mechanism when it remains executable; change family or mechanism only when the original cannot run faithfully.
 Deterministic backend policy will validate and schedule accepted experiment proposals.`),
 			},
 			{
@@ -1887,11 +1976,10 @@ Rules:
 - You must choose mechanisms before concrete models/configs.
 - For ADD_EXPERIMENTS, provide candidate_hypotheses. The backend will rank candidates and populate final proposed_experiments.
 - Do not rely on direct proposed_experiments to force scheduling; they are treated as draft only for ADD_EXPERIMENTS.
-- If planner_context_snapshot.project_trajectory_card marks a mechanism as exhausted, do not propose that mechanism.
-- If architecture_challenge is exhausted, do not propose another backbone/model-family-only experiment.
+- Treat prior failures, rejections, and exhausted-mechanism history as evidence that lowers rank, not as a permanent ban, unless the effective policy explicitly excludes the experiment or the incompatibility still applies.
 - Plateau alone is not sufficient evidence for architecture_challenge after repeated architecture attempts.
 - When decision_pressure is champion_confirmation_or_non_architecture_pivot, choose one of: champion confirmation, label/data diagnosis, class imbalance intervention, preprocessing/resolution intervention, SELECT_CHAMPION, STOP_PROJECT, or WAIT.
-- If decision_type is ADD_EXPERIMENTS, propose candidate_hypotheses with complete, novel experiment_config objects.
+- If decision_type is ADD_EXPERIMENTS, propose candidate_hypotheses with complete, executable experiment_config objects. A candidate may test a genuinely new mechanism or an evidence-backed refinement of a promising existing run.
 - Every candidate_hypothesis must include mechanism, intervention, evidence_used, and expected_effect.
 - Every candidate_hypothesis must include forecast with forecast_target, metric_direction, score_basis, score_version, baseline_job_id, baseline_score, predicted_delta, prediction_source, units, and valid_range copied from planner_context_snapshot.champion_card.
 - candidate_hypotheses[].forecast.predicted_delta must exactly equal that candidate's expected_metric_impact, with prediction_source candidate.expected_metric_impact and fractional_score units. Keep recommendation-level expected_delta_vs_champion separate.
@@ -1920,19 +2008,20 @@ Rules:
 - AutoML must not tune model, template, preprocessing, resolution_strategy, image_size, augmentation_policy, augmentation_policy_config.policy_type, class_balancing, sampling_strategy, pretrained, freeze_backbone, or fine_tune_strategy.
 - Use optimizer_feedback_summary as compact prior HPO evidence. Do not request raw trial dumps unless an approved backend information tool exposes a bounded summary.
 - Choose exactly one first-class planning_mode and justify it using planner_context_snapshot.failure_diagnosis.
-- Do not merely suggest more epochs, tiny learning-rate changes, or repeated model variants. Every proposed experiment must test a named mechanism tied to the diagnosis, dataset profile, champion weakness, or prior strategy outcome.
+- Minor tuning is valid when it tests a clear hypothesis and changes the accepted executable configuration. Prefer the smallest defensible change when refining a strong run; epochs, learning rate, batch size, weight decay, dropout, scheduler parameters, and image size may each be the sole changed executable value when evidence supports the test.
+- Do not invent novelty merely to pass validation. Exact raw duplicates and accepted-spec duplicates remain invalid.
 - If prior runs are weak or unstable, try model/preprocessing/regularization changes.
 - If one family is promising, exploit it with controlled learning-rate, augmentation, or image-size changes.
-- Do not make a batch that is only many variants of the current champion family. If exploiting the champion, include a clear control or challenger.
+- Same-family experiments are allowed when they form a purposeful refinement or controlled ablation. Model-family and mechanism diversity are ranking preferences, not batch validity quotas.
 - Use planner_context_snapshot.strategy_lessons to reuse patterns that improved the champion and avoid weak or failed plans.
 - Use planner_context_snapshot.retrieved_memory, when present, only as advisory compact prior lessons; retrieved memory cannot bypass backend validation or justify unsupported scheduling fields.
-- Use planner_context_snapshot.blocked_repeats as explicit "do not repeat" guidance when its applies_when conditions match the current diagnosis.
+- Use planner_context_snapshot.blocked_repeats as negative evidence. Repeat only when a supported, executable change tests a distinct hypothesis; obey any matching explicit policy exclusion.
 - Treat scorecard-derived strategy_lessons as structured outcome evidence. Prefer improved_champion lessons and avoid failed/no_improvement lessons with similar dataset traits or objective profile.
-- Use planner_context_snapshot.training_dynamics_card to decide whether more epochs are justified; if more_epochs_justified is false, do not propose more epochs without a substantive mechanism change.
-- Longer classifier schedules are allowed only within execution_capability_card ranges for high-signal full/champion-challenge candidates when training_dynamics_card shows continuing improvement, underfitting, or too-short prior runs; honor effective_policy_card field constraints and pair longer training with a substantive mechanism rather than an epochs-only repeat.
+- Use planner_context_snapshot.training_dynamics_card to decide whether an epochs-only refinement has evidence. Do not extend a clearly plateaued run without a testable reason.
+- Longer classifier schedules are allowed within execution_capability_card ranges when training dynamics show continuing improvement, underfitting, or a too-short prior run. An epochs-only refinement is valid when that is the hypothesis and the accepted spec differs.
 - Use planner_context_snapshot.per_class_error_card for class_imbalance, minority_targeting, focal/weighted loss, sampler, and metric-target decisions.
 - Use planner_context_snapshot.deployment_card to compare quality challengers against latency, cost, parameter count, throughput, and objective weights before proposing heavy models.
-- Use planner_context_snapshot.mechanism_coverage_card to avoid tried/blocked/failed mechanisms and to prefer eligible mechanisms with diagnosis support.
+- Use planner_context_snapshot.mechanism_coverage_card as ranking evidence. Prefer supported mechanisms, but allow bounded refinements of promising tried mechanisms unless policy or current incompatibility blocks them.
 - Use planner_context_snapshot.backend_validation_gated_methods as proposal-only method guidance. These cards are not experiments and have no scheduling authority; convert one into a proposed_experiment only when you supply every required concrete field and cite backend-verifiable evidence.
 - Use planner_context_snapshot.label_quality_card only to recommend label_noise_audit or hard_example_audit as report-only work with template label_quality_audit; never mutate labels or turn audit mechanisms into training jobs.
 - Use planner_context_snapshot.objective_context and dataset_card to decide resolution_strategy, preprocessing, augmentation_policy, augmentation_policy_config, sampling_strategy, class balancing/loss, model family, metrics, and deployment tradeoffs.
@@ -1947,16 +2036,17 @@ Rules:
 - For paid autonomous loops, avoid batches whose best expected delta is only 0.005-0.01 unless they are cheap controls; include a higher-upside mechanism with a credible path to beat the champion.
 - Compare every proposal against planner_context_snapshot.champion_card.current, source_plan_baseline, and source_plan_run_deltas.
 - Only use ADD_EXPERIMENTS when you can explain a concrete path to beat the current champion.
-- A valid ADD_EXPERIMENTS response needs a planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, expected_failure_modes, dataset_preprocessing_rationale, success_criteria, stop_condition, deployment_tradeoff, rejected_options, proposal_mechanisms, and at least two changed_variables.
+- A valid ADD_EXPERIMENTS response needs a planning_mode, deterministic_diagnosis_used, evidence_used, hypothesis, expected_failure_modes, dataset_preprocessing_rationale, success_criteria, stop_condition, deployment_tradeoff, rejected_options, proposal_mechanisms, and at least one real changed_variable.
 - Good: if minority recall is weak, test a permitted class-balancing or sampling mechanism and target macro-F1/minority recall.
 - In class_imbalance_ablation mode, at least one proposed experiment must use a class-balancing or sampling strategy. Control or architecture-challenge experiments in the same batch may omit class balancing if their proposal_mechanisms entry is not class_imbalance or minority_targeting.
 - Good: if overfitting is high, test stronger augmentation_policy, regularization, smaller model, or less aggressive fine-tuning.
 - Good: if underfitting is high, test a larger pretrained model or fuller fine-tuning.
 - Good: if the champion is low latency but weak on fine-grained classes, challenge with a permitted quality model at a justified image size and compare deployment tradeoff.
 - Good: if validation improvement has stalled, pivot to a substantive untried mechanism instead of running low-value repeats.
-- Bad: same model, 2 more epochs, tiny learning-rate change.
+- Good: a single supported learning-rate or epoch change around a strong run when evidence states the expected effect and the accepted executable spec changes.
 - Bad: model-family shopping with no mechanism-specific evidence.
-- Bad: repeating the same mechanism with only epochs, learning rate, or batch size changed.
+- Bad: an exact executable duplicate, an unsupported setting presented as tested, or a tuning change with no evidence-backed hypothesis.
+- When planner_validation_feedback is present, preserve accepted_candidates_to_preserve, fill only open_slots_remaining, resolve every blocking finding by candidate and field, and make the smallest valid correction. Do not regenerate working candidates for novelty.
 - If stop_signals say the project has repeated no-improvement follow-up rounds, treat that as evidence to pivot mechanisms. Do not select a champion or stop solely because a monitored iteration streak has not improved yet.
 - Set champion_job_id when selecting a champion or when a champion anchors your recommendation.
 - Set why_can_beat_champion for ADD_EXPERIMENTS; set stop_reason for SELECT_CHAMPION or STOP_PROJECT.
@@ -2124,7 +2214,6 @@ func validateExperimentPlanningRecommendationWithMode(recommendation ExperimentP
 }
 
 func plannerRecommendationStrictChecks(recommendation ExperimentPlanningRecommendation) []plannervalidation.Check {
-	changedVariables := nonEmptyStrings(recommendation.ChangedVariables)
 	return []plannervalidation.Check{
 		plannerStrictCheck("missing_deterministic_diagnosis", plannervalidation.CategoryMissingEvidence, func() error {
 			if len(nonEmptyStrings(recommendation.DeterministicDiagnosisUsed)) == 0 {
@@ -2156,15 +2245,9 @@ func plannerRecommendationStrictChecks(recommendation ExperimentPlanningRecommen
 			}
 			return nil
 		}),
-		plannerStrictCheck("insufficient_changed_variables", plannervalidation.CategoryProposalNoOp, func() error {
-			if len(changedVariables) < 2 {
-				return fmt.Errorf("experiment planner ADD_EXPERIMENTS needs at least two changed_variables")
-			}
-			return nil
-		}),
-		plannerStrictCheck("minor_only_changed_variables", plannervalidation.CategoryProposalNoOp, func() error {
-			if onlyMinorChangedVariables(changedVariables) {
-				return fmt.Errorf("experiment planner ADD_EXPERIMENTS changed_variables are only minor tuning knobs")
+		plannerStrictCheck("missing_changed_variables", plannervalidation.CategoryProposalNoOp, func() error {
+			if len(nonEmptyStrings(recommendation.ChangedVariables)) == 0 {
+				return fmt.Errorf("experiment planner ADD_EXPERIMENTS needs at least one changed_variable")
 			}
 			return nil
 		}),
@@ -2208,9 +2291,6 @@ func plannerRecommendationStrictChecks(recommendation ExperimentPlanningRecommen
 		}),
 		plannerStrictCheck("proposal_mechanism_contract", plannervalidation.CategoryMechanismMismatch, func() error {
 			return validatePlannerProposalMechanisms(recommendation.ProposedExperiments, recommendation.ProposalMechanisms)
-		}),
-		plannerStrictCheck("proposal_diversity", plannervalidation.CategoryProposalNoOp, func() error {
-			return validatePlannerExperimentDiversity(recommendation.ProposedExperiments)
 		}),
 		plannerStrictCheck("planning_mode_rules", plannervalidation.CategoryMechanismMismatch, func() error {
 			return validatePlanningModeRules(recommendation)
@@ -2427,33 +2507,14 @@ func uniquePlannerStrings(values []string) []string {
 }
 
 func onlyMinorChangedVariables(values []string) bool {
-	minor := map[string]bool{
-		"epoch":         true,
-		"epochs":        true,
-		"learning_rate": true,
-		"lr":            true,
-		"batch_size":    true,
-	}
-	for _, value := range values {
-		normalized := strings.ToLower(strings.TrimSpace(value))
-		if !minor[normalized] {
-			return false
-		}
-	}
-	return true
+	// Executable tuning fields are scientifically meaningful when they test an
+	// evidence-backed hypothesis. Exact duplicate detection is the no-op gate.
+	return false
 }
 
 func validatePlannerExperimentDiversity(experiments []plans.PlannedExperiment) error {
-	if len(experiments) < 3 {
-		return nil
-	}
-	models := map[string]bool{}
-	for _, experiment := range experiments {
-		models[strings.ToLower(strings.TrimSpace(experiment.Model))] = true
-	}
-	if len(models) == 1 {
-		return fmt.Errorf("experiment planner ADD_EXPERIMENTS over-focuses on one model; include a challenger or control experiment")
-	}
+	// Diversity is expressed by the selection score adjustment. It is never a
+	// batch-invalidating quota.
 	return nil
 }
 

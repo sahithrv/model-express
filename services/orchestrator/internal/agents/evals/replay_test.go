@@ -317,7 +317,7 @@ func TestReplayRetrievalFailedMechanismPenaltyMetrics(t *testing.T) {
 	}
 }
 
-func TestReplayRetrievalRejectedOptionBlocksRepeat(t *testing.T) {
+func TestReplayRetrievalRejectedOptionPenalizesRepeat(t *testing.T) {
 	fixture := loadPlateauFixture(t)
 	input := ExperimentPlannerInputFromReplayFixture(fixture)
 	input.RetrievedMemory = []memory.MemoryRetrievalResult{
@@ -326,11 +326,11 @@ func TestReplayRetrievalRejectedOptionBlocksRepeat(t *testing.T) {
 	recommendation := plateauAddRecommendation([]agents.CandidateHypothesis{plateauClassImbalanceCandidate()})
 
 	scores := ScorePlannerRecommendation(input, recommendation, fixture.Expected)
-	if scores.BackendValidationPassed {
-		t.Fatalf("expected rejected retrieved option to fail backend replay scoring, got %#v", scores)
+	if !scores.BackendValidationPassed {
+		t.Fatalf("expected rejected retrieved option to remain ranking evidence rather than a permanent ban, got %#v", scores)
 	}
-	if scores.RejectedCandidateMemoryPenalty >= 0 {
-		t.Fatalf("expected rejected candidate memory penalty, got %#v", scores)
+	if scores.SelectedCandidateMemoryScore >= 0 {
+		t.Fatalf("expected selected repeat to retain a negative memory penalty, got %#v", scores)
 	}
 	if scores.RetrievalHitSourceMix[memory.SourceAgentMemoryRecord] != 1 {
 		t.Fatalf("expected agent memory source mix, got %#v", scores.RetrievalHitSourceMix)

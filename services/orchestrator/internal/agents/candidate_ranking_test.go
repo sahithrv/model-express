@@ -106,6 +106,57 @@ func TestSelectPlannerCandidateIndexesHonorsMaxAndEligibility(t *testing.T) {
 	}
 }
 
+func TestRankPlannerCandidateHypothesesSelectsFiveOfTwelveViableCandidates(t *testing.T) {
+	input := ExperimentPlannerInput{MaxExperiments: 5, NoImprovementRounds: 4, StopSignals: []string{"high decision pressure"}}
+	candidates := make([]CandidateHypothesis, 0, 12)
+	for index := 0; index < 12; index++ {
+		candidate := rankingCandidate("mobilenet_v3_small", 0.012+float64(index)/1000)
+		candidate.ExperimentConfig.LearningRate = 0.0001 + float64(index)*0.00001
+		candidate.ProposedChanges = map[string]any{"learning_rate": candidate.ExperimentConfig.LearningRate}
+		candidate.Intervention = "Tune one supported learning-rate value around the strong MobileNet run."
+		candidates = append(candidates, candidate)
+	}
+
+	rankings, selected, _, _ := rankPlannerCandidateHypotheses(input, candidates, effectiveMaxPlannerExperiments(input))
+	if len(selected) != 5 {
+		t.Fatalf("12 viable candidates should fill the configured five slots, got %d", len(selected))
+	}
+	dispositions := map[string]int{}
+	for _, ranking := range rankings {
+		dispositions[ranking.Disposition]++
+	}
+	if dispositions[PlannerCandidateAccepted] != 5 || dispositions[PlannerCandidateUnselectedByRank] != 7 {
+		t.Fatalf("every candidate should have a stable selected/unselected disposition: %#v", dispositions)
+	}
+}
+
+func TestEffectiveMaxPlannerExperimentsIgnoresNoveltyDecisionPressure(t *testing.T) {
+	input := ExperimentPlannerInput{MaxExperiments: 5, NoImprovementRounds: 9, StopSignals: []string{"select final champion", "mechanisms exhausted"}}
+	if got := effectiveMaxPlannerExperiments(input); got != 5 {
+		t.Fatalf("decision pressure reduced configured experiment capacity: got %d want 5", got)
+	}
+}
+
+func TestRankPlannerCandidateHypothesesBackfillsCandidateLevelRejection(t *testing.T) {
+	input := ExperimentPlannerInput{MaxExperiments: 5, CandidatePrevalidation: map[int]PlannerCandidateValidationResult{
+		0: {Experiment: rankingCandidate("mobilenet_v2", 0.03).ExperimentConfig, Disposition: PlannerCandidateRejectedFidelity, Reason: "unsupported core field"},
+	}}
+	candidates := make([]CandidateHypothesis, 0, 6)
+	for index := 0; index < 6; index++ {
+		candidate := rankingCandidate("mobilenet_v3_small", 0.03-float64(index)/1000)
+		candidate.ExperimentConfig.LearningRate += float64(index) * 0.00001
+		candidates = append(candidates, candidate)
+	}
+
+	rankings, selected, _, _ := rankPlannerCandidateHypotheses(input, candidates, 5)
+	if len(selected) != 5 {
+		t.Fatalf("expected unselected viable candidate to backfill rejected selected candidate, got %d", len(selected))
+	}
+	if rankings[0].Disposition != PlannerCandidateRejectedFidelity || rankings[0].Selected {
+		t.Fatalf("invalid candidate disposition was not retained: %#v", rankings[0])
+	}
+}
+
 func TestSelectPlannerCandidateIndexesTraceIsBoundedAndDeterministic(t *testing.T) {
 	models := []string{"mobilenet_v1", "mobilenet_v2", "mobilenet_v3_small", "mobilenet_v3_large", "efficientnet_b0", "resnet18", "convnext_tiny", "swin_tiny"}
 	scores := []float64{0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92, 0.91}

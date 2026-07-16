@@ -157,3 +157,78 @@ func TestPlannerAugmentationPolicyConfigFieldActiveDocumentsFidelityMatrix(t *te
 		}
 	}
 }
+
+func TestPlannerCandidateExecutionValidatorRemovesUnsupportedIncidentalField(t *testing.T) {
+	card, err := execution.BuildPlannerCapabilityCard("image_classification", "modal_torchvision", execution.ValidationModeEnforce, []string{"resnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	experiment := testExperiment("resnet18", 8)
+	experiment.ResolutionStrategy = "low_latency"
+	experiment.MarkFieldPresent("resolution_strategy")
+	candidate := agents.CandidateHypothesis{
+		Hypothesis: "A lower supported learning rate may stabilize the strong run.", Mechanism: "optimizer_scheduler",
+		Intervention: "Change learning rate only.", ExpectedEffect: "Improve convergence stability.",
+		ProposedChanges: map[string]any{"learning_rate": experiment.LearningRate}, ExperimentConfig: experiment,
+	}
+	validator := plannerCandidateExecutionValidator(agents.ExperimentPlannerInput{ExecutionCapabilityCard: card})
+	result := validator(candidate, 0)
+	if result.Disposition != agents.PlannerCandidateAcceptedAfterNormalization || result.Experiment.IsFieldPresent("resolution_strategy") {
+		t.Fatalf("incidental unsupported field should be removed while retaining the candidate: %#v", result)
+	}
+	if len(result.FieldFindings) == 0 || !result.FieldFindings[0].Removed || !result.FieldFindings[0].Incidental {
+		t.Fatalf("normalization did not record requested/accepted field semantics: %#v", result.FieldFindings)
+	}
+}
+
+func TestPlannerCandidateExecutionValidatorRejectsUnsupportedCoreMechanism(t *testing.T) {
+	card, err := execution.BuildPlannerCapabilityCard("image_classification", "modal_torchvision", execution.ValidationModeEnforce, []string{"resnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	experiment := testExperiment("resnet18", 8)
+	experiment.ResolutionStrategy = "low_latency"
+	experiment.MarkFieldPresent("resolution_strategy")
+	candidate := agents.CandidateHypothesis{
+		Hypothesis: "The low-latency resolution strategy is the intervention.", Mechanism: "resolution_crop",
+		Intervention: "Test resolution_strategy=low_latency.", ExpectedEffect: "Reduce latency through the requested resolution strategy.",
+		ProposedChanges: map[string]any{"resolution_strategy": "low_latency"}, ExperimentConfig: experiment,
+	}
+	result := plannerCandidateExecutionValidator(agents.ExperimentPlannerInput{ExecutionCapabilityCard: card})(candidate, 0)
+	if result.Disposition != agents.PlannerCandidateRejectedFidelity || result.ReasonCode != "unsupported_core_mechanism" {
+		t.Fatalf("removing the claimed core mechanism must reject only that candidate: %#v", result)
+	}
+	if len(result.FieldFindings) == 0 || !result.FieldFindings[0].CentralToMechanism {
+		t.Fatalf("core-field finding was not explicit: %#v", result.FieldFindings)
+	}
+}
+
+func TestPlannerCandidateExecutionValidatorRecordsInactiveConditionalRepair(t *testing.T) {
+	card, err := execution.BuildPlannerCapabilityCard("image_classification", "modal_torchvision", execution.ValidationModeEnforce, []string{"resnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	experiment := testExperiment("resnet18", 8)
+	experiment.Optimizer = "adamw"
+	experiment.OptimizerMomentum = 0.8
+	experiment.MarkFieldPresent("optimizer")
+	experiment.MarkFieldPresent("optimizer_momentum")
+	candidate := agents.CandidateHypothesis{
+		Hypothesis: "Test the existing AdamW configuration.", Mechanism: "optimizer_scheduler",
+		Intervention: "Retain AdamW and change learning rate.", ExpectedEffect: "Improve convergence.",
+		ProposedChanges: map[string]any{"learning_rate": experiment.LearningRate}, ExperimentConfig: experiment,
+	}
+	result := plannerCandidateExecutionValidator(agents.ExperimentPlannerInput{ExecutionCapabilityCard: card})(candidate, 3)
+	if result.Disposition != agents.PlannerCandidateAcceptedAfterNormalization || result.Experiment.IsFieldPresent("optimizer_momentum") {
+		t.Fatalf("inactive conditional field was not repaired: %#v", result)
+	}
+	found := false
+	for _, finding := range result.FieldFindings {
+		if finding.Field == "optimizer_momentum" && finding.RequestedValue == 0.8 && finding.Removed && finding.CandidateIndex == 3 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("repair finding omitted candidate, field, requested value, or removal: %#v", result.FieldFindings)
+	}
+}

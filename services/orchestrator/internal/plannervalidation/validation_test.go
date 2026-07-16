@@ -85,7 +85,7 @@ func TestModeFromEnvironmentDefaultsStrictWithObservableOneSwitchRollback(t *tes
 
 func TestStrictRolloutThresholdsAllowBoundedRetriesButRejectEscapes(t *testing.T) {
 	thresholds := DefaultStrictRolloutThresholds()
-	if thresholds.MaximumRetriesPerAttemptGroup != 1 || thresholds.MaximumUnsafeSchedules != 0 || thresholds.MaximumPostValidationEscapes != 0 {
+	if thresholds.MaximumRetriesPerAttemptGroup != 2 || thresholds.MaximumUnsafeSchedules != 0 || thresholds.MaximumPostValidationEscapes != 0 {
 		t.Fatalf("unsafe strict thresholds: %#v", thresholds)
 	}
 	bounded := StrictRolloutObservation{

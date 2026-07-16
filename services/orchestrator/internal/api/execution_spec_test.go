@@ -323,12 +323,15 @@ func TestPlannerEnforcementErrorCarriesActionableAlternative(t *testing.T) {
 	if finding.Field != "resolution_strategy" || finding.RequestedValue != "low_latency" || finding.ReasonCode != "runner_does_not_consume" || !strings.Contains(finding.SuggestedAlternative, "omit resolution_strategy") {
 		t.Fatalf("unexpected planner field finding: %#v", finding)
 	}
+	if finding.CandidateIndex != 0 || finding.ExperimentIndex == nil || *finding.ExperimentIndex != 0 || finding.CandidateModel != "resnet18" || finding.ValidationStage != "execution_fidelity" || finding.Action != "repair" || finding.SuggestedPatch["remove"] != "resolution_strategy" {
+		t.Fatalf("planner feedback did not identify the exact candidate, stage, field, and correction: %#v", finding)
+	}
 }
 
 func TestPlannerBackendValidationRetryLimitIsEnvConfigurableAndBounded(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "")
-	if got := plannerBackendValidationRetryLimit(); got != 1 {
-		t.Fatalf("default retry limit = %d, want 1", got)
+	if got := plannerBackendValidationRetryLimit(); got != 2 {
+		t.Fatalf("default retry limit = %d, want 2", got)
 	}
 	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "3")
 	if got := plannerBackendValidationRetryLimit(); got != 3 {
@@ -339,8 +342,8 @@ func TestPlannerBackendValidationRetryLimitIsEnvConfigurableAndBounded(t *testin
 		t.Fatalf("bounded retry limit = %d, want 3", got)
 	}
 	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "-1")
-	if got := plannerBackendValidationRetryLimit(); got != 1 {
-		t.Fatalf("invalid retry limit = %d, want default 1", got)
+	if got := plannerBackendValidationRetryLimit(); got != 2 {
+		t.Fatalf("invalid retry limit = %d, want default 2", got)
 	}
 }
 

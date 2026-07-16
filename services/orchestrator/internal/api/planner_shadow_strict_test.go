@@ -201,6 +201,7 @@ func TestPlannerValidationAttemptOutcomePersistsRetryAttribution(t *testing.T) {
 func TestShadowStrictPlannerRunPersistsWouldBlockWithoutBlockingRelaxedDecision(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_PLANNER_VALIDATION_MODE", plannervalidation.ModeShadowStrict)
 	t.Setenv("MODEL_EXPRESS_EXECUTION_VALIDATION_MODE", execution.ValidationModeShadow)
+	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "0")
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 6)})
 	createTerminalTrainingJob(t, server, plan, plan.Experiments[0], "SUCCEEDED", 0.62)
 	input, ready, err := server.buildExperimentPlannerInput(projectID, plan.ID)

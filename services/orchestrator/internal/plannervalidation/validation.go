@@ -42,7 +42,7 @@ const (
 	StrictDefaultRolloutPolicyVersion = "planner_strict_default_rollout_v1"
 	RelaxedRollbackPolicyVersion      = "planner_relaxed_rollback_v1"
 	RelaxedRollbackDiagnosticEvent    = "planner_validation_relaxed_rollback"
-	DefaultMaxRetriesPerAttemptGroup  = 1
+	DefaultMaxRetriesPerAttemptGroup  = 2
 )
 
 var relaxedRollbackDiagnosticCount atomic.Uint64

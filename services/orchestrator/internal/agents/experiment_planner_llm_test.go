@@ -884,75 +884,11 @@ func TestExperimentPlannerAgentRejectsAddWithoutHypothesis(t *testing.T) {
 	}
 }
 
-func TestExperimentPlannerAgentRejectsMinorOnlyTweaks(t *testing.T) {
-	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
-
-	agent := NewExperimentPlannerAgent(fakeJSONGenerator{
-		response: `{
-			"summary": "Try a small tweak.",
-			"decision_type": "ADD_EXPERIMENTS",
-			"rationale": "Need a modest improvement.",
-			"confidence": 0.75,
-			"planning_mode": "exploit",
-			"deterministic_diagnosis_used": ["plateau_score=0.7"],
-			"evidence_used": ["prior champion family is strong"],
-			"hypothesis": "More epochs and a lower learning rate may help.",
-			"expected_failure_modes": ["may repeat plateau"],
-			"dataset_preprocessing_rationale": "No dataset-specific preprocessing change is needed.",
-			"changed_variables": ["epochs", "learning_rate"],
-			"success_criteria": "Improve macro-F1.",
-			"stop_condition": "Stop if no improvement.",
-			"deployment_tradeoff": "Similar latency.",
-			"candidate_hypotheses": [
-				{
-					"hypothesis": "Weighted loss should improve minority recall.",
-					"planning_mode": "class_imbalance_ablation",
-					"mechanism": "class_imbalance",
-					"intervention": "Use weighted_loss rather than another architecture sweep.",
-					"proposed_changes": {"class_balancing": "weighted_loss"},
-					"expected_effect": "Improve minority recall and macro-F1.",
-					"expected_metric_impact": 0.02,
-					"expected_tradeoffs": ["possible precision drop"],
-					"risk": "medium",
-					"cost_level": "low",
-					"novelty_score": 0.6,
-					"evidence_used": ["prior champion family is strong"],
-					"similar_success_memory_ids": [],
-					"similar_failure_memory_ids": [],
-					"experiment_config": {
-						"template": "mobilenet_transfer",
-						"model": "mobilenet_v3_small",
-						"epochs": 12,
-						"batch_size": 16,
-						"learning_rate": 0.0003,
-						"reason": "Weighted-loss candidate.",
-						"class_balancing": "weighted_loss"
-					}
-				}
-			],
-			"proposed_experiments": [
-				{
-					"template": "mobilenet_transfer",
-					"model": "mobilenet_v3_small",
-					"epochs": 14,
-					"batch_size": 16,
-					"learning_rate": 0.0002,
-					"reason": "More epochs and lower learning rate."
-				}
-			],
-			"champion_job_id": "",
-			"why_can_beat_champion": "More conservative optimization might help.",
-			"risks": [],
-			"expected_tradeoffs": [],
-			"novelty_notes": [],
-			"rejected_options": [{"option": "heavy model", "reason": "latency", "evidence": "goal", "applies_when": ["latency"]}],
-			"tags": []
-		}`,
-	}, "test-model")
-
-	_, err := agent.Plan(context.Background(), testExperimentPlannerInput())
-	if err == nil || !strings.Contains(err.Error(), "only minor tuning knobs") {
-		t.Fatalf("expected minor-only tuning error, got %v", err)
+func TestExperimentPlannerAgentAllowsEvidenceBackedMinorOnlyTweaks(t *testing.T) {
+	recommendation := validExperimentPlannerRecommendationForMode("exploit")
+	recommendation.ChangedVariables = []string{"learning_rate"}
+	if err := validateExperimentPlanningRecommendation(recommendation, 5); err != nil {
+		t.Fatalf("expected one-variable tuning refinement to remain valid: %v", err)
 	}
 }
 
@@ -2429,8 +2365,8 @@ func TestExperimentPlannerRanksCandidateHypotheses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan with candidate hypotheses: %v", err)
 	}
-	if len(trace.Recommendation.ProposedExperiments) != 1 {
-		t.Fatalf("expected one selected experiment, got %d", len(trace.Recommendation.ProposedExperiments))
+	if len(trace.Recommendation.ProposedExperiments) != 2 {
+		t.Fatalf("expected configured capacity to retain both viable experiments, got %d", len(trace.Recommendation.ProposedExperiments))
 	}
 	if trace.Recommendation.ProposedExperiments[0].ClassBalancing != "weighted_loss" {
 		t.Fatalf("expected weighted-loss candidate to be selected")
@@ -2444,7 +2380,7 @@ func TestExperimentPlannerRanksCandidateHypotheses(t *testing.T) {
 	if trace.Recommendation.CandidateRankings[1].Mechanism != "class_imbalance" {
 		t.Fatalf("expected selected ranking to expose mechanism, got %#v", trace.Recommendation.CandidateRankings[1])
 	}
-	if len(trace.Recommendation.ProposalMechanisms) != 1 || trace.Recommendation.ProposalMechanisms[0].Mechanism != "class_imbalance" {
+	if len(trace.Recommendation.ProposalMechanisms) != 2 || trace.Recommendation.ProposalMechanisms[0].Mechanism != "class_imbalance" {
 		t.Fatalf("expected selected candidate mechanism sidecar, got %#v", trace.Recommendation.ProposalMechanisms)
 	}
 }
@@ -2614,10 +2550,10 @@ func TestCandidateRankingPenalizesSameMechanismMinorVariant(t *testing.T) {
 	}
 
 	ranking := scorePlannerCandidate(input, candidate, 0, map[string]bool{}, map[string]bool{})
-	if !ranking.Rejected {
-		t.Fatalf("expected same-mechanism minor variant to be rejected, got %#v", ranking)
+	if ranking.Rejected {
+		t.Fatalf("expected same-mechanism minor variant to remain rank eligible, got %#v", ranking)
 	}
-	if !containsTestString(ranking.Reasons, "same mechanism only changes minor tuning knobs") {
+	if !containsTestString(ranking.Reasons, "same-mechanism refinement receives a modest ranking penalty") {
 		t.Fatalf("expected same-mechanism penalty reason, got %#v", ranking.Reasons)
 	}
 }
@@ -2699,7 +2635,7 @@ func TestCandidateRankingRetrievedFailedMemoryAppliesPenalty(t *testing.T) {
 	}
 }
 
-func TestCandidateRankingRetrievedRejectedOptionBlocksCandidate(t *testing.T) {
+func TestCandidateRankingRetrievedRejectedOptionPenalizesCandidate(t *testing.T) {
 	input := candidateRankingMemoryTestInput()
 	input.RetrievedMemory = []memory.MemoryRetrievalResult{
 		retrievedPlannerTestResult(memory.SourceAgentMemoryRecord, "memory_rejected", memory.KindPlanningFeedback, "rejected", "rejected weighted loss repeat"),
@@ -2707,8 +2643,8 @@ func TestCandidateRankingRetrievedRejectedOptionBlocksCandidate(t *testing.T) {
 
 	ranking := scorePlannerCandidate(input, candidateRankingClassImbalanceCandidate(), 0, map[string]bool{}, map[string]bool{})
 
-	if !ranking.Rejected || ranking.Score != 0 {
-		t.Fatalf("expected rejected retrieved memory to block candidate, got %#v", ranking)
+	if ranking.Rejected || ranking.Score == 0 {
+		t.Fatalf("expected rejected retrieved memory to remain evidence rather than a permanent ban, got %#v", ranking)
 	}
 	if ranking.ScoreComponents["retrieved_memory"] >= 0 {
 		t.Fatalf("expected negative retrieved memory component, got %#v", ranking.ScoreComponents)

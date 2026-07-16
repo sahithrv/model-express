@@ -52,9 +52,10 @@ func rankPlannerCandidateHypothesesV2(
 			Mechanism: v1.Mechanism, Intervention: v1.Intervention, ExpectedEffect: v1.ExpectedEffect,
 			RetrievedMemoryHits: append([]CandidateRetrievedMemoryHit(nil), v1.RetrievedMemoryHits...),
 			PromotionDecision:   v1.PromotionDecision, StopReason: v1.StopReason,
-			Rejected: v1.Rejected, Reasons: append([]string(nil), v1.Reasons...), ExperimentSignature: v1.ExperimentSignature,
-			PolicyFindings:  append([]policies.Finding(nil), v1.PolicyFindings...),
-			ScoreComponents: map[string]float64{},
+			Rejected: v1.Rejected, Disposition: v1.Disposition, Reasons: append([]string(nil), v1.Reasons...), ExperimentSignature: v1.ExperimentSignature,
+			PolicyFindings:     append([]policies.Finding(nil), v1.PolicyFindings...),
+			ValidationFindings: append([]PlannerValidationFieldFinding(nil), v1.ValidationFindings...),
+			ScoreComponents:    map[string]float64{},
 		}
 		if ranking.Rejected {
 			ranking.ScoreComponents["rejected_by_v1_structural_gate"] = 1
@@ -103,10 +104,18 @@ func rankPlannerCandidateHypothesesV2(
 		score := entry.AdjustedScore
 		experimentIndex := order
 		v2[index].Selected = true
+		if v2[index].Disposition != PlannerCandidateAcceptedAfterNormalization {
+			v2[index].Disposition = PlannerCandidateAccepted
+		}
 		v2[index].SelectionScore = &score
 		v2[index].SelectionOrder = &order
 		v2[index].SelectedExperimentIndex = &experimentIndex
 		v2[index].SelectionAdjustments = append([]CandidateSelectionAdjustment(nil), entry.SelectionAdjustments...)
+	}
+	for index := range v2 {
+		if !v2[index].Rejected && !v2[index].Selected {
+			v2[index].Disposition = PlannerCandidateUnselectedByRank
+		}
 	}
 	comparison := compareRankerSelections(v1Rankings, v2)
 	return v2, trace, &comparison

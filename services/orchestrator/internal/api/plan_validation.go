@@ -163,16 +163,13 @@ func experimentSignaturesForPlans(projectPlans []plans.ExperimentPlan) []string 
 
 func validateNovelProposedExperiments(experiments []plans.PlannedExperiment, projectPlans []plans.ExperimentPlan) error {
 	existing := map[string]bool{}
-	existingMechanisms := map[string]bool{}
 	for _, plan := range projectPlans {
 		for _, experiment := range plan.Experiments {
 			existing[experimentSignature(experiment)] = true
-			existingMechanisms[experimentMechanismSignature(experiment)] = true
 		}
 	}
 
 	proposed := map[string]bool{}
-	proposedMechanisms := map[string]bool{}
 	for index, experiment := range experiments {
 		if err := validatePlannedExperiment(experiment, index); err != nil {
 			return err
@@ -184,45 +181,30 @@ func validateNovelProposedExperiments(experiments []plans.PlannedExperiment, pro
 		if proposed[signature] {
 			return fmt.Errorf("%w: proposed experiment %d duplicates another proposed experiment signature %s", store.ErrInvalidRequest, index, signature)
 		}
-		mechanismSignature := experimentMechanismSignature(experiment)
-		if existingMechanisms[mechanismSignature] {
-			return fmt.Errorf("%w: proposed experiment %d only changes minor tuning knobs for an already tested experiment mechanism", store.ErrInvalidRequest, index)
-		}
-		if proposedMechanisms[mechanismSignature] {
-			return fmt.Errorf("%w: proposed experiment %d only changes minor tuning knobs relative to another proposed experiment", store.ErrInvalidRequest, index)
-		}
 		proposed[signature] = true
-		proposedMechanisms[mechanismSignature] = true
 	}
 	return nil
 }
 
 func filterNovelPlannedExperiments(experiments []plans.PlannedExperiment, projectPlans []plans.ExperimentPlan) ([]plans.PlannedExperiment, []string) {
 	existing := map[string]bool{}
-	existingMechanisms := map[string]bool{}
 	for _, plan := range projectPlans {
 		for _, experiment := range plan.Experiments {
 			existing[experimentSignature(experiment)] = true
-			existingMechanisms[experimentMechanismSignature(experiment)] = true
 		}
 	}
 
 	out := []plans.PlannedExperiment{}
 	warnings := []string{}
 	proposed := map[string]bool{}
-	proposedMechanisms := map[string]bool{}
 	for index, experiment := range experiments {
 		signature := experimentSignature(experiment)
-		mechanismSignature := experimentMechanismSignature(experiment)
 		switch {
 		case existing[signature] || proposed[signature]:
 			warnings = append(warnings, fmt.Sprintf("Skipped follow-up experiment %d because it duplicated an existing experiment signature.", index))
-		case existingMechanisms[mechanismSignature] || proposedMechanisms[mechanismSignature]:
-			warnings = append(warnings, fmt.Sprintf("Skipped follow-up experiment %d because it only changed minor tuning knobs for an already tested mechanism.", index))
 		default:
 			out = append(out, experiment)
 			proposed[signature] = true
-			proposedMechanisms[mechanismSignature] = true
 		}
 	}
 	return out, warnings

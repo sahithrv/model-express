@@ -2,7 +2,6 @@ package api
 
 import (
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -171,13 +170,17 @@ func TestExistingDecisionPathRepairsCandidateProvenanceWithoutDuplicates(t *test
 	}
 }
 
-func TestInvalidPreAcceptanceForecastRemainsInvocationAuditOnly(t *testing.T) {
+func TestMismatchedPreAcceptanceForecastIsOverwrittenByFrozenBackendContract(t *testing.T) {
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{testExperiment("mobilenet_v3_small", 6)})
 	invocation := createExperimentPlannerInvocation(t, server, projectID, plan)
 	input, recommendation := candidateProvenancePlannerFixture(t, server, projectID, plan)
 	recommendation.CandidateHypotheses[0].Forecast.Units = "percentage_points"
-	if _, err := agents.FinalizePlannerRecommendation(input, recommendation); err == nil || !strings.Contains(err.Error(), "backend-frozen contract") {
-		t.Fatalf("invalid frozen forecast was not rejected: %v", err)
+	finalized, err := agents.FinalizePlannerRecommendation(input, recommendation)
+	if err != nil {
+		t.Fatalf("backend should overwrite mismatched LLM forecast metadata: %v", err)
+	}
+	if got := finalized.CandidateHypotheses[0].Forecast.Units; got != calibration.CandidateForecastUnits {
+		t.Fatalf("frozen forecast units = %q, want %q", got, calibration.CandidateForecastUnits)
 	}
 	if stored, err := server.store.GetAgentInvocation(invocation.ID); err != nil || stored.ID != invocation.ID {
 		t.Fatalf("invocation audit was lost: %#v err=%v", stored, err)

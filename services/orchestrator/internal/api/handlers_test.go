@@ -5175,7 +5175,7 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 		`{
 			"summary": "Use backend feedback to switch to a meaningful EfficientNet preprocessing ablation.",
 			"decision_type": "ADD_EXPERIMENTS",
-			"rationale": "The rejected MobileNet repeat only changed epochs, so the corrected plan changes model family, resolution, augmentation, and class balancing.",
+			"rationale": "Keep the valid MobileNet refinement and add a supported EfficientNet class-balancing challenger for an open slot.",
 			"confidence": 0.83,
 			"planning_mode": "preprocessing_ablation",
 			"deterministic_diagnosis_used": ["plateau_score=0.40"],
@@ -5183,7 +5183,7 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 			"hypothesis": "EfficientNet with moderate augmentation and weighted loss can improve macro-F1 more than a shallow epoch repeat.",
 			"expected_failure_modes": ["higher runtime"],
 			"dataset_preprocessing_rationale": "Change preprocessing and balancing to test a real mechanism instead of only extending epochs.",
-			"changed_variables": ["model_family", "resolution_strategy", "augmentation_policy", "class_balancing"],
+			"changed_variables": ["model_family", "image_size", "augmentation", "class_balancing"],
 			"success_criteria": "Improve macro-F1 by at least 0.01 without excessive latency.",
 			"stop_condition": "Select champion if this mechanism does not improve.",
 			"deployment_tradeoff": "More runtime for a stronger quality challenger.",
@@ -5192,7 +5192,7 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 				"planning_mode": "preprocessing_ablation",
 				"mechanism": "class_imbalance",
 				"intervention": "Use weighted loss and weighted sampling with a stronger EfficientNet challenger.",
-				"proposed_changes": {"model_family": "efficientnet", "resolution_strategy": "high_resolution_ablation", "augmentation_policy": "moderate", "class_balancing": "weighted_loss"},
+				"proposed_changes": {"model_family": "efficientnet", "image_size": 256, "augmentation": "horizontal_flip and color_jitter", "class_balancing": "weighted_loss"},
 				"expected_effect": "Improve macro-F1 by addressing class imbalance instead of repeating training budget.",
 				"expected_metric_impact": 0.02,
 				"expected_tradeoffs": ["higher runtime"],
@@ -5204,30 +5204,34 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 				"similar_failure_memory_ids": [],
 				"experiment_config": {
 					"template": "efficientnet_transfer",
-					"model": "efficientnet_b0",
+					"model": "efficientnet_b1",
 					"epochs": 10,
 					"batch_size": 16,
-					"learning_rate": 0.0003,
+					"learning_rate": 0.0002,
 					"reason": "Corrected proposal changes family, augmentation, and balancing.",
 					"image_size": 256,
-					"resolution_strategy": "high_resolution_ablation",
-					"augmentation_policy": "moderate",
+					"optimizer": "adamw",
+					"scheduler": "cosine",
+					"weight_decay": 0.01,
+					"augmentation": {"horizontal_flip": true, "color_jitter": true},
 					"class_balancing": "weighted_loss",
-					"sampling_strategy": "weighted_random_sampler"
+					"early_stopping_patience": 3
 				}
 			}],
 			"proposed_experiments": [{
 				"template": "efficientnet_transfer",
-				"model": "efficientnet_b0",
+				"model": "efficientnet_b1",
 				"epochs": 10,
 				"batch_size": 16,
-				"learning_rate": 0.0003,
+				"learning_rate": 0.0002,
 				"reason": "Corrected proposal changes family, augmentation, and balancing.",
 				"image_size": 256,
-				"resolution_strategy": "high_resolution_ablation",
-				"augmentation_policy": "moderate",
+				"optimizer": "adamw",
+				"scheduler": "cosine",
+				"weight_decay": 0.01,
+				"augmentation": {"horizontal_flip": true, "color_jitter": true},
 				"class_balancing": "weighted_loss",
-				"sampling_strategy": "weighted_random_sampler"
+				"early_stopping_patience": 3
 			}],
 			"proposal_mechanisms": [{
 				"experiment_index": 0,
@@ -5296,22 +5300,22 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 	if !handled {
 		t.Fatal("expected planner to handle the completed job")
 	}
-	if len(requestBodies) != 2 {
-		t.Fatalf("expected initial request plus retry, got %d", len(requestBodies))
+	if len(requestBodies) != 3 {
+		t.Fatalf("expected initial request plus two bounded repair retries, got %d", len(requestBodies))
 	}
-	if !strings.Contains(requestBodies[1], "planner_validation_feedback") || !strings.Contains(requestBodies[1], "minor tuning knobs") {
+	if !strings.Contains(requestBodies[1], "planner_validation_feedback") || !strings.Contains(requestBodies[1], "open_slots_remaining") || !strings.Contains(requestBodies[1], "accepted_candidates_to_preserve") {
 		t.Fatalf("expected retry request to include backend validation feedback, got %s", requestBodies[1])
 	}
 	agentDecisions := listAgentDecisions(t, server, projectID)
 	if len(agentDecisions) != 1 {
 		t.Fatalf("expected one accepted decision after retry, got %d", len(agentDecisions))
 	}
-	if retryCount, _ := agentDecisions[0].Payload["validation_retry_count"].(int); retryCount != 1 {
-		t.Fatalf("expected retry count 1 in decision payload, got %#v", agentDecisions[0].Payload["validation_retry_count"])
+	if retryCount, _ := agentDecisions[0].Payload["validation_retry_count"].(int); retryCount != 2 {
+		t.Fatalf("expected retry count 2 in decision payload, got %#v", agentDecisions[0].Payload["validation_retry_count"])
 	}
 	experiments := plannedExperimentsFromUnknown(t, agentDecisions[0].Payload["proposed_experiments"])
-	if len(experiments) != 1 || experiments[0].Model != "efficientnet_b0" {
-		t.Fatalf("expected corrected EfficientNet proposal, got %#v", experiments)
+	if len(experiments) != 2 || experiments[0].Model != "efficientnet_b1" || experiments[1].Model != "mobilenet_v3_small" {
+		t.Fatalf("expected corrected proposal plus unchanged retained candidate, got %#v", experiments)
 	}
 	projectPlans := listExperimentPlans(t, server, projectID)
 	if len(projectPlans) != 2 {
@@ -5321,8 +5325,8 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected follow-up plan from accepted retry decision, got %#v", projectPlans)
 	}
-	if len(followUpPlan.Experiments) != 1 || followUpPlan.Experiments[0].Model != "efficientnet_b0" {
-		t.Fatalf("expected scheduled follow-up to use corrected EfficientNet proposal, got %#v", followUpPlan.Experiments)
+	if len(followUpPlan.Experiments) != 2 || followUpPlan.Experiments[0].Model != "efficientnet_b1" || followUpPlan.Experiments[1].Model != "mobilenet_v3_small" {
+		t.Fatalf("expected scheduled follow-up to preserve the valid refinement and add the corrected replacement, got %#v", followUpPlan.Experiments)
 	}
 	projectJobs, err := server.store.ListProjectJobs(projectID)
 	if err != nil {
@@ -5335,8 +5339,8 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list invocations: %v", err)
 	}
-	if len(invocations) != 2 {
-		t.Fatalf("expected two planner invocations, got %d", len(invocations))
+	if len(invocations) != 3 {
+		t.Fatalf("expected three planner invocations, got %d", len(invocations))
 	}
 	attemptGroupID := invocations[0].AttemptGroupID
 	plannerVariantID := invocations[0].PlannerVariantID
@@ -5365,29 +5369,30 @@ func TestExperimentPlannerRetriesAfterBackendValidationRejection(t *testing.T) {
 		}
 		byAttempt[invocation.AttemptIndex] = invocation
 	}
-	if len(byAttempt) != 2 || byAttempt[0].RetryReason != "" || byAttempt[1].RetryReason == "" {
+	if len(byAttempt) != 3 || byAttempt[0].RetryReason != "" || byAttempt[1].RetryReason == "" || byAttempt[2].RetryReason == "" {
 		t.Fatalf("unexpected retry attempt facts: %#v", byAttempt)
 	}
 	if payloadString(agentDecisions[0].Payload, "planner_variant_id") != plannerVariantID {
 		t.Fatalf("decision is not attributed to accepted planner variant %q: %#v", plannerVariantID, agentDecisions[0].Payload)
 	}
-	if payloadString(agentDecisions[0].Payload, "invocation_id") != byAttempt[1].ID {
-		t.Fatalf("decision is not linked to accepted retry invocation %s: %#v", byAttempt[1].ID, agentDecisions[0].Payload)
+	if payloadString(agentDecisions[0].Payload, "invocation_id") != byAttempt[2].ID {
+		t.Fatalf("decision is not linked to accepted retry invocation %s: %#v", byAttempt[2].ID, agentDecisions[0].Payload)
 	}
-	foundRejected := false
+	foundUnderfilledFunnel := false
 	for _, invocation := range invocations {
-		if invocation.DownstreamOutcome["backend_validation_status"] == "rejected" {
-			foundRejected = true
+		if invocation.DownstreamOutcome["will_retry"] == true && invocation.DownstreamOutcome["acceptance_funnel"] != nil {
+			foundUnderfilledFunnel = true
 			break
 		}
 	}
-	if !foundRejected {
-		t.Fatalf("expected one invocation to record backend rejection, got %#v", invocations)
+	if !foundUnderfilledFunnel {
+		t.Fatalf("expected underfilled attempts to record bounded acceptance funnels, got %#v", invocations)
 	}
 }
 
-func TestExperimentPlannerRetriesAfterPlannerValidationRejection(t *testing.T) {
+func TestExperimentPlannerRetriesUnderfilledChampionChallengeWithPreservationFeedback(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
+	t.Setenv("MODEL_EXPRESS_PLANNER_BACKEND_VALIDATION_RETRIES", "1")
 
 	response := func(fixChampionReason bool) string {
 		secondReason := "Keep a compact latency control."
@@ -5531,8 +5536,8 @@ func TestExperimentPlannerRetriesAfterPlannerValidationRejection(t *testing.T) {
 	if len(requestBodies) != 2 {
 		t.Fatalf("expected planner validation retry, got %d requests", len(requestBodies))
 	}
-	if !strings.Contains(requestBodies[1], "planner_validation_feedback") || !strings.Contains(requestBodies[1], "champion_challenge experiment") {
-		t.Fatalf("expected retry prompt to include champion challenge validation feedback, got %s", requestBodies[1])
+	if !strings.Contains(requestBodies[1], "planner_validation_feedback") || !strings.Contains(requestBodies[1], "accepted_candidates_to_preserve") || !strings.Contains(requestBodies[1], "open_slots_remaining") {
+		t.Fatalf("expected retry prompt to include cumulative candidate-preservation feedback, got %s", requestBodies[1])
 	}
 
 	agentDecisions := listAgentDecisions(t, server, projectID)
@@ -5752,7 +5757,7 @@ func TestExperimentPlannerRejectsProposedExperimentWithoutMechanism(t *testing.T
 	}
 }
 
-func TestExperimentPlannerRejectsMinorOnlyRepeat(t *testing.T) {
+func TestExperimentPlannerAllowsEpochOnlyRefinement(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
 
 	server, projectID, plan := newAutomaticReviewFixture(t, []plans.PlannedExperiment{
@@ -5789,9 +5794,8 @@ func TestExperimentPlannerRejectsMinorOnlyRepeat(t *testing.T) {
 		}},
 	}
 
-	_, err := experimentPlannerDecisionPayload(recommendation, invocation, "autonomous", plannerInputForPayload(t, server, projectID))
-	if err == nil || !strings.Contains(err.Error(), "minor tuning knobs") {
-		t.Fatalf("expected minor-only repeat validation error, got %v", err)
+	if _, err := experimentPlannerDecisionPayload(recommendation, invocation, "autonomous", plannerInputForPayload(t, server, projectID)); err != nil {
+		t.Fatalf("expected accepted-spec-distinct epoch-only refinement to remain valid: %v", err)
 	}
 }
 
@@ -5835,15 +5839,15 @@ func TestEnsureFollowUpPlanRevalidatesStaleDecisionPayload(t *testing.T) {
 	if !created {
 		t.Fatal("expected a new follow-up plan after filtering stale payload")
 	}
-	if len(followUp.Experiments) != 1 || followUp.Experiments[0].Model != "mobilenet_v3_large" {
-		t.Fatalf("expected only novel experiment to survive stale payload filtering, got %#v", followUp.Experiments)
+	if len(followUp.Experiments) != 2 {
+		t.Fatalf("expected epoch refinement and challenger to survive exact-duplicate filtering, got %#v", followUp.Experiments)
 	}
-	if len(followUp.Warnings) == 0 || !strings.Contains(strings.Join(followUp.Warnings, " "), "minor tuning knobs") {
-		t.Fatalf("expected warning for filtered stale repeat, got %#v", followUp.Warnings)
+	if strings.Contains(strings.Join(followUp.Warnings, " "), "minor tuning knobs") {
+		t.Fatalf("epoch-only refinement was incorrectly described as invalid: %#v", followUp.Warnings)
 	}
 }
 
-func TestEnsureFollowUpPlanBlocksWhenAllExperimentsFiltered(t *testing.T) {
+func TestEnsureFollowUpPlanRetainsEpochRefinementWhileFilteringExactDuplicate(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
 	t.Setenv("MODEL_EXPRESS_AUTO_EXECUTE_PLANS", "false")
 
@@ -5865,12 +5869,12 @@ func TestEnsureFollowUpPlanBlocksWhenAllExperimentsFiltered(t *testing.T) {
 		t.Fatalf("create stale decision: %v", err)
 	}
 
-	_, _, err = server.ensureFollowUpPlan(projectID, plan, decision)
-	if err == nil || !errors.Is(err, errNoNovelFollowUpExperiments) {
-		t.Fatalf("expected no-novel follow-up error, got %v", err)
+	followUp, created, err := server.ensureFollowUpPlan(projectID, plan, decision)
+	if err != nil || !created || len(followUp.Experiments) != 1 || followUp.Experiments[0].Epochs != 24 {
+		t.Fatalf("expected epoch refinement to proceed while exact duplicate is filtered: plan=%#v created=%v err=%v", followUp, created, err)
 	}
-	if got := len(listExperimentPlans(t, server, projectID)); got != 1 {
-		t.Fatalf("expected no follow-up plan to be created, got %d total plans", got)
+	if got := len(listExperimentPlans(t, server, projectID)); got != 2 {
+		t.Fatalf("expected one follow-up plan to be created, got %d total plans", got)
 	}
 	projectJobs, err := server.store.ListProjectJobs(projectID)
 	if err != nil {
@@ -5883,8 +5887,8 @@ func TestEnsureFollowUpPlanBlocksWhenAllExperimentsFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list execution events: %v", err)
 	}
-	if !hasBlockedFollowUpEvent(events) {
-		t.Fatalf("expected blocked follow-up event, got %#v", events)
+	if hasBlockedFollowUpEvent(events) {
+		t.Fatalf("did not expect partial candidate filtering to block the follow-up, got %#v", events)
 	}
 }
 
@@ -5928,7 +5932,7 @@ func TestEnsureFollowUpPlanAllowsRepeatExperimentsInRelaxedMode(t *testing.T) {
 	}
 }
 
-func TestExistingStaleFollowUpPlanIsRevalidatedBeforeExecution(t *testing.T) {
+func TestExistingEpochRefinementFollowUpPlanRemainsExecutable(t *testing.T) {
 	t.Setenv("MODEL_EXPRESS_STRICT_PLANNER_VALIDATION", "true")
 
 	first := testExperiment("efficientnet_b1", 12)
@@ -5954,16 +5958,15 @@ func TestExistingStaleFollowUpPlanIsRevalidatedBeforeExecution(t *testing.T) {
 		t.Fatalf("create stale follow-up plan: %v", err)
 	}
 
-	_, err = server.executeStoredExperimentPlan(stalePlan.ID, executeExperimentPlanRequest{Provider: "local"})
-	if err == nil || !errors.Is(err, errNoNovelFollowUpExperiments) {
-		t.Fatalf("expected stale follow-up execution to be blocked, got %v", err)
+	if _, err = server.executeStoredExperimentPlan(stalePlan.ID, executeExperimentPlanRequest{Provider: "local"}); err != nil {
+		t.Fatalf("expected accepted-spec-distinct epoch refinement to execute: %v", err)
 	}
 	projectJobs, err := server.store.ListProjectJobs(projectID)
 	if err != nil {
 		t.Fatalf("list project jobs: %v", err)
 	}
-	if len(projectJobs) != 0 {
-		t.Fatalf("expected stale plan execution to create no jobs, got %d", len(projectJobs))
+	if len(projectJobs) != 1 {
+		t.Fatalf("expected epoch refinement execution to create one job, got %d", len(projectJobs))
 	}
 }
 

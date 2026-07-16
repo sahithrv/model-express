@@ -512,6 +512,17 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 		return plans.ExperimentPlan{}, false, err
 	}
 	relaxedValidationWarnings = append(relaxedValidationWarnings, executionWarnings...)
+	var acceptedDuplicateWarnings []string
+	experiments, acceptedDuplicateWarnings, err = s.filterFollowUpAcceptedSpecDuplicates(projectID, experiments)
+	if err != nil {
+		return plans.ExperimentPlan{}, false, err
+	}
+	if len(experiments) == 0 {
+		message := "Follow-up scheduling blocked because every candidate duplicates an accepted executable spec."
+		s.recordFollowUpValidationBlocked(projectID, sourcePlan.ID, decision.ID, "", message, acceptedDuplicateWarnings)
+		return plans.ExperimentPlan{}, false, fmt.Errorf("%w: no candidates remain after accepted-spec duplicate filtering", errNoNovelFollowUpExperiments)
+	}
+	relaxedValidationWarnings = append(relaxedValidationWarnings, acceptedDuplicateWarnings...)
 	acceptedSpecVerdict, acceptedSpecErr := plannervalidation.Evaluate(plannerValidationMode(), []plannervalidation.Check{{
 		Code:     "accepted_spec_no_op",
 		Category: plannervalidation.CategoryProposalNoOp,
@@ -600,6 +611,17 @@ func (s *Server) ensureFollowUpPlan(projectID string, sourcePlan plans.Experimen
 	if _, err := s.finalizeCandidateOutcomesForPlan(plan.ID); err != nil {
 		return plans.ExperimentPlan{}, false, err
 	}
+	funnel := copyPayloadMap(payloadMap(decision.Payload, "acceptance_funnel"))
+	if funnel == nil {
+		funnel = map[string]any{}
+	}
+	funnel["ultimately_scheduled"] = len(plan.Experiments)
+	if _, eventErr := s.store.CreateExecutionEvent(projectID, plan.ID, execution.EventAgentOutcomeRecorded, "Planner acceptance funnel finalized for follow-up scheduling.", map[string]any{
+		"source_decision_id": decision.ID,
+		"acceptance_funnel":  funnel,
+	}); eventErr != nil {
+		log.Printf("record planner acceptance funnel failed for plan %s: %v", plan.ID, eventErr)
+	}
 
 	return plan, true, nil
 }
@@ -610,18 +632,23 @@ func (s *Server) normalizeFollowUpExperimentsForExecution(projectID string, sour
 		provider = "local"
 	}
 	provider = normalizeTrainingProvider(provider)
-	out := append([]plans.PlannedExperiment(nil), experiments...)
+	out := make([]plans.PlannedExperiment, 0, len(experiments))
 	warnings := []string{}
-	for index, experiment := range out {
+	for index, experiment := range experiments {
 		if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+			out = append(out, experiment)
 			continue
 		}
 		normalized, experimentWarnings, err := normalizeFollowUpExperimentForExecution(provider, experiment, index)
 		if err != nil {
-			return experiments, warnings, err
+			warnings = append(warnings, fmt.Sprintf("Rejected follow-up experiment %d during execution normalization: %v", index, err))
+			continue
 		}
-		out[index] = normalized
+		out = append(out, normalized)
 		warnings = append(warnings, experimentWarnings...)
+	}
+	if len(out) == 0 && len(experiments) > 0 {
+		return experiments, warnings, fmt.Errorf("%w: no follow-up candidates remain after execution normalization", store.ErrInvalidRequest)
 	}
 	if len(warnings) > 0 {
 		if _, err := s.store.CreateExecutionEvent(projectID, sourcePlanID, execution.EventExecutionValidationReported, "Follow-up proposal was normalized to remove runner no-op fields before scheduling.", map[string]any{
@@ -658,6 +685,14 @@ func normalizeFollowUpExperimentForExecution(provider string, experiment plans.P
 		}
 		changed := false
 		for _, field := range fields {
+			candidate := agents.CandidateHypothesis{
+				Mechanism: experiment.Mechanism, Intervention: experiment.Intervention,
+				ExpectedEffect: experiment.ExpectedEffect, Hypothesis: experiment.Reason,
+				ExperimentConfig: experiment,
+			}
+			if plannerCandidateFieldCentral(candidate, field) {
+				return experiment, warnings, fmt.Errorf("%w: experiment %d claims unsupported field %s as part of its core mechanism", store.ErrInvalidRequest, index, field)
+			}
 			normalized, removed, err := removeFollowUpExperimentConfigPath(experiment, field)
 			if err != nil {
 				return experiment, warnings, err
@@ -685,10 +720,7 @@ func followUpExecutionNoOpFields(report execution.ExecutionValidationReport) []s
 		if !finding.WouldBlock || strings.TrimSpace(finding.Field) == "" {
 			continue
 		}
-		switch finding.ReasonCode {
-		case "runner_does_not_consume", "simulator_does_not_model":
-			fields = append(fields, finding.Field)
-		}
+		fields = append(fields, finding.Field)
 	}
 	return uniqueStrings(fields)
 }
@@ -736,9 +768,20 @@ func deleteNestedConfigPath(root map[string]any, parts []string) bool {
 }
 
 func (s *Server) validateFollowUpAcceptedSpecNovelty(projectID string, experiments []plans.PlannedExperiment) error {
-	projectJobs, err := s.store.ListProjectJobs(projectID)
+	filtered, warnings, err := s.filterFollowUpAcceptedSpecDuplicates(projectID, experiments)
 	if err != nil {
 		return err
+	}
+	if len(filtered) != len(experiments) {
+		return fmt.Errorf("%w: %s", store.ErrInvalidRequest, strings.Join(warnings, "; "))
+	}
+	return nil
+}
+
+func (s *Server) filterFollowUpAcceptedSpecDuplicates(projectID string, experiments []plans.PlannedExperiment) ([]plans.PlannedExperiment, []string, error) {
+	projectJobs, err := s.store.ListProjectJobs(projectID)
+	if err != nil {
+		return nil, nil, err
 	}
 	existing := map[string]string{}
 	for _, job := range projectJobs {
@@ -748,23 +791,29 @@ func (s *Server) validateFollowUpAcceptedSpecNovelty(projectID string, experimen
 	}
 	provider := s.defaultExecuteExperimentPlanRequest().Provider
 	proposed := map[string]int{}
+	out := make([]plans.PlannedExperiment, 0, len(experiments))
+	warnings := []string{}
 	for index, experiment := range experiments {
 		if strings.EqualFold(strings.TrimSpace(experiment.Template), jobs.TemplateLabelQualityAudit) {
+			out = append(out, experiment)
 			continue
 		}
 		spec, err := buildExecutionSpecV1(experiment, provider)
 		if err != nil {
-			return err
+			return nil, warnings, err
 		}
 		if jobID, ok := existing[spec.AcceptedSpecHash]; ok {
-			return fmt.Errorf("%w: follow-up experiment %d is a proposal-time no-op matching accepted spec %s from job %s", store.ErrInvalidRequest, index, spec.AcceptedSpecHash, jobID)
+			warnings = append(warnings, fmt.Sprintf("Rejected follow-up experiment %d because accepted spec %s matches job %s.", index, spec.AcceptedSpecHash, jobID))
+			continue
 		}
 		if previous, ok := proposed[spec.AcceptedSpecHash]; ok {
-			return fmt.Errorf("%w: follow-up experiment %d is a proposal-time no-op matching proposed experiment %d by accepted spec %s", store.ErrInvalidRequest, index, previous, spec.AcceptedSpecHash)
+			warnings = append(warnings, fmt.Sprintf("Rejected follow-up experiment %d because accepted spec %s matches proposed experiment %d.", index, spec.AcceptedSpecHash, previous))
+			continue
 		}
 		proposed[spec.AcceptedSpecHash] = index
+		out = append(out, experiment)
 	}
-	return nil
+	return out, warnings, nil
 }
 
 func (s *Server) persistDecisionShadowStrictVerdict(decision decisions.AgentDecision, verdict plannervalidation.Verdict) error {
@@ -854,17 +903,37 @@ func (s *Server) validateFollowUpExperimentMechanismsAgainstDataset(
 	if err != nil {
 		return experiments, err
 	}
-	if err := validateMechanismDatasetEvidence(profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary), enrichedExperiments, planEvidence); err != nil {
+	profile := profileWithAgentSafeMetadataSummary(dataset.Profile, metadataSummary)
+	accepted := make([]plans.PlannedExperiment, 0, len(enrichedExperiments))
+	rejected := []string{}
+	for index, experiment := range enrichedExperiments {
+		if err := validateMechanismDatasetEvidence(profile, []plans.PlannedExperiment{experiment}, planEvidence); err != nil {
+			rejected = append(rejected, fmt.Sprintf("experiment %d: %v", index, err))
+			continue
+		}
+		accepted = append(accepted, experiment)
+	}
+	if len(rejected) > 0 && len(accepted) == 0 {
 		message := "Follow-up scheduling blocked because one or more proposed mechanisms lack backend-verifiable diagnosis or dataset support."
 		if followUpPlanID != "" {
 			message = fmt.Sprintf("Existing follow-up plan %s is blocked because one or more mechanisms lack backend-verifiable diagnosis or dataset support.", followUpPlanID)
 		}
 		if plannervalidation.IsStrict(plannerValidationMode()) {
-			s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, []string{err.Error()})
+			s.recordFollowUpValidationBlocked(projectID, planID, decisionID, followUpPlanID, message, rejected)
 		}
-		return enrichedExperiments, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, err.Error())
+		return enrichedExperiments, fmt.Errorf("%w: %s", errNoNovelFollowUpExperiments, strings.Join(rejected, "; "))
 	}
-	return enrichedExperiments, nil
+	if len(rejected) > 0 {
+		if _, eventErr := s.store.CreateExecutionEvent(projectID, planID, execution.EventExecutionValidationReported, "Rejected individual follow-up candidates whose mechanisms lacked backend-verifiable support; viable candidates were retained.", map[string]any{
+			"source_decision_id": decisionID,
+			"follow_up_plan_id":  followUpPlanID,
+			"disposition":        agents.PlannerCandidateRejectedInvalid,
+			"findings":           rejected,
+		}); eventErr != nil {
+			log.Printf("record partial follow-up mechanism filtering failed: %v", eventErr)
+		}
+	}
+	return accepted, nil
 }
 
 func (s *Server) recordFollowUpValidationBlocked(projectID string, planID string, decisionID string, followUpPlanID string, message string, skippedExperiments []string) {

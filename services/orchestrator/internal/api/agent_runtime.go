@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -1150,6 +1151,8 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 	retryReason := ""
 	retryLimit := plannerBackendValidationRetryLimit()
 	for attempt := 0; attempt <= retryLimit; attempt++ {
+		attemptInput.PlannerRetryAttempt = attempt
+		attemptInput.CandidateExecutionValidator = plannerCandidateExecutionValidator(attemptInput)
 		startedAt := time.Now()
 		trace, err := agent.PlanWithTrace(ctx, attemptInput)
 		wallLatencyMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
@@ -1173,6 +1176,16 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			Invocation: invocation,
 		}
 		if err != nil {
+			terminalRecommendation := applyExperimentPlannerStopCriteria(trace.Recommendation, attemptInput)
+			if trace.Recommendation.DecisionType != "" && !strings.EqualFold(terminalRecommendation.DecisionType, decisions.TypeAddExperiments) {
+				trace.Recommendation = terminalRecommendation
+				trace.ValidationStatus = memory.InvocationValidationValid
+				trace.ValidationError = ""
+				err = nil
+				result.Trace = trace
+			}
+		}
+		if err != nil {
 			lastErr = err
 			willRetry := attempt < retryLimit && shouldRetryExperimentPlannerTraceValidation(trace, err)
 			if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, willRetry); persistErr != nil {
@@ -1180,7 +1193,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			}
 			s.recordPlannerValidationRejection(invocation, err, attempt, willRetry)
 			if willRetry {
-				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(trace.Recommendation, err, attempt+1))
+				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedbackForInput(trace.Recommendation, err, attempt+1, attemptInput))
 				retryReason = plannerRetryReasonTraceValidation
 				continue
 			}
@@ -1202,7 +1215,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 					result.Recommendation = recommendation
 					return result, prepareErr
 				}
-				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, prepareErr, attempt+1))
+				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedbackForInput(recommendation, prepareErr, attempt+1, attemptInput))
 				retryReason = plannerRetryReasonAutoMLPreparation
 				continue
 			}
@@ -1224,9 +1237,39 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 				result.Recommendation = recommendation
 				return result, capabilityErr
 			}
-			attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, capabilityErr, attempt+1, executionReports...))
+			retained := retainedPlannerCandidatesPassingReports(recommendation, executionReports)
+			attemptInput.RetainedCandidates = retained
+			attemptInput.OpenReplacementSlots = maxInt(0, plannerConfiguredExperimentCapacity(attemptInput)-len(retained))
+			feedback := plannerValidationFeedbackForInput(recommendation, capabilityErr, attempt+1, attemptInput, executionReports...)
+			feedback.AcceptedCandidates = acceptedPlannerCandidateFeedback(retained)
+			attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, feedback)
 			retryReason = plannerRetryReasonExecutionCapabilities
 			continue
+		}
+		if strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
+			capacity := plannerConfiguredExperimentCapacity(attemptInput)
+			openSlots := capacity - len(recommendation.ProposedExperiments)
+			if openSlots > 0 && attempt < retryLimit {
+				underfilledErr := fmt.Errorf("planner produced %d viable candidates for %d configured slots; request %d replacements or repairs", len(recommendation.ProposedExperiments), capacity, openSlots)
+				retained := retainedPlannerCandidates(recommendation)
+				feedback := plannerValidationFeedback(recommendation, underfilledErr, attempt+1, executionReports...)
+				feedback.AcceptedCandidates = acceptedPlannerCandidateFeedback(retained)
+				feedback.OpenSlots = openSlots
+				feedback.ActiveTask = attemptInput.ExecutionCapabilityCard.Task
+				feedback.ActiveRunner = attemptInput.ExecutionCapabilityCard.Runner
+				feedback.CapabilitySubset = plannerFeedbackCapabilitySubset(attemptInput.ExecutionCapabilityCard, feedback.FieldFindings)
+				attemptInput.RetainedCandidates = retained
+				attemptInput.OpenReplacementSlots = openSlots
+				attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, feedback)
+				recommendation.AcceptanceFunnel.ReplacementSlotsRequested = openSlots
+				recommendation.AcceptanceFunnel.RetainedAcrossRetry = len(retained)
+				s.recordPlannerAcceptanceFunnel(invocation, recommendation.AcceptanceFunnel, attempt, true)
+				if persistErr := s.persistPlannerValidationAttempt(invocation, trace.StrictValidationVerdict, attempt, false, true); persistErr != nil {
+					return result, persistErr
+				}
+				retryReason = plannerRetryReasonExecutionCapabilities
+				continue
+			}
 		}
 		payload, err := experimentPlannerDecisionPayload(recommendation, invocation, agentMode, attemptInput)
 		if err == nil && strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
@@ -1247,6 +1290,7 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			}
 		}
 		if err == nil {
+			s.recordPlannerAcceptanceFunnel(invocation, recommendation.AcceptanceFunnel, attempt, false)
 			verdict := plannerStrictVerdictFromPayload(trace.StrictValidationVerdict, payload)
 			if persistErr := s.persistPlannerValidationAttempt(invocation, verdict, attempt, true, false); persistErr != nil {
 				return result, persistErr
@@ -1274,13 +1318,128 @@ func (s *Server) runExperimentPlannerWithBackendValidationRetry(
 			result.Recommendation = recommendation
 			return result, err
 		}
-		attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedback(recommendation, err, attempt+1))
+		attemptInput.ValidationFeedback = append(attemptInput.ValidationFeedback, plannerValidationFeedbackForInput(recommendation, err, attempt+1, attemptInput))
 		retryReason = plannerRetryReasonDecisionPayload
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("%w: experiment planner validation retry failed", store.ErrInvalidRequest)
 	}
 	return result, lastErr
+}
+
+func plannerConfiguredExperimentCapacity(input agents.ExperimentPlannerInput) int {
+	capacity := input.MaxExperiments
+	if capacity < 1 || capacity > maxLLMPlannerExperiments {
+		capacity = maxLLMPlannerExperiments
+	}
+	return capacity
+}
+
+func retainedPlannerCandidates(recommendation agents.ExperimentPlanningRecommendation) []agents.CandidateHypothesis {
+	type selectedCandidate struct {
+		order     int
+		candidate agents.CandidateHypothesis
+	}
+	selected := []selectedCandidate{}
+	for _, ranking := range recommendation.CandidateRankings {
+		if !ranking.Selected || ranking.SelectedExperimentIndex == nil || ranking.CandidateIndex < 0 || ranking.CandidateIndex >= len(recommendation.CandidateHypotheses) {
+			continue
+		}
+		candidate := recommendation.CandidateHypotheses[ranking.CandidateIndex]
+		if *ranking.SelectedExperimentIndex >= 0 && *ranking.SelectedExperimentIndex < len(recommendation.ProposedExperiments) {
+			candidate.ExperimentConfig = recommendation.ProposedExperiments[*ranking.SelectedExperimentIndex]
+		}
+		selected = append(selected, selectedCandidate{order: *ranking.SelectedExperimentIndex, candidate: candidate})
+	}
+	sort.Slice(selected, func(i, j int) bool { return selected[i].order < selected[j].order })
+	out := make([]agents.CandidateHypothesis, 0, len(selected))
+	for _, value := range selected {
+		out = append(out, value.candidate)
+	}
+	return out
+}
+
+func retainedPlannerCandidatesPassingReports(recommendation agents.ExperimentPlanningRecommendation, reports []execution.ExecutionValidationReport) []agents.CandidateHypothesis {
+	blocked := map[int]bool{}
+	for index, report := range reports {
+		if report.WouldBlock {
+			blocked[index] = true
+		}
+	}
+	retained := retainedPlannerCandidates(recommendation)
+	out := make([]agents.CandidateHypothesis, 0, len(retained))
+	for index, candidate := range retained {
+		if !blocked[index] {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func acceptedPlannerCandidateFeedback(candidates []agents.CandidateHypothesis) []agents.PlannerAcceptedCandidate {
+	out := make([]agents.PlannerAcceptedCandidate, 0, len(candidates))
+	for index, candidate := range candidates {
+		out = append(out, agents.PlannerAcceptedCandidate{
+			CandidateIndex: index,
+			Model:          candidate.ExperimentConfig.Model,
+			Mechanism:      candidate.Mechanism,
+			Experiment:     candidate.ExperimentConfig,
+		})
+	}
+	return out
+}
+
+func plannerFeedbackCapabilitySubset(card execution.PlannerCapabilityCard, findings []agents.PlannerValidationFieldFinding) map[string]any {
+	fields := map[string]bool{}
+	for _, finding := range findings {
+		if field := strings.TrimSpace(finding.Field); field != "" {
+			fields[field] = true
+		}
+	}
+	filter := func(values []string) []string {
+		out := []string{}
+		for _, value := range values {
+			if fields[value] {
+				out = append(out, value)
+			}
+		}
+		return out
+	}
+	conditional := []execution.PlannerConditionalCapability{}
+	for _, value := range card.ConditionalFields {
+		if fields[value.Field] {
+			conditional = append(conditional, value)
+		}
+	}
+	rules := []execution.PlannerCapabilityRule{}
+	for _, value := range card.Rules {
+		if fields[value.Field] {
+			rules = append(rules, value)
+		}
+	}
+	return map[string]any{
+		"capability_version": card.CapabilityVersion,
+		"task":               card.Task,
+		"runner":             card.Runner,
+		"executed_fields":    filter(card.ExecutedFields),
+		"conditional_fields": conditional,
+		"unsupported_fields": filter(card.UnsupportedFields),
+		"rules":              rules,
+	}
+}
+
+func (s *Server) recordPlannerAcceptanceFunnel(invocation memory.AgentInvocation, funnel agents.PlannerAcceptanceFunnel, attempt int, willRetry bool) {
+	if invocation.ID == "" {
+		return
+	}
+	payload := map[string]any{
+		"acceptance_funnel": funnel,
+		"retry_attempt":     attempt,
+		"will_retry":        willRetry,
+	}
+	if _, err := s.store.UpdateAgentInvocationDownstreamOutcome(invocation.ID, payload); err != nil {
+		log.Printf("update planner acceptance funnel failed for invocation %s: %v", invocation.ID, err)
+	}
 }
 
 func (s *Server) recordPlannerValidationRejection(invocation memory.AgentInvocation, validationErr error, attempt int, willRetry bool) {
@@ -1405,7 +1564,8 @@ func plannerCandidateDryRunValidator(input agents.ExperimentPlannerInput) agents
 			WouldWriteRows:          false,
 			WouldScheduleJobs:       false,
 			Details: map[string]any{
-				"dry_run_only": true,
+				"dry_run_only":      true,
+				"acceptance_funnel": recommendation.AcceptanceFunnel,
 			},
 		}
 		if strings.EqualFold(strings.TrimSpace(recommendation.DecisionType), decisions.TypeAddExperiments) {
@@ -1580,11 +1740,48 @@ func invalidPlannerDryRunResult(result agents.PlannerCandidateDryRunResult, err 
 	return result
 }
 
+func plannerValidationFeedbackForInput(recommendation agents.ExperimentPlanningRecommendation, validationErr error, attempt int, input agents.ExperimentPlannerInput, reports ...execution.ExecutionValidationReport) agents.PlannerValidationFeedback {
+	feedback := plannerValidationFeedback(recommendation, validationErr, attempt, reports...)
+	feedback.ActiveTask = input.ExecutionCapabilityCard.Task
+	feedback.ActiveRunner = input.ExecutionCapabilityCard.Runner
+	feedback.OpenSlots = input.OpenReplacementSlots
+	if feedback.OpenSlots == 0 && strings.EqualFold(recommendation.DecisionType, decisions.TypeAddExperiments) {
+		feedback.OpenSlots = maxInt(0, plannerConfiguredExperimentCapacity(input)-len(recommendation.ProposedExperiments))
+	}
+	feedback.CapabilitySubset = plannerFeedbackCapabilitySubset(input.ExecutionCapabilityCard, feedback.FieldFindings)
+	for index := range feedback.FieldFindings {
+		for _, rule := range input.ExecutionCapabilityCard.Rules {
+			if rule.Field != feedback.FieldFindings[index].Field {
+				continue
+			}
+			feedback.FieldFindings[index].SupportedValues = append([]string(nil), rule.Values...)
+			if rule.Range != "" {
+				feedback.FieldFindings[index].Prerequisites = append(feedback.FieldFindings[index].Prerequisites, rule.Range)
+			}
+		}
+	}
+	return feedback
+}
+
 func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommendation, validationErr error, attempt int, reports ...execution.ExecutionValidationReport) agents.PlannerValidationFeedback {
-	rejectedExperiments := make([]string, 0, len(recommendation.ProposedExperiments))
+	validationErrorText := "planner candidate validation requested repairs"
+	if validationErr != nil {
+		validationErrorText = validationErr.Error()
+	}
+	rejectedExperiments := []string{}
 	rejectedModels := []string{}
 	seenModels := map[string]bool{}
-	for _, experiment := range recommendation.ProposedExperiments {
+	rejectedIndexes := map[int]bool{}
+	for _, ranking := range recommendation.CandidateRankings {
+		if ranking.Rejected {
+			rejectedIndexes[ranking.CandidateIndex] = true
+		}
+	}
+	for index, candidate := range recommendation.CandidateHypotheses {
+		if len(recommendation.CandidateRankings) > 0 && !rejectedIndexes[index] {
+			continue
+		}
+		experiment := candidate.ExperimentConfig
 		rejectedExperiments = append(rejectedExperiments, experimentFeedbackSummary(experiment))
 		model := strings.ToLower(strings.TrimSpace(experiment.Model))
 		if model != "" && !seenModels[model] {
@@ -1594,15 +1791,18 @@ func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommend
 	}
 	feedback := agents.PlannerValidationFeedback{
 		Attempt:             attempt,
-		ValidationError:     validationErr.Error(),
+		ValidationError:     validationErrorText,
 		RejectedDecision:    recommendation.DecisionType,
 		RejectedModels:      rejectedModels,
 		RejectedExperiments: rejectedExperiments,
-		FieldFindings:       plannerValidationFieldFindings(validationErr, reports),
+		FieldFindings:       plannerValidationFieldFindings(recommendation, validationErr, reports),
+		AcceptedCandidates:  acceptedPlannerCandidateFeedback(retainedPlannerCandidates(recommendation)),
 		Instructions: []string{
 			"Return corrected JSON only.",
-			"Do not repeat the rejected experiment configuration unchanged.",
-			"Change a meaningful mechanism such as model family, preprocessing, augmentation policy, sampling/class balancing, scheduler, optimizer, regularization, or resolution strategy.",
+			"Preserve every accepted candidate exactly as listed; propose only repairs or replacements for open slots.",
+			"Preserve the original hypothesis when it remains executable. Make the smallest correction that resolves each listed finding.",
+			"A real change to a supported tuning value is acceptable; changing model family or mechanism is required only when the original mechanism cannot be executed.",
+			"Evidence-backed minor tuning is allowed. Do not replace a working candidate merely to create novelty.",
 			"Only propose experiments that backend validation can schedule.",
 		},
 	}
@@ -1621,26 +1821,66 @@ func plannerValidationFeedback(recommendation agents.ExperimentPlanningRecommend
 	return feedback
 }
 
-func plannerValidationFieldFindings(validationErr error, reports []execution.ExecutionValidationReport) []agents.PlannerValidationFieldFinding {
-	const maxFindings = 24
+func plannerValidationFieldFindings(recommendation agents.ExperimentPlanningRecommendation, validationErr error, reports []execution.ExecutionValidationReport) []agents.PlannerValidationFieldFinding {
+	const maxInformationalFindings = 24
 	out := []agents.PlannerValidationFieldFinding{}
+	seen := map[string]bool{}
+	informational := 0
 	appendFinding := func(finding agents.PlannerValidationFieldFinding) {
-		if len(out) >= maxFindings || strings.TrimSpace(finding.Field) == "" {
+		if strings.TrimSpace(finding.Field) == "" {
 			return
 		}
+		key := fmt.Sprintf("%d|%s|%s|%s", finding.CandidateIndex, finding.Field, finding.ReasonCode, finding.Disposition)
+		if seen[key] {
+			return
+		}
+		blocking := strings.HasPrefix(finding.Disposition, "rejected_") || finding.CentralToMechanism
+		if !blocking && informational >= maxInformationalFindings {
+			return
+		}
+		if !blocking {
+			informational++
+		}
+		seen[key] = true
 		out = append(out, finding)
 	}
-	for _, report := range reports {
+	for _, ranking := range recommendation.CandidateRankings {
+		for _, finding := range ranking.ValidationFindings {
+			if finding.Disposition == "" {
+				finding.Disposition = ranking.Disposition
+			}
+			appendFinding(finding)
+		}
+	}
+	for reportIndex, report := range reports {
 		if !report.WouldBlock {
 			continue
 		}
 		for _, finding := range report.Findings {
+			experimentIndex := reportIndex
+			model := ""
+			mechanism := ""
+			if reportIndex < len(recommendation.ProposedExperiments) {
+				model = recommendation.ProposedExperiments[reportIndex].Model
+				mechanism = recommendation.ProposedExperiments[reportIndex].Mechanism
+			}
 			appendFinding(agents.PlannerValidationFieldFinding{
+				CandidateIndex:       reportIndex,
+				ExperimentIndex:      &experimentIndex,
+				CandidateModel:       model,
+				CandidateMechanism:   mechanism,
+				ValidationStage:      "execution_fidelity",
+				Disposition:          agents.PlannerCandidateRejectedFidelity,
 				Field:                finding.Field,
+				Classification:       finding.Classification,
 				RequestedValue:       finding.RequestedValue,
 				AcceptedValue:        finding.AcceptedValue,
 				ReasonCode:           finding.ReasonCode,
+				Reason:               finding.Message,
 				SuggestedAlternative: finding.SuggestedAlternative,
+				SuggestedPatch:       map[string]any{"remove": finding.Field},
+				Prerequisites:        []string{finding.SuggestedAlternative},
+				Action:               "repair",
 			})
 		}
 	}
@@ -1652,8 +1892,12 @@ func plannerValidationFieldFindings(validationErr error, reports []execution.Exe
 		for _, finding := range evaluationErr.Findings {
 			appendFinding(agents.PlannerValidationFieldFinding{
 				Field:                finding.Stage,
+				ValidationStage:      finding.Stage,
+				Disposition:          agents.PlannerCandidateRejectedInvalid,
 				ReasonCode:           finding.Code,
+				Reason:               finding.Message,
 				SuggestedAlternative: finding.Message,
+				Action:               "repair",
 			})
 		}
 	}
@@ -1856,6 +2100,7 @@ func experimentPlannerDecisionPayload(
 		"candidate_selection_trace":       recommendation.CandidateSelectionTrace,
 		"candidate_rankings_v2":           recommendation.CandidateRankingsV2,
 		"candidate_selection_trace_v2":    recommendation.CandidateSelectionTraceV2,
+		"acceptance_funnel":               recommendation.AcceptanceFunnel,
 		"ranker_shadow_comparison":        recommendation.RankerShadowComparison,
 		"ranker_v2_prior_snapshot":        input.RankerV2PriorSnapshot,
 		"scheduling_ranker_version":       agents.PlannerSchedulingRankerVersion(input),

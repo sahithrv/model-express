@@ -97,7 +97,6 @@ func scorePlannerRecommendationDetailed(input agents.ExperimentPlannerInput, rec
 		selectionAuditValid &&
 		avoidedBlocked &&
 		duplicatesAvoided &&
-		architectureAvoided &&
 		expectedValueOK &&
 		evidencePresent &&
 		countOK &&

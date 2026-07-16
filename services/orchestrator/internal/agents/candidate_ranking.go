@@ -24,12 +24,23 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 	if strings.ToUpper(strings.TrimSpace(recommendation.DecisionType)) != decisions.TypeAddExperiments {
 		return recommendation, nil
 	}
-	if len(recommendation.CandidateHypotheses) == 0 {
+	if len(recommendation.CandidateHypotheses) == 0 && len(input.RetainedCandidates) == 0 {
 		return recommendation, fmt.Errorf("experiment planner ADD_EXPERIMENTS requires candidate_hypotheses for backend ranking")
 	}
-	candidates, err := freezeCandidateForecastContracts(input, recommendation.CandidateHypotheses)
+	allCandidates := make([]CandidateHypothesis, 0, len(input.RetainedCandidates)+len(recommendation.CandidateHypotheses))
+	allCandidates = append(allCandidates, input.RetainedCandidates...)
+	allCandidates = append(allCandidates, recommendation.CandidateHypotheses...)
+	candidates, err := freezeCandidateForecastContracts(input, allCandidates)
 	if err != nil {
 		return recommendation, err
+	}
+	input.CandidatePrevalidation = make(map[int]PlannerCandidateValidationResult, len(candidates))
+	if input.CandidateExecutionValidator != nil {
+		for index := range candidates {
+			result := input.CandidateExecutionValidator(candidates[index], index)
+			candidates[index].ExperimentConfig = result.Experiment
+			input.CandidatePrevalidation[index] = result
+		}
 	}
 	recommendation.CandidateHypotheses = candidates
 
@@ -62,6 +73,7 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 	}
 	recommendation.ProposedExperiments = selected
 	recommendation.ProposalMechanisms = mechanisms
+	recommendation.AcceptanceFunnel = plannerAcceptanceFunnel(input, candidates, rankings)
 	if len(selected) == 0 {
 		return recommendation, fmt.Errorf("experiment planner ADD_EXPERIMENTS has no backend-ranked candidate_hypotheses that survived validation")
 	}
@@ -74,7 +86,24 @@ func FinalizePlannerRecommendation(input ExperimentPlannerInput, recommendation 
 		}
 	}
 	normalizeFinalPlannerRecommendationForValidation(&recommendation)
+	synchronizeSelectedCandidateConfigs(&recommendation)
 	return recommendation, nil
+}
+
+func synchronizeSelectedCandidateConfigs(recommendation *ExperimentPlanningRecommendation) {
+	if recommendation == nil {
+		return
+	}
+	for _, ranking := range recommendation.CandidateRankings {
+		if !ranking.Selected || ranking.SelectedExperimentIndex == nil || ranking.CandidateIndex < 0 || ranking.CandidateIndex >= len(recommendation.CandidateHypotheses) {
+			continue
+		}
+		experimentIndex := *ranking.SelectedExperimentIndex
+		if experimentIndex < 0 || experimentIndex >= len(recommendation.ProposedExperiments) {
+			continue
+		}
+		recommendation.CandidateHypotheses[ranking.CandidateIndex].ExperimentConfig = recommendation.ProposedExperiments[experimentIndex]
+	}
 }
 
 func normalizeFinalPlannerRecommendationForValidation(recommendation *ExperimentPlanningRecommendation) {
@@ -253,24 +282,9 @@ func freezeCandidateForecastContracts(input ExperimentPlannerInput, candidates [
 }
 
 func mechanismExhausted(input ExperimentPlannerInput, candidate CandidateHypothesis, experiment plans.PlannedExperiment) (bool, string) {
-	normalized := normalizeMechanism(candidate.Mechanism)
-	if normalized == "" {
-		return false, ""
-	}
-	group := mechanismGroup(normalized)
-	if multiFidelityPolicyEnabledForInput(input) && yoloWeakBaselineRescueAllowed(input, candidate, experiment, normalized, group) {
-		return false, ""
-	}
-
-	if blockedByRejectedStrategyMemory(input, normalized, group) {
-		return true, fmt.Sprintf("mechanism %s is blocked by rejected strategy memory", normalized)
-	}
-	if blocked, reason := projectTrajectoryBlocksMechanism(input, normalized, group); blocked {
-		return true, reason
-	}
-	if normalized == "architecture_challenge" && repeatedArchitectureAttemptsExhausted(input) {
-		return true, "architecture_challenge exhausted after repeated architecture attempts without meaningful improvement"
-	}
+	// Historical failure, rejection, and mechanism exhaustion are ranking
+	// evidence, not permanent bans. Explicit proposal policy is enforced
+	// separately by EvaluateProposal.
 	return false, ""
 }
 
@@ -293,17 +307,7 @@ func projectDecisionPressure(input ExperimentPlannerInput) string {
 }
 
 func effectiveMaxPlannerExperiments(input ExperimentPlannerInput) int {
-	maxExperiments := maxPlannerExperiments(input.MaxExperiments)
-	switch projectDecisionPressure(input) {
-	case "critical", "final", "select_champion", "stop_project":
-		return minInt(maxExperiments, 1)
-	case "high", "non_exhausted_mechanism_or_stop", "champion_confirmation_or_non_architecture_pivot":
-		return minInt(maxExperiments, 2)
-	case "moderate":
-		return minInt(maxExperiments, 3)
-	default:
-		return maxExperiments
-	}
+	return maxPlannerExperiments(input.MaxExperiments)
 }
 
 func RankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []CandidateHypothesis, maxExperiments int) ([]CandidateRanking, []plans.PlannedExperiment, []PlannerProposalMechanism) {
@@ -354,6 +358,9 @@ func rankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []C
 		order := selectionOrder
 		experimentIndex := len(selected)
 		rankings[rankingIndex].Selected = true
+		if rankings[rankingIndex].Disposition != PlannerCandidateAcceptedAfterNormalization {
+			rankings[rankingIndex].Disposition = PlannerCandidateAccepted
+		}
 		rankings[rankingIndex].SelectionScore = &selectionScore
 		rankings[rankingIndex].SelectionOrder = &order
 		rankings[rankingIndex].SelectedExperimentIndex = &experimentIndex
@@ -362,7 +369,71 @@ func rankPlannerCandidateHypotheses(input ExperimentPlannerInput, candidates []C
 		selectedMechanisms = append(selectedMechanisms, plannerProposalMechanismFromCandidate(candidates[candidateIndex], experimentIndex))
 		selected = append(selected, candidates[candidateIndex].ExperimentConfig)
 	}
+	for index := range rankings {
+		if !rankings[index].Rejected && !rankings[index].Selected {
+			rankings[index].Disposition = PlannerCandidateUnselectedByRank
+		}
+	}
 	return rankings, selected, selectedMechanisms, selectionTrace
+}
+
+func plannerAcceptanceFunnel(input ExperimentPlannerInput, candidates []CandidateHypothesis, rankings []CandidateRanking) PlannerAcceptanceFunnel {
+	const candidateDispositionLimit = 32
+	funnel := PlannerAcceptanceFunnel{
+		CandidatesProposed:        len(candidates),
+		RetainedAcrossRetry:       len(input.RetainedCandidates),
+		ReplacementSlotsRequested: input.OpenReplacementSlots,
+		CandidateDispositions:     make([]PlannerCandidateDisposition, 0, len(rankings)),
+	}
+	for _, ranking := range rankings {
+		if ranking.Disposition != PlannerCandidateRejectedInvalid {
+			funnel.StructurallyValid++
+		}
+		switch ranking.Disposition {
+		case PlannerCandidateRejectedPolicy:
+			funnel.PolicyRejected++
+		case PlannerCandidateRejectedDuplicate:
+			funnel.ExactDuplicatesRejected++
+		case PlannerCandidateRejectedFidelity:
+			funnel.FidelityRejected++
+		}
+		if !ranking.Rejected {
+			funnel.RankEligible++
+		}
+		if ranking.Selected {
+			funnel.Selected++
+		}
+		if validation, ok := input.CandidatePrevalidation[ranking.CandidateIndex]; ok && validation.Normalized {
+			funnel.FidelityNormalized++
+		}
+		if candidateRankingHasHistoryPenalty(ranking) {
+			funnel.HistoryNoveltyPenalized++
+		}
+		model := ""
+		if ranking.CandidateIndex >= 0 && ranking.CandidateIndex < len(candidates) {
+			model = candidates[ranking.CandidateIndex].ExperimentConfig.Model
+		}
+		if len(funnel.CandidateDispositions) < candidateDispositionLimit {
+			funnel.CandidateDispositions = append(funnel.CandidateDispositions, PlannerCandidateDisposition{
+				CandidateIndex: ranking.CandidateIndex,
+				Model:          model,
+				Mechanism:      ranking.Mechanism,
+				Disposition:    ranking.Disposition,
+				ReasonCodes:    []string{ranking.Disposition},
+			})
+		} else {
+			funnel.CandidateDispositionsTruncated++
+		}
+	}
+	if input.PlannerRetryAttempt > 0 {
+		funnel.AcceptedAfterRetry = funnel.Selected
+	}
+	return funnel
+}
+
+func candidateRankingHasHistoryPenalty(ranking CandidateRanking) bool {
+	text := strings.ToLower(strings.Join(ranking.Reasons, " "))
+	return containsAnyText(text, "same-mechanism", "bounded refinement", "strategy memory", "strategy scorecard", "retrieved rejected", "failed mechanism")
 }
 
 const (
@@ -470,11 +541,28 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 		ScoreComponents:     map[string]float64{"base": 0.45},
 		Reasons:             []string{},
 		ExperimentSignature: signature,
+		Disposition:         PlannerCandidateAccepted,
+	}
+	if validation, ok := input.CandidatePrevalidation[index]; ok {
+		ranking.ValidationFindings = append([]PlannerValidationFieldFinding(nil), validation.FieldFindings...)
+		if validation.Normalized {
+			ranking.Disposition = PlannerCandidateAcceptedAfterNormalization
+			ranking.Reasons = append(ranking.Reasons, "accepted after execution normalization")
+		}
+		switch validation.Disposition {
+		case PlannerCandidateRejectedDuplicate, PlannerCandidateRejectedPolicy, PlannerCandidateRejectedFidelity, PlannerCandidateRejectedInvalid:
+			ranking.Rejected = true
+			ranking.Score = 0
+			ranking.Disposition = validation.Disposition
+			ranking.Reasons = append(ranking.Reasons, firstNonEmpty(validation.Reason, validation.ReasonCode))
+			return ranking
+		}
 	}
 
 	if err := validatePlannedExperimentShape(experiment, index); err != nil {
 		ranking.Rejected = true
 		ranking.Score = 0
+		ranking.Disposition = PlannerCandidateRejectedInvalid
 		ranking.Reasons = append(ranking.Reasons, err.Error())
 		return ranking
 	}
@@ -483,6 +571,7 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 		if policyErr != nil {
 			ranking.Rejected = true
 			ranking.Score = 0
+			ranking.Disposition = PlannerCandidateRejectedPolicy
 			ranking.Reasons = append(ranking.Reasons, policyErr.Error())
 			var structured *policies.PolicyError
 			if errors.As(policyErr, &structured) {
@@ -494,12 +583,14 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	if err := validateCandidateMechanismExpectation(candidate, index); err != nil {
 		ranking.Rejected = true
 		ranking.Score = 0
+		ranking.Disposition = PlannerCandidateRejectedInvalid
 		ranking.Reasons = append(ranking.Reasons, err.Error())
 		return ranking
 	}
 	if exhausted, reason := mechanismExhausted(input, candidate, experiment); exhausted {
 		ranking.Rejected = true
 		ranking.Score = 0
+		ranking.Disposition = PlannerCandidateRejectedInvalid
 		ranking.Reasons = append(ranking.Reasons, reason)
 		applyMultiFidelityPolicy(input, candidate, experiment, &ranking)
 		return ranking
@@ -507,12 +598,14 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	if existing[signature] {
 		ranking.Rejected = true
 		ranking.Score = 0
+		ranking.Disposition = PlannerCandidateRejectedDuplicate
 		ranking.Reasons = append(ranking.Reasons, "duplicate experiment signature already exists")
 		return ranking
 	}
 	if seenProposed[signature] {
 		ranking.Rejected = true
 		ranking.Score = 0
+		ranking.Disposition = PlannerCandidateRejectedDuplicate
 		ranking.Reasons = append(ranking.Reasons, "duplicate candidate signature in this planner output")
 		return ranking
 	}
@@ -561,8 +654,8 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	ranking.ScoreComponents["mechanism"] = roundCandidateScore(mechanismScore)
 
 	if tinyOnlyCandidate(candidate) {
-		ranking.Score -= 0.45
-		ranking.Reasons = append(ranking.Reasons, "tiny-only candidate: only epochs, learning rate, or batch size changed")
+		ranking.Score -= 0.04
+		ranking.Reasons = append(ranking.Reasons, "bounded refinement receives a modest ranking penalty")
 	}
 	if highCostWithoutEvidence(candidate, expectedGain) {
 		ranking.Score -= 0.28
@@ -580,15 +673,7 @@ func scorePlannerCandidate(input ExperimentPlannerInput, candidate CandidateHypo
 	ranking.ScoreComponents["memory_similarity"] = roundCandidateScore(memoryBonus)
 	ranking.ScoreComponents["retrieved_memory"] = roundCandidateScore(retrievedMemoryComponent(memoryHits))
 	if blockedByRetrievedMemory {
-		ranking.Rejected = true
-		ranking.Score = 0
-		ranking.Reasons = append(ranking.Reasons, "blocked by retrieved rejected option")
-		return ranking
-	}
-
-	if ranking.Score < 0.20 {
-		ranking.Rejected = true
-		ranking.Reasons = append(ranking.Reasons, "score below backend acceptance threshold")
+		ranking.Reasons = append(ranking.Reasons, "strong retrieved rejection evidence applied as a penalty, not a ban")
 	}
 	ranking.Score = roundCandidateScore(clampCandidate(ranking.Score, 0, 1))
 	if len(ranking.Reasons) == 0 {
@@ -670,8 +755,8 @@ func candidateMechanismScore(input ExperimentPlannerInput, candidate CandidateHy
 		reasons = append(reasons, "architecture-only candidate lacks underfitting, plateau, or champion-challenge evidence")
 	}
 	if sameMechanismMinorVariant(input, candidate, experiment) {
-		score -= 0.24
-		reasons = append(reasons, "same mechanism only changes minor tuning knobs")
+		score -= 0.06
+		reasons = append(reasons, "same-mechanism refinement receives a modest ranking penalty")
 	}
 	return score, reasons
 }
